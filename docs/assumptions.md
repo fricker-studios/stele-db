@@ -23,6 +23,7 @@ These four were answered directly by the project owner and are treated as decide
 | A24 | **Releases & versioning** | **Three channels** (edge/beta/stable) + **coordinated-but-independent SemVer** with explicit per-surface compatibility contracts (on-disk format the most conservative). | `CONFIRMED` | [ADR-0014](adr/0014-release-channels-and-versioning-policy.md) |
 | A25 | **Telemetry** | **Off by default, explicit opt-in**, anonymous aggregate only; across engine, CLI, and desktop app. | `CONFIRMED` | [ADR-0015](adr/0015-telemetry-opt-in.md) |
 | A26 | **Admin surface & SDKs** | A dedicated **admin/control-plane API** (gRPC + HTTP gateway) for ops; **rely on existing PG drivers** for SQL; ship `stele-client` (Rust) + thin language SDKs later. | `CONFIRMED` | [ADR-0016](adr/0016-admin-control-plane-api.md) |
+| A27 | **Default network port** | **5454** for pg-wire by default, **configurable** (consumers can override). Distinct from Postgres 5432 for identity and to avoid clashing with a local Postgres; IANA-unassigned, in the safe band (1024–32767). | `CONFIRMED` | [ADR-0017](adr/0017-default-network-port-5454.md) |
 
 ---
 

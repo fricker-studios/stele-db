@@ -24,6 +24,7 @@ Use the [template](_template.md) for new records. Number sequentially.
 | [0014](0014-release-channels-and-versioning-policy.md) | Release channels & cross-artifact versioning/compatibility policy | Accepted |
 | [0015](0015-telemetry-opt-in.md) | Telemetry: off by default, explicit opt-in | Accepted |
 | [0016](0016-admin-control-plane-api.md) | Admin/control-plane API + client SDK strategy | Accepted |
+| [0017](0017-default-network-port-5454.md) | Default network port: 5454 (pg-wire), configurable | Accepted |
 
 ## Conventions
 

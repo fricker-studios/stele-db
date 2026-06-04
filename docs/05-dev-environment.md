@@ -11,10 +11,10 @@ The goal is a **"clone to a running engine in minutes"** path, with a hermetic, 
 git clone https://github.com/<org>/stele-db
 cd stele-db
 # Option A — native (Rust toolchain auto-pinned by rust-toolchain.toml)
-cargo run -p stele-server -- --dev          # starts the engine on :5432 (pg-wire)
+cargo run -p stele-server -- --dev          # starts the engine on :5454 (pg-wire)
 
 # in another shell — connect with any Postgres client:
-psql -h localhost -p 5432 -d stele          # or:  cargo run -p stele-cli -- shell
+psql -h localhost -p 5454 -d stele          # or:  cargo run -p stele-cli -- shell
 ```
 
 ```sql
@@ -118,7 +118,7 @@ docker-build:   docker build -f docker/Dockerfile -t stele:dev .
 ## Running, building, testing
 
 ```bash
-just dev                  # run the engine in dev mode (verbose logs, no auth, :5432)
+just dev                  # run the engine in dev mode (verbose logs, no auth, :5454)
 just build                # compile the whole workspace
 just test                 # unit + integration + doctests (nextest)
 just lint                 # fmt-check + clippy (warnings = errors)
@@ -165,7 +165,7 @@ RUN cargo build --release -p stele-server -p stele-cli
 FROM gcr.io/distroless/cc-debian12 AS runtime
 COPY --from=build /src/target/release/stele-server /usr/local/bin/stele-server
 COPY --from=build /src/target/release/stele         /usr/local/bin/stele
-EXPOSE 5432
+EXPOSE 5454
 ENTRYPOINT ["stele-server"]
 CMD ["--config", "/etc/stele/stele.toml"]
 ```
@@ -173,9 +173,9 @@ CMD ["--config", "/etc/stele/stele.toml"]
 Run it:
 
 ```bash
-docker run --rm -p 5432:5432 ghcr.io/<org>/stele:latest --dev
+docker run --rm -p 5454:5454 ghcr.io/<org>/stele:latest --dev
 # or pin a release:
-docker run --rm -p 5432:5432 ghcr.io/<org>/stele:v0.1.0 --dev
+docker run --rm -p 5454:5454 ghcr.io/<org>/stele:v0.1.0 --dev
 ```
 
 A `docker-compose.yml` is provided for a one-command local stack (engine + MinIO as an S3-compatible store once tiering lands):
@@ -186,7 +186,7 @@ services:
   stele:
     image: ghcr.io/<org>/stele:latest
     command: ["--dev"]
-    ports: ["5432:5432"]
+    ports: ["5454:5454"]
     depends_on: [minio]
   minio:                       # S3-compatible store for tiering dev (v0.3+)
     image: minio/minio
@@ -261,8 +261,8 @@ For contributors who want Nix-backed reproducibility without writing Nix:
 A new contributor's first session:
 
 1. `git clone` → `cd stele-db`
-2. `just dev` (toolchain auto-installs) → engine running on `:5432`
-3. `psql -h localhost -p 5432 -d stele` → run the four-statement identity demo above
+2. `just dev` (toolchain auto-installs) → engine running on `:5454`
+3. `psql -h localhost -p 5454 -d stele` → run the four-statement identity demo above
 4. `just check` → confirm a clean local gate
 5. `just sim 100` → watch deterministic simulation run
 6. Read [02 — Architecture](02-architecture.md) and the [ADR index](adr/README.md)
@@ -279,7 +279,7 @@ Engine config is a single `stele.toml` (with env-var overrides), e.g.:
 ```toml
 # stele.toml
 [server]
-listen     = "0.0.0.0:5432"
+listen     = "0.0.0.0:5454"   # Stele's default pg-wire port (ADR-0017); override freely
 data_dir   = "/var/lib/stele"
 
 [storage]

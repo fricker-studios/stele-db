@@ -59,6 +59,7 @@ SELECT balance FROM account FOR SYSTEM_TIME AS OF (now() - interval '1 second') 
 | Releases & versioning | **3 channels + cross-artifact SemVer/compat policy** | [0014](adr/0014-release-channels-and-versioning-policy.md) |
 | Telemetry | **Off by default, explicit opt-in** | [0015](adr/0015-telemetry-opt-in.md) |
 | Admin surface | **Dedicated control-plane API**; PG drivers for SQL | [0016](adr/0016-admin-control-plane-api.md) |
+| Default port | **5454** (pg-wire), configurable — not 5432, for identity + no local-PG clash | [0017](adr/0017-default-network-port-5454.md) |
 
 ---
 
