@@ -1,0 +1,74 @@
+# CodeQL static analysis.
+#
+# The repo is public, so CodeQL analysis minutes are free. Findings show up in
+# the Security tab and as inline PR annotations — this is the only SAST gate
+# in CI today (cargo-clippy catches lints; cargo-deny catches advisories;
+# CodeQL catches taint flows and known vulnerability patterns).
+#
+# Scope: two analyses, run as a matrix.
+#   * `rust`    — uses `build-mode: none` so analysis works off Cargo metadata
+#                 + source without compiling the workspace. Much faster than
+#                 autobuild and avoids duplicating the toolchain setup that
+#                 `ci.yml` already does.
+#   * `actions` — scans workflow YAML for unsafe ${{ }} interpolation,
+#                 script-injection from PR titles / branch names, etc. A
+#                 natural follow-up to STL-84 (pinning Actions to SHAs).
+#
+# Pinned by SHA per ADR-0005. The `codeql-action` major tag (`v4`) is a
+# rolling pointer — Dependabot will propose SHA bumps.
+#
+# Spec: docs/04-cicd.md (CI gates).
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly run keeps the CodeQL database fresh against upstream rule
+    # updates even when the repo is quiet. Monday 06:00 UTC = off-peak.
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # `security-events: write` is what lets the action upload SARIF to the
+  # Security tab; no other write scope is needed.
+  security-events: write
+  # Required by codeql-action when running on a private repo's PR from a
+  # fork; harmless on a public repo.
+  actions: read
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    # Hosted runner: free for public repos, comes with the CodeQL bundle
+    # pre-cached. The self-hosted ARC runner used elsewhere isn't worth the
+    # setup cost for this workload.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            build-mode: none
+          - language: actions
+            build-mode: none
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@87557b9c84dde89fdd9b10e88954ac2f4248e463 # v4.36.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@87557b9c84dde89fdd9b10e88954ac2f4248e463 # v4.36.1
+        with:
+          category: /language:${{ matrix.language }}
