@@ -37,9 +37,10 @@ use super::DeltaError;
 pub(crate) const HEADER_LEN: usize = 24;
 
 /// Per-frame ceiling that guards against runaway allocations when decoding a
-/// corrupt frame. The WAL itself enforces `MAX_PAYLOAD_LEN = 16 MiB`, so a
-/// delta-tier frame can never legitimately exceed that.
-const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+/// corrupt frame **and** against producing an unreadable frame at encode time.
+/// The WAL itself enforces `MAX_PAYLOAD_LEN = 16 MiB`, so a delta-tier frame
+/// can never legitimately exceed that.
+pub const MAX_VERSION_FRAME_LEN: usize = 16 * 1024 * 1024;
 
 /// Opaque business-key bytes — the user/PK or hash key for a logical row.
 ///
@@ -91,13 +92,45 @@ impl Version {
         HEADER_LEN + self.business_key.0.len() + self.payload.len()
     }
 
+    /// Verify the version can be encoded — i.e. its component sizes fit in
+    /// `u32` and the total stays under [`MAX_VERSION_FRAME_LEN`]. The same
+    /// preflight runs at [`super::Delta::insert`], so callers writing the WAL
+    /// path get the size error before bytes hit the log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeltaError::TooLarge`] when either component overflows `u32`
+    /// or the encoded frame would exceed [`MAX_VERSION_FRAME_LEN`].
+    pub fn check_encodable(&self) -> Result<(), DeltaError> {
+        if u32::try_from(self.business_key.0.len()).is_err()
+            || u32::try_from(self.payload.len()).is_err()
+        {
+            return Err(DeltaError::TooLarge(self.encoded_size()));
+        }
+        let size = self.encoded_size();
+        if size > MAX_VERSION_FRAME_LEN {
+            return Err(DeltaError::TooLarge(size));
+        }
+        Ok(())
+    }
+
     /// Encode into `out`, appending bytes to it. Used by both the WAL
     /// committer and the spill writer so the two paths share one wire format.
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeltaError::TooLarge`] when the version is larger than
+    /// [`MAX_VERSION_FRAME_LEN`] — the same precondition [`Self::check_encodable`]
+    /// reports.
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), DeltaError> {
+        self.check_encodable()?;
+        // `try_from` here is redundant with `check_encodable` above, but
+        // makes `encode` self-checking — any caller that bypassed the
+        // preflight still gets the typed error instead of a panic.
         let business_len = u32::try_from(self.business_key.0.len())
-            .expect("business_key fits in u32 — bounded by MAX_FRAME_LEN");
+            .map_err(|_| DeltaError::TooLarge(self.encoded_size()))?;
         let payload_len = u32::try_from(self.payload.len())
-            .expect("payload fits in u32 — bounded by MAX_FRAME_LEN");
+            .map_err(|_| DeltaError::TooLarge(self.encoded_size()))?;
         out.reserve(self.encoded_size());
         out.extend_from_slice(&business_len.to_le_bytes());
         out.extend_from_slice(&payload_len.to_le_bytes());
@@ -105,14 +138,18 @@ impl Version {
         out.extend_from_slice(&self.sys_to.0.to_le_bytes());
         out.extend_from_slice(&self.business_key.0);
         out.extend_from_slice(&self.payload);
+        Ok(())
     }
 
     /// Convenience: encode to a fresh `Vec<u8>`.
-    #[must_use]
-    pub fn encoded(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`DeltaError::TooLarge`] from [`Self::encode`].
+    pub fn encoded(&self) -> Result<Vec<u8>, DeltaError> {
         let mut v = Vec::with_capacity(self.encoded_size());
-        self.encode(&mut v);
-        v
+        self.encode(&mut v)?;
+        Ok(v)
     }
 
     /// Decode from the head of `bytes`. Returns the parsed `Version` and the
@@ -154,8 +191,10 @@ impl Version {
             .checked_add(business_len)
             .and_then(|v| v.checked_add(payload_len))
             .ok_or(DeltaError::Corrupt("frame length overflows usize"))?;
-        if total > MAX_FRAME_LEN {
-            return Err(DeltaError::Corrupt("frame length exceeds MAX_FRAME_LEN"));
+        if total > MAX_VERSION_FRAME_LEN {
+            return Err(DeltaError::Corrupt(
+                "frame length exceeds MAX_VERSION_FRAME_LEN",
+            ));
         }
         if bytes.len() < total {
             return Err(DeltaError::Corrupt("frame body shorter than declared"));
@@ -191,7 +230,7 @@ mod tests {
     #[test]
     fn encode_decode_round_trip() {
         let original = v(b"alex", 42, b"hello world");
-        let bytes = original.encoded();
+        let bytes = original.encoded().expect("encode");
         let (parsed, consumed) = Version::decode(&bytes).expect("decode");
         assert_eq!(parsed, original);
         assert_eq!(consumed, bytes.len());
@@ -203,8 +242,8 @@ mod tests {
         let a = v(b"a", 1, b"one");
         let b = v(b"bb", 2, b"two");
         let mut buf = Vec::new();
-        a.encode(&mut buf);
-        b.encode(&mut buf);
+        a.encode(&mut buf).expect("encode a");
+        b.encode(&mut buf).expect("encode b");
 
         let (parsed_a, n) = Version::decode(&buf).expect("decode a");
         assert_eq!(parsed_a, a);
@@ -218,7 +257,7 @@ mod tests {
         // A zero-length business_key and payload is a degenerate but valid
         // case — the encoding shouldn't special-case it.
         let original = v(b"", 0, b"");
-        let bytes = original.encoded();
+        let bytes = original.encoded().expect("encode");
         assert_eq!(bytes.len(), HEADER_LEN);
         let (parsed, n) = Version::decode(&bytes).expect("decode");
         assert_eq!(parsed, original);
@@ -227,15 +266,33 @@ mod tests {
 
     #[test]
     fn truncated_header_is_corruption() {
-        let bytes = v(b"k", 7, b"x").encoded();
+        let bytes = v(b"k", 7, b"x").encoded().expect("encode");
         let err = Version::decode(&bytes[..HEADER_LEN - 1]).unwrap_err();
         assert!(matches!(err, DeltaError::Corrupt(_)));
     }
 
     #[test]
     fn truncated_body_is_corruption() {
-        let bytes = v(b"key", 7, b"value").encoded();
+        let bytes = v(b"key", 7, b"value").encoded().expect("encode");
         let err = Version::decode(&bytes[..bytes.len() - 1]).unwrap_err();
         assert!(matches!(err, DeltaError::Corrupt(_)));
+    }
+
+    /// A frame that exceeds `MAX_VERSION_FRAME_LEN` at encode time must
+    /// surface `DeltaError::TooLarge` — not a panic on the `u32::try_from`
+    /// cast.
+    #[test]
+    fn oversized_frame_is_too_large_not_panic() {
+        // 16 MiB + 1 of payload pushes the frame past MAX_VERSION_FRAME_LEN.
+        let big = Version {
+            business_key: BusinessKey::new(b"k".to_vec()),
+            sys_from: SystemTimeMicros(0),
+            sys_to: SYSTEM_TIME_OPEN,
+            payload: vec![0u8; MAX_VERSION_FRAME_LEN + 1],
+        };
+        let err = big.check_encodable().unwrap_err();
+        assert!(matches!(err, DeltaError::TooLarge(_)));
+        let err = big.encode(&mut Vec::new()).unwrap_err();
+        assert!(matches!(err, DeltaError::TooLarge(_)));
     }
 }

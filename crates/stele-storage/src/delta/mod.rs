@@ -81,6 +81,13 @@ pub enum DeltaError {
     #[error("delta-tier on-disk frame corrupt: {0}")]
     Corrupt(&'static str),
 
+    /// A `Version`'s encoded size exceeded the per-frame ceiling
+    /// ([`MAX_VERSION_FRAME_LEN`](version::MAX_VERSION_FRAME_LEN)). Returned
+    /// from [`Delta::insert`] and from the encode path so callers get a typed
+    /// error instead of a panic.
+    #[error("version frame too large: {0} bytes (max 16 MiB)")]
+    TooLarge(usize),
+
     /// An I/O failure on the spill path.
     #[error("i/o error: {0}")]
     Io(#[from] io::Error),
@@ -133,12 +140,20 @@ impl<D: Disk> Delta<D> {
     /// the current contents spill first and `version` lands in a fresh
     /// in-memory store.
     pub fn insert(&mut self, version: Version) -> Result<(), DeltaError> {
+        version.check_encodable()?;
         let incoming = version.encoded_size() as u64;
         let projected = self.mem.byte_size().saturating_add(incoming);
-        // Spill *before* inserting so the in-memory store never exceeds the
-        // threshold. A bare insert that would itself blow past the threshold
-        // (one giant row) still spills first, then lands in an empty mem
-        // tier — keeping the upper bound on memory usage honest.
+        // Spill the current mem tier first when its existing contents plus the
+        // incoming row would cross the threshold. Two soft edges to call out:
+        //
+        // * `mem.byte_size() > 0` — we don't spill an empty tier; that's a
+        //   no-op and would just create a zero-row spill file.
+        // * A single row larger than `spill_threshold_bytes` therefore lands
+        //   in an empty mem tier and *does* briefly exceed the threshold.
+        //   The next insert observes the over-threshold mem and spills it
+        //   then. The threshold is a steady-state soft bound on resident
+        //   bytes, not a hard per-insert ceiling — which matches the
+        //   row-oriented LSM convention and the WAL's group-commit spirit.
         if projected > self.config.spill_threshold_bytes && self.mem.byte_size() > 0 {
             self.spill_in_memory()?;
         }
@@ -180,7 +195,7 @@ impl<D: Disk> Delta<D> {
         snapshot: Snapshot,
     ) -> Result<Vec<Version>, DeltaError>
     where
-        R: RangeBounds<BusinessKey> + Clone,
+        R: RangeBounds<BusinessKey>,
     {
         // Materialise every candidate row in `(key, sys_from)` order into a
         // single chain-per-key map, then pick the snapshot's live version

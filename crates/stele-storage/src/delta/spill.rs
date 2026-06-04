@@ -59,10 +59,21 @@ pub(super) fn write_spill<D: Disk>(
     // Buffer the whole spill before writing so a partially-written file is
     // never observable mid-flush. Spills are bounded by `spill_threshold_bytes`
     // and we're already prepared to hold the data in memory.
-    let total: usize = rows.iter().map(Version::encoded_size).sum();
+    //
+    // Sum as `u64` (not `usize`) so the addition can't overflow on a 32-bit
+    // host even if `spill_threshold_bytes` is configured higher than 4 GiB,
+    // then `try_from` to `usize` for the allocation. Mirrors the symmetric
+    // guard in [`read_spill`].
+    let total_u64: u64 = rows.iter().map(|r| r.encoded_size() as u64).sum();
+    let total = usize::try_from(total_u64).map_err(|_| {
+        DeltaError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("spill {name} buffer length {total_u64} exceeds usize"),
+        ))
+    })?;
     let mut buf = Vec::with_capacity(total);
     for row in rows {
-        row.encode(&mut buf);
+        row.encode(&mut buf)?;
     }
     file.append(&buf)?;
     file.sync()?;

@@ -413,7 +413,7 @@ fn delta_plus_wal_replay_reproduces_pre_crash_state_under_seed_sweep() {
             let v = version(key.as_bytes(), sys, sys_to, &payload);
             // Append the encoded version to the WAL — this is what the txn
             // manager will do at commit time once [STL-94] lands.
-            wal.append(&v.encoded()).unwrap();
+            wal.append(&v.encoded().expect("encode")).unwrap();
             pre.insert(v).unwrap();
             sys += 1 + rng.range(5) as i64;
         }
