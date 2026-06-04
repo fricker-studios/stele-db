@@ -33,6 +33,7 @@ use super::format::{
     CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FORMAT_VERSION, HEADER_LEN, HEADER_MAGIC,
     TRAILER_LEN, TRAILER_MAGIC,
 };
+use super::zone_map::{Predicate, ZoneBound, ZoneMap};
 
 /// Decoded contents of one projected column chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +54,7 @@ pub enum ColumnData {
 pub struct SegmentReader<F: DiskFile> {
     file: F,
     footer: Footer,
+    zone_map: ZoneMap,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +76,8 @@ struct ColumnChunkMeta {
     offset: u64,
     length: u64,
     value_count: u32,
+    stat_min: Option<ZoneBound>,
+    stat_max: Option<ZoneBound>,
 }
 
 impl<F: DiskFile> SegmentReader<F> {
@@ -84,7 +88,12 @@ impl<F: DiskFile> SegmentReader<F> {
         let file = disk.open(name)?;
         validate_header(&file)?;
         let footer = read_footer(&file)?;
-        Ok(Self { file, footer })
+        let zone_map = build_zone_map(&footer);
+        Ok(Self {
+            file,
+            footer,
+            zone_map,
+        })
     }
 
     /// Schema id stored in the footer. v0.1 always returns `0` (the implicit
@@ -103,6 +112,31 @@ impl<F: DiskFile> SegmentReader<F> {
             .iter()
             .map(|rg| u64::from(rg.row_count))
             .sum()
+    }
+
+    /// The segment's resident [`ZoneMap`], decoded once at open from the
+    /// footer's per-column min/max stats.
+    ///
+    /// The returned map is independent of the segment's column-chunk bytes:
+    /// the planner can clone it and keep it after the segment has been tiered
+    /// to cold storage, the property
+    /// [ADR-0021](../../../../../docs/adr/0021-storage-lifecycle-tiered-archival.md)
+    /// relies on (*zone maps are never archived*).
+    #[must_use]
+    pub const fn zone_map(&self) -> &ZoneMap {
+        &self.zone_map
+    }
+
+    /// Whether this segment *might* contain a row visible at `snapshot` that
+    /// satisfies `predicate` — the planner's per-segment skip test.
+    ///
+    /// Delegates to [`ZoneMap::might_contain`] and so touches **no** column
+    /// chunk: a `false` result lets the planner prune the segment before any
+    /// read I/O. Conservative by construction — never `false` for a segment
+    /// that holds a match.
+    #[must_use]
+    pub fn might_contain(&self, predicate: &Predicate, snapshot: crate::delta::Snapshot) -> bool {
+        self.zone_map.might_contain(predicate, snapshot)
     }
 
     /// Read one column end-to-end across every row-group, in row order. The
@@ -285,15 +319,17 @@ fn parse_footer(bytes: &[u8]) -> Result<Footer, SegmentError> {
             let length = p.u64()?;
             let value_count = p.u32()?;
             let _reserved = p.u32()?;
-            let min_len = p.u32()? as usize;
-            // Stats payloads are intentionally skipped here — STL-89 consumes
-            // them for zone-map pruning, but the format-level reader only
-            // needs to walk over their bytes to advance the parser cursor.
-            // Bounded by the footer-CRC envelope so an oversized declared
+            // Stats feed zone-map pruning (STL-89). A zero-length field is the
+            // writer's "no stats" sentinel; a non-empty field is decoded into a
+            // typed bound matching the column's `ColumnType`. The declared
+            // lengths are bounded by the footer-CRC envelope, so an oversized
             // length can't escape the footer.
-            let _min = p.bytes(min_len)?;
+            let min_len = p.u32()? as usize;
+            let min_bytes = p.bytes(min_len)?;
             let max_len = p.u32()? as usize;
-            let _max = p.bytes(max_len)?;
+            let max_bytes = p.bytes(max_len)?;
+            let stat_min = decode_stat(column_id, min_bytes)?;
+            let stat_max = decode_stat(column_id, max_bytes)?;
             // Every column in a row-group shares the row-group's row count.
             // Detect a footer that claims a row count contradicting its own
             // per-column figures at open time, so the inconsistency surfaces
@@ -310,6 +346,8 @@ fn parse_footer(bytes: &[u8]) -> Result<Footer, SegmentError> {
                 offset,
                 length,
                 value_count,
+                stat_min,
+                stat_max,
             });
         }
         row_groups.push(RowGroup { row_count, columns });
@@ -321,6 +359,56 @@ fn parse_footer(bytes: &[u8]) -> Result<Footer, SegmentError> {
         schema_id,
         row_groups,
     })
+}
+
+/// Decode one footer stat field into a typed [`ZoneBound`]. The zero-length
+/// sentinel maps to `None` ("no stats"); a non-empty field is interpreted
+/// according to the column's [`ColumnType`], and an `i64` stat whose length is
+/// not exactly 8 bytes is rejected as corruption rather than silently
+/// truncated.
+fn decode_stat(col: ColumnId, bytes: &[u8]) -> Result<Option<ZoneBound>, SegmentError> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    match col.ty() {
+        ColumnType::I64 => {
+            let arr: [u8; 8] = bytes
+                .try_into()
+                .map_err(|_| SegmentError::Corrupt("i64 column stat is not 8 bytes"))?;
+            Ok(Some(ZoneBound::I64(i64::from_le_bytes(arr))))
+        }
+        ColumnType::Bytes => Ok(Some(ZoneBound::Bytes(bytes.to_vec()))),
+    }
+}
+
+/// Fold the per-chunk stats across every row-group into one segment-level
+/// [`ZoneMap`]: the overall min is the least of the row-group mins, the overall
+/// max the greatest of the row-group maxes. v0.1 emits a single row-group, so
+/// this collapses to a copy; the fold keeps the segment-level digest correct
+/// once multi-row-group writes land.
+fn build_zone_map(footer: &Footer) -> ZoneMap {
+    let bounds = ColumnId::ALL.into_iter().map(|col| {
+        let mut min: Option<ZoneBound> = None;
+        let mut max: Option<ZoneBound> = None;
+        for rg in &footer.row_groups {
+            for c in rg.columns.iter().filter(|c| c.column_id == col) {
+                if let Some(m) = &c.stat_min {
+                    min = Some(match min {
+                        Some(cur) if cur <= *m => cur,
+                        _ => m.clone(),
+                    });
+                }
+                if let Some(m) = &c.stat_max {
+                    max = Some(match max {
+                        Some(cur) if cur >= *m => cur,
+                        _ => m.clone(),
+                    });
+                }
+            }
+        }
+        (col, min, max)
+    });
+    ZoneMap::from_bounds(bounds)
 }
 
 fn chunk_meta(rg: &RowGroup, col: ColumnId) -> Result<&ColumnChunkMeta, SegmentError> {
@@ -567,6 +655,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn empty_stat_decodes_to_no_stats_sentinel() {
+        assert_eq!(decode_stat(ColumnId::SysFrom, &[]).unwrap(), None);
+        assert_eq!(decode_stat(ColumnId::BusinessKey, &[]).unwrap(), None);
+    }
+
+    #[test]
+    fn typed_stats_decode_by_column_type() {
+        assert_eq!(
+            decode_stat(ColumnId::SysFrom, &42i64.to_le_bytes()).unwrap(),
+            Some(ZoneBound::I64(42)),
+        );
+        assert_eq!(
+            decode_stat(ColumnId::BusinessKey, b"abc").unwrap(),
+            Some(ZoneBound::Bytes(b"abc".to_vec())),
+        );
+    }
+
+    #[test]
+    fn i64_stat_with_non_8_byte_length_is_rejected() {
+        // A corrupt footer that declares a 4-byte min for an i64 column must
+        // surface a typed error, not silently decode a truncated value.
+        let err = decode_stat(ColumnId::SysTo, &[0u8; 4]).unwrap_err();
+        assert!(
+            matches!(err, SegmentError::Corrupt(msg) if msg.contains("8 bytes")),
+            "i64 stat length mismatch must be rejected, got {err:?}"
+        );
+    }
+
     /// In-memory `DiskFile` that reports a fixed `len`. Used by the
     /// `read_chunk_payload` bounds tests so they can probe the allocation
     /// guard without standing up a full segment + footer round-trip.
@@ -597,6 +714,8 @@ mod tests {
             offset,
             length,
             value_count: 1,
+            stat_min: None,
+            stat_max: None,
         }
     }
 

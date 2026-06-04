@@ -55,8 +55,10 @@
 //! * Multi-row-group writes. The format describes N row-groups and the reader
 //!   walks them all; the writer emits one. Adding row-group flushing is a
 //!   writer-side change with no format implications.
-//! * Bloom filters. The footer reserves a stats area per column; bloom
-//!   filters slot in as new typed fields when [STL-89] lands.
+//! * Bloom filters. The footer reserves a stats area per column; the per-column
+//!   min/max stats it records feed the zone-map pruning that landed with
+//!   [STL-89] ([`ZoneMap`]), and bloom filters slot in alongside them as new
+//!   typed fields in a later ticket.
 //! * Schema evolution. v0.1 has one implicit schema id — 0, the implicit
 //!   `Version` schema. Real schema resolution rides on [STL-98]'s versioned
 //!   catalog.
@@ -64,12 +66,14 @@
 mod format;
 mod reader;
 mod writer;
+mod zone_map;
 
 use std::io;
 
 pub use format::ColumnId;
 pub use reader::{ColumnData, SegmentReader};
 pub use writer::SegmentWriter;
+pub use zone_map::{ColumnZone, Predicate, ZoneBound, ZoneMap};
 
 /// Errors surfaced from the sealed-segment writer and reader.
 #[derive(Debug, thiserror::Error)]
