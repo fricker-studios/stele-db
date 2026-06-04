@@ -18,9 +18,9 @@
 
 #![allow(dead_code)] // scaffold — real impls land per [STL-76] roadmap
 
+pub mod delta;
 pub mod wal;
 
 // Submodule placeholders — each becomes its own ticket under STL-76.
-// pub mod delta;
 // pub mod segment;
 // pub mod compaction;

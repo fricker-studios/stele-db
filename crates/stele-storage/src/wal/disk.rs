@@ -30,6 +30,16 @@ pub trait Disk: Send + Sync + 'static {
     /// List file names currently in this disk. Order is unspecified — callers
     /// must sort.
     fn list(&self) -> io::Result<Vec<String>>;
+
+    /// Remove a file by name. Errors with `NotFound` if it does not exist.
+    ///
+    /// The WAL itself does not delete its segments — sealed log files are
+    /// recoverable forever, by design. `remove` is here for *ephemeral*
+    /// artefacts on the same disk handle: today, the delta tier's spill
+    /// files ([STL-87]); later, compaction's temporary segment buffers. A
+    /// production filesystem-backed [`Disk`] implements this as
+    /// [`std::fs::remove_file`]; the simulated disk models the same.
+    fn remove(&self, name: &str) -> io::Result<()>;
 }
 
 /// A single append-only file within a [`Disk`].
