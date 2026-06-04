@@ -8,11 +8,11 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use super::disk::Disk;
 use super::log::{
     Checkpoint, Inner, LogOffset, WalError, known_segments, read_segment, segment_len,
 };
 use super::record::{HEADER_LEN, MAX_PAYLOAD_LEN, parse_header, verify};
+use crate::backend::Disk;
 
 /// Iterator over recovered records. See [`crate::wal::Wal::replay_from`].
 pub struct Replay<D: Disk> {

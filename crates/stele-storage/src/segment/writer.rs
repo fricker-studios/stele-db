@@ -14,9 +14,9 @@
 //! segments append-rejecting at the type level
 //! ([architecture §12 invariant 1](../../../../../docs/02-architecture.md#12-cross-cutting-architectural-invariants)).
 
+use crate::backend::{Disk, DiskFile};
 use crate::checksum::crc32c;
 use crate::delta::Version;
-use crate::wal::{Disk, DiskFile};
 
 use super::SegmentError;
 use super::format::{

@@ -8,9 +8,9 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use super::disk::{Disk, DiskFile};
 use super::record::{HEADER_LEN, MAX_PAYLOAD_LEN, encode};
 use super::segment;
+use crate::backend::{Disk, DiskFile};
 
 /// Tuning knobs.
 #[derive(Debug, Clone, Copy)]

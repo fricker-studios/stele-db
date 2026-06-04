@@ -27,10 +27,19 @@ struct Args {
 fn main() {
     let args = Args::parse();
     if let Some(seed) = args.seed {
-        println!("stele-sim: replay seed {seed} — scaffold, no scenarios registered yet");
+        let digest = stele_sim::run_storage_seed(seed);
+        println!("stele-sim: seed {seed} → storage digest {digest:#018x}");
+    } else if args.seeds == 0 {
+        println!("stele-sim: no seeds requested (pass --seeds N or --seed S)");
     } else {
+        // Sweep: each seed is independent and reproducible. We fold the
+        // per-seed digests so the sweep itself has a single comparable result.
+        let mut sweep = 0u64;
+        for seed in 0..args.seeds {
+            sweep ^= stele_sim::run_storage_seed(seed);
+        }
         println!(
-            "stele-sim: sweep {} seed(s), fault_injection={} — scaffold, no scenarios registered yet",
+            "stele-sim: swept {} seed(s) over the in-memory backend, fault_injection={} → sweep digest {sweep:#018x}",
             args.seeds, args.fault_injection
         );
     }

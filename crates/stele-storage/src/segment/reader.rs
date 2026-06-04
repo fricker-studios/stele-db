@@ -26,9 +26,9 @@ use std::cmp::Ordering;
 
 use stele_common::time::SystemTimeMicros;
 
+use crate::backend::{Disk, DiskFile};
 use crate::checksum::crc32c;
 use crate::delta::{BusinessKey, Version};
-use crate::wal::{Disk, DiskFile};
 
 use super::SegmentError;
 use super::format::{

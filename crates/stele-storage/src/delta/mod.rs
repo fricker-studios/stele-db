@@ -42,7 +42,7 @@ mod version;
 use std::io;
 use std::ops::RangeBounds;
 
-use crate::wal::Disk;
+use crate::backend::Disk;
 
 pub use version::{BusinessKey, MAX_VERSION_FRAME_LEN, Snapshot, Version};
 
@@ -95,9 +95,9 @@ pub enum DeltaError {
 /// The delta-tier handle.
 ///
 /// `Delta` owns one [`Disk`] handle for spill files. The WAL uses a separate
-/// handle today — until [STL-90] unifies the storage backend, the two are
-/// expected to be distinct namespaces (in the filesystem case, separate
-/// directories) so their filename schemes can never alias.
+/// handle: [STL-90] unified the backend *trait* ([`crate::backend`]), but the
+/// two stay distinct namespaces (in the filesystem case, separate directories)
+/// so their filename schemes can never alias.
 pub struct Delta<D: Disk> {
     disk: D,
     config: DeltaConfig,
