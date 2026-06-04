@@ -24,8 +24,12 @@
 //! ## Invariants enforced here
 //!
 //! 1. **Durability is at fsync, not append.** `append` *stages* a record;
-//!    `tick` makes it durable; the `commit` future resolves only once `tick`
-//!    has covered that record's position.
+//!    an fsync of the underlying file is what makes it durable. Two paths
+//!    fsync today: [`Wal::tick`] (the group-commit drain) and the
+//!    segment-boundary sync inside rotation. The `commit` future resolves
+//!    once *any* fsync has covered its target — typically via `tick`, but
+//!    rotation can also satisfy a pending commit when its target is in the
+//!    closing segment.
 //! 2. **Replay never proceeds past corruption.** A CRC-mismatched or
 //!    short-read frame stops the iterator after yielding one `Err`. This is
 //!    the torn-write contract from

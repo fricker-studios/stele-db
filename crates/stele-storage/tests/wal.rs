@@ -314,6 +314,137 @@ fn segment_rotation_keeps_records_replayable() {
     assert_eq!(payloads, (0u64..30).collect::<Vec<_>>());
 }
 
+/// Two `commit()` futures targeting the **same** `LogOffset` must both be
+/// woken on tick — earlier wakers must not be overwritten.
+#[test]
+fn multiple_commits_at_same_offset_both_resolve() {
+    let disk = MemDisk::new();
+    let wal = Wal::open(disk, WalConfig::default()).unwrap();
+
+    let pos = wal.append(b"shared").unwrap();
+    let mut first = Box::pin(wal.commit(pos));
+    let mut second = Box::pin(wal.commit(pos));
+
+    // Two distinct tasks → two distinct wakers. We model that with two
+    // separate `CountingWaker`s and assert each is woken exactly once.
+    let first_waker = Waker::from(Arc::new(NoopWaker));
+    let second_waker = Waker::from(Arc::new(NoopWaker));
+    let mut cx_a = Context::from_waker(&first_waker);
+    let mut cx_b = Context::from_waker(&second_waker);
+    assert!(first.as_mut().poll(&mut cx_a).is_pending());
+    assert!(second.as_mut().poll(&mut cx_b).is_pending());
+
+    let woken = wal.tick().unwrap();
+    assert_eq!(
+        woken, 2,
+        "tick must wake both futures sharing the same target"
+    );
+
+    block_on(first).unwrap();
+    block_on(second).unwrap();
+}
+
+/// Segment rotation fsyncs the closing segment, so a `commit()` whose target
+/// lies in that segment must resolve as soon as rotation happens — without
+/// waiting for the next explicit `tick()`.
+#[test]
+fn rotation_resolves_commits_in_closing_segment() {
+    let disk = MemDisk::new();
+    // 80-byte segments → 5 records per segment (16 bytes each).
+    let wal = Wal::open(
+        disk,
+        WalConfig {
+            segment_size_bytes: 80,
+        },
+    )
+    .unwrap();
+
+    // Fill segment 0. Take a commit on the last record before the boundary.
+    let mut last_in_seg0 = LogOffset::ZERO;
+    for i in 0u64..5 {
+        last_in_seg0 = wal.append(&i.to_le_bytes()).unwrap();
+    }
+    let mut commit = Box::pin(wal.commit(last_in_seg0));
+    let waker = Waker::from(Arc::new(NoopWaker));
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        commit.as_mut().poll(&mut cx).is_pending(),
+        "no fsync has happened yet"
+    );
+
+    // Now append one more — this forces a rotation, which fsyncs segment 0.
+    let _ = wal.append(&5u64.to_le_bytes()).unwrap();
+
+    // The commit's target was in the (now closed and fsync'd) segment, so it
+    // must be ready without us calling `tick()` first.
+    assert!(matches!(commit.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+}
+
+/// `replay_from(...)` surfaces I/O failures from disk-listing as the first
+/// iterator item (then stops) — never silently as "no records".
+#[test]
+fn replay_surfaces_disk_list_failure() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Wraps a `MemDisk` and errors from `list()` after the first call,
+    /// modeling a transient FS failure (e.g. EIO mid-replay).
+    struct ExplodingList {
+        inner: MemDisk,
+        list_calls: AtomicUsize,
+    }
+    struct ExplodingFile(<MemDisk as Disk>::File);
+
+    impl Disk for ExplodingList {
+        type File = ExplodingFile;
+        fn create(&self, name: &str) -> io::Result<Self::File> {
+            self.inner.create(name).map(ExplodingFile)
+        }
+        fn open(&self, name: &str) -> io::Result<Self::File> {
+            self.inner.open(name).map(ExplodingFile)
+        }
+        fn list(&self) -> io::Result<Vec<String>> {
+            // First call (during `Wal::open`) succeeds. Replay's own
+            // `known_segments` is the second call — fail it.
+            let n = self.list_calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                self.inner.list()
+            } else {
+                Err(io::Error::other("boom"))
+            }
+        }
+    }
+    impl DiskFile for ExplodingFile {
+        fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.0.append(bytes)
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read_at(offset, buf)
+        }
+        fn sync(&mut self) -> io::Result<()> {
+            self.0.sync()
+        }
+        fn len(&self) -> u64 {
+            self.0.len()
+        }
+    }
+
+    let disk = ExplodingList {
+        inner: MemDisk::new(),
+        list_calls: AtomicUsize::new(0),
+    };
+    let wal = Wal::open(disk, WalConfig::default()).unwrap();
+    wal.append(b"one").unwrap();
+    wal.tick().unwrap();
+
+    let mut it = wal.replay_from(Checkpoint::BEGIN);
+    let first = it.next().expect("must yield error");
+    assert!(
+        first.is_err(),
+        "first item should surface the listing error"
+    );
+    assert!(it.next().is_none(), "iterator stops after the error");
+}
+
 /// `replay_from(Checkpoint)` skips records ≤ the checkpoint.
 #[test]
 fn replay_from_checkpoint_skips_prefix() {

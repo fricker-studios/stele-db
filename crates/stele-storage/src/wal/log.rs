@@ -92,14 +92,21 @@ pub(super) struct Inner<D: Disk> {
     staged_end: LogOffset,
     /// The most-recent `LogOffset` that is *durable*.
     durable_end: LogOffset,
-    /// Pending commit waiters in FIFO order. `tick()` drains the prefix whose
-    /// target is now durable.
+    /// Pending commit waiters. Order is insertion order, but a drain removes
+    /// every waiter whose target is now durable (the *order* of waking is
+    /// unspecified — `swap_remove` is used internally).
     waiters: Vec<Waiter>,
 }
 
+/// One distinct `LogOffset` target shared by 1..N pending `Commit` futures.
+///
+/// Multiple `commit()` futures may legitimately await the same offset (e.g. a
+/// transaction that retries its commit, or two consumers waiting on the same
+/// boundary). Each contributing future registers its own waker; on drain we
+/// wake all of them.
 struct Waiter {
     target: LogOffset,
-    waker: Option<Waker>,
+    wakers: Vec<Waker>,
 }
 
 impl<D: Disk> Wal<D> {
@@ -136,35 +143,46 @@ impl<D: Disk> Wal<D> {
     /// record — pass it to [`commit`](Self::commit) to await durability.
     ///
     /// The record is visible to subsequent reads on the same `Disk`
-    /// immediately, but is **not** durable until a `tick()` drains it.
+    /// immediately, but is not durable until an fsync covers it (via either
+    /// [`tick`](Self::tick) or the segment-boundary sync inside rotation).
     pub fn append(&self, payload: &[u8]) -> Result<LogOffset, WalError> {
         if payload.len() > MAX_PAYLOAD_LEN as usize {
             return Err(WalError::PayloadTooLarge(payload.len()));
         }
         let record_len = HEADER_LEN as u64 + payload.len() as u64;
 
-        let mut g = self.inner.lock().expect("wal mutex poisoned");
+        let mut rotation_wakers = Vec::new();
+        let result = {
+            let mut g = self.inner.lock().expect("wal mutex poisoned");
 
-        // Rotate if appending this record would overflow the current segment.
-        // A record is never split across segments.
-        let projected = g.staged_end.byte_offset + record_len;
-        if projected > g.config.segment_size_bytes && g.staged_end.byte_offset > 0 {
-            rotate(&mut g)?;
+            // Rotate if appending this record would overflow the current
+            // segment. A record is never split across segments.
+            let projected = g.staged_end.byte_offset + record_len;
+            if projected > g.config.segment_size_bytes && g.staged_end.byte_offset > 0 {
+                rotate(&mut g, &mut rotation_wakers)?;
+            }
+
+            let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
+            encode(payload, &mut frame);
+            g.current.append(&frame)?;
+            g.staged_end.byte_offset += record_len;
+            g.staged_end
+        };
+        // Wake any commit futures the rotation's fsync just made durable —
+        // outside the lock, since `wake` can re-enter the same mutex.
+        for w in rotation_wakers {
+            w.wake();
         }
-
-        let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
-        encode(payload, &mut frame);
-        g.current.append(&frame)?;
-        g.staged_end.byte_offset += record_len;
-        Ok(g.staged_end)
+        Ok(result)
     }
 
     /// Return a future that resolves once every record appended **before** or
     /// **at** `target` is durable on disk.
     ///
     /// The future does not drive I/O on its own — durability is produced by
-    /// [`tick`](Self::tick). One `tick()` may resolve many pending
-    /// `commit()` futures: that's group commit.
+    /// [`tick`](Self::tick) (the group-commit fsync) or by the segment-boundary
+    /// fsync inside rotation. One `tick()` may resolve many pending `commit()`
+    /// futures: that's group commit.
     pub fn commit(&self, target: LogOffset) -> Commit<D> {
         Commit {
             inner: Arc::clone(&self.inner),
@@ -215,32 +233,50 @@ fn drain_tick<D: Disk>(inner: &Mutex<Inner<D>>) -> Result<Vec<Waker>, WalError> 
     let mut g = inner.lock().expect("wal mutex poisoned");
     g.current.sync()?;
     g.durable_end = g.staged_end;
+    Ok(drain_waiters(&mut g))
+}
+
+/// Remove and return wakers for every waiter whose target is now ≤
+/// `durable_end`. Multi-waker waiters (multiple futures awaiting the same
+/// offset) contribute every one of their wakers.
+fn drain_waiters<D: Disk>(g: &mut Inner<D>) -> Vec<Waker> {
     let mut wakers = Vec::new();
     let mut i = 0;
     while i < g.waiters.len() {
         if g.waiters[i].target <= g.durable_end {
-            let mut w = g.waiters.swap_remove(i);
-            if let Some(waker) = w.waker.take() {
-                wakers.push(waker);
-            }
+            let w = g.waiters.swap_remove(i);
+            wakers.extend(w.wakers);
         } else {
             i += 1;
         }
     }
-    Ok(wakers)
+    wakers
 }
 
-fn rotate<D: Disk>(g: &mut Inner<D>) -> Result<(), WalError> {
-    // Sync the closing segment so the boundary is itself durable. A
-    // subsequent `tick()` will still cover any later appends.
+/// Rotate to a fresh segment. The `wakers` out-parameter accumulates any
+/// commit waiters the closing segment's fsync just made durable; the caller is
+/// responsible for waking them *after* releasing the mutex.
+fn rotate<D: Disk>(g: &mut Inner<D>, wakers: &mut Vec<Waker>) -> Result<(), WalError> {
+    // Create the new segment first so we can fail cleanly before mutating any
+    // committed state.
+    let new_idx = g.current_segment_index + 1;
+    let new_file = g.disk.create(&segment::name_for(new_idx))?;
     g.current.sync()?;
-    g.current_segment_index += 1;
-    g.current = g.disk.create(&segment::name_for(g.current_segment_index))?;
+
+    // From here on the rotation is committed. The closing segment is durable,
+    // so every record in it is durable — advance `durable_end` past the
+    // boundary and drain waiters covered by that fsync. (Without this, a
+    // commit() future awaiting the closing segment would sit Pending until the
+    // next tick(), even though its data is already on disk — which violates
+    // the contract that "any fsync that covers a target resolves it".)
+    g.current_segment_index = new_idx;
+    g.current = new_file;
     g.staged_end = LogOffset {
-        segment_index: g.current_segment_index,
+        segment_index: new_idx,
         byte_offset: 0,
     };
     g.durable_end = g.staged_end;
+    wakers.extend(drain_waiters(g));
     Ok(())
 }
 
@@ -269,18 +305,27 @@ impl<D: Disk> Future for Commit<D> {
         if me.target <= g.durable_end {
             return Poll::Ready(Ok(()));
         }
-        // Park ourselves. We register a fresh waker every poll: this is correct
-        // (and matches what Tokio's mutex does) — a moved-Pin caller might bring
-        // a different task to the same future.
+        // Park ourselves. Multiple `Commit` futures may share the same
+        // `target` (e.g. two consumers awaiting the same boundary); we store
+        // every distinct waker so each gets notified, deduped by
+        // `Waker::will_wake` so repeated polls from the same task don't bloat
+        // the vector.
+        let new_waker = cx.waker().clone();
         for w in &mut g.waiters {
             if w.target == me.target {
-                w.waker = Some(cx.waker().clone());
+                if !w
+                    .wakers
+                    .iter()
+                    .any(|existing| existing.will_wake(&new_waker))
+                {
+                    w.wakers.push(new_waker);
+                }
                 return Poll::Pending;
             }
         }
         g.waiters.push(Waiter {
             target: me.target,
-            waker: Some(cx.waker().clone()),
+            wakers: vec![new_waker],
         });
         Poll::Pending
     }

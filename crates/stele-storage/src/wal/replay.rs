@@ -20,16 +20,23 @@ pub struct Replay<D: Disk> {
     position: LogOffset,
     segments: Vec<u64>,
     stopped: bool,
+    /// Error captured at construction time (e.g. `Disk::list` failed). Yielded
+    /// on the first `next()` call and then cleared; the iterator stops after.
+    init_error: Option<WalError>,
 }
 
 impl<D: Disk> Replay<D> {
     pub(super) fn new(inner: Arc<Mutex<Inner<D>>>, checkpoint: Checkpoint) -> Self {
-        let segments = known_segments(&inner).unwrap_or_default();
+        let (segments, init_error) = match known_segments(&inner) {
+            Ok(s) => (s, None),
+            Err(e) => (Vec::new(), Some(WalError::Io(e))),
+        };
         Self {
             inner,
             position: checkpoint.0,
             segments,
             stopped: false,
+            init_error,
         }
     }
 
@@ -101,6 +108,12 @@ impl<D: Disk> Iterator for Replay<D> {
     fn next(&mut self) -> Option<Self::Item> {
         if self.stopped {
             return None;
+        }
+        // Surface any construction-time error first, exactly once, then stop —
+        // same "yield Err, then None forever" contract as corruption detection.
+        if let Some(e) = self.init_error.take() {
+            self.stopped = true;
+            return Some(Err(e));
         }
         match self.read_next() {
             Ok(Some(payload)) => Some(Ok(payload)),
