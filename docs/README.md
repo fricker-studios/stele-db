@@ -21,10 +21,15 @@ This `/docs` set is the **single source of truth** for the project's vision, arc
 | 08 | [**Packaging, Distribution & Releases**](08-packaging-distribution-and-releases.md) | The artifact catalog; tagged Docker images; binaries; package registries; release channels; **cross-artifact versioning & compatibility policy**; supply-chain signing/SBOM/provenance; docs-per-release. |
 | 09 | [**Ecosystem & Products**](09-ecosystem-and-products.md) | The CLI/REPL; the **Tauri desktop app** (Stele Studio); the admin/control-plane API + client SDKs; the **K8s/OpenShift operator** + Helm; docs/marketing site; WASM playground; telemetry/privacy. |
 | 10 | [**Security & Compliance**](10-security-and-compliance.md) | Security as a **first-class pillar**: threat model; identity-driven security; encryption (TLS/at-rest/KMS/BYOK); authN/authZ (RBAC/RLS/CLS/ABAC); access auditing; memory-safety/exploit protection; compliance roadmap (SOC 2/HIPAA/PCI-DSS/GDPR); crypto-shredding erasure. |
+| 11 | [**Operations & Runbooks**](11-operations-and-runbooks.md) | Health/monitoring signals; incident response (severity, triage, blameless postmortem); disaster recovery (RPO/RTO, drills); common failure scenarios + remediation; backup/restore; format-aware upgrades; capacity/cost. |
+| 12 | [**Data Migration & Interop**](12-data-migration-and-interop.md) | Ingest paths; import from Postgres; **temporal-aware historical backfill**; Parquet/CSV/Arrow + external tables; export & no-lock-in; change-feed; schema evolution. |
+| 13 | [**Glossary**](13-glossary.md) | Plain-language definitions of every key term, cross-linked to the owning docs. |
+| 14 | [**Performance & Benchmarking**](14-performance-and-benchmarking.md) | The asymmetric contract; what we benchmark; correctness-gated, reproducible, no-cherry-picking methodology; the do-not-regress gate; cost-performance; claims policy. |
+| 15 | [**Commercialization & Sustainability**](15-commercialization-and-sustainability.md) | Directional & light: open-core model; what's always free; possible revenue avenues; the Solvia long-game; anti-rug-pull commitments. |
 
 ## Supporting material
 
-- [**Architecture Decision Records**](adr/README.md) — one record per significant decision (Context / Decision / Status / Consequences). Twenty-one ADRs to date.
+- [**Architecture Decision Records**](adr/README.md) — one record per significant decision (Context / Decision / Status / Consequences). Twenty-two ADRs to date.
 - [**Assumptions log**](assumptions.md) — the running ledger of what was decided on faith, and the open questions.
 
 ## The thesis in four SQL statements
@@ -66,6 +71,7 @@ SELECT balance FROM account FOR SYSTEM_TIME AS OF (now() - interval '1 second') 
 | Right-to-erasure | **Layered**: namespace-drop (per-namespace key destruction) + per-subject crypto-shredding; preserves append-only | [0020](adr/0020-crypto-shredding-erasure.md) |
 | Tenancy | **Namespaces** as first-class isolation + lifecycle units (per-namespace keys, audited drop); app maps tenant→namespace | [0020](adr/0020-crypto-shredding-erasure.md) · [0009](adr/0009-data-vault-conceptual-seam.md) |
 | Storage lifecycle | **System-time-driven tiered archival** (hot→Standard→Glacier), keeps all data; async restore; engine-native | [0021](adr/0021-storage-lifecycle-tiered-archival.md) |
+| Clocks (distributed) | **NTP required** + **Hybrid Logical Clocks** + max-skew self-fencing; PTP/cloud-time-sync optional | [0022](adr/0022-clock-synchronization-and-ordering.md) |
 
 ---
 
