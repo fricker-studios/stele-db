@@ -22,6 +22,8 @@
 //! materialization contract: a caller projecting one column out of four pays
 //! for one chunk's I/O and one CRC.
 
+use std::cmp::Ordering;
+
 use stele_common::time::SystemTimeMicros;
 
 use crate::checksum::crc32c;
@@ -392,17 +394,25 @@ fn build_zone_map(footer: &Footer) -> ZoneMap {
         let mut max: Option<ZoneBound> = None;
         for rg in &footer.row_groups {
             for c in rg.columns.iter().filter(|c| c.column_id == col) {
+                // Compare by reference (`ZoneBound` isn't `Copy`); replace only
+                // on a *provable* same-variant ordering. Every chunk for one
+                // column shares that column's type, so the fold always sees a
+                // `Some` ordering here.
                 if let Some(m) = &c.stat_min {
-                    min = Some(match min {
-                        Some(cur) if cur <= *m => cur,
-                        _ => m.clone(),
-                    });
+                    if min
+                        .as_ref()
+                        .is_none_or(|cur| m.cmp_same_variant(cur) == Some(Ordering::Less))
+                    {
+                        min = Some(m.clone());
+                    }
                 }
                 if let Some(m) = &c.stat_max {
-                    max = Some(match max {
-                        Some(cur) if cur >= *m => cur,
-                        _ => m.clone(),
-                    });
+                    if max
+                        .as_ref()
+                        .is_none_or(|cur| m.cmp_same_variant(cur) == Some(Ordering::Greater))
+                    {
+                        max = Some(m.clone());
+                    }
                 }
             }
         }

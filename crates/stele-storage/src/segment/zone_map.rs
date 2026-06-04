@@ -39,6 +39,8 @@
 //! through the same [`Predicate::Range`] path the moment those columns land —
 //! no change to this module required.
 
+use std::cmp::Ordering;
+
 use stele_common::time::SystemTimeMicros;
 
 use crate::delta::Snapshot;
@@ -138,10 +140,11 @@ impl ZoneMap {
     fn snapshot_overlaps(&self, snapshot: Snapshot) -> bool {
         let s = snapshot.0;
         // If we know the minimum `sys_from` and it is already past the
-        // snapshot, no row has begun yet at `s`.
+        // snapshot, no row has begun yet at `s`. Match on a reference and copy
+        // the inner `i64` out — `ZoneBound` is not `Copy`.
         if let Some(zone) = self.column(ColumnId::SysFrom) {
-            if let ZoneBound::I64(min_sys_from) = zone.min {
-                if SystemTimeMicros(min_sys_from) > s {
+            if let ZoneBound::I64(min_sys_from) = &zone.min {
+                if SystemTimeMicros(*min_sys_from) > s {
                     return false;
                 }
             }
@@ -150,8 +153,8 @@ impl ZoneMap {
         // every row was already superseded by `s` (the interval is half-open,
         // so `sys_to == s` is *not* visible).
         if let Some(zone) = self.column(ColumnId::SysTo) {
-            if let ZoneBound::I64(max_sys_to) = zone.max {
-                if SystemTimeMicros(max_sys_to) <= s {
+            if let ZoneBound::I64(max_sys_to) = &zone.max {
+                if SystemTimeMicros(*max_sys_to) <= s {
                     return false;
                 }
             }
@@ -165,16 +168,21 @@ impl ZoneMap {
         match predicate {
             Predicate::All => true,
             Predicate::And(parts) => parts.iter().all(|p| self.satisfies(p)),
-            // A point lies in the segment only if it is within [min, max]. No
-            // stats for this column ⇒ cannot prune on it (`is_none_or`).
+            // A point survives only if it lies within [min, max]. We keep the
+            // segment unless we can *prove* `value` is outside — a value whose
+            // variant doesn't match the column's stat (a mistyped predicate) is
+            // incomparable, so neither `is_below` nor `is_above` fires and the
+            // segment is conservatively kept. No stats ⇒ `is_none_or` keeps it.
             Predicate::Eq { column, value } => self
                 .column(*column)
-                .is_none_or(|zone| *value >= zone.min && *value <= zone.max),
-            // Two ranges [low, high] and [min, max] overlap iff
-            // `low <= max && min <= high`; absent stats can't prune.
+                .is_none_or(|zone| !value.is_below(&zone.min) && !value.is_above(&zone.max)),
+            // Ranges [low, high] and [min, max] are provably disjoint only when
+            // `high < min` or `low > max`; either proof prunes. Cross-variant
+            // bounds are incomparable, so neither proof fires and the segment
+            // is kept.
             Predicate::Range { column, low, high } => self
                 .column(*column)
-                .is_none_or(|zone| *low <= zone.max && zone.min <= *high),
+                .is_none_or(|zone| !high.is_below(&zone.min) && !low.is_above(&zone.max)),
         }
     }
 }
@@ -211,26 +219,36 @@ pub enum Predicate {
     And(Vec<Predicate>),
 }
 
-// `ZoneBound`'s derived `PartialOrd`/`Ord` would compare across variants in
-// declaration order, which is meaningless. The footer never mixes variants for
-// one column (the column's `ColumnType` fixes the variant), and the comparisons
-// in `satisfies` only ever pair same-typed bounds. We implement ordering so
-// that same-variant comparisons are correct and cross-variant comparisons fall
-// back to a stable-but-unused total order, so a mis-typed predicate degrades to
-// "cannot prune" rather than panicking.
-impl PartialOrd for ZoneBound {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+impl ZoneBound {
+    /// Total order *within* a variant. Deliberately **not** a `PartialOrd`
+    /// impl: two bounds of different variants are genuinely incomparable
+    /// (`None`), and there is no meaningful cross-variant order to expose.
+    ///
+    /// The footer never mixes variants for one column — the column's
+    /// `ColumnType` fixes the variant — so this returns `Some` on every path
+    /// the writer/reader can produce. The `None` arm exists for a *mistyped
+    /// predicate* (a caller comparing, say, a `Bytes` value against an `I64`
+    /// column), which every caller must treat conservatively: incomparable
+    /// means "cannot prune", never "prune".
+    pub(super) fn cmp_same_variant(&self, other: &Self) -> Option<Ordering> {
         match (self, other) {
-            (Self::I64(a), Self::I64(b)) => a.partial_cmp(b),
-            (Self::Bytes(a), Self::Bytes(b)) => a.partial_cmp(b),
-            // Mismatched variants: no meaningful order. Returning `None` makes
-            // the `>=`/`<=` comparisons in `satisfies` evaluate to `false`,
-            // which would *over*-prune — the one outcome we must never allow.
-            // So callers must never mix variants; the writer/reader guarantee
-            // that per-column bounds share the column's type. This arm exists
-            // only to keep the impl total.
+            (Self::I64(a), Self::I64(b)) => Some(a.cmp(b)),
+            (Self::Bytes(a), Self::Bytes(b)) => Some(a.cmp(b)),
             _ => None,
         }
+    }
+
+    /// `true` only when `self` is *provably* less than `other` (same variant
+    /// and strictly smaller). Cross-variant ⇒ `false`, so a mistyped predicate
+    /// can never use this to justify a skip.
+    fn is_below(&self, other: &Self) -> bool {
+        self.cmp_same_variant(other) == Some(Ordering::Less)
+    }
+
+    /// `true` only when `self` is *provably* greater than `other`. Cross-variant
+    /// ⇒ `false`.
+    fn is_above(&self, other: &Self) -> bool {
+        self.cmp_same_variant(other) == Some(Ordering::Greater)
     }
 }
 
@@ -373,6 +391,32 @@ mod tests {
         assert!(!zm.might_contain(&Predicate::And(vec![keep, drop]), snap(5)));
         // Empty conjunction is vacuously true.
         assert!(zm.might_contain(&Predicate::And(vec![]), snap(5)));
+    }
+
+    #[test]
+    fn mistyped_predicate_is_conservative_and_keeps_segment() {
+        // A predicate whose bound variant disagrees with the column's stat
+        // type (a caller bug) is incomparable. Pruning on an incomparable
+        // ordering would be a false negative, so might_contain must keep the
+        // segment in every such case.
+        let zm = map((1, 10), (20, 30), b"k");
+        // Bytes value against the i64 SysFrom column.
+        assert!(zm.might_contain(
+            &Predicate::Eq {
+                column: ColumnId::SysFrom,
+                value: ZoneBound::Bytes(b"x".to_vec()),
+            },
+            snap(5),
+        ));
+        // i64 range against the Bytes BusinessKey column.
+        assert!(zm.might_contain(
+            &Predicate::Range {
+                column: ColumnId::BusinessKey,
+                low: ZoneBound::I64(0),
+                high: ZoneBound::I64(100),
+            },
+            snap(5),
+        ));
     }
 
     #[test]
