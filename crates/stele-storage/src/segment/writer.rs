@@ -167,6 +167,17 @@ fn encode_column(col: ColumnId, rows: &[Version]) -> Result<EncodedColumn, Segme
             // later attach a column-level comparator, but at the format layer
             // bytewise order is the natural choice (it matches how
             // BusinessKey already sorts via `Vec<u8>`'s Ord).
+            //
+            // Some bytes columns are unbounded blobs — `Payload` can be up to
+            // `MAX_VERSION_FRAME_LEN` (16 MiB) per row — and inlining their
+            // lex-min/max would let one row blow the footer past the u32
+            // `footer_len` ceiling. Until [STL-89] introduces a bounded /
+            // typed stats scheme (truncated prefixes, length caps, or
+            // structured summaries), payload-shaped columns emit the
+            // zero-length "no stats" sentinel and rely on key-range pruning
+            // through `BusinessKey` instead. Bounded key-shaped bytes
+            // columns continue to emit lex-min/max.
+            let collect_stats = matches!(col, ColumnId::BusinessKey);
             let mut payload = Vec::new();
             let mut min: Option<&[u8]> = None;
             let mut max: Option<&[u8]> = None;
@@ -177,8 +188,10 @@ fn encode_column(col: ColumnId, rows: &[Version]) -> Result<EncodedColumn, Segme
                 })?;
                 payload.extend_from_slice(&len.to_le_bytes());
                 payload.extend_from_slice(bytes);
-                min = Some(min.map_or(bytes, |m| if bytes < m { bytes } else { m }));
-                max = Some(max.map_or(bytes, |m| if bytes > m { bytes } else { m }));
+                if collect_stats {
+                    min = Some(min.map_or(bytes, |m| if bytes < m { bytes } else { m }));
+                    max = Some(max.map_or(bytes, |m| if bytes > m { bytes } else { m }));
+                }
             }
             Ok(EncodedColumn {
                 payload,

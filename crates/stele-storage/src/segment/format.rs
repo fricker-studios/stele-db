@@ -79,9 +79,11 @@ pub enum ColumnId {
 
 impl ColumnId {
     /// Every column the implicit-Version schema carries, in writer/reader
-    /// canonical order.
-    pub(super) const ALL: [Self; 4] =
-        [Self::BusinessKey, Self::SysFrom, Self::SysTo, Self::Payload];
+    /// canonical order. Exposed publicly so tests and other consumers share
+    /// a single source of truth for the column set — adding a column here
+    /// flows into both writer/reader and every test that iterates the
+    /// schema, no shadow constants left to drift.
+    pub const ALL: [Self; 4] = [Self::BusinessKey, Self::SysFrom, Self::SysTo, Self::Payload];
 
     pub(super) const fn ty(self) -> ColumnType {
         match self {

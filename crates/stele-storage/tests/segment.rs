@@ -248,9 +248,15 @@ fn projection_does_not_touch_other_columns_chunks() {
 
     const HEADER_LEN: usize = 16;
     const CHUNK_HEADER_LEN: usize = 16;
-    // chunk 0: business_key, 1: sys_from, 2: sys_to, 3: payload.
+    // Walk chunks in declaration order until we reach Payload's chunk —
+    // ColumnId::ALL is the same order the writer emits, so this naturally
+    // tracks any column-list change.
+    let payload_index = ColumnId::ALL
+        .iter()
+        .position(|&c| c == ColumnId::Payload)
+        .expect("Payload is in ColumnId::ALL");
     let mut cursor = HEADER_LEN;
-    for _ in 0..3 {
+    for _ in 0..payload_index {
         let payload_len =
             u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
         cursor += CHUNK_HEADER_LEN + payload_len;
@@ -278,10 +284,12 @@ fn projection_does_not_touch_other_columns_chunks() {
 /// no offset escapes detection.
 #[test]
 fn flipping_any_byte_in_any_page_fails_on_read() {
-    // Compute the byte ranges of every chunk's coverage region (header[0..12]
-    // || payload). Bytes within these ranges are checksum-protected; a flip
-    // in either the header bytes the CRC covers or the payload itself must
-    // be caught.
+    // Compute the byte ranges every chunk covers: the chunk header
+    // (header[0..12]), the on-disk CRC field (header[12..16]), and the
+    // payload bytes. A flip in any of those must be caught — the first two
+    // ranges by `crc32c(header[0..12] || payload)` not matching the stored
+    // CRC; the third either by the CRC or by a chunk-header / footer
+    // cross-check.
     let disk_origin = MemDisk::new();
     let written = sample_workload();
     write_segment(&disk_origin, "orig.seg", &written);
@@ -297,17 +305,22 @@ fn flipping_any_byte_in_any_page_fails_on_read() {
 
     const HEADER_LEN: usize = 16;
     const CHUNK_HEADER_LEN: usize = 16;
-    // Compute per-chunk covered byte ranges.
+    // Compute per-chunk byte ranges. ColumnId::ALL is the segment module's
+    // canonical column list — using it (rather than a duplicated `4`) means
+    // adding a column flows into this sweep automatically.
     let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
     let mut cursor = HEADER_LEN;
-    for _ in 0..ColumnId::ALL_LEN {
+    for _ in 0..ColumnId::ALL.len() {
         let payload_len =
             u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-        let header_covered_start = cursor;
-        let header_covered_end = cursor + 12;
+        // Chunk header bytes the CRC covers.
+        ranges.push(cursor..cursor + 12);
+        // On-disk CRC field — a flip here makes the stored CRC disagree
+        // with the recomputed one and must also be detected.
+        ranges.push(cursor + 12..cursor + CHUNK_HEADER_LEN);
+        // Payload bytes.
         let payload_start = cursor + CHUNK_HEADER_LEN;
         let payload_end = payload_start + payload_len;
-        ranges.push(header_covered_start..header_covered_end);
         ranges.push(payload_start..payload_end);
         cursor = payload_end;
     }
@@ -418,13 +431,4 @@ fn a_second_writer_cannot_reopen_an_existing_segment() {
     // disturb its bytes.
     let r = SegmentReader::open(&disk, "sealed.seg").expect("original still readable");
     assert_eq!(r.read_versions().unwrap(), written);
-}
-
-// --- internal: surface ColumnId::ALL length without exposing it -------------
-
-trait ColumnIdAllLen {
-    const ALL_LEN: usize;
-}
-impl ColumnIdAllLen for ColumnId {
-    const ALL_LEN: usize = 4;
 }

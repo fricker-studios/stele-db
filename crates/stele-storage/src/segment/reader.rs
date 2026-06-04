@@ -378,8 +378,12 @@ fn read_chunk_payload<F: DiskFile>(
             "chunk length disagrees with declared payload",
         ));
     }
-    // CRC covers header[0..12] || payload. Zero out the crc field in the
-    // covered region — equivalent to never having written it.
+    // CRC covers header[0..12] || payload — i.e. the chunk header bytes
+    // *excluding* the CRC field itself (header[12..16]) followed by the
+    // payload bytes. This is the same byte range the writer fed into
+    // `crc32c` before stamping the CRC into header[12..16], so a flip
+    // anywhere in those bytes — or in the CRC field itself — fails this
+    // comparison.
     let mut crc_input = Vec::with_capacity(12 + payload_len);
     crc_input.extend_from_slice(&buf[0..12]);
     crc_input.extend_from_slice(&buf[CHUNK_HEADER_LEN..]);
