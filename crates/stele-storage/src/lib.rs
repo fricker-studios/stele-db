@@ -21,6 +21,7 @@
 pub(crate) mod checksum;
 pub mod delta;
 pub mod segment;
+pub mod systime;
 pub mod wal;
 
 // Submodule placeholders — each becomes its own ticket under STL-76.
