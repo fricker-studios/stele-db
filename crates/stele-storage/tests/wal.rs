@@ -91,6 +91,14 @@ impl Disk for MemDisk {
     fn list(&self) -> io::Result<Vec<String>> {
         Ok(self.inner.lock().unwrap().keys().cloned().collect())
     }
+
+    fn remove(&self, name: &str) -> io::Result<()> {
+        let mut files = self.inner.lock().unwrap();
+        if files.remove(name).is_none() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, name.to_string()));
+        }
+        Ok(())
+    }
 }
 
 impl DiskFile for MemFile {
@@ -448,6 +456,9 @@ fn replay_surfaces_disk_list_failure() {
             } else {
                 Err(io::Error::other("boom"))
             }
+        }
+        fn remove(&self, name: &str) -> io::Result<()> {
+            self.inner.remove(name)
         }
     }
     impl DiskFile for ExplodingFile {
