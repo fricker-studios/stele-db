@@ -62,7 +62,7 @@ jobs:
     runs-on: arc-runner-fricker-amd64
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85.0"
       - uses: Swatinem/rust-cache@v2

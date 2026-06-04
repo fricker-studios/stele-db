@@ -67,10 +67,15 @@ const MSG_TERMINATE: u8 = b'X';
 
 // SQLSTATE codes we return.
 const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
-// Used once we start enforcing protocol-level invariants on real input;
-// kept here so the constant pool stays close to the protocol spec.
-#[allow(dead_code)]
 const SQLSTATE_PROTOCOL_VIOLATION: &str = "08P01";
+
+// DoS guard: cap how large a single frame we will allocate for. The Postgres
+// protocol notionally allows up to ~1 GiB messages; in practice v0.1 traffic is
+// startup params (≤ KiB) and short simple-query strings. A malicious client can
+// advertise a multi-GiB length to OOM us, so we refuse frames over these bounds
+// before allocating anything.
+const MAX_STARTUP_PAYLOAD_SIZE: usize = 64 * 1024; // 64 KiB
+const MAX_MESSAGE_PAYLOAD_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
 
 // Reported server identity. We expose a real Postgres major so client-side
 // version checks don't refuse us; the build component declares Stele.
@@ -171,7 +176,23 @@ async fn handle_connection(mut stream: TcpStream, peer: SocketAddr) -> Result<()
                 // The first non-trivial Query goes here. v0.1 returns a
                 // not-implemented error and stays in the loop, which is enough
                 // for `psql` to print the error and keep its session alive.
-                let q = cstring_from(&msg.payload).unwrap_or_default();
+                //
+                // A Query payload MUST be a NUL-terminated cstring. If the
+                // terminator is missing, surface that as a protocol violation
+                // rather than silently treating it as an empty query — masking
+                // it would let framing desync go unnoticed.
+                let Some(q) = cstring_from(&msg.payload) else {
+                    warn!("Query payload missing NUL terminator");
+                    write_error_response(
+                        &mut stream,
+                        "ERROR",
+                        SQLSTATE_PROTOCOL_VIOLATION,
+                        "Query message missing NUL terminator",
+                    )
+                    .await?;
+                    write_ready_for_query(&mut stream).await?;
+                    continue;
+                };
                 info!(query = %q, "received simple query (not implemented in v0.1)");
                 write_error_response(
                     &mut stream,
@@ -242,6 +263,9 @@ async fn read_startup(stream: &mut TcpStream) -> Result<StartupMessage, WireErro
                     .map_err(|_| WireError::Protocol("startup length negative"))?
                     .checked_sub(8)
                     .ok_or(WireError::Protocol("startup length too short"))?;
+                if payload_len > MAX_STARTUP_PAYLOAD_SIZE {
+                    return Err(WireError::Protocol("startup payload exceeds limit"));
+                }
                 let mut payload = vec![0u8; payload_len];
                 stream.read_exact(&mut payload).await?;
                 let params = parse_startup_params(&payload)?;
@@ -317,6 +341,9 @@ async fn read_typed_message(stream: &mut TcpStream) -> Result<Option<TypedMessag
     }
     let payload_len =
         usize::try_from(length - 4).map_err(|_| WireError::Protocol("message length negative"))?;
+    if payload_len > MAX_MESSAGE_PAYLOAD_SIZE {
+        return Err(WireError::Protocol("message payload exceeds limit"));
+    }
     let mut payload = BytesMut::with_capacity(payload_len);
     payload.resize(payload_len, 0);
     if payload_len > 0 {
@@ -542,6 +569,83 @@ mod tests {
         client.write_all(&term).await.unwrap();
         drop(client);
 
+        server.await.unwrap().unwrap();
+    }
+
+    // Compile-time sanity: the DoS guards must be non-zero, fit in i32 so the
+    // length cast can't truncate, and startup ≤ message (startup is smaller).
+    const _: () = {
+        assert!(MAX_MESSAGE_PAYLOAD_SIZE > 0);
+        assert!(MAX_MESSAGE_PAYLOAD_SIZE <= i32::MAX as usize);
+        assert!(MAX_STARTUP_PAYLOAD_SIZE <= MAX_MESSAGE_PAYLOAD_SIZE);
+    };
+
+    #[tokio::test]
+    async fn query_without_nul_terminator_returns_protocol_violation() {
+        use tokio::io::AsyncWriteExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_connection(stream, peer).await
+        });
+
+        let mut client = TcpStream::connect(bound).await.unwrap();
+
+        // StartupMessage.
+        let body = b"user\0stele\0\0";
+        let length = 8 + body.len();
+        let mut startup = BytesMut::with_capacity(length);
+        startup.put_i32(i32::try_from(length).unwrap());
+        startup.put_i32(PROTOCOL_3_0);
+        startup.put_slice(body);
+        client.write_all(&startup).await.unwrap();
+
+        // Drain handshake until ReadyForQuery.
+        loop {
+            let mut h = [0u8; 5];
+            client.read_exact(&mut h).await.unwrap();
+            let len = usize::try_from(i32::from_be_bytes(h[1..5].try_into().unwrap())).unwrap();
+            let mut payload = vec![0u8; len - 4];
+            if !payload.is_empty() {
+                client.read_exact(&mut payload).await.unwrap();
+            }
+            if h[0] == MSG_READY_FOR_QUERY {
+                break;
+            }
+        }
+
+        // Send a Query missing the trailing NUL.
+        let query = b"SELECT 1"; // no \0
+        let qlen = i32::try_from(4 + query.len()).unwrap();
+        let mut q = BytesMut::with_capacity(5 + query.len());
+        q.put_u8(MSG_QUERY);
+        q.put_i32(qlen);
+        q.put_slice(query);
+        client.write_all(&q).await.unwrap();
+
+        // Expect ErrorResponse carrying SQLSTATE 08P01.
+        let mut eh = [0u8; 5];
+        client.read_exact(&mut eh).await.unwrap();
+        assert_eq!(eh[0], MSG_ERROR_RESPONSE);
+        let elen = usize::try_from(i32::from_be_bytes(eh[1..5].try_into().unwrap())).unwrap();
+        let mut epayload = vec![0u8; elen - 4];
+        client.read_exact(&mut epayload).await.unwrap();
+        assert!(
+            epayload
+                .windows(5)
+                .any(|w| w == SQLSTATE_PROTOCOL_VIOLATION.as_bytes()),
+            "SQLSTATE 08P01 should be embedded in the error payload"
+        );
+
+        // Followed by ReadyForQuery.
+        let mut zh = [0u8; 5];
+        client.read_exact(&mut zh).await.unwrap();
+        assert_eq!(zh[0], MSG_READY_FOR_QUERY);
+
+        let term: [u8; 5] = [MSG_TERMINATE, 0, 0, 0, 4];
+        client.write_all(&term).await.unwrap();
+        drop(client);
         server.await.unwrap().unwrap();
     }
 }
