@@ -130,6 +130,30 @@ impl Wake for NoopWaker {
     fn wake(self: Arc<Self>) {}
 }
 
+/// A `Waker` that counts how many times it was woken — used by tests that
+/// need to assert "each task got notified", not just "n wakeups happened".
+struct CountingWaker {
+    woken: std::sync::atomic::AtomicUsize,
+}
+impl CountingWaker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            woken: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+    fn count(&self) -> usize {
+        self.woken.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+impl Wake for CountingWaker {
+    fn wake(self: Arc<Self>) {
+        self.woken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 fn block_on<F: Future>(future: F) -> F::Output {
     let waker = Waker::from(Arc::new(NoopWaker));
     let mut cx = Context::from_waker(&waker);
@@ -325,10 +349,13 @@ fn multiple_commits_at_same_offset_both_resolve() {
     let mut first = Box::pin(wal.commit(pos));
     let mut second = Box::pin(wal.commit(pos));
 
-    // Two distinct tasks → two distinct wakers. We model that with two
-    // separate `CountingWaker`s and assert each is woken exactly once.
-    let first_waker = Waker::from(Arc::new(NoopWaker));
-    let second_waker = Waker::from(Arc::new(NoopWaker));
+    // Two distinct tasks → two distinct wakers. Use CountingWakers so we can
+    // assert that *each one specifically* is woken exactly once, not just
+    // that `tick()` returned a count of 2.
+    let first_cw = CountingWaker::new();
+    let second_cw = CountingWaker::new();
+    let first_waker = Waker::from(first_cw.clone());
+    let second_waker = Waker::from(second_cw.clone());
     let mut cx_a = Context::from_waker(&first_waker);
     let mut cx_b = Context::from_waker(&second_waker);
     assert!(first.as_mut().poll(&mut cx_a).is_pending());
@@ -338,6 +365,16 @@ fn multiple_commits_at_same_offset_both_resolve() {
     assert_eq!(
         woken, 2,
         "tick must wake both futures sharing the same target"
+    );
+    assert_eq!(
+        first_cw.count(),
+        1,
+        "first task's waker must fire exactly once"
+    );
+    assert_eq!(
+        second_cw.count(),
+        1,
+        "second task's waker must fire exactly once"
     );
 
     block_on(first).unwrap();

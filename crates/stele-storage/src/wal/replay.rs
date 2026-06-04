@@ -42,15 +42,17 @@ impl<D: Disk> Replay<D> {
 
     fn read_next(&mut self) -> Result<Option<Vec<u8>>, WalError> {
         loop {
-            // Advance over segments whose tail we've passed.
+            // `self.segments` is sorted (produced by `known_segments`), so we
+            // can binary-search the current position and step forward in O(1)
+            // — keeping replay O(records · log segments) rather than O(records
+            // · segments).
             let seg = self.position.segment_index;
-            if !self.segments.contains(&seg) {
+            let Ok(seg_idx) = self.segments.binary_search(&seg) else {
                 return Ok(None);
-            }
+            };
             let len = segment_len(&self.inner, seg)?;
             if self.position.byte_offset >= len {
-                // Move to the next segment if one exists; otherwise we're done.
-                let Some(&next) = self.segments.iter().find(|&&candidate| candidate > seg) else {
+                let Some(&next) = self.segments.get(seg_idx + 1) else {
                     return Ok(None);
                 };
                 self.position = LogOffset {

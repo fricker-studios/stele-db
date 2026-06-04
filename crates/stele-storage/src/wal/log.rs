@@ -50,7 +50,7 @@ impl LogOffset {
 }
 
 /// Where replay should resume from. Construct from a [`LogOffset`] returned by
-/// `commit`.
+/// [`Wal::append`], or from [`Wal::durable_end`] for a persisted resume point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Checkpoint(pub LogOffset);
 
@@ -257,11 +257,13 @@ fn drain_waiters<D: Disk>(g: &mut Inner<D>) -> Vec<Waker> {
 /// commit waiters the closing segment's fsync just made durable; the caller is
 /// responsible for waking them *after* releasing the mutex.
 fn rotate<D: Disk>(g: &mut Inner<D>, wakers: &mut Vec<Waker>) -> Result<(), WalError> {
-    // Create the new segment first so we can fail cleanly before mutating any
-    // committed state.
+    // Sync the closing segment FIRST. If `create` ran first and `sync` then
+    // failed, we'd leave an orphan empty segment with a higher index — a later
+    // `Wal::open` would pick that index as the head and silently skip past the
+    // closing segment's unsynced tail, breaking recovery.
+    g.current.sync()?;
     let new_idx = g.current_segment_index + 1;
     let new_file = g.disk.create(&segment::name_for(new_idx))?;
-    g.current.sync()?;
 
     // From here on the rotation is committed. The closing segment is durable,
     // so every record in it is durable — advance `durable_end` past the
