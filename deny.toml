@@ -28,8 +28,24 @@ allow = [
     "Zlib",
 ]
 
-# Stele itself ships under BUSL-1.1 ([ADR-0004]); we never pull in BUSL-licensed deps.
-exceptions = []
+# Stele itself ships under BUSL-1.1 ([ADR-0004]); we never pull in BUSL-licensed
+# *dependencies*. To express that we only allow BUSL-1.1 on **our own** workspace
+# crates — and still reject any third-party BUSL dep — we list each first-party
+# crate by name as a license exception rather than adding BUSL-1.1 to the global
+# `allow` list. Keep this in sync with the workspace members in /Cargo.toml.
+exceptions = [
+    { allow = ["BUSL-1.1"], name = "stele-common" },
+    { allow = ["BUSL-1.1"], name = "stele-storage" },
+    { allow = ["BUSL-1.1"], name = "stele-sim" },
+    { allow = ["BUSL-1.1"], name = "stele-catalog" },
+    { allow = ["BUSL-1.1"], name = "stele-txn" },
+    { allow = ["BUSL-1.1"], name = "stele-sql" },
+    { allow = ["BUSL-1.1"], name = "stele-exec" },
+    { allow = ["BUSL-1.1"], name = "stele-pgwire" },
+    { allow = ["BUSL-1.1"], name = "stele-lineage" },
+    { allow = ["BUSL-1.1"], name = "stele-server" },
+    { allow = ["BUSL-1.1"], name = "stele-cli" },
+]
 
 [bans]
 multiple-versions = "warn"
