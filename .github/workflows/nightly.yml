@@ -11,6 +11,10 @@
 #
 # The jobs are wired so PRs can opt in by adding the `full-ci` label, and the
 # scheduled run keeps a nightly heartbeat once any of them have real work.
+#
+# All `uses:` references are pinned to a 40-char commit SHA per ADR-0005
+# (reproducible builds). See .github/workflows/ci.yml for the SHA rationale —
+# Dependabot proposes bumps, the trailing `# vX.Y.Z` comment stays in sync.
 name: nightly
 
 on:
@@ -28,11 +32,12 @@ jobs:
       matrix:
         san: [address, thread, undefined]
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (no semver tags)
         with:
+          toolchain: nightly
           components: rust-src
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - name: nextest under sanitizer
         env:
           RUSTFLAGS: "-Zsanitizer=${{ matrix.san }}"
@@ -46,9 +51,10 @@ jobs:
     if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: arc-runner-fricker-amd64
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (no semver tags)
         with:
+          toolchain: nightly
           components: miri
       - run: cargo +nightly miri setup
       - run: |
@@ -59,8 +65,10 @@ jobs:
     if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: arc-runner-fricker-amd64
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (no semver tags)
+        with:
+          toolchain: nightly
       - run: |
           echo "Fuzz stub — add cargo-fuzz targets under fuzz/ then loop them here."
 
@@ -68,17 +76,21 @@ jobs:
     if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: arc-runner-fricker-amd64
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (no semver tags)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - run: cargo run -p stele-sim --release -- --seeds 100 --fault-injection on
 
   bench-gate:
     if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: arc-runner-fricker-amd64
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (no semver tags)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - run: |
           echo "Bench gate stub — wire criterion baselines in STL follow-up."
