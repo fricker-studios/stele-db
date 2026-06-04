@@ -30,10 +30,19 @@ struct TempDir {
 
 impl TempDir {
     fn new() -> Self {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("stele-backend-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        Self { path }
+        // `create_dir` (not `create_dir_all`) so we never reuse a directory left
+        // behind by a crashed run or a recycled PID — retry with a fresh counter
+        // on the off chance the name already exists, guaranteeing an empty dir.
+        loop {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("stele-backend-{}-{n}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Self { path },
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create temp dir: {e}"),
+            }
+        }
     }
 
     fn path(&self) -> &Path {
@@ -190,6 +199,33 @@ fn segment_round_trip_local() {
 #[test]
 fn segment_round_trip_memory() {
     segment_round_trip(&MemDisk::new());
+}
+
+#[test]
+fn local_backend_rejects_non_flat_names() {
+    // `LocalDisk` is a flat namespace: any name that is not a single normal path
+    // component must be rejected before it can escape the disk root.
+    let tmp = TempDir::new();
+    let disk = LocalDisk::open(tmp.path()).expect("open LocalDisk");
+    for bad in ["../escape", "sub/dir", "/abs", "", ".", ".."] {
+        assert_eq!(
+            disk.create(bad).map(|_| ()).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput,
+            "create({bad:?}) must be rejected"
+        );
+        assert_eq!(
+            disk.open(bad).map(|_| ()).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput,
+            "open({bad:?}) must be rejected"
+        );
+        assert_eq!(
+            disk.remove(bad).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput,
+            "remove({bad:?}) must be rejected"
+        );
+    }
+    // Nothing leaked into the root.
+    assert!(disk.list().expect("list").is_empty());
 }
 
 // --- fault injection is memory-only ----------------------------------------

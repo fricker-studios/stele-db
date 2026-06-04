@@ -209,7 +209,9 @@ impl DiskFile for MemFile {
         if start >= src.len() {
             return Ok(0);
         }
-        let end = (start + buf.len()).min(src.len());
+        // `saturating_add` so a huge `buf.len()` can't overflow `usize` when
+        // `start` is already near the top of the address space.
+        let end = start.saturating_add(buf.len()).min(src.len());
         let n = end - start;
         buf[..n].copy_from_slice(&src[start..end]);
         drop(src);

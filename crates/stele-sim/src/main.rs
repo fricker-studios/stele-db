@@ -32,11 +32,12 @@ fn main() {
     } else if args.seeds == 0 {
         println!("stele-sim: no seeds requested (pass --seeds N or --seed S)");
     } else {
-        // Sweep: each seed is independent and reproducible. We fold the
-        // per-seed digests so the sweep itself has a single comparable result.
-        let mut sweep = 0u64;
+        // Sweep: each seed is independent and reproducible. Fold the per-seed
+        // digests with an order-dependent FNV-style mix (not XOR, which would
+        // cancel matching digests) so the sweep stays a sharp regression signal.
+        let mut sweep = 0xCBF2_9CE4_8422_2325u64;
         for seed in 0..args.seeds {
-            sweep ^= stele_sim::run_storage_seed(seed);
+            sweep = (sweep ^ stele_sim::run_storage_seed(seed)).wrapping_mul(0x0000_0100_0000_01B3);
         }
         println!(
             "stele-sim: swept {} seed(s) over the in-memory backend, fault_injection={} → sweep digest {sweep:#018x}",

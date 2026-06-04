@@ -14,7 +14,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::{Disk, DiskFile};
 
@@ -36,8 +36,19 @@ impl LocalDisk {
         Ok(Self { root })
     }
 
-    fn path(&self, name: &str) -> PathBuf {
-        self.root.join(name)
+    /// Resolve `name` to a path inside `root`, rejecting anything that is not a
+    /// single normal path component. A [`Disk`] is a *flat* namespace, so names
+    /// like `../escape`, `sub/dir`, `/abs`, `.` or `""` are invalid — this keeps
+    /// a caller-supplied name from escaping the disk root.
+    fn path(&self, name: &str) -> io::Result<PathBuf> {
+        let mut components = Path::new(name).components();
+        match (components.next(), components.next()) {
+            (Some(Component::Normal(c)), None) => Ok(self.root.join(c)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid backend file name: {name:?}"),
+            )),
+        }
     }
 }
 
@@ -49,7 +60,7 @@ impl Disk for LocalDisk {
             .read(true)
             .append(true)
             .create_new(true)
-            .open(self.path(name))?;
+            .open(self.path(name)?)?;
         Ok(LocalFile { file, len: 0 })
     }
 
@@ -57,7 +68,7 @@ impl Disk for LocalDisk {
         let file = OpenOptions::new()
             .read(true)
             .append(true)
-            .open(self.path(name))?;
+            .open(self.path(name)?)?;
         let len = file.metadata()?.len();
         Ok(LocalFile { file, len })
     }
@@ -76,7 +87,7 @@ impl Disk for LocalDisk {
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
-        fs::remove_file(self.path(name))
+        fs::remove_file(self.path(name)?)
     }
 }
 

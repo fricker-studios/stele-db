@@ -56,8 +56,9 @@ impl Rng {
         self.next_u64() % bound
     }
 
-    /// Uniform-ish `usize` in `0..bound`. The result is `< bound`, so it always
-    /// fits a `usize`.
+    /// Uniform-ish `usize` in `0..bound` (`bound` must be non-zero — like
+    /// [`below`](Self::below), a zero `bound` panics with a division-by-zero).
+    /// The result is `< bound`, so it always fits a `usize`.
     pub fn below_usize(&mut self, bound: usize) -> usize {
         usize::try_from(self.next_u64() % bound as u64).expect("value < bound fits usize")
     }
