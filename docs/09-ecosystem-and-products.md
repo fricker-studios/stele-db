@@ -103,6 +103,7 @@ flowchart TB
 
 - **CRDs:** `SteleCluster` (topology, storage backend, resources), `SteleBackup`/`SteleRestore` (scheduled + on-demand, to object storage), `SteleUser`/`SteleRole` (declarative auth). CRD versions graduate `v1alpha1`→`v1`, with conversion webhooks so a stored resource never breaks ([08 §7](08-packaging-distribution-and-releases.md#7-versioning--compatibility-policy-the-important-part)).
 - **Lifecycle:** provisioning, configuration, scaling compute (especially clean once [storage/compute are separated](adr/0007-storage-compute-separation.md)), **format-compatibility-aware rolling upgrades**, backup/restore/PITR, and (in the distributed era) failover.
+- **Clock-sync preflight:** for distributed clusters the operator **requires and continuously monitors NTP/PTP** on every node (the engine is time-native) and surfaces skew alerts — a node without healthy time sync is not admitted ([ADR-0022](adr/0022-clock-synchronization-and-ordering.md)).
 - **Packaging:** OLM bundle on **OperatorHub**; Helm chart in an OCI Helm repo; images from `ghcr.io`. Pursue OpenShift **certified** status and climb the operator **capability levels** (Basic Install → Seamless Upgrades → Full Lifecycle → Deep Insights → Autopilot) as the engine matures.
 - **Phasing:** Helm chart at **v0.5**, operator at **v0.7**, OpenShift certification around **v1.0**, distributed-cluster management at **v2.0+** ([roadmap](03-roadmap.md#artifact--product-roadmap)).
 

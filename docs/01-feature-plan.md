@@ -192,6 +192,8 @@ The unglamorous foundation. Built to the standard the differentiators need — *
 | **Synchronous replication** | Quorum durability. | Later | **v1.0** |
 | **Automatic failover** | Leader election (ties into distribution/consensus). | Later | **v1.0+** |
 | **Distributed consensus** | Raft for control-plane metadata; data over shared object storage. | Later | **v2.0+** |
+| **Clock sync requirement (NTP/PTP)** | Hard operational requirement on all nodes (the engine is time-native); operator-enforced preflight + monitoring ([ADR-0022](adr/0022-clock-synchronization-and-ordering.md)). | Later | **v2.0+** |
+| **Hybrid Logical Clocks + skew fencing** | HLC for causally-consistent cross-node system-time under bounded skew; a node beyond the max-skew bound fences itself (fail-safe, never mis-orders history). | Later | **v2.0+** |
 | **Hash distribution / partitioning** | Partition rows across nodes by a declared distribution (hash) key — the general scale-out primitive ([ADR-0011](adr/0011-hash-distribution-integration-groundwork.md)). | Later | **v2.0+** |
 | **Key co-location / co-partitioning** | Co-partition tables joined on the same key so those joins stay node-local (no shuffle); generic groundwork for hub↔satellite-shaped access, without naming it. | Later | **v2.0+** |
 

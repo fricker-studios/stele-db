@@ -429,6 +429,23 @@ Why this shape: immutable segments mean **read scale-out is nearly free** (any n
 
 **Data distribution & co-location.** Within this shape, a table may declare a **distribution key** — typically a [stable hash key](01-feature-plan.md#a5--hash-keys--mergeupsert) — and rows partition across nodes by its hash; frequently-joined tables can be **co-located** (co-partitioned on the same key) so those joins stay node-local with no shuffle. These are generic sharded-analytics primitives, but they are deliberately part of the [integration groundwork](adr/0011-hash-distribution-integration-groundwork.md) ([ADR-0011](adr/0011-hash-distribution-integration-groundwork.md)): they make hash-keyed models — Data Vault among them — distribute and join cleanly, while the engine stays ignorant of what a hub or satellite is ([ADR-0009](adr/0009-data-vault-conceptual-seam.md)).
 
+**Clocks & cross-node time ordering.** Stele's spine is *system-time* ([§2](#2-the-bitemporal-record-model)), so in a distributed deployment time ordering across nodes is **correctness-critical**, not cosmetic ([ADR-0022](adr/0022-clock-synchronization-and-ordering.md)). NTP alone is insufficient (real drift is tens–hundreds of ms), so:
+
+- **NTP is a hard requirement** on every node (chrony/PHC), enforced by the [operator](09-ecosystem-and-products.md#5-kubernetes--openshift-operator) as preflight + continuous check — the *baseline*, not the guarantee.
+- **Hybrid Logical Clocks (HLC)** assign system-time across nodes (physical time + logical counter) so **causal ordering survives bounded skew** — the CockroachDB/YugabyteDB approach.
+- A **configurable max-skew bound** is enforced: a node drifting beyond it **fences itself** (stops serving) rather than mis-order history — fail-safe over fail-wrong.
+- **PTP / cloud time-sync** (e.g. Amazon Time Sync at microsecond accuracy) narrows the bound; a TrueTime-style commit-wait path is optional where high-precision time exists.
+
+```mermaid
+flowchart TB
+    ntp["NTP / PTP on every node<br/>(operator-enforced)"] --> hlc["Hybrid Logical Clock<br/>(physical + logical counter)"]
+    hlc --> skew{"Skew over max bound?"}
+    skew -->|"no"| order["Causally-consistent system-time<br/>ordering across nodes"]
+    skew -->|"yes"| fence["Node fences itself<br/>(stop serving) — fail-safe"]
+```
+
+Single-node and read-replica deployments are unaffected — one writer clock, no cross-node ordering problem.
+
 ---
 
 ## 11. Crate / module decomposition (intended)
