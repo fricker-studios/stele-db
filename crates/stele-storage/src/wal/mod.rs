@@ -38,13 +38,15 @@
 //!    through the [`Disk`] / [`DiskFile`] traits; `commit` is a plain
 //!    [`std::future::Future`].
 
-mod disk;
 mod log;
 mod record;
 mod replay;
 mod segment;
 
-pub use disk::{Disk, DiskFile};
+// The `Disk` / `DiskFile` seam now lives in [`crate::backend`] ([STL-90]); the
+// WAL was its first user, so these re-exports preserve `stele_storage::wal::`
+// import paths.
+pub use crate::backend::{Disk, DiskFile};
 pub use log::{Checkpoint, Commit, LogOffset, Wal, WalConfig, WalError};
 pub use record::MAX_PAYLOAD_LEN;
 pub use replay::Replay;

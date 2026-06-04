@@ -27,11 +27,31 @@ struct Args {
 fn main() {
     let args = Args::parse();
     if let Some(seed) = args.seed {
-        println!("stele-sim: replay seed {seed} — scaffold, no scenarios registered yet");
+        let digest = stele_sim::run_storage_seed(seed);
+        println!("stele-sim: seed {seed} → storage digest {digest:#018x}");
+    } else if args.seeds == 0 {
+        println!("stele-sim: no seeds requested (pass --seeds N or --seed S)");
     } else {
+        // Sweep: each seed is independent and reproducible. Fold the per-seed
+        // digests with an order-dependent FNV-style mix (not XOR, which would
+        // cancel matching digests) so the sweep stays a sharp regression signal.
+        let mut sweep = 0xCBF2_9CE4_8422_2325u64;
+        for seed in 0..args.seeds {
+            sweep = (sweep ^ stele_sim::run_storage_seed(seed)).wrapping_mul(0x0000_0100_0000_01B3);
+        }
         println!(
-            "stele-sim: sweep {} seed(s), fault_injection={} — scaffold, no scenarios registered yet",
-            args.seeds, args.fault_injection
+            "stele-sim: swept {} seed(s) over the in-memory backend → sweep digest {sweep:#018x}",
+            args.seeds
         );
+        if args.fault_injection != "off" {
+            // The flag is accepted (the justfile passes it), but the seeded
+            // storage workload does not yet inject disk faults — that lands with
+            // the seeded-fault virtual disk in STL-109. Say so rather than imply
+            // toggling it changed the digest above.
+            println!(
+                "stele-sim: note: --fault-injection={} is not yet wired into the storage workload (STL-109)",
+                args.fault_injection
+            );
+        }
     }
 }

@@ -25,7 +25,7 @@
 
 use std::io;
 
-use crate::wal::{Disk, DiskFile};
+use crate::backend::{Disk, DiskFile};
 
 use super::version::Version;
 use super::{DeltaError, SPILL_FILENAME_PREFIX};

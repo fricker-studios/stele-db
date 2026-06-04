@@ -18,6 +18,7 @@
 
 #![allow(dead_code)] // scaffold — real impls land per [STL-76] roadmap
 
+pub mod backend;
 pub(crate) mod checksum;
 pub mod delta;
 pub mod segment;
