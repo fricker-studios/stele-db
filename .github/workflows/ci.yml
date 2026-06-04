@@ -19,6 +19,13 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege GITHUB_TOKEN: every job in this workflow only reads the
+# repo (clone, cargo build/test/lint/doc, cargo-deny). Setting it here so
+# the workflow doesn't inherit a write-default if the repo/org default
+# changes, and so the intent is documented locally (STL-114).
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
