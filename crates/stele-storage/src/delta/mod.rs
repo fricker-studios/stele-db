@@ -44,7 +44,7 @@ use std::ops::RangeBounds;
 
 use crate::wal::Disk;
 
-pub use version::{BusinessKey, Snapshot, Version};
+pub use version::{BusinessKey, MAX_VERSION_FRAME_LEN, Snapshot, Version};
 
 use mem::MemTier;
 
@@ -82,9 +82,8 @@ pub enum DeltaError {
     Corrupt(&'static str),
 
     /// A `Version`'s encoded size exceeded the per-frame ceiling
-    /// ([`MAX_VERSION_FRAME_LEN`](version::MAX_VERSION_FRAME_LEN)). Returned
-    /// from [`Delta::insert`] and from the encode path so callers get a typed
-    /// error instead of a panic.
+    /// ([`MAX_VERSION_FRAME_LEN`]). Returned from [`Delta::insert`] and from
+    /// the encode path so callers get a typed error instead of a panic.
     #[error("version frame too large: {0} bytes (max 16 MiB)")]
     TooLarge(usize),
 

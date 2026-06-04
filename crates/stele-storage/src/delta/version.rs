@@ -36,10 +36,12 @@ use super::DeltaError;
 /// Header size in bytes for the [`Version`] binary encoding.
 pub(crate) const HEADER_LEN: usize = 24;
 
-/// Per-frame ceiling that guards against runaway allocations when decoding a
-/// corrupt frame **and** against producing an unreadable frame at encode time.
-/// The WAL itself enforces `MAX_PAYLOAD_LEN = 16 MiB`, so a delta-tier frame
-/// can never legitimately exceed that.
+/// Per-frame ceiling for a delta-tier `Version` (16 MiB).
+///
+/// Guards against runaway allocations when decoding a corrupt frame **and**
+/// against producing an unreadable frame at encode time. The WAL itself
+/// enforces `MAX_PAYLOAD_LEN = 16 MiB`, so a delta-tier frame can never
+/// legitimately exceed that.
 pub const MAX_VERSION_FRAME_LEN: usize = 16 * 1024 * 1024;
 
 /// Opaque business-key bytes — the user/PK or hash key for a logical row.
