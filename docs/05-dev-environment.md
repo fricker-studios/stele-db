@@ -1,0 +1,300 @@
+# 05 — Development Environment
+
+> **Status:** Founding dev-experience plan. Paths/commands describe the *intended* layout; they become real as the workspace lands.
+> **Read with:** [04 — CI/CD](04-cicd.md) (same toolchain, in CI) · [06 — Testing Strategy](06-testing-strategy.md) (how to run the suites) · [ADR-0005](adr/0005-reproducible-builds-pinned-toolchain.md).
+
+The goal is a **"clone to a running engine in minutes"** path, with a hermetic, reproducible toolchain that matches CI exactly. A contributor should never debug their environment — only Stele.
+
+## The five-minute path (the headline promise)
+
+```bash
+git clone https://github.com/<org>/stele-db
+cd stele-db
+# Option A — native (Rust toolchain auto-pinned by rust-toolchain.toml)
+cargo run -p stele-server -- --dev          # starts the engine on :5432 (pg-wire)
+
+# in another shell — connect with any Postgres client:
+psql -h localhost -p 5432 -d stele          # or:  cargo run -p stele-cli -- shell
+```
+
+```sql
+-- prove the identity in four statements:
+CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING;
+INSERT INTO account VALUES (1, 100);
+UPDATE account SET balance = 250 WHERE id = 1;
+SELECT balance FROM account FOR SYSTEM_TIME AS OF (now() - interval '1 second') WHERE id = 1;
+--   → 100   (time-travel: the value *before* the update)
+```
+
+If that works on a fresh clone, the dev environment is doing its job.
+
+---
+
+## Toolchain (pinned, hermetic)
+
+| Tool | Version source | Purpose |
+|---|---|---|
+| **Rust** | `rust-toolchain.toml` (edition 2024, ≥ 1.85) | The compiler. Auto-installed by rustup on first `cargo` invocation. |
+| **Cargo** | bundled with Rust | Build/test/run; workspace. |
+| **rustfmt, clippy** | pinned via toolchain components | Format + lint (match CI). |
+| **cargo-nextest** | pinned in `bootstrap` | Fast, reliable test runner. |
+| **cargo-deny, cargo-audit** | pinned | Supply-chain checks. |
+| **cargo-fuzz** (nightly) | pinned | Fuzz targets. |
+| **just** | pinned | Task runner (thin wrapper over cargo; see below). |
+
+`rust-toolchain.toml` is the single source of truth, so **native, devcontainer, Nix, and CI all use the same compiler:**
+
+```toml
+# rust-toolchain.toml
+[toolchain]
+channel    = "1.85.0"          # bumped deliberately; also Stele's MSRV
+components = ["rustfmt", "clippy", "rust-src"]
+profile    = "minimal"
+```
+
+---
+
+## Repository layout (intended)
+
+```
+stele-db/
+├── Cargo.toml                 # workspace
+├── rust-toolchain.toml        # pinned compiler (= MSRV)
+├── deny.toml                  # cargo-deny config (licenses, bans, advisories)
+├── justfile                   # task runner entrypoints
+├── flake.nix / devbox.json    # optional hermetic shells
+├── .devcontainer/             # VS Code / Codespaces
+├── .github/workflows/         # CI/CD ([04])
+├── docker/                    # canonical Dockerfile(s)
+├── crates/
+│   ├── stele-common/          # types, errors, time
+│   ├── stele-storage/         # segments, WAL, delta, compaction
+│   ├── stele-sim/             # virtual clock/disk/net + deterministic scheduler
+│   ├── stele-catalog/         # versioned metadata
+│   ├── stele-txn/             # MVCC, snapshots
+│   ├── stele-sql/             # parser, binder, planner, optimizer
+│   ├── stele-exec/            # vectorized operators
+│   ├── stele-pgwire/          # Postgres wire front end
+│   ├── stele-lineage/         # provenance
+│   ├── stele-server/          # daemon (binary)
+│   └── stele-cli/             # `stele` binary
+├── fuzz/                      # cargo-fuzz targets
+├── benches/                   # criterion benchmarks
+├── tests/                     # cross-crate integration tests
+└── docs/                      # you are here
+```
+
+(The crate graph is detailed in [02 §11](02-architecture.md#11-crate--module-decomposition-intended).)
+
+---
+
+## Task runner: `just`
+
+A `justfile` gives memorable commands that wrap cargo and **mirror CI exactly**, so "green locally" means "green in CI":
+
+```make
+# justfile
+default: dev
+
+dev:            cargo run -p stele-server -- --dev
+build:          cargo build --workspace
+test:           cargo nextest run --workspace && cargo test --doc
+fmt:            cargo fmt --all
+lint:           cargo fmt --all --check && cargo clippy --all-targets -- -D warnings
+check:          just lint && just test          # the pre-push gate
+sim seeds="100": cargo run -p stele-sim --release -- --seeds {{seeds}} --fault-injection on
+sim-seed seed:  cargo run -p stele-sim --release -- --seed {{seed}}   # reproduce one failure
+fuzz target:    cargo +nightly fuzz run {{target}}
+bench:          cargo bench --workspace
+deny:           cargo deny check && cargo audit
+cli *args:      cargo run -p stele-cli -- {{args}}
+docker-build:   docker build -f docker/Dockerfile -t stele:dev .
+```
+
+`just check` is the **one command** a contributor runs before pushing — it is the local mirror of the CI merge gate ([04](04-cicd.md)).
+
+---
+
+## Running, building, testing
+
+```bash
+just dev                  # run the engine in dev mode (verbose logs, no auth, :5432)
+just build                # compile the whole workspace
+just test                 # unit + integration + doctests (nextest)
+just lint                 # fmt-check + clippy (warnings = errors)
+just check                # lint + test  → run this before every push
+just sim 1000             # 1000 deterministic simulation seeds with fault injection
+just sim-seed 42          # replay exactly the failure that seed 42 produced
+just bench                # criterion benchmarks (compare against baseline)
+just cli shell            # open the interactive stele shell
+```
+
+**Dev mode** (`--dev`) disables auth, enables verbose `tracing`, uses a local-disk storage backend in a scratch dir, and turns on extra assertions — never for production (which, per the [Charter](00-charter.md#8-the-trust-gate-no-production-data-stated-plainly), doesn't exist yet anyway).
+
+---
+
+## The `stele` CLI
+
+One binary, two modes:
+
+```bash
+stele shell                          # interactive SQL shell (history, multiline, \dt etc.)
+stele query "SELECT 1"               # one-shot query
+stele server --config stele.toml     # run the engine (same as stele-server)
+stele admin backup --to s3://...      # operational subcommands (as they land)
+stele admin restore --from s3://...
+stele admin inspect-segment <path>    # dump a segment's footer/zone maps (debug)
+stele version                        # build + format-version info
+```
+
+The shell speaks to the engine over pg-wire (so it's also a reference client), and supports Stele's temporal niceties (e.g., `\\asof <timestamp>` to set a session as-of context).
+
+---
+
+## The canonical Docker image
+
+The single blessed way to run Stele without a Rust toolchain. Multi-stage, minimal final image, multi-arch, published to `ghcr.io` on release ([04](04-cicd.md)).
+
+```dockerfile
+# docker/Dockerfile
+FROM rust:1.85-slim AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p stele-server -p stele-cli
+
+FROM gcr.io/distroless/cc-debian12 AS runtime
+COPY --from=build /src/target/release/stele-server /usr/local/bin/stele-server
+COPY --from=build /src/target/release/stele         /usr/local/bin/stele
+EXPOSE 5432
+ENTRYPOINT ["stele-server"]
+CMD ["--config", "/etc/stele/stele.toml"]
+```
+
+Run it:
+
+```bash
+docker run --rm -p 5432:5432 ghcr.io/<org>/stele:latest --dev
+# or pin a release:
+docker run --rm -p 5432:5432 ghcr.io/<org>/stele:v0.1.0 --dev
+```
+
+A `docker-compose.yml` is provided for a one-command local stack (engine + MinIO as an S3-compatible store once tiering lands):
+
+```yaml
+# docker-compose.yml (excerpt)
+services:
+  stele:
+    image: ghcr.io/<org>/stele:latest
+    command: ["--dev"]
+    ports: ["5432:5432"]
+    depends_on: [minio]
+  minio:                       # S3-compatible store for tiering dev (v0.3+)
+    image: minio/minio
+    command: server /data
+    ports: ["9000:9000"]
+```
+
+---
+
+## Hermetic shells (pick your poison)
+
+All three resolve to the **same pinned toolchain** so results are reproducible across machines ([ADR-0005](adr/0005-reproducible-builds-pinned-toolchain.md)).
+
+### Devcontainer / GitHub Codespaces
+`.devcontainer/devcontainer.json` gives a zero-setup, browser-or-VS-Code environment:
+
+```json
+{
+  "name": "stele-db",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+  "features": { "ghcr.io/devcontainers/features/docker-in-docker:2": {} },
+  "postCreateCommand": "cargo install just cargo-nextest && just build",
+  "customizations": { "vscode": { "extensions": ["rust-lang.rust-analyzer", "tamasfe.even-better-toml"] } }
+}
+```
+
+"Open in Codespaces" → working engine, no local install.
+
+### Nix (maximally hermetic)
+A `flake.nix` dev shell pins *everything* (compiler, tools, even system libs) for bit-reproducible environments:
+
+```nix
+# flake.nix (excerpt)
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.rust-overlay.url = "github:oxalica/rust-overlay";
+  outputs = { self, nixpkgs, rust-overlay, ... }: let
+    pkgs = import nixpkgs { overlays = [ rust-overlay.overlays.default ]; };
+    rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+  in {
+    devShells.default = pkgs.mkShell {
+      buildInputs = [ rust pkgs.just pkgs.cargo-nextest pkgs.cargo-deny ];
+    };
+  };
+}
+```
+
+`nix develop` → identical shell on any machine.
+
+### devbox (lighter than Nix)
+For contributors who want Nix-backed reproducibility without writing Nix:
+
+```json
+// devbox.json
+{ "packages": ["rustup", "just", "cargo-nextest"], "shell": { "init_hook": ["rustup show"] } }
+```
+
+`devbox shell` → ready.
+
+---
+
+## Editor setup
+
+- **rust-analyzer** is the assumed LSP; `.vscode/settings.json` and `.zed/` configs are checked in with sensible defaults (clippy on save, format on save).
+- A `.editorconfig` enforces whitespace conventions across editors.
+- `even-better-toml` (or equivalent) for the many `*.toml` configs.
+
+---
+
+## Contributor onboarding checklist
+
+A new contributor's first session:
+
+1. `git clone` → `cd stele-db`
+2. `just dev` (toolchain auto-installs) → engine running on `:5432`
+3. `psql -h localhost -p 5432 -d stele` → run the four-statement identity demo above
+4. `just check` → confirm a clean local gate
+5. `just sim 100` → watch deterministic simulation run
+6. Read [02 — Architecture](02-architecture.md) and the [ADR index](adr/README.md)
+7. Pick a `good-first-issue`; open a PR with a Conventional-Commit title
+
+If any step takes more than a few minutes (compile time aside) or needs undocumented setup, that's a **bug in this document** — fix it here.
+
+---
+
+## Configuration
+
+Engine config is a single `stele.toml` (with env-var overrides), e.g.:
+
+```toml
+# stele.toml
+[server]
+listen     = "0.0.0.0:5432"
+data_dir   = "/var/lib/stele"
+
+[storage]
+backend    = "local"            # local | memory | s3
+# [storage.s3] bucket = "stele-cold"  endpoint = "http://minio:9000"
+
+[storage.cache]
+hot_cache_bytes = "8GiB"
+
+[wal]
+fsync      = "on_commit"        # group commit; the durability point ([02 §3.4])
+
+[telemetry]
+metrics    = "0.0.0.0:9090"     # Prometheus/OpenMetrics
+tracing    = "info"
+```
+
+Dev mode (`--dev`) supplies safe defaults so a contributor needs **no config file** to get running — config is for operators, not for the five-minute path.
