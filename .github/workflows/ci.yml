@@ -1,0 +1,85 @@
+# CI quick + test gate — runs on every PR and on push to main.
+# Spec: docs/04-cicd.md (the "required status checks" table is the source of truth).
+#
+# Action references below use tag form for readability while the workflow is
+# under development; once the file stabilizes they will be pinned to commit
+# SHAs ([ADR-0005] reproducibility). Tracked as a v0.1 follow-up ticket.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: 1
+
+jobs:
+  quick:
+    name: quick (fmt · clippy · typos)
+    runs-on: arc-runner-fricker-amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - uses: crate-ci/typos@master
+
+  test:
+    name: test (${{ matrix.target }})
+    needs: quick
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: macos-latest,  target: aarch64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --all-features
+      - run: cargo test --doc --workspace --all-features
+
+  msrv:
+    name: msrv (1.85.0)
+    needs: quick
+    runs-on: arc-runner-fricker-amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-features --locked
+
+  docs:
+    name: docs build
+    needs: quick
+    runs-on: arc-runner-fricker-amd64
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps --all-features
+
+  supply-chain:
+    name: cargo-deny
+    needs: quick
+    runs-on: arc-runner-fricker-amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

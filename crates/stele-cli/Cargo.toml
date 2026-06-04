@@ -1,0 +1,23 @@
+[package]
+name        = "stele-cli"
+description = "The `stele` CLI — interactive shell, one-shot queries, admin subcommands."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "stele"
+path = "src/main.rs"
+
+[dependencies]
+stele-server = { workspace = true }
+anyhow       = { workspace = true }
+clap         = { workspace = true }
+tokio        = { workspace = true }

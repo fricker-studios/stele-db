@@ -1,0 +1,6 @@
+# Pinned toolchain — the single source of truth shared by local dev, devcontainer,
+# Nix, and CI ([docs/05-dev-environment.md], [ADR-0005]).
+[toolchain]
+channel    = "1.85.0"
+components = ["rustfmt", "clippy", "rust-src"]
+profile    = "minimal"

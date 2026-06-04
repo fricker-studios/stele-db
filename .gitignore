@@ -1,1 +1,35 @@
+# Rust / Cargo
+/target/
+**/target/
+Cargo.lock.bak
+*.rs.bk
+**/*.profraw
+
+# Editors
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.zed/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local dev data
+/data/
+/scratch/
+*.log
+
+# Coverage / profiling
+/coverage/
+*.gcda
+*.gcno
+
+# Nix
+.direnv/
+result
+result-*
+
+# Stele-specific notes / scratch (kept out of git)
 .ai

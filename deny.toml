@@ -1,0 +1,41 @@
+# cargo-deny configuration — supply-chain gates run in CI.
+# See https://embarkstudios.github.io/cargo-deny/.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+ignore  = []
+# `cargo deny check advisories` reads the RustSec database via cargo-audit.
+
+[licenses]
+version    = 2
+confidence-threshold = 0.93
+# Permissive licenses we are willing to depend on. Anything outside this set
+# must be added with a written rationale — license drift is a supply-chain bug.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+
+# Stele itself ships under BUSL-1.1 ([ADR-0004]); we never pull in BUSL-licensed deps.
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards         = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]
