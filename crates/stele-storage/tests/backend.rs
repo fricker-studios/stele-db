@@ -201,12 +201,10 @@ fn segment_round_trip_memory() {
     segment_round_trip(&MemDisk::new());
 }
 
-#[test]
-fn local_backend_rejects_non_flat_names() {
-    // `LocalDisk` is a flat namespace: any name that is not a single normal path
-    // component must be rejected before it can escape the disk root.
-    let tmp = TempDir::new();
-    let disk = LocalDisk::open(tmp.path()).expect("open LocalDisk");
+/// The `Disk` flat-namespace rule (mod.rs): a name must be a single normal path
+/// component, else `InvalidInput` — *before* any storage is touched. Generic, so
+/// both backends are held to the identical contract.
+fn run_rejects_non_flat_names<D: Disk>(disk: &D) {
     for bad in ["../escape", "sub/dir", "/abs", "", ".", ".."] {
         assert_eq!(
             disk.create(bad).map(|_| ()).unwrap_err().kind(),
@@ -224,8 +222,20 @@ fn local_backend_rejects_non_flat_names() {
             "remove({bad:?}) must be rejected"
         );
     }
-    // Nothing leaked into the root.
+    // Nothing leaked into the namespace.
     assert!(disk.list().expect("list").is_empty());
+}
+
+#[test]
+fn local_backend_rejects_non_flat_names() {
+    let tmp = TempDir::new();
+    let disk = LocalDisk::open(tmp.path()).expect("open LocalDisk");
+    run_rejects_non_flat_names(&disk);
+}
+
+#[test]
+fn memory_backend_rejects_non_flat_names() {
+    run_rejects_non_flat_names(&MemDisk::new());
 }
 
 // --- fault injection is memory-only ----------------------------------------

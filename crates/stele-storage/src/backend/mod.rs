@@ -32,6 +32,7 @@
 //! the deterministic [`memory`] backend under the sim scheduler.
 
 use std::io;
+use std::path::{Component, Path};
 
 pub mod local;
 pub mod memory;
@@ -39,23 +40,52 @@ pub mod memory;
 pub use local::{LocalDisk, LocalFile};
 pub use memory::{Fault, FaultOp, Faults, MemDisk, MemFile};
 
+/// Validate a file name against the flat-namespace rule every [`Disk`] shares
+/// (see the trait docs): a name must be a single *normal* path component — no
+/// separators, no `.`/`..`, non-empty. Returns `Err(InvalidInput)` otherwise.
+///
+/// Centralizing this keeps every backend's namespace identical, so a name that
+/// the in-memory disk accepts can never be one a real filesystem would reject.
+pub(crate) fn validate_name(name: &str) -> io::Result<()> {
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid backend file name: {name:?}"),
+        )),
+    }
+}
+
 /// Directory-like handle. A backend stores all of its files under one `Disk` —
 /// equivalent to a single directory in a filesystem-backed implementation.
+///
+/// ## Flat namespace
+///
+/// A `Disk` is a *flat* namespace: a file name must be a single normal path
+/// component (no `/`, no `.`/`..`, non-empty). [`create`](Self::create),
+/// [`open`](Self::open), and [`remove`](Self::remove) reject anything else with
+/// [`io::ErrorKind::InvalidInput`] *before* touching storage, so a name can
+/// never escape the disk root. Every backend enforces this identically (via
+/// [`validate_name`]); the backend conformance suite asserts it for both.
 pub trait Disk: Send + Sync + 'static {
     /// File handle returned by [`create`](Self::create) / [`open`](Self::open).
     type File: DiskFile;
 
-    /// Create a new file. Errors with `AlreadyExists` if it already exists.
+    /// Create a new file. Errors with `AlreadyExists` if it already exists, or
+    /// `InvalidInput` if `name` violates the flat-namespace rule.
     fn create(&self, name: &str) -> io::Result<Self::File>;
 
-    /// Open an existing file for append + random read.
+    /// Open an existing file for append + random read. Errors with `NotFound`
+    /// if absent, or `InvalidInput` for a non-flat `name`.
     fn open(&self, name: &str) -> io::Result<Self::File>;
 
     /// List file names currently in this disk. Order is unspecified — callers
     /// must sort.
     fn list(&self) -> io::Result<Vec<String>>;
 
-    /// Remove a file by name. Errors with `NotFound` if it does not exist.
+    /// Remove a file by name. Errors with `NotFound` if it does not exist, or
+    /// `InvalidInput` for a non-flat `name`.
     ///
     /// The WAL itself does not delete its segments — sealed log files are
     /// recoverable forever, by design. `remove` is here for *ephemeral*

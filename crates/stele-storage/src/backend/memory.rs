@@ -21,7 +21,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use super::{Disk, DiskFile};
+use super::{Disk, DiskFile, validate_name};
 
 /// The operation a scheduled [`Fault`] targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +139,7 @@ impl Disk for MemDisk {
     type File = MemFile;
 
     fn create(&self, name: &str) -> io::Result<Self::File> {
+        validate_name(name)?;
         self.faults.check(FaultOp::Create)?;
         let bytes = {
             let mut files = self.inner.lock().unwrap();
@@ -159,6 +160,7 @@ impl Disk for MemDisk {
     }
 
     fn open(&self, name: &str) -> io::Result<Self::File> {
+        validate_name(name)?;
         self.faults.check(FaultOp::Open)?;
         let bytes = {
             let files = self.inner.lock().unwrap();
@@ -179,6 +181,7 @@ impl Disk for MemDisk {
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
+        validate_name(name)?;
         self.faults.check(FaultOp::Remove)?;
         if self.inner.lock().unwrap().remove(name).is_none() {
             return Err(io::Error::new(io::ErrorKind::NotFound, name.to_owned()));

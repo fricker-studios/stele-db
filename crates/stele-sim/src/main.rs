@@ -40,8 +40,18 @@ fn main() {
             sweep = (sweep ^ stele_sim::run_storage_seed(seed)).wrapping_mul(0x0000_0100_0000_01B3);
         }
         println!(
-            "stele-sim: swept {} seed(s) over the in-memory backend, fault_injection={} → sweep digest {sweep:#018x}",
-            args.seeds, args.fault_injection
+            "stele-sim: swept {} seed(s) over the in-memory backend → sweep digest {sweep:#018x}",
+            args.seeds
         );
+        if args.fault_injection != "off" {
+            // The flag is accepted (the justfile passes it), but the seeded
+            // storage workload does not yet inject disk faults — that lands with
+            // the seeded-fault virtual disk in STL-109. Say so rather than imply
+            // toggling it changed the digest above.
+            println!(
+                "stele-sim: note: --fault-injection={} is not yet wired into the storage workload (STL-109)",
+                args.fault_injection
+            );
+        }
     }
 }

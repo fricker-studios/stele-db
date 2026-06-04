@@ -14,9 +14,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
-use super::{Disk, DiskFile};
+use super::{Disk, DiskFile, validate_name};
 
 /// A [`Disk`] rooted at a filesystem directory. All files live directly under
 /// `root`; the directory is created on construction if it does not exist.
@@ -36,19 +36,12 @@ impl LocalDisk {
         Ok(Self { root })
     }
 
-    /// Resolve `name` to a path inside `root`, rejecting anything that is not a
-    /// single normal path component. A [`Disk`] is a *flat* namespace, so names
-    /// like `../escape`, `sub/dir`, `/abs`, `.` or `""` are invalid — this keeps
-    /// a caller-supplied name from escaping the disk root.
+    /// Resolve `name` to a path inside `root`, enforcing the [`Disk`] flat-
+    /// namespace rule ([`validate_name`]) so a caller-supplied name can't escape
+    /// the disk root.
     fn path(&self, name: &str) -> io::Result<PathBuf> {
-        let mut components = Path::new(name).components();
-        match (components.next(), components.next()) {
-            (Some(Component::Normal(c)), None) => Ok(self.root.join(c)),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid backend file name: {name:?}"),
-            )),
-        }
+        validate_name(name)?;
+        Ok(self.root.join(name))
     }
 }
 
