@@ -1,9 +1,13 @@
 # CI quick + test gate — runs on every PR and on push to main.
 # Spec: docs/04-cicd.md (the "required status checks" table is the source of truth).
 #
-# Action references below use tag form for readability while the workflow is
-# under development; once the file stabilizes they will be pinned to commit
-# SHAs ([ADR-0005] reproducibility). Tracked as a v0.1 follow-up ticket.
+# All `uses:` references are pinned to a 40-char commit SHA per ADR-0005
+# (reproducible builds). Dependabot proposes SHA bumps as normal PRs; keep the
+# trailing `# vX.Y.Z` comment in sync when accepting them.
+#
+# dtolnay/rust-toolchain has no version tags upstream — when pinning by SHA the
+# `toolchain:` input must be set explicitly (the action otherwise infers it
+# from the ref name, which is the SHA when pinned).
 name: ci
 
 on:
@@ -25,11 +29,12 @@ jobs:
     name: quick (fmt · clippy · typos)
     runs-on: arc-runner-fricker-amd64
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (no semver tags)
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       # `crate-ci/typos@master` downloads via `wget`, which isn't on this
@@ -52,10 +57,14 @@ jobs:
           - { os: macos-latest,  target: aarch64-apple-darwin }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (no semver tags)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - uses: taiki-e/install-action@25435dc8dd3baed7417e0c96d3fe89013a5b2e09 # v2.81.3
+        with:
+          tool: nextest
       - run: cargo nextest run --workspace --all-features
       - run: cargo test --doc --workspace --all-features
 
@@ -64,11 +73,11 @@ jobs:
     needs: quick
     runs-on: arc-runner-fricker-amd64
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (no semver tags)
         with:
           toolchain: "1.85.0"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - run: cargo build --workspace --all-features --locked
 
   docs:
@@ -78,9 +87,11 @@ jobs:
     env:
       RUSTDOCFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (no semver tags)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - run: cargo doc --workspace --no-deps --all-features
 
   supply-chain:
@@ -88,5 +99,5 @@ jobs:
     needs: quick
     runs-on: arc-runner-fricker-amd64
     steps:
-      - uses: actions/checkout@v6
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
