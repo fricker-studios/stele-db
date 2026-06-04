@@ -69,7 +69,7 @@ These are the reason Stele exists. They get the novelty budget.
 | **Provenance query surface** | Pseudo-columns / system functions to read a row's provenance inline (`_stele_txn_id`, `_stele_committed_at`, `_stele_principal`). | Must | **v0.3** |
 | **Immutable audit log** | The WAL/commit log is itself an auditable, append-only record; tamper-evident hashing optional. | Should | **v0.5** |
 | **Derivation lineage (opt-in)** | "This row was computed from those input rows by that statement." Column/row-level lineage graph. Expensive; opt-in. | Later | **v0.7+** |
-| **Cryptographic verifiability** | Merkle/hash-chained commits so an external auditor can verify history wasn't altered. | Later | **v1.0+** |
+| **Cryptographic verifiability** | Merkle/hash-chained commits so an external auditor can verify history wasn't altered — a [security pillar](#b8--security-authz--data-protection-pillar) feature, bumped earlier accordingly. | Should | **v0.7** |
 
 ## A.5 — Hash keys & MERGE/upsert
 
@@ -194,16 +194,29 @@ The unglamorous foundation. Built to the standard the differentiators need — *
 
 > All of B.7 is gated behind the single-node core being rock-solid (Charter §3, [ADR-0006](adr/0006-distribution-later-shared-storage.md)). Hash distribution and co-location are *general* sharded-analytics primitives that also make hash-keyed models (Data Vault included) distribute cleanly — see [ADR-0011](adr/0011-hash-distribution-integration-groundwork.md).
 
-## B.8 — Security & authorization
+## B.8 — Security, authZ & data protection (pillar)
+
+> **This is a [first-class pillar](00-charter.md#4-differentiating-primitives-the-identity), not substrate** — Stele targets financial and heavily-audited systems. The *identity-driven* half (tamper-evidence, provenance-as-audit, forensic time-travel, cryptographic verifiability) lives in [A.2](#a2--append-only--immutable-storage--historization) and [A.4](#a4--lineage--provenance-first-class); the table-stakes controls below are tiered higher and earlier than a typical engine. Full treatment, threat model, and the compliance roadmap (SOC 2 / HIPAA / PCI-DSS / GDPR) are in [10 — Security & Compliance](10-security-and-compliance.md) ([ADR-0018](adr/0018-security-auditability-pillar.md)).
 
 | Feature | Description | Tier | Milestone |
 |---|---|---|---|
-| **Authentication** | Password (SCRAM-SHA-256, pg-compatible) and TLS. | Must | **v0.3** |
-| **TLS in transit** | Wire encryption for pg-wire. | Must | **v0.3** |
-| **Roles & privileges (RBAC)** | `GRANT/REVOKE` on objects. | Should | **v0.5** |
-| **Row/column-level security** | Policy-based access; pairs naturally with audit/lineage. | Later | **v0.7** |
-| **Encryption at rest** | Segment/page encryption; KMS integration. | Later | **v0.7** |
-| **Audit of access** | Read/write access logged (leverages provenance infra). | Should | **v0.5** |
+| **Memory-safety / exploit resistance** | Rust ownership eliminates whole exploit classes; `unsafe` minimized and gated by Miri/ASan/TSan/UBSan + fuzzing ([06](06-testing-strategy.md)). Foundational from day one. | Must | **v0.1** |
+| **Secure defaults** | TLS on, telemetry off ([ADR-0015](adr/0015-telemetry-opt-in.md)), least-privilege, no default passwords, minimal network exposure. | Must | **v0.3** |
+| **TLS in transit (+ mTLS)** | Wire encryption for pg-wire and the admin API; mutual-TLS option. | Must | **v0.3** |
+| **Authentication** | SCRAM-SHA-256 (pg-compatible), mTLS, admin-API tokens. | Must | **v0.3** |
+| **Roles & privileges (RBAC)** | `GRANT/REVOKE` on objects; least-privilege roles. | Must | **v0.5** |
+| **Encryption at rest** | Envelope encryption: per-segment data keys wrapped by a key-encryption key; transparent on read/write ([ADR-0019](adr/0019-encryption-at-rest-kms.md)). | Must | **v0.5** |
+| **External KMS + BYOK** | Pluggable KMS (AWS KMS, Vault, etc.); bring-your-own-key / hold-your-own-key. | Should | **v0.7** |
+| **Encrypted backups** | Backups/object-store tier inherit at-rest encryption end to end. | Must | **v0.5** |
+| **Access auditing** | Every read/write logged with principal/time via the provenance infra; tamper-evident; SIEM export. | Must | **v0.5** |
+| **Row-level security** | Policy-based row visibility; pairs naturally with audit/lineage. | Should | **v0.5** |
+| **Column-level security & masking** | Column grants + dynamic masking/redaction of sensitive fields (PII/PHI/PAN). | Should | **v0.7** |
+| **ABAC / policy engine** | Attribute/policy-based access beyond roles (e.g., purpose, classification). | Later | **v0.7+** |
+| **Namespace / tenant isolation + lifecycle** | Namespaces/schemas as a first-class isolation **and** lifecycle unit: per-namespace keys, residency, and policy; an **audited "drop namespace"** offboards a whole tenant as a clean break. General tenancy primitive — app maps tenant→namespace ([ADR-0020](adr/0020-crypto-shredding-erasure.md), [ADR-0009](adr/0009-data-vault-conceptual-seam.md)). | Should | **v0.5** |
+| **Layered right-to-erasure** | Namespace-drop (destroy the namespace key) for tenant offboarding; per-subject crypto-shredding as the fine-grained backstop; PII sidecar + scoped physical expiry. All preserve append-only immutability ([ADR-0020](adr/0020-crypto-shredding-erasure.md)). | Should | **v0.7** |
+| **Secrets management** | No plaintext secrets at rest; integration with external secret stores. | Should | **v0.5** |
+| **Rate limiting / DoS resistance** | Connection/query quotas, resource limits, query-cost guards. | Should | **v0.5** |
+| **Federated identity (OIDC/SSO/SAML)** | Enterprise SSO for the admin surfaces. | Later | **v1.0+** |
 
 ## B.9 — Observability & operability
 
@@ -251,10 +264,10 @@ The unglamorous foundation. Built to the standard the differentiators need — *
 |---|---|
 | **v0.1** | Single-node append-only columnar store · system-time + valid-time storage · `AS OF` (system) reads · core DML/DDL · WAL + crash recovery · minimal pg-wire (psql connects) · `stele` CLI seed. |
 | **v0.2** | Full bitemporal tables + temporal DDL · vectorized executor · zone maps · MVCC + snapshot isolation · multi-statement txns · per-row provenance · hash keys · pg-wire extended protocol. |
-| **v0.3** | Bitemporal `AS OF` · temporal `MERGE`/upsert · bulk ingest · joins/CTEs · B-tree/hash/bloom indexes · compaction · backup/restore · metrics + `EXPLAIN ANALYZE` · pluggable storage backends · auth/TLS. |
-| **v0.5** | Object-store cold tier + hot cache · change-feed/diff · window functions · RBAC · incremental backup/PITR · idempotent ingest · driver compat matrix · temporal integrity constraints. |
-| **v0.7** | Storage/compute separation · read replicas (WAL streaming) · serializable isolation · derivation lineage (opt-in) · row/column security · encryption at rest · BI-tool compatibility. |
-| **v1.0** | Hardened, documented, semver-stable single-node (+ read-replica) engine · cryptographic audit verifiability · synchronous replication groundwork · extension API v1 · trust-gate met for first production use. |
+| **v0.3** | Bitemporal `AS OF` · temporal `MERGE`/upsert · bulk ingest · joins/CTEs · B-tree/hash/bloom indexes · compaction · backup/restore · metrics + `EXPLAIN ANALYZE` · pluggable storage backends · **authN + TLS/mTLS + secure defaults**. |
+| **v0.5** | Object-store cold tier + hot cache · change-feed/diff · window functions · **RBAC · row-level security · encryption at rest (+ encrypted backups) · access auditing** · incremental backup/PITR · idempotent ingest · driver compat matrix · temporal integrity constraints. |
+| **v0.7** | Storage/compute separation · read replicas (WAL streaming) · serializable isolation · derivation lineage (opt-in) · **column security + masking · external KMS/BYOK · cryptographic audit verifiability · crypto-shredding erasure** · BI-tool compatibility. |
+| **v1.0** | Hardened, documented, semver-stable single-node (+ read-replica) engine · **completed security baseline + compliance posture (SOC 2 path) · federated SSO** · synchronous replication groundwork · extension API v1 · trust-gate met for first production use. |
 | **v2.0+** | Distribution: Raft control plane + shared-object-storage data plane · distributed query · Jepsen-validated consistency · managed/cloud offering · the path to hosting Solvia. |
 
 > Tiers and milestones are intentionally revisable. What is **not** revisable without amending the [Charter](00-charter.md): the asymmetric performance bar, append-only-by-default, and keeping Data Vault/Solvia concepts out of the engine.

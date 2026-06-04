@@ -280,6 +280,8 @@ flowchart LR
 
 The catalog also exposes **`pg_catalog`/`information_schema` shims** so the Postgres ecosystem's introspection (and thus drivers/BI tools) works against Stele.
 
+**Namespaces as isolation + lifecycle units.** Schemas/namespaces are a first-class boundary: each can carry its own [encryption key, residency, and access policy](10-security-and-compliance.md#9-hardening--operational-security), and supports an **audited drop** that decommissions a whole namespace as a clean break — the basis for tenant offboarding and [namespace-drop erasure](10-security-and-compliance.md#the-append-only-vs-right-to-erasure-tension-handled-not-hand-waved). This is a *general* tenancy primitive: the app (e.g., Solvia) maps tenants to namespaces; the engine never knows what a tenant *is* ([ADR-0009](adr/0009-data-vault-conceptual-seam.md), [ADR-0020](adr/0020-crypto-shredding-erasure.md)).
+
 ---
 
 ## 6. Query layer
@@ -453,5 +455,6 @@ These are test-enforced ([06](06-testing-strategy.md)) and amendable only via AD
 5. **Provenance is inline and captured at commit**, never reconstructed after the fact.
 6. **The columnstore is correct without any secondary index.** Indexes are accelerators only.
 7. **The storage/txn core is deterministic** and runnable under the simulation scheduler.
+8. **History within a dataset is immutable; a whole namespace has a lifecycle.** Sealed segments are never rewritten (invariant 1), but creating and *dropping* an entire namespace is a legitimate, audited, coarse operation — a drop is implemented as destroying the namespace's key, not mutating segments ([ADR-0020](adr/0020-crypto-shredding-erasure.md)).
 
 Each box in the diagrams above traces to an [ADR](adr/README.md); each ADR traces back to the [Charter](00-charter.md).

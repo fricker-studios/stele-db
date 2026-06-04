@@ -25,6 +25,9 @@ Use the [template](_template.md) for new records. Number sequentially.
 | [0015](0015-telemetry-opt-in.md) | Telemetry: off by default, explicit opt-in | Accepted |
 | [0016](0016-admin-control-plane-api.md) | Admin/control-plane API + client SDK strategy | Accepted |
 | [0017](0017-default-network-port-5454.md) | Default network port: 5454 (pg-wire), configurable | Accepted |
+| [0018](0018-security-auditability-pillar.md) | Security & Auditability as a first-class pillar | Accepted |
+| [0019](0019-encryption-at-rest-kms.md) | Encryption at rest: envelope encryption + KMS / BYOK | Accepted |
+| [0020](0020-crypto-shredding-erasure.md) | Right-to-erasure & data-lifecycle: layered (namespace-drop + crypto-shredding) | Accepted |
 
 ## Conventions
 

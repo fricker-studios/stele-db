@@ -125,6 +125,8 @@ The engine milestones above drive a parallel schedule of **shipped artifacts and
 
 Versioning and compatibility across this whole set is governed by [ADR-0014](adr/0014-release-channels-and-versioning-policy.md); distribution mechanics are in [08](08-packaging-distribution-and-releases.md).
 
+**Security threads through every milestone** (it's a [pillar](00-charter.md#4-differentiating-primitives-the-identity), not a late add): memory-safety from v0.1; TLS/authN at v0.3; RBAC + row-level security + encryption at rest + access auditing at v0.5; column masking + KMS/BYOK + cryptographic verifiability + crypto-shredding at v0.7; completed baseline + compliance posture at v1.0. The full per-milestone breakdown is [10 §13](10-security-and-compliance.md#13-security-by-milestone).
+
 ---
 
 ## The 1 / 5 / 10-year vision

@@ -194,6 +194,7 @@ The [Charter's trust gate](00-charter.md#8-the-trust-gate-no-production-data-sta
 - [ ] Sanitizers (ASan/TSan/UBSan) + Miri clean on core crates.
 - [ ] A real (even small) OSS user base has exercised the engine on non-critical data.
 - [ ] **(Distributed only)** Jepsen-style testing in place and passing before any multi-node production claim.
+- [ ] **Security baseline** met: encryption in transit + at rest, authN/authZ, tamper-evident access auditing, minimal-`unsafe` + sanitizers/fuzz clean, signed/SBOM artifacts, a reviewed threat model, and a proven crypto-shredding erasure path ([10 §12](10-security-and-compliance.md#12-security--the-trust-gate)).
 
 Until every box is checked, Stele runs **synthetic and contributor data only.** That is the line, and it is enforced by this document, not by judgment in the moment.
 

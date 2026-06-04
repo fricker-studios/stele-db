@@ -40,6 +40,7 @@ These are non-negotiable. They are *what Stele is*; everything else is plumbing 
 | **Append-only / immutable storage** | Writes append new versions; old versions are retained and efficiently historized. "Delete" and "update" are logical, not physical. |
 | **As-of / point-in-time queries** | `SELECT … FOR SYSTEM_TIME AS OF …` and the valid-time equivalent. Time-travel is a query, not a backup restore. |
 | **Lineage & provenance as first-class** | Every record can answer "where did I come from, by what transaction, derived from what inputs?" Provenance metadata lives in the engine, not in an app-side audit table. |
+| **Security & auditability (unified pillar)** | The audit-native primitives *are* security primitives: immutability is tamper-resistance, provenance is who-did-what-when, time-travel is forensics, hash-chained commits are cryptographic verifiability. On top of that, table-stakes controls are first-class, not afterthoughts: encryption in transit + at rest (KMS/BYOK), strong authN, RBAC + row/column security, access auditing, and Rust's memory-safety/exploit resistance. See [10 — Security & Compliance](10-security-and-compliance.md) and [ADR-0018](adr/0018-security-auditability-pillar.md). |
 | **Hash-key support + fast `MERGE`/upsert** | Deterministic hash keys and a high-throughput merge/upsert path — the ingestion primitive audit and historization lean on. |
 | **Columnar core with adequate point-lookup** | Columnstore for scans and aggregation; a B-tree/point-access path that is *good enough* for the transactional minority. |
 | **Object-storage tiering (S3-compatible)** | Separation of storage and compute; cold data lives in object storage, hot data is cached locally. |
@@ -53,7 +54,8 @@ If a proposed feature does not strengthen one of these or the general-DBMS subst
 - A single-node engine first: bitemporal storage, append-only columnar format, as-of queries, MERGE/upsert, a working SQL surface, WAL + crash recovery, and a **minimal-but-incremental Postgres wire-protocol front end from early on** ([ADR-0003](adr/0003-postgres-wire-protocol-early.md)).
 - Object-storage tiering and storage/compute separation as the engine matures.
 - Distribution, consensus, and a managed/cloud offering as **later** phases.
-- The general DBMS substrate (types, indexing, transactions/MVCC, durability, backup/restore, security, observability, extensibility) — built to the standard the differentiators require, no more, no less.
+- **Security & auditability as a first-class pillar** — encryption (in transit + at rest with KMS/BYOK), strong authN, RBAC + row/column security, access auditing, tamper-evidence, memory-safety/exploit resistance, and a compliance roadmap (SOC 2, HIPAA, PCI-DSS, GDPR). Stele targets financial and heavily-audited systems; security is designed in, not bolted on. See [10 — Security & Compliance](10-security-and-compliance.md).
+- The general DBMS substrate (types, indexing, transactions/MVCC, durability, backup/restore, observability, extensibility) — built to the standard the differentiators require, no more, no less.
 
 ### Out of scope (now and possibly forever)
 - **Beating ClickHouse and Postgres simultaneously.** (See §3.)
@@ -63,14 +65,15 @@ If a proposed feature does not strengthen one of these or the general-DBMS subst
 
 ## 6. Guiding principles
 
-1. **Correctness and auditability over speed — always.** A benchmark win bought with a correctness compromise is a loss. Every temporal/as-of behavior has a written oracle ([06](06-testing-strategy.md)).
-2. **Append-only is a discipline, not a feature flag.** The storage engine is immutable at its core; mutation is modeled as new truth, not erased truth.
-3. **Pick one workload identity and defend it.** Analytical + temporal first; transactional adequacy second; both-at-once never.
-4. **Earn trust before taking data.** Open-source usage and a deep test apparatus come *before* any production deployment, and long before Solvia.
-5. **Every significant decision is an ADR.** If it's architecturally load-bearing and reversible only at cost, it gets a Context/Decision/Status/Consequences record in [`/docs/adr`](adr/README.md).
-6. **Reproducibility is a feature.** Pinned toolchains, deterministic builds where feasible, deterministic simulation testing at the core ([04](04-cicd.md), [06](06-testing-strategy.md)).
-7. **Inherit ecosystems; don't reinvent them.** Postgres wire compatibility buys the entire driver/ORM/BI/admin tooling world. Apache Arrow-shaped in-memory representation buys interoperability. We spend novelty budget only on the differentiators.
-8. **Slow churn is a strategy, not an apology.** No deadline means we get to do it right. The cost of that freedom is ruthless prioritization, documented here.
+1. **Correctness, auditability, and security over speed — always.** A benchmark win bought with a correctness *or security* compromise is a loss. Every temporal/as-of behavior has a written oracle ([06](06-testing-strategy.md)).
+2. **Secure and auditable by default.** Stele targets financial and heavily-audited systems, so security is a pillar, not a checkbox: TLS on by default, encryption at rest with KMS/BYOK, least-privilege authZ, tamper-evident history, and memory-safe-by-construction code. The audit-native primitives *are* security features ([10](10-security-and-compliance.md), [ADR-0018](adr/0018-security-auditability-pillar.md)).
+3. **Append-only is a discipline, not a feature flag.** The storage engine is immutable at its core; mutation is modeled as new truth, not erased truth.
+4. **Pick one workload identity and defend it.** Analytical + temporal first; transactional adequacy second; both-at-once never.
+5. **Earn trust before taking data.** Open-source usage and a deep test apparatus come *before* any production deployment, and long before Solvia.
+6. **Every significant decision is an ADR.** If it's architecturally load-bearing and reversible only at cost, it gets a Context/Decision/Status/Consequences record in [`/docs/adr`](adr/README.md).
+7. **Reproducibility is a feature.** Pinned toolchains, deterministic builds where feasible, deterministic simulation testing at the core ([04](04-cicd.md), [06](06-testing-strategy.md)).
+8. **Inherit ecosystems; don't reinvent them.** Postgres wire compatibility buys the entire driver/ORM/BI/admin tooling world. Apache Arrow-shaped in-memory representation buys interoperability. We spend novelty budget only on the differentiators.
+9. **Slow churn is a strategy, not an apology.** No deadline means we get to do it right. The cost of that freedom is ruthless prioritization, documented here.
 
 ## 7. The Solvia seam (designed-for, decoupled)
 
@@ -90,6 +93,7 @@ Stele **must not** hold production customer data until it has genuinely earned i
 - Bitemporal and as-of correctness oracles passing across a large generated workload corpus.
 - Backup/restore and point-in-time recovery proven by test, not by hope.
 - A real (even if small) open-source user base exercising the engine on non-critical data.
+- A security baseline in place: encryption in transit + at rest, authN/authZ, access auditing, a documented threat model, and a passing security review ([10](10-security-and-compliance.md)).
 - For the distributed phase: Jepsen-style consistency testing in place before any multi-node production claim.
 
 Until those gates are met, Stele runs synthetic data, contributors' throwaway data, and benchmarks — nothing a human would miss.
