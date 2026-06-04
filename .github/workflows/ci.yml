@@ -35,7 +35,10 @@ jobs:
       # `crate-ci/typos@master` downloads via `wget`, which isn't on this
       # self-hosted runner. Install from crates.io instead — the Rust toolchain
       # is already in place, so no extra system dependency is needed.
-      - run: cargo install --locked typos-cli
+      #
+      # Pinned to 1.39.0 because newer typos-cli (>=1.40) requires rustc >= 1.91
+      # while our MSRV is 1.85. Bump alongside the MSRV (tracked in STL-84).
+      - run: cargo install --locked --version 1.39.0 typos-cli
       - run: typos
 
   test:
