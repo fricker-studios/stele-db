@@ -66,8 +66,9 @@ pub(crate) fn validate_name(name: &str) -> io::Result<()> {
 /// component (no `/`, no `.`/`..`, non-empty). [`create`](Self::create),
 /// [`open`](Self::open), and [`remove`](Self::remove) reject anything else with
 /// [`io::ErrorKind::InvalidInput`] *before* touching storage, so a name can
-/// never escape the disk root. Every backend enforces this identically (via
-/// [`validate_name`]); the backend conformance suite asserts it for both.
+/// never escape the disk root. Every backend enforces this identically (via the
+/// crate-internal `validate_name`); the backend conformance suite asserts it for
+/// both.
 pub trait Disk: Send + Sync + 'static {
     /// File handle returned by [`create`](Self::create) / [`open`](Self::open).
     type File: DiskFile;
