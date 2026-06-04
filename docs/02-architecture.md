@@ -262,6 +262,31 @@ flowchart TB
 
 Because segments are **immutable**, cache coherence is free: a cached segment can never be stale. This is a direct dividend of the append-only design and is what makes storage/compute separation (and, later, multiple stateless readers over one dataset) clean. See [ADR-0007](adr/0007-storage-compute-separation.md).
 
+### Storage lifecycle: tiered archival (controlling append-only growth)
+
+Append-only means total data volume only grows — so without a cost strategy, object-storage bills grow unbounded. Stele manages this with **tiered archival** ([ADR-0021](adr/0021-storage-lifecycle-tiered-archival.md)), which is *distinct from retention/expiry* ([01 §A.2](01-feature-plan.md#a2--append-only--immutable-storage--historization)): tiering **keeps every byte** (append-only + audit guarantees intact) and only moves cold data to cheaper storage.
+
+The bitemporal model supplies a **principled staleness signal for free**: **system-time age** tells the engine exactly which versions are *superseded history* vs *current*. Current versions stay hot; superseded versions age **down** the tier ladder. Compaction clusters segments by **time-era**, so a cold segment is *purely* old history and never drags a live row into archive.
+
+```mermaid
+flowchart TB
+    hot["Hot — local NVMe cache<br/>(current + recently read)"]
+    warm["Warm — S3 Standard"]
+    cold["Cold — S3-IA / Glacier Instant<br/>(cheaper, still ms reads)"]
+    frozen["Frozen — Glacier Deep Archive<br/>(~23x cheaper, 12–48h restore)"]
+    hot -->|"superseded, by system-time age"| warm --> cold --> frozen
+    frozen -.->|"explicit RESTORE (async)"| hot
+    meta["Resident metadata + zone maps<br/>(ALWAYS hot, never archived)"]
+    meta -. "prune first → rehydrate only matching segments" .-> frozen
+```
+
+Two properties keep retrieval cheap and predictable:
+
+- **Metadata and zone maps are never archived.** An `AS OF` query prunes against resident zone maps *first* and only rehydrates the handful of segments that actually match — you never thaw a whole partition to answer a narrow query.
+- **Frozen data needs an explicit, async restore.** The **tier-aware planner** detects when a query would touch Glacier-class data and returns `restore required` + a handle (with a cost/latency estimate) rather than silently hanging for hours; the user issues a `RESTORE` (or admin-API) call to rehydrate, then re-queries. Cold tiers with millisecond retrieval (S3-IA / Glacier Instant) are read transparently.
+
+Tiering is **engine-native and pluggable**: Stele decides per-segment placement (by system-time/policy) and sets the storage class on write/migration, working across any S3-compatible backend; delegating to S3 Intelligent-Tiering is an optional backend mode. Policy is configurable per namespace/table with conservative defaults — no surprise archival. Crucially, **the data always still exists** — archival changes cost and latency, never durability or auditability.
+
 ---
 
 ## 5. Catalog & metadata

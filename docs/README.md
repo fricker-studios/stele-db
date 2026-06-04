@@ -24,7 +24,7 @@ This `/docs` set is the **single source of truth** for the project's vision, arc
 
 ## Supporting material
 
-- [**Architecture Decision Records**](adr/README.md) — one record per significant decision (Context / Decision / Status / Consequences). Twenty ADRs to date.
+- [**Architecture Decision Records**](adr/README.md) — one record per significant decision (Context / Decision / Status / Consequences). Twenty-one ADRs to date.
 - [**Assumptions log**](assumptions.md) — the running ledger of what was decided on faith, and the open questions.
 
 ## The thesis in four SQL statements
@@ -65,6 +65,7 @@ SELECT balance FROM account FOR SYSTEM_TIME AS OF (now() - interval '1 second') 
 | Encryption at rest | **Envelope encryption + external KMS + BYOK/HYOK** | [0019](adr/0019-encryption-at-rest-kms.md) |
 | Right-to-erasure | **Layered**: namespace-drop (per-namespace key destruction) + per-subject crypto-shredding; preserves append-only | [0020](adr/0020-crypto-shredding-erasure.md) |
 | Tenancy | **Namespaces** as first-class isolation + lifecycle units (per-namespace keys, audited drop); app maps tenant→namespace | [0020](adr/0020-crypto-shredding-erasure.md) · [0009](adr/0009-data-vault-conceptual-seam.md) |
+| Storage lifecycle | **System-time-driven tiered archival** (hot→Standard→Glacier), keeps all data; async restore; engine-native | [0021](adr/0021-storage-lifecycle-tiered-archival.md) |
 
 ---
 

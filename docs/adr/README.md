@@ -28,6 +28,7 @@ Use the [template](_template.md) for new records. Number sequentially.
 | [0018](0018-security-auditability-pillar.md) | Security & Auditability as a first-class pillar | Accepted |
 | [0019](0019-encryption-at-rest-kms.md) | Encryption at rest: envelope encryption + KMS / BYOK | Accepted |
 | [0020](0020-crypto-shredding-erasure.md) | Right-to-erasure & data-lifecycle: layered (namespace-drop + crypto-shredding) | Accepted |
+| [0021](0021-storage-lifecycle-tiered-archival.md) | Storage lifecycle: system-time-driven tiered archival | Accepted |
 
 ## Conventions
 

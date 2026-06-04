@@ -75,6 +75,7 @@ Each milestone has an **exit criterion** — the thing that must be *true and te
 
 ### v0.7 — Separation, replication, and depth
 - **Storage/compute separation** (stateless-ish compute over shared storage).
+- **Tiered archival / storage lifecycle** — system-time-driven cold→frozen tiering with async restore; controls append-only cost growth ([ADR-0021](adr/0021-storage-lifecycle-tiered-archival.md)).
 - **Read replicas** (WAL streaming); **serializable (SSI)** opt-in.
 - **Derivation lineage** (opt-in); row/column security; encryption at rest.
 - **BI/admin tool compatibility** (DBeaver, Grafana, Metabase) validated.

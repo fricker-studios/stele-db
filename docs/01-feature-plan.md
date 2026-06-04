@@ -91,15 +91,18 @@ These are the reason Stele exists. They get the novelty budget.
 | **Bloom filters / hash index** | Accelerate hash-key point lookups and MERGE probes. | Should | **v0.3** |
 | **Late materialization** | Defer column fetches until after predicate filtering. | Should | **v0.5** |
 
-## A.7 — Object-storage tiering (storage/compute separation)
+## A.7 — Object-storage tiering & storage lifecycle (storage/compute separation)
 
 | Feature | Description | Tier | Milestone |
 |---|---|---|---|
 | **Pluggable storage backends** | Trait-based: local disk, in-memory (test), S3-compatible. | Should | **v0.3** |
 | **S3-compatible cold tier** | Sealed segments tier to object storage; metadata stays hot. | Should | **v0.5** |
 | **Local hot cache** | LRU/“foyer”-style cache of hot segments/pages on local NVMe. | Should | **v0.5** |
+| **Tiered archival (system-time-driven)** | Multi-tier ladder (Standard → IA/Glacier Instant → Deep Archive) driven by **system-time age**; *keeps every byte* — distinct from retention/expiry. Controls append-only cost growth ([ADR-0021](adr/0021-storage-lifecycle-tiered-archival.md)). | Should | **v0.7** |
+| **Time-era compaction** | Cluster segments by system-time era so cold segments are purely historical and age together cleanly. | Should | **v0.7** |
+| **Async restore / rehydration** | Explicit `RESTORE` (admin API / SQL) for frozen (Glacier-class) data; planner returns "restore required" + estimate rather than hanging for hours. Data always still exists. | Should | **v0.7** |
 | **Separation of storage & compute** | Compute nodes are (largely) stateless over shared object storage. | Later | **v0.7** |
-| **Tier-aware planner** | The optimizer knows which data is hot vs cold and plans I/O accordingly. | Later | **v0.7+** |
+| **Tier-aware planner** | The optimizer knows each segment's tier (hot/warm/cold/frozen), prunes via resident zone maps *before* rehydrating, and gates frozen-data access. | Should | **v0.7** |
 
 ---
 
