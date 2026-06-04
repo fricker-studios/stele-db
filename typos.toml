@@ -19,6 +19,15 @@ mis = "mis"
 # what triggers; whitelisting the stem is sufficient.
 Hashi = "Hashi"
 
+# Identifier-split false positives: typos tokenizes on case changes, so e.g.
+# "PNGs" becomes ("PN", "Gs") and the bare "PN" is flagged as a typo for "ON".
+PN = "PN"
+
+# Standard ops/disaster-recovery acronyms (Recovery Time / Point Objective).
+# Used in the runbooks doc; typos flags RTO as a typo for "TO".
+RTO = "RTO"
+RPO = "RPO"
+
 [files]
 # Don't scan vendored or generated output. (Cargo.lock is regenerated; binary
 # artifacts under target/ are already excluded by .gitignore.)
