@@ -32,7 +32,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - uses: crate-ci/typos@master
+      # `crate-ci/typos@master` downloads via `wget`, which isn't on this
+      # self-hosted runner. Install from crates.io instead — the Rust toolchain
+      # is already in place, so no extra system dependency is needed.
+      - run: cargo install --locked typos-cli
+      - run: typos
 
   test:
     name: test (${{ matrix.target }})
