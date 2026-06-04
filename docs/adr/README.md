@@ -29,6 +29,7 @@ Use the [template](_template.md) for new records. Number sequentially.
 | [0019](0019-encryption-at-rest-kms.md) | Encryption at rest: envelope encryption + KMS / BYOK | Accepted |
 | [0020](0020-crypto-shredding-erasure.md) | Right-to-erasure & data-lifecycle: layered (namespace-drop + crypto-shredding) | Accepted |
 | [0021](0021-storage-lifecycle-tiered-archival.md) | Storage lifecycle: system-time-driven tiered archival | Accepted |
+| [0022](0022-clock-synchronization-and-ordering.md) | Clock synchronization & cross-node time ordering (NTP + HLC + fencing) | Accepted |
 
 ## Conventions
 
