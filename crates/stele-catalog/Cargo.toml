@@ -1,0 +1,16 @@
+[package]
+name        = "stele-catalog"
+description = "Versioned metadata — schemas/tables resolved as-of any system-time snapshot."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+stele-common = { workspace = true }

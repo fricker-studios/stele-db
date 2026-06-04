@@ -1,0 +1,22 @@
+[package]
+name        = "stele-sim"
+description = "Deterministic simulation harness — virtual clock, disk, network, and scheduler."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "stele-sim"
+path = "src/main.rs"
+
+[dependencies]
+stele-storage = { workspace = true }
+stele-common  = { workspace = true }
+clap          = { workspace = true }

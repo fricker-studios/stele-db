@@ -36,7 +36,7 @@ On the Change Date (or the four-year anniversary, whichever comes first), **that
 ### Stele's exact BSL parameters
 
 ```
-Licensor:             [legal entity — TBD before launch]
+Licensor:             Alex Fricker Studios, LLC
 Licensed Work:        Stele (the version stated in each release)
 Additional Use Grant: You may make production use of the Licensed Work, provided
                       you do not offer a commercial product or service that, for a
@@ -117,7 +117,7 @@ A slow-churn project grows a slow, real community — quality over virality:
 These are tracked in the [assumptions log](assumptions.md):
 
 
-- Exact legal entity that will be the **Licensor** (formation before launch).
+- Licensor entity: **Alex Fricker Studios, LLC** (resolved).
 - Final **CLA vs DCO** decision and text.
 - Counsel sign-off on **Apache-2.0 as Change License** (the GPL-compatibility reading, [A15](assumptions.md)).
 - Precise **Additional Use Grant** wording (the managed-service carve-out) — narrow enough to not chill adoption, broad enough to protect the commercial path.

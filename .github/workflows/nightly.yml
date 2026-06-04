@@ -1,0 +1,84 @@
+# Nightly + labeled deep gate.
+# Spec: docs/04-cicd.md "Scheduled / labeled (deep) checks".
+#
+# These jobs are placeholders matching the documented intent. Each becomes a
+# real ticket as the relevant subsystem lands:
+#   * sanitizers   — needs the storage core compiling under -Zsanitizer
+#   * miri         — needs unsafe-bearing crates to exist
+#   * fuzz         — needs cargo-fuzz targets
+#   * simulation   — needs stele-sim scenarios registered
+#   * bench-gate   — needs criterion benchmarks committed
+#
+# The jobs are wired so PRs can opt in by adding the `full-ci` label, and the
+# scheduled run keeps a nightly heartbeat once any of them have real work.
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  pull_request:
+    types: [labeled]
+
+jobs:
+  sanitizers:
+    if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    runs-on: arc-runner-fricker-amd64
+    strategy:
+      fail-fast: false
+      matrix:
+        san: [address, thread, undefined]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: nextest under sanitizer
+        env:
+          RUSTFLAGS: "-Zsanitizer=${{ matrix.san }}"
+          RUSTDOCFLAGS: "-Zsanitizer=${{ matrix.san }}"
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+        run: |
+          echo "Sanitizer ${{ matrix.san }} stub — wire real test invocation in STL follow-up."
+          cargo build --workspace --all-features
+
+  miri:
+    if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    runs-on: arc-runner-fricker-amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo +nightly miri setup
+      - run: |
+          echo "Miri stub — enable once unsafe-bearing crates exist."
+          cargo +nightly miri test -p stele-common
+
+  fuzz:
+    if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    runs-on: arc-runner-fricker-amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: |
+          echo "Fuzz stub — add cargo-fuzz targets under fuzz/ then loop them here."
+
+  simulation:
+    if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    runs-on: arc-runner-fricker-amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -p stele-sim --release -- --seeds 100 --fault-injection on
+
+  bench-gate:
+    if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    runs-on: arc-runner-fricker-amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          echo "Bench gate stub — wire criterion baselines in STL follow-up."

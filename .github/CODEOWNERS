@@ -1,0 +1,11 @@
+# Code owners for stele-db.
+# Owners are auto-requested for review on PRs touching matching paths.
+# Replace the handle below with your GitHub username (or a @org/team) and uncomment.
+#
+# Catch-all:
+# *                 @your-handle
+#
+# Example per-area ownership (uncomment + adjust as the team grows):
+# /docs/            @your-handle
+# /docs/adr/        @your-handle
+# /.github/         @your-handle

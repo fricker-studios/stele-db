@@ -1,0 +1,84 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/stele-common",
+    "crates/stele-storage",
+    "crates/stele-sim",
+    "crates/stele-catalog",
+    "crates/stele-txn",
+    "crates/stele-sql",
+    "crates/stele-exec",
+    "crates/stele-pgwire",
+    "crates/stele-lineage",
+    "crates/stele-server",
+    "crates/stele-cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85.0"
+license = "BUSL-1.1"
+repository = "https://github.com/fricker-studios/stele-db"
+homepage = "https://steledb.com"
+authors = ["Stele DB contributors"]
+
+[workspace.dependencies]
+# Internal crates — referenced by path so workspace builds are hermetic.
+stele-common   = { path = "crates/stele-common",   version = "0.0.0" }
+stele-storage  = { path = "crates/stele-storage",  version = "0.0.0" }
+stele-sim      = { path = "crates/stele-sim",      version = "0.0.0" }
+stele-catalog  = { path = "crates/stele-catalog",  version = "0.0.0" }
+stele-txn      = { path = "crates/stele-txn",      version = "0.0.0" }
+stele-sql      = { path = "crates/stele-sql",      version = "0.0.0" }
+stele-exec     = { path = "crates/stele-exec",     version = "0.0.0" }
+stele-pgwire   = { path = "crates/stele-pgwire",   version = "0.0.0" }
+stele-lineage  = { path = "crates/stele-lineage",  version = "0.0.0" }
+stele-server   = { path = "crates/stele-server",   version = "0.0.0" }
+
+# Pinned third-party deps. Keep this list short on purpose — each addition is a
+# supply-chain surface and a `cargo-deny` decision.
+anyhow             = "1.0"
+bytes              = "1.7"
+clap               = { version = "4.5", features = ["derive"] }
+thiserror          = "1.0"
+tokio              = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[workspace.lints.rust]
+unsafe_code     = "warn"
+missing_docs    = "allow"  # flip to "warn" once the public APIs settle
+rust_2024_compatibility = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+# Mirrors the spirit of CI's `clippy -- -D warnings` but expressed as lint groups so
+# individual crates can downgrade specific lints with a localized #[allow].
+pedantic    = { level = "warn", priority = -1 }
+nursery     = { level = "warn", priority = -1 }
+# These are too noisy at scaffold-time; reconsider per-crate as code lands.
+module_name_repetitions = "allow"
+must_use_candidate      = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+# Proper nouns (FoundationDB, TigerBeetle, BSL, ADR) trip this constantly.
+# Tracked: tighten in a follow-up once doc style guide lands.
+doc_markdown            = "allow"
+# Internal modules and one-letter buffer locals are fine in scaffolds.
+items_after_statements  = "allow"
+similar_names           = "allow"
+# `or_else(|_| EnvFilter::new(...))` is more readable than the suggested closure.
+or_fun_call             = "allow"
+# tokio::select!'s generated `pub(crate)` items trip this nursery lint.
+redundant_pub_crate     = "allow"
+
+[profile.release]
+lto        = "thin"
+codegen-units = 1
+debug      = "line-tables-only"
+strip      = "symbols"
+panic      = "abort"
+
+[profile.dev]
+# Dev builds favor turn-around time; the release profile owns optimization.
+debug = "limited"

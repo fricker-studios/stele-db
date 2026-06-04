@@ -1,0 +1,27 @@
+[package]
+name        = "stele-server"
+description = "The stele engine daemon — wires pgwire / lineage into a runnable process."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "stele-server"
+path = "src/main.rs"
+
+[dependencies]
+stele-pgwire       = { workspace = true }
+stele-lineage      = { workspace = true }
+stele-common       = { workspace = true }
+anyhow             = { workspace = true }
+clap               = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }

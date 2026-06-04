@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Question / Discussion
+    url: https://github.com/fricker-studios/stele-db/discussions
+    about: Ask questions and discuss ideas in GitHub Discussions.
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/fricker-studios/stele-db/security/advisories/new
+    about: Please report vulnerabilities privately — do not open a public issue.

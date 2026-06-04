@@ -1,0 +1,36 @@
+name: 🐛 Bug report
+description: Report a defect in Stele
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Stele is pre-1.0 and holds no production data — please don't include real/sensitive data.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What went wrong, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps, SQL, or a failing seed (e.g. `just sim-seed <N>`).
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      placeholder: "v0.x.y or git SHA"
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: "OS, arch, how you ran it (binary/Docker/source)"
+    validations:
+      required: false

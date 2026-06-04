@@ -34,5 +34,5 @@ Cloud/enterprise features are a separate **proprietary** tier, monetized later. 
 - A CLA (to enable relicensing into the commercial tier) adds contributor friction vs. a bare DCO.
 
 ### Neutral / follow-ups
-- Final Licensor entity, CLA-vs-DCO, and exact Additional Use Grant wording are tracked as [open licensing questions](../07-licensing-and-oss.md#open-licensing-and-legal-questions).
+- The Licensor entity is **Alex Fricker Studios, LLC**. CLA-vs-DCO and exact Additional Use Grant wording remain tracked as [open licensing questions](../07-licensing-and-oss.md#open-licensing-and-legal-questions).
 - Trademark protection ([07 — trademark](../07-licensing-and-oss.md#trademark-notes)) is what keeps the *brand* protected even after code converts to Apache.

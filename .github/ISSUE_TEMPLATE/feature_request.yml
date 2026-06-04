@@ -1,0 +1,28 @@
+name: ✨ Feature request
+description: Suggest a capability or enhancement
+labels: ["feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check this fits Stele's scope — see the [Charter non-goals](../docs/00-charter.md#3-the-guardrail--lead-with-the-non-goal). Engine features must be general (no Data Vault / RCM specifics).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do, and why is it hard today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like Stele to do?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false

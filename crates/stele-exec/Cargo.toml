@@ -1,0 +1,18 @@
+[package]
+name        = "stele-exec"
+description = "Vectorized executor — Arrow-shaped batches, pull/push hybrid."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+stele-storage = { workspace = true }
+stele-txn     = { workspace = true }
+stele-common  = { workspace = true }
