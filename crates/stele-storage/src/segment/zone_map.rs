@@ -104,6 +104,10 @@ impl ZoneMap {
                 columns.push((col, ColumnZone { min, max }));
             }
         }
+        // Canonicalize by column id so the derived `PartialEq`/`Eq` (and any
+        // future hashing) reflect the logical set of bounds, not whatever order
+        // the caller happened to supply.
+        columns.sort_by_key(|(c, _)| *c);
         Self { columns }
     }
 
