@@ -1,0 +1,628 @@
+//! [`ValidityIndex`] and its entry types. See [the module docs](super) for the
+//! design rationale.
+
+use std::collections::BTreeMap;
+use std::io;
+
+use stele_common::provenance::{Principal, Provenance, TxnId};
+use stele_common::time::SystemTimeMicros;
+
+use crate::backend::Disk;
+use crate::delta::BusinessKey;
+
+use super::spill;
+
+/// The materialized **end** of one version's system-time period: the value half
+/// of a validity-index entry.
+///
+/// `sys_to` is the system-time at which the version was superseded or deleted —
+/// the period is `[sys_from, sys_to)`. `closed_by` is the provenance of the
+/// transaction that performed the close: for a delete there is no successor
+/// version, so this is the only record of who closed the period ([STL-118]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedInterval {
+    /// The system-time at which the version was superseded/deleted (exclusive
+    /// end of `[sys_from, sys_to)`).
+    pub sys_to: SystemTimeMicros,
+    /// Provenance of the transaction that closed the period.
+    pub closed_by: Provenance,
+}
+
+/// An appended **close** record: the validity-index entry, and the unit the WAL
+/// logs so the index is rebuildable ([the "appended close" of STL-127, realigned
+/// under ADR-0023](super)).
+///
+/// It names the version it closes by `(business_key, sys_from)` — the same key
+/// the delta tier and sealed segments cluster a version chain by — and supplies
+/// the materialized `sys_to` plus the closing transaction's provenance. The
+/// closed version's body (payload, birth provenance) is never touched: a close
+/// is bookkeeping by the superseding/deleting transaction, not a rewrite of who
+/// wrote the closed version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Close {
+    /// The business key of the version being closed.
+    pub business_key: BusinessKey,
+    /// The `sys_from` of the version this close refers to — the match key.
+    pub sys_from: SystemTimeMicros,
+    /// The materialized end stamped on the closed period; the interval becomes
+    /// `[sys_from, sys_to)`.
+    pub sys_to: SystemTimeMicros,
+    /// Provenance of the transaction that performed the close.
+    pub closed_by: Provenance,
+}
+
+/// Fixed header size for the [`Close`] binary frame: `business_len`/`principal_len`
+/// `u32` (8) + `sys_from`/`sys_to`/`closed_at` `i64` (24) + `closed_txn` `u64` (8).
+const HEADER_LEN: usize = 40;
+
+/// Per-frame ceiling for an encoded [`Close`] (16 MiB) — the same bound the
+/// delta tier and the WAL apply, so a close frame can never legitimately exceed
+/// what the WAL will accept.
+pub const MAX_CLOSE_FRAME_LEN: usize = 16 * 1024 * 1024;
+
+impl Close {
+    /// The `(business_key, sys_from)` this close materializes an end for.
+    fn target(&self) -> (BusinessKey, SystemTimeMicros) {
+        (self.business_key.clone(), self.sys_from)
+    }
+
+    /// The value half of the entry.
+    fn interval(&self) -> ClosedInterval {
+        ClosedInterval {
+            sys_to: self.sys_to,
+            closed_by: self.closed_by.clone(),
+        }
+    }
+
+    /// Bytes this close contributes to the in-memory / on-spill byte accounting —
+    /// its encoded size.
+    #[must_use]
+    pub fn encoded_size(&self) -> usize {
+        HEADER_LEN + self.business_key.as_bytes().len() + self.closed_by.principal.0.len()
+    }
+
+    /// Verify the close can be encoded — component sizes fit `u32` and the frame
+    /// stays under [`MAX_CLOSE_FRAME_LEN`].
+    fn check_encodable(&self) -> Result<(), ValidityError> {
+        if u32::try_from(self.business_key.as_bytes().len()).is_err()
+            || u32::try_from(self.closed_by.principal.0.len()).is_err()
+            || self.encoded_size() > MAX_CLOSE_FRAME_LEN
+        {
+            return Err(ValidityError::TooLarge(self.encoded_size()));
+        }
+        Ok(())
+    }
+
+    /// Encode into `out`, appending bytes. Shared by the WAL committer and the
+    /// spill writer so both paths use one wire format. Layout (little-endian):
+    ///
+    /// ```text
+    /// | business_len:u32 | principal_len:u32 | sys_from:i64 | sys_to:i64 |
+    /// | closed_txn:u64 | closed_at:i64 | business_key bytes … | principal bytes … |
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`ValidityError::TooLarge`] when the frame would exceed [`MAX_CLOSE_FRAME_LEN`].
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ValidityError> {
+        self.check_encodable()?;
+        let business_len = u32::try_from(self.business_key.as_bytes().len())
+            .map_err(|_| ValidityError::TooLarge(self.encoded_size()))?;
+        let principal_len = u32::try_from(self.closed_by.principal.0.len())
+            .map_err(|_| ValidityError::TooLarge(self.encoded_size()))?;
+        out.reserve(self.encoded_size());
+        out.extend_from_slice(&business_len.to_le_bytes());
+        out.extend_from_slice(&principal_len.to_le_bytes());
+        out.extend_from_slice(&self.sys_from.0.to_le_bytes());
+        out.extend_from_slice(&self.sys_to.0.to_le_bytes());
+        out.extend_from_slice(&self.closed_by.txn_id.0.to_le_bytes());
+        out.extend_from_slice(&self.closed_by.committed_at.0.to_le_bytes());
+        out.extend_from_slice(self.business_key.as_bytes());
+        out.extend_from_slice(self.closed_by.principal.as_bytes());
+        Ok(())
+    }
+
+    /// Convenience: encode to a fresh `Vec<u8>`.
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`ValidityError::TooLarge`] from [`Self::encode`].
+    pub fn encoded(&self) -> Result<Vec<u8>, ValidityError> {
+        let mut v = Vec::with_capacity(self.encoded_size());
+        self.encode(&mut v)?;
+        Ok(v)
+    }
+
+    /// Decode from the head of `bytes`. Returns the parsed [`Close`] and the
+    /// number of bytes consumed, so a caller reading concatenated frames (spill
+    /// reload) can drive a cursor.
+    ///
+    /// # Errors
+    ///
+    /// [`ValidityError::Corrupt`] when the frame's declared lengths do not match
+    /// the bytes available or exceed the per-frame ceiling.
+    pub fn decode(bytes: &[u8]) -> Result<(Self, usize), ValidityError> {
+        if bytes.len() < HEADER_LEN {
+            return Err(ValidityError::Corrupt("short read on close header"));
+        }
+        let rd_u32 = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().expect("4 bytes"));
+        let rd_i64 = |o: usize| i64::from_le_bytes(bytes[o..o + 8].try_into().expect("8 bytes"));
+        let rd_u64 = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().expect("8 bytes"));
+        let business_len = rd_u32(0) as usize;
+        let principal_len = rd_u32(4) as usize;
+        let sys_from = rd_i64(8);
+        let sys_to = rd_i64(16);
+        let closed_txn = rd_u64(24);
+        let closed_at = rd_i64(32);
+        let total = HEADER_LEN
+            .checked_add(business_len)
+            .and_then(|v| v.checked_add(principal_len))
+            .ok_or(ValidityError::Corrupt("frame length overflows usize"))?;
+        if total > MAX_CLOSE_FRAME_LEN {
+            return Err(ValidityError::Corrupt(
+                "frame length exceeds MAX_CLOSE_FRAME_LEN",
+            ));
+        }
+        if bytes.len() < total {
+            return Err(ValidityError::Corrupt("frame body shorter than declared"));
+        }
+        let bk_end = HEADER_LEN + business_len;
+        let business_key = BusinessKey::new(bytes[HEADER_LEN..bk_end].to_vec());
+        let principal = Principal::new(bytes[bk_end..total].to_vec());
+        Ok((
+            Self {
+                business_key,
+                sys_from: SystemTimeMicros(sys_from),
+                sys_to: SystemTimeMicros(sys_to),
+                closed_by: Provenance {
+                    txn_id: TxnId(closed_txn),
+                    committed_at: SystemTimeMicros(closed_at),
+                    principal,
+                },
+            },
+            total,
+        ))
+    }
+}
+
+/// Tuning knobs for the validity index.
+#[derive(Debug, Clone, Copy)]
+pub struct ValidityConfig {
+    /// Freeze the in-memory entries to a spill file once their encoded byte
+    /// count would exceed this value — mirrors [`crate::delta::DeltaConfig`].
+    pub spill_threshold_bytes: u64,
+}
+
+impl Default for ValidityConfig {
+    fn default() -> Self {
+        // Match the delta tier's default so "a comfortable chunk of recent
+        // activity" means the same thing on both structures.
+        Self {
+            spill_threshold_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+/// Errors surfaced from the validity index.
+#[derive(Debug, thiserror::Error)]
+pub enum ValidityError {
+    /// A conflicting close for an already-closed `(business_key, sys_from)`: the
+    /// version's end was materialized once and cannot be re-materialized to a
+    /// *different* value. This is the per-key serialization point — a second,
+    /// racing supersession of the same version loses and must retry ([ADR-0023]).
+    #[error("version (key, sys_from) is already closed with a different sys_to")]
+    AlreadyClosed,
+
+    /// A [`Close`] frame on disk failed to decode — a torn write on the spill
+    /// path or a stale on-disk file a caller failed to discard via [`super::ValidityIndex::open`].
+    #[error("validity-index on-disk frame corrupt: {0}")]
+    Corrupt(&'static str),
+
+    /// A [`Close`]'s encoded size exceeded the per-frame ceiling
+    /// ([`MAX_CLOSE_FRAME_LEN`]).
+    #[error("close frame too large: {0} bytes (max 16 MiB)")]
+    TooLarge(usize),
+
+    /// An I/O failure on the spill path.
+    #[error("i/o error: {0}")]
+    Io(#[from] io::Error),
+}
+
+/// The validity-index handle: in-memory entries with local-disk spill, owning
+/// one [`Disk`] handle for its spill files (a namespace distinct from the WAL
+/// and the delta tier).
+///
+/// `ValidityIndex` is a **peer** of the [`Delta`](crate::delta::Delta) tier,
+/// not a part of it: the write path stages a version into the delta *and*
+/// materializes its predecessor's close into this index, and the read path folds
+/// the two together ([`crate::merge`]). Like the delta, it makes **no durability
+/// claim** — on crash, [`Self::open`] discards stale spills and the caller drives
+/// WAL replay back through [`Self::insert_close`].
+pub struct ValidityIndex<D: Disk> {
+    disk: D,
+    config: ValidityConfig,
+    /// `(business_key, sys_from) → materialized end`. Resident entries; the
+    /// spilled ones live in `live_spills`.
+    mem: BTreeMap<(BusinessKey, SystemTimeMicros), ClosedInterval>,
+    /// Running sum of [`Close::encoded_size`] for the resident entries.
+    byte_size: u64,
+    /// Next spill index to allocate — `max(existing) + 1` at open even though the
+    /// existing files are discarded, so a delayed remove can't clash a new write.
+    next_spill_index: u64,
+    /// Spill indices written this lifetime, ascending.
+    live_spills: Vec<u64>,
+}
+
+impl<D: Disk> ValidityIndex<D> {
+    /// Open the validity index backed by `disk`. Any spill files left by a prior
+    /// (crashed) process are **discarded** — the WAL is the canonical truth, and
+    /// re-loading a stale spill would disagree with what replay reconstructs.
+    ///
+    /// # Errors
+    ///
+    /// [`ValidityError::Io`] if the backing disk cannot be listed/cleared.
+    pub fn open(disk: D, config: ValidityConfig) -> Result<Self, ValidityError> {
+        let existing = spill::list_spills(&disk)?;
+        let next_spill_index = existing.last().map_or(0, |&i| i + 1);
+        spill::discard_stale_spills(&disk)?;
+        Ok(Self {
+            disk,
+            config,
+            mem: BTreeMap::new(),
+            byte_size: 0,
+            next_spill_index,
+            live_spills: Vec::new(),
+        })
+    }
+
+    /// Materialize a version's end into the index — **write-once**.
+    ///
+    /// Re-applying the *identical* close (same `sys_to` and `closed_by`) is
+    /// idempotent and returns `Ok` — the property WAL replay relies on. A
+    /// *conflicting* close for an already-closed `(business_key, sys_from)` is
+    /// refused with [`ValidityError::AlreadyClosed`]: the per-key serialization
+    /// point ([ADR-0023]).
+    ///
+    /// # Errors
+    ///
+    /// [`ValidityError::AlreadyClosed`] on a conflicting re-close;
+    /// [`ValidityError::TooLarge`] / [`ValidityError::Corrupt`] / [`ValidityError::Io`]
+    /// from the encode/spill path.
+    pub fn insert_close(&mut self, close: Close) -> Result<(), ValidityError> {
+        close.check_encodable()?;
+        if let Some(existing) = self.close_of(&close.business_key, close.sys_from)? {
+            return if existing == close.interval() {
+                Ok(()) // idempotent replay
+            } else {
+                Err(ValidityError::AlreadyClosed)
+            };
+        }
+        let incoming = close.encoded_size() as u64;
+        let projected = self.byte_size.saturating_add(incoming);
+        if projected > self.config.spill_threshold_bytes && !self.mem.is_empty() {
+            self.spill_in_memory()?;
+        }
+        self.byte_size = self.byte_size.saturating_add(incoming);
+        // Consume `close` by moving its parts into the entry — no clone, and the
+        // owned argument is genuinely used up (not merely borrowed).
+        let Close {
+            business_key,
+            sys_from,
+            sys_to,
+            closed_by,
+        } = close;
+        self.mem.insert(
+            (business_key, sys_from),
+            ClosedInterval { sys_to, closed_by },
+        );
+        Ok(())
+    }
+
+    /// The materialized end of the version `(key, sys_from)`, or `None` while the
+    /// version is still open (no close has committed).
+    ///
+    /// Checks the resident entries first, then each spill — a point lookup that
+    /// reads a spill only when the entry is not resident. Closes are tiny and
+    /// usually resident, so spilling stays rare ([the module docs](super)).
+    ///
+    /// # Errors
+    ///
+    /// [`ValidityError::Corrupt`] / [`ValidityError::Io`] loading a spill file.
+    pub fn close_of(
+        &self,
+        key: &BusinessKey,
+        sys_from: SystemTimeMicros,
+    ) -> Result<Option<ClosedInterval>, ValidityError> {
+        if let Some(interval) = self.mem.get(&(key.clone(), sys_from)) {
+            return Ok(Some(interval.clone()));
+        }
+        for &idx in &self.live_spills {
+            for close in spill::read_spill(&self.disk, idx)? {
+                if &close.business_key == key && close.sys_from == sys_from {
+                    return Ok(Some(close.interval()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Every materialized close for `key`, keyed by the version's `sys_from`.
+    ///
+    /// The read path ([`crate::merge`]) overlays these onto the key's candidate
+    /// versions to stamp each one's `sys_to` / `closed_by` before resolving a
+    /// snapshot. Merges the resident entries with every spill.
+    ///
+    /// # Errors
+    ///
+    /// [`ValidityError::Corrupt`] / [`ValidityError::Io`] loading a spill file.
+    pub fn closes_for(
+        &self,
+        key: &BusinessKey,
+    ) -> Result<BTreeMap<SystemTimeMicros, ClosedInterval>, ValidityError> {
+        use std::ops::Bound::Included;
+        let mut out: BTreeMap<SystemTimeMicros, ClosedInterval> = BTreeMap::new();
+        // Spilled entries first, resident last — a resident entry supersedes a
+        // spilled one for the same version (they never disagree, but this keeps
+        // the merge order well-defined, mirroring the delta tier).
+        for &idx in &self.live_spills {
+            for close in spill::read_spill(&self.disk, idx)? {
+                if &close.business_key == key {
+                    out.insert(close.sys_from, close.interval());
+                }
+            }
+        }
+        let lo = (key.clone(), SystemTimeMicros(i64::MIN));
+        let hi = (key.clone(), SystemTimeMicros(i64::MAX));
+        for ((_, sys_from), interval) in self.mem.range((Included(lo), Included(hi))) {
+            out.insert(*sys_from, interval.clone());
+        }
+        Ok(out)
+    }
+
+    /// The `sys_from` of the version active at system-time `at` for `key`, when
+    /// `at` falls inside a **materialized** (closed) interval — a direct
+    /// range-containment lookup, no version-chain walk
+    /// ([DoD of STL-133](super)).
+    ///
+    /// Returns the greatest `sys_from ≤ at` whose materialized `sys_to > at`.
+    /// `None` means `at` is not covered by any closed interval for the key: it
+    /// is either before the key's first version or in its currently-*open* tail,
+    /// which the read path resolves against the version set ([`crate::merge`]) —
+    /// the index alone does not track the open head, which is not write-once.
+    ///
+    /// # Errors
+    ///
+    /// [`ValidityError::Corrupt`] / [`ValidityError::Io`] loading a spill file.
+    pub fn active_at(
+        &self,
+        key: &BusinessKey,
+        at: SystemTimeMicros,
+    ) -> Result<Option<SystemTimeMicros>, ValidityError> {
+        let closes = self.closes_for(key)?;
+        Ok(closes
+            .range(..=at)
+            .next_back()
+            .filter(|(_, interval)| interval.sys_to > at)
+            .map(|(sys_from, _)| *sys_from))
+    }
+
+    /// The full set of entries, resident + spilled, as one map. The canonical
+    /// form for comparing two indexes for *exact* equality — the property the
+    /// "rebuild-from-WAL reproduces the exact index" seed sweep asserts
+    /// ([DoD of STL-133](super)).
+    ///
+    /// # Errors
+    ///
+    /// [`ValidityError::Corrupt`] / [`ValidityError::Io`] loading a spill file.
+    pub fn materialize(
+        &self,
+    ) -> Result<BTreeMap<(BusinessKey, SystemTimeMicros), ClosedInterval>, ValidityError> {
+        let mut out: BTreeMap<(BusinessKey, SystemTimeMicros), ClosedInterval> = BTreeMap::new();
+        for &idx in &self.live_spills {
+            for close in spill::read_spill(&self.disk, idx)? {
+                out.insert(close.target(), close.interval());
+            }
+        }
+        for (k, v) in &self.mem {
+            out.insert(k.clone(), v.clone());
+        }
+        Ok(out)
+    }
+
+    /// Total number of materialized entries, resident + spilled.
+    ///
+    /// # Errors
+    ///
+    /// [`ValidityError::Corrupt`] / [`ValidityError::Io`] loading a spill file.
+    pub fn len(&self) -> Result<usize, ValidityError> {
+        Ok(self.materialize()?.len())
+    }
+
+    /// Whether the index holds any entry.
+    ///
+    /// # Errors
+    ///
+    /// [`ValidityError::Corrupt`] / [`ValidityError::Io`] loading a spill file.
+    pub fn is_empty(&self) -> Result<bool, ValidityError> {
+        Ok(self.mem.is_empty() && self.live_spills.is_empty())
+    }
+
+    /// Resident (un-spilled) byte count — the figure the spill threshold is
+    /// taken against.
+    #[must_use]
+    pub const fn byte_size(&self) -> u64 {
+        self.byte_size
+    }
+
+    fn spill_in_memory(&mut self) -> Result<(), ValidityError> {
+        if self.mem.is_empty() {
+            return Ok(());
+        }
+        let closes: Vec<Close> = self
+            .mem
+            .iter()
+            .map(|((business_key, sys_from), interval)| Close {
+                business_key: business_key.clone(),
+                sys_from: *sys_from,
+                sys_to: interval.sys_to,
+                closed_by: interval.closed_by.clone(),
+            })
+            .collect();
+        let idx = self.next_spill_index;
+        self.next_spill_index += 1;
+        spill::write_spill(&self.disk, idx, &closes)?;
+        self.live_spills.push(idx);
+        self.mem.clear();
+        self.byte_size = 0;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::MemDisk;
+
+    fn close(key: &[u8], sys_from: i64, sys_to: i64, closer: &[u8]) -> Close {
+        Close {
+            business_key: BusinessKey::new(key.to_vec()),
+            sys_from: SystemTimeMicros(sys_from),
+            sys_to: SystemTimeMicros(sys_to),
+            closed_by: Provenance::new(
+                TxnId(u64::try_from(sys_to).unwrap_or(0)),
+                SystemTimeMicros(sys_to),
+                Principal::new(closer.to_vec()),
+            ),
+        }
+    }
+
+    fn index() -> ValidityIndex<MemDisk> {
+        ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("open")
+    }
+
+    #[test]
+    fn close_frame_round_trips() {
+        let c = close(b"acct", 10, 20, b"deleter");
+        let bytes = c.encoded().expect("encode");
+        let (parsed, consumed) = Close::decode(&bytes).expect("decode");
+        assert_eq!(parsed, c);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(parsed.encoded_size(), bytes.len());
+    }
+
+    #[test]
+    fn empty_key_and_principal_frame_is_exactly_the_header() {
+        let mut c = close(b"", 1, 2, b"");
+        c.closed_by.principal = Principal::new(Vec::new());
+        let bytes = c.encoded().expect("encode");
+        assert_eq!(bytes.len(), HEADER_LEN);
+        let (parsed, n) = Close::decode(&bytes).expect("decode");
+        assert_eq!(parsed, c);
+        assert_eq!(n, HEADER_LEN);
+    }
+
+    #[test]
+    fn truncated_close_frame_is_corruption() {
+        let bytes = close(b"k", 1, 2, b"x").encoded().expect("encode");
+        let err = Close::decode(&bytes[..bytes.len() - 1]).unwrap_err();
+        assert!(matches!(err, ValidityError::Corrupt(_)));
+    }
+
+    #[test]
+    fn insert_and_lookup_round_trips() {
+        let mut idx = index();
+        idx.insert_close(close(b"k", 10, 20, b"a")).expect("insert");
+        let got = idx
+            .close_of(&BusinessKey::new(b"k".to_vec()), SystemTimeMicros(10))
+            .expect("lookup");
+        assert_eq!(got.unwrap().sys_to, SystemTimeMicros(20));
+        // A version with no close is open.
+        assert!(
+            idx.close_of(&BusinessKey::new(b"k".to_vec()), SystemTimeMicros(20))
+                .expect("lookup")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn identical_reclose_is_idempotent() {
+        let mut idx = index();
+        idx.insert_close(close(b"k", 10, 20, b"a")).expect("first");
+        idx.insert_close(close(b"k", 10, 20, b"a"))
+            .expect("identical re-close is a no-op");
+        assert_eq!(idx.len().expect("len"), 1);
+    }
+
+    #[test]
+    fn conflicting_reclose_is_refused() {
+        let mut idx = index();
+        idx.insert_close(close(b"k", 10, 20, b"a")).expect("first");
+        // Same target, different sys_to — the per-key serialization point.
+        let err = idx.insert_close(close(b"k", 10, 21, b"a")).unwrap_err();
+        assert!(matches!(err, ValidityError::AlreadyClosed));
+    }
+
+    #[test]
+    fn active_at_is_range_containment() {
+        let mut idx = index();
+        // Two closed intervals tile [0,10) and [10,20); [20,+inf) is the open
+        // tail (not in the index).
+        idx.insert_close(close(b"k", 0, 10, b"a")).expect("c0");
+        idx.insert_close(close(b"k", 10, 20, b"b")).expect("c1");
+        let k = BusinessKey::new(b"k".to_vec());
+        assert_eq!(
+            idx.active_at(&k, SystemTimeMicros(5)).expect("at 5"),
+            Some(SystemTimeMicros(0)),
+        );
+        assert_eq!(
+            idx.active_at(&k, SystemTimeMicros(15)).expect("at 15"),
+            Some(SystemTimeMicros(10)),
+        );
+        // At the exact close point the interval is already exclusive-closed.
+        assert_eq!(
+            idx.active_at(&k, SystemTimeMicros(10)).expect("at 10"),
+            Some(SystemTimeMicros(10)),
+        );
+        // Beyond every closed interval ⇒ open tail, not the index's to answer.
+        assert_eq!(
+            idx.active_at(&k, SystemTimeMicros(25)).expect("at 25"),
+            None
+        );
+        // Before the first version.
+        idx.insert_close(close(b"k", 0, 10, b"a")).expect("idem");
+    }
+
+    #[test]
+    fn spill_then_lookup_merges_disk_and_memory() {
+        // Tiny threshold so the second insert spills the first.
+        let mut idx = ValidityIndex::open(
+            MemDisk::new(),
+            ValidityConfig {
+                spill_threshold_bytes: 1,
+            },
+        )
+        .expect("open");
+        idx.insert_close(close(b"k", 0, 10, b"a")).expect("c0");
+        idx.insert_close(close(b"k", 10, 20, b"b")).expect("c1");
+        // The first entry is on a spill, the second resident — both must resolve.
+        let k = BusinessKey::new(b"k".to_vec());
+        assert_eq!(
+            idx.close_of(&k, SystemTimeMicros(0))
+                .expect("spilled")
+                .unwrap()
+                .sys_to,
+            SystemTimeMicros(10),
+        );
+        assert_eq!(
+            idx.close_of(&k, SystemTimeMicros(10))
+                .expect("resident")
+                .unwrap()
+                .sys_to,
+            SystemTimeMicros(20),
+        );
+        assert_eq!(idx.len().expect("len"), 2);
+        // A conflicting re-close of the *spilled* entry is still refused.
+        let err = idx.insert_close(close(b"k", 0, 11, b"a")).unwrap_err();
+        assert!(matches!(err, ValidityError::AlreadyClosed));
+    }
+}

@@ -31,6 +31,7 @@ use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
 use stele_storage::systime::{EmptySealed, SysTimeError, SysTimeWriter};
+use stele_storage::validity::{ValidityConfig, ValidityIndex};
 use stele_storage::wal::{Disk, DiskFile};
 
 /// A throwaway principal for write-path tests that don't themselves assert on
@@ -169,15 +170,33 @@ fn new_delta() -> Delta<MemDisk> {
     Delta::open(MemDisk::new(), DeltaConfig::default()).unwrap()
 }
 
+fn new_index() -> ValidityIndex<MemDisk> {
+    ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).unwrap()
+}
+
 /// Drain the delta and group every stored version by business key, preserving
 /// the `(business_key, sys_from)` order `flush_to_segment` guarantees — so each
 /// `Vec<Version>` is one key's full chain, oldest first (closed *and* open
 /// periods, which a snapshot scan can't surface together).
 ///
+/// Under [ADR-0023] a flushed/staged version is raw: its end lives in the
+/// [`ValidityIndex`], not on the record, so every drained version comes back
+/// `sys_to == SYSTEM_TIME_OPEN` / `closed_by == None`. We overlay each version's
+/// materialized end from the index — exactly the resolution the read path does —
+/// so the returned chain carries the closed `sys_to`/`closed_by` the tests
+/// assert on, leaving the open tail untouched.
+///
 /// Destructive: call it once, after all writes for the test are done.
-fn drain_chains(delta: &mut Delta<MemDisk>) -> BTreeMap<BusinessKey, Vec<Version>> {
+fn drain_chains(
+    delta: &mut Delta<MemDisk>,
+    index: &ValidityIndex<MemDisk>,
+) -> BTreeMap<BusinessKey, Vec<Version>> {
     let mut map: BTreeMap<BusinessKey, Vec<Version>> = BTreeMap::new();
-    for v in delta.flush_to_segment().unwrap() {
+    for mut v in delta.flush_to_segment().unwrap() {
+        if let Some(ci) = index.close_of(&v.business_key, v.sys_from).unwrap() {
+            v.sys_to = ci.sys_to;
+            v.closed_by = Some(ci.closed_by);
+        }
         map.entry(v.business_key.clone()).or_default().push(v);
     }
     map
@@ -188,6 +207,7 @@ fn drain_chains(delta: &mut Delta<MemDisk>) -> BTreeMap<BusinessKey, Vec<Version
 #[test]
 fn insert_then_update_leaves_one_closed_and_one_open_version() {
     let mut delta = new_delta();
+    let mut index = new_index();
     let clock = StubClock::new(1_000);
     let mut writer = SysTimeWriter::new(clock.clone());
     let key = BusinessKey::new(b"acct-42".to_vec());
@@ -195,6 +215,7 @@ fn insert_then_update_leaves_one_closed_and_one_open_version() {
     let c0 = writer
         .insert(
             &mut delta,
+            &mut index,
             &EmptySealed,
             key.clone(),
             b"balance=100".to_vec(),
@@ -207,6 +228,7 @@ fn insert_then_update_leaves_one_closed_and_one_open_version() {
     let c1 = writer
         .update(
             &mut delta,
+            &mut index,
             &EmptySealed,
             key.clone(),
             b"balance=150".to_vec(),
@@ -217,7 +239,7 @@ fn insert_then_update_leaves_one_closed_and_one_open_version() {
 
     assert!(c0 < c1, "the update's commit must be after the insert's");
 
-    let mut chains = drain_chains(&mut delta);
+    let mut chains = drain_chains(&mut delta, &index);
     let versions = chains.remove(&key).expect("key has a chain");
     assert_eq!(versions.len(), 2, "insert + update ⇒ exactly two versions");
 
@@ -273,12 +295,14 @@ fn insert_then_update_leaves_one_closed_and_one_open_version() {
 #[test]
 fn insert_on_a_live_key_is_rejected() {
     let mut delta = new_delta();
+    let mut index = new_index();
     let mut writer = SysTimeWriter::new(StubClock::new(1));
     let key = BusinessKey::new(b"dup".to_vec());
 
     writer
         .insert(
             &mut delta,
+            &mut index,
             &EmptySealed,
             key.clone(),
             b"first".to_vec(),
@@ -289,6 +313,7 @@ fn insert_on_a_live_key_is_rejected() {
     let err = writer
         .insert(
             &mut delta,
+            &mut index,
             &EmptySealed,
             key,
             b"second".to_vec(),
@@ -302,6 +327,7 @@ fn insert_on_a_live_key_is_rejected() {
 #[test]
 fn update_or_delete_without_a_live_version_is_rejected() {
     let mut delta = new_delta();
+    let mut index = new_index();
     let mut writer = SysTimeWriter::new(StubClock::new(1));
     let key = BusinessKey::new(b"ghost".to_vec());
 
@@ -309,6 +335,7 @@ fn update_or_delete_without_a_live_version_is_rejected() {
         writer
             .update(
                 &mut delta,
+                &mut index,
                 &EmptySealed,
                 key.clone(),
                 b"x".to_vec(),
@@ -320,7 +347,7 @@ fn update_or_delete_without_a_live_version_is_rejected() {
     ));
     assert!(matches!(
         writer
-            .delete(&mut delta, &EmptySealed, &key, TxnId(2), who())
+            .delete(&mut delta, &mut index, &EmptySealed, &key, TxnId(2), who())
             .unwrap_err(),
         SysTimeError::KeyNotFound
     ));
@@ -329,6 +356,7 @@ fn update_or_delete_without_a_live_version_is_rejected() {
 #[test]
 fn delete_closes_the_live_period_and_leaves_no_open_version() {
     let mut delta = new_delta();
+    let mut index = new_index();
     let clock = StubClock::new(10);
     let mut writer = SysTimeWriter::new(clock);
     let key = BusinessKey::new(b"k".to_vec());
@@ -336,6 +364,7 @@ fn delete_closes_the_live_period_and_leaves_no_open_version() {
     writer
         .insert(
             &mut delta,
+            &mut index,
             &EmptySealed,
             key.clone(),
             b"v".to_vec(),
@@ -346,6 +375,7 @@ fn delete_closes_the_live_period_and_leaves_no_open_version() {
     let closed_at = writer
         .delete(
             &mut delta,
+            &mut index,
             &EmptySealed,
             &key,
             TxnId(2),
@@ -355,11 +385,11 @@ fn delete_closes_the_live_period_and_leaves_no_open_version() {
 
     // No version is live after the delete.
     let live = delta
-        .range_scan(.., Snapshot(SystemTimeMicros(i64::MAX - 1)))
+        .range_scan(.., Snapshot(SystemTimeMicros(i64::MAX - 1)), &index)
         .unwrap();
     assert!(live.is_empty(), "deleted key has no live version");
 
-    let mut chains = drain_chains(&mut delta);
+    let mut chains = drain_chains(&mut delta, &index);
     let versions = chains.remove(&key).expect("key has a chain");
     assert_eq!(versions.len(), 1);
     assert_eq!(versions[0].sys_to, closed_at, "delete closes the period");
@@ -381,6 +411,7 @@ fn delete_closes_the_live_period_and_leaves_no_open_version() {
 #[test]
 fn reinsert_after_delete_opens_a_new_period_with_a_gap() {
     let mut delta = new_delta();
+    let mut index = new_index();
     let clock = StubClock::new(100);
     let mut writer = SysTimeWriter::new(clock.clone());
     let key = BusinessKey::new(b"k".to_vec());
@@ -388,6 +419,7 @@ fn reinsert_after_delete_opens_a_new_period_with_a_gap() {
     writer
         .insert(
             &mut delta,
+            &mut index,
             &EmptySealed,
             key.clone(),
             b"a".to_vec(),
@@ -397,12 +429,13 @@ fn reinsert_after_delete_opens_a_new_period_with_a_gap() {
         .unwrap();
     clock.set(200);
     let deleted_at = writer
-        .delete(&mut delta, &EmptySealed, &key, TxnId(2), who())
+        .delete(&mut delta, &mut index, &EmptySealed, &key, TxnId(2), who())
         .unwrap();
     clock.set(300);
     let reopened_at = writer
         .insert(
             &mut delta,
+            &mut index,
             &EmptySealed,
             key.clone(),
             b"b".to_vec(),
@@ -411,7 +444,7 @@ fn reinsert_after_delete_opens_a_new_period_with_a_gap() {
         )
         .unwrap();
 
-    let mut chains = drain_chains(&mut delta);
+    let mut chains = drain_chains(&mut delta, &index);
     let versions = chains.remove(&key).expect("key has a chain");
     assert_eq!(versions.len(), 2);
     // The deleted period ends strictly before the new one starts — a real,
@@ -441,6 +474,7 @@ fn version_chains_are_non_overlapping_and_gap_free_under_seed_sweep() {
     for seed in 0u64..200 {
         let mut rng = Rng::new(seed);
         let mut delta = new_delta();
+        let mut index = new_index();
         let clock = StubClock::new(1);
         let mut writer = SysTimeWriter::new(clock.clone());
         let mut live: Vec<bool> = vec![false; KEY_POOL as usize];
@@ -461,17 +495,33 @@ fn version_chains_are_non_overlapping_and_gap_free_under_seed_sweep() {
 
             if live[key_idx] {
                 writer
-                    .update(&mut delta, &EmptySealed, key, payload, txn, who())
+                    .update(
+                        &mut delta,
+                        &mut index,
+                        &EmptySealed,
+                        key,
+                        payload,
+                        txn,
+                        who(),
+                    )
                     .unwrap();
             } else {
                 writer
-                    .insert(&mut delta, &EmptySealed, key, payload, txn, who())
+                    .insert(
+                        &mut delta,
+                        &mut index,
+                        &EmptySealed,
+                        key,
+                        payload,
+                        txn,
+                        who(),
+                    )
                     .unwrap();
                 live[key_idx] = true;
             }
         }
 
-        let chains = drain_chains(&mut delta);
+        let chains = drain_chains(&mut delta, &index);
         for (key_idx, &is_live) in live.iter().enumerate() {
             if !is_live {
                 continue;

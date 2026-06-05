@@ -25,7 +25,7 @@
 use std::cmp::Ordering;
 
 use stele_common::provenance::{Principal, Provenance, TxnId};
-use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
+use stele_common::time::SystemTimeMicros;
 
 use crate::backend::{Disk, DiskFile};
 use crate::checksum::crc32c;
@@ -43,12 +43,10 @@ use super::zone_map::{Predicate, ZoneBound, ZoneMap};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnData {
     /// Variable-length bytes column ([`ColumnId::BusinessKey`],
-    /// [`ColumnId::Payload`], [`ColumnId::Principal`], or
-    /// [`ColumnId::ClosedByPrincipal`]).
+    /// [`ColumnId::Payload`], or [`ColumnId::Principal`]).
     Bytes(Vec<Vec<u8>>),
-    /// Fixed-width `i64` column ([`ColumnId::SysFrom`], [`ColumnId::SysTo`],
-    /// [`ColumnId::TxnId`], [`ColumnId::CommittedAt`], [`ColumnId::ClosedByTxn`],
-    /// [`ColumnId::ClosedAt`], or — on a valid-time table's segment —
+    /// Fixed-width `i64` column ([`ColumnId::SysFrom`], [`ColumnId::TxnId`],
+    /// [`ColumnId::CommittedAt`], or — on a valid-time table's segment —
     /// [`ColumnId::ValidFrom`] / [`ColumnId::ValidTo`]).
     I64(Vec<i64>),
 }
@@ -216,25 +214,17 @@ impl<F: DiskFile> SegmentReader<F> {
         let mut business_keys = self.read_bytes_column(ColumnId::BusinessKey)?;
         let mut payloads = self.read_bytes_column(ColumnId::Payload)?;
         let mut principals = self.read_bytes_column(ColumnId::Principal)?;
-        let mut closed_principals = self.read_bytes_column(ColumnId::ClosedByPrincipal)?;
         let sys_from = self.read_i64_column(ColumnId::SysFrom)?;
-        let sys_to = self.read_i64_column(ColumnId::SysTo)?;
         let txn_ids = self.read_i64_column(ColumnId::TxnId)?;
         let committed_ats = self.read_i64_column(ColumnId::CommittedAt)?;
-        let closed_txns = self.read_i64_column(ColumnId::ClosedByTxn)?;
-        let closed_ats = self.read_i64_column(ColumnId::ClosedAt)?;
 
         let n = business_keys.len();
         if ![
             payloads.len(),
             principals.len(),
-            closed_principals.len(),
             sys_from.len(),
-            sys_to.len(),
             txn_ids.len(),
             committed_ats.len(),
-            closed_txns.len(),
-            closed_ats.len(),
         ]
         .iter()
         .all(|&len| len == n)
@@ -275,34 +265,23 @@ impl<F: DiskFile> SegmentReader<F> {
         }
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            // `ClosedAt`'s `SYSTEM_TIME_OPEN` sentinel is the presence
-            // discriminator: an open version carries no close provenance. The
-            // writer guarantees a real close can never stamp the sentinel.
-            // Move the owned byte vectors out by index (`mem::take` leaves a
-            // cheap empty `Vec` placeholder) rather than cloning — the column
-            // vectors are discarded at function end. `i64` columns are `Copy`,
-            // so they read by value.
-            let closed_by = if closed_ats[i] == SYSTEM_TIME_OPEN.0 {
-                None
-            } else {
-                Some(Provenance {
-                    txn_id: TxnId(closed_txns[i] as u64),
-                    committed_at: SystemTimeMicros(closed_ats[i]),
-                    principal: Principal::new(std::mem::take(&mut closed_principals[i])),
-                })
-            };
-            out.push(Version {
-                business_key: BusinessKey::new(std::mem::take(&mut business_keys[i])),
-                sys_from: SystemTimeMicros(sys_from[i]),
-                sys_to: SystemTimeMicros(sys_to[i]),
-                provenance: Provenance {
+            // A sealed segment stores only birth state (v6, [ADR-0023]): the
+            // reconstructed version is **open/unresolved** — its `sys_to` /
+            // `closed_by` overlay is supplied by the validity index at read time
+            // ([`crate::merge`]). Move the owned byte vectors out by index
+            // (`mem::take` leaves a cheap empty `Vec` placeholder) rather than
+            // cloning — the column vectors are discarded at function end. `i64`
+            // columns are `Copy`, so they read by value.
+            out.push(Version::open(
+                BusinessKey::new(std::mem::take(&mut business_keys[i])),
+                SystemTimeMicros(sys_from[i]),
+                Provenance {
                     txn_id: TxnId(txn_ids[i] as u64),
                     committed_at: SystemTimeMicros(committed_ats[i]),
                     principal: Principal::new(std::mem::take(&mut principals[i])),
                 },
-                closed_by,
-                payload: std::mem::take(&mut payloads[i]),
-            });
+                std::mem::take(&mut payloads[i]),
+            ));
         }
         Ok(out)
     }
@@ -812,7 +791,7 @@ mod tests {
     fn i64_stat_with_non_8_byte_length_is_rejected() {
         // A corrupt footer that declares a 4-byte min for an i64 column must
         // surface a typed error, not silently decode a truncated value.
-        let err = decode_stat(ColumnId::SysTo, &[0u8; 4]).unwrap_err();
+        let err = decode_stat(ColumnId::SysFrom, &[0u8; 4]).unwrap_err();
         assert!(
             matches!(err, SegmentError::Corrupt(msg) if msg.contains("8 bytes")),
             "i64 stat length mismatch must be rejected, got {err:?}"

@@ -19,11 +19,23 @@
 //!   ([architecture §8](../../../docs/02-architecture.md#8-lineage--provenance-subsystem),
 //!   invariant 5). Provenance is stored inline on the version, never
 //!   reconstructed.
-//! * **Updates close the prior period.** An [`SysTimeWriter::update`] writes a
-//!   new open version *and* a logical close on the previous version's `sys_to`
-//!   (it abuts: the old period ends exactly where the new one begins). A
-//!   [`SysTimeWriter::delete`] closes without re-opening — the "tombstone =
-//!   logical period-close" of [architecture §3.1](../../../docs/02-architecture.md#31-tiered-layout-lsm-flavored-history-preserving).
+//! * **Updates close the prior period.** An [`SysTimeWriter::update`] stages a
+//!   new open version *and* a [`Close`] that materializes the previous version's
+//!   `sys_to` into the [validity index](crate::validity) (it abuts: the old
+//!   period ends exactly where the new one begins). A [`SysTimeWriter::delete`]
+//!   closes without re-opening — the "tombstone = logical period-close" of
+//!   [architecture §3.1](../../../docs/02-architecture.md#31-tiered-layout-lsm-flavored-history-preserving).
+//!
+//! ## A close is an appended index entry, never a record mutation ([ADR-0023])
+//!
+//! A committed version is append-only and is **never rewritten** to record its
+//! end. Closing the prior period materializes its `sys_to` **once** into the
+//! [validity index](crate::validity), keyed `(business_key, sys_from)` — a
+//! write-once append, regardless of whether the version body still lives in the
+//! delta tier or has been flushed into a sealed segment. The read path overlays
+//! that materialized end at resolution time ([`crate::merge`]). This is what
+//! replaced the older "re-stage the closed version" / "append a close marker"
+//! machinery (STL-91/127): there is now a single close mechanism for both tiers.
 //!
 //! The SQL DML surface (INSERT / UPDATE / DELETE statements) is built on top of
 //! these primitives in [STL-94]; this module is the engine mechanism, not the
@@ -42,49 +54,54 @@
 //! writer is recreated (e.g. after a restart). So the monotonicity guarantee
 //! holds *within one writer's lifetime*, not across restarts: a caller that
 //! constructs a fresh writer must supply a commit clock that does not read
-//! earlier than the newest `sys_from` already persisted — otherwise the first
-//! commit of the new writer could stamp behind existing versions. Re-establishing
-//! that high-water mark on recovery, and global commit ordering across
-//! transactions and (later) nodes, is the transaction manager's job
+//! earlier than the newest `sys_from` already persisted. Re-establishing that
+//! high-water mark on recovery, and global commit ordering across transactions
+//! and (later) nodes, is the transaction manager's job
 //! ([architecture §9](../../../docs/02-architecture.md#9-transaction--concurrency-model),
 //! [ADR-0022](../../../docs/adr/0022-clock-synchronization-and-ordering.md)); this
 //! guard is what keeps the single-writer storage path correct on its own.
 //!
-//! ```ignore
-//! let mut writer = SysTimeWriter::new(SystemClock);
-//! // `EmptySealed`: this table has no sealed segments yet, so the writer only
-//! // consults the delta tier. Hand it a `SealedVersions` once segments exist.
-//! writer.insert(&mut delta, &EmptySealed, key.clone(), b"v0".to_vec())?;   // [c0, +∞)
-//! writer.update(&mut delta, &EmptySealed, key.clone(), b"v1".to_vec())?;   // closes c0 at c1; [c1, +∞)
-//! // delta now holds two versions for `key`: [c0, c1) and [c1, +∞).
-//! ```
-//!
 //! ## Closing across a flush boundary
 //!
-//! Once a key's open version has been flushed into a **sealed segment**, the
-//! close can no longer re-stage it — invariant 1 forbids mutating a sealed
-//! segment. [`SysTimeWriter::update`] / [`SysTimeWriter::delete`] then append a
-//! [`CloseMarker`] instead, naming the sealed
-//! version and the new `sys_to`; the read path ([`crate::merge`]) folds the
-//! marker onto the sealed version to surface the closed interval. The writer
-//! tells the two cases apart through the [`SealedLookup`] it is handed ([STL-127]).
+//! Once a key's open version has been flushed into a **sealed segment**, closing
+//! it is *still* just an appended [`Close`] in the validity index — invariant 1
+//! is honored trivially because no record, sealed or staged, is ever mutated. The
+//! writer consults a [`SealedLookup`] only to *find* a live version that no longer
+//! lives in the delta tier ([ADR-0023], realigning STL-127).
 
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros};
 
-use crate::delta::{BusinessKey, CloseMarker, Delta, DeltaError, Snapshot, Version};
-use crate::merge::{self, LiveLocation};
+use crate::backend::Disk;
+use crate::delta::{BusinessKey, Delta, Snapshot, Version};
+use crate::merge;
 use crate::segment::SegmentError;
-use crate::wal::Disk;
+use crate::validity::{Close, ValidityError, ValidityIndex};
+
+/// One entry of a resolved redo set — the unit the WAL logs and a forward write
+/// or a crash replay applies ([`crate::dml`]).
+///
+/// An `INSERT` resolves to a single [`Redo::Insert`]; an `UPDATE` to a
+/// [`Redo::Close`] (the prior period's materialized end) followed by a
+/// [`Redo::Insert`] (the new open version); a `DELETE` to a single
+/// [`Redo::Close`]. The shared `apply` step dispatches each: an insert stages into the delta
+/// tier, a close materializes into the validity index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Redo {
+    /// Stage a new open version into the delta tier.
+    Insert(Version),
+    /// Materialize a prior version's end into the validity index.
+    Close(Close),
+}
 
 /// A read-only lookup over the sealed segments the writer must consult to
 /// resolve a key's live version that has already been flushed out of the delta
-/// tier ([STL-127]).
+/// tier ([ADR-0023], realigning STL-127).
 ///
 /// The writer always checks the delta tier first; this trait covers the
-/// "already sealed" case. It returns the key's sealed versions **raw** — open
-/// or closed, before any delta close-marker is folded in — because the writer
-/// owns the markers and folds them itself ([`crate::merge::resolve_open`]).
+/// "already sealed" case. It returns the key's sealed versions **raw** — every
+/// one open/unresolved, before any validity-index overlay — because the writer
+/// owns the index and overlays it itself ([`crate::merge::resolve_open`]).
 pub trait SealedLookup {
     /// Every version of `key` stored across the sealed segments, in any order.
     ///
@@ -95,11 +112,8 @@ pub trait SealedLookup {
 }
 
 /// A [`SealedLookup`] for a table with no sealed segments — every lookup is
-/// empty.
-///
-/// The writer then behaves exactly as the delta-only path did before [STL-127].
-/// Used by callers that have not wired a segment set through yet (the valid-time
-/// writer, the simulation harness).
+/// empty. Used by callers that have not wired a segment set through yet (the
+/// valid-time writer, the simulation harness).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EmptySealed;
 
@@ -168,15 +182,21 @@ pub enum SysTimeError {
     #[error(transparent)]
     Delta(#[from] crate::delta::DeltaError),
 
+    /// An error bubbled up from the validity index — a write-once conflict
+    /// (a concurrent supersession of the same version), or a spill-read failure
+    /// ([ADR-0023]).
+    #[error(transparent)]
+    Validity(#[from] ValidityError),
+
     /// An error bubbled up while consulting the sealed segments through a
     /// [`SealedLookup`] — e.g. a backing segment that failed its checksum on
-    /// read ([STL-127]).
+    /// read.
     #[error(transparent)]
     Sealed(#[from] SegmentError),
 }
 
-/// Stamps commit timestamps and maintains the per-key `[sys_from, sys_to)`
-/// chain as writes flow into the delta tier.
+/// Stamps commit timestamps and resolves the per-key `[sys_from, sys_to)` chain
+/// as writes flow into the delta tier and the validity index.
 ///
 /// One writer owns the monotonic commit-timestamp counter for the rows it
 /// stamps; see the [module docs](self) for why that monotonicity is what makes
@@ -196,8 +216,7 @@ impl<C: Clock> SysTimeWriter<C> {
         }
     }
 
-    /// The most recent commit timestamp this writer issued, if any. Exposed for
-    /// observability and tests; callers do not need it to drive writes.
+    /// The most recent commit timestamp this writer issued, if any.
     #[must_use]
     pub const fn last_commit(&self) -> Option<SystemTimeMicros> {
         self.last_commit
@@ -207,19 +226,21 @@ impl<C: Clock> SysTimeWriter<C> {
     ///
     /// Returns the stamped `sys_from`.
     ///
-    /// The liveness check spans both tiers: a key whose live version has been
-    /// flushed into a sealed segment is still live, so re-opening it is rejected
-    /// just as it would be for a version still in the delta ([STL-127]). Pass
-    /// [`EmptySealed`] when the table has no sealed segments.
+    /// The liveness check spans both tiers and the index: a key whose live
+    /// version has been flushed into a sealed segment is still live, so
+    /// re-opening it is rejected just as it would be for a version still in the
+    /// delta. Pass [`EmptySealed`] when the table has no sealed segments.
     ///
     /// # Errors
     ///
     /// [`SysTimeError::KeyExists`] if `key` already has a live version — use
-    /// [`Self::update`] to supersede it. Delta-tier errors propagate as
-    /// [`SysTimeError::Delta`]; segment-read errors as [`SysTimeError::Sealed`].
-    pub fn insert<D: Disk, S: SealedLookup>(
+    /// [`Self::update`] to supersede it. Delta/index/segment errors propagate as
+    /// the matching [`SysTimeError`] variants.
+    #[allow(clippy::too_many_arguments)] // tier handles + key/payload + provenance triple
+    pub fn insert<D: Disk, I: Disk, S: SealedLookup>(
         &mut self,
         delta: &mut Delta<D>,
+        index: &mut ValidityIndex<I>,
         sealed: &S,
         key: BusinessKey,
         payload: Vec<u8>,
@@ -227,36 +248,38 @@ impl<C: Clock> SysTimeWriter<C> {
         principal: Principal,
     ) -> Result<SystemTimeMicros, SysTimeError> {
         let commit = self.next_commit_ts()?;
-        if resolve_live(delta, sealed, &key, commit)?.is_some() {
+        if resolve_live(delta, sealed, index, &key, commit)?.is_some() {
             return Err(SysTimeError::KeyExists);
         }
         apply(
             delta,
-            vec![open_version(key, commit, payload, txn_id, principal)],
+            index,
+            vec![Redo::Insert(open_version(
+                key, commit, payload, txn_id, principal,
+            ))],
         )?;
         Ok(commit)
     }
 
-    /// Supersede the live version of `key`: close the prior period at `commit`
-    /// and open a new one `[commit, +∞)`. The two intervals abut, so the chain
-    /// stays gap-free.
+    /// Supersede the live version of `key`: materialize the prior period's end
+    /// into the index at `commit` and open a new one `[commit, +∞)`. The two
+    /// intervals abut, so the chain stays gap-free.
     ///
-    /// The prior period is closed where it lives: re-staged in place if still in
-    /// the delta tier, or — if it has already been flushed into a sealed segment
-    /// — closed by an appended [`CloseMarker`], since invariant 1 forbids
-    /// mutating the segment ([STL-127]). Either way the new open version lands in
-    /// the delta tier.
+    /// The prior period is closed by an appended [`Close`] in the validity index
+    /// — never a record mutation — wherever its body lives ([ADR-0023]). The new
+    /// open version lands in the delta tier.
     ///
     /// Returns the stamped `sys_from` of the new version.
     ///
     /// # Errors
     ///
-    /// [`SysTimeError::KeyNotFound`] if `key` has no live version. Delta-tier
-    /// errors propagate as [`SysTimeError::Delta`]; segment-read errors as
-    /// [`SysTimeError::Sealed`].
-    pub fn update<D: Disk, S: SealedLookup>(
+    /// [`SysTimeError::KeyNotFound`] if `key` has no live version; otherwise the
+    /// delta/index/segment errors.
+    #[allow(clippy::too_many_arguments)] // tier handles + key/payload + provenance triple
+    pub fn update<D: Disk, I: Disk, S: SealedLookup>(
         &mut self,
         delta: &mut Delta<D>,
+        index: &mut ValidityIndex<I>,
         sealed: &S,
         key: BusinessKey,
         payload: Vec<u8>,
@@ -264,13 +287,18 @@ impl<C: Clock> SysTimeWriter<C> {
         principal: Principal,
     ) -> Result<SystemTimeMicros, SysTimeError> {
         let commit = self.next_commit_ts()?;
+        let prior =
+            resolve_live(delta, sealed, index, &key, commit)?.ok_or(SysTimeError::KeyNotFound)?;
         // The superseding transaction both closes the prior period (stamping its
         // identity as `closed_by`) and opens the new one — same `txn_id` /
         // `principal` for both halves.
-        close_prior(delta, sealed, &key, commit, txn_id, principal.clone())?;
         apply(
             delta,
-            vec![open_version(key, commit, payload, txn_id, principal)],
+            index,
+            vec![
+                Redo::Close(close_of(&key, &prior, commit, txn_id, principal.clone())),
+                Redo::Insert(open_version(key, commit, payload, txn_id, principal)),
+            ],
         )?;
         Ok(commit)
     }
@@ -279,117 +307,127 @@ impl<C: Clock> SysTimeWriter<C> {
     /// Afterwards the key has no version live at any snapshot `≥ commit`.
     ///
     /// The deleting transaction's `txn_id` + `principal` are recorded as the
-    /// closed version's `closed_by` provenance — a delete is a logical
-    /// period-close that "carries its own provenance"
-    /// ([architecture §3.1](../../../docs/02-architecture.md#31-tiered-layout-lsm-flavored-history-preserving),
-    /// [STL-118]). Unlike an [`update`](Self::update), a delete leaves no
-    /// successor version, so this is the only record of who performed it.
+    /// [`Close`]'s `closed_by` provenance — a delete is a logical period-close
+    /// that "carries its own provenance" ([architecture §3.1], [STL-118]). Unlike
+    /// an [`update`](Self::update), a delete leaves no successor version, so this
+    /// is the only record of who performed it.
     ///
     /// Returns the `commit` at which the period was closed.
     ///
-    /// Like [`update`](Self::update), the close lands where the live version
-    /// lives: re-staged in the delta tier, or appended as a [`CloseMarker`] when
-    /// the version is already sealed ([STL-127]).
-    ///
     /// # Errors
     ///
-    /// [`SysTimeError::KeyNotFound`] if `key` has no live version. Delta-tier
-    /// errors propagate as [`SysTimeError::Delta`]; segment-read errors as
-    /// [`SysTimeError::Sealed`].
-    pub fn delete<D: Disk, S: SealedLookup>(
+    /// [`SysTimeError::KeyNotFound`] if `key` has no live version; otherwise the
+    /// delta/index/segment errors.
+    pub fn delete<D: Disk, I: Disk, S: SealedLookup>(
         &mut self,
         delta: &mut Delta<D>,
+        index: &mut ValidityIndex<I>,
         sealed: &S,
         key: &BusinessKey,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<SystemTimeMicros, SysTimeError> {
         let commit = self.next_commit_ts()?;
-        close_prior(delta, sealed, key, commit, txn_id, principal)?;
+        let prior =
+            resolve_live(delta, sealed, index, key, commit)?.ok_or(SysTimeError::KeyNotFound)?;
+        apply(
+            delta,
+            index,
+            vec![Redo::Close(close_of(
+                key, &prior, commit, txn_id, principal,
+            ))],
+        )?;
         Ok(commit)
     }
 
     /// Resolve an insert into the redo set it stages — **without** touching the
-    /// delta tier. Returns the stamped commit timestamp and the version(s) to
-    /// apply (a single open version `[commit, +∞)`).
+    /// delta tier or the index. Returns the stamped commit timestamp and the
+    /// redo set (a single open version `[commit, +∞)`).
     ///
     /// This is the resolution half of the write path: it stamps the commit
-    /// timestamp and builds the rows, but leaves *applying* them to the caller.
-    /// [`Self::insert`] applies them straight to the delta; the DML write path
-    /// ([`crate::dml`]) logs them to the WAL first, then applies the same set —
-    /// so a forward write and a crash-recovery replay run identical inserts
-    /// ([architecture §3.4](../../../docs/02-architecture.md#34-write-path-sequence)).
+    /// timestamp and builds the redo, but leaves *applying* it to the caller.
+    /// [`Self::insert`] applies straight to the delta + index; the DML write path
+    /// ([`crate::dml`]) logs the redo to the WAL first, then applies the same set
+    /// — so a forward write and a crash-recovery replay run identical operations.
+    ///
+    /// Liveness here is resolved against the **delta tier and the index** only
+    /// (no sealed lookup), matching the delta-resident DML path.
     ///
     /// # Errors
     ///
     /// [`SysTimeError::KeyExists`] if `key` already has a live version (the
     /// commit timestamp is still consumed, matching [`Self::insert`]);
-    /// [`SysTimeError::TimeExhausted`] from the commit-timestamp allocator.
-    pub fn stage_insert<D: Disk>(
+    /// [`SysTimeError::TimeExhausted`] from the allocator.
+    pub fn stage_insert<D: Disk, I: Disk>(
         &mut self,
         delta: &Delta<D>,
+        index: &ValidityIndex<I>,
         key: BusinessKey,
         payload: Vec<u8>,
         txn_id: TxnId,
         principal: Principal,
-    ) -> Result<(SystemTimeMicros, Vec<Version>), SysTimeError> {
+    ) -> Result<(SystemTimeMicros, Vec<Redo>), SysTimeError> {
         let commit = self.next_commit_ts()?;
-        if current_open(delta, &key, commit)?.is_some() {
+        if current_open(delta, index, &key, commit)?.is_some() {
             return Err(SysTimeError::KeyExists);
         }
         Ok((
             commit,
-            vec![open_version(key, commit, payload, txn_id, principal)],
+            vec![Redo::Insert(open_version(
+                key, commit, payload, txn_id, principal,
+            ))],
         ))
     }
 
-    /// Resolve an update into the redo set it stages — the prior version closed
-    /// at `commit` plus the new open version `[commit, +∞)` — without touching
-    /// the delta tier. The two abut, so the chain stays gap-free. See
-    /// [`Self::stage_insert`] for why resolution is split from application.
+    /// Resolve an update into the redo set it stages — the prior version's close
+    /// plus the new open version `[commit, +∞)` — without touching the delta tier
+    /// or index. See [`Self::stage_insert`].
     ///
     /// # Errors
     ///
     /// [`SysTimeError::KeyNotFound`] if `key` has no live version;
-    /// [`SysTimeError::TimeExhausted`] from the commit-timestamp allocator;
-    /// delta-tier read errors as [`SysTimeError::Delta`].
-    pub fn stage_update<D: Disk>(
+    /// [`SysTimeError::TimeExhausted`]; delta/index read errors.
+    pub fn stage_update<D: Disk, I: Disk>(
         &mut self,
         delta: &Delta<D>,
+        index: &ValidityIndex<I>,
         key: BusinessKey,
         payload: Vec<u8>,
         txn_id: TxnId,
         principal: Principal,
-    ) -> Result<(SystemTimeMicros, Vec<Version>), SysTimeError> {
+    ) -> Result<(SystemTimeMicros, Vec<Redo>), SysTimeError> {
         let commit = self.next_commit_ts()?;
-        // The superseding transaction both closes the prior period (stamping its
-        // identity as `closed_by`) and opens the new one — same `txn_id` /
-        // `principal` for both halves.
-        let closed = closed_prior_version(delta, &key, commit, txn_id, principal.clone())?;
+        let prior = current_open(delta, index, &key, commit)?.ok_or(SysTimeError::KeyNotFound)?;
+        let close = close_of(&key, &prior, commit, txn_id, principal.clone());
         let opened = open_version(key, commit, payload, txn_id, principal);
-        Ok((commit, vec![closed, opened]))
+        Ok((commit, vec![Redo::Close(close), Redo::Insert(opened)]))
     }
 
-    /// Resolve a delete into the redo set it stages — the prior version closed
-    /// at `commit`, with no successor — without touching the delta tier. See
+    /// Resolve a delete into the redo set it stages — the prior version's close,
+    /// with no successor — without touching the delta tier or index. See
     /// [`Self::stage_insert`] for why resolution is split from application, and
     /// [`Self::delete`] for the tombstone-provenance semantics.
     ///
     /// # Errors
     ///
     /// [`SysTimeError::KeyNotFound`] if `key` has no live version;
-    /// [`SysTimeError::TimeExhausted`] from the commit-timestamp allocator;
-    /// delta-tier read errors as [`SysTimeError::Delta`].
-    pub fn stage_delete<D: Disk>(
+    /// [`SysTimeError::TimeExhausted`]; delta/index read errors.
+    pub fn stage_delete<D: Disk, I: Disk>(
         &mut self,
         delta: &Delta<D>,
+        index: &ValidityIndex<I>,
         key: &BusinessKey,
         txn_id: TxnId,
         principal: Principal,
-    ) -> Result<(SystemTimeMicros, Vec<Version>), SysTimeError> {
+    ) -> Result<(SystemTimeMicros, Vec<Redo>), SysTimeError> {
         let commit = self.next_commit_ts()?;
-        let closed = closed_prior_version(delta, key, commit, txn_id, principal)?;
-        Ok((commit, vec![closed]))
+        let prior = current_open(delta, index, key, commit)?.ok_or(SysTimeError::KeyNotFound)?;
+        Ok((
+            commit,
+            vec![Redo::Close(close_of(
+                key, &prior, commit, txn_id, principal,
+            ))],
+        ))
     }
 
     /// Allocate the next commit timestamp: at least the clock's reading, and
@@ -407,9 +445,6 @@ impl<C: Clock> SysTimeWriter<C> {
             Some(prev) if now <= prev => SystemTimeMicros(prev.0.saturating_add(1)),
             _ => now,
         };
-        // A commit must stay strictly below the +∞ open sentinel, or it would be
-        // indistinguishable from an open period. Enforced in every build, not
-        // just via debug_assert — the cost is one comparison.
         if ts >= SYSTEM_TIME_OPEN {
             return Err(SysTimeError::TimeExhausted);
         }
@@ -418,105 +453,59 @@ impl<C: Clock> SysTimeWriter<C> {
     }
 }
 
-/// Apply a resolved redo set to the delta tier: insert each version in order.
+/// Apply a resolved redo set: stage each [`Redo::Insert`] into the delta tier and
+/// materialize each [`Redo::Close`] into the validity index, in order.
 ///
 /// The single application point shared by every write path. A forward write
 /// (via [`SysTimeWriter::insert`] and friends), the WAL-logging DML writer
-/// ([`crate::dml::DmlWriter`]), and a crash-recovery replay
-/// ([`crate::dml::replay`]) all funnel their resolved versions through here, so
-/// "the same code path under sim and under real I/O" is structural, not a
-/// promise. Re-inserting the same `(business_key, sys_from)` is the delta tier's
-/// idempotent replace, which is what makes replay safe to run over already-
-/// applied records.
+/// ([`crate::dml::DmlWriter`]), and a crash-recovery replay ([`crate::dml::replay`])
+/// all funnel their resolved redo sets through here, so "the same code path under
+/// sim and under real I/O" is structural, not a promise. Re-inserting the same
+/// `(business_key, sys_from)` is the delta tier's idempotent replace, and an
+/// identical re-close is the index's idempotent write-once, so replaying an
+/// already-applied record is a no-op.
 ///
-/// Returns the raw [`DeltaError`] so each caller maps it onto its own error type
-/// (`SysTimeError::Delta` here, `DmlError::Delta` in [`crate::dml`]) via `?`.
-pub(crate) fn apply<D: Disk>(
+/// # Errors
+///
+/// [`SysTimeError::Delta`] from a delta apply; [`SysTimeError::Validity`] from an
+/// index close (e.g. a write-once conflict).
+pub(crate) fn apply<D: Disk, I: Disk>(
     delta: &mut Delta<D>,
-    versions: Vec<Version>,
-) -> Result<(), DeltaError> {
-    for version in versions {
-        delta.insert(version)?;
+    index: &mut ValidityIndex<I>,
+    redos: Vec<Redo>,
+) -> Result<(), SysTimeError> {
+    for redo in redos {
+        match redo {
+            Redo::Insert(version) => delta.insert(version)?,
+            Redo::Close(close) => index.insert_close(close)?,
+        }
     }
     Ok(())
 }
 
-/// Build (but do **not** apply) the closed form of `key`'s current open version:
-/// the same row re-stamped with `sys_to = commit` and the closing transaction's
-/// provenance. Applying it is an idempotent replace of the same
-/// `(business_key, sys_from)`, so the period is updated in place rather than
-/// duplicated.
+/// Build the [`Close`] that materializes `prior`'s end at `commit`, stamping the
+/// closing transaction's provenance.
 ///
-/// **Delta-tier only.** This is the resolution half the staging path uses
-/// ([`SysTimeWriter::stage_update`] / [`SysTimeWriter::stage_delete`]), which the
-/// WAL-logging DML writer drives — so a close it resolves can be logged to the
-/// WAL before it is applied. The cross-tier close that also handles a live
-/// version already flushed into a sealed segment is [`close_prior`] ([STL-127]);
-/// wiring that through the staging/WAL path is a follow-up ([STL-128]).
-///
-/// The prior version's **birth provenance is preserved untouched**: closing a
-/// period is bookkeeping by the superseding transaction, not a rewrite of who
-/// wrote the closed version, so `txn_id` / `committed_at` / `principal` keep
-/// their original values. What the close *adds* is `closed_by` — the `txn_id` /
+/// The closed version's **birth provenance is preserved untouched** — closing a
+/// period is bookkeeping by the superseding/deleting transaction, not a rewrite
+/// of who wrote the closed version. The `Close` adds `closed_by`: the `txn_id` /
 /// `principal` of the transaction performing the close, with `committed_at`
 /// stamped to `commit` (which equals the new `sys_to`). For a `delete` there is
-/// no successor version to carry that identity, so recording it here is the only
-/// place "who closed this period" survives ([architecture §3.1](../../../docs/02-architecture.md#31-tiered-layout-lsm-flavored-history-preserving),
-/// [STL-118]).
-fn closed_prior_version<D: Disk>(
-    delta: &Delta<D>,
+/// no successor version to carry that identity, so the `Close` is the only place
+/// "who closed this period" survives ([architecture §3.1], [STL-118]).
+fn close_of(
     key: &BusinessKey,
+    prior: &Version,
     commit: SystemTimeMicros,
     txn_id: TxnId,
     principal: Principal,
-) -> Result<Version, SysTimeError> {
-    let mut prior = current_open(delta, key, commit)?.ok_or(SysTimeError::KeyNotFound)?;
-    prior.sys_to = commit;
-    prior.closed_by = Some(Provenance::new(txn_id, commit, principal));
-    Ok(prior)
-}
-
-/// Close `key`'s current open version at `commit`, stamping the closing
-/// transaction's provenance — **wherever that version lives** ([STL-127]).
-///
-/// * **Still in the delta tier** ([`LiveLocation::Delta`]): re-stage it with
-///   `sys_to = commit` and `closed_by`. Re-inserting the same
-///   `(business_key, sys_from)` is the delta tier's idempotent replace, so the
-///   period is updated in place rather than duplicated — the original [STL-91]
-///   path.
-/// * **Already sealed** ([`LiveLocation::Sealed`]): append a [`CloseMarker`]
-///   naming the sealed version's `sys_from` and the new `sys_to`. The segment is
-///   never touched — invariant 1. The read path folds the marker onto the sealed
-///   version to surface the closed interval.
-///
-/// The forward-path counterpart to [`closed_prior_version`]: it both *resolves*
-/// and *applies*, and it is cross-tier. The prior version's birth provenance is
-/// preserved untouched in either case — corrections append, never rewrite
-/// ([STL-118]).
-fn close_prior<D: Disk, S: SealedLookup>(
-    delta: &mut Delta<D>,
-    sealed: &S,
-    key: &BusinessKey,
-    commit: SystemTimeMicros,
-    txn_id: TxnId,
-    principal: Principal,
-) -> Result<(), SysTimeError> {
-    match resolve_live(delta, sealed, key, commit)?.ok_or(SysTimeError::KeyNotFound)? {
-        LiveLocation::Delta(mut prior) => {
-            prior.sys_to = commit;
-            prior.closed_by = Some(Provenance::new(txn_id, commit, principal));
-            delta.insert(prior)?;
-        }
-        LiveLocation::Sealed(prior) => {
-            delta.insert_close_marker(CloseMarker {
-                business_key: key.clone(),
-                sys_from: prior.sys_from,
-                sys_to: commit,
-                closed_by: Provenance::new(txn_id, commit, principal),
-            });
-        }
+) -> Close {
+    Close {
+        business_key: key.clone(),
+        sys_from: prior.sys_from,
+        sys_to: commit,
+        closed_by: Provenance::new(txn_id, commit, principal),
     }
-    Ok(())
 }
 
 /// Build an open version `[commit, +∞)` for `key`, stamping provenance.
@@ -531,64 +520,56 @@ const fn open_version(
     txn_id: TxnId,
     principal: Principal,
 ) -> Version {
-    Version {
-        business_key: key,
-        sys_from: commit,
-        sys_to: SYSTEM_TIME_OPEN,
-        provenance: Provenance::new(txn_id, commit, principal),
-        // Open: no period-close yet, so no closing provenance ([STL-118]).
-        closed_by: None,
-        payload,
-    }
-}
-
-/// The version of `key` that is live at `at`, resolved **across both tiers** and
-/// reporting which tier holds its body ([`LiveLocation`]).
-///
-/// Gathers the key's staged delta candidates, the delta tier's close markers,
-/// and the key's sealed versions, then folds the markers and picks the live
-/// version ([`crate::merge::resolve_open`]). `at` is the freshly-allocated commit
-/// timestamp, strictly greater than every `sys_from` already on the key's chain,
-/// so the open version (if one exists) is always the one resolved — scanning at
-/// [`SYSTEM_TIME_OPEN`] would instead exclude it, since the resolver's
-/// `sys_to > at` test fails at that exact point.
-fn resolve_live<D: Disk, S: SealedLookup>(
-    delta: &Delta<D>,
-    sealed: &S,
-    key: &BusinessKey,
-    at: SystemTimeMicros,
-) -> Result<Option<LiveLocation>, SysTimeError> {
-    let delta_versions = delta.candidate_versions(key)?;
-    let sealed_versions = sealed.versions_for(key)?;
-    let markers: Vec<CloseMarker> = delta.close_markers_for(key).cloned().collect();
-    Ok(merge::resolve_open(
-        &delta_versions,
-        &markers,
-        &sealed_versions,
+    Version::open(
         key,
-        Snapshot(at),
-    ))
+        commit,
+        Provenance::new(txn_id, commit, principal),
+        payload,
+    )
 }
 
-/// The version of `key` that is live at `at`, if any — **delta tier only**.
+/// The version of `key` live at `at`, resolved across the **delta tier, the
+/// sealed segments, and the validity index** ([`crate::merge::resolve_open`]).
 ///
 /// `at` is the freshly-allocated commit timestamp, strictly greater than every
 /// `sys_from` already on the key's chain, so the open version (if one exists) is
-/// always live at `at`. Scanning at [`SYSTEM_TIME_OPEN`] would *not* work: an
-/// open version has `sys_to == SYSTEM_TIME_OPEN`, which the resolver's
-/// `sys_to > at` test excludes at that exact point.
-///
-/// This is the delta-only resolver the staging path uses ([`SysTimeWriter::stage_insert`],
-/// [`closed_prior_version`]); the cross-tier resolver that also consults sealed
-/// segments is [`resolve_live`] ([STL-127]).
-fn current_open<D: Disk>(
+/// always the one returned — scanning at [`SYSTEM_TIME_OPEN`] would instead
+/// exclude it, since the resolver's `sys_to > at` test fails at that exact point.
+fn resolve_live<D: Disk, I: Disk, S: SealedLookup>(
     delta: &Delta<D>,
+    sealed: &S,
+    index: &ValidityIndex<I>,
     key: &BusinessKey,
     at: SystemTimeMicros,
-) -> Result<Option<Version>, DeltaError> {
-    // `range_scan` returns at most one live version per key.
-    let live = delta.range_scan(key.clone()..=key.clone(), Snapshot(at))?;
-    Ok(live.into_iter().next())
+) -> Result<Option<Version>, SysTimeError> {
+    let delta_versions = delta.candidate_versions(key)?;
+    let sealed_versions = sealed.versions_for(key)?;
+    Ok(merge::resolve_open(
+        &delta_versions,
+        &sealed_versions,
+        index,
+        key,
+        Snapshot(at),
+    )?)
+}
+
+/// The version of `key` live at `at`, resolved across the **delta tier and the
+/// validity index** only (no sealed segments) — the resolver the staging path
+/// uses, matching the delta-resident DML write path.
+fn current_open<D: Disk, I: Disk>(
+    delta: &Delta<D>,
+    index: &ValidityIndex<I>,
+    key: &BusinessKey,
+    at: SystemTimeMicros,
+) -> Result<Option<Version>, SysTimeError> {
+    let delta_versions = delta.candidate_versions(key)?;
+    Ok(merge::resolve_open(
+        &delta_versions,
+        &[],
+        index,
+        key,
+        Snapshot(at),
+    )?)
 }
 
 #[cfg(test)]
@@ -621,12 +602,9 @@ mod tests {
         let mut writer = SysTimeWriter::new(clock);
 
         let a = writer.next_commit_ts().unwrap();
-        // Clock does not move: the guard must still advance.
         let b = writer.next_commit_ts().unwrap();
-        // Clock regresses: still must advance.
         writer.clock.set(50);
         let c = writer.next_commit_ts().unwrap();
-        // Clock jumps far ahead: take the larger value.
         writer.clock.set(10_000);
         let d = writer.next_commit_ts().unwrap();
 
@@ -639,23 +617,17 @@ mod tests {
 
     #[test]
     fn commit_at_the_open_sentinel_is_refused_in_all_builds() {
-        // A clock reading at the +∞ sentinel must not be stamped as a real
-        // commit — it would be indistinguishable from an open period. Enforced
-        // via a typed error, not a debug-only assertion.
         let clock = StubClock::new(SYSTEM_TIME_OPEN.0);
         let mut writer = SysTimeWriter::new(clock);
         assert!(matches!(
             writer.next_commit_ts(),
             Err(SysTimeError::TimeExhausted)
         ));
-        // The failed allocation left no high-water mark behind.
         assert_eq!(writer.last_commit(), None);
     }
 
     #[test]
     fn commit_one_below_the_sentinel_is_allowed_but_the_next_is_refused() {
-        // The monotonic guard would push the *next* commit to the sentinel; that
-        // step must fail rather than wrap into +∞.
         let clock = StubClock::new(SYSTEM_TIME_OPEN.0 - 1);
         let mut writer = SysTimeWriter::new(clock);
         assert_eq!(

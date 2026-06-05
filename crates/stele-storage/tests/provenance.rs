@@ -27,10 +27,11 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use stele_common::provenance::{Principal, Provenance, TxnId};
-use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros};
+use stele_common::time::{Clock, SystemTimeMicros};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Version};
 use stele_storage::segment::{ColumnId, SegmentReader, SegmentWriter};
 use stele_storage::systime::{EmptySealed, SysTimeWriter};
+use stele_storage::validity::{ValidityConfig, ValidityIndex};
 use stele_storage::wal::{Disk, DiskFile};
 
 // --- MemDisk: minimal in-memory Disk for tests ------------------------------
@@ -147,6 +148,11 @@ fn every_persisted_version_carries_its_three_provenance_columns() {
     // manager's contribution (txn_id + principal) is handed down per write,
     // and the writer stamps committed_at = the commit timestamp.
     let mut delta = new_delta();
+    // The write path materializes period ends into the validity index; these
+    // are all fresh inserts, so the index stays empty, but the writer still
+    // requires it (v6, ADR-0023).
+    let mut index =
+        ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("open index");
     let mut writer = SysTimeWriter::new(StubClock(AtomicI64::new(1_000)));
 
     // key -> (txn_id, principal) we handed to the writer.
@@ -157,6 +163,7 @@ fn every_persisted_version_carries_its_three_provenance_columns() {
         writer
             .insert(
                 &mut delta,
+                &mut index,
                 &EmptySealed,
                 BusinessKey::new(key.clone()),
                 format!("balance={i}").into_bytes(),
@@ -230,18 +237,16 @@ fn provenance_columns_add_under_ten_percent_overhead() {
         // 24-byte business key (a hash key + tag is a realistic width).
         let key = format!("hk-{i:020}").into_bytes();
         let payload = vec![0x7Au8; PAYLOAD_LEN];
-        rows.push(Version {
-            business_key: BusinessKey::new(key),
-            sys_from: SystemTimeMicros(i64::try_from(i).unwrap() + 1),
-            sys_to: SYSTEM_TIME_OPEN,
-            provenance: Provenance::new(
+        rows.push(Version::open(
+            BusinessKey::new(key),
+            SystemTimeMicros(i64::try_from(i).unwrap() + 1),
+            Provenance::new(
                 TxnId(i / 64), // ~64 rows per transaction: a bulk-ingest batch
                 SystemTimeMicros(i64::try_from(i).unwrap() + 1),
                 principal.clone(),
             ),
-            closed_by: None,
             payload,
-        });
+        ));
     }
 
     let disk = MemDisk::new();
@@ -252,15 +257,11 @@ fn provenance_columns_add_under_ten_percent_overhead() {
         &[ColumnId::TxnId, ColumnId::CommittedAt, ColumnId::Principal],
     );
     // Everything that is *not* provenance — the baseline a no-provenance
-    // segment would have written.
+    // segment would have written. There is no `sys_to` column (v6, ADR-0023):
+    // the period end lives in the validity index, not the segment.
     let baseline = columns_bytes(
         &reader,
-        &[
-            ColumnId::BusinessKey,
-            ColumnId::SysFrom,
-            ColumnId::SysTo,
-            ColumnId::Payload,
-        ],
+        &[ColumnId::BusinessKey, ColumnId::SysFrom, ColumnId::Payload],
     );
 
     // "Overhead" = the fraction the provenance columns add on top of the

@@ -28,6 +28,10 @@ PN = "PN"
 RTO = "RTO"
 RPO = "RPO"
 
+# Load-generator tool name (wrk2, the coordinated-omission-aware fork of wrk).
+# typos splits on the digit and flags the bare stem "wrk" as a typo for "work".
+wrk = "wrk"
+
 [files]
 # Don't scan vendored or generated output. (Cargo.lock is regenerated; binary
 # artifacts under target/ are already excluded by .gitignore.)

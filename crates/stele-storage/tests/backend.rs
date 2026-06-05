@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use stele_common::provenance::{Principal, Provenance, TxnId};
-use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
+use stele_common::time::SystemTimeMicros;
 use stele_storage::backend::{Disk, DiskFile, FaultOp, Faults, LocalDisk, MemDisk};
 use stele_storage::delta::{BusinessKey, Version};
 use stele_storage::segment::{SegmentReader, SegmentWriter};
@@ -153,48 +153,40 @@ fn memory_backend_satisfies_contract() {
 fn sample_versions() -> Vec<Version> {
     let blob = vec![0x5Au8; 4096];
     vec![
-        Version {
-            business_key: BusinessKey::new(b"a".to_vec()),
-            sys_from: SystemTimeMicros(10),
-            sys_to: SystemTimeMicros(20),
-            provenance: Provenance::new(
+        // Segments store only *birth* state (v6, ADR-0023): the period end /
+        // closer live in the validity index, not on the record. So every
+        // version pushed into a segment is constructed open via `Version::open`,
+        // and the round-trip asserts the birth fields survive on both backends.
+        Version::open(
+            BusinessKey::new(b"a".to_vec()),
+            SystemTimeMicros(10),
+            Provenance::new(
                 TxnId(10),
                 SystemTimeMicros(10),
                 Principal::new(b"svc".to_vec()),
             ),
-            // A closed version: exercise close-provenance round-tripping on
-            // both backends (STL-118). Closed at sys_to=20 by txn 20.
-            closed_by: Some(Provenance::new(
-                TxnId(20),
-                SystemTimeMicros(20),
-                Principal::new(b"svc".to_vec()),
-            )),
-            payload: b"a-v0".to_vec(),
-        },
-        Version {
-            business_key: BusinessKey::new(b"a".to_vec()),
-            sys_from: SystemTimeMicros(20),
-            sys_to: SYSTEM_TIME_OPEN,
-            provenance: Provenance::new(
+            b"a-v0".to_vec(),
+        ),
+        Version::open(
+            BusinessKey::new(b"a".to_vec()),
+            SystemTimeMicros(20),
+            Provenance::new(
                 TxnId(20),
                 SystemTimeMicros(20),
                 Principal::new(b"svc".to_vec()),
             ),
-            closed_by: None,
-            payload: b"a-v1".to_vec(),
-        },
-        Version {
-            business_key: BusinessKey::new(b"big".to_vec()),
-            sys_from: SystemTimeMicros(1),
-            sys_to: SYSTEM_TIME_OPEN,
-            provenance: Provenance::new(
+            b"a-v1".to_vec(),
+        ),
+        Version::open(
+            BusinessKey::new(b"big".to_vec()),
+            SystemTimeMicros(1),
+            Provenance::new(
                 TxnId(1),
                 SystemTimeMicros(1),
                 Principal::new(b"svc".to_vec()),
             ),
-            closed_by: None,
-            payload: blob,
-        },
+            blob,
+        ),
     ]
 }
 

@@ -29,8 +29,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros, ValidTimeMicros};
+use stele_storage::backend::MemDisk;
 use stele_storage::delta::{BusinessKey, Snapshot, Version};
+use stele_storage::merge::{fold_chains, resolve_snapshot};
 use stele_storage::segment::{ColumnId, Predicate, SegmentReader, SegmentWriter, ZoneBound};
+use stele_storage::validity::{Close, ValidityConfig, ValidityIndex};
 use stele_storage::validtime::{VALID_TIME_PREFIX_LEN, ValidInterval, frame_payload};
 use stele_storage::wal::{Disk, DiskFile};
 
@@ -135,19 +138,21 @@ impl DiskFile for CountingFile {
 
 // --- Helpers ----------------------------------------------------------------
 
-fn version(key: &[u8], sys_from: i64, sys_to: i64, payload: &[u8]) -> Version {
-    Version {
-        business_key: BusinessKey::new(key.to_vec()),
-        sys_from: SystemTimeMicros(sys_from),
-        sys_to: SystemTimeMicros(sys_to),
-        provenance: Provenance::new(
+// A segment stores only *birth* state (v6, ADR-0023): there is no stored
+// `sys_to` column and a version read back from a segment is always open. The
+// helper therefore builds open versions via `Version::open`; tests that need a
+// period end for their oracle track it separately (it is not a segment field).
+fn version(key: &[u8], sys_from: i64, payload: &[u8]) -> Version {
+    Version::open(
+        BusinessKey::new(key.to_vec()),
+        SystemTimeMicros(sys_from),
+        Provenance::new(
             TxnId(u64::try_from(sys_from).unwrap_or(0)),
             SystemTimeMicros(sys_from),
             Principal::new(format!("svc-{sys_from}").into_bytes()),
         ),
-        closed_by: None,
-        payload: payload.to_vec(),
-    }
+        payload.to_vec(),
+    )
 }
 
 fn write_segment(disk: &CountingDisk, name: &str, versions: &[Version]) {
@@ -171,31 +176,48 @@ const fn snap(t: i64) -> Snapshot {
 fn time_slice_query_scans_only_matching_segment() {
     let disk = CountingDisk::new();
 
-    // Era 0: [0, 100). Era 1: [100, 200). Era 2: [200, open).
+    // Era 0: born [0/10], superseded at 100. Era 1: born 100, superseded at 200.
+    // Era 2: born 200, open. Segments store only the birth (`sys_from`); the
+    // period ends live in the validity index (v6, ADR-0023), so we record them
+    // there as closes and resolve visibility through the index overlay.
     write_segment(
         &disk,
         "era0.seg",
-        &[
-            version(b"a", 0, 100, b"a@era0"),
-            version(b"b", 10, 100, b"b@era0"),
-        ],
+        &[version(b"a", 0, b"a@era0"), version(b"b", 10, b"b@era0")],
     );
     write_segment(
         &disk,
         "era1.seg",
-        &[
-            version(b"a", 100, 200, b"a@era1"),
-            version(b"b", 100, 200, b"b@era1"),
-        ],
+        &[version(b"a", 100, b"a@era1"), version(b"b", 100, b"b@era1")],
     );
     write_segment(
         &disk,
         "era2.seg",
-        &[
-            version(b"a", 200, SYSTEM_TIME_OPEN.0, b"a@era2"),
-            version(b"b", 200, SYSTEM_TIME_OPEN.0, b"b@era2"),
-        ],
+        &[version(b"a", 200, b"a@era2"), version(b"b", 200, b"b@era2")],
     );
+
+    // The materialized period ends: era0 rows close at 100, era1 rows at 200,
+    // era2 rows stay open. The closer provenance is immaterial to this test.
+    let mut index = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+    for (key, sys_from, sys_to) in [
+        (b"a".as_slice(), 0, 100),
+        (b"b".as_slice(), 10, 100),
+        (b"a".as_slice(), 100, 200),
+        (b"b".as_slice(), 100, 200),
+    ] {
+        index
+            .insert_close(Close {
+                business_key: BusinessKey::new(key.to_vec()),
+                sys_from: SystemTimeMicros(sys_from),
+                sys_to: SystemTimeMicros(sys_to),
+                closed_by: Provenance::new(
+                    TxnId(u64::try_from(sys_to).unwrap()),
+                    SystemTimeMicros(sys_to),
+                    Principal::new(b"svc".to_vec()),
+                ),
+            })
+            .expect("insert close");
+    }
 
     let names = ["era0.seg", "era1.seg", "era2.seg"];
     let readers: Vec<SegmentReader<_>> = names
@@ -218,29 +240,31 @@ fn time_slice_query_scans_only_matching_segment() {
         0,
         "might_contain must not read any column chunk — it works off the resident zone map"
     );
+    // The system-time prune is now one-sided (v6, ADR-0023): a segment is pruned
+    // only when every row is *born after* the snapshot (`min(sys_from) > snap`).
+    // era2's rows are born at 200 > 150, so it prunes; era0 and era1 are both
+    // born at/before 150 and are conservatively kept — the index overlay below
+    // filters era0's already-superseded rows out at read time, not the zone map.
     assert_eq!(
         keep,
-        vec![false, true, false],
-        "only era1 overlaps snapshot 150"
+        vec![true, true, false],
+        "era2 (born at 200) is pruned; era0/era1 are kept and resolved at read time"
     );
 
-    // Now run the actual query: scan only the segments might_contain keeps.
+    // Now run the actual query: scan only the segments might_contain keeps, then
+    // resolve the snapshot through the validity-index overlay.
     disk.reset_reads();
-    let mut scanned = Vec::new();
+    let mut raw = Vec::new();
     for (r, &k) in readers.iter().zip(&keep) {
         if k {
-            let versions = r.read_versions().expect("read");
-            scanned.extend(
-                versions
-                    .into_iter()
-                    .filter(|v| v.sys_from <= snapshot.0 && v.sys_to > snapshot.0),
-            );
+            raw.extend(r.read_versions().expect("read"));
         }
     }
     let reads_after_pruned_scan = disk.reads();
+    let chains = fold_chains(raw, &index).expect("fold");
+    let scanned = resolve_snapshot(&chains, snapshot);
 
     // Exactly the two era1 rows are live at snapshot 150.
-    scanned.sort_by(|x, y| x.business_key.cmp(&y.business_key));
     assert_eq!(scanned.len(), 2);
     assert_eq!(scanned[0].payload, b"a@era1");
     assert_eq!(scanned[1].payload, b"b@era1");
@@ -267,7 +291,7 @@ fn time_slice_query_scans_only_matching_segment() {
 #[test]
 fn zone_map_is_resident_after_segment_handle_dropped() {
     let disk = CountingDisk::new();
-    write_segment(&disk, "cold.seg", &[version(b"k", 100, 200, b"v")]);
+    write_segment(&disk, "cold.seg", &[version(b"k", 100, b"v")]);
 
     let zone_map = {
         let r = SegmentReader::open(&disk, "cold.seg").expect("open");
@@ -275,11 +299,15 @@ fn zone_map_is_resident_after_segment_handle_dropped() {
         // reader (and its file handle) dropped here
     };
 
-    // Even after the segment file handle is gone, the resident map prunes.
+    // Even after the segment file handle is gone, the resident map prunes. The
+    // sole row is born at 100, so the one-sided system-time prune (v6,
+    // ADR-0023) drops only snapshots strictly before 100; a snapshot at/after
+    // 100 is conservatively kept (the period end lives in the validity index,
+    // not the zone map, so the map cannot prune on "already superseded").
     disk.reset_reads();
     assert!(!zone_map.might_contain(&Predicate::All, snap(50)));
     assert!(zone_map.might_contain(&Predicate::All, snap(150)));
-    assert!(!zone_map.might_contain(&Predicate::All, snap(200)));
+    assert!(zone_map.might_contain(&Predicate::All, snap(200)));
     assert_eq!(
         disk.reads(),
         0,
@@ -296,9 +324,9 @@ fn zone_map_records_per_column_min_max() {
         &disk,
         "z.seg",
         &[
-            version(b"m", 30, 90, b"x"),
-            version(b"a", 10, 100, b"y"),
-            version(b"z", 20, 80, b"w"),
+            version(b"m", 30, b"x"),
+            version(b"a", 10, b"y"),
+            version(b"z", 20, b"w"),
         ],
     );
     let r = SegmentReader::open(&disk, "z.seg").expect("open");
@@ -308,9 +336,9 @@ fn zone_map_records_per_column_min_max() {
     assert_eq!(sys_from.min, ZoneBound::I64(10));
     assert_eq!(sys_from.max, ZoneBound::I64(30));
 
-    let sys_to = zm.column(ColumnId::SysTo).expect("sys_to stats");
-    assert_eq!(sys_to.min, ZoneBound::I64(80));
-    assert_eq!(sys_to.max, ZoneBound::I64(100));
+    // There is no `sys_to` zone (v6, ADR-0023): `ColumnId::SysTo` no longer
+    // exists — the period end lives in the validity index, so the segment
+    // carries only the `sys_from` birth zone on the system-time axis.
 
     let bk = zm
         .column(ColumnId::BusinessKey)
@@ -357,7 +385,11 @@ fn might_contain_never_prunes_a_real_match() {
         let mut rng = Lcg(seed.wrapping_mul(2_654_435_761).wrapping_add(1));
         let disk = CountingDisk::new();
 
-        // Build a random segment of 1..=8 rows.
+        // Build a random segment of 1..=8 rows. The segment stores only birth
+        // state (v6, ADR-0023), so the version is open; the oracle tracks the
+        // intended period end (`sys_to`) alongside it — the end lives in the
+        // validity index, not the segment, but the no-false-negative invariant
+        // is about the closed `[sys_from, sys_to)` visibility window.
         let row_count = 1 + rng.below(8);
         let mut rows = Vec::new();
         for _ in 0..row_count {
@@ -370,9 +402,10 @@ fn might_contain_never_prunes_a_real_match() {
             } else {
                 sys_from + 1 + rng.below(100) as i64
             };
-            rows.push(version(key, sys_from, sys_to, b"p"));
+            rows.push((version(key, sys_from, b"p"), sys_to));
         }
-        write_segment(&disk, "o.seg", &rows);
+        let versions: Vec<Version> = rows.iter().map(|(v, _)| v.clone()).collect();
+        write_segment(&disk, "o.seg", &versions);
         let reader = SegmentReader::open(&disk, "o.seg").expect("open");
 
         // Fire several random probes against this segment.
@@ -388,9 +421,9 @@ fn might_contain_never_prunes_a_real_match() {
             };
 
             // Oracle: does a visible, in-range row truly exist?
-            let real_match = rows.iter().any(|v| {
+            let real_match = rows.iter().any(|(v, sys_to)| {
                 v.sys_from <= snapshot.0
-                    && v.sys_to > snapshot.0
+                    && *sys_to > snapshot.0.0
                     && v.business_key.as_bytes() >= keys[lo]
                     && v.business_key.as_bytes() <= keys[hi]
             });
@@ -414,18 +447,16 @@ fn valid_version(key: &[u8], valid_from: i64, valid_to: i64) -> Version {
     let interval = ValidInterval::new(ValidTimeMicros(valid_from), ValidTimeMicros(valid_to))
         .expect("well-formed valid interval");
     let payload = frame_payload(true, Some(interval), b"row".to_vec()).expect("frame payload");
-    Version {
-        business_key: BusinessKey::new(key.to_vec()),
-        sys_from: SystemTimeMicros(0),
-        sys_to: SYSTEM_TIME_OPEN,
-        provenance: Provenance::new(
+    Version::open(
+        BusinessKey::new(key.to_vec()),
+        SystemTimeMicros(0),
+        Provenance::new(
             TxnId(1),
             SystemTimeMicros(0),
             Principal::new(b"svc".to_vec()),
         ),
-        closed_by: None,
         payload,
-    }
+    )
 }
 
 fn write_valid_segment(disk: &CountingDisk, name: &str, versions: &[Version]) {
@@ -574,9 +605,9 @@ fn valid_time_segment_stores_user_payload_once() {
     write_valid_segment(&disk, "vt-once.seg", &vt_rows);
 
     let sys_rows = [
-        version(b"a", 0, SYSTEM_TIME_OPEN.0, b"row"),
-        version(b"b", 0, SYSTEM_TIME_OPEN.0, b"row"),
-        version(b"c", 0, SYSTEM_TIME_OPEN.0, b"row"),
+        version(b"a", 0, b"row"),
+        version(b"b", 0, b"row"),
+        version(b"c", 0, b"row"),
     ];
     write_segment(&disk, "sys-once.seg", &sys_rows);
 
@@ -604,7 +635,7 @@ fn valid_time_segment_stores_user_payload_once() {
 #[test]
 fn system_only_segment_has_no_valid_time_columns() {
     let disk = CountingDisk::new();
-    write_segment(&disk, "sys.seg", &[version(b"k", 10, 100, b"v")]);
+    write_segment(&disk, "sys.seg", &[version(b"k", 10, b"v")]);
     let r = SegmentReader::open(&disk, "sys.seg").expect("open");
 
     assert!(r.zone_map().column(ColumnId::ValidFrom).is_none());
@@ -657,6 +688,8 @@ fn might_contain_never_prunes_a_real_match_on_truncated_payload() {
         // 1..=6 rows, each with a payload comfortably over the prefix cap
         // (97..=144 bytes), drawn from the stress alphabet so the truncation
         // and round-up paths run for every row.
+        // The segment stores only birth state (v6, ADR-0023); the oracle tracks
+        // the intended period end (`sys_to`) alongside each open version.
         let row_count = 1 + rng.below(6);
         let mut rows = Vec::new();
         for i in 0..row_count {
@@ -668,14 +701,13 @@ fn might_contain_never_prunes_a_real_match_on_truncated_payload() {
             } else {
                 sys_from + 1 + rng.below(100) as i64
             };
-            rows.push(version(
-                format!("k{i}").as_bytes(),
-                sys_from,
+            rows.push((
+                version(format!("k{i}").as_bytes(), sys_from, &payload),
                 sys_to,
-                &payload,
             ));
         }
-        write_segment(&disk, "p.seg", &rows);
+        let versions: Vec<Version> = rows.iter().map(|(v, _)| v.clone()).collect();
+        write_segment(&disk, "p.seg", &versions);
         let reader = SegmentReader::open(&disk, "p.seg").expect("open");
 
         for _ in 0..24 {
@@ -687,7 +719,7 @@ fn might_contain_never_prunes_a_real_match_on_truncated_payload() {
             let predicate = if rng.below(2) == 0 {
                 let value = if rng.below(2) == 0 && !rows.is_empty() {
                     let idx = rng.below(rows.len() as u64) as usize;
-                    rows[idx].payload.clone()
+                    rows[idx].0.payload.clone()
                 } else {
                     let len = 40 + rng.below(50) as usize;
                     stress_bytes(&mut rng, len)
@@ -710,8 +742,8 @@ fn might_contain_never_prunes_a_real_match_on_truncated_payload() {
             };
 
             // Oracle: does a visible row satisfy the predicate exactly?
-            let real_match = rows.iter().any(|v| {
-                let visible = v.sys_from <= snapshot.0 && v.sys_to > snapshot.0;
+            let real_match = rows.iter().any(|(v, sys_to)| {
+                let visible = v.sys_from <= snapshot.0 && *sys_to > snapshot.0.0;
                 let pred_holds = match &predicate {
                     Predicate::Eq {
                         value: ZoneBound::Bytes(value),

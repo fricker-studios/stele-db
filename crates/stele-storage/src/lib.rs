@@ -25,6 +25,7 @@ pub mod dml;
 pub mod merge;
 pub mod segment;
 pub mod systime;
+pub mod validity;
 pub mod validtime;
 pub mod wal;
 

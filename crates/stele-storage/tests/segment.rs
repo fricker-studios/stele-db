@@ -21,7 +21,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use stele_common::provenance::{Principal, Provenance, TxnId};
-use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
+use stele_common::time::SystemTimeMicros;
 use stele_storage::delta::{BusinessKey, Version};
 use stele_storage::segment::{ColumnData, ColumnId, SegmentError, SegmentReader, SegmentWriter};
 use stele_storage::wal::{Disk, DiskFile};
@@ -123,21 +123,23 @@ impl DiskFile for MemFile {
 
 // --- Test helpers -----------------------------------------------------------
 
-fn version(key: &[u8], sys_from: i64, sys_to: SystemTimeMicros, payload: &[u8]) -> Version {
-    Version {
-        business_key: BusinessKey::new(key.to_vec()),
-        sys_from: SystemTimeMicros(sys_from),
-        sys_to,
-        // Provenance varies per row (txn_id/committed_at track sys_from) so the
-        // round-trip exercises real values across the three provenance columns.
-        provenance: Provenance::new(
+// A segment stores only *birth* state (v6, ADR-0023): there is no stored
+// `sys_to` / close-provenance column, and a version read back from a segment is
+// always open. So the helper builds open versions via `Version::open`; the
+// close/`sys_to` concept is exercised by the validity-index tests, not here.
+fn version(key: &[u8], sys_from: i64, payload: &[u8]) -> Version {
+    // Provenance varies per row (txn_id/committed_at track sys_from) so the
+    // round-trip exercises real values across the three provenance columns.
+    Version::open(
+        BusinessKey::new(key.to_vec()),
+        SystemTimeMicros(sys_from),
+        Provenance::new(
             TxnId(u64::try_from(sys_from).unwrap_or(0)),
             SystemTimeMicros(sys_from),
             Principal::new(format!("svc-{sys_from}").into_bytes()),
         ),
-        closed_by: None,
-        payload: payload.to_vec(),
-    }
+        payload.to_vec(),
+    )
 }
 
 fn write_segment(disk: &MemDisk, name: &str, versions: &[Version]) {
@@ -149,22 +151,23 @@ fn write_segment(disk: &MemDisk, name: &str, versions: &[Version]) {
 }
 
 /// A representative workload: a handful of business keys with version chains
-/// of varied length, sys_to mixing closed and open intervals, payloads
-/// non-empty including some larger blobs. Exercises both bytes and i64
-/// columns and both stats paths.
+/// of varied length and distinct `sys_from` birth times, payloads non-empty
+/// including some larger blobs. Exercises both bytes and i64 columns and both
+/// stats paths. Every version is *open* — a segment stores only birth state,
+/// so the period end is not a round-trippable segment field.
 fn sample_workload() -> Vec<Version> {
     let blob = vec![0xABu8; 4096];
     vec![
-        // Key "a": three versions — two closed, one open.
-        version(b"a", 10, SystemTimeMicros(20), b"a-v0"),
-        version(b"a", 20, SystemTimeMicros(30), b"a-v1"),
-        version(b"a", 30, SYSTEM_TIME_OPEN, b"a-v2"),
-        // Key "b": one open version.
-        version(b"b", 15, SYSTEM_TIME_OPEN, b"only-b"),
+        // Key "a": three versions at distinct birth times.
+        version(b"a", 10, b"a-v0"),
+        version(b"a", 20, b"a-v1"),
+        version(b"a", 30, b"a-v2"),
+        // Key "b": one version.
+        version(b"b", 15, b"only-b"),
         // Key "c": empty payload — exercises the zero-length-bytes legal case.
-        version(b"c", 5, SystemTimeMicros(7), b""),
+        version(b"c", 5, b""),
         // Key "long": multi-KB payload — exercises larger bytes values.
-        version(b"long", 1, SystemTimeMicros(2), &blob),
+        version(b"long", 1, &blob),
     ]
 }
 
@@ -192,7 +195,6 @@ fn round_trip_preserves_every_column_value() {
         .map(|v| v.business_key.as_bytes().to_vec())
         .collect();
     let expected_sys_from: Vec<i64> = written.iter().map(|v| v.sys_from.0).collect();
-    let expected_sys_to: Vec<i64> = written.iter().map(|v| v.sys_to.0).collect();
     let expected_payload: Vec<Vec<u8>> = written.iter().map(|v| v.payload.clone()).collect();
 
     assert_eq!(
@@ -203,10 +205,8 @@ fn round_trip_preserves_every_column_value() {
         r.read_column(ColumnId::SysFrom).unwrap(),
         ColumnData::I64(expected_sys_from),
     );
-    assert_eq!(
-        r.read_column(ColumnId::SysTo).unwrap(),
-        ColumnData::I64(expected_sys_to),
-    );
+    // No `sys_to` column exists (v6, ADR-0023): the period end lives in the
+    // validity index, not the segment.
     assert_eq!(
         r.read_column(ColumnId::Payload).unwrap(),
         ColumnData::Bytes(expected_payload),

@@ -14,8 +14,6 @@
 //! segments append-rejecting at the type level
 //! ([architecture §12 invariant 1](../../../../../docs/02-architecture.md#12-cross-cutting-architectural-invariants)).
 
-use stele_common::time::SYSTEM_TIME_OPEN;
-
 use crate::backend::{Disk, DiskFile};
 use crate::checksum::crc32c;
 use crate::delta::Version;
@@ -350,19 +348,11 @@ fn extract_bytes(col: ColumnId, row: &Version, valid_time: bool) -> Result<&[u8]
             }
         }
         ColumnId::Principal => Ok(row.provenance.principal.as_bytes()),
-        // Empty on an open version; the closing principal's bytes otherwise.
-        ColumnId::ClosedByPrincipal => Ok(row
-            .closed_by
-            .as_ref()
-            .map_or(&[][..], |c| c.principal.as_bytes())),
         ColumnId::SysFrom
-        | ColumnId::SysTo
         | ColumnId::TxnId
         | ColumnId::CommittedAt
         | ColumnId::ValidFrom
-        | ColumnId::ValidTo
-        | ColumnId::ClosedByTxn
-        | ColumnId::ClosedAt => {
+        | ColumnId::ValidTo => {
             unreachable!("not a bytes column")
         }
     }
@@ -374,29 +364,17 @@ fn extract_bytes(col: ColumnId, row: &Version, valid_time: bool) -> Result<&[u8]
 fn extract_i64(col: ColumnId, row: &Version) -> i64 {
     match col {
         ColumnId::SysFrom => row.sys_from.0,
-        ColumnId::SysTo => row.sys_to.0,
         // `txn_id` is a u64; store its bits in the i64 column (lossless
         // round-trip — see `ColumnId::TxnId`).
         ColumnId::TxnId => row.provenance.txn_id.0 as i64,
         ColumnId::CommittedAt => row.provenance.committed_at.0,
-        // Close-provenance: `0` / the `SYSTEM_TIME_OPEN` sentinel on an open
-        // version. `ClosedAt`'s sentinel is the presence discriminator the
-        // reader keys off — see `ColumnId::ClosedAt`.
-        ColumnId::ClosedByTxn => row.closed_by.as_ref().map_or(0, |c| c.txn_id.0 as i64),
-        ColumnId::ClosedAt => row
-            .closed_by
-            .as_ref()
-            .map_or(SYSTEM_TIME_OPEN.0, |c| c.committed_at.0),
         // The valid-time columns are not `Version` fields — they are lifted
         // from the payload prefix by `decode_valid_pairs`, which the caller
         // reads from directly.
         ColumnId::ValidFrom | ColumnId::ValidTo => {
             unreachable!("valid-time columns are extracted via decode_valid_pairs")
         }
-        ColumnId::BusinessKey
-        | ColumnId::Payload
-        | ColumnId::Principal
-        | ColumnId::ClosedByPrincipal => {
+        ColumnId::BusinessKey | ColumnId::Payload | ColumnId::Principal => {
             unreachable!("not an i64 column")
         }
     }
