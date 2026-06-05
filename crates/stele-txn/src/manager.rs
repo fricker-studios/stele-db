@@ -374,7 +374,12 @@ mod tests {
     use stele_common::provenance::{Principal, Provenance};
     use stele_storage::backend::MemDisk;
     use stele_storage::delta::{Delta, DeltaConfig, Version};
+    use stele_storage::validity::{Close, ValidityConfig, ValidityIndex};
     use stele_storage::wal::{Checkpoint, Wal, WalConfig};
+
+    fn new_index() -> ValidityIndex<MemDisk> {
+        ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("open index")
+    }
 
     /// A clock pinned to a fixed reading — a stalled wall clock — to prove the
     /// monotonic cursor advances commits past snapshots on its own, not the
@@ -398,20 +403,24 @@ mod tests {
 
     /// Build the open version a committed insert stages: `[commit, +∞)`.
     fn open_version(key: &BusinessKey, txn_id: TxnId, commit: SystemTimeMicros) -> Version {
-        Version {
-            business_key: key.clone(),
-            sys_from: commit,
-            sys_to: SYSTEM_TIME_OPEN,
-            provenance: Provenance::new(txn_id, commit, Principal::new(b"tester".to_vec())),
-            closed_by: None,
-            payload: format!("v@{}", commit.0).into_bytes(),
-        }
+        Version::open(
+            key.clone(),
+            commit,
+            Provenance::new(txn_id, commit, Principal::new(b"tester".to_vec())),
+            format!("v@{}", commit.0).into_bytes(),
+        )
     }
 
-    /// Read back the single payload live for `key` at `snapshot`, if any.
-    fn read(delta: &Delta<MemDisk>, key: &BusinessKey, snapshot: Snapshot) -> Option<Vec<u8>> {
+    /// Read back the single payload live for `key` at `snapshot`, if any —
+    /// resolving each version's end from the validity `index` ([ADR-0023]).
+    fn read(
+        delta: &Delta<MemDisk>,
+        index: &ValidityIndex<MemDisk>,
+        key: &BusinessKey,
+        snapshot: Snapshot,
+    ) -> Option<Vec<u8>> {
         delta
-            .range_scan(key.clone()..=key.clone(), snapshot)
+            .range_scan(key.clone()..=key.clone(), snapshot, index)
             .expect("range scan")
             .into_iter()
             .next()
@@ -425,6 +434,7 @@ mod tests {
     fn reader_snapshot_is_stable_under_a_concurrent_commit() {
         let mgr = manager(StubClock::new(1_000));
         let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+        let mut index = new_index();
         let key = BusinessKey::new(b"k".to_vec());
 
         // Writer A inserts v1 and commits.
@@ -440,11 +450,12 @@ mod tests {
         let r = mgr.begin();
         let s = r.snapshot();
         assert_eq!(
-            read(&delta, &key, s),
+            read(&delta, &index, &key, s),
             Some(format!("v@{}", c1.0).into_bytes())
         );
 
-        // Writer B supersedes K: commit at c2 > s, closing v1 and opening v2.
+        // Writer B supersedes K: commit at c2 > s, closing v1 (a write-once entry
+        // in the validity index) and opening v2.
         let mut b = mgr.begin();
         b.write(key.clone());
         let b_done = mgr.commit(b).expect("commit b");
@@ -453,27 +464,27 @@ mod tests {
             c2.0 > s.0.0,
             "the concurrent commit must land strictly after R's snapshot"
         );
-        let mut v1_closed = open_version(&key, a_done.txn_id, c1);
-        v1_closed.sys_to = c2;
-        v1_closed.closed_by = Some(Provenance::new(
-            b_done.txn_id,
-            c2,
-            Principal::new(b"tester".to_vec()),
-        ));
-        delta.insert(v1_closed).expect("close v1");
+        index
+            .insert_close(Close {
+                business_key: key.clone(),
+                sys_from: c1,
+                sys_to: c2,
+                closed_by: Provenance::new(b_done.txn_id, c2, Principal::new(b"tester".to_vec())),
+            })
+            .expect("close v1");
         delta
             .insert(open_version(&key, b_done.txn_id, c2))
             .expect("stage v2");
 
         // R, still at its snapshot, must NOT observe v2.
         assert_eq!(
-            read(&delta, &key, s),
+            read(&delta, &index, &key, s),
             Some(format!("v@{}", c1.0).into_bytes())
         );
         // A fresh reader, snapshotting after c2, sees v2.
         let r2 = mgr.begin();
         assert_eq!(
-            read(&delta, &key, r2.snapshot()),
+            read(&delta, &index, &key, r2.snapshot()),
             Some(format!("v@{}", c2.0).into_bytes())
         );
     }
@@ -631,6 +642,7 @@ mod tests {
 
         // A version open at that clamped snapshot is still visible.
         let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+        let index = new_index();
         let key = BusinessKey::new(b"k".to_vec());
         delta
             .insert(open_version(
@@ -639,6 +651,6 @@ mod tests {
                 SystemTimeMicros(SYSTEM_TIME_OPEN.0 - 1),
             ))
             .expect("stage open version");
-        assert!(read(&delta, &key, r.snapshot()).is_some());
+        assert!(read(&delta, &index, &key, r.snapshot()).is_some());
     }
 }

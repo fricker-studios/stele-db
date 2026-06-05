@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros, VALID_TIME_OPEN, ValidTimeMicros};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
+use stele_storage::validity::{ValidityConfig, ValidityIndex};
 use stele_storage::validtime::{ValidInterval, ValidTimeError, ValidTimeWriter, unframe_payload};
 use stele_storage::wal::{Disk, DiskFile};
 
@@ -145,6 +146,10 @@ fn new_delta() -> Delta<MemDisk> {
     Delta::open(MemDisk::new(), DeltaConfig::default()).unwrap()
 }
 
+fn new_index() -> ValidityIndex<MemDisk> {
+    ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).unwrap()
+}
+
 const fn vt(micros: i64) -> ValidTimeMicros {
     ValidTimeMicros(micros)
 }
@@ -155,10 +160,26 @@ fn interval(from: i64, to: i64) -> ValidInterval {
 
 /// Drain the delta and group every stored version by business key, preserving
 /// the `(business_key, sys_from)` order — each `Vec<Version>` is one key's full
-/// chain, oldest first. Destructive: call once, after all writes.
-fn drain_chains(delta: &mut Delta<MemDisk>) -> BTreeMap<BusinessKey, Vec<Version>> {
+/// chain, oldest first.
+///
+/// Under [ADR-0023] a flushed version's system-time end is not on the record;
+/// it lives in the [`ValidityIndex`]. We overlay each version's materialized
+/// `sys_to`/`closed_by` from the index — the read path's resolution — so the
+/// returned chain carries the closed ends the tests assert on, leaving the open
+/// tail untouched. The valid-time interval is unaffected: it stays framed in the
+/// payload regardless.
+///
+/// Destructive: call once, after all writes.
+fn drain_chains(
+    delta: &mut Delta<MemDisk>,
+    index: &ValidityIndex<MemDisk>,
+) -> BTreeMap<BusinessKey, Vec<Version>> {
     let mut map: BTreeMap<BusinessKey, Vec<Version>> = BTreeMap::new();
-    for v in delta.flush_to_segment().unwrap() {
+    for mut v in delta.flush_to_segment().unwrap() {
+        if let Some(ci) = index.close_of(&v.business_key, v.sys_from).unwrap() {
+            v.sys_to = ci.sys_to;
+            v.closed_by = Some(ci.closed_by);
+        }
         map.entry(v.business_key.clone()).or_default().push(v);
     }
     map
@@ -169,6 +190,7 @@ fn drain_chains(delta: &mut Delta<MemDisk>) -> BTreeMap<BusinessKey, Vec<Version
 #[test]
 fn insert_into_a_valid_time_table_populates_both_axes_and_reads_filter_on_either() {
     let mut delta = new_delta();
+    let mut index = new_index();
     let clock = StubClock::new(1_000);
     let mut writer = ValidTimeWriter::new(clock, true);
     let key = BusinessKey::new(b"emp-1".to_vec());
@@ -177,6 +199,7 @@ fn insert_into_a_valid_time_table_populates_both_axes_and_reads_filter_on_either
     let sys_from = writer
         .insert(
             &mut delta,
+            &mut index,
             key.clone(),
             Some(interval(100, 200)),
             b"role=ic".to_vec(),
@@ -187,7 +210,7 @@ fn insert_into_a_valid_time_table_populates_both_axes_and_reads_filter_on_either
 
     // --- Filter on the SYSTEM axis: range_scan resolves the live version. ---
     let live = delta
-        .range_scan(key.clone()..=key, Snapshot(SystemTimeMicros(1_500)))
+        .range_scan(key.clone()..=key, Snapshot(SystemTimeMicros(1_500)), &index)
         .unwrap();
     assert_eq!(live.len(), 1, "exactly one version live at the snapshot");
     let stored = &live[0];
@@ -213,6 +236,7 @@ fn insert_into_a_valid_time_table_populates_both_axes_and_reads_filter_on_either
 #[test]
 fn update_opens_a_new_valid_period_and_the_superseded_one_keeps_its_interval() {
     let mut delta = new_delta();
+    let mut index = new_index();
     let clock = StubClock::new(1_000);
     let mut writer = ValidTimeWriter::new(clock.clone(), true);
     let key = BusinessKey::new(b"emp-1".to_vec());
@@ -220,6 +244,7 @@ fn update_opens_a_new_valid_period_and_the_superseded_one_keeps_its_interval() {
     writer
         .insert(
             &mut delta,
+            &mut index,
             key.clone(),
             Some(interval(100, 200)),
             b"role=ic".to_vec(),
@@ -232,6 +257,7 @@ fn update_opens_a_new_valid_period_and_the_superseded_one_keeps_its_interval() {
     writer
         .update(
             &mut delta,
+            &mut index,
             key.clone(),
             Some(interval(200, i64::MAX)),
             b"role=lead".to_vec(),
@@ -240,7 +266,7 @@ fn update_opens_a_new_valid_period_and_the_superseded_one_keeps_its_interval() {
         )
         .unwrap();
 
-    let mut chains = drain_chains(&mut delta);
+    let mut chains = drain_chains(&mut delta, &index);
     let versions = chains.remove(&key).expect("key has a chain");
     assert_eq!(versions.len(), 2, "insert + update ⇒ two versions");
 
@@ -266,6 +292,7 @@ fn update_opens_a_new_valid_period_and_the_superseded_one_keeps_its_interval() {
 #[test]
 fn delete_closes_the_system_period_and_preserves_the_valid_interval() {
     let mut delta = new_delta();
+    let mut index = new_index();
     let clock = StubClock::new(10);
     let mut writer = ValidTimeWriter::new(clock, true);
     let key = BusinessKey::new(b"emp-1".to_vec());
@@ -273,6 +300,7 @@ fn delete_closes_the_system_period_and_preserves_the_valid_interval() {
     writer
         .insert(
             &mut delta,
+            &mut index,
             key.clone(),
             Some(interval(100, 200)),
             b"role=ic".to_vec(),
@@ -283,6 +311,7 @@ fn delete_closes_the_system_period_and_preserves_the_valid_interval() {
     let closed_at = writer
         .delete(
             &mut delta,
+            &mut index,
             &key,
             TxnId(7),
             Principal::new(b"deleter".to_vec()),
@@ -291,11 +320,11 @@ fn delete_closes_the_system_period_and_preserves_the_valid_interval() {
 
     // Nothing is live after the delete on the system axis.
     let live = delta
-        .range_scan(.., Snapshot(SystemTimeMicros(i64::MAX - 1)))
+        .range_scan(.., Snapshot(SystemTimeMicros(i64::MAX - 1)), &index)
         .unwrap();
     assert!(live.is_empty(), "deleted key has no live version");
 
-    let mut chains = drain_chains(&mut delta);
+    let mut chains = drain_chains(&mut delta, &index);
     let versions = chains.remove(&key).expect("key has a chain");
     assert_eq!(versions.len(), 1);
     assert_eq!(
@@ -323,11 +352,20 @@ fn delete_closes_the_system_period_and_preserves_the_valid_interval() {
 #[test]
 fn valid_time_table_requires_an_interval_on_every_write() {
     let mut delta = new_delta();
+    let mut index = new_index();
     let mut writer = ValidTimeWriter::new(StubClock::new(1), true);
     let key = BusinessKey::new(b"k".to_vec());
 
     let err = writer
-        .insert(&mut delta, key, None, b"x".to_vec(), TxnId(1), who())
+        .insert(
+            &mut delta,
+            &mut index,
+            key,
+            None,
+            b"x".to_vec(),
+            TxnId(1),
+            who(),
+        )
         .unwrap_err();
     assert!(matches!(err, ValidTimeError::ValidTimeRequired));
 }
@@ -335,12 +373,14 @@ fn valid_time_table_requires_an_interval_on_every_write() {
 #[test]
 fn system_only_table_rejects_a_supplied_interval() {
     let mut delta = new_delta();
+    let mut index = new_index();
     let mut writer = ValidTimeWriter::new(StubClock::new(1), false);
     let key = BusinessKey::new(b"k".to_vec());
 
     let err = writer
         .insert(
             &mut delta,
+            &mut index,
             key,
             Some(interval(1, 2)),
             b"x".to_vec(),
@@ -354,6 +394,7 @@ fn system_only_table_rejects_a_supplied_interval() {
 #[test]
 fn system_only_table_stores_payload_with_no_prefix() {
     let mut delta = new_delta();
+    let mut index = new_index();
     let clock = StubClock::new(500);
     let mut writer = ValidTimeWriter::new(clock, false);
     let key = BusinessKey::new(b"k".to_vec());
@@ -361,6 +402,7 @@ fn system_only_table_stores_payload_with_no_prefix() {
     writer
         .insert(
             &mut delta,
+            &mut index,
             key.clone(),
             None,
             b"plain".to_vec(),
@@ -370,7 +412,7 @@ fn system_only_table_stores_payload_with_no_prefix() {
         .unwrap();
 
     let live = delta
-        .range_scan(key.clone()..=key, Snapshot(SystemTimeMicros(600)))
+        .range_scan(key.clone()..=key, Snapshot(SystemTimeMicros(600)), &index)
         .unwrap();
     assert_eq!(live.len(), 1);
     // Stored verbatim — no 16-byte interval prefix on a system-only table.

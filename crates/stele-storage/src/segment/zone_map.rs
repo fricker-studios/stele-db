@@ -23,15 +23,19 @@
 //! ## Temporal pruning ([architecture §3.3](../../../../../docs/02-architecture.md#33-how-b-tree-and-columnstore-coexist))
 //!
 //! A version is visible at a system-time `snapshot` iff
-//! `sys_from <= snapshot < sys_to` — the same half-open `[sys_from, sys_to)`
-//! interval the delta tier's resolver uses
-//! ([`crate::delta`]'s `pick_live`). From the segment's zone maps that yields
-//! two one-sided skip rules:
+//! `sys_from <= snapshot < sys_to`. A sealed segment stores only `sys_from`, not
+//! `sys_to` (v6, [ADR-0023](../../../../../docs/adr/0023-append-only-record-model-validity-index.md)):
+//! the period end lives in the derived [validity index](crate::validity). So the
+//! segment zone map gives **one** one-sided skip rule on the system axis:
 //!
 //! * if `min(sys_from) > snapshot`, *every* row begins after the snapshot —
 //!   none is visible yet; skip.
-//! * if `max(sys_to) <= snapshot`, *every* row was already superseded at the
-//!   snapshot — none is visible; skip.
+//!
+//! The complementary "every row already superseded" prune (an upper bound on the
+//! period end) is the validity index's to provide — a follow-up; until then a
+//! segment whose rows have all been superseded is conservatively *kept* and the
+//! index-overlaid resolver filters it out at read time. Conservative, never a
+//! false negative.
 //!
 //! Valid-time pruning rides the *same* generic machinery. A valid-time table's
 //! segment carries `valid_from` / `valid_to` as first-class `i64` columns,
@@ -57,8 +61,7 @@ use super::format::ColumnId;
 /// lexicographically (the order [`crate::delta::BusinessKey`] already sorts by).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ZoneBound {
-    /// Bound of a fixed-width `i64` column ([`ColumnId::SysFrom`] /
-    /// [`ColumnId::SysTo`]).
+    /// Bound of a fixed-width `i64` column (e.g. [`ColumnId::SysFrom`]).
     I64(i64),
     /// Bound of a variable-length bytes column ([`ColumnId::BusinessKey`]).
     Bytes(Vec<u8>),
@@ -147,7 +150,9 @@ impl ZoneMap {
     }
 
     /// One-sided system-time visibility test. `false` means every row in the
-    /// segment is provably outside the snapshot's `[sys_from, sys_to)` slice.
+    /// segment provably begins after the snapshot. The complementary "every row
+    /// already superseded" prune needs the period end, which a segment no longer
+    /// stores (v6, [ADR-0023]) — that prune is the validity index's to provide.
     fn snapshot_overlaps(&self, snapshot: Snapshot) -> bool {
         let s = snapshot.0;
         // If we know the minimum `sys_from` and it is already past the
@@ -156,16 +161,6 @@ impl ZoneMap {
         if let Some(zone) = self.column(ColumnId::SysFrom) {
             if let ZoneBound::I64(min_sys_from) = &zone.min {
                 if SystemTimeMicros(*min_sys_from) > s {
-                    return false;
-                }
-            }
-        }
-        // If we know the maximum `sys_to` and it is at or before the snapshot,
-        // every row was already superseded by `s` (the interval is half-open,
-        // so `sys_to == s` is *not* visible).
-        if let Some(zone) = self.column(ColumnId::SysTo) {
-            if let ZoneBound::I64(max_sys_to) = &zone.max {
-                if SystemTimeMicros(*max_sys_to) <= s {
                     return false;
                 }
             }
@@ -287,13 +282,13 @@ mod tests {
         )
     }
 
-    /// A zone map for a segment whose rows span `sys_from in [sf_min, sf_max]`
-    /// and `sys_to in [st_min, st_max]`, all sharing the single business key
-    /// `bk` (so the BusinessKey zone is the degenerate `[bk, bk]`).
-    fn map(sf: (i64, i64), st: (i64, i64), bk: &[u8]) -> ZoneMap {
+    /// A zone map for a segment whose rows span `sys_from in [sf_min, sf_max]`,
+    /// all sharing the single business key `bk` (so the BusinessKey zone is the
+    /// degenerate `[bk, bk]`). A segment no longer stores `sys_to` (v6,
+    /// [ADR-0023]), so the period-end prune is not the zone map's anymore.
+    fn map(sf: (i64, i64), bk: &[u8]) -> ZoneMap {
         ZoneMap::from_bounds([
             i64_zone(ColumnId::SysFrom, sf.0, sf.1),
-            i64_zone(ColumnId::SysTo, st.0, st.1),
             bytes_zone(ColumnId::BusinessKey, bk, bk),
         ])
     }
@@ -305,31 +300,24 @@ mod tests {
     #[test]
     fn snapshot_before_every_sys_from_is_pruned() {
         // All rows begin at sys_from >= 100; a snapshot at 50 sees nothing.
-        let zm = map((100, 200), (300, 400), b"a");
+        let zm = map((100, 200), b"a");
         assert!(!zm.might_contain(&Predicate::All, snap(50)));
     }
 
     #[test]
-    fn snapshot_at_or_after_every_sys_to_is_pruned() {
-        // All rows superseded by sys_to <= 400; the interval is half-open so a
-        // snapshot exactly at 400 is already outside every row.
-        let zm = map((100, 200), (300, 400), b"a");
-        assert!(!zm.might_contain(&Predicate::All, snap(400)));
-        assert!(!zm.might_contain(&Predicate::All, snap(401)));
-    }
-
-    #[test]
-    fn snapshot_inside_the_slice_is_kept() {
-        let zm = map((100, 200), (300, 400), b"a");
-        // 399 < max(sys_to)=400 and >= min(sys_from)=100 ⇒ cannot rule out.
-        assert!(zm.might_contain(&Predicate::All, snap(399)));
+    fn snapshot_at_or_after_min_sys_from_is_kept() {
+        // Without a stored sys_to the segment can no longer prune on "every row
+        // already superseded" — a snapshot at or after min(sys_from) is kept and
+        // the index-overlaid resolver filters at read time.
+        let zm = map((100, 200), b"a");
+        assert!(zm.might_contain(&Predicate::All, snap(400)));
         // Boundary: snapshot == min(sys_from) is visible (closed lower bound).
         assert!(zm.might_contain(&Predicate::All, snap(100)));
     }
 
     #[test]
     fn eq_predicate_prunes_outside_value_range() {
-        let zm = map((1, 10), (20, 30), b"d");
+        let zm = map((1, 10), b"d");
         let inside = snap(5);
         // business_key range is exactly ["d","d"]; "a" and "z" fall outside.
         assert!(!zm.might_contain(
@@ -350,7 +338,7 @@ mod tests {
 
     #[test]
     fn range_predicate_overlap_logic() {
-        let zm = map((1, 10), (20, 30), b"m");
+        let zm = map((1, 10), b"m");
         let inside = snap(5);
         let bk = ColumnId::BusinessKey;
         // [a, c] entirely below [m, m] ⇒ prune.
@@ -376,7 +364,7 @@ mod tests {
     #[test]
     fn missing_column_stats_never_prune() {
         // A zone map with no Payload stats must never prune on Payload.
-        let zm = map((1, 10), (20, 30), b"k");
+        let zm = map((1, 10), b"k");
         assert!(zm.might_contain(
             &Predicate::Eq {
                 column: ColumnId::Payload,
@@ -388,7 +376,7 @@ mod tests {
 
     #[test]
     fn and_requires_every_part() {
-        let zm = map((1, 10), (20, 30), b"k");
+        let zm = map((1, 10), b"k");
         let bk = ColumnId::BusinessKey;
         let keep = Predicate::Eq {
             column: bk,
@@ -410,7 +398,7 @@ mod tests {
         // type (a caller bug) is incomparable. Pruning on an incomparable
         // ordering would be a false negative, so might_contain must keep the
         // segment in every such case.
-        let zm = map((1, 10), (20, 30), b"k");
+        let zm = map((1, 10), b"k");
         // Bytes value against the i64 SysFrom column.
         assert!(zm.might_contain(
             &Predicate::Eq {

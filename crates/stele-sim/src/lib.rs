@@ -24,12 +24,14 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use stele_common::provenance::{Principal, Provenance, TxnId};
-use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros, ValidTimeMicros};
+use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
 use stele_storage::backend::{Disk, DiskFile, FaultOp, Faults, MemDisk};
-use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Version};
+use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
 use stele_storage::dml::{self, DmlWriter};
+use stele_storage::merge;
 use stele_storage::segment::{SegmentReader, SegmentWriter};
 use stele_storage::systime::{EmptySealed, SysTimeWriter};
+use stele_storage::validity::{Close, ValidityConfig, ValidityIndex};
 use stele_storage::validtime::{ValidInterval, ValidTimeWriter, unframe_payload};
 use stele_storage::wal::{Checkpoint, Wal, WalConfig};
 use stele_txn::TxnManager;
@@ -157,45 +159,24 @@ pub fn run_storage_seed(seed: u64) -> u64 {
             let payload = rng.bytes(payload_len);
             // Provenance is part of every version — generate it from the same
             // seed stream so the round-trip exercises the provenance columns
-            // deterministically ([STL-93]).
+            // deterministically ([STL-93]). A sealed segment stores only birth
+            // state ([ADR-0023]): `sys_to` / `closed_by` are not segment columns,
+            // so every pushed version is open/unresolved.
             let sys_from = rng.next_i64_nonneg() % 1_000_000;
             let txn_id = u64::try_from(rng.next_i64_nonneg()).unwrap_or(0);
             let principal_len = rng.below_usize(8);
             let principal = rng.bytes(principal_len);
-            // Roughly half the rows are *closed* versions carrying a second
-            // (close) provenance group, so the round-trip exercises the v3
-            // close-provenance columns deterministically ([STL-118]). A closed
-            // version's `sys_to` and `closed_at` are real values below the open
-            // sentinel; an open one keeps `SYSTEM_TIME_OPEN` and `None`.
-            let (sys_to, closed_by) = if rng.below(2) == 0 {
-                let closed_at = sys_from + 1 + (rng.next_i64_nonneg() % 1_000);
-                let closer_txn = u64::try_from(rng.next_i64_nonneg()).unwrap_or(0);
-                let closer_principal_len = rng.below_usize(8);
-                let closer_principal = rng.bytes(closer_principal_len);
-                (
-                    SystemTimeMicros(closed_at),
-                    Some(Provenance::new(
-                        TxnId(closer_txn),
-                        SystemTimeMicros(closed_at),
-                        Principal::new(closer_principal),
-                    )),
-                )
-            } else {
-                (SYSTEM_TIME_OPEN, None)
-            };
             writer
-                .push(Version {
-                    business_key: BusinessKey::new(key),
-                    sys_from: SystemTimeMicros(sys_from),
-                    sys_to,
-                    provenance: Provenance::new(
+                .push(Version::open(
+                    BusinessKey::new(key),
+                    SystemTimeMicros(sys_from),
+                    Provenance::new(
                         TxnId(txn_id),
                         SystemTimeMicros(sys_from),
                         Principal::new(principal),
                     ),
-                    closed_by,
                     payload,
-                })
+                ))
                 .expect("push version");
         }
         writer.finish().expect("finish segment");
@@ -210,14 +191,42 @@ pub fn run_storage_seed(seed: u64) -> u64 {
     for name in &names {
         let reader = SegmentReader::open(&disk, name).expect("open segment");
         for v in reader.read_versions().expect("read versions") {
-            digest = fnv1a(digest, v.business_key.as_bytes());
-            digest = fnv1a(digest, &v.sys_from.0.to_le_bytes());
-            digest = fnv1a(digest, &v.sys_to.0.to_le_bytes());
-            digest = fnv1a(digest, &v.provenance.txn_id.0.to_le_bytes());
-            digest = fnv1a(digest, &v.provenance.committed_at.0.to_le_bytes());
-            digest = fnv1a(digest, v.provenance.principal.as_bytes());
-            digest = fold_closed_by(digest, v.closed_by.as_ref());
-            digest = fnv1a(digest, &v.payload);
+            digest = fold_version(digest, &v);
+        }
+    }
+    digest
+}
+
+/// Fold a resolved version — birth fields plus the validity-index overlay
+/// (`sys_to` / `closed_by`) — into the digest. The single place the seed oracles
+/// agree on what a version "is", so a segment read, a delta drain, and a WAL
+/// rebuild all hash the same bytes for the same logical version.
+fn fold_version(mut digest: u64, v: &Version) -> u64 {
+    digest = fnv1a(digest, v.business_key.as_bytes());
+    digest = fnv1a(digest, &v.sys_from.0.to_le_bytes());
+    digest = fnv1a(digest, &v.sys_to.0.to_le_bytes());
+    digest = fnv1a(digest, &v.provenance.txn_id.0.to_le_bytes());
+    digest = fnv1a(digest, &v.provenance.committed_at.0.to_le_bytes());
+    digest = fnv1a(digest, v.provenance.principal.as_bytes());
+    digest = fold_closed_by(digest, v.closed_by.as_ref());
+    digest = fnv1a(digest, &v.payload);
+    digest
+}
+
+/// Drain `delta`, overlay the validity `index` onto every staged version
+/// ([`merge::fold_chains`]), and fold the resolved chains — in `(key, sys_from)`
+/// order — into `digest`. The oracle for the system-time write paths: it sees
+/// each version's materialized `sys_to` / `closed_by` exactly as a reader would.
+fn fold_resolved_chains<D: Disk, I: Disk>(
+    mut digest: u64,
+    delta: &mut Delta<D>,
+    index: &ValidityIndex<I>,
+) -> u64 {
+    let drained = delta.flush_to_segment().expect("flush");
+    let chains = merge::fold_chains(drained, index).expect("fold chains");
+    for chain in chains.values() {
+        for v in chain.values() {
+            digest = fold_version(digest, v);
         }
     }
     digest
@@ -236,6 +245,7 @@ pub fn run_validtime_seed(seed: u64) -> u64 {
     const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
     let mut rng = Rng::new(seed);
     let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+    let mut index = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
     let mut writer = ValidTimeWriter::new(StepClock::new(1), true);
 
     let keys = 1 + rng.below(8);
@@ -254,6 +264,7 @@ pub fn run_validtime_seed(seed: u64) -> u64 {
         writer
             .insert(
                 &mut delta,
+                &mut index,
                 key,
                 Some(interval),
                 payload,
@@ -297,6 +308,7 @@ pub fn run_delete_seed(seed: u64) -> u64 {
     const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
     let mut rng = Rng::new(seed);
     let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+    let mut index = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
     let mut writer = SysTimeWriter::new(StepClock::new(1));
 
     let key_count = 1 + rng.below_usize(6);
@@ -310,42 +322,50 @@ pub fn run_delete_seed(seed: u64) -> u64 {
         let principal = Principal::new(rng.bytes(principal_len));
         if live[k] {
             // A live key is either superseded (close + re-open) or deleted
-            // (close, no re-open) — both record `principal` as the closer.
+            // (close, no re-open) — both record `principal` as the closer in the
+            // validity index.
             if rng.below(2) == 0 {
                 writer
-                    .delete(&mut delta, &EmptySealed, &key, txn, principal)
+                    .delete(&mut delta, &mut index, &EmptySealed, &key, txn, principal)
                     .expect("delete");
                 live[k] = false;
             } else {
                 let payload_len = rng.below_usize(16);
                 let payload = rng.bytes(payload_len);
                 writer
-                    .update(&mut delta, &EmptySealed, key, payload, txn, principal)
+                    .update(
+                        &mut delta,
+                        &mut index,
+                        &EmptySealed,
+                        key,
+                        payload,
+                        txn,
+                        principal,
+                    )
                     .expect("update");
             }
         } else {
             let payload_len = rng.below_usize(16);
             let payload = rng.bytes(payload_len);
             writer
-                .insert(&mut delta, &EmptySealed, key, payload, txn, principal)
+                .insert(
+                    &mut delta,
+                    &mut index,
+                    &EmptySealed,
+                    key,
+                    payload,
+                    txn,
+                    principal,
+                )
                 .expect("insert");
             live[k] = true;
         }
     }
 
-    // `flush_to_segment` drains in `(business_key, sys_from)` order — deterministic.
-    let mut digest = FNV_OFFSET;
-    for v in delta.flush_to_segment().expect("flush") {
-        digest = fnv1a(digest, v.business_key.as_bytes());
-        digest = fnv1a(digest, &v.sys_from.0.to_le_bytes());
-        digest = fnv1a(digest, &v.sys_to.0.to_le_bytes());
-        digest = fnv1a(digest, &v.provenance.txn_id.0.to_le_bytes());
-        digest = fnv1a(digest, &v.provenance.committed_at.0.to_le_bytes());
-        digest = fnv1a(digest, v.provenance.principal.as_bytes());
-        digest = fold_closed_by(digest, v.closed_by.as_ref());
-        digest = fnv1a(digest, &v.payload);
-    }
-    digest
+    // Drain the delta and overlay the validity index — the digest sees each
+    // version's materialized `sys_to` / `closed_by`, including the delete case
+    // where no successor version carries the closer's identity ([STL-118]).
+    fold_resolved_chains(FNV_OFFSET, &mut delta, &index)
 }
 
 /// Play a seeded insert/update/delete workload through the **full DML write
@@ -365,6 +385,7 @@ pub fn run_dml_seed(seed: u64) -> u64 {
     let mut rng = Rng::new(seed);
     let wal = Wal::open(MemDisk::new(), WalConfig::default()).expect("open wal");
     let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+    let mut index = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
     // System-only table (`valid_time = false`): payloads carry no interval prefix.
     let mut writer = DmlWriter::new(wal.clone(), StepClock::new(1), false);
 
@@ -380,41 +401,111 @@ pub fn run_dml_seed(seed: u64) -> u64 {
         if live[k] {
             if rng.below(2) == 0 {
                 writer
-                    .delete(&mut delta, &key, txn, principal)
+                    .delete(&mut delta, &mut index, &key, txn, principal)
                     .expect("delete");
                 live[k] = false;
             } else {
                 let payload_len = rng.below_usize(16);
                 let payload = rng.bytes(payload_len);
                 writer
-                    .update(&mut delta, key, None, payload, txn, principal)
+                    .update(&mut delta, &mut index, key, None, payload, txn, principal)
                     .expect("update");
             }
         } else {
             let payload_len = rng.below_usize(16);
             let payload = rng.bytes(payload_len);
             writer
-                .insert(&mut delta, key, None, payload, txn, principal)
+                .insert(&mut delta, &mut index, key, None, payload, txn, principal)
                 .expect("insert");
             live[k] = true;
         }
     }
     wal.tick().expect("group-commit fsync");
 
-    // Rebuild the delta from the WAL alone, then digest the reconstructed chain.
+    // Rebuild the delta **and** the validity index from the WAL alone, then
+    // digest the reconstructed, index-overlaid chain — so the seed sweep
+    // regresses on the tagged redo codec and the WAL→(delta + index) recovery
+    // path, not just the in-memory writer ([ADR-0023]).
     let mut replayed = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
-    dml::replay(&wal, &mut replayed, Checkpoint::BEGIN).expect("replay");
+    let mut replayed_index =
+        ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+    dml::replay(&wal, &mut replayed, &mut replayed_index, Checkpoint::BEGIN).expect("replay");
+    fold_resolved_chains(FNV_OFFSET, &mut replayed, &replayed_index)
+}
 
+/// Assert the validity index rebuilt from the WAL reproduces the pre-crash one.
+///
+/// Plays a seeded insert/update/delete workload through the full DML write path,
+/// then asserts the validity index **rebuilt from the WAL alone** equals the
+/// pre-crash index *exactly* — the rebuildability guarantee of [ADR-0023]
+/// (STL-133 DoD). Returns a digest of the (identical) rebuilt index so the sweep
+/// also regresses on determinism.
+///
+/// # Panics
+///
+/// Panics if the rebuilt index is not byte-identical to the pre-crash one — a
+/// correctness regression, not a workload outcome.
+#[must_use]
+pub fn run_recovery_index_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut rng = Rng::new(seed);
+    let wal = Wal::open(MemDisk::new(), WalConfig::default()).expect("open wal");
+    let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+    let mut index = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+    let mut writer = DmlWriter::new(wal.clone(), StepClock::new(1), false);
+
+    let key_count = 1 + rng.below_usize(6);
+    let mut live = vec![false; key_count];
+    let ops = 8 + rng.below(24);
+    for op in 0..ops {
+        let k = rng.below_usize(key_count);
+        let key = BusinessKey::new(format!("k-{k:04}").into_bytes());
+        let txn = TxnId(op);
+        let principal_len = rng.below_usize(8);
+        let principal = Principal::new(rng.bytes(principal_len));
+        if live[k] {
+            if rng.below(2) == 0 {
+                writer
+                    .delete(&mut delta, &mut index, &key, txn, principal)
+                    .expect("delete");
+                live[k] = false;
+            } else {
+                let payload_len = rng.below_usize(16);
+                let payload = rng.bytes(payload_len);
+                writer
+                    .update(&mut delta, &mut index, key, None, payload, txn, principal)
+                    .expect("update");
+            }
+        } else {
+            let payload_len = rng.below_usize(16);
+            let payload = rng.bytes(payload_len);
+            writer
+                .insert(&mut delta, &mut index, key, None, payload, txn, principal)
+                .expect("insert");
+            live[k] = true;
+        }
+    }
+    wal.tick().expect("group-commit fsync");
+
+    // Crash: throw away the delta *and* the index, rebuild both from the WAL.
+    let mut replayed = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+    let mut rebuilt = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("idx");
+    dml::replay(&wal, &mut replayed, &mut rebuilt, Checkpoint::BEGIN).expect("replay");
+
+    let before = index.materialize().expect("materialize pre-crash index");
+    let after = rebuilt.materialize().expect("materialize rebuilt index");
+    assert_eq!(
+        before, after,
+        "seed {seed}: rebuild-from-WAL must reproduce the exact validity index",
+    );
+
+    // Digest the (identical) rebuilt index for the determinism sweep.
     let mut digest = FNV_OFFSET;
-    for v in replayed.flush_to_segment().expect("flush") {
-        digest = fnv1a(digest, v.business_key.as_bytes());
-        digest = fnv1a(digest, &v.sys_from.0.to_le_bytes());
-        digest = fnv1a(digest, &v.sys_to.0.to_le_bytes());
-        digest = fnv1a(digest, &v.provenance.txn_id.0.to_le_bytes());
-        digest = fnv1a(digest, &v.provenance.committed_at.0.to_le_bytes());
-        digest = fnv1a(digest, v.provenance.principal.as_bytes());
-        digest = fold_closed_by(digest, v.closed_by.as_ref());
-        digest = fnv1a(digest, &v.payload);
+    for ((key, sys_from), interval) in &after {
+        digest = fnv1a(digest, key.as_bytes());
+        digest = fnv1a(digest, &sys_from.0.to_le_bytes());
+        digest = fnv1a(digest, &interval.sys_to.0.to_le_bytes());
+        digest = fold_closed_by(digest, Some(&interval.closed_by));
     }
     digest
 }
@@ -425,33 +516,35 @@ pub fn run_dml_seed(seed: u64) -> u64 {
 /// the per-key chain stays non-overlapping.
 fn stage_committed_write(
     delta: &mut Delta<MemDisk>,
+    index: &mut ValidityIndex<MemDisk>,
     key: &BusinessKey,
     txn_id: TxnId,
     commit: SystemTimeMicros,
 ) {
+    // Resolve the key's open version across the delta tier and the index; if one
+    // exists, materialize its close into the index (write-once) before opening
+    // the new version. `commit` is strictly greater than every prior `sys_from`,
+    // so the open version (if any) is the one resolved.
     let candidates = delta.candidate_versions(key).expect("candidate versions");
-    if let Some(open) = candidates
-        .into_iter()
-        .find(|v| v.sys_to == SYSTEM_TIME_OPEN)
-    {
-        let mut closed = open;
-        closed.sys_to = commit;
-        closed.closed_by = Some(Provenance::new(
-            txn_id,
-            commit,
-            Principal::new(b"sim".to_vec()),
-        ));
-        delta.insert(closed).expect("close prior version");
+    let live =
+        merge::resolve_open(&candidates, &[], index, key, Snapshot(commit)).expect("resolve");
+    if let Some(open) = live {
+        index
+            .insert_close(Close {
+                business_key: key.clone(),
+                sys_from: open.sys_from,
+                sys_to: commit,
+                closed_by: Provenance::new(txn_id, commit, Principal::new(b"sim".to_vec())),
+            })
+            .expect("close prior version");
     }
     delta
-        .insert(Version {
-            business_key: key.clone(),
-            sys_from: commit,
-            sys_to: SYSTEM_TIME_OPEN,
-            provenance: Provenance::new(txn_id, commit, Principal::new(b"sim".to_vec())),
-            closed_by: None,
-            payload: format!("v@{}", commit.0).into_bytes(),
-        })
+        .insert(Version::open(
+            key.clone(),
+            commit,
+            Provenance::new(txn_id, commit, Principal::new(b"sim".to_vec())),
+            format!("v@{}", commit.0).into_bytes(),
+        ))
         .expect("open new version");
 }
 
@@ -476,6 +569,7 @@ pub fn run_mvcc_seed(seed: u64) -> u64 {
     let wal = Wal::open(MemDisk::new(), WalConfig::default()).expect("open wal");
     let mgr = TxnManager::new(StepClock::new(1), wal);
     let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+    let mut index = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
 
     let key_count = 1 + rng.below_usize(5);
     let keys: Vec<BusinessKey> = (0..key_count)
@@ -508,6 +602,7 @@ pub fn run_mvcc_seed(seed: u64) -> u64 {
                     digest = fnv1a(digest, &committed.commit_ts.0.to_le_bytes());
                     stage_committed_write(
                         &mut delta,
+                        &mut index,
                         &keys[k],
                         committed.txn_id,
                         committed.commit_ts,
@@ -526,7 +621,11 @@ pub fn run_mvcc_seed(seed: u64) -> u64 {
         let reader = mgr.begin();
         let rk = rng.below_usize(key_count);
         let seen = delta
-            .range_scan(keys[rk].clone()..=keys[rk].clone(), reader.snapshot())
+            .range_scan(
+                keys[rk].clone()..=keys[rk].clone(),
+                reader.snapshot(),
+                &index,
+            )
             .expect("range scan");
         match seen.into_iter().next() {
             Some(v) => {
@@ -671,6 +770,29 @@ mod tests {
         assert!(
             digests.len() > 1,
             "the WAL→delta DML workload must actually depend on the seed"
+        );
+    }
+
+    #[test]
+    fn recovery_index_seed_is_reproducible() {
+        // Also asserts (inside the seed) that the WAL-rebuilt validity index is
+        // byte-identical to the pre-crash one across the sweep ([ADR-0023] DoD).
+        for seed in 0..64 {
+            assert_eq!(
+                run_recovery_index_seed(seed),
+                run_recovery_index_seed(seed),
+                "seed {seed} must replay to an identical rebuilt-index digest"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_index_distinct_seeds_diverge() {
+        let digests: std::collections::HashSet<u64> =
+            (0..64).map(run_recovery_index_seed).collect();
+        assert!(
+            digests.len() > 1,
+            "the WAL→index rebuild workload must actually depend on the seed"
         );
     }
 

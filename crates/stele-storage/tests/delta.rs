@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
+use stele_storage::validity::{Close, ValidityConfig, ValidityIndex};
 use stele_storage::wal::{Checkpoint, Disk, DiskFile, Wal, WalConfig};
 
 // --- MemDisk: minimal in-memory Disk for tests ------------------------------
@@ -116,21 +117,43 @@ impl DiskFile for MemFile {
 
 // --- Test helpers -----------------------------------------------------------
 
-fn version(key: &[u8], sys_from: i64, sys_to: SystemTimeMicros, payload: &[u8]) -> Version {
-    Version {
-        business_key: BusinessKey::new(key.to_vec()),
-        sys_from: SystemTimeMicros(sys_from),
-        sys_to,
-        // Provenance tracks sys_from so the crash-replay sweep round-trips real
-        // provenance bytes through encode/decode, not a constant.
-        provenance: Provenance::new(
+fn mem_index() -> ValidityIndex<MemDisk> {
+    ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).unwrap()
+}
+
+/// Build a raw **open** version (the only shape a record body carries under
+/// [ADR-0023] — the `sys_to` end lives in the validity index, not on the
+/// record). The provenance tracks `sys_from` so the crash-replay sweep
+/// round-trips real provenance bytes through encode/decode, not a constant.
+fn version(key: &[u8], sys_from: i64, payload: &[u8]) -> Version {
+    Version::open(
+        BusinessKey::new(key.to_vec()),
+        SystemTimeMicros(sys_from),
+        Provenance::new(
             TxnId(u64::try_from(sys_from).unwrap_or(0)),
             SystemTimeMicros(sys_from),
             Principal::new(format!("svc-{sys_from}").into_bytes()),
         ),
-        closed_by: None,
-        payload: payload.to_vec(),
-    }
+        payload.to_vec(),
+    )
+}
+
+/// Materialize a version's end into the validity index — the out-of-record
+/// equivalent of writing a closed `sys_to` on the version body. `closed_by`
+/// provenance tracks `sys_to`, mirroring what the write path stamps.
+fn close(index: &mut ValidityIndex<MemDisk>, key: &[u8], sys_from: i64, sys_to: i64) {
+    index
+        .insert_close(Close {
+            business_key: BusinessKey::new(key.to_vec()),
+            sys_from: SystemTimeMicros(sys_from),
+            sys_to: SystemTimeMicros(sys_to),
+            closed_by: Provenance::new(
+                TxnId(u64::try_from(sys_to).unwrap_or(0)),
+                SystemTimeMicros(sys_to),
+                Principal::new(format!("close-{sys_to}").into_bytes()),
+            ),
+        })
+        .unwrap();
 }
 
 /// Tiny xorshift64* — deterministic, no dependency, plenty good for randomized
@@ -163,24 +186,24 @@ impl Rng {
 #[test]
 fn snapshot_returns_latest_live_version_per_key() {
     let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).unwrap();
+    let mut index = mem_index();
 
     // Key "a": closed at sys=10, reopened, closed at sys=20, then open
-    // forever from sys=20.
-    delta
-        .insert(version(b"a", 0, SystemTimeMicros(10), b"v0"))
-        .unwrap();
-    delta
-        .insert(version(b"a", 10, SystemTimeMicros(20), b"v1"))
-        .unwrap();
-    delta
-        .insert(version(b"a", 20, SYSTEM_TIME_OPEN, b"v2"))
-        .unwrap();
+    // forever from sys=20. The record bodies are open; the ends are
+    // materialized into the validity index.
+    delta.insert(version(b"a", 0, b"v0")).unwrap();
+    close(&mut index, b"a", 0, 10);
+    delta.insert(version(b"a", 10, b"v1")).unwrap();
+    close(&mut index, b"a", 10, 20);
+    delta.insert(version(b"a", 20, b"v2")).unwrap();
     // Key "b": one version, still open from sys=15.
-    delta
-        .insert(version(b"b", 15, SYSTEM_TIME_OPEN, b"only"))
-        .unwrap();
+    delta.insert(version(b"b", 15, b"only")).unwrap();
 
-    let at = |s: i64| delta.range_scan(.., Snapshot(SystemTimeMicros(s))).unwrap();
+    let at = |s: i64| {
+        delta
+            .range_scan(.., Snapshot(SystemTimeMicros(s)), &index)
+            .unwrap()
+    };
 
     // Before "b" was written, "b" should be absent.
     let s5 = at(5);
@@ -206,11 +229,11 @@ fn snapshot_returns_latest_live_version_per_key() {
 #[test]
 fn half_open_period_excludes_sys_to_at_snapshot() {
     let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).unwrap();
-    delta
-        .insert(version(b"k", 0, SystemTimeMicros(10), b"closed"))
-        .unwrap();
+    let mut index = mem_index();
+    delta.insert(version(b"k", 0, b"closed")).unwrap();
+    close(&mut index, b"k", 0, 10);
     let live = delta
-        .range_scan(.., Snapshot(SystemTimeMicros(10)))
+        .range_scan(.., Snapshot(SystemTimeMicros(10)), &index)
         .unwrap();
     assert!(live.is_empty(), "[0,10) must not be live at s=10");
 }
@@ -234,12 +257,7 @@ fn spill_round_trips_versions_to_disk_and_back() {
     let mut written: Vec<Version> = Vec::new();
     for i in 0u64..50 {
         let key = format!("k-{i:04}");
-        let v = version(
-            key.as_bytes(),
-            i as i64,
-            SYSTEM_TIME_OPEN,
-            format!("payload-{i}").as_bytes(),
-        );
+        let v = version(key.as_bytes(), i as i64, format!("payload-{i}").as_bytes());
         written.push(v.clone());
         delta.insert(v).unwrap();
     }
@@ -257,8 +275,10 @@ fn spill_round_trips_versions_to_disk_and_back() {
         "at least one spill file should be on disk"
     );
 
+    // No version is ever closed here, so an empty index leaves every body open.
+    let index = mem_index();
     let live = delta
-        .range_scan(.., Snapshot(SystemTimeMicros(i64::MAX - 1)))
+        .range_scan(.., Snapshot(SystemTimeMicros(i64::MAX - 1)), &index)
         .unwrap();
     // Same multiset of payloads.
     let mut got_payloads: Vec<Vec<u8>> = live.iter().map(|v| v.payload.clone()).collect();
@@ -282,12 +302,7 @@ fn flush_merges_memory_and_spills_then_clears() {
     .unwrap();
     for i in 0u64..40 {
         delta
-            .insert(version(
-                format!("k-{i:04}").as_bytes(),
-                i as i64,
-                SYSTEM_TIME_OPEN,
-                b"x",
-            ))
+            .insert(version(format!("k-{i:04}").as_bytes(), i as i64, b"x"))
             .unwrap();
     }
     assert!(delta.is_spilled());
@@ -331,7 +346,6 @@ fn open_discards_pre_existing_spill_files() {
                 .insert(version(
                     format!("stale-{i:02}").as_bytes(),
                     i as i64,
-                    SYSTEM_TIME_OPEN,
                     b"stale",
                 ))
                 .unwrap();
@@ -350,7 +364,10 @@ fn open_discards_pre_existing_spill_files() {
 
     // A fresh Delta::open must wipe them.
     let delta = Delta::open(disk.clone(), DeltaConfig::default()).unwrap();
-    let live = delta.range_scan(.., Snapshot(SYSTEM_TIME_OPEN)).unwrap();
+    let index = mem_index();
+    let live = delta
+        .range_scan(.., Snapshot(SYSTEM_TIME_OPEN), &index)
+        .unwrap();
     assert!(
         live.is_empty(),
         "freshly-opened delta must not surface stale spill rows"
@@ -397,6 +414,10 @@ fn delta_plus_wal_replay_reproduces_pre_crash_state_under_seed_sweep() {
             },
         )
         .unwrap();
+        // The validity index holds every version's end. It is derived state,
+        // rebuilt from the same WAL on recovery, so both the pre-crash and the
+        // post-replay reads resolve `sys_to` against this one index ([ADR-0023]).
+        let mut index = mem_index();
 
         // Generate a workload: random business keys (drawn from a small
         // pool so we get version chains per key) with monotonically
@@ -407,23 +428,21 @@ fn delta_plus_wal_replay_reproduces_pre_crash_state_under_seed_sweep() {
         for _ in 0..record_count {
             let key_idx = rng.range(KEY_POOL as u64) as usize;
             let key = format!("k-{key_idx:02}");
-            // Close prior versions implicitly: each new write opens at the
-            // current sys clock; tests on the read path check half-open
-            // resolution. Half the time, leave sys_to open; the rest, write
-            // an already-closed version (gap in coverage) to stress the
-            // resolver.
+            // Each new write opens at the current sys clock; tests on the read
+            // path check half-open resolution. Half the time leave the period
+            // open; the rest, materialize a close into the validity index (a
+            // gap in coverage) to stress the resolver.
             let close_now = rng.next_u64() & 1 == 0;
-            let sys_to = if close_now {
-                SystemTimeMicros(sys + 1)
-            } else {
-                SYSTEM_TIME_OPEN
-            };
             let payload = format!("seed{seed}-{sys}").into_bytes();
-            let v = version(key.as_bytes(), sys, sys_to, &payload);
-            // Append the encoded version to the WAL — this is what the txn
-            // manager will do at commit time once [STL-94] lands.
+            let v = version(key.as_bytes(), sys, &payload);
+            // Append the encoded version body to the WAL — this is what the txn
+            // manager will do at commit time once [STL-94] lands. The record
+            // carries only the open body; the close rides in the index.
             wal.append(&v.encoded().expect("encode")).unwrap();
             pre.insert(v).unwrap();
+            if close_now {
+                close(&mut index, key.as_bytes(), sys, sys + 1);
+            }
             sys += 1 + rng.range(5) as i64;
         }
         wal.tick().unwrap();
@@ -434,7 +453,7 @@ fn delta_plus_wal_replay_reproduces_pre_crash_state_under_seed_sweep() {
             .collect();
         let before: Vec<Vec<Version>> = probes
             .iter()
-            .map(|s| pre.range_scan(.., *s).unwrap())
+            .map(|s| pre.range_scan(.., *s, &index).unwrap())
             .collect();
 
         // "Crash": drop `pre`. Open a fresh delta on a fresh spill disk
@@ -453,12 +472,16 @@ fn delta_plus_wal_replay_reproduces_pre_crash_state_under_seed_sweep() {
             let bytes = record.expect("clean WAL replay");
             let (v, consumed) = Version::decode(&bytes).expect("decode replay record");
             assert_eq!(consumed, bytes.len(), "WAL record == one version frame");
+            // A raw WAL decode is always open — `sys_to` is the index's to
+            // supply, not the record's to carry.
+            assert_eq!(v.sys_to, SYSTEM_TIME_OPEN);
+            assert!(v.closed_by.is_none());
             post.insert(v).unwrap();
         }
 
         let after: Vec<Vec<Version>> = probes
             .iter()
-            .map(|s| post.range_scan(.., *s).unwrap())
+            .map(|s| post.range_scan(.., *s, &index).unwrap())
             .collect();
 
         assert_eq!(

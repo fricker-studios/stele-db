@@ -55,6 +55,8 @@ use stele_common::provenance::{Principal, TxnId};
 use stele_common::time::{Clock, SystemTimeMicros};
 
 use crate::delta::{BusinessKey, Delta, DeltaError, Version};
+use crate::systime::{Redo, SysTimeError};
+use crate::validity::{Close, ValidityError, ValidityIndex};
 use crate::validtime::{ValidInterval, ValidTimeError, ValidTimeWriter};
 use crate::wal::{Checkpoint, Disk, LogOffset, Wal, WalError};
 
@@ -72,9 +74,19 @@ pub enum DmlError {
     #[error(transparent)]
     Wal(#[from] WalError),
 
-    /// The delta tier rejected an apply, or a redo record failed to decode.
+    /// A version redo frame failed to decode, or the delta tier rejected a stage.
     #[error(transparent)]
     Delta(#[from] DeltaError),
+
+    /// A close redo frame failed to decode, or the validity index rejected a
+    /// close ([ADR-0023]).
+    #[error(transparent)]
+    Validity(#[from] ValidityError),
+
+    /// The shared apply step (`crate::systime::apply`) failed staging the redo
+    /// set into the delta tier and validity index.
+    #[error(transparent)]
+    Apply(#[from] SysTimeError),
 }
 
 /// The result of a single committed DML operation.
@@ -136,19 +148,21 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     /// [`DmlError::Resolve`] if `key` already has a live version or the
     /// valid-time policy is violated; [`DmlError::Wal`] / [`DmlError::Delta`] on
     /// a log or staging failure.
-    pub fn insert(
+    #[allow(clippy::too_many_arguments)] // tier handles + key/valid/payload + provenance triple
+    pub fn insert<I: Disk>(
         &mut self,
         delta: &mut Delta<D>,
+        index: &mut ValidityIndex<I>,
         key: BusinessKey,
         valid: Option<ValidInterval>,
         payload: Vec<u8>,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<DmlOutcome, DmlError> {
-        let (commit, versions) = self
+        let (commit, redos) = self
             .writer
-            .stage_insert(delta, key, valid, payload, txn_id, principal)?;
-        self.log_and_apply(delta, commit, versions)
+            .stage_insert(delta, index, key, valid, payload, txn_id, principal)?;
+        self.log_and_apply(delta, index, commit, redos)
     }
 
     /// `UPDATE`: close `key`'s prior period at `commit` and open a new
@@ -159,19 +173,21 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     /// [`DmlError::Resolve`] if `key` has no live version or the valid-time
     /// policy is violated; [`DmlError::Wal`] / [`DmlError::Delta`] on a log or
     /// staging failure.
-    pub fn update(
+    #[allow(clippy::too_many_arguments)] // tier handles + key/valid/payload + provenance triple
+    pub fn update<I: Disk>(
         &mut self,
         delta: &mut Delta<D>,
+        index: &mut ValidityIndex<I>,
         key: BusinessKey,
         valid: Option<ValidInterval>,
         payload: Vec<u8>,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<DmlOutcome, DmlError> {
-        let (commit, versions) = self
+        let (commit, redos) = self
             .writer
-            .stage_update(delta, key, valid, payload, txn_id, principal)?;
-        self.log_and_apply(delta, commit, versions)
+            .stage_update(delta, index, key, valid, payload, txn_id, principal)?;
+        self.log_and_apply(delta, index, commit, redos)
     }
 
     /// `DELETE`: close `key`'s prior period at `commit` with no successor — a
@@ -182,161 +198,196 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     ///
     /// [`DmlError::Resolve`] if `key` has no live version; [`DmlError::Wal`] /
     /// [`DmlError::Delta`] on a log or staging failure.
-    pub fn delete(
+    pub fn delete<I: Disk>(
         &mut self,
         delta: &mut Delta<D>,
+        index: &mut ValidityIndex<I>,
         key: &BusinessKey,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<DmlOutcome, DmlError> {
-        let (commit, versions) = self.writer.stage_delete(delta, key, txn_id, principal)?;
-        self.log_and_apply(delta, commit, versions)
+        let (commit, redos) = self
+            .writer
+            .stage_delete(delta, index, key, txn_id, principal)?;
+        self.log_and_apply(delta, index, commit, redos)
     }
 
-    /// Log the resolved redo set to the WAL, then stage it in the delta — in
-    /// that order, so the record is durable-eligible before the delta is
-    /// mutated. The returned [`DmlOutcome::wal`] is the post-record offset to
-    /// await for durability.
-    fn log_and_apply(
+    /// Log the resolved redo set to the WAL, then stage it into the delta tier
+    /// and validity index — in that order, so the record is durable-eligible
+    /// before either structure is touched. The returned [`DmlOutcome::wal`] is
+    /// the post-record offset to await for durability.
+    fn log_and_apply<I: Disk>(
         &self,
         delta: &mut Delta<D>,
+        index: &mut ValidityIndex<I>,
         commit: SystemTimeMicros,
-        versions: Vec<Version>,
+        redos: Vec<Redo>,
     ) -> Result<DmlOutcome, DmlError> {
-        let record = encode_redo(&versions)?;
+        let record = encode_redo(&redos)?;
         let wal = self.wal.append(&record)?;
-        crate::systime::apply(delta, versions)?;
+        crate::systime::apply(delta, index, redos)?;
         Ok(DmlOutcome { commit, wal })
     }
 }
 
-/// Replay the WAL from `checkpoint` into `delta`, reconstructing the staged
-/// state a crash discarded. Returns the number of versions applied.
+/// Replay the WAL from `checkpoint` into `delta` **and** `index`, reconstructing
+/// both the staged versions and the materialized closes a crash discarded.
+/// Returns the number of redo entries applied.
 ///
-/// Each WAL record is a redo set of [`Version`]s; replay decodes them and
-/// applies each with the delta's idempotent insert — the *same* application the
-/// forward [`DmlWriter`] path uses, so a replay over already-applied records
-/// converges rather than duplicates. Replay stops at the first corrupt record
-/// the WAL surfaces ([`crate::wal`]'s torn-write contract).
+/// Each WAL record is a redo set of tagged [`Redo`] entries; replay decodes them
+/// and applies each with the *same* `crate::systime::apply` the forward
+/// [`DmlWriter`] path uses — so a replay over already-applied records converges
+/// rather than duplicates (the delta's idempotent insert and the index's
+/// idempotent write-once close). Replay stops at the first corrupt record the WAL
+/// surfaces ([`crate::wal`]'s torn-write contract).
 ///
-/// Drive this on startup *after* [`Delta::open`] (which discards stale spills),
-/// per [`crate::delta`]'s crash semantics.
+/// Drive this on startup *after* [`Delta::open`] and [`ValidityIndex::open`]
+/// (both discard stale spills), per the crash semantics of [`crate::delta`] /
+/// [`crate::validity`]. The reconstructed index is **exactly** the pre-crash one
+/// ([ADR-0023]'s rebuildability claim).
 ///
 /// # Errors
 ///
 /// [`DmlError::Wal`] if the WAL yields a corrupt or unreadable record;
-/// [`DmlError::Delta`] if a record fails to decode or the delta rejects an apply.
-pub fn replay<D: Disk>(
+/// [`DmlError::Delta`] / [`DmlError::Validity`] if a frame fails to decode;
+/// [`DmlError::Apply`] if a structure rejects the apply.
+pub fn replay<D: Disk, I: Disk>(
     wal: &Wal<D>,
     delta: &mut Delta<D>,
+    index: &mut ValidityIndex<I>,
     checkpoint: Checkpoint,
 ) -> Result<usize, DmlError> {
     let mut applied = 0;
     for record in wal.replay_from(checkpoint) {
         let payload = record?;
-        let versions = decode_redo(&payload)?;
-        applied += versions.len();
+        let redos = decode_redo(&payload)?;
+        applied += redos.len();
         // The same application point the forward DmlWriter path uses.
-        crate::systime::apply(delta, versions)?;
+        crate::systime::apply(delta, index, redos)?;
     }
     Ok(applied)
 }
 
-/// Encode a resolved redo set as a single WAL record: the version frames
-/// concatenated back-to-back. Each [`Version`] frame is self-delimiting (it
-/// carries its own lengths), so no envelope is needed — the WAL record boundary
-/// delimits the set and [`decode_redo`] walks the frames.
-fn encode_redo(versions: &[Version]) -> Result<Vec<u8>, DeltaError> {
+/// Tag byte for a [`Redo::Insert`] frame in a WAL redo record.
+const REDO_TAG_INSERT: u8 = 0;
+/// Tag byte for a [`Redo::Close`] frame in a WAL redo record.
+const REDO_TAG_CLOSE: u8 = 1;
+
+/// Encode a resolved redo set as a single WAL record: each entry is a one-byte
+/// tag (insert vs close) followed by the entry's self-delimiting frame, all
+/// concatenated back-to-back. The frames carry their own lengths, so no envelope
+/// is needed — the WAL record boundary delimits the set and [`decode_redo`] walks
+/// it, dispatching on the tag.
+fn encode_redo(redos: &[Redo]) -> Result<Vec<u8>, DmlError> {
     let mut buf = Vec::new();
-    for version in versions {
-        version.encode(&mut buf)?;
+    for redo in redos {
+        match redo {
+            Redo::Insert(version) => {
+                buf.push(REDO_TAG_INSERT);
+                version.encode(&mut buf)?;
+            }
+            Redo::Close(close) => {
+                buf.push(REDO_TAG_CLOSE);
+                close.encode(&mut buf)?;
+            }
+        }
     }
     Ok(buf)
 }
 
-/// Decode a redo record back into its version set: walk the concatenated frames
-/// until the record is consumed.
+/// Decode a redo record back into its redo set: walk the concatenated
+/// `tag || frame` entries until the record is consumed.
 ///
 /// # Errors
 ///
-/// [`DeltaError::Corrupt`] (as [`DmlError::Delta`]) if a frame is truncated or
-/// declares a length past the record's end.
-fn decode_redo(bytes: &[u8]) -> Result<Vec<Version>, DmlError> {
-    let mut versions = Vec::new();
+/// [`DmlError::Delta`] / [`DmlError::Validity`] if a frame is truncated or
+/// declares a length past the record's end, or [`DmlError::Delta`] for an unknown
+/// tag byte.
+fn decode_redo(bytes: &[u8]) -> Result<Vec<Redo>, DmlError> {
+    let mut redos = Vec::new();
     let mut rest = bytes;
-    while !rest.is_empty() {
-        let (version, consumed) = Version::decode(rest)?;
-        versions.push(version);
-        rest = &rest[consumed..];
+    while let Some((&tag, body)) = rest.split_first() {
+        match tag {
+            REDO_TAG_INSERT => {
+                let (version, consumed) = Version::decode(body)?;
+                redos.push(Redo::Insert(version));
+                rest = &body[consumed..];
+            }
+            REDO_TAG_CLOSE => {
+                let (close, consumed) = Close::decode(body)?;
+                redos.push(Redo::Close(close));
+                rest = &body[consumed..];
+            }
+            _ => {
+                return Err(DmlError::Delta(DeltaError::Corrupt(
+                    "unknown redo tag byte",
+                )));
+            }
+        }
     }
-    Ok(versions)
+    Ok(redos)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A redo set of one or two versions round-trips through the record codec —
-    /// the property [`replay`] relies on to reconstruct the delta from the WAL.
+    /// An update's redo set — a [`Redo::Close`] (the prior period's end) plus a
+    /// [`Redo::Insert`] (the new open version) — round-trips through the tagged
+    /// record codec, the property [`replay`] relies on to reconstruct the delta
+    /// and the validity index from the WAL.
     #[test]
     fn redo_record_round_trips() {
         use stele_common::provenance::Provenance;
-        use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
+        use stele_common::time::SystemTimeMicros;
 
-        let closed = Version {
+        let close = Redo::Close(Close {
             business_key: BusinessKey::new(b"k".to_vec()),
             sys_from: SystemTimeMicros(10),
             sys_to: SystemTimeMicros(20),
-            provenance: Provenance::new(
-                TxnId(1),
-                SystemTimeMicros(10),
-                Principal::new(b"a".to_vec()),
-            ),
-            closed_by: Some(Provenance::new(
-                TxnId(2),
-                SystemTimeMicros(20),
-                Principal::new(b"b".to_vec()),
-            )),
-            payload: b"old".to_vec(),
-        };
-        let opened = Version {
-            business_key: BusinessKey::new(b"k".to_vec()),
-            sys_from: SystemTimeMicros(20),
-            sys_to: SYSTEM_TIME_OPEN,
-            provenance: Provenance::new(
+            closed_by: Provenance::new(
                 TxnId(2),
                 SystemTimeMicros(20),
                 Principal::new(b"b".to_vec()),
             ),
-            closed_by: None,
-            payload: b"new".to_vec(),
-        };
+        });
+        let opened = Redo::Insert(Version::open(
+            BusinessKey::new(b"k".to_vec()),
+            SystemTimeMicros(20),
+            Provenance::new(
+                TxnId(2),
+                SystemTimeMicros(20),
+                Principal::new(b"b".to_vec()),
+            ),
+            b"new".to_vec(),
+        ));
 
-        let record = encode_redo(&[closed.clone(), opened.clone()]).expect("encode");
+        let record = encode_redo(&[close.clone(), opened.clone()]).expect("encode");
         let decoded = decode_redo(&record).expect("decode");
-        assert_eq!(decoded, vec![closed, opened]);
+        assert_eq!(decoded, vec![close, opened]);
     }
 
     /// A truncated record is corruption, not a silently-dropped tail.
     #[test]
     fn truncated_redo_record_is_corruption() {
         use stele_common::provenance::Provenance;
-        use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
+        use stele_common::time::SystemTimeMicros;
 
-        let v = Version {
-            business_key: BusinessKey::new(b"k".to_vec()),
-            sys_from: SystemTimeMicros(1),
-            sys_to: SYSTEM_TIME_OPEN,
-            provenance: Provenance::new(
-                TxnId(1),
-                SystemTimeMicros(1),
-                Principal::new(b"a".to_vec()),
-            ),
-            closed_by: None,
-            payload: b"value".to_vec(),
-        };
-        let record = encode_redo(&[v]).expect("encode");
+        let redo = Redo::Insert(Version::open(
+            BusinessKey::new(b"k".to_vec()),
+            SystemTimeMicros(1),
+            Provenance::new(TxnId(1), SystemTimeMicros(1), Principal::new(b"a".to_vec())),
+            b"value".to_vec(),
+        ));
+        let record = encode_redo(&[redo]).expect("encode");
         let err = decode_redo(&record[..record.len() - 1]).unwrap_err();
+        assert!(matches!(err, DmlError::Delta(DeltaError::Corrupt(_))));
+    }
+
+    /// An unknown tag byte is corruption, not a silently-dropped entry.
+    #[test]
+    fn unknown_redo_tag_is_corruption() {
+        let err = decode_redo(&[0xFFu8]).unwrap_err();
         assert!(matches!(err, DmlError::Delta(DeltaError::Corrupt(_))));
     }
 }

@@ -1,54 +1,70 @@
-//! Cross-tier read merge — fold the delta tier and sealed segments into one
-//! resolved view ([architecture §3.5](../../../docs/02-architecture.md#35-read-path--as-of-flow)).
+//! Cross-tier read merge — fold the delta tier, sealed segments, and the
+//! validity index into one resolved view
+//! ([architecture §3.5](../../../docs/02-architecture.md#35-read-path--as-of-flow)).
 //!
-//! A snapshot read sees both tiers: recent versions still staged in the
+//! A snapshot read sees versions from two tiers — recent ones still staged in the
 //! [`Delta`](crate::delta::Delta) tier and older ones flushed into sealed
-//! segments. STL-127 adds a third ingredient — a [`CloseMarker`] in the delta
-//! tier that closes a version whose body lives in an already-sealed segment.
-//! Resolving a key means **folding** any such marker onto its target before
-//! picking the version live at the snapshot.
+//! segments — plus the [`ValidityIndex`], which
+//! supplies each version's system-time **end** (`sys_to`) and closing provenance.
+//! Records never store `sys_to` ([ADR-0023](../../../docs/adr/0023-append-only-record-model-validity-index.md));
+//! resolving a key means **overlaying** the index's materialized close onto each
+//! candidate version before picking the one live at the snapshot.
 //!
-//! This module is pure: it takes already-read versions and markers and returns
-//! the resolved chains. It does no I/O and holds no tier handles, so it stays
-//! trivially deterministic ([architecture §12 invariant 7](../../../docs/02-architecture.md#12-cross-cutting-architectural-invariants))
+//! This module reads the index (deterministic [`Disk`] I/O)
+//! but holds no tier handles of its own and no wall-clock or runtime dependency,
+//! so it stays deterministic ([architecture §12 invariant 7](../../../docs/02-architecture.md#12-cross-cutting-architectural-invariants))
 //! and reusable by both the write-path resolver (in [`crate::systime`]) and the
-//! eventual query executor. It is distinct from *compaction* merge, which
-//! rewrites segments; this never mutates anything.
+//! eventual query executor. It is distinct from *compaction* merge, which rewrites
+//! segments; this never mutates anything.
 
 use std::collections::BTreeMap;
 
 use stele_common::time::SystemTimeMicros;
 
-use crate::delta::{BusinessKey, CloseMarker, Snapshot, Version};
+use crate::backend::Disk;
+use crate::delta::{BusinessKey, Snapshot, Version};
+use crate::validity::{ValidityError, ValidityIndex};
 
-/// Overlay one close marker onto its target version: stamp the new `sys_to` and
-/// record the closing transaction's provenance. The target's body — payload and
-/// birth provenance — is never touched (corrections append, never rewrite,
-/// [STL-118]). Only an *open* target is closed; a marker whose target is already
-/// closed is inert, which keeps a replayed or duplicated marker harmless.
-fn apply_marker(target: &mut Version, marker: &CloseMarker) {
-    if target.sys_to == stele_common::time::SYSTEM_TIME_OPEN {
-        target.sys_to = marker.sys_to;
-        target.closed_by = Some(marker.closed_by.clone());
+/// Overlay the [`ValidityIndex`] onto one chain of a single key's versions:
+/// stamp each version's `sys_to` / `closed_by` from the index's materialized
+/// close, leaving a version with no index entry **open**
+/// ([`SYSTEM_TIME_OPEN`](stele_common::time::SYSTEM_TIME_OPEN) / `None`). The
+/// version body — payload and birth provenance — is never touched (corrections
+/// append, never rewrite, [STL-118]).
+///
+/// `closes` is the key's materialized ends, keyed by `sys_from`
+/// ([`ValidityIndex::closes_for`]).
+fn overlay_chain(
+    chain: &mut BTreeMap<SystemTimeMicros, Version>,
+    closes: &BTreeMap<SystemTimeMicros, crate::validity::ClosedInterval>,
+) {
+    for (sys_from, version) in chain.iter_mut() {
+        if let Some(interval) = closes.get(sys_from) {
+            version.sys_to = interval.sys_to;
+            version.closed_by = Some(interval.closed_by.clone());
+        }
     }
 }
 
-/// Fold a pool of versions (from any tier) and the delta tier's close markers
-/// into per-key version chains, applying each marker to the matching
-/// `(business_key, sys_from)` version.
+/// Fold a pool of versions into per-key chains, overlaying the [`ValidityIndex`].
+///
+/// Each version is grouped by key, then each key's materialized closes are
+/// overlaid so every version carries its resolved `[sys_from, sys_to)` interval.
 ///
 /// `versions` should be the union of every sealed segment's rows and the delta
 /// tier's staged versions for the key range of interest; ordering does not
 /// matter. When two tiers carry the same `(business_key, sys_from)` (which the
 /// flush path does not normally produce), the later one in iteration order
 /// wins — pass the delta versions last so freshly-staged state supersedes a
-/// stale segment copy. A marker with no matching version in the pool is
-/// ignored: its target segment was not part of this read.
-#[must_use]
-pub fn fold_chains(
+/// stale segment copy.
+///
+/// # Errors
+///
+/// [`ValidityError`] if a backing spill of the index cannot be read.
+pub fn fold_chains<D: Disk>(
     versions: impl IntoIterator<Item = Version>,
-    markers: impl IntoIterator<Item = CloseMarker>,
-) -> BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Version>> {
+    index: &ValidityIndex<D>,
+) -> Result<BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Version>>, ValidityError> {
     let mut chains: BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Version>> = BTreeMap::new();
     for v in versions {
         chains
@@ -56,22 +72,18 @@ pub fn fold_chains(
             .or_default()
             .insert(v.sys_from, v);
     }
-    for m in markers {
-        if let Some(target) = chains
-            .get_mut(&m.business_key)
-            .and_then(|chain| chain.get_mut(&m.sys_from))
-        {
-            apply_marker(target, &m);
-        }
+    for (key, chain) in &mut chains {
+        let closes = index.closes_for(key)?;
+        overlay_chain(chain, &closes);
     }
-    chains
+    Ok(chains)
 }
 
 /// Resolve a snapshot read over already-folded `chains`.
 ///
 /// For each key, returns the version whose `[sys_from, sys_to)` interval
 /// contains `snapshot`, in key order. Mirrors the delta tier's per-tier
-/// resolver, but over the merged view.
+/// resolver, but over the merged + index-overlaid view.
 #[must_use]
 pub fn resolve_snapshot(
     chains: &BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Version>>,
@@ -83,83 +95,50 @@ pub fn resolve_snapshot(
         .collect()
 }
 
-/// Where a key's currently-open version lives, as resolved across tiers — the
-/// signal the write path needs to choose between closing in the delta tier and
-/// appending a [`CloseMarker`] ([STL-127]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LiveLocation {
-    /// The open version is still staged in the delta tier; its period can be
-    /// closed in place by re-staging it (the original [STL-91] path).
-    Delta(Version),
-    /// The open version has been flushed into a sealed segment; closing it must
-    /// be an appended [`CloseMarker`], never a mutation (invariant 1).
-    Sealed(Version),
-}
-
-impl LiveLocation {
-    /// The resolved open version, regardless of which tier holds its body.
-    #[must_use]
-    pub const fn version(&self) -> &Version {
-        match self {
-            Self::Delta(v) | Self::Sealed(v) => v,
-        }
-    }
-}
-
-/// Resolve the version of `key` open at `at`, reporting **which tier** holds it.
+/// Resolve the version of `key` open at `at`, across the delta tier, the sealed
+/// segments, and the validity index — the signal the write path needs to decide
+/// whether a key has a live version to close.
 ///
-/// Folds the delta tier's staged versions, its close markers, and the sealed
-/// segments' versions into one chain, then picks the live version — and reports
-/// whether its body lives in the delta tier or a sealed segment.
+/// Folds the delta tier's staged candidates and the key's sealed versions into
+/// one chain (a delta version supersedes a sealed one at the same `sys_from` —
+/// the flush path does not produce that overlap, but preferring the delta keeps
+/// a mid-flush view consistent), overlays the index's materialized closes, then
+/// returns the greatest `sys_from ≤ at` whose `sys_to > at`.
 ///
-/// `delta_versions` are the key's staged candidates ([`Delta::candidate_versions`](crate::delta::Delta::candidate_versions));
-/// `markers` the delta tier's close markers; `sealed_versions` the key's rows
-/// from every relevant sealed segment. A delta version supersedes a sealed one
-/// at the same `sys_from` (the flush path does not produce that overlap, but
-/// preferring the delta keeps a mid-flush view consistent). Markers fold over
-/// whichever tier holds the target, then the greatest `sys_from ≤ at` with
-/// `sys_to > at` is the live version.
+/// Unlike pre-[ADR-0023] code, the result no longer distinguishes *which tier*
+/// holds the live version: a close is always a write-once append to the validity
+/// index ([`ValidityIndex::insert_close`]), regardless of where the version body
+/// lives, so the writer only needs the open version's `sys_from`.
 ///
 /// `at` is a freshly-allocated commit timestamp on the write path, strictly
 /// greater than every `sys_from` on the chain, so the open version (if any) is
 /// always the one returned.
-#[must_use]
-pub fn resolve_open(
+///
+/// # Errors
+///
+/// [`ValidityError`] if a backing spill of the index cannot be read.
+pub fn resolve_open<D: Disk>(
     delta_versions: &[Version],
-    markers: &[CloseMarker],
     sealed_versions: &[Version],
+    index: &ValidityIndex<D>,
     key: &BusinessKey,
     at: Snapshot,
-) -> Option<LiveLocation> {
-    // `sys_from → (version, sealed?)`. Sealed first, then delta, so a delta
-    // version wins a same-`sys_from` collision.
-    let mut chain: BTreeMap<SystemTimeMicros, (Version, bool)> = BTreeMap::new();
+) -> Result<Option<Version>, ValidityError> {
+    let mut chain: BTreeMap<SystemTimeMicros, Version> = BTreeMap::new();
     for v in sealed_versions.iter().filter(|v| &v.business_key == key) {
-        chain.insert(v.sys_from, (v.clone(), true));
+        chain.insert(v.sys_from, v.clone());
     }
     for v in delta_versions.iter().filter(|v| &v.business_key == key) {
-        chain.insert(v.sys_from, (v.clone(), false));
+        chain.insert(v.sys_from, v.clone());
     }
-    for m in markers.iter().filter(|m| &m.business_key == key) {
-        if let Some((target, _sealed)) = chain.get_mut(&m.sys_from) {
-            apply_marker(target, m);
-        }
-    }
-    let (_, (version, sealed)) = chain.range(..=at.0).next_back()?;
-    if version.sys_to > at.0 {
-        let version = version.clone();
-        Some(if *sealed {
-            LiveLocation::Sealed(version)
-        } else {
-            LiveLocation::Delta(version)
-        })
-    } else {
-        None
-    }
+    let closes = index.closes_for(key)?;
+    overlay_chain(&mut chain, &closes);
+    Ok(live_in_chain(&chain, at).cloned())
 }
 
 /// The version of one key's chain live at `snapshot`: greatest `sys_from ≤ s`
-/// whose `sys_to > s`. Shared by [`resolve_snapshot`].
+/// whose `sys_to > s`. Shared by [`resolve_snapshot`] and [`resolve_open`];
+/// the chain must already carry its index overlay.
 fn live_in_chain(
     chain: &BTreeMap<SystemTimeMicros, Version>,
     snapshot: Snapshot,
@@ -177,23 +156,28 @@ mod tests {
     use stele_common::provenance::{Principal, Provenance, TxnId};
     use stele_common::time::SYSTEM_TIME_OPEN;
 
+    use crate::backend::MemDisk;
+    use crate::validity::{Close, ValidityConfig, ValidityIndex};
+
     fn open(key: &[u8], sys_from: i64) -> Version {
-        Version {
-            business_key: BusinessKey::new(key.to_vec()),
-            sys_from: SystemTimeMicros(sys_from),
-            sys_to: SYSTEM_TIME_OPEN,
-            provenance: Provenance::new(
+        Version::open(
+            BusinessKey::new(key.to_vec()),
+            SystemTimeMicros(sys_from),
+            Provenance::new(
                 TxnId(1),
                 SystemTimeMicros(sys_from),
                 Principal::new(b"birth".to_vec()),
             ),
-            closed_by: None,
-            payload: b"body".to_vec(),
-        }
+            b"body".to_vec(),
+        )
     }
 
-    fn marker(key: &[u8], sys_from: i64, sys_to: i64) -> CloseMarker {
-        CloseMarker {
+    fn index() -> ValidityIndex<MemDisk> {
+        ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("open")
+    }
+
+    fn close(idx: &mut ValidityIndex<MemDisk>, key: &[u8], sys_from: i64, sys_to: i64) {
+        idx.insert_close(Close {
             business_key: BusinessKey::new(key.to_vec()),
             sys_from: SystemTimeMicros(sys_from),
             sys_to: SystemTimeMicros(sys_to),
@@ -202,101 +186,91 @@ mod tests {
                 SystemTimeMicros(sys_to),
                 Principal::new(b"closer".to_vec()),
             ),
-        }
+        })
+        .expect("close");
     }
 
     #[test]
-    fn marker_folds_onto_a_sealed_open_version() {
-        // The sealed version is open; the delta marker closes it. The folded
-        // chain must carry the body from the segment and the close from the
-        // marker — no mutation of either input.
-        let sealed = vec![open(b"k", 10)];
-        let chains = fold_chains(sealed, vec![marker(b"k", 10, 20)]);
+    fn index_overlay_closes_a_versions_interval() {
+        // The version is read raw (open); the index closes it. The folded chain
+        // must carry the body from the version and the close from the index.
+        let mut idx = index();
+        close(&mut idx, b"k", 10, 20);
+        let chains = fold_chains(vec![open(b"k", 10)], &idx).expect("fold");
         let chain = &chains[&BusinessKey::new(b"k".to_vec())];
         let v = &chain[&SystemTimeMicros(10)];
-        assert_eq!(v.sys_to, SystemTimeMicros(20), "marker closes the interval");
-        assert_eq!(v.payload, b"body", "body is preserved from the segment");
+        assert_eq!(v.sys_to, SystemTimeMicros(20), "index closes the interval");
+        assert_eq!(v.payload, b"body", "body is preserved");
         assert_eq!(v.provenance.principal, Principal::new(b"birth".to_vec()));
         assert_eq!(
             v.closed_by.as_ref().unwrap().principal,
             Principal::new(b"closer".to_vec()),
-            "close provenance comes from the marker",
+            "close provenance comes from the index",
         );
     }
 
     #[test]
-    fn orphan_marker_without_its_target_is_ignored() {
-        // A marker whose target segment was not part of this read leaves the
-        // pool untouched rather than fabricating a version.
-        let chains = fold_chains(vec![open(b"k", 10)], vec![marker(b"other", 5, 7)]);
-        assert!(!chains.contains_key(&BusinessKey::new(b"other".to_vec())));
-        assert_eq!(chains.len(), 1);
+    fn a_version_with_no_index_entry_stays_open() {
+        let idx = index();
+        let chains = fold_chains(vec![open(b"k", 10)], &idx).expect("fold");
+        let v = &chains[&BusinessKey::new(b"k".to_vec())][&SystemTimeMicros(10)];
+        assert_eq!(v.sys_to, SYSTEM_TIME_OPEN);
+        assert!(v.closed_by.is_none());
     }
 
     #[test]
-    fn resolve_open_reports_sealed_when_the_body_is_in_a_segment() {
-        // Sealed open version, no delta staging → the writer must learn the body
-        // is sealed so it appends a marker instead of re-staging.
+    fn resolve_open_finds_a_sealed_open_version() {
+        // Sealed open version, no delta staging, no close → it is the live one.
+        let idx = index();
         let live = resolve_open(
             &[],
-            &[],
             &[open(b"k", 10)],
+            &idx,
             &BusinessKey::new(b"k".to_vec()),
             Snapshot(SystemTimeMicros(100)),
-        );
-        assert!(matches!(live, Some(LiveLocation::Sealed(_))));
-        assert_eq!(live.unwrap().version().sys_from, SystemTimeMicros(10));
+        )
+        .expect("resolve");
+        assert_eq!(live.unwrap().sys_from, SystemTimeMicros(10));
     }
 
     #[test]
-    fn resolve_open_reports_delta_when_the_body_is_staged() {
-        let live = resolve_open(
-            &[open(b"k", 10)],
-            &[],
-            &[],
-            &BusinessKey::new(b"k".to_vec()),
-            Snapshot(SystemTimeMicros(100)),
-        );
-        assert!(matches!(live, Some(LiveLocation::Delta(_))));
-    }
-
-    #[test]
-    fn resolve_open_is_none_once_a_marker_closes_the_sealed_version() {
-        // Sealed version closed by a delta marker at 20 → nothing is live at a
-        // later snapshot, so a re-insert (not an update) is the correct next op.
+    fn resolve_open_is_none_once_the_index_closes_the_version() {
+        // Sealed version closed by the index at 20 → nothing live at a later
+        // snapshot, so a re-insert (not an update) is the correct next op.
+        let mut idx = index();
+        close(&mut idx, b"k", 10, 20);
         let live = resolve_open(
             &[],
-            &[marker(b"k", 10, 20)],
             &[open(b"k", 10)],
+            &idx,
             &BusinessKey::new(b"k".to_vec()),
             Snapshot(SystemTimeMicros(100)),
-        );
+        )
+        .expect("resolve");
         assert_eq!(live, None);
     }
 
     #[test]
     fn resolve_open_picks_the_newest_open_across_two_segments() {
-        // Two flushes: v0 sealed-and-marker-closed, v1 sealed-open. The live
-        // version is v1, and it is reported sealed (its body is in segment 2).
+        // Two flushes: v0 closed, v1 open. The live version is v1.
+        let mut idx = index();
+        close(&mut idx, b"k", 10, 20);
         let live = resolve_open(
             &[],
-            &[marker(b"k", 10, 20)],
             &[open(b"k", 10), open(b"k", 20)],
+            &idx,
             &BusinessKey::new(b"k".to_vec()),
             Snapshot(SystemTimeMicros(100)),
-        );
-        match live {
-            Some(LiveLocation::Sealed(v)) => assert_eq!(v.sys_from, SystemTimeMicros(20)),
-            other => panic!("expected sealed v1, got {other:?}"),
-        }
+        )
+        .expect("resolve");
+        assert_eq!(live.unwrap().sys_from, SystemTimeMicros(20));
     }
 
     #[test]
-    fn snapshot_resolution_sees_the_folded_close() {
-        let chains = fold_chains(
-            vec![open(b"k", 10), open(b"k", 20)],
-            vec![marker(b"k", 10, 20)],
-        );
+    fn snapshot_resolution_sees_the_index_close() {
+        let mut idx = index();
+        close(&mut idx, b"k", 10, 20);
+        let chains = fold_chains(vec![open(b"k", 10), open(b"k", 20)], &idx).expect("fold");
         // Before the close: v0 live. After: v1 live.
         let before = resolve_snapshot(&chains, Snapshot(SystemTimeMicros(15)));
         assert_eq!(before.len(), 1);

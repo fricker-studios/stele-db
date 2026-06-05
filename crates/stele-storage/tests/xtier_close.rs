@@ -1,18 +1,23 @@
-//! Cross-segment system-time close — integration tests (STL-127).
+//! Cross-segment system-time close — integration tests (STL-133, [ADR-0023]).
 //!
 //! These exercise closing a prior system-time period when the open version has
-//! already been flushed out of the delta tier into a **sealed segment**, so the
-//! close cannot re-stage it (invariant 1 forbids mutating a sealed segment) and
-//! must become an appended [`CloseMarker`](stele_storage::delta::CloseMarker).
+//! already been flushed out of the delta tier into a **sealed segment**. The
+//! close cannot re-stage the version (invariant 1 forbids mutating a sealed
+//! segment) — instead it is a write-once append to the derived
+//! [validity index](stele_storage::validity::ValidityIndex): the version's
+//! materialized `sys_to` lives there, never on the record. A read overlays the
+//! index onto the sealed version to surface the closed interval
+//! ([`merge::fold_chains`]).
 //!
-//! * **Round-trip** — DoD bullet 1: insert → `flush_to_segment` → update; a
-//!   snapshot scan merging segment + delta returns exactly two versions, the
-//!   sealed one closed at the new commit plus a new open one.
-//! * **Interval invariant across a flush boundary** — DoD bullet 2: for any
-//!   business key, the `[sys_from, sys_to)` intervals stay non-overlapping and
-//!   gap-free with updates/deletes interleaved with flushes, over a seed sweep.
-//! * **Invariant 1** — DoD bullet 3: no code path mutates the sealed segment;
-//!   the segment's bytes are byte-for-byte unchanged after a cross-segment close.
+//! * **Round-trip** — insert → `flush_to_segment` → update; a snapshot scan
+//!   merging segment + delta + index returns exactly two versions, the sealed one
+//!   closed at the new commit plus a new open one.
+//! * **Interval invariant across a flush boundary** — for any business key, the
+//!   `[sys_from, sys_to)` intervals stay non-overlapping and gap-free with
+//!   updates/deletes interleaved with flushes, over a seed sweep.
+//! * **Invariant 1** — no code path mutates the sealed segment; its bytes are
+//!   byte-for-byte unchanged after a cross-segment close (the close is an index
+//!   append, not a segment rewrite).
 
 #![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 
@@ -23,10 +28,11 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros};
 use stele_storage::backend::{Disk, DiskFile, MemDisk};
-use stele_storage::delta::{BusinessKey, CloseMarker, Delta, DeltaConfig, Snapshot, Version};
+use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
 use stele_storage::merge;
 use stele_storage::segment::{SegmentReader, SegmentWriter};
 use stele_storage::systime::{SealedVersions, SysTimeWriter};
+use stele_storage::validity::{ValidityConfig, ValidityIndex};
 
 fn who() -> Principal {
     Principal::new(b"tester".to_vec())
@@ -34,6 +40,10 @@ fn who() -> Principal {
 
 fn new_delta() -> Delta<MemDisk> {
     Delta::open(MemDisk::new(), DeltaConfig::default()).unwrap()
+}
+
+fn new_index() -> ValidityIndex<MemDisk> {
+    ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).unwrap()
 }
 
 /// A hand-driven clock behind a shared atomic — satisfies `Clock: Send + Sync`.
@@ -74,7 +84,8 @@ impl Rng {
 }
 
 /// Write `rows` into a fresh sealed segment and read every version back — the
-/// real columnar flush boundary, not a stand-in. Returns what a reader sees.
+/// real columnar flush boundary, not a stand-in. Returns what a reader sees
+/// (open/unresolved birth state — the materialized end lives in the index).
 fn seal(disk: &MemDisk, name: &str, rows: Vec<Version>) -> Vec<Version> {
     let mut writer = SegmentWriter::create(disk, name).expect("create segment");
     for v in rows {
@@ -97,17 +108,18 @@ fn raw_bytes(disk: &MemDisk, name: &str) -> Vec<u8> {
 }
 
 /// Reconstruct one key's full version chain across the sealed pool and the delta
-/// tier, folding the delta's close markers — the cross-tier read path a query
-/// executor performs ([`merge::fold_chains`]).
-fn merged_chain(delta: &Delta<MemDisk>, sealed: &[Version], key: &BusinessKey) -> Vec<Version> {
+/// tier, overlaying each version's materialized end from the validity index —
+/// the cross-tier read path a query executor performs ([`merge::fold_chains`]).
+fn merged_chain(
+    delta: &Delta<MemDisk>,
+    sealed: &[Version],
+    index: &ValidityIndex<MemDisk>,
+    key: &BusinessKey,
+) -> Vec<Version> {
     let delta_versions = delta.candidate_versions(key).expect("candidates");
     let sealed_versions = sealed.iter().filter(|v| &v.business_key == key).cloned();
-    let markers: Vec<CloseMarker> = delta
-        .close_markers()
-        .filter(|m| &m.business_key == key)
-        .cloned()
-        .collect();
-    let chains = merge::fold_chains(sealed_versions.chain(delta_versions), markers);
+    let chains =
+        merge::fold_chains(sealed_versions.chain(delta_versions), index).expect("fold chains");
     chains
         .get(key)
         .map(|c| c.values().cloned().collect())
@@ -128,11 +140,12 @@ fn chains_of(
     chains
 }
 
-// --- Round-trip (DoD bullet 1) ----------------------------------------------
+// --- Round-trip --------------------------------------------------------------
 
 #[test]
-fn update_across_a_flush_boundary_closes_the_sealed_version_via_a_marker() {
+fn update_across_a_flush_boundary_closes_the_sealed_version_via_the_index() {
     let mut delta = new_delta();
+    let mut index = new_index();
     let seg_disk = MemDisk::new();
     let clock = StubClock::new(1_000);
     let mut writer = SysTimeWriter::new(clock.clone());
@@ -142,6 +155,7 @@ fn update_across_a_flush_boundary_closes_the_sealed_version_via_a_marker() {
     let c0 = writer
         .insert(
             &mut delta,
+            &mut index,
             &SealedVersions::default(),
             key.clone(),
             b"balance=100".to_vec(),
@@ -160,6 +174,7 @@ fn update_across_a_flush_boundary_closes_the_sealed_version_via_a_marker() {
     let c1 = writer
         .update(
             &mut delta,
+            &mut index,
             &lookup,
             key.clone(),
             b"balance=150".to_vec(),
@@ -169,12 +184,11 @@ fn update_across_a_flush_boundary_closes_the_sealed_version_via_a_marker() {
         .unwrap();
     assert!(c0 < c1);
 
-    // The close did not re-stage a full version — it appended a single marker.
-    assert_eq!(delta.close_markers().count(), 1, "exactly one close marker");
-    let marker = delta.close_markers().next().unwrap();
-    assert_eq!(marker.business_key, key);
-    assert_eq!(marker.sys_from, c0, "marker targets the sealed version");
-    assert_eq!(marker.sys_to, c1);
+    // The close did not re-stage a full version — it appended exactly one entry
+    // to the validity index, targeting the sealed version.
+    assert_eq!(index.len().unwrap(), 1, "exactly one materialized close");
+    let closed_interval = index.close_of(&key, c0).unwrap().expect("c0 is closed");
+    assert_eq!(closed_interval.sys_to, c1, "the index closes c0 at c1");
 
     // Invariant 1: the sealed segment's bytes are unchanged by the close.
     assert_eq!(
@@ -185,9 +199,13 @@ fn update_across_a_flush_boundary_closes_the_sealed_version_via_a_marker() {
 
     // The merged read returns exactly two versions: the sealed one closed at c1,
     // and the new open one — with the sealed version's body and birth provenance
-    // intact, plus the close provenance from the marker.
-    let chain = merged_chain(&delta, &sealed, &key);
-    assert_eq!(chain.len(), 2, "segment + delta merge ⇒ two versions");
+    // intact, plus the close provenance from the index overlay.
+    let chain = merged_chain(&delta, &sealed, &index, &key);
+    assert_eq!(
+        chain.len(),
+        2,
+        "segment + delta + index merge ⇒ two versions"
+    );
     let (closed, open) = (&chain[0], &chain[1]);
 
     assert_eq!(closed.sys_from, c0);
@@ -238,6 +256,7 @@ fn update_across_a_flush_boundary_closes_the_sealed_version_via_a_marker() {
 #[test]
 fn delete_across_a_flush_boundary_closes_the_sealed_version_and_leaves_no_open() {
     let mut delta = new_delta();
+    let mut index = new_index();
     let seg_disk = MemDisk::new();
     let clock = StubClock::new(50);
     let mut writer = SysTimeWriter::new(clock.clone());
@@ -246,6 +265,7 @@ fn delete_across_a_flush_boundary_closes_the_sealed_version_and_leaves_no_open()
     let c0 = writer
         .insert(
             &mut delta,
+            &mut index,
             &SealedVersions::default(),
             key.clone(),
             b"v".to_vec(),
@@ -260,6 +280,7 @@ fn delete_across_a_flush_boundary_closes_the_sealed_version_and_leaves_no_open()
     let deleted_at = writer
         .delete(
             &mut delta,
+            &mut index,
             &lookup,
             &key,
             TxnId(2),
@@ -267,13 +288,13 @@ fn delete_across_a_flush_boundary_closes_the_sealed_version_and_leaves_no_open()
         )
         .unwrap();
 
-    // A delete-across-flush is a marker too — no successor version.
+    // A delete-across-flush is an index close too — no successor version staged.
     assert_eq!(
         delta.candidate_versions(&key).unwrap().len(),
         0,
         "no new version staged"
     );
-    let chain = merged_chain(&delta, &sealed, &key);
+    let chain = merged_chain(&delta, &sealed, &index, &key);
     assert_eq!(
         chain.len(),
         1,
@@ -305,6 +326,7 @@ fn insert_on_a_key_live_only_in_a_segment_is_rejected() {
     // The liveness check must span tiers: a key whose live version is sealed is
     // still live, so a re-insert is a KeyExists error, not a silent second open.
     let mut delta = new_delta();
+    let mut index = new_index();
     let seg_disk = MemDisk::new();
     let mut writer = SysTimeWriter::new(StubClock::new(1));
     let key = BusinessKey::new(b"dup".to_vec());
@@ -312,6 +334,7 @@ fn insert_on_a_key_live_only_in_a_segment_is_rejected() {
     writer
         .insert(
             &mut delta,
+            &mut index,
             &SealedVersions::default(),
             key.clone(),
             b"a".to_vec(),
@@ -323,7 +346,15 @@ fn insert_on_a_key_live_only_in_a_segment_is_rejected() {
 
     let lookup = SealedVersions::new(sealed);
     let err = writer
-        .insert(&mut delta, &lookup, key, b"b".to_vec(), TxnId(2), who())
+        .insert(
+            &mut delta,
+            &mut index,
+            &lookup,
+            key,
+            b"b".to_vec(),
+            TxnId(2),
+            who(),
+        )
         .unwrap_err();
     assert!(
         matches!(err, stele_storage::systime::SysTimeError::KeyExists),
@@ -331,7 +362,7 @@ fn insert_on_a_key_live_only_in_a_segment_is_rejected() {
     );
 }
 
-// --- Interval invariant across a flush boundary (DoD bullet 2) ---------------
+// --- Interval invariant across a flush boundary ------------------------------
 
 /// What op created a given version — the boundary to it abuts iff it was an
 /// update; an insert after a delete opens a fresh period with a real gap.
@@ -415,6 +446,9 @@ fn chains_stay_non_overlapping_and_gap_free_across_flush_boundaries() {
     for seed in 0u64..120 {
         let mut rng = Rng::new(seed);
         let mut delta = new_delta();
+        // The validity index is derived state that persists across flushes — it
+        // is the authority for every version's end, delta-resident or sealed.
+        let mut index = new_index();
         let seg_disk = MemDisk::new();
         let clock = StubClock::new(1);
         let mut writer = SysTimeWriter::new(clock.clone());
@@ -433,8 +467,8 @@ fn chains_stay_non_overlapping_and_gap_free_across_flush_boundaries() {
             clock.advance((rng.range(3)) as i64);
 
             // ~1 in 5 ops is a flush: drain the delta's versions into a new
-            // sealed segment and fold them into the reader-visible pool. Markers
-            // deliberately stay in the delta until compaction.
+            // sealed segment and fold them into the reader-visible pool. The
+            // closes stay in the index (the authority), not the segment.
             if rng.range(5) == 0 {
                 let drained = delta.flush_to_segment().unwrap();
                 if !drained.is_empty() {
@@ -455,29 +489,30 @@ fn chains_stay_non_overlapping_and_gap_free_across_flush_boundaries() {
                 // Half the time supersede, half the time delete.
                 if rng.range(2) == 0 {
                     writer
-                        .delete(&mut delta, &lookup, &key, txn, who())
+                        .delete(&mut delta, &mut index, &lookup, &key, txn, who())
                         .unwrap();
                     live[k] = false;
                 } else {
                     writer
-                        .update(&mut delta, &lookup, key, payload, txn, who())
+                        .update(&mut delta, &mut index, &lookup, key, payload, txn, who())
                         .unwrap();
                     born[k].push(Born::Update);
                 }
             } else {
                 writer
-                    .insert(&mut delta, &lookup, key, payload, txn, who())
+                    .insert(&mut delta, &mut index, &lookup, key, payload, txn, who())
                     .unwrap();
                 live[k] = true;
                 born[k].push(Born::Insert);
             }
         }
 
-        // Reconstruct each key's full chain across every segment + the delta and
-        // assert the bitemporal invariant holds across the flush boundaries.
+        // Reconstruct each key's full chain across every segment + the delta +
+        // the index and assert the bitemporal invariant holds across the flush
+        // boundaries.
         for k in 0..KEY_POOL as usize {
             let key = BusinessKey::new(vec![b'k', k as u8]);
-            let chain = merged_chain(&delta, &sealed, &key);
+            let chain = merged_chain(&delta, &sealed, &index, &key);
             assert_chain_invariant(seed, k, &chain, &born[k], live[k]);
         }
     }

@@ -35,7 +35,6 @@
 //! test-enforced under multiple deterministic seeds in
 //! `tests/delta.rs`.
 
-mod marker;
 mod mem;
 mod spill;
 mod version;
@@ -47,8 +46,9 @@ use std::ops::RangeBounds;
 use stele_common::time::SystemTimeMicros;
 
 use crate::backend::Disk;
+use crate::merge;
+use crate::validity::{ValidityError, ValidityIndex};
 
-pub use marker::CloseMarker;
 pub use version::{BusinessKey, MAX_VERSION_FRAME_LEN, Snapshot, Version};
 
 use mem::MemTier;
@@ -95,6 +95,12 @@ pub enum DeltaError {
     /// An I/O failure on the spill path.
     #[error("i/o error: {0}")]
     Io(#[from] io::Error),
+
+    /// A read folded the [validity index](crate::validity) onto staged versions
+    /// to resolve their `sys_to` ([ADR-0023]) and the index's backing spill
+    /// could not be read.
+    #[error(transparent)]
+    Validity(#[from] ValidityError),
 }
 
 /// The delta-tier handle.
@@ -115,15 +121,6 @@ pub struct Delta<D: Disk> {
     /// Spill indices we have written this lifetime and have not yet flushed
     /// into a sealed segment. Kept in ascending order.
     live_spills: Vec<u64>,
-    /// Appended close markers ([`CloseMarker`]), keyed by the
-    /// `(business_key, sys_from)` of the sealed version each one closes.
-    /// Idempotent on that key — re-applying the same close is a no-op, the
-    /// property WAL replay relies on, mirroring [`Version`] inserts. Markers
-    /// live here until history-preserving compaction folds them into the
-    /// rewritten segment (a later milestone); [`flush_to_segment`](Self::flush_to_segment)
-    /// deliberately leaves them in place, since the open versions they close
-    /// live in an *already-sealed* segment, not in this flush's output.
-    markers: BTreeMap<(BusinessKey, SystemTimeMicros), CloseMarker>,
 }
 
 impl<D: Disk> Delta<D> {
@@ -143,7 +140,6 @@ impl<D: Disk> Delta<D> {
             mem: MemTier::new(),
             next_spill_index,
             live_spills: Vec::new(),
-            markers: BTreeMap::new(),
         })
     }
 
@@ -189,59 +185,46 @@ impl<D: Disk> Delta<D> {
         !self.live_spills.is_empty()
     }
 
-    /// Snapshot read over `key_range`.
+    /// Snapshot read over `key_range`, resolving each version's `sys_to` from the
+    /// [`ValidityIndex`].
     ///
     /// For each business key in `key_range`, emit the version whose
-    /// `[sys_from, sys_to)` interval contains `snapshot`. Output is sorted by
-    /// business key. The merge across the in-memory tier and spill files is
-    /// done by collecting all candidate versions per key and resolving the
-    /// snapshot pick at the end — so a spill containing a closed period and
-    /// an in-memory row containing the live one produce the live row, even
-    /// if the closed one was written more recently.
+    /// `[sys_from, sys_to)` interval contains `snapshot`. The interval *end*
+    /// is not stored on the staged version ([ADR-0023]); it is overlaid from
+    /// `index` ([`crate::merge::fold_chains`]). Output is sorted by business key.
+    /// Candidates from the in-memory tier and every spill are collected and
+    /// resolved together, so a spilled and a resident row for one key both
+    /// contribute.
     ///
     /// # Errors
     ///
-    /// Surfaces I/O or corruption errors loading spill files. The in-memory
-    /// path itself is infallible.
-    pub fn range_scan<R>(
+    /// Surfaces I/O or corruption errors loading delta spill files, or
+    /// [`DeltaError::Validity`] if an index spill cannot be read.
+    pub fn range_scan<R, I>(
         &self,
         key_range: R,
         snapshot: Snapshot,
+        index: &ValidityIndex<I>,
     ) -> Result<Vec<Version>, DeltaError>
     where
         R: RangeBounds<BusinessKey>,
+        I: Disk,
     {
-        // Materialise every candidate row in `(key, sys_from)` order into a
-        // single chain-per-key map, then pick the snapshot's live version
-        // for each. Doing the merge here (rather than picking per-source)
-        // means a closed-period row in a spill and the matching live row in
-        // memory both contribute; the snapshot resolver picks correctly.
-        let mut merged: BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Version>> =
-            BTreeMap::new();
-        let mut take = |v: Version| {
-            if !in_range(&v.business_key, &key_range) {
-                return;
-            }
-            merged
-                .entry(v.business_key.clone())
-                .or_default()
-                .insert(v.sys_from, v);
-        };
+        let mut candidates: Vec<Version> = Vec::new();
         for v in self.mem.iter() {
-            take(v.clone());
+            if in_range(&v.business_key, &key_range) {
+                candidates.push(v.clone());
+            }
         }
         for &idx in &self.live_spills {
             for v in spill::read_spill(&self.disk, idx)? {
-                take(v);
+                if in_range(&v.business_key, &key_range) {
+                    candidates.push(v);
+                }
             }
         }
-        let mut out = Vec::new();
-        for (_, chain) in merged {
-            if let Some(v) = pick_live(&chain, snapshot) {
-                out.push(v);
-            }
-        }
-        Ok(out)
+        let chains = merge::fold_chains(candidates, index)?;
+        Ok(merge::resolve_snapshot(&chains, snapshot))
     }
 
     /// Promote every in-memory row plus every spill into a single sorted
@@ -283,51 +266,15 @@ impl<D: Disk> Delta<D> {
             .collect())
     }
 
-    /// Append a [`CloseMarker`] — the cross-tier logical period-close used when
-    /// the version being closed lives in an already-sealed segment rather than
-    /// the delta tier ([STL-127]). Idempotent on `(business_key, sys_from)`: a
-    /// replayed close overwrites the prior marker for that target rather than
-    /// stacking, exactly as a re-inserted [`Version`] does.
-    ///
-    /// Markers are tiny and kept resident; they are *not* charged against the
-    /// spill threshold and *not* drained by [`flush_to_segment`](Self::flush_to_segment)
-    /// — see the field docs on `markers`.
-    pub fn insert_close_marker(&mut self, marker: CloseMarker) {
-        self.markers
-            .insert((marker.business_key.clone(), marker.sys_from), marker);
-    }
-
-    /// Every close marker currently held, in `(business_key, sys_from)` order.
-    /// The read path ([`crate::merge`]) folds these onto the matching sealed
-    /// versions to resolve the closed interval.
-    pub fn close_markers(&self) -> impl Iterator<Item = &CloseMarker> {
-        self.markers.values()
-    }
-
-    /// The close markers for a single `key`, in `sys_from` order.
-    ///
-    /// Markers are keyed by `(business_key, sys_from)`, so one key's markers are
-    /// a contiguous run — this `range`-scans just that run rather than walking
-    /// every marker. The write-path liveness check ([`crate::systime`]) uses it
-    /// so a key's resolution stays `O(log n + markers_for_key)` even as markers
-    /// accumulate across the tier until compaction folds them ([STL-127]).
-    pub fn close_markers_for(&self, key: &BusinessKey) -> impl Iterator<Item = &CloseMarker> {
-        use std::ops::Bound::Included;
-        let lo = (key.clone(), SystemTimeMicros(i64::MIN));
-        let hi = (key.clone(), SystemTimeMicros(i64::MAX));
-        self.markers
-            .range((Included(lo), Included(hi)))
-            .map(|(_, marker)| marker)
-    }
-
     /// Every version of `key` currently staged in the delta tier — both the
-    /// in-memory store and every live spill — **without** snapshot resolution.
+    /// in-memory store and every live spill — **raw** (no validity-index overlay,
+    /// no snapshot resolution).
     ///
     /// Unlike [`range_scan`](Self::range_scan), which returns at most the one
     /// version live at a snapshot, this returns the key's full set of staged
-    /// candidates (open and closed). The cross-tier writer path uses it to tell
-    /// whether a key's live version is still in the delta (close it in place)
-    /// or has been sealed (append a [`CloseMarker`] instead) ([STL-127]).
+    /// candidates. The writer's liveness check ([`crate::systime`]) folds these
+    /// with the sealed versions and the validity index ([`crate::merge::resolve_open`])
+    /// to find the open version a supersession must close.
     ///
     /// # Errors
     ///
@@ -360,21 +307,6 @@ impl<D: Disk> Delta<D> {
         self.live_spills.push(idx);
         Ok(())
     }
-}
-
-/// Resolve a key's chain at `snapshot`: the greatest `sys_from ≤ snapshot`
-/// whose `sys_to > snapshot`. Mirrors the in-memory tier's resolver, but works
-/// over the merged map.
-fn pick_live(
-    chain: &std::collections::BTreeMap<stele_common::time::SystemTimeMicros, Version>,
-    snapshot: Snapshot,
-) -> Option<Version> {
-    chain
-        .range(..=snapshot.0)
-        .next_back()
-        .map(|(_, v)| v)
-        .filter(|v| v.sys_to > snapshot.0)
-        .cloned()
 }
 
 /// Inclusive-on-start / per-bound-as-stated membership test, matching the

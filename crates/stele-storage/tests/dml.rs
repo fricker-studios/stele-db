@@ -34,6 +34,8 @@ use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros, ValidTimeMic
 use stele_storage::backend::MemDisk;
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
 use stele_storage::dml::{self, DmlWriter};
+use stele_storage::merge;
+use stele_storage::validity::{ValidityConfig, ValidityIndex};
 use stele_storage::validtime::{ValidInterval, unframe_payload};
 use stele_storage::wal::{Checkpoint, Wal, WalConfig};
 
@@ -77,36 +79,50 @@ fn who() -> Principal {
     Principal::new(b"tester".to_vec())
 }
 
-/// A fresh WAL + delta pair over independent in-memory disks, and a system-only
-/// (`valid_time = false`) DML writer driving them.
-fn new_writer(start: i64) -> (DmlWriter<StepClock, MemDisk>, Delta<MemDisk>, Wal<MemDisk>) {
+/// A fresh WAL + delta + validity-index triple over independent in-memory
+/// disks, and a system-only (`valid_time = false`) DML writer driving them.
+fn new_writer(
+    start: i64,
+) -> (
+    DmlWriter<StepClock, MemDisk>,
+    Delta<MemDisk>,
+    ValidityIndex<MemDisk>,
+    Wal<MemDisk>,
+) {
     let wal = Wal::open(MemDisk::new(), WalConfig::default()).expect("open wal");
     let delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+    let index = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("open index");
     let writer = DmlWriter::new(wal.clone(), StepClock::new(start), false);
-    (writer, delta, wal)
+    (writer, delta, index, wal)
 }
 
-/// Drain the delta and group every stored version by key, preserving the
-/// `(business_key, sys_from)` order `flush_to_segment` guarantees — so each
-/// `Vec<Version>` is one key's full chain, oldest first (closed *and* open).
-fn drain_chains(delta: &mut Delta<MemDisk>) -> BTreeMap<BusinessKey, Vec<Version>> {
-    let mut map: BTreeMap<BusinessKey, Vec<Version>> = BTreeMap::new();
-    for v in delta.flush_to_segment().expect("flush") {
-        map.entry(v.business_key.clone()).or_default().push(v);
-    }
-    map
+/// Drain the delta and group every stored version by key, overlaying each
+/// version's end (`sys_to` / `closed_by`) from the validity index ([ADR-0023] —
+/// the record bodies are open; their ends live in the index). Each `Vec<Version>`
+/// is one key's full chain, oldest first by `sys_from` (closed *and* open).
+fn drain_chains(
+    delta: &mut Delta<MemDisk>,
+    index: &ValidityIndex<MemDisk>,
+) -> BTreeMap<BusinessKey, Vec<Version>> {
+    let drained = delta.flush_to_segment().expect("flush");
+    let folded = merge::fold_chains(drained, index).expect("fold chains");
+    folded
+        .into_iter()
+        .map(|(key, chain)| (key, chain.into_values().collect()))
+        .collect()
 }
 
 // --- focused flow ----------------------------------------------------------
 
 #[test]
 fn insert_update_delete_flow_through_wal_then_delta() {
-    let (mut dml, mut delta, wal) = new_writer(1_000);
+    let (mut dml, mut delta, mut index, wal) = new_writer(1_000);
     let key = BusinessKey::new(b"acct-7".to_vec());
 
     let c0 = dml
         .insert(
             &mut delta,
+            &mut index,
             key.clone(),
             None,
             b"v0".to_vec(),
@@ -118,6 +134,7 @@ fn insert_update_delete_flow_through_wal_then_delta() {
     let c1 = dml
         .update(
             &mut delta,
+            &mut index,
             key.clone(),
             None,
             b"v1".to_vec(),
@@ -129,6 +146,7 @@ fn insert_update_delete_flow_through_wal_then_delta() {
     let out = dml
         .delete(
             &mut delta,
+            &mut index,
             &key,
             TxnId(3),
             Principal::new(b"deleter".to_vec()),
@@ -147,11 +165,11 @@ fn insert_update_delete_flow_through_wal_then_delta() {
 
     // No version is live after the delete.
     let live = delta
-        .range_scan(.., Snapshot(SystemTimeMicros(i64::MAX - 1)))
+        .range_scan(.., Snapshot(SystemTimeMicros(i64::MAX - 1)), &index)
         .expect("scan");
     assert!(live.is_empty(), "deleted key has no live version");
 
-    let mut chains = drain_chains(&mut delta);
+    let mut chains = drain_chains(&mut delta, &index);
     let versions = chains.remove(&key).expect("key has a chain");
     // insert opened [c0,+∞); update closed it at c1 and opened [c1,+∞); delete
     // closed that at c2 — two closed periods, no open one, abutting exactly.
@@ -174,10 +192,11 @@ fn insert_update_delete_flow_through_wal_then_delta() {
 
 #[test]
 fn insert_on_a_live_key_is_rejected_through_the_dml_path() {
-    let (mut dml, mut delta, _wal) = new_writer(1);
+    let (mut dml, mut delta, mut index, _wal) = new_writer(1);
     let key = BusinessKey::new(b"dup".to_vec());
     dml.insert(
         &mut delta,
+        &mut index,
         key.clone(),
         None,
         b"a".to_vec(),
@@ -186,7 +205,15 @@ fn insert_on_a_live_key_is_rejected_through_the_dml_path() {
     )
     .expect("first insert");
     let err = dml
-        .insert(&mut delta, key, None, b"b".to_vec(), TxnId(2), who())
+        .insert(
+            &mut delta,
+            &mut index,
+            key,
+            None,
+            b"b".to_vec(),
+            TxnId(2),
+            who(),
+        )
         .unwrap_err();
     assert!(matches!(err, dml::DmlError::Resolve(_)));
 }
@@ -204,6 +231,8 @@ fn wal_replay_reconstructs_the_delta_under_seed_sweep() {
         let mut rng = Rng::new(seed);
         let wal = Wal::open(MemDisk::new(), WalConfig::default()).expect("open wal");
         let mut live_delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
+        let mut live_index =
+            ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
         // valid_time = true: inserts/updates must carry an interval.
         let mut dml = DmlWriter::new(wal.clone(), StepClock::new(1), true);
         let mut live = vec![false; KEY_POOL as usize];
@@ -215,7 +244,7 @@ fn wal_replay_reconstructs_the_delta_under_seed_sweep() {
             let txn = TxnId(op);
             if live[k] {
                 if rng.range(2) == 0 {
-                    dml.delete(&mut live_delta, &key, txn, who())
+                    dml.delete(&mut live_delta, &mut live_index, &key, txn, who())
                         .expect("delete");
                     live[k] = false;
                 } else {
@@ -224,26 +253,45 @@ fn wal_replay_reconstructs_the_delta_under_seed_sweep() {
                     let iv =
                         ValidInterval::new(ValidTimeMicros(from), ValidTimeMicros(from + span))
                             .expect("from < to");
-                    dml.update(&mut live_delta, key, Some(iv), b"u".to_vec(), txn, who())
-                        .expect("update");
+                    dml.update(
+                        &mut live_delta,
+                        &mut live_index,
+                        key,
+                        Some(iv),
+                        b"u".to_vec(),
+                        txn,
+                        who(),
+                    )
+                    .expect("update");
                 }
             } else {
                 let from = (rng.range(1_000_000)) as i64;
                 let span = 1 + (rng.range(1_000_000)) as i64;
                 let iv = ValidInterval::new(ValidTimeMicros(from), ValidTimeMicros(from + span))
                     .expect("from < to");
-                dml.insert(&mut live_delta, key, Some(iv), b"i".to_vec(), txn, who())
-                    .expect("insert");
+                dml.insert(
+                    &mut live_delta,
+                    &mut live_index,
+                    key,
+                    Some(iv),
+                    b"i".to_vec(),
+                    txn,
+                    who(),
+                )
+                .expect("insert");
                 live[k] = true;
             }
         }
         wal.tick().expect("fsync");
 
-        // Snapshot the live delta, then rebuild a fresh one purely from the WAL.
-        let live_chains = drain_chains(&mut live_delta);
+        // Snapshot the live delta, then rebuild a fresh delta *and* index purely
+        // from the WAL — replay now reconstructs both ([ADR-0023]).
+        let live_chains = drain_chains(&mut live_delta, &live_index);
         let mut replayed = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
-        dml::replay(&wal, &mut replayed, Checkpoint::BEGIN).expect("replay");
-        let replayed_chains = drain_chains(&mut replayed);
+        let mut replayed_index =
+            ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+        dml::replay(&wal, &mut replayed, &mut replayed_index, Checkpoint::BEGIN).expect("replay");
+        let replayed_chains = drain_chains(&mut replayed, &replayed_index);
 
         assert_eq!(
             live_chains, replayed_chains,
@@ -282,7 +330,7 @@ fn timeline_reconstructs_with_no_gaps_or_overlaps_under_seed_sweep() {
 
     for seed in 0u64..256 {
         let mut rng = Rng::new(seed);
-        let (mut dml, mut delta, _wal) = new_writer(1);
+        let (mut dml, mut delta, mut index, _wal) = new_writer(1);
 
         // Per key: the expected period chain (oldest first) and whether live.
         let mut model: Vec<Vec<Period>> = vec![Vec::new(); KEY_POOL as usize];
@@ -298,7 +346,7 @@ fn timeline_reconstructs_with_no_gaps_or_overlaps_under_seed_sweep() {
                 if rng.range(2) == 0 {
                     // DELETE: close the open period, no successor.
                     let commit = dml
-                        .delete(&mut delta, &key, txn, who())
+                        .delete(&mut delta, &mut index, &key, txn, who())
                         .expect("delete")
                         .commit;
                     close_open(&mut model[k], commit.0);
@@ -306,7 +354,7 @@ fn timeline_reconstructs_with_no_gaps_or_overlaps_under_seed_sweep() {
                 } else {
                     // UPDATE: close the open period at `commit`, open a new one.
                     let commit = dml
-                        .update(&mut delta, key, None, b"u".to_vec(), txn, who())
+                        .update(&mut delta, &mut index, key, None, b"u".to_vec(), txn, who())
                         .expect("update")
                         .commit;
                     close_open(&mut model[k], commit.0);
@@ -319,7 +367,7 @@ fn timeline_reconstructs_with_no_gaps_or_overlaps_under_seed_sweep() {
             } else {
                 // INSERT: open a fresh period (a gap from any prior delete).
                 let commit = dml
-                    .insert(&mut delta, key, None, b"i".to_vec(), txn, who())
+                    .insert(&mut delta, &mut index, key, None, b"i".to_vec(), txn, who())
                     .expect("insert")
                     .commit;
                 model[k].push(Period {
@@ -331,7 +379,7 @@ fn timeline_reconstructs_with_no_gaps_or_overlaps_under_seed_sweep() {
             }
         }
 
-        let chains = drain_chains(&mut delta);
+        let chains = drain_chains(&mut delta, &index);
         for k in 0..KEY_POOL as usize {
             let key = BusinessKey::new(vec![b'k', k as u8]);
             verify_key_timeline(seed, k, &model[k], chains.get(&key), live[k]);

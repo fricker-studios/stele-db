@@ -110,6 +110,12 @@ impl From<crate::delta::DeltaError> for SegmentError {
             crate::delta::DeltaError::TooLarge(_) => Self::TooLarge("version frame too large"),
             crate::delta::DeltaError::Corrupt(msg) => Self::Corrupt(msg),
             crate::delta::DeltaError::Io(e) => Self::Io(e),
+            // The segment writer never folds the validity index, so this variant
+            // is unreachable on this path; map it to a corruption marker rather
+            // than widen SegmentError for a case the writer cannot produce.
+            crate::delta::DeltaError::Validity(_) => {
+                Self::Corrupt("unexpected validity-index error on the segment path")
+            }
         }
     }
 }
