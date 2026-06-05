@@ -560,11 +560,7 @@ fn resolve_live<D: Disk, S: SealedLookup>(
 ) -> Result<Option<LiveLocation>, SysTimeError> {
     let delta_versions = delta.candidate_versions(key)?;
     let sealed_versions = sealed.versions_for(key)?;
-    let markers: Vec<CloseMarker> = delta
-        .close_markers()
-        .filter(|m| &m.business_key == key)
-        .cloned()
-        .collect();
+    let markers: Vec<CloseMarker> = delta.close_markers_for(key).cloned().collect();
     Ok(merge::resolve_open(
         &delta_versions,
         &markers,

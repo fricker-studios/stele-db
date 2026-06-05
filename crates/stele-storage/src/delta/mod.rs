@@ -304,6 +304,22 @@ impl<D: Disk> Delta<D> {
         self.markers.values()
     }
 
+    /// The close markers for a single `key`, in `sys_from` order.
+    ///
+    /// Markers are keyed by `(business_key, sys_from)`, so one key's markers are
+    /// a contiguous run — this `range`-scans just that run rather than walking
+    /// every marker. The write-path liveness check ([`crate::systime`]) uses it
+    /// so a key's resolution stays `O(log n + markers_for_key)` even as markers
+    /// accumulate across the tier until compaction folds them ([STL-127]).
+    pub fn close_markers_for(&self, key: &BusinessKey) -> impl Iterator<Item = &CloseMarker> {
+        use std::ops::Bound::Included;
+        let lo = (key.clone(), SystemTimeMicros(i64::MIN));
+        let hi = (key.clone(), SystemTimeMicros(i64::MAX));
+        self.markers
+            .range((Included(lo), Included(hi)))
+            .map(|(_, marker)| marker)
+    }
+
     /// Every version of `key` currently staged in the delta tier — both the
     /// in-memory store and every live spill — **without** snapshot resolution.
     ///
