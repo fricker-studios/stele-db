@@ -41,7 +41,7 @@
 //! [`crate::segment`] zone maps prune the valid axis generically.
 //!
 //! Provenance ([STL-93]) is *not* in the payload: unlike valid-time it is
-//! always-on and first-class, carried as dedicated [`Version`](crate::delta::Version)
+//! always-on and first-class, carried as dedicated [`Version`]
 //! fields and segment columns. [`ValidTimeWriter`] simply forwards the caller's
 //! `txn_id` / `principal` down to the system-time writer, which stamps them at
 //! commit.
@@ -65,7 +65,7 @@
 use stele_common::provenance::{Principal, TxnId};
 use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
 
-use crate::delta::{BusinessKey, Delta};
+use crate::delta::{BusinessKey, Delta, Version};
 use crate::systime::{SysTimeError, SysTimeWriter};
 use crate::wal::Disk;
 
@@ -353,6 +353,71 @@ impl<C: Clock> ValidTimeWriter<C> {
         principal: Principal,
     ) -> Result<SystemTimeMicros, ValidTimeError> {
         Ok(self.inner.delete(delta, key, txn_id, principal)?)
+    }
+
+    /// Resolve an insert into the redo set it stages — both temporal axes
+    /// populated, framed payload built — **without** touching the delta tier.
+    /// The valid-time framing happens here; the rest delegates to
+    /// [`SysTimeWriter::stage_insert`]. The DML write path ([`crate::dml`]) logs
+    /// the returned versions to the WAL before applying them.
+    ///
+    /// # Errors
+    ///
+    /// Policy mismatches as in [`Self::insert`]; otherwise the system-time
+    /// resolution's errors (e.g. [`SysTimeError::KeyExists`]).
+    pub fn stage_insert<D: Disk>(
+        &mut self,
+        delta: &Delta<D>,
+        key: BusinessKey,
+        valid: Option<ValidInterval>,
+        payload: Vec<u8>,
+        txn_id: TxnId,
+        principal: Principal,
+    ) -> Result<(SystemTimeMicros, Vec<Version>), ValidTimeError> {
+        let framed = frame_payload(self.valid_time, valid, payload)?;
+        Ok(self
+            .inner
+            .stage_insert(delta, key, framed, txn_id, principal)?)
+    }
+
+    /// Resolve an update into the redo set it stages — the prior version closed
+    /// plus a new open version carrying the new valid interval — without
+    /// touching the delta tier. See [`Self::stage_insert`].
+    ///
+    /// # Errors
+    ///
+    /// Policy mismatches as in [`Self::insert`]; otherwise the system-time
+    /// resolution's errors (e.g. [`SysTimeError::KeyNotFound`]).
+    pub fn stage_update<D: Disk>(
+        &mut self,
+        delta: &Delta<D>,
+        key: BusinessKey,
+        valid: Option<ValidInterval>,
+        payload: Vec<u8>,
+        txn_id: TxnId,
+        principal: Principal,
+    ) -> Result<(SystemTimeMicros, Vec<Version>), ValidTimeError> {
+        let framed = frame_payload(self.valid_time, valid, payload)?;
+        Ok(self
+            .inner
+            .stage_update(delta, key, framed, txn_id, principal)?)
+    }
+
+    /// Resolve a delete into the redo set it stages — the prior version closed,
+    /// no successor — without touching the delta tier. Carries no valid-time
+    /// interval (a delete is a system-time fact); see [`Self::delete`].
+    ///
+    /// # Errors
+    ///
+    /// The system-time resolution's errors (e.g. [`SysTimeError::KeyNotFound`]).
+    pub fn stage_delete<D: Disk>(
+        &mut self,
+        delta: &Delta<D>,
+        key: &BusinessKey,
+        txn_id: TxnId,
+        principal: Principal,
+    ) -> Result<(SystemTimeMicros, Vec<Version>), ValidTimeError> {
+        Ok(self.inner.stage_delete(delta, key, txn_id, principal)?)
     }
 }
 

@@ -21,6 +21,7 @@
 pub mod backend;
 pub(crate) mod checksum;
 pub mod delta;
+pub mod dml;
 pub mod segment;
 pub mod systime;
 pub mod validtime;
