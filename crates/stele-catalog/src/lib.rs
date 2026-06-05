@@ -25,10 +25,26 @@
 //! are separate tickets; this type is the metadata both sides agree on. The
 //! storage write path turns [`TableTemporal::valid_time_enabled`] into its
 //! require-vs-reject policy (`stele_storage::validtime`).
+//!
+//! ## Versioned resolution ([STL-98])
+//!
+//! [`Catalog`] holds, per table, a chain of [`TableSchema`] versions on the
+//! system-time axis: each DDL change appends a version stamped with the system
+//! time it took effect, and [`Catalog::resolve`] returns the schema in effect at
+//! a given snapshot. That is what lets an `AS OF` read in the past resolve
+//! columns under the schema that was live *then*. Persisting the catalog onto
+//! the sealed-segment substrate and wiring [`SchemaId`] into the footer write
+//! path are follow-ups; the resolution semantics live here.
 
-#![allow(dead_code)] // scaffold — wired in by the binder/DML in [STL-94]/[STL-95]
+#![allow(dead_code)] // scaffold for the not-yet-wired binder/DML seams ([STL-94]/[STL-95])
 
-/// Error raised when a temporal configuration is malformed.
+mod schema;
+mod versioned;
+
+pub use schema::{ColumnDef, SchemaId, TableSchema};
+pub use versioned::Catalog;
+
+/// Error raised when a catalog operation is malformed.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CatalogError {
     /// A `VALID TIME (from, to)` clause named columns that were empty or not
@@ -36,6 +52,39 @@ pub enum CatalogError {
     /// a column cannot be both the start and the end of its own period.
     #[error("valid-time period needs two distinct, non-empty columns (got from={0:?}, to={1:?})")]
     InvalidValidTimeColumns(String, String),
+
+    /// A [`ColumnDef`] was given an empty name. A column needs a name to be
+    /// resolvable.
+    #[error("column name must be non-empty")]
+    InvalidColumnName,
+
+    /// Two columns in one schema share a name. Column names must be distinct
+    /// within a schema so a reference resolves unambiguously.
+    #[error("duplicate column {0:?} in schema")]
+    DuplicateColumn(String),
+
+    /// [`Catalog::create_table`] named a table that already exists.
+    #[error("table {0:?} already exists")]
+    TableAlreadyExists(String),
+
+    /// An operation referenced a table not registered in the catalog.
+    #[error("unknown table {0:?}")]
+    UnknownTable(String),
+
+    /// A schema change carried a system time at or before the current version's
+    /// start. System time never moves backward, and a zero-width version would
+    /// break the gap-free/non-overlapping interval invariant.
+    #[error(
+        "schema change for table {table:?} at sys_time {at} is not after the current version start {current_from}"
+    )]
+    NonMonotonicSchemaChange {
+        /// The table whose schema change was rejected.
+        table: String,
+        /// The offending change's system time.
+        at: i64,
+        /// The current open version's start, which `at` must exceed.
+        current_from: i64,
+    },
 }
 
 /// The two boundary columns of a table's valid-time period, captured from a
