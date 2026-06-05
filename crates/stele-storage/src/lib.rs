@@ -22,6 +22,7 @@ pub mod backend;
 pub(crate) mod checksum;
 pub mod delta;
 pub mod dml;
+pub mod merge;
 pub mod segment;
 pub mod systime;
 pub mod validtime;

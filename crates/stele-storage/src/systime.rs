@@ -52,16 +52,93 @@
 //!
 //! ```ignore
 //! let mut writer = SysTimeWriter::new(SystemClock);
-//! writer.insert(&mut delta, key.clone(), b"v0".to_vec())?;   // [c0, +∞)
-//! writer.update(&mut delta, key.clone(), b"v1".to_vec())?;   // closes c0 at c1; [c1, +∞)
+//! // `EmptySealed`: this table has no sealed segments yet, so the writer only
+//! // consults the delta tier. Hand it a `SealedVersions` once segments exist.
+//! writer.insert(&mut delta, &EmptySealed, key.clone(), b"v0".to_vec())?;   // [c0, +∞)
+//! writer.update(&mut delta, &EmptySealed, key.clone(), b"v1".to_vec())?;   // closes c0 at c1; [c1, +∞)
 //! // delta now holds two versions for `key`: [c0, c1) and [c1, +∞).
 //! ```
+//!
+//! ## Closing across a flush boundary
+//!
+//! Once a key's open version has been flushed into a **sealed segment**, the
+//! close can no longer re-stage it — invariant 1 forbids mutating a sealed
+//! segment. [`SysTimeWriter::update`] / [`SysTimeWriter::delete`] then append a
+//! [`CloseMarker`] instead, naming the sealed
+//! version and the new `sys_to`; the read path ([`crate::merge`]) folds the
+//! marker onto the sealed version to surface the closed interval. The writer
+//! tells the two cases apart through the [`SealedLookup`] it is handed ([STL-127]).
 
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros};
 
-use crate::delta::{BusinessKey, Delta, DeltaError, Snapshot, Version};
+use crate::delta::{BusinessKey, CloseMarker, Delta, DeltaError, Snapshot, Version};
+use crate::merge::{self, LiveLocation};
+use crate::segment::SegmentError;
 use crate::wal::Disk;
+
+/// A read-only lookup over the sealed segments the writer must consult to
+/// resolve a key's live version that has already been flushed out of the delta
+/// tier ([STL-127]).
+///
+/// The writer always checks the delta tier first; this trait covers the
+/// "already sealed" case. It returns the key's sealed versions **raw** — open
+/// or closed, before any delta close-marker is folded in — because the writer
+/// owns the markers and folds them itself ([`crate::merge::resolve_open`]).
+pub trait SealedLookup {
+    /// Every version of `key` stored across the sealed segments, in any order.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces a [`SegmentError`] if a backing segment cannot be read.
+    fn versions_for(&self, key: &BusinessKey) -> Result<Vec<Version>, SegmentError>;
+}
+
+/// A [`SealedLookup`] for a table with no sealed segments — every lookup is
+/// empty.
+///
+/// The writer then behaves exactly as the delta-only path did before [STL-127].
+/// Used by callers that have not wired a segment set through yet (the valid-time
+/// writer, the simulation harness).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EmptySealed;
+
+impl SealedLookup for EmptySealed {
+    fn versions_for(&self, _key: &BusinessKey) -> Result<Vec<Version>, SegmentError> {
+        Ok(Vec::new())
+    }
+}
+
+/// A [`SealedLookup`] backed by versions already read out of one or more sealed
+/// segments (e.g. via [`SegmentReader::read_versions`](crate::segment::SegmentReader::read_versions)).
+///
+/// v0.1 keeps the whole set resident and filters per key on each lookup; the
+/// query executor will later resolve a key via the zone-map / secondary index
+/// rather than a full scan ([architecture §3.3](../../../docs/02-architecture.md#33-how-b-tree-and-columnstore-coexist)).
+#[derive(Debug, Default, Clone)]
+pub struct SealedVersions {
+    versions: Vec<Version>,
+}
+
+impl SealedVersions {
+    /// Build a lookup over `versions` — typically the concatenation of every
+    /// relevant segment's [`read_versions`](crate::segment::SegmentReader::read_versions).
+    #[must_use]
+    pub const fn new(versions: Vec<Version>) -> Self {
+        Self { versions }
+    }
+}
+
+impl SealedLookup for SealedVersions {
+    fn versions_for(&self, key: &BusinessKey) -> Result<Vec<Version>, SegmentError> {
+        Ok(self
+            .versions
+            .iter()
+            .filter(|v| &v.business_key == key)
+            .cloned()
+            .collect())
+    }
+}
 
 /// Errors surfaced from the system-time write path.
 #[derive(Debug, thiserror::Error)]
@@ -90,6 +167,12 @@ pub enum SysTimeError {
     /// large to encode).
     #[error(transparent)]
     Delta(#[from] crate::delta::DeltaError),
+
+    /// An error bubbled up while consulting the sealed segments through a
+    /// [`SealedLookup`] — e.g. a backing segment that failed its checksum on
+    /// read ([STL-127]).
+    #[error(transparent)]
+    Sealed(#[from] SegmentError),
 }
 
 /// Stamps commit timestamps and maintains the per-key `[sys_from, sys_to)`
@@ -124,21 +207,33 @@ impl<C: Clock> SysTimeWriter<C> {
     ///
     /// Returns the stamped `sys_from`.
     ///
+    /// The liveness check spans both tiers: a key whose live version has been
+    /// flushed into a sealed segment is still live, so re-opening it is rejected
+    /// just as it would be for a version still in the delta ([STL-127]). Pass
+    /// [`EmptySealed`] when the table has no sealed segments.
+    ///
     /// # Errors
     ///
     /// [`SysTimeError::KeyExists`] if `key` already has a live version — use
     /// [`Self::update`] to supersede it. Delta-tier errors propagate as
-    /// [`SysTimeError::Delta`].
-    pub fn insert<D: Disk>(
+    /// [`SysTimeError::Delta`]; segment-read errors as [`SysTimeError::Sealed`].
+    pub fn insert<D: Disk, S: SealedLookup>(
         &mut self,
         delta: &mut Delta<D>,
+        sealed: &S,
         key: BusinessKey,
         payload: Vec<u8>,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<SystemTimeMicros, SysTimeError> {
-        let (commit, versions) = self.stage_insert(delta, key, payload, txn_id, principal)?;
-        apply(delta, versions)?;
+        let commit = self.next_commit_ts()?;
+        if resolve_live(delta, sealed, &key, commit)?.is_some() {
+            return Err(SysTimeError::KeyExists);
+        }
+        apply(
+            delta,
+            vec![open_version(key, commit, payload, txn_id, principal)],
+        )?;
         Ok(commit)
     }
 
@@ -146,22 +241,37 @@ impl<C: Clock> SysTimeWriter<C> {
     /// and open a new one `[commit, +∞)`. The two intervals abut, so the chain
     /// stays gap-free.
     ///
+    /// The prior period is closed where it lives: re-staged in place if still in
+    /// the delta tier, or — if it has already been flushed into a sealed segment
+    /// — closed by an appended [`CloseMarker`], since invariant 1 forbids
+    /// mutating the segment ([STL-127]). Either way the new open version lands in
+    /// the delta tier.
+    ///
     /// Returns the stamped `sys_from` of the new version.
     ///
     /// # Errors
     ///
     /// [`SysTimeError::KeyNotFound`] if `key` has no live version. Delta-tier
-    /// errors propagate as [`SysTimeError::Delta`].
-    pub fn update<D: Disk>(
+    /// errors propagate as [`SysTimeError::Delta`]; segment-read errors as
+    /// [`SysTimeError::Sealed`].
+    pub fn update<D: Disk, S: SealedLookup>(
         &mut self,
         delta: &mut Delta<D>,
+        sealed: &S,
         key: BusinessKey,
         payload: Vec<u8>,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<SystemTimeMicros, SysTimeError> {
-        let (commit, versions) = self.stage_update(delta, key, payload, txn_id, principal)?;
-        apply(delta, versions)?;
+        let commit = self.next_commit_ts()?;
+        // The superseding transaction both closes the prior period (stamping its
+        // identity as `closed_by`) and opens the new one — same `txn_id` /
+        // `principal` for both halves.
+        close_prior(delta, sealed, &key, commit, txn_id, principal.clone())?;
+        apply(
+            delta,
+            vec![open_version(key, commit, payload, txn_id, principal)],
+        )?;
         Ok(commit)
     }
 
@@ -177,19 +287,25 @@ impl<C: Clock> SysTimeWriter<C> {
     ///
     /// Returns the `commit` at which the period was closed.
     ///
+    /// Like [`update`](Self::update), the close lands where the live version
+    /// lives: re-staged in the delta tier, or appended as a [`CloseMarker`] when
+    /// the version is already sealed ([STL-127]).
+    ///
     /// # Errors
     ///
     /// [`SysTimeError::KeyNotFound`] if `key` has no live version. Delta-tier
-    /// errors propagate as [`SysTimeError::Delta`].
-    pub fn delete<D: Disk>(
+    /// errors propagate as [`SysTimeError::Delta`]; segment-read errors as
+    /// [`SysTimeError::Sealed`].
+    pub fn delete<D: Disk, S: SealedLookup>(
         &mut self,
         delta: &mut Delta<D>,
+        sealed: &S,
         key: &BusinessKey,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<SystemTimeMicros, SysTimeError> {
-        let (commit, versions) = self.stage_delete(delta, key, txn_id, principal)?;
-        apply(delta, versions)?;
+        let commit = self.next_commit_ts()?;
+        close_prior(delta, sealed, key, commit, txn_id, principal)?;
         Ok(commit)
     }
 
@@ -331,6 +447,13 @@ pub(crate) fn apply<D: Disk>(
 /// `(business_key, sys_from)`, so the period is updated in place rather than
 /// duplicated.
 ///
+/// **Delta-tier only.** This is the resolution half the staging path uses
+/// ([`SysTimeWriter::stage_update`] / [`SysTimeWriter::stage_delete`]), which the
+/// WAL-logging DML writer drives — so a close it resolves can be logged to the
+/// WAL before it is applied. The cross-tier close that also handles a live
+/// version already flushed into a sealed segment is [`close_prior`] ([STL-127]);
+/// wiring that through the staging/WAL path is a follow-up ([STL-128]).
+///
 /// The prior version's **birth provenance is preserved untouched**: closing a
 /// period is bookkeeping by the superseding transaction, not a rewrite of who
 /// wrote the closed version, so `txn_id` / `committed_at` / `principal` keep
@@ -351,6 +474,49 @@ fn closed_prior_version<D: Disk>(
     prior.sys_to = commit;
     prior.closed_by = Some(Provenance::new(txn_id, commit, principal));
     Ok(prior)
+}
+
+/// Close `key`'s current open version at `commit`, stamping the closing
+/// transaction's provenance — **wherever that version lives** ([STL-127]).
+///
+/// * **Still in the delta tier** ([`LiveLocation::Delta`]): re-stage it with
+///   `sys_to = commit` and `closed_by`. Re-inserting the same
+///   `(business_key, sys_from)` is the delta tier's idempotent replace, so the
+///   period is updated in place rather than duplicated — the original [STL-91]
+///   path.
+/// * **Already sealed** ([`LiveLocation::Sealed`]): append a [`CloseMarker`]
+///   naming the sealed version's `sys_from` and the new `sys_to`. The segment is
+///   never touched — invariant 1. The read path folds the marker onto the sealed
+///   version to surface the closed interval.
+///
+/// The forward-path counterpart to [`closed_prior_version`]: it both *resolves*
+/// and *applies*, and it is cross-tier. The prior version's birth provenance is
+/// preserved untouched in either case — corrections append, never rewrite
+/// ([STL-118]).
+fn close_prior<D: Disk, S: SealedLookup>(
+    delta: &mut Delta<D>,
+    sealed: &S,
+    key: &BusinessKey,
+    commit: SystemTimeMicros,
+    txn_id: TxnId,
+    principal: Principal,
+) -> Result<(), SysTimeError> {
+    match resolve_live(delta, sealed, key, commit)?.ok_or(SysTimeError::KeyNotFound)? {
+        LiveLocation::Delta(mut prior) => {
+            prior.sys_to = commit;
+            prior.closed_by = Some(Provenance::new(txn_id, commit, principal));
+            delta.insert(prior)?;
+        }
+        LiveLocation::Sealed(prior) => {
+            delta.insert_close_marker(CloseMarker {
+                business_key: key.clone(),
+                sys_from: prior.sys_from,
+                sys_to: commit,
+                closed_by: Provenance::new(txn_id, commit, principal),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Build an open version `[commit, +∞)` for `key`, stamping provenance.
@@ -376,18 +542,50 @@ const fn open_version(
     }
 }
 
-/// The version of `key` that is live at `at`, if any.
+/// The version of `key` that is live at `at`, resolved **across both tiers** and
+/// reporting which tier holds its body ([`LiveLocation`]).
 ///
-/// `at` is the freshly-allocated commit timestamp, which is strictly greater
-/// than every `sys_from` already on the key's chain — so the open version (if
-/// one exists) is always live at `at`. Scanning at [`SYSTEM_TIME_OPEN`] would
-/// *not* work: an open version has `sys_to == SYSTEM_TIME_OPEN`, and the
-/// resolver's `sys_to > snapshot` test excludes it at that exact point.
+/// Gathers the key's staged delta candidates, the delta tier's close markers,
+/// and the key's sealed versions, then folds the markers and picks the live
+/// version ([`crate::merge::resolve_open`]). `at` is the freshly-allocated commit
+/// timestamp, strictly greater than every `sys_from` already on the key's chain,
+/// so the open version (if one exists) is always the one resolved — scanning at
+/// [`SYSTEM_TIME_OPEN`] would instead exclude it, since the resolver's
+/// `sys_to > at` test fails at that exact point.
+fn resolve_live<D: Disk, S: SealedLookup>(
+    delta: &Delta<D>,
+    sealed: &S,
+    key: &BusinessKey,
+    at: SystemTimeMicros,
+) -> Result<Option<LiveLocation>, SysTimeError> {
+    let delta_versions = delta.candidate_versions(key)?;
+    let sealed_versions = sealed.versions_for(key)?;
+    let markers: Vec<CloseMarker> = delta.close_markers_for(key).cloned().collect();
+    Ok(merge::resolve_open(
+        &delta_versions,
+        &markers,
+        &sealed_versions,
+        key,
+        Snapshot(at),
+    ))
+}
+
+/// The version of `key` that is live at `at`, if any — **delta tier only**.
+///
+/// `at` is the freshly-allocated commit timestamp, strictly greater than every
+/// `sys_from` already on the key's chain, so the open version (if one exists) is
+/// always live at `at`. Scanning at [`SYSTEM_TIME_OPEN`] would *not* work: an
+/// open version has `sys_to == SYSTEM_TIME_OPEN`, which the resolver's
+/// `sys_to > at` test excludes at that exact point.
+///
+/// This is the delta-only resolver the staging path uses ([`SysTimeWriter::stage_insert`],
+/// [`closed_prior_version`]); the cross-tier resolver that also consults sealed
+/// segments is [`resolve_live`] ([STL-127]).
 fn current_open<D: Disk>(
     delta: &Delta<D>,
     key: &BusinessKey,
     at: SystemTimeMicros,
-) -> Result<Option<Version>, crate::delta::DeltaError> {
+) -> Result<Option<Version>, DeltaError> {
     // `range_scan` returns at most one live version per key.
     let live = delta.range_scan(key.clone()..=key.clone(), Snapshot(at))?;
     Ok(live.into_iter().next())

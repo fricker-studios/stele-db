@@ -29,7 +29,7 @@ use stele_storage::backend::{Disk, DiskFile, FaultOp, Faults, MemDisk};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Version};
 use stele_storage::dml::{self, DmlWriter};
 use stele_storage::segment::{SegmentReader, SegmentWriter};
-use stele_storage::systime::SysTimeWriter;
+use stele_storage::systime::{EmptySealed, SysTimeWriter};
 use stele_storage::validtime::{ValidInterval, ValidTimeWriter, unframe_payload};
 use stele_storage::wal::{Checkpoint, Wal, WalConfig};
 
@@ -312,21 +312,21 @@ pub fn run_delete_seed(seed: u64) -> u64 {
             // (close, no re-open) — both record `principal` as the closer.
             if rng.below(2) == 0 {
                 writer
-                    .delete(&mut delta, &key, txn, principal)
+                    .delete(&mut delta, &EmptySealed, &key, txn, principal)
                     .expect("delete");
                 live[k] = false;
             } else {
                 let payload_len = rng.below_usize(16);
                 let payload = rng.bytes(payload_len);
                 writer
-                    .update(&mut delta, key, payload, txn, principal)
+                    .update(&mut delta, &EmptySealed, key, payload, txn, principal)
                     .expect("update");
             }
         } else {
             let payload_len = rng.below_usize(16);
             let payload = rng.bytes(payload_len);
             writer
-                .insert(&mut delta, key, payload, txn, principal)
+                .insert(&mut delta, &EmptySealed, key, payload, txn, principal)
                 .expect("insert");
             live[k] = true;
         }

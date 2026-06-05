@@ -66,7 +66,7 @@ use stele_common::provenance::{Principal, TxnId};
 use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
 
 use crate::delta::{BusinessKey, Delta, Version};
-use crate::systime::{SysTimeError, SysTimeWriter};
+use crate::systime::{EmptySealed, SysTimeError, SysTimeWriter};
 use crate::wal::Disk;
 
 /// Length of the little-endian valid-time prefix stamped on a stored payload:
@@ -250,6 +250,12 @@ pub fn reframe_payload(valid_from: i64, valid_to: i64, user: &[u8]) -> Vec<u8> {
 /// The DML layer ([STL-94]) constructs the writer from the catalog flag; this
 /// crate stays free of a catalog dependency by taking the resolved policy as a
 /// `bool`.
+///
+/// Cross-segment system-time close ([STL-127]) is wired only for the bare
+/// [`SysTimeWriter`] so far: this wrapper forwards an [`EmptySealed`] lookup, so
+/// it closes prior periods in the delta tier only. Threading a real
+/// [`SealedLookup`](crate::systime::SealedLookup) through the valid-time path is
+/// a follow-up once the DML layer owns the segment set.
 #[derive(Debug)]
 pub struct ValidTimeWriter<C: Clock> {
     inner: SysTimeWriter<C>,
@@ -302,7 +308,9 @@ impl<C: Clock> ValidTimeWriter<C> {
         principal: Principal,
     ) -> Result<SystemTimeMicros, ValidTimeError> {
         let framed = frame_payload(self.valid_time, valid, payload)?;
-        Ok(self.inner.insert(delta, key, framed, txn_id, principal)?)
+        Ok(self
+            .inner
+            .insert(delta, &EmptySealed, key, framed, txn_id, principal)?)
     }
 
     /// Supersede the live version of `key`: close the prior system-time period
@@ -326,7 +334,9 @@ impl<C: Clock> ValidTimeWriter<C> {
         principal: Principal,
     ) -> Result<SystemTimeMicros, ValidTimeError> {
         let framed = frame_payload(self.valid_time, valid, payload)?;
-        Ok(self.inner.update(delta, key, framed, txn_id, principal)?)
+        Ok(self
+            .inner
+            .update(delta, &EmptySealed, key, framed, txn_id, principal)?)
     }
 
     /// Close the live version of `key` on the system axis without re-opening — a
@@ -352,7 +362,9 @@ impl<C: Clock> ValidTimeWriter<C> {
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<SystemTimeMicros, ValidTimeError> {
-        Ok(self.inner.delete(delta, key, txn_id, principal)?)
+        Ok(self
+            .inner
+            .delete(delta, &EmptySealed, key, txn_id, principal)?)
     }
 
     /// Resolve an insert into the redo set it stages — both temporal axes
