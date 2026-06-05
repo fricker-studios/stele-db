@@ -495,17 +495,23 @@ pub fn run_mvcc_seed(seed: u64) -> u64 {
         b.write(keys[kb].clone());
 
         // Commit in a seed-chosen order; whoever lands first wins a contended key.
-        let ordered: [(&stele_txn::Transaction, usize); 2] = if rng.below(2) == 0 {
-            [(&a, ka), (&b, kb)]
+        // `commit` consumes the transaction, so the txns are moved into the array.
+        let ordered: [(stele_txn::Transaction, usize); 2] = if rng.below(2) == 0 {
+            [(a, ka), (b, kb)]
         } else {
-            [(&b, kb), (&a, ka)]
+            [(b, kb), (a, ka)]
         };
         for (txn, k) in ordered {
             match mgr.commit(txn) {
                 Ok(committed) => {
                     digest = fnv1a(digest, &[1]);
                     digest = fnv1a(digest, &committed.commit_ts.0.to_le_bytes());
-                    stage_committed_write(&mut delta, &keys[k], txn.id(), committed.commit_ts);
+                    stage_committed_write(
+                        &mut delta,
+                        &keys[k],
+                        committed.txn_id,
+                        committed.commit_ts,
+                    );
                 }
                 // The only expected failure is a write-write conflict — folded as
                 // a distinct outcome byte. Any other error (WAL failure, time

@@ -71,10 +71,12 @@
 //! a.write(key.clone());
 //! b.write(key);
 //!
-//! // First committer wins; the loser gets a clean retry signal.
-//! let committed = mgr.commit(&a).unwrap();
-//! assert!(committed.commit_ts.0 > a.snapshot().0.0);
-//! assert!(matches!(mgr.commit(&b), Err(TxnError::Conflict)));
+//! // First committer wins; the loser gets a clean retry signal. `commit`
+//! // consumes the transaction, so capture the snapshot before committing.
+//! let snapshot_a = a.snapshot();
+//! let committed = mgr.commit(a).unwrap();
+//! assert!(committed.commit_ts.0 > snapshot_a.0.0);
+//! assert!(matches!(mgr.commit(b), Err(TxnError::Conflict)));
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -264,6 +266,25 @@ impl<C: Clock, D: Disk> TxnManager<C, D> {
     /// Commit `txn`: detect conflicts, assign the commit timestamp, durably log
     /// the commit record, and publish the transaction's writes.
     ///
+    /// **Consumes the transaction** — `commit` takes it by value, so a given
+    /// transaction (and its `txn_id`) can be committed at most once. This enforces
+    /// the "one txn id → one commit" contract at the type level: a transaction
+    /// cannot be re-committed or have its write set mutated after committing, and
+    /// a conflicted transaction must re-`begin` against a fresh snapshot to retry
+    /// (the correct snapshot-isolation retry).
+    ///
+    /// ```compile_fail
+    /// # use stele_txn::TxnManager;
+    /// # use stele_storage::backend::MemDisk;
+    /// # use stele_storage::wal::{Wal, WalConfig};
+    /// # use stele_common::time::SystemClock;
+    /// let wal = Wal::open(MemDisk::new(), WalConfig::default()).unwrap();
+    /// let mgr = TxnManager::new(SystemClock, wal);
+    /// let txn = mgr.begin();
+    /// let _ = mgr.commit(txn);
+    /// let _ = mgr.commit(txn); // error[E0382]: use of moved value `txn`
+    /// ```
+    ///
     /// On success the commit timestamp is the `sys_from` the transaction's
     /// versions carry, and every key it wrote is recorded for future conflict
     /// checks. Nothing is published until the commit record is fsynced — the WAL
@@ -286,7 +307,7 @@ impl<C: Clock, D: Disk> TxnManager<C, D> {
     // commit-timestamp order. Tightening the guard would break that — group-commit
     // batching across transactions is a separate v0.2 concern.
     #[allow(clippy::significant_drop_tightening)]
-    pub fn commit(&self, txn: &Transaction) -> Result<Committed, TxnError> {
+    pub fn commit(&self, txn: Transaction) -> Result<Committed, TxnError> {
         let mut st = self.state.lock().expect("txn manager mutex poisoned");
 
         // First committer wins: a key written by a commit newer than our snapshot
@@ -324,15 +345,14 @@ impl<C: Clock, D: Disk> TxnManager<C, D> {
         self.wal.tick()?;
 
         // Now publish: advance the cursor and record this transaction's writes as
-        // the newest committers of their keys.
+        // the newest committers of their keys. The write set is moved out of the
+        // (consumed) transaction — no clone needed.
+        let txn_id = txn.txn_id;
         st.cursor = commit_ts;
-        for key in &txn.writes {
-            st.write_index.insert(key.clone(), commit_ts);
+        for key in txn.writes {
+            st.write_index.insert(key, commit_ts);
         }
-        Ok(Committed {
-            txn_id: txn.txn_id,
-            commit_ts,
-        })
+        Ok(Committed { txn_id, commit_ts })
     }
 
     /// The current commit cursor — the highest snapshot or commit timestamp the
@@ -410,9 +430,10 @@ mod tests {
         // Writer A inserts v1 and commits.
         let mut a = mgr.begin();
         a.write(key.clone());
-        let c1 = mgr.commit(&a).expect("commit a").commit_ts;
+        let a_done = mgr.commit(a).expect("commit a");
+        let c1 = a_done.commit_ts;
         delta
-            .insert(open_version(&key, a.id(), c1))
+            .insert(open_version(&key, a_done.txn_id, c1))
             .expect("stage v1");
 
         // Reader R takes a snapshot that sees v1.
@@ -426,21 +447,22 @@ mod tests {
         // Writer B supersedes K: commit at c2 > s, closing v1 and opening v2.
         let mut b = mgr.begin();
         b.write(key.clone());
-        let c2 = mgr.commit(&b).expect("commit b").commit_ts;
+        let b_done = mgr.commit(b).expect("commit b");
+        let c2 = b_done.commit_ts;
         assert!(
             c2.0 > s.0.0,
             "the concurrent commit must land strictly after R's snapshot"
         );
-        let mut v1_closed = open_version(&key, a.id(), c1);
+        let mut v1_closed = open_version(&key, a_done.txn_id, c1);
         v1_closed.sys_to = c2;
         v1_closed.closed_by = Some(Provenance::new(
-            b.id(),
+            b_done.txn_id,
             c2,
             Principal::new(b"tester".to_vec()),
         ));
         delta.insert(v1_closed).expect("close v1");
         delta
-            .insert(open_version(&key, b.id(), c2))
+            .insert(open_version(&key, b_done.txn_id, c2))
             .expect("stage v2");
 
         // R, still at its snapshot, must NOT observe v2.
@@ -469,8 +491,8 @@ mod tests {
         b.write(key);
 
         // Whoever commits first wins; the second to commit loses cleanly.
-        assert!(mgr.commit(&a).is_ok());
-        assert!(matches!(mgr.commit(&b), Err(TxnError::Conflict)));
+        assert!(mgr.commit(a).is_ok());
+        assert!(matches!(mgr.commit(b), Err(TxnError::Conflict)));
     }
 
     /// Conflict resolution is symmetric: the winner is the first committer, not a
@@ -485,8 +507,8 @@ mod tests {
         a.write(key.clone());
         b.write(key);
 
-        assert!(mgr.commit(&b).is_ok());
-        assert!(matches!(mgr.commit(&a), Err(TxnError::Conflict)));
+        assert!(mgr.commit(b).is_ok());
+        assert!(matches!(mgr.commit(a), Err(TxnError::Conflict)));
     }
 
     /// A transaction that begins *after* another commits sees that write in its
@@ -499,12 +521,12 @@ mod tests {
 
         let mut a = mgr.begin();
         a.write(key.clone());
-        mgr.commit(&a).expect("commit a");
+        mgr.commit(a).expect("commit a");
 
         // b begins after a's commit: its snapshot already includes a's write.
         let mut b = mgr.begin();
         b.write(key);
-        assert!(mgr.commit(&b).is_ok());
+        assert!(mgr.commit(b).is_ok());
     }
 
     /// Writers touching disjoint keys never conflict, even at the same snapshot.
@@ -515,8 +537,8 @@ mod tests {
         let mut b = mgr.begin();
         a.write(BusinessKey::new(b"key-a".to_vec()));
         b.write(BusinessKey::new(b"key-b".to_vec()));
-        assert!(mgr.commit(&a).is_ok());
-        assert!(mgr.commit(&b).is_ok());
+        assert!(mgr.commit(a).is_ok());
+        assert!(mgr.commit(b).is_ok());
     }
 
     /// Every commit timestamp is strictly greater than the snapshot of any
@@ -533,7 +555,7 @@ mod tests {
 
         let mut w1 = mgr.begin(); // snapshot still 100, cursor stays 100
         w1.write(BusinessKey::new(b"k1".to_vec()));
-        let c1 = mgr.commit(&w1).expect("commit w1").commit_ts;
+        let c1 = mgr.commit(w1).expect("commit w1").commit_ts;
         assert!(
             c1 > s,
             "stalled-clock commit must exceed an outstanding snapshot"
@@ -541,7 +563,7 @@ mod tests {
 
         let mut w2 = mgr.begin();
         w2.write(BusinessKey::new(b"k2".to_vec()));
-        let c2 = mgr.commit(&w2).expect("commit w2").commit_ts;
+        let c2 = mgr.commit(w2).expect("commit w2").commit_ts;
         assert!(
             c2 > c1,
             "commit timestamps strictly increase even with a frozen clock"
@@ -560,7 +582,7 @@ mod tests {
 
         let mut a = mgr.begin();
         a.write(BusinessKey::new(b"k".to_vec()));
-        let committed = mgr.commit(&a).expect("commit");
+        let committed = mgr.commit(a).expect("commit");
 
         // Re-open over the same store and replay — the record is on disk.
         let reopened = Wal::open(disk, WalConfig::default()).expect("reopen wal");
@@ -594,7 +616,7 @@ mod tests {
         let mut a = mgr.begin(); // snapshot SYSTEM_TIME_OPEN-1, cursor there too
         a.write(BusinessKey::new(b"k".to_vec()));
         // next commit = max(clock, cursor+1) = SYSTEM_TIME_OPEN -> refused.
-        assert!(matches!(mgr.commit(&a), Err(TxnError::TimeExhausted)));
+        assert!(matches!(mgr.commit(a), Err(TxnError::TimeExhausted)));
     }
 
     /// A clock saturated at the `+∞` sentinel (as `SystemClock::now()` does at the
