@@ -22,7 +22,7 @@ use crate::validtime::unframe_payload;
 use super::SegmentError;
 use super::format::{
     CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FORMAT_VERSION, HEADER_LEN, HEADER_MAGIC,
-    SCHEMA_ID_IMPLICIT_VERSION, TRAILER_LEN, TRAILER_MAGIC,
+    MAX_BYTES_STAT_PREFIX_LEN, SCHEMA_ID_IMPLICIT_VERSION, TRAILER_LEN, TRAILER_MAGIC,
 };
 
 /// Streaming writer over a single sealed-segment file.
@@ -105,11 +105,19 @@ impl<F: DiskFile> SegmentWriter<F> {
         // came from `self.rows[k]`. A valid-time table's schema carries the
         // two extra `valid_from` / `valid_to` columns ([STL-117]).
         let schema = ColumnId::schema(self.valid_time);
+        // Decode each row's valid-time prefix exactly once up front (not once
+        // per valid-time column), so emitting both valid_from and valid_to
+        // re-uses the same parse ([STL-117]).
+        let valid_pairs: Option<Vec<(i64, i64)>> = if self.valid_time {
+            Some(decode_valid_pairs(&self.rows)?)
+        } else {
+            None
+        };
         let mut chunks: Vec<EncodedChunk> = Vec::with_capacity(schema.len());
         let mut offset: u64 = HEADER_LEN as u64;
 
         for &col in schema {
-            let encoded = encode_column(col, &self.rows)?;
+            let encoded = encode_column(col, &self.rows, valid_pairs.as_deref())?;
             // Each chunk is laid out contiguously in `(business_key, sys_from,
             // sys_to, payload)` order. The footer records the absolute
             // offset, so the reader projects exactly the columns it wants.
@@ -190,29 +198,29 @@ struct EncodedChunk {
     stat_max: Vec<u8>,
 }
 
-fn encode_column(col: ColumnId, rows: &[Version]) -> Result<EncodedColumn, SegmentError> {
+fn encode_column(
+    col: ColumnId,
+    rows: &[Version],
+    valid_pairs: Option<&[(i64, i64)]>,
+) -> Result<EncodedColumn, SegmentError> {
     match col.ty() {
         ColumnType::Bytes => {
-            // Plain layout: `[u32 len][bytes]` repeated. Min/max stats are the
-            // lex-min and lex-max of the actual byte values; the catalog will
-            // later attach a column-level comparator, but at the format layer
-            // bytewise order is the natural choice (it matches how
+            // Plain layout: `[u32 len][bytes]` repeated. Min/max stats are a
+            // bounded *prefix* of the lex-min and lex-max byte values; the
+            // catalog will later attach a column-level comparator, but at the
+            // format layer bytewise order is the natural choice (it matches how
             // BusinessKey already sorts via `Vec<u8>`'s Ord).
             //
-            // Some bytes columns are unbounded blobs — `Payload` can be up to
-            // `MAX_VERSION_FRAME_LEN` (16 MiB) per row — and inlining their
-            // lex-min/max would let one row blow the footer past the u32
-            // `footer_len` ceiling. Until [STL-89] introduces a bounded /
-            // typed stats scheme (truncated prefixes, length caps, or
-            // structured summaries), payload-shaped columns emit the
-            // zero-length "no stats" sentinel and rely on key-range pruning
-            // through `BusinessKey` instead. Bounded key-shaped bytes
-            // columns continue to emit lex-min/max.
-            // Key-shaped bytes columns emit lex-min/max; unbounded ones
-            // (`Payload`, and `Principal` which the txn layer sizes) emit the
-            // "no stats" sentinel to keep the footer bounded — same reasoning
-            // as `Payload`.
-            let collect_stats = matches!(col, ColumnId::BusinessKey);
+            // Every bytes column can be an unbounded blob — `Payload` runs up
+            // to `MAX_VERSION_FRAME_LEN` (16 MiB) per row, and `BusinessKey` /
+            // `Principal` are only bounded by the same frame ceiling — so
+            // inlining a full lex-min/max would let one row push the footer
+            // past the `u32` `footer_len` limit. Instead we record a bounded
+            // prefix capped at `MAX_BYTES_STAT_PREFIX_LEN`: the min prefix is
+            // truncated *down* and the max prefix is rounded *up*, so the
+            // `[min, max]` envelope stays a superset of the real value range
+            // and `might_contain` keeps its no-false-negatives contract. This
+            // caps every bytes column's footer cost regardless of value size.
             let mut payload = Vec::new();
             let mut min: Option<&[u8]> = None;
             let mut max: Option<&[u8]> = None;
@@ -223,15 +231,13 @@ fn encode_column(col: ColumnId, rows: &[Version]) -> Result<EncodedColumn, Segme
                 })?;
                 payload.extend_from_slice(&len.to_le_bytes());
                 payload.extend_from_slice(bytes);
-                if collect_stats {
-                    min = Some(min.map_or(bytes, |m| if bytes < m { bytes } else { m }));
-                    max = Some(max.map_or(bytes, |m| if bytes > m { bytes } else { m }));
-                }
+                min = Some(min.map_or(bytes, |m| if bytes < m { bytes } else { m }));
+                max = Some(max.map_or(bytes, |m| if bytes > m { bytes } else { m }));
             }
             Ok(EncodedColumn {
                 payload,
-                stat_min: min.map(<[u8]>::to_vec).unwrap_or_default(),
-                stat_max: max.map(<[u8]>::to_vec).unwrap_or_default(),
+                stat_min: min.map(bounded_min_prefix).unwrap_or_default(),
+                stat_max: max.map(bounded_max_prefix).unwrap_or_default(),
             })
         }
         ColumnType::I64 => {
@@ -241,13 +247,17 @@ fn encode_column(col: ColumnId, rows: &[Version]) -> Result<EncodedColumn, Segme
             let mut payload = Vec::with_capacity(rows.len() * 8);
             let mut min: Option<i64> = None;
             let mut max: Option<i64> = None;
-            for row in rows {
-                // The `valid_from` / `valid_to` columns are lifted from the
-                // payload's valid-time prefix (fallible — a truncated frame is
-                // rejected); every other i64 column reads a `Version` field
-                // directly.
+            for (i, row) in rows.iter().enumerate() {
+                // The `valid_from` / `valid_to` columns read from the per-row
+                // prefix decoded once up front (`decode_valid_pairs`); every
+                // other i64 column reads a `Version` field directly.
                 let v = match col {
-                    ColumnId::ValidFrom | ColumnId::ValidTo => extract_valid_i64(col, row)?,
+                    ColumnId::ValidFrom => {
+                        valid_pairs.expect("valid-time schema carries decoded pairs")[i].0
+                    }
+                    ColumnId::ValidTo => {
+                        valid_pairs.expect("valid-time schema carries decoded pairs")[i].1
+                    }
                     _ => extract_i64(col, row),
                 };
                 payload.extend_from_slice(&v.to_le_bytes());
@@ -261,6 +271,42 @@ fn encode_column(col: ColumnId, rows: &[Version]) -> Result<EncodedColumn, Segme
             })
         }
     }
+}
+
+/// Truncate a lex-min byte value *down* to a bounded prefix for the footer
+/// stat. A byte prefix is lex-`<=` the value it came from, so the prefix is a
+/// sound lower bound for every value in the column — pruning against it can
+/// never drop a real match. An empty result (the min value is itself empty)
+/// encodes as the footer's zero-length "no stats" sentinel; because the reader
+/// records a zone entry only when *both* bounds are present (`ZoneMap::from_bounds`),
+/// that drops the column's zone for the segment entirely — no pruning on either
+/// side. Conservative, never wrong.
+fn bounded_min_prefix(value: &[u8]) -> Vec<u8> {
+    value[..value.len().min(MAX_BYTES_STAT_PREFIX_LEN)].to_vec()
+}
+
+/// Round a lex-max byte value *up* to a bounded prefix that stays `>=` the
+/// value. If the value already fits within the cap it is its own exact upper
+/// bound; otherwise keep the first `MAX_BYTES_STAT_PREFIX_LEN` bytes and
+/// increment them — drop any trailing `0xFF` bytes and bump the last byte below
+/// `0xFF` — so the result is `>=` every value sharing that prefix. A prefix that
+/// is *all* `0xFF` has no shorter upper bound representable, so it encodes as the
+/// zero-length "no stats" sentinel; as with an empty min, the column then records
+/// no zone entry for the segment (an entry needs both bounds), so it never prunes
+/// at all — still conservative, never a false negative.
+fn bounded_max_prefix(value: &[u8]) -> Vec<u8> {
+    if value.len() <= MAX_BYTES_STAT_PREFIX_LEN {
+        return value.to_vec();
+    }
+    let mut prefix = value[..MAX_BYTES_STAT_PREFIX_LEN].to_vec();
+    while let Some(last) = prefix.last_mut() {
+        if *last < u8::MAX {
+            *last += 1;
+            return prefix;
+        }
+        prefix.pop();
+    }
+    Vec::new()
 }
 
 fn extract_bytes(col: ColumnId, row: &Version) -> &[u8] {
@@ -291,10 +337,10 @@ fn extract_i64(col: ColumnId, row: &Version) -> i64 {
         ColumnId::TxnId => row.provenance.txn_id.0 as i64,
         ColumnId::CommittedAt => row.provenance.committed_at.0,
         // The valid-time columns are not `Version` fields — they are lifted
-        // from the payload prefix by `extract_valid_i64`, which the caller
-        // routes to directly.
+        // from the payload prefix by `decode_valid_pairs`, which the caller
+        // reads from directly.
         ColumnId::ValidFrom | ColumnId::ValidTo => {
-            unreachable!("valid-time columns are extracted via extract_valid_i64")
+            unreachable!("valid-time columns are extracted via decode_valid_pairs")
         }
         ColumnId::BusinessKey | ColumnId::Payload | ColumnId::Principal => {
             unreachable!("not an i64 column")
@@ -302,20 +348,24 @@ fn extract_i64(col: ColumnId, row: &Version) -> i64 {
     }
 }
 
-// Lift one of the two valid-time boundaries out of `row`'s payload prefix.
-// Only called for a valid-time table's segment, where every payload was framed
-// by [`crate::validtime::frame_payload`] and therefore carries the prefix; a
-// frame too short to hold it is a malformed input row, surfaced as `Corrupt`.
-fn extract_valid_i64(col: ColumnId, row: &Version) -> Result<i64, SegmentError> {
-    let (interval, _user) = unframe_payload(true, &row.payload).map_err(|_| {
-        SegmentError::Corrupt("valid-time payload too short to lift valid_from/valid_to columns")
-    })?;
-    let interval = interval.expect("valid-time enabled ⇒ unframe yields an interval");
-    Ok(match col {
-        ColumnId::ValidFrom => interval.from.0,
-        ColumnId::ValidTo => interval.to.0,
-        _ => unreachable!("not a valid-time column"),
-    })
+// Decode every row's 16-byte valid-time prefix into `(valid_from, valid_to)`
+// once, so `finish` can emit both the valid_from and valid_to columns without
+// re-parsing the payload per column. Only called for a valid-time table's
+// segment, where every payload was framed by [`crate::validtime::frame_payload`]
+// and therefore carries the prefix; a frame that fails to decode (too short, or
+// an inverted/invalid interval) is a malformed input row, surfaced as `Corrupt`.
+fn decode_valid_pairs(rows: &[Version]) -> Result<Vec<(i64, i64)>, SegmentError> {
+    rows.iter()
+        .map(|row| {
+            let (interval, _user) = unframe_payload(true, &row.payload).map_err(|_| {
+                SegmentError::Corrupt(
+                    "valid-time payload could not be decoded into valid_from/valid_to columns",
+                )
+            })?;
+            let interval = interval.expect("valid-time enabled ⇒ unframe yields an interval");
+            Ok((interval.from.0, interval.to.0))
+        })
+        .collect()
 }
 
 fn encode_footer(row_count: usize, chunks: &[EncodedChunk]) -> Result<Vec<u8>, SegmentError> {
@@ -347,4 +397,86 @@ fn encode_footer(row_count: usize, chunks: &[EncodedChunk]) -> Result<Vec<u8>, S
         out.extend_from_slice(&chunk.stat_max);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the bounded-prefix bytes-stat helpers. The cross-module
+    //! proof that these bounds never prune a real match lives in the seed-swept
+    //! oracle (`tests/zone_map.rs`); these pin the rounding arithmetic — the
+    //! easy place to get an off-by-one that silently produces a too-tight
+    //! upper bound.
+
+    use super::{MAX_BYTES_STAT_PREFIX_LEN, bounded_max_prefix, bounded_min_prefix};
+
+    #[test]
+    fn short_values_round_trip_exactly() {
+        // Values within the cap are their own exact bounds — no truncation,
+        // no rounding — so pruning stays as precise as the old full min/max.
+        assert_eq!(bounded_min_prefix(b"apple"), b"apple");
+        assert_eq!(bounded_max_prefix(b"apple"), b"apple");
+        // A value exactly at the cap is still exact (boundary, no truncation).
+        let at_cap = vec![b'a'; MAX_BYTES_STAT_PREFIX_LEN];
+        assert_eq!(bounded_min_prefix(&at_cap), at_cap);
+        assert_eq!(bounded_max_prefix(&at_cap), at_cap);
+    }
+
+    #[test]
+    fn min_prefix_truncates_down() {
+        // One byte over the cap: the min keeps the first cap bytes verbatim —
+        // a prefix is lex-<= its source, a sound lower bound.
+        let value = vec![b'z'; MAX_BYTES_STAT_PREFIX_LEN + 1];
+        let min = bounded_min_prefix(&value);
+        assert_eq!(min.len(), MAX_BYTES_STAT_PREFIX_LEN);
+        assert!(min.as_slice() <= value.as_slice());
+    }
+
+    #[test]
+    fn max_prefix_rounds_up_past_the_value() {
+        // Over-cap value: the rounded prefix must be strictly greater than the
+        // full value so it stays a sound upper bound.
+        let mut value = vec![b'm'; MAX_BYTES_STAT_PREFIX_LEN + 5];
+        value[MAX_BYTES_STAT_PREFIX_LEN] = b'm'; // suffix shares the prefix byte
+        let max = bounded_max_prefix(&value);
+        assert!(max.len() <= MAX_BYTES_STAT_PREFIX_LEN);
+        assert!(
+            max.as_slice() > value.as_slice(),
+            "rounded max {max:?} must exceed the source value"
+        );
+    }
+
+    #[test]
+    fn max_prefix_carries_over_trailing_ff() {
+        // The first cap bytes end in 0xFF: incrementing must carry — drop the
+        // 0xFF tail and bump the last byte below it. Result still >= value.
+        let mut prefix = vec![b'k'; MAX_BYTES_STAT_PREFIX_LEN];
+        prefix[MAX_BYTES_STAT_PREFIX_LEN - 1] = 0xFF;
+        prefix[MAX_BYTES_STAT_PREFIX_LEN - 2] = 0xFF;
+        let mut value = prefix.clone();
+        value.extend_from_slice(b"anything");
+        let max = bounded_max_prefix(&value);
+        // Carried two bytes: length cap-2, last byte bumped from b'k' to b'k'+1.
+        assert_eq!(max.len(), MAX_BYTES_STAT_PREFIX_LEN - 2);
+        assert_eq!(*max.last().unwrap(), b'k' + 1);
+        assert!(max.as_slice() > value.as_slice());
+    }
+
+    #[test]
+    fn max_prefix_all_ff_has_no_bound() {
+        // An all-0xFF prefix has no shorter upper bound — emit the empty "no
+        // stats" sentinel, which makes the column simply not prune on its max.
+        let value = vec![0xFFu8; MAX_BYTES_STAT_PREFIX_LEN + 3];
+        assert!(bounded_max_prefix(&value).is_empty());
+    }
+
+    #[test]
+    fn bounds_stay_ordered_for_over_cap_values() {
+        // For any value, the truncated-down min never exceeds the rounded-up
+        // max — the zone envelope is never inverted.
+        let value = vec![0x7Fu8; MAX_BYTES_STAT_PREFIX_LEN + 10];
+        let min = bounded_min_prefix(&value);
+        let max = bounded_max_prefix(&value);
+        assert!(!max.is_empty(), "0x7F prefix rounds up cleanly");
+        assert!(min.as_slice() <= max.as_slice());
+    }
 }

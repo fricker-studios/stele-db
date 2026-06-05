@@ -47,6 +47,26 @@ pub(super) const TRAILER_LEN: usize = 16;
 /// (4) + codec (1) + reserved (3) + CRC32C (4).
 pub(super) const CHUNK_HEADER_LEN: usize = 16;
 
+/// Maximum bytes retained for a variable-length column's zone-map min/max stat.
+///
+/// Bytes columns ([`ColumnType::Bytes`]) can hold values up to
+/// `MAX_VERSION_FRAME_LEN` (16 MiB) each — `Payload`, `Principal`, and even a
+/// pathologically long `BusinessKey`. Inlining a full lex-min/max of such a
+/// value would let one row push the footer past its `u32` `footer_len` ceiling,
+/// so the writer records only a bounded *prefix* of the lex-min/max instead
+/// ([`super::writer`]): the min prefix is truncated *down* (a byte prefix is
+/// lex-`<=` its source, so it stays a sound lower bound) and the max prefix is
+/// rounded *up* (so it stays a sound upper bound). This caps each bytes
+/// column's footer contribution at `2 * MAX_BYTES_STAT_PREFIX_LEN`, independent
+/// of value size, which keeps [`ZoneMap::might_contain`](super::zone_map::ZoneMap::might_contain)'s
+/// no-false-negatives contract intact for worst-case blob inputs.
+///
+/// 64 bytes trades footer size against prune selectivity: long enough that
+/// realistic keys/prefixes still discriminate, small enough that the worst-case
+/// footer stays tiny. It is purely a writer-side choice — the on-disk stat
+/// field is length-prefixed, so changing it needs no [`FORMAT_VERSION`] bump.
+pub(super) const MAX_BYTES_STAT_PREFIX_LEN: usize = 64;
+
 /// Logical schema id stored in the footer.
 ///
 /// v0.1 has exactly one implicit schema — the seven always-on `Version` columns
@@ -114,7 +134,7 @@ pub enum ColumnId {
     /// Valid-time period start (fixed `i64`, microseconds) — the inclusive
     /// `valid_from` boundary, lifted at flush from the payload's valid-time
     /// prefix ([`crate::validtime`], [STL-92]). Present only on a valid-time
-    /// table's segments ([`FORMAT_VERSION`] v3); absent otherwise.
+    /// table's segments (format v3); absent otherwise.
     ValidFrom = 7,
     /// Valid-time period end (fixed `i64`, microseconds) — the exclusive
     /// `valid_to` boundary; `i64::MAX` for an open-ended fact
@@ -136,9 +156,9 @@ impl ColumnId {
     ///
     /// This is the **always-on** set, present on every segment. A valid-time
     /// table's segments additionally carry [`Self::ValidFrom`] /
-    /// [`Self::ValidTo`]; use [`Self::schema`] to get the full ordered set for
-    /// a given valid-time policy rather than iterating `ALL` directly when the
-    /// opt-in columns matter.
+    /// [`Self::ValidTo`]; use the crate-internal `schema` helper to get the full
+    /// ordered set for a given valid-time policy rather than iterating `ALL`
+    /// directly when the opt-in columns matter.
     pub const ALL: [Self; 7] = [
         Self::BusinessKey,
         Self::SysFrom,
