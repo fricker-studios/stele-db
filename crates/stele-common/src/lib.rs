@@ -12,6 +12,7 @@
 
 pub mod provenance;
 pub mod time;
+pub mod types;
 
 /// Stele's default Postgres-wire listen port ([ADR-0017](../../../docs/adr/0017-default-network-port-5454.md)).
 pub const DEFAULT_PG_PORT: u16 = 5454;
