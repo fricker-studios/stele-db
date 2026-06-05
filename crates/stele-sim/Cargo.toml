@@ -19,4 +19,5 @@ path = "src/main.rs"
 [dependencies]
 stele-storage = { workspace = true }
 stele-common  = { workspace = true }
+stele-txn     = { workspace = true }
 clap          = { workspace = true }

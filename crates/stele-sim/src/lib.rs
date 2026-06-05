@@ -32,6 +32,7 @@ use stele_storage::segment::{SegmentReader, SegmentWriter};
 use stele_storage::systime::{EmptySealed, SysTimeWriter};
 use stele_storage::validtime::{ValidInterval, ValidTimeWriter, unframe_payload};
 use stele_storage::wal::{Checkpoint, Wal, WalConfig};
+use stele_txn::TxnManager;
 
 /// A deterministic, strictly-increasing clock for seeded scenarios.
 ///
@@ -418,6 +419,117 @@ pub fn run_dml_seed(seed: u64) -> u64 {
     digest
 }
 
+/// Close any open version of `key` at `commit`, then open a fresh `[commit, +∞)`
+/// version — the version a committed writer stages with the manager-assigned
+/// commit timestamp as its `sys_from`. Keeps exactly one open version per key, so
+/// the per-key chain stays non-overlapping.
+fn stage_committed_write(
+    delta: &mut Delta<MemDisk>,
+    key: &BusinessKey,
+    txn_id: TxnId,
+    commit: SystemTimeMicros,
+) {
+    let candidates = delta.candidate_versions(key).expect("candidate versions");
+    if let Some(open) = candidates
+        .into_iter()
+        .find(|v| v.sys_to == SYSTEM_TIME_OPEN)
+    {
+        let mut closed = open;
+        closed.sys_to = commit;
+        closed.closed_by = Some(Provenance::new(
+            txn_id,
+            commit,
+            Principal::new(b"sim".to_vec()),
+        ));
+        delta.insert(closed).expect("close prior version");
+    }
+    delta
+        .insert(Version {
+            business_key: key.clone(),
+            sys_from: commit,
+            sys_to: SYSTEM_TIME_OPEN,
+            provenance: Provenance::new(txn_id, commit, Principal::new(b"sim".to_vec())),
+            closed_by: None,
+            payload: format!("v@{}", commit.0).into_bytes(),
+        })
+        .expect("open new version");
+}
+
+/// Play a seeded MVCC workload through the real [`TxnManager`] — concurrent
+/// writers contending on a small key space — and fold every commit outcome and
+/// snapshot read into a digest.
+///
+/// Each round begins two transactions whose snapshots overlap, points them at
+/// seed-chosen keys, and commits them in a seed-chosen order. Same-key
+/// contenders force a write-write conflict: exactly one commits and the other
+/// gets [`TxnError`](stele_txn::TxnError)'s clean retry signal ([STL-99] DoD).
+/// Disjoint-key writers both commit. A committed writer stages its version at the
+/// manager-assigned commit timestamp; a fresh reader then resolves a seed-chosen
+/// key at its snapshot, exercising the `sys_from ≤ s < sys_to` visibility rule.
+/// The digest folds the commit/conflict pattern, the commit timestamps, and the
+/// versions read back — so the seed sweep regresses on commit ordering, conflict
+/// detection, and snapshot resolution together. Same seed ⇒ same digest.
+#[must_use]
+pub fn run_mvcc_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut rng = Rng::new(seed);
+    let wal = Wal::open(MemDisk::new(), WalConfig::default()).expect("open wal");
+    let mgr = TxnManager::new(StepClock::new(1), wal);
+    let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+
+    let key_count = 1 + rng.below_usize(5);
+    let keys: Vec<BusinessKey> = (0..key_count)
+        .map(|i| BusinessKey::new(format!("k-{i:04}").into_bytes()))
+        .collect();
+
+    let mut digest = FNV_OFFSET;
+    let rounds = 8 + rng.below(24);
+    for _ in 0..rounds {
+        // Two writers begin before either commits — their snapshots overlap, so a
+        // shared key forces a conflict the manager must resolve to one winner.
+        let mut a = mgr.begin();
+        let mut b = mgr.begin();
+        let ka = rng.below_usize(key_count);
+        let kb = rng.below_usize(key_count);
+        a.write(keys[ka].clone());
+        b.write(keys[kb].clone());
+
+        // Commit in a seed-chosen order; whoever lands first wins a contended key.
+        let ordered: [(&stele_txn::Transaction, usize); 2] = if rng.below(2) == 0 {
+            [(&a, ka), (&b, kb)]
+        } else {
+            [(&b, kb), (&a, ka)]
+        };
+        for (txn, k) in ordered {
+            match mgr.commit(txn) {
+                Ok(committed) => {
+                    digest = fnv1a(digest, &[1]);
+                    digest = fnv1a(digest, &committed.commit_ts.0.to_le_bytes());
+                    stage_committed_write(&mut delta, &keys[k], txn.id(), committed.commit_ts);
+                }
+                // A clean retry signal — folded as a distinct outcome byte.
+                Err(_) => digest = fnv1a(digest, &[0]),
+            }
+        }
+
+        // A fresh reader resolves a seed-chosen key at its snapshot.
+        let reader = mgr.begin();
+        let rk = rng.below_usize(key_count);
+        let seen = delta
+            .range_scan(keys[rk].clone()..=keys[rk].clone(), reader.snapshot())
+            .expect("range scan");
+        match seen.into_iter().next() {
+            Some(v) => {
+                digest = fnv1a(digest, &[1]);
+                digest = fnv1a(digest, &v.sys_from.0.to_le_bytes());
+                digest = fnv1a(digest, &v.payload);
+            }
+            None => digest = fnv1a(digest, &[0]),
+        }
+    }
+    digest
+}
+
 /// Play a seeded sequence of operations against a [`MemDisk`] whose
 /// fault schedule is also seed-derived, and return the per-operation
 /// success/failure pattern.
@@ -549,6 +661,26 @@ mod tests {
         assert!(
             digests.len() > 1,
             "the WAL→delta DML workload must actually depend on the seed"
+        );
+    }
+
+    #[test]
+    fn mvcc_seed_is_reproducible() {
+        for seed in 0..64 {
+            assert_eq!(
+                run_mvcc_seed(seed),
+                run_mvcc_seed(seed),
+                "seed {seed} must replay to an identical MVCC digest"
+            );
+        }
+    }
+
+    #[test]
+    fn mvcc_distinct_seeds_diverge() {
+        let digests: std::collections::HashSet<u64> = (0..64).map(run_mvcc_seed).collect();
+        assert!(
+            digests.len() > 1,
+            "the MVCC commit/conflict workload must actually depend on the seed"
         );
     }
 }
