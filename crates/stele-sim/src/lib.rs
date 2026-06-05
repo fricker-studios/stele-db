@@ -21,10 +21,33 @@
 
 #![allow(dead_code)]
 
-use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros, ValidTimeMicros};
 use stele_storage::backend::{Disk, DiskFile, FaultOp, Faults, MemDisk};
-use stele_storage::delta::{BusinessKey, Version};
+use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Version};
 use stele_storage::segment::{SegmentReader, SegmentWriter};
+use stele_storage::validtime::{ValidInterval, ValidTimeWriter, unframe_payload};
+
+/// A deterministic, strictly-increasing clock for seeded scenarios.
+///
+/// The system-time axis needs commit timestamps that advance ([`stele_storage::systime`]),
+/// and determinism forbids reading the wall clock — so the harness hands the
+/// writer a counter that ticks once per [`Clock::now`]. Same seed ⇒ same
+/// sequence of `sys_from` values.
+struct StepClock(AtomicI64);
+
+impl StepClock {
+    const fn new(start: i64) -> Self {
+        Self(AtomicI64::new(start))
+    }
+}
+
+impl Clock for StepClock {
+    fn now(&self) -> SystemTimeMicros {
+        SystemTimeMicros(self.0.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 /// Tiny `xorshift64*` PRNG — deterministic and dependency-free.
 ///
@@ -139,6 +162,51 @@ pub fn run_storage_seed(seed: u64) -> u64 {
     digest
 }
 
+/// Play a seeded valid-time workload against a fresh delta tier and return a
+/// digest folding **both** temporal axes of every version read back.
+///
+/// Each key gets one framed insert ([`ValidTimeWriter`]) carrying a seed-derived
+/// `[valid_from, valid_to)` interval and payload; the delta is drained and every
+/// version's system interval, decoded valid interval, and user payload are mixed
+/// into the digest. Same seed ⇒ same digest — the determinism contract of
+/// [`run_storage_seed`], now exercising the valid-time ingestion path ([STL-92]).
+#[must_use]
+pub fn run_validtime_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut rng = Rng::new(seed);
+    let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+    let mut writer = ValidTimeWriter::new(StepClock::new(1), true);
+
+    let keys = 1 + rng.below(8);
+    for i in 0..keys {
+        let key = BusinessKey::new(format!("k-{i:04}").into_bytes());
+        let from = rng.next_i64_nonneg() % 1_000_000;
+        // `+ 1` guarantees a non-empty half-open interval (valid_from < valid_to).
+        let span = 1 + (rng.next_i64_nonneg() % 1_000_000);
+        let interval = ValidInterval::new(ValidTimeMicros(from), ValidTimeMicros(from + span))
+            .expect("from < from + span");
+        let payload_len = rng.below_usize(32);
+        let payload = rng.bytes(payload_len);
+        writer
+            .insert(&mut delta, key, Some(interval), payload)
+            .expect("framed insert");
+    }
+
+    // `flush_to_segment` drains in `(business_key, sys_from)` order — deterministic.
+    let mut digest = FNV_OFFSET;
+    for v in delta.flush_to_segment().expect("flush") {
+        let (valid, user) = unframe_payload(true, &v.payload).expect("unframe");
+        let valid = valid.expect("valid-time table carries an interval");
+        digest = fnv1a(digest, v.business_key.as_bytes());
+        digest = fnv1a(digest, &v.sys_from.0.to_le_bytes());
+        digest = fnv1a(digest, &v.sys_to.0.to_le_bytes());
+        digest = fnv1a(digest, &valid.from.0.to_le_bytes());
+        digest = fnv1a(digest, &valid.to.0.to_le_bytes());
+        digest = fnv1a(digest, user);
+    }
+    digest
+}
+
 /// Play a seeded sequence of operations against a [`MemDisk`] whose
 /// fault schedule is also seed-derived, and return the per-operation
 /// success/failure pattern.
@@ -211,5 +279,25 @@ mod tests {
         for seed in 0..64 {
             assert_eq!(run_fault_seed(seed), run_fault_seed(seed));
         }
+    }
+
+    #[test]
+    fn validtime_seed_is_reproducible() {
+        for seed in 0..64 {
+            assert_eq!(
+                run_validtime_seed(seed),
+                run_validtime_seed(seed),
+                "seed {seed} must replay to an identical valid-time digest"
+            );
+        }
+    }
+
+    #[test]
+    fn validtime_distinct_seeds_diverge() {
+        let digests: std::collections::HashSet<u64> = (0..64).map(run_validtime_seed).collect();
+        assert!(
+            digests.len() > 1,
+            "valid-time workload must actually depend on the seed"
+        );
     }
 }
