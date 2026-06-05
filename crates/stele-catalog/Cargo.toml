@@ -14,3 +14,4 @@ workspace = true
 
 [dependencies]
 stele-common = { workspace = true }
+thiserror    = { workspace = true }

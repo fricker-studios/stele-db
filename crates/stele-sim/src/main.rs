@@ -28,7 +28,10 @@ fn main() {
     let args = Args::parse();
     if let Some(seed) = args.seed {
         let digest = stele_sim::run_storage_seed(seed);
-        println!("stele-sim: seed {seed} → storage digest {digest:#018x}");
+        let vt_digest = stele_sim::run_validtime_seed(seed);
+        println!(
+            "stele-sim: seed {seed} → storage digest {digest:#018x} · valid-time digest {vt_digest:#018x}"
+        );
     } else if args.seeds == 0 {
         println!("stele-sim: no seeds requested (pass --seeds N or --seed S)");
     } else {
@@ -37,7 +40,11 @@ fn main() {
         // cancel matching digests) so the sweep stays a sharp regression signal.
         let mut sweep = 0xCBF2_9CE4_8422_2325u64;
         for seed in 0..args.seeds {
+            // Mix both scenarios per seed so the sweep regresses on either the
+            // sealed-segment path or the valid-time ingestion path.
             sweep = (sweep ^ stele_sim::run_storage_seed(seed)).wrapping_mul(0x0000_0100_0000_01B3);
+            sweep =
+                (sweep ^ stele_sim::run_validtime_seed(seed)).wrapping_mul(0x0000_0100_0000_01B3);
         }
         println!(
             "stele-sim: swept {} seed(s) over the in-memory backend → sweep digest {sweep:#018x}",
