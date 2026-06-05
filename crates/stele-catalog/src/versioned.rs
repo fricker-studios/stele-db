@@ -73,10 +73,17 @@ impl Catalog {
     }
 
     /// Hand out the next never-reused schema id.
-    fn alloc_schema_id(&mut self) -> SchemaId {
+    ///
+    /// Uses a checked increment: ids must stay unique for footer→schema
+    /// resolution, so an exhausted `u32` space fails loudly rather than wrapping
+    /// and silently reusing an id.
+    fn alloc_schema_id(&mut self) -> Result<SchemaId, CatalogError> {
         let id = SchemaId(self.next_schema_id);
-        self.next_schema_id += 1;
-        id
+        self.next_schema_id = self
+            .next_schema_id
+            .checked_add(1)
+            .ok_or(CatalogError::SchemaIdExhausted)?;
+        Ok(id)
     }
 
     /// Register a brand-new table whose first schema version takes effect at
@@ -89,6 +96,7 @@ impl Catalog {
     /// - [`CatalogError::TableAlreadyExists`] if `name` is already registered.
     /// - [`CatalogError::DuplicateColumn`] / [`CatalogError::InvalidColumnName`]
     ///   if the column list is malformed.
+    /// - [`CatalogError::SchemaIdExhausted`] if the `u32` id space is used up.
     pub fn create_table(
         &mut self,
         name: impl Into<String>,
@@ -106,7 +114,7 @@ impl Catalog {
         if self.tables.contains_key(&name) {
             return Err(CatalogError::TableAlreadyExists(name));
         }
-        let schema_id = self.alloc_schema_id();
+        let schema_id = self.alloc_schema_id()?;
         let schema = TableSchema::new(schema_id, columns, temporal)?;
         self.tables.insert(
             name,
@@ -137,6 +145,7 @@ impl Catalog {
     /// - [`CatalogError::NonMonotonicSchemaChange`] if `at` is not strictly after
     ///   the current version's `sys_from` — system time never moves backward, and
     ///   a zero-width version would break the gap-free/non-overlapping invariant.
+    /// - [`CatalogError::SchemaIdExhausted`] if the `u32` id space is used up.
     pub fn add_column(
         &mut self,
         name: &str,
@@ -170,7 +179,7 @@ impl Catalog {
         let mut columns = current.schema.columns().to_vec();
         columns.push(column);
         let temporal = current.schema.temporal().clone();
-        let schema_id = self.alloc_schema_id();
+        let schema_id = self.alloc_schema_id()?;
         let schema = TableSchema::new(schema_id, columns, temporal)?;
 
         // Close the prior version at `at` and append the new open one — the two
@@ -195,13 +204,21 @@ impl Catalog {
     /// `snapshot` (its first version starts strictly after it). Containment is
     /// half-open: the returned version satisfies `sys_from <= snapshot < sys_to`,
     /// matching how the storage core bounds a row's system-time interval.
+    ///
+    /// Versions are kept in ascending `sys_from` order, so the lookup is an
+    /// `O(log n)` binary search rather than a scan — planning-time resolution
+    /// stays cheap as a table's DDL history grows.
     #[must_use]
     pub fn resolve(&self, table_name: &str, snapshot: SystemTimeMicros) -> Option<&TableSchema> {
         let versions = self.tables.get(table_name)?;
-        versions
-            .iter()
-            .find(|v| v.sys_from <= snapshot && snapshot < v.sys_to)
-            .map(|v| &v.schema)
+        // The number of versions that start at or before `snapshot`; the
+        // candidate is the last of them. `0` means `snapshot` precedes the
+        // table's first version.
+        let started = versions.partition_point(|v| v.sys_from <= snapshot);
+        let candidate = &versions[started.checked_sub(1)?];
+        // The chain is contiguous, so this `sys_to` check only ever fails at the
+        // `< first.sys_from` edge already handled above — kept for exactness.
+        (snapshot < candidate.sys_to).then_some(&candidate.schema)
     }
 
     /// Look up a schema by the id a sealed segment's footer records.

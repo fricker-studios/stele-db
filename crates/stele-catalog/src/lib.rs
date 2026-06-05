@@ -98,6 +98,13 @@ pub enum CatalogError {
         /// The offending change's system time.
         at: i64,
     },
+
+    /// The catalog's `u32` schema-id space is exhausted. Ids are never reused,
+    /// so after `u32::MAX` allocations there is no fresh id to hand out.
+    /// Practically unreachable, but failing explicitly beats wrapping and
+    /// silently reusing an id, which would corrupt footer→schema resolution.
+    #[error("schema-id space (u32) is exhausted")]
+    SchemaIdExhausted,
 }
 
 /// The two boundary columns of a table's valid-time period, captured from a
