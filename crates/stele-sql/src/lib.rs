@@ -24,6 +24,13 @@
 //! ([`logical_type`]) — the seam between parsed `CREATE TABLE` column types and
 //! the catalog/executor type set.
 //!
+//! The DDL binder ([`bind_ddl`]) sits one step further on: it turns a parsed
+//! `CREATE TABLE` / `DROP TABLE` into a [`DdlStatement`] that
+//! [applies](DdlStatement::apply) to a `stele-catalog` `Catalog`, rejecting
+//! constraints and clauses outside the v0.1 surface. Wiring it to the pg-wire
+//! query loop is a follow-up; the parse → bind → apply path is complete and
+//! tested here.
+//!
 //! ```
 //! let stmts = stele_sql::parse(
 //!     "SELECT balance FROM account \
@@ -39,12 +46,14 @@
 #![allow(dead_code)]
 
 pub mod ast;
+pub mod ddl;
 pub mod dialect;
 pub mod error;
 mod parser;
 pub mod types;
 
 pub use ast::{AsOf, Statement, Temporal, TimeDimension, ValidTimePeriod};
+pub use ddl::{BindError, DdlOutcome, DdlStatement, bind_ddl};
 pub use dialect::SteleDialect;
 pub use error::ParseError;
 pub use parser::parse;

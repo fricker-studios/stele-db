@@ -1,7 +1,8 @@
 # SQL grammar — temporal extensions
 
-> **Status:** v0.1 parser bootstrap (STL-97). Tracks the parser only; binding,
-> planning, and execution land in later tickets.
+> **Status:** v0.1 parser bootstrap (STL-97) + DDL binding (STL-95). The parser
+> and the `CREATE TABLE` / `DROP TABLE` binder are live; planning and execution
+> of queries land in later tickets.
 > **Read with:** [02 — Architecture §6](02-architecture.md#6-query-layer).
 
 Stele's SQL frontend (`stele-sql`) starts from [`sqlparser-rs`][sqlparser] and
@@ -84,6 +85,29 @@ CREATE TABLE booking (id INT, valid_from TIMESTAMP, valid_to TIMESTAMP)
 Declares the two columns that form the table's application-time (valid-time)
 period. Captured as `Temporal::valid_time: Option<ValidTimePeriod>`. May appear
 in either order relative to `WITH SYSTEM VERSIONING`.
+
+## DDL binding (STL-95)
+
+Beyond parsing, `stele_sql::bind_ddl` lowers a `CREATE TABLE` / `DROP TABLE`
+into a `DdlStatement` that `apply`s to a `stele-catalog` `Catalog`:
+
+- **`CREATE TABLE`** requires `WITH SYSTEM VERSIONING` — every Stele table is
+  system-versioned (invariant 4), so the clause is mandatory rather than
+  silently assumed; a bare `CREATE TABLE` is rejected. `VALID TIME (f, t)` must
+  name two declared `TIMESTAMP` columns. Columns lower through
+  [`logical_type`](#type-vocabulary).
+- **`DROP TABLE`** is a *logical* drop — a catalog version transition that closes
+  the table's open schema version, never a segment deletion. A read `AS OF` an
+  instant before the drop still sees the table; the name may later be re-created.
+  `DROP TABLE IF EXISTS` of an absent table is a no-op.
+- **Rejected in v0.1**, each with a roadmap pointer: constraints other than a
+  column-level `PRIMARY KEY` (`FOREIGN KEY`/`REFERENCES`, `UNIQUE`, `CHECK`,
+  `NOT NULL`, `DEFAULT`, …), table-level constraints, indexes,
+  `CREATE TABLE … AS SELECT`, `LIKE`/`CLONE`, `IF NOT EXISTS`, `OR REPLACE`,
+  temporary/external tables, schema-qualified names, and `DROP … CASCADE`.
+  `PRIMARY KEY` is **accepted but not enforced** (no uniqueness/index yet), so
+  the identity-demo `CREATE TABLE account (id INT PRIMARY KEY, balance INT) …`
+  binds.
 
 ## Type vocabulary
 

@@ -67,9 +67,27 @@ pub enum CatalogError {
     #[error("table {0:?} already exists")]
     TableAlreadyExists(String),
 
-    /// An operation referenced a table not registered in the catalog.
+    /// An operation referenced a table not registered in the catalog — or one
+    /// that existed once but has since been dropped, so it is not *currently*
+    /// live. A read `AS OF` a past instant may still see it; a mutation cannot.
     #[error("unknown table {0:?}")]
     UnknownTable(String),
+
+    /// [`Catalog::create_table`](crate::Catalog::create_table) tried to re-create
+    /// a previously dropped name at a system time that falls *before* the drop
+    /// took effect. A re-created table must begin at or after its prior version's
+    /// close, or the two system-time intervals would overlap.
+    #[error(
+        "table {table:?} re-created at sys_time {at} before its drop took effect at {dropped_at}"
+    )]
+    TableRecreatedBeforeDrop {
+        /// The table whose re-creation was rejected.
+        table: String,
+        /// The offending re-creation's system time.
+        at: i64,
+        /// The system time the prior version was dropped at; `at` must not precede it.
+        dropped_at: i64,
+    },
 
     /// A schema change carried a system time at or before the current version's
     /// start. System time never moves backward, and a zero-width version would
