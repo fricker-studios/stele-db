@@ -18,6 +18,7 @@
 //! segments; this never mutates anything.
 
 use std::collections::BTreeMap;
+use std::ops::Bound::Included;
 
 use stele_common::time::SystemTimeMicros;
 
@@ -58,6 +59,11 @@ fn overlay_chain(
 /// wins — pass the delta versions last so freshly-staged state supersedes a
 /// stale segment copy.
 ///
+/// The index is **materialized once** ([`ValidityIndex::materialize`]) — a single
+/// pass over its spills — and then overlaid in memory, so a fold over `K` keys
+/// costs O(spills) reads, not O(K × spills). Each key's entries are a contiguous
+/// `(business_key, sys_from)` run, so the overlay range-scans just that run.
+///
 /// # Errors
 ///
 /// [`ValidityError`] if a backing spill of the index cannot be read.
@@ -72,9 +78,16 @@ pub fn fold_chains<D: Disk>(
             .or_default()
             .insert(v.sys_from, v);
     }
+    let closes = index.materialize()?;
     for (key, chain) in &mut chains {
-        let closes = index.closes_for(key)?;
-        overlay_chain(chain, &closes);
+        let lo = (key.clone(), SystemTimeMicros(i64::MIN));
+        let hi = (key.clone(), SystemTimeMicros(i64::MAX));
+        for ((_, sys_from), interval) in closes.range((Included(lo), Included(hi))) {
+            if let Some(version) = chain.get_mut(sys_from) {
+                version.sys_to = interval.sys_to;
+                version.closed_by = Some(interval.closed_by.clone());
+            }
+        }
     }
     Ok(chains)
 }

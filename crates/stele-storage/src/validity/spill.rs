@@ -43,7 +43,18 @@ pub(super) fn write_spill<D: Disk>(
 ) -> Result<(), ValidityError> {
     let name = spill_name(index);
     let mut file = disk.create(&name)?;
-    let total_u64: u64 = closes.iter().map(|c| c.encoded_size() as u64).sum();
+    // Checked accumulation: a plain `.sum()` over `u64` wraps in release on a
+    // pathologically large batch, which would under-size the buffer below and
+    // defeat its own length check. Overflow is surfaced as a typed error instead.
+    let total_u64 = closes
+        .iter()
+        .try_fold(0u64, |acc, c| acc.checked_add(c.encoded_size() as u64))
+        .ok_or_else(|| {
+            ValidityError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("validity spill {name} total encoded length overflows u64"),
+            ))
+        })?;
     let total = usize::try_from(total_u64).map_err(|_| {
         ValidityError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
