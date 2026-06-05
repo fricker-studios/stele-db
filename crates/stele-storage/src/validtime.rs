@@ -303,6 +303,11 @@ impl<C: Clock> ValidTimeWriter<C> {
     /// the database stopped holding the row*, which is a system-time fact; the
     /// closed version retains the valid interval it was written with.
     ///
+    /// The deleting transaction's `txn_id` + `principal` are recorded as the
+    /// closed version's `closed_by` provenance, forwarded verbatim to the
+    /// system-time path ([STL-118]) — valid-time has no bearing on *who* closed
+    /// a period.
+    ///
     /// Returns the system-time `commit` at which the period was closed.
     ///
     /// # Errors
@@ -313,8 +318,10 @@ impl<C: Clock> ValidTimeWriter<C> {
         &mut self,
         delta: &mut Delta<D>,
         key: &BusinessKey,
+        txn_id: TxnId,
+        principal: Principal,
     ) -> Result<SystemTimeMicros, ValidTimeError> {
-        Ok(self.inner.delete(delta, key)?)
+        Ok(self.inner.delete(delta, key, txn_id, principal)?)
     }
 }
 

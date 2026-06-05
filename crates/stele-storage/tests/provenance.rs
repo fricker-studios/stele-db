@@ -238,6 +238,7 @@ fn provenance_columns_add_under_ten_percent_overhead() {
                 SystemTimeMicros(i64::try_from(i).unwrap() + 1),
                 principal.clone(),
             ),
+            closed_by: None,
             payload,
         });
     }

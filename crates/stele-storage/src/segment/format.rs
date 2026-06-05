@@ -35,7 +35,15 @@ pub(super) const TRAILER_MAGIC: [u8; 8] = *b"STLSEGFT";
 ///   version marks the generation, and bumping it makes a v2 reader reject a
 ///   valid-time segment cleanly at the header rather than choking on column
 ///   id 7 mid-footer.
-pub(super) const FORMAT_VERSION: u16 = 3;
+/// * **v4** — adds the three always-on close-provenance columns
+///   (`closed_by_txn`, `closed_at`, `closed_by_principal`), ids 9..=11
+///   ([STL-118]): who closed each version's system-time period and when. Like
+///   the v2 provenance columns these are on every segment, but populated only on
+///   a *closed* version — an open version stores the [`ColumnId::ClosedAt`]
+///   sentinel (`SYSTEM_TIME_OPEN`) to mean "not closed". Same
+///   backwards-incompatible reasoning as v2/v3: a new column-id set is a clean
+///   header-level reject for an older reader.
+pub(super) const FORMAT_VERSION: u16 = 4;
 
 /// Header size in bytes — magic (8) + version (2) + flags (2) + reserved (4).
 pub(super) const HEADER_LEN: usize = 16;
@@ -50,15 +58,15 @@ pub(super) const CHUNK_HEADER_LEN: usize = 16;
 /// Maximum bytes retained for a variable-length column's zone-map min/max stat.
 ///
 /// Bytes columns ([`ColumnType::Bytes`]) can hold values up to
-/// `MAX_VERSION_FRAME_LEN` (16 MiB) each — `Payload`, `Principal`, and even a
-/// pathologically long `BusinessKey`. Inlining a full lex-min/max of such a
-/// value would let one row push the footer past its `u32` `footer_len` ceiling,
-/// so the writer records only a bounded *prefix* of the lex-min/max instead
-/// ([`super::writer`]): the min prefix is truncated *down* (a byte prefix is
-/// lex-`<=` its source, so it stays a sound lower bound) and the max prefix is
-/// rounded *up* (so it stays a sound upper bound). This caps each bytes
-/// column's footer contribution at `2 * MAX_BYTES_STAT_PREFIX_LEN`, independent
-/// of value size, which keeps [`ZoneMap::might_contain`](super::zone_map::ZoneMap::might_contain)'s
+/// `MAX_VERSION_FRAME_LEN` (16 MiB) each — `Payload`, `Principal`,
+/// `ClosedByPrincipal`, and even a pathologically long `BusinessKey`. Inlining a
+/// full lex-min/max of such a value would push the footer past its `u32`
+/// `footer_len` ceiling, so the writer records only a bounded *prefix* of the
+/// lex-min/max instead ([`super::writer`]): the min prefix is truncated *down*
+/// (a byte prefix is lex-`<=` its source, so it stays a sound lower bound) and
+/// the max prefix is rounded *up* (so it stays a sound upper bound). This caps
+/// each bytes column's footer contribution at `2 * MAX_BYTES_STAT_PREFIX_LEN`,
+/// independent of value size, which keeps [`ZoneMap::might_contain`](super::zone_map::ZoneMap::might_contain)'s
 /// no-false-negatives contract intact for worst-case blob inputs.
 ///
 /// 64 bytes trades footer size against prune selectivity: long enough that
@@ -69,14 +77,13 @@ pub(super) const MAX_BYTES_STAT_PREFIX_LEN: usize = 64;
 
 /// Logical schema id stored in the footer.
 ///
-/// v0.1 has exactly one implicit schema — the seven always-on `Version` columns
-/// (the four data/temporal fields plus the three provenance columns,
-/// [`FORMAT_VERSION`] v2), optionally extended with the valid-time pair for a
-/// valid-time table ([`FORMAT_VERSION`] v3) — so the id is hard-coded. Once
-/// [STL-98] lands the versioned catalog,
-/// this becomes a real schema reference resolved through the catalog at read
-/// time; the footer field is wide enough already that no format change is
-/// needed.
+/// v0.1 has exactly one implicit schema — the ten always-on `Version` columns
+/// (the four data/temporal fields, the three provenance columns of
+/// [`FORMAT_VERSION`] v2, and the three close-provenance columns of v4),
+/// optionally extended with the valid-time pair for a valid-time table (v3) —
+/// so the id is hard-coded. Once [STL-98] lands the versioned catalog, this
+/// becomes a real schema reference resolved through the catalog at read time;
+/// the footer field is wide enough already that no format change is needed.
 pub(super) const SCHEMA_ID_IMPLICIT_VERSION: u32 = 0;
 
 /// Column codecs the format can describe. v0.1 emits [`Codec::Plain`]; the
@@ -141,25 +148,45 @@ pub enum ColumnId {
     /// ([`stele_common::time::VALID_TIME_OPEN`]). Present only on a valid-time
     /// table's segments, alongside [`Self::ValidFrom`].
     ValidTo = 8,
+    /// Close-provenance: the transaction that closed this version's system-time
+    /// period (fixed 8 bytes, `u64` bits in the `i64` column like [`Self::TxnId`]).
+    /// `0` on an open version — read [`Self::ClosedAt`] for presence, never this
+    /// ([STL-118]).
+    ClosedByTxn = 9,
+    /// Close-provenance: the commit timestamp of the closing transaction (fixed
+    /// `i64`, microseconds) — equal to the version's `sys_to` on the
+    /// single-writer path, stored as its own fact for the same reason
+    /// [`stele_common::provenance::Provenance::committed_at`] is. This column is
+    /// also the **presence discriminator** for the close group: the
+    /// `SYSTEM_TIME_OPEN` sentinel ([`stele_common::time::SYSTEM_TIME_OPEN`])
+    /// means the version is still open (no close provenance); any other value
+    /// means it was closed. A real close can never stamp the sentinel — the
+    /// system-time writer refuses a commit that would reach it.
+    ClosedAt = 10,
+    /// Close-provenance: opaque principal bytes of the closing transaction
+    /// (variable-length). Empty on an open version ([STL-118]).
+    ClosedByPrincipal = 11,
 }
 
 impl ColumnId {
-    /// Every column the implicit-Version schema carries, in writer/reader
+    /// Every column an always-on (system-only) segment carries, in writer/reader
     /// canonical order. Exposed publicly so tests and other consumers share
     /// a single source of truth for the column set — adding a column here
     /// flows into both writer/reader and every test that iterates the
     /// schema, no shadow constants left to drift.
     ///
-    /// The three provenance columns ([`Self::TxnId`], [`Self::CommittedAt`],
-    /// [`Self::Principal`]) sit at the end — additions never renumber the
-    /// frozen ids 0..=3 ([architecture §3.2](../../../../../docs/02-architecture.md#32-on-disk-segment-format)).
+    /// The provenance columns ([`Self::TxnId`], [`Self::CommittedAt`],
+    /// [`Self::Principal`]) and the close-provenance columns
+    /// ([`Self::ClosedByTxn`], [`Self::ClosedAt`], [`Self::ClosedByPrincipal`])
+    /// sit at the end — additions never renumber the frozen ids 0..=3
+    /// ([architecture §3.2](../../../../../docs/02-architecture.md#32-on-disk-segment-format)).
     ///
     /// This is the **always-on** set, present on every segment. A valid-time
     /// table's segments additionally carry [`Self::ValidFrom`] /
     /// [`Self::ValidTo`]; use the crate-internal `schema` helper to get the full
     /// ordered set for a given valid-time policy rather than iterating `ALL`
     /// directly when the opt-in columns matter.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 10] = [
         Self::BusinessKey,
         Self::SysFrom,
         Self::SysTo,
@@ -167,13 +194,17 @@ impl ColumnId {
         Self::TxnId,
         Self::CommittedAt,
         Self::Principal,
+        Self::ClosedByTxn,
+        Self::ClosedAt,
+        Self::ClosedByPrincipal,
     ];
 
-    /// The always-on set ([`Self::ALL`]) extended with the valid-time pair —
-    /// the column set a *valid-time* table's segment carries, in writer/reader
-    /// canonical order. The valid-time columns sit at the end so the always-on
-    /// ids keep their frozen positions.
-    const ALL_WITH_VALID_TIME: [Self; 9] = [
+    /// The always-on set ([`Self::ALL`]) plus the valid-time pair — the column
+    /// set a *valid-time* table's segment carries, in writer/reader canonical
+    /// order. The valid-time columns sit at their frozen ids (7..=8) ahead of
+    /// the close-provenance columns (9..=11); array position is just the write
+    /// order, while the footer records each column's id, so the two never drift.
+    const ALL_WITH_VALID_TIME: [Self; 12] = [
         Self::BusinessKey,
         Self::SysFrom,
         Self::SysTo,
@@ -183,6 +214,9 @@ impl ColumnId {
         Self::Principal,
         Self::ValidFrom,
         Self::ValidTo,
+        Self::ClosedByTxn,
+        Self::ClosedAt,
+        Self::ClosedByPrincipal,
     ];
 
     /// The ordered column set a segment carries given the table's valid-time
@@ -200,13 +234,17 @@ impl ColumnId {
 
     pub(super) const fn ty(self) -> ColumnType {
         match self {
-            Self::BusinessKey | Self::Payload | Self::Principal => ColumnType::Bytes,
+            Self::BusinessKey | Self::Payload | Self::Principal | Self::ClosedByPrincipal => {
+                ColumnType::Bytes
+            }
             Self::SysFrom
             | Self::SysTo
             | Self::TxnId
             | Self::CommittedAt
             | Self::ValidFrom
-            | Self::ValidTo => ColumnType::I64,
+            | Self::ValidTo
+            | Self::ClosedByTxn
+            | Self::ClosedAt => ColumnType::I64,
         }
     }
 
@@ -221,6 +259,9 @@ impl ColumnId {
             6 => Some(Self::Principal),
             7 => Some(Self::ValidFrom),
             8 => Some(Self::ValidTo),
+            9 => Some(Self::ClosedByTxn),
+            10 => Some(Self::ClosedAt),
+            11 => Some(Self::ClosedByPrincipal),
             _ => None,
         }
     }

@@ -25,7 +25,7 @@
 use std::cmp::Ordering;
 
 use stele_common::provenance::{Principal, Provenance, TxnId};
-use stele_common::time::SystemTimeMicros;
+use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
 
 use crate::backend::{Disk, DiskFile};
 use crate::checksum::crc32c;
@@ -42,11 +42,13 @@ use super::zone_map::{Predicate, ZoneBound, ZoneMap};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnData {
     /// Variable-length bytes column ([`ColumnId::BusinessKey`],
-    /// [`ColumnId::Payload`], or [`ColumnId::Principal`]).
+    /// [`ColumnId::Payload`], [`ColumnId::Principal`], or
+    /// [`ColumnId::ClosedByPrincipal`]).
     Bytes(Vec<Vec<u8>>),
     /// Fixed-width `i64` column ([`ColumnId::SysFrom`], [`ColumnId::SysTo`],
-    /// [`ColumnId::TxnId`], [`ColumnId::CommittedAt`], or — on a valid-time
-    /// table's segment — [`ColumnId::ValidFrom`] / [`ColumnId::ValidTo`]).
+    /// [`ColumnId::TxnId`], [`ColumnId::CommittedAt`], [`ColumnId::ClosedByTxn`],
+    /// [`ColumnId::ClosedAt`], or — on a valid-time table's segment —
+    /// [`ColumnId::ValidFrom`] / [`ColumnId::ValidTo`]).
     I64(Vec<i64>),
 }
 
@@ -178,54 +180,60 @@ impl<F: DiskFile> SegmentReader<F> {
         }
     }
 
+    /// Project one bytes column, erroring if the segment typed it as `i64`.
+    /// Structurally unreachable — each decoder picks its [`ColumnData`] arm
+    /// from [`ColumnId::ty`] — but kept as a typed error so a future codec
+    /// change that loosens the mapping fails loudly in one place.
+    fn read_bytes_column(&self, col: ColumnId) -> Result<Vec<Vec<u8>>, SegmentError> {
+        match self.read_column(col)? {
+            ColumnData::Bytes(v) => Ok(v),
+            ColumnData::I64(_) => Err(SegmentError::Corrupt(
+                "column data type mismatched expected schema",
+            )),
+        }
+    }
+
+    /// Project one `i64` column, erroring if the segment typed it as bytes.
+    /// See [`Self::read_bytes_column`] for why the mismatch is a typed error.
+    fn read_i64_column(&self, col: ColumnId) -> Result<Vec<i64>, SegmentError> {
+        match self.read_column(col)? {
+            ColumnData::I64(v) => Ok(v),
+            ColumnData::Bytes(_) => Err(SegmentError::Corrupt(
+                "column data type mismatched expected schema",
+            )),
+        }
+    }
+
     /// Read every column and reassemble [`Version`]s in row order — the
     /// dual of [`super::writer::SegmentWriter::push`]. Useful for tests and
     /// for the compaction reader; query execution prefers the projected
     /// [`Self::read_column`].
     #[allow(clippy::cast_sign_loss)] // `txn_id` round-trips i64-bits → u64 (see `ColumnId::TxnId`).
     pub fn read_versions(&self) -> Result<Vec<Version>, SegmentError> {
-        let business_keys = self.read_column(ColumnId::BusinessKey)?;
-        let sys_from = self.read_column(ColumnId::SysFrom)?;
-        let sys_to = self.read_column(ColumnId::SysTo)?;
-        let payloads = self.read_column(ColumnId::Payload)?;
-        let txn_ids = self.read_column(ColumnId::TxnId)?;
-        let committed_ats = self.read_column(ColumnId::CommittedAt)?;
-        let principals = self.read_column(ColumnId::Principal)?;
-        let (
-            ColumnData::Bytes(business_keys),
-            ColumnData::I64(sys_from),
-            ColumnData::I64(sys_to),
-            ColumnData::Bytes(payloads),
-            ColumnData::I64(txn_ids),
-            ColumnData::I64(committed_ats),
-            ColumnData::Bytes(principals),
-        ) = (
-            business_keys,
-            sys_from,
-            sys_to,
-            payloads,
-            txn_ids,
-            committed_ats,
-            principals,
-        )
-        else {
-            // Each column's decoder picks the right ColumnData arm from
-            // ColumnId::ty(), so this is structurally unreachable. Keep the
-            // typed error rather than `unreachable!()` so a future codec
-            // expansion that loosens the mapping has a single place to fail
-            // loudly.
-            return Err(SegmentError::Corrupt(
-                "column data type mismatched expected schema",
-            ));
-        };
+        // `mut` so the row loop can `mem::take` each owned byte vector out
+        // instead of cloning it — see the loop below.
+        let mut business_keys = self.read_bytes_column(ColumnId::BusinessKey)?;
+        let mut payloads = self.read_bytes_column(ColumnId::Payload)?;
+        let mut principals = self.read_bytes_column(ColumnId::Principal)?;
+        let mut closed_principals = self.read_bytes_column(ColumnId::ClosedByPrincipal)?;
+        let sys_from = self.read_i64_column(ColumnId::SysFrom)?;
+        let sys_to = self.read_i64_column(ColumnId::SysTo)?;
+        let txn_ids = self.read_i64_column(ColumnId::TxnId)?;
+        let committed_ats = self.read_i64_column(ColumnId::CommittedAt)?;
+        let closed_txns = self.read_i64_column(ColumnId::ClosedByTxn)?;
+        let closed_ats = self.read_i64_column(ColumnId::ClosedAt)?;
+
         let n = business_keys.len();
         if ![
+            payloads.len(),
+            principals.len(),
+            closed_principals.len(),
             sys_from.len(),
             sys_to.len(),
-            payloads.len(),
             txn_ids.len(),
             committed_ats.len(),
-            principals.len(),
+            closed_txns.len(),
+            closed_ats.len(),
         ]
         .iter()
         .all(|&len| len == n)
@@ -235,24 +243,34 @@ impl<F: DiskFile> SegmentReader<F> {
             ));
         }
         let mut out = Vec::with_capacity(n);
-        for (((((bk, sf), st), pl), (txn, ca)), principal) in business_keys
-            .into_iter()
-            .zip(sys_from)
-            .zip(sys_to)
-            .zip(payloads)
-            .zip(txn_ids.into_iter().zip(committed_ats))
-            .zip(principals)
-        {
+        for i in 0..n {
+            // `ClosedAt`'s `SYSTEM_TIME_OPEN` sentinel is the presence
+            // discriminator: an open version carries no close provenance. The
+            // writer guarantees a real close can never stamp the sentinel.
+            // Move the owned byte vectors out by index (`mem::take` leaves a
+            // cheap empty `Vec` placeholder) rather than cloning — the column
+            // vectors are discarded at function end. `i64` columns are `Copy`,
+            // so they read by value.
+            let closed_by = if closed_ats[i] == SYSTEM_TIME_OPEN.0 {
+                None
+            } else {
+                Some(Provenance {
+                    txn_id: TxnId(closed_txns[i] as u64),
+                    committed_at: SystemTimeMicros(closed_ats[i]),
+                    principal: Principal::new(std::mem::take(&mut closed_principals[i])),
+                })
+            };
             out.push(Version {
-                business_key: BusinessKey::new(bk),
-                sys_from: SystemTimeMicros(sf),
-                sys_to: SystemTimeMicros(st),
+                business_key: BusinessKey::new(std::mem::take(&mut business_keys[i])),
+                sys_from: SystemTimeMicros(sys_from[i]),
+                sys_to: SystemTimeMicros(sys_to[i]),
                 provenance: Provenance {
-                    txn_id: TxnId(txn as u64),
-                    committed_at: SystemTimeMicros(ca),
-                    principal: Principal::new(principal),
+                    txn_id: TxnId(txn_ids[i] as u64),
+                    committed_at: SystemTimeMicros(committed_ats[i]),
+                    principal: Principal::new(std::mem::take(&mut principals[i])),
                 },
-                payload: pl,
+                closed_by,
+                payload: std::mem::take(&mut payloads[i]),
             });
         }
         Ok(out)
@@ -674,7 +692,8 @@ mod tests {
         out.extend_from_slice(&1u32.to_le_bytes()); // row_group_count
         // row-group 0
         out.extend_from_slice(&row_count.to_le_bytes());
-        // `ColumnId::ALL.len()` is the const `4`; the cast can never truncate.
+        // `ColumnId::ALL.len()` is a small compile-time const; the cast can
+        // never truncate.
         let column_count = u32::try_from(ColumnId::ALL.len()).expect("ColumnId::ALL fits in u32");
         out.extend_from_slice(&column_count.to_le_bytes());
         let mut offset: u64 = HEADER_LEN as u64;

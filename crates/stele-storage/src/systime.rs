@@ -164,13 +164,23 @@ impl<C: Clock> SysTimeWriter<C> {
         principal: Principal,
     ) -> Result<SystemTimeMicros, SysTimeError> {
         let commit = self.next_commit_ts()?;
-        close_prior(delta, &key, commit)?;
+        // The superseding transaction both closes the prior period (stamping its
+        // identity as `closed_by`) and opens the new one — same `txn_id` /
+        // `principal` for both halves.
+        close_prior(delta, &key, commit, txn_id, principal.clone())?;
         delta.insert(open_version(key, commit, payload, txn_id, principal))?;
         Ok(commit)
     }
 
     /// Close the live version of `key` without re-opening — a logical delete.
     /// Afterwards the key has no version live at any snapshot `≥ commit`.
+    ///
+    /// The deleting transaction's `txn_id` + `principal` are recorded as the
+    /// closed version's `closed_by` provenance — a delete is a logical
+    /// period-close that "carries its own provenance"
+    /// ([architecture §3.1](../../../docs/02-architecture.md#31-tiered-layout-lsm-flavored-history-preserving),
+    /// [STL-118]). Unlike an [`update`](Self::update), a delete leaves no
+    /// successor version, so this is the only record of who performed it.
     ///
     /// Returns the `commit` at which the period was closed.
     ///
@@ -182,9 +192,11 @@ impl<C: Clock> SysTimeWriter<C> {
         &mut self,
         delta: &mut Delta<D>,
         key: &BusinessKey,
+        txn_id: TxnId,
+        principal: Principal,
     ) -> Result<SystemTimeMicros, SysTimeError> {
         let commit = self.next_commit_ts()?;
-        close_prior(delta, key, commit)?;
+        close_prior(delta, key, commit, txn_id, principal)?;
         Ok(commit)
     }
 
@@ -215,21 +227,29 @@ impl<C: Clock> SysTimeWriter<C> {
 }
 
 /// Close `key`'s current open version at `commit` by re-staging it with
-/// `sys_to = commit`. Re-inserting the same `(business_key, sys_from)` is the
-/// delta tier's idempotent replace, so this updates the period end in place
-/// rather than appending a duplicate.
+/// `sys_to = commit` and the closing transaction's provenance. Re-inserting the
+/// same `(business_key, sys_from)` is the delta tier's idempotent replace, so
+/// this updates the period in place rather than appending a duplicate.
 ///
-/// The prior version's **provenance is preserved untouched**: closing a period
-/// is bookkeeping by the superseding transaction, not a rewrite of who wrote
-/// the closed version. Only `sys_to` changes; `txn_id` / `committed_at` /
-/// `principal` keep their birth values.
+/// The prior version's **birth provenance is preserved untouched**: closing a
+/// period is bookkeeping by the superseding transaction, not a rewrite of who
+/// wrote the closed version, so `txn_id` / `committed_at` / `principal` keep
+/// their original values. What the close *adds* is `closed_by` — the `txn_id` /
+/// `principal` of the transaction performing the close, with `committed_at`
+/// stamped to `commit` (which equals the new `sys_to`). For a `delete` there is
+/// no successor version to carry that identity, so recording it here is the only
+/// place "who closed this period" survives ([architecture §3.1](../../../docs/02-architecture.md#31-tiered-layout-lsm-flavored-history-preserving),
+/// [STL-118]).
 fn close_prior<D: Disk>(
     delta: &mut Delta<D>,
     key: &BusinessKey,
     commit: SystemTimeMicros,
+    txn_id: TxnId,
+    principal: Principal,
 ) -> Result<(), SysTimeError> {
     let mut prior = current_open(delta, key, commit)?.ok_or(SysTimeError::KeyNotFound)?;
     prior.sys_to = commit;
+    prior.closed_by = Some(Provenance::new(txn_id, commit, principal));
     delta.insert(prior)?;
     Ok(())
 }
@@ -251,6 +271,8 @@ const fn open_version(
         sys_from: commit,
         sys_to: SYSTEM_TIME_OPEN,
         provenance: Provenance::new(txn_id, commit, principal),
+        // Open: no period-close yet, so no closing provenance ([STL-118]).
+        closed_by: None,
         payload,
     }
 }
