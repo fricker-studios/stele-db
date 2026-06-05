@@ -29,10 +29,17 @@ use std::io;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use stele_common::provenance::{Principal, TxnId};
 use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros, VALID_TIME_OPEN, ValidTimeMicros};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
 use stele_storage::validtime::{ValidInterval, ValidTimeError, ValidTimeWriter, unframe_payload};
 use stele_storage::wal::{Disk, DiskFile};
+
+/// A throwaway principal for valid-time write-path tests; provenance values are
+/// asserted in `provenance.rs`.
+fn who() -> Principal {
+    Principal::new(b"tester".to_vec())
+}
 
 // --- MemDisk: minimal in-memory Disk for tests ------------------------------
 
@@ -173,6 +180,8 @@ fn insert_into_a_valid_time_table_populates_both_axes_and_reads_filter_on_either
             key.clone(),
             Some(interval(100, 200)),
             b"role=ic".to_vec(),
+            TxnId(1),
+            who(),
         )
         .unwrap();
 
@@ -214,6 +223,8 @@ fn update_opens_a_new_valid_period_and_the_superseded_one_keeps_its_interval() {
             key.clone(),
             Some(interval(100, 200)),
             b"role=ic".to_vec(),
+            TxnId(1),
+            who(),
         )
         .unwrap();
     clock.set(2_000);
@@ -224,6 +235,8 @@ fn update_opens_a_new_valid_period_and_the_superseded_one_keeps_its_interval() {
             key.clone(),
             Some(interval(200, i64::MAX)),
             b"role=lead".to_vec(),
+            TxnId(2),
+            who(),
         )
         .unwrap();
 
@@ -263,6 +276,8 @@ fn delete_closes_the_system_period_and_preserves_the_valid_interval() {
             key.clone(),
             Some(interval(100, 200)),
             b"role=ic".to_vec(),
+            TxnId(1),
+            who(),
         )
         .unwrap();
     let closed_at = writer.delete(&mut delta, &key).unwrap();
@@ -294,7 +309,7 @@ fn valid_time_table_requires_an_interval_on_every_write() {
     let key = BusinessKey::new(b"k".to_vec());
 
     let err = writer
-        .insert(&mut delta, key, None, b"x".to_vec())
+        .insert(&mut delta, key, None, b"x".to_vec(), TxnId(1), who())
         .unwrap_err();
     assert!(matches!(err, ValidTimeError::ValidTimeRequired));
 }
@@ -306,7 +321,14 @@ fn system_only_table_rejects_a_supplied_interval() {
     let key = BusinessKey::new(b"k".to_vec());
 
     let err = writer
-        .insert(&mut delta, key, Some(interval(1, 2)), b"x".to_vec())
+        .insert(
+            &mut delta,
+            key,
+            Some(interval(1, 2)),
+            b"x".to_vec(),
+            TxnId(1),
+            who(),
+        )
         .unwrap_err();
     assert!(matches!(err, ValidTimeError::ValidTimeNotSupported));
 }
@@ -319,7 +341,14 @@ fn system_only_table_stores_payload_with_no_prefix() {
     let key = BusinessKey::new(b"k".to_vec());
 
     writer
-        .insert(&mut delta, key.clone(), None, b"plain".to_vec())
+        .insert(
+            &mut delta,
+            key.clone(),
+            None,
+            b"plain".to_vec(),
+            TxnId(1),
+            who(),
+        )
         .unwrap();
 
     let live = delta

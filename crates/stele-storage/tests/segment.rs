@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 
+use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
 use stele_storage::delta::{BusinessKey, Version};
 use stele_storage::segment::{ColumnData, ColumnId, SegmentError, SegmentReader, SegmentWriter};
@@ -127,6 +128,13 @@ fn version(key: &[u8], sys_from: i64, sys_to: SystemTimeMicros, payload: &[u8]) 
         business_key: BusinessKey::new(key.to_vec()),
         sys_from: SystemTimeMicros(sys_from),
         sys_to,
+        // Provenance varies per row (txn_id/committed_at track sys_from) so the
+        // round-trip exercises real values across the three provenance columns.
+        provenance: Provenance::new(
+            TxnId(u64::try_from(sys_from).unwrap_or(0)),
+            SystemTimeMicros(sys_from),
+            Principal::new(format!("svc-{sys_from}").into_bytes()),
+        ),
         payload: payload.to_vec(),
     }
 }
@@ -201,6 +209,33 @@ fn round_trip_preserves_every_column_value() {
     assert_eq!(
         r.read_column(ColumnId::Payload).unwrap(),
         ColumnData::Bytes(expected_payload),
+    );
+
+    // Provenance columns are first-class — projectable exactly like the data
+    // columns (DoD: every persisted version has all three populated).
+    let expected_txn: Vec<i64> = written
+        .iter()
+        .map(|v| i64::try_from(v.provenance.txn_id.0).unwrap())
+        .collect();
+    let expected_committed: Vec<i64> = written
+        .iter()
+        .map(|v| v.provenance.committed_at.0)
+        .collect();
+    let expected_principal: Vec<Vec<u8>> = written
+        .iter()
+        .map(|v| v.provenance.principal.as_bytes().to_vec())
+        .collect();
+    assert_eq!(
+        r.read_column(ColumnId::TxnId).unwrap(),
+        ColumnData::I64(expected_txn),
+    );
+    assert_eq!(
+        r.read_column(ColumnId::CommittedAt).unwrap(),
+        ColumnData::I64(expected_committed),
+    );
+    assert_eq!(
+        r.read_column(ColumnId::Principal).unwrap(),
+        ColumnData::Bytes(expected_principal),
     );
 }
 

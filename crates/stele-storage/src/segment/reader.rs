@@ -24,6 +24,7 @@
 
 use std::cmp::Ordering;
 
+use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::SystemTimeMicros;
 
 use crate::backend::{Disk, DiskFile};
@@ -40,11 +41,11 @@ use super::zone_map::{Predicate, ZoneBound, ZoneMap};
 /// Decoded contents of one projected column chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnData {
-    /// Variable-length bytes column ([`ColumnId::BusinessKey`] or
-    /// [`ColumnId::Payload`]).
+    /// Variable-length bytes column ([`ColumnId::BusinessKey`],
+    /// [`ColumnId::Payload`], or [`ColumnId::Principal`]).
     Bytes(Vec<Vec<u8>>),
-    /// Fixed-width `i64` column ([`ColumnId::SysFrom`] or
-    /// [`ColumnId::SysTo`]).
+    /// Fixed-width `i64` column ([`ColumnId::SysFrom`], [`ColumnId::SysTo`],
+    /// [`ColumnId::TxnId`], or [`ColumnId::CommittedAt`]).
     I64(Vec<i64>),
 }
 
@@ -179,17 +180,32 @@ impl<F: DiskFile> SegmentReader<F> {
     /// dual of [`super::writer::SegmentWriter::push`]. Useful for tests and
     /// for the compaction reader; query execution prefers the projected
     /// [`Self::read_column`].
+    #[allow(clippy::cast_sign_loss)] // `txn_id` round-trips i64-bits → u64 (see `ColumnId::TxnId`).
     pub fn read_versions(&self) -> Result<Vec<Version>, SegmentError> {
         let business_keys = self.read_column(ColumnId::BusinessKey)?;
         let sys_from = self.read_column(ColumnId::SysFrom)?;
         let sys_to = self.read_column(ColumnId::SysTo)?;
         let payloads = self.read_column(ColumnId::Payload)?;
+        let txn_ids = self.read_column(ColumnId::TxnId)?;
+        let committed_ats = self.read_column(ColumnId::CommittedAt)?;
+        let principals = self.read_column(ColumnId::Principal)?;
         let (
             ColumnData::Bytes(business_keys),
             ColumnData::I64(sys_from),
             ColumnData::I64(sys_to),
             ColumnData::Bytes(payloads),
-        ) = (business_keys, sys_from, sys_to, payloads)
+            ColumnData::I64(txn_ids),
+            ColumnData::I64(committed_ats),
+            ColumnData::Bytes(principals),
+        ) = (
+            business_keys,
+            sys_from,
+            sys_to,
+            payloads,
+            txn_ids,
+            committed_ats,
+            principals,
+        )
         else {
             // Each column's decoder picks the right ColumnData arm from
             // ColumnId::ty(), so this is structurally unreachable. Keep the
@@ -200,29 +216,64 @@ impl<F: DiskFile> SegmentReader<F> {
                 "column data type mismatched expected schema",
             ));
         };
-        if !(business_keys.len() == sys_from.len()
-            && sys_from.len() == sys_to.len()
-            && sys_to.len() == payloads.len())
+        let n = business_keys.len();
+        if ![
+            sys_from.len(),
+            sys_to.len(),
+            payloads.len(),
+            txn_ids.len(),
+            committed_ats.len(),
+            principals.len(),
+        ]
+        .iter()
+        .all(|&len| len == n)
         {
             return Err(SegmentError::Corrupt(
                 "per-column value counts disagree within row-group",
             ));
         }
-        let mut out = Vec::with_capacity(business_keys.len());
-        for (((bk, sf), st), pl) in business_keys
+        let mut out = Vec::with_capacity(n);
+        for (((((bk, sf), st), pl), (txn, ca)), principal) in business_keys
             .into_iter()
             .zip(sys_from)
             .zip(sys_to)
             .zip(payloads)
+            .zip(txn_ids.into_iter().zip(committed_ats))
+            .zip(principals)
         {
             out.push(Version {
                 business_key: BusinessKey::new(bk),
                 sys_from: SystemTimeMicros(sf),
                 sys_to: SystemTimeMicros(st),
+                provenance: Provenance {
+                    txn_id: TxnId(txn as u64),
+                    committed_at: SystemTimeMicros(ca),
+                    principal: Principal::new(principal),
+                },
                 payload: pl,
             });
         }
         Ok(out)
+    }
+
+    /// Total on-disk bytes the chunk(s) for `col` occupy across every
+    /// row-group, including each chunk's 16-byte header — or `None` if the
+    /// column is absent from the segment.
+    ///
+    /// Footer-derived, so it costs no column-chunk I/O. Exposed for IO-cost
+    /// estimation and for measuring per-column storage footprint (e.g. the
+    /// provenance-overhead check in [STL-93]).
+    #[must_use]
+    pub fn column_byte_len(&self, col: ColumnId) -> Option<u64> {
+        let mut total = 0u64;
+        let mut seen = false;
+        for rg in &self.footer.row_groups {
+            for c in rg.columns.iter().filter(|c| c.column_id == col) {
+                total = total.saturating_add(c.length);
+                seen = true;
+            }
+        }
+        seen.then_some(total)
     }
 }
 

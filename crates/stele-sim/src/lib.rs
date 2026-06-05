@@ -23,6 +23,7 @@
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros, ValidTimeMicros};
 use stele_storage::backend::{Disk, DiskFile, FaultOp, Faults, MemDisk};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Version};
@@ -132,11 +133,23 @@ pub fn run_storage_seed(seed: u64) -> u64 {
             let key = rng.bytes(key_len);
             let payload_len = rng.below_usize(64);
             let payload = rng.bytes(payload_len);
+            // Provenance is part of every version — generate it from the same
+            // seed stream so the round-trip exercises the provenance columns
+            // deterministically ([STL-93]).
+            let sys_from = rng.next_i64_nonneg() % 1_000_000;
+            let txn_id = u64::try_from(rng.next_i64_nonneg()).unwrap_or(0);
+            let principal_len = rng.below_usize(8);
+            let principal = rng.bytes(principal_len);
             writer
                 .push(Version {
                     business_key: BusinessKey::new(key),
-                    sys_from: SystemTimeMicros(rng.next_i64_nonneg() % 1_000_000),
+                    sys_from: SystemTimeMicros(sys_from),
                     sys_to: SYSTEM_TIME_OPEN,
+                    provenance: Provenance::new(
+                        TxnId(txn_id),
+                        SystemTimeMicros(sys_from),
+                        Principal::new(principal),
+                    ),
                     payload,
                 })
                 .expect("push version");
@@ -156,6 +169,9 @@ pub fn run_storage_seed(seed: u64) -> u64 {
             digest = fnv1a(digest, v.business_key.as_bytes());
             digest = fnv1a(digest, &v.sys_from.0.to_le_bytes());
             digest = fnv1a(digest, &v.sys_to.0.to_le_bytes());
+            digest = fnv1a(digest, &v.provenance.txn_id.0.to_le_bytes());
+            digest = fnv1a(digest, &v.provenance.committed_at.0.to_le_bytes());
+            digest = fnv1a(digest, v.provenance.principal.as_bytes());
             digest = fnv1a(digest, &v.payload);
         }
     }
@@ -187,8 +203,18 @@ pub fn run_validtime_seed(seed: u64) -> u64 {
             .expect("from < from + span");
         let payload_len = rng.below_usize(32);
         let payload = rng.bytes(payload_len);
+        let txn_id = u64::try_from(rng.next_i64_nonneg()).unwrap_or(0);
+        let principal_len = rng.below_usize(8);
+        let principal = rng.bytes(principal_len);
         writer
-            .insert(&mut delta, key, Some(interval), payload)
+            .insert(
+                &mut delta,
+                key,
+                Some(interval),
+                payload,
+                TxnId(txn_id),
+                Principal::new(principal),
+            )
             .expect("framed insert");
     }
 
@@ -200,6 +226,9 @@ pub fn run_validtime_seed(seed: u64) -> u64 {
         digest = fnv1a(digest, v.business_key.as_bytes());
         digest = fnv1a(digest, &v.sys_from.0.to_le_bytes());
         digest = fnv1a(digest, &v.sys_to.0.to_le_bytes());
+        digest = fnv1a(digest, &v.provenance.txn_id.0.to_le_bytes());
+        digest = fnv1a(digest, &v.provenance.committed_at.0.to_le_bytes());
+        digest = fnv1a(digest, v.provenance.principal.as_bytes());
         digest = fnv1a(digest, &valid.from.0.to_le_bytes());
         digest = fnv1a(digest, &valid.to.0.to_le_bytes());
         digest = fnv1a(digest, user);

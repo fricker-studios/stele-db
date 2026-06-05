@@ -75,6 +75,19 @@ pub enum ColumnId {
     SysTo = 2,
     /// Opaque payload bytes (variable-length).
     Payload = 3,
+    /// Provenance: writing transaction id (fixed 8 bytes). Stored in the `i64`
+    /// column layout — `txn_id` is logically a `u64`
+    /// ([`stele_common::provenance::TxnId`]); the writer reinterprets the bits
+    /// (`u64 as i64`) and the reader reverses it (`i64 as u64`), a lossless
+    /// round-trip. Only the zone-map ordering would differ for ids ≥ 2^63,
+    /// unreachable for the same reason the system-time `i64` axis is.
+    TxnId = 4,
+    /// Provenance: commit timestamp (fixed `i64`, microseconds) —
+    /// [`stele_common::provenance::Provenance::committed_at`].
+    CommittedAt = 5,
+    /// Provenance: opaque principal bytes (variable-length) —
+    /// [`stele_common::provenance::Principal`].
+    Principal = 6,
 }
 
 impl ColumnId {
@@ -83,12 +96,24 @@ impl ColumnId {
     /// a single source of truth for the column set — adding a column here
     /// flows into both writer/reader and every test that iterates the
     /// schema, no shadow constants left to drift.
-    pub const ALL: [Self; 4] = [Self::BusinessKey, Self::SysFrom, Self::SysTo, Self::Payload];
+    ///
+    /// The three provenance columns ([`Self::TxnId`], [`Self::CommittedAt`],
+    /// [`Self::Principal`]) sit at the end — additions never renumber the
+    /// frozen ids 0..=3 ([architecture §3.2](../../../../../docs/02-architecture.md#32-on-disk-segment-format)).
+    pub const ALL: [Self; 7] = [
+        Self::BusinessKey,
+        Self::SysFrom,
+        Self::SysTo,
+        Self::Payload,
+        Self::TxnId,
+        Self::CommittedAt,
+        Self::Principal,
+    ];
 
     pub(super) const fn ty(self) -> ColumnType {
         match self {
-            Self::BusinessKey | Self::Payload => ColumnType::Bytes,
-            Self::SysFrom | Self::SysTo => ColumnType::I64,
+            Self::BusinessKey | Self::Payload | Self::Principal => ColumnType::Bytes,
+            Self::SysFrom | Self::SysTo | Self::TxnId | Self::CommittedAt => ColumnType::I64,
         }
     }
 
@@ -98,6 +123,9 @@ impl ColumnId {
             1 => Some(Self::SysFrom),
             2 => Some(Self::SysTo),
             3 => Some(Self::Payload),
+            4 => Some(Self::TxnId),
+            5 => Some(Self::CommittedAt),
+            6 => Some(Self::Principal),
             _ => None,
         }
     }
