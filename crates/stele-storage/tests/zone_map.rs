@@ -1,4 +1,4 @@
-//! Zone-map pruning integration tests (STL-89).
+//! Zone-map pruning integration tests (STL-89, STL-115).
 //!
 //! Covers the ticket's Definition of done:
 //!
@@ -9,7 +9,9 @@
 //!   handle, modelling cold-tiered metadata that is never archived (ADR-0021).
 //! * **Correctness oracle** — a seeded differential check that `might_contain`
 //!   never prunes a segment that actually holds a matching, visible row (no
-//!   false negatives), per testing-strategy §4.
+//!   false negatives), per testing-strategy §4. STL-115 extends the oracle to
+//!   bounded-prefix bytes columns (`Payload`), proving a truncated-down min and
+//!   rounded-up max bound never prune a real value/range match.
 
 #![allow(
     clippy::significant_drop_tightening,
@@ -314,8 +316,11 @@ fn zone_map_records_per_column_min_max() {
     assert_eq!(bk.min, ZoneBound::Bytes(b"a".to_vec()));
     assert_eq!(bk.max, ZoneBound::Bytes(b"z".to_vec()));
 
-    // Payload opts out of stats — no zone, so it never prunes.
-    assert!(zm.column(ColumnId::Payload).is_none());
+    // Payload now carries bounded-prefix stats (STL-115). These payloads are
+    // single bytes, well under the prefix cap, so the bounds are exact.
+    let payload = zm.column(ColumnId::Payload).expect("payload stats");
+    assert_eq!(payload.min, ZoneBound::Bytes(b"w".to_vec()));
+    assert_eq!(payload.max, ZoneBound::Bytes(b"y".to_vec()));
 }
 
 // --- DoD: correctness oracle (no false negatives) ---------------------------
@@ -393,6 +398,120 @@ fn might_contain_never_prunes_a_real_match() {
                 !real_match || kept,
                 "seed {seed}: might_contain pruned a segment that holds a real match \
                  (snapshot={snapshot:?}, key_range={lo}..={hi}, rows={rows:?})"
+            );
+        }
+    }
+}
+
+/// A byte alphabet weighted toward the rounding edges: `0x00`, mid values, and
+/// runs of `0xFF` so generated payloads frequently exercise the max-prefix
+/// carry (trailing `0xFF` dropped + previous byte bumped) and the all-`0xFF`
+/// "no upper bound" path.
+const STRESS_ALPHABET: [u8; 6] = [0x00, 0x41, 0x7F, 0xFE, 0xFF, 0xFF];
+
+/// Generate a random byte string of length `len` over [`STRESS_ALPHABET`].
+fn stress_bytes(rng: &mut Lcg, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|_| STRESS_ALPHABET[rng.below(STRESS_ALPHABET.len() as u64) as usize])
+        .collect()
+}
+
+/// STL-115 differential oracle for **bounded-prefix bytes columns**. Builds
+/// segments whose `Payload` values are *longer than the prefix cap* (so the
+/// writer must truncate the min down and round the max up), then fires random
+/// `Eq` and `Range` predicates on `Payload`. The brute-force oracle decides
+/// whether a visible, predicate-satisfying row truly exists by exact byte
+/// comparison; `might_contain` must never answer `false` when it does.
+///
+/// The invariant holds for any cap value, so the test stays agnostic to
+/// `MAX_BYTES_STAT_PREFIX_LEN` — it only needs payloads long enough that
+/// truncation definitely happens, which lengths `>= 48` guarantee.
+#[test]
+fn might_contain_never_prunes_a_real_match_on_truncated_payload() {
+    for seed in 0..300u64 {
+        let mut rng = Lcg(seed.wrapping_mul(2_654_435_761).wrapping_add(7));
+        let disk = CountingDisk::new();
+
+        // 1..=6 rows, each with an over-cap payload drawn from the stress
+        // alphabet so the prefix truncation/rounding is genuinely exercised.
+        let row_count = 1 + rng.below(6);
+        let mut rows = Vec::new();
+        for i in 0..row_count {
+            let payload_len = 48 + rng.below(42) as usize; // 48..=89 bytes
+            let payload = stress_bytes(&mut rng, payload_len);
+            let sys_from = rng.below(100) as i64;
+            let sys_to = if rng.below(4) == 0 {
+                SYSTEM_TIME_OPEN.0
+            } else {
+                sys_from + 1 + rng.below(100) as i64
+            };
+            rows.push(version(
+                format!("k{i}").as_bytes(),
+                sys_from,
+                sys_to,
+                &payload,
+            ));
+        }
+        write_segment(&disk, "p.seg", &rows);
+        let reader = SegmentReader::open(&disk, "p.seg").expect("open");
+
+        for _ in 0..24 {
+            let snapshot = snap(rng.below(210) as i64 - 5);
+
+            // Alternate between an exact-value probe and a range probe. The
+            // Eq probe sometimes targets a real row's payload (forcing the
+            // keep path) and sometimes a random value.
+            let predicate = if rng.below(2) == 0 {
+                let value = if rng.below(2) == 0 && !rows.is_empty() {
+                    let idx = rng.below(rows.len() as u64) as usize;
+                    rows[idx].payload.clone()
+                } else {
+                    let len = 40 + rng.below(50) as usize;
+                    stress_bytes(&mut rng, len)
+                };
+                Predicate::Eq {
+                    column: ColumnId::Payload,
+                    value: ZoneBound::Bytes(value),
+                }
+            } else {
+                let a_len = 1 + rng.below(80) as usize;
+                let a = stress_bytes(&mut rng, a_len);
+                let b_len = 1 + rng.below(80) as usize;
+                let b = stress_bytes(&mut rng, b_len);
+                let (low, high) = if a <= b { (a, b) } else { (b, a) };
+                Predicate::Range {
+                    column: ColumnId::Payload,
+                    low: ZoneBound::Bytes(low),
+                    high: ZoneBound::Bytes(high),
+                }
+            };
+
+            // Oracle: does a visible row satisfy the predicate exactly?
+            let real_match = rows.iter().any(|v| {
+                let visible = v.sys_from <= snapshot.0 && v.sys_to > snapshot.0;
+                let pred_holds = match &predicate {
+                    Predicate::Eq {
+                        value: ZoneBound::Bytes(value),
+                        ..
+                    } => v.payload == *value,
+                    Predicate::Range {
+                        low: ZoneBound::Bytes(low),
+                        high: ZoneBound::Bytes(high),
+                        ..
+                    } => {
+                        v.payload.as_slice() >= low.as_slice()
+                            && v.payload.as_slice() <= high.as_slice()
+                    }
+                    _ => unreachable!("only bytes Eq/Range predicates are built above"),
+                };
+                visible && pred_holds
+            });
+
+            let kept = reader.might_contain(&predicate, snapshot);
+            assert!(
+                !real_match || kept,
+                "seed {seed}: might_contain pruned a segment holding a real payload match \
+                 (snapshot={snapshot:?}, predicate={predicate:?}, rows={rows:?})"
             );
         }
     }

@@ -82,8 +82,12 @@ pub struct ColumnZone {
 /// Cheap to clone and independent of the file handle — the planner can retain
 /// it after the segment's bytes have been tiered to cold storage
 /// ([ADR-0021](../../../../../docs/adr/0021-storage-lifecycle-tiered-archival.md)).
-/// A column with no stats (an empty segment, or an opted-out column such as
-/// [`ColumnId::Payload`]) simply has no entry and never contributes a skip.
+/// Every column now carries stats — variable-length bytes columns such as
+/// [`ColumnId::Payload`] record a bounded min/max *prefix* (the writer caps it
+/// at `MAX_BYTES_STAT_PREFIX_LEN`). A column with no entry means no bound could
+/// be recorded (an empty segment, or the degenerate case where a bound rounds
+/// to the zero-length "no stats" sentinel); such a column simply never
+/// contributes a skip.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ZoneMap {
     // Small, fixed-cardinality column set (four in v0.1) — a linear-scan Vec
