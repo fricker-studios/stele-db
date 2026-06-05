@@ -7,34 +7,48 @@
 //! * `sys_from` — system-time at which this version became current.
 //! * `sys_to` — system-time at which it was superseded; `SYSTEM_TIME_OPEN`
 //!   while the version is the current one.
+//! * `provenance` — the [`Provenance`] triple (`txn_id`, `committed_at`,
+//!   `principal`) captured at commit and stored inline on every version
+//!   ([architecture §12 invariant 5](../../../../docs/02-architecture.md#12-cross-cutting-architectural-invariants)).
+//!   Unlike valid-time, provenance is **always present**, never opt-in, and is
+//!   carried as first-class fields here (and as first-class columns in a sealed
+//!   segment) rather than inside `payload` — so it survives WAL replay and
+//!   compresses on its own column statistics ([STL-93]).
 //! * `payload` — the column values, encoded by a layer above. The delta tier
 //!   treats this as opaque bytes.
 //!
 //! Valid-time columns are *deliberately absent* at this layer: valid-time is a
 //! per-table opt-in ([architecture §12 invariant 4](../../../../docs/02-architecture.md#12-cross-cutting-architectural-invariants))
-//! and the delta tier itself does not interpret them — they will travel inside
-//! `payload` once [STL-92] lands.
+//! and the delta tier itself does not interpret them — they travel inside
+//! `payload` as a fixed prefix ([`crate::validtime`], [STL-92]). Provenance is
+//! the opposite: always-on and first-class, never in the payload.
 //!
 //! ## Encoding
 //!
 //! [`Version::encode`] / [`Version::decode`] share one binary frame, used for
-//! both WAL records and spill files. Layout (little-endian, header is 24 B):
+//! both WAL records and spill files. Layout (little-endian, fixed header is
+//! 44 B; the three variable-length fields follow in order):
 //!
 //! ```text
-//! +----------------+----------------+-----------+-----------+----------------+--------------+
-//! | business_len:u32| payload_len:u32| sys_from:i64| sys_to:i64| business_key  | payload      |
-//! +----------------+----------------+-----------+-----------+----------------+--------------+
+//! +-----------------+----------------+------------------+------------+----------+-----------+----------------+
+//! | business_len:u32| payload_len:u32| principal_len:u32| sys_from:i64| sys_to:i64| txn_id:u64 | committed_at:i64|
+//! +-----------------+----------------+------------------+------------+----------+-----------+----------------+
+//! | business_key bytes … | payload bytes … | principal bytes … |
+//! +----------------------+-----------------+-------------------+
 //! ```
 //!
 //! No CRC here — the WAL frames its own records ([`crate::wal`]), and spill
 //! files are non-durable by design (the delta is rebuilt from WAL on crash).
 
+use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::SystemTimeMicros;
 
 use super::DeltaError;
 
-/// Header size in bytes for the [`Version`] binary encoding.
-pub(crate) const HEADER_LEN: usize = 24;
+/// Fixed header size in bytes for the [`Version`] binary encoding: three `u32`
+/// lengths (12) + `sys_from`/`sys_to`/`committed_at` `i64` (24) + `txn_id` `u64`
+/// (8).
+pub(crate) const HEADER_LEN: usize = 44;
 
 /// Per-frame ceiling for a delta-tier `Version` (16 MiB).
 ///
@@ -80,18 +94,23 @@ pub struct Version {
     pub business_key: BusinessKey,
     pub sys_from: SystemTimeMicros,
     pub sys_to: SystemTimeMicros,
+    /// Inline provenance captured at commit — invariant 5. Always present.
+    pub provenance: Provenance,
     pub payload: Vec<u8>,
 }
 
 impl Version {
     /// Number of bytes this version contributes to the delta's in-memory
     /// accounting — i.e. the size of its encoded representation. We charge the
-    /// encoded size (not just `business_key.len() + payload.len()`) so that
-    /// the same threshold value behaves consistently whether the bytes are in
+    /// encoded size (not just the variable-length field lengths) so that the
+    /// same threshold value behaves consistently whether the bytes are in
     /// memory or just-written to a spill file.
     #[must_use]
     pub fn encoded_size(&self) -> usize {
-        HEADER_LEN + self.business_key.0.len() + self.payload.len()
+        HEADER_LEN
+            + self.business_key.0.len()
+            + self.payload.len()
+            + self.provenance.principal.0.len()
     }
 
     /// Verify the version can be encoded — i.e. its component sizes fit in
@@ -101,11 +120,13 @@ impl Version {
     ///
     /// # Errors
     ///
-    /// Returns [`DeltaError::TooLarge`] when either component overflows `u32`
-    /// or the encoded frame would exceed [`MAX_VERSION_FRAME_LEN`].
+    /// Returns [`DeltaError::TooLarge`] when any variable-length component
+    /// overflows `u32` or the encoded frame would exceed
+    /// [`MAX_VERSION_FRAME_LEN`].
     pub fn check_encodable(&self) -> Result<(), DeltaError> {
         if u32::try_from(self.business_key.0.len()).is_err()
             || u32::try_from(self.payload.len()).is_err()
+            || u32::try_from(self.provenance.principal.0.len()).is_err()
         {
             return Err(DeltaError::TooLarge(self.encoded_size()));
         }
@@ -133,13 +154,19 @@ impl Version {
             .map_err(|_| DeltaError::TooLarge(self.encoded_size()))?;
         let payload_len = u32::try_from(self.payload.len())
             .map_err(|_| DeltaError::TooLarge(self.encoded_size()))?;
+        let principal_len = u32::try_from(self.provenance.principal.0.len())
+            .map_err(|_| DeltaError::TooLarge(self.encoded_size()))?;
         out.reserve(self.encoded_size());
         out.extend_from_slice(&business_len.to_le_bytes());
         out.extend_from_slice(&payload_len.to_le_bytes());
+        out.extend_from_slice(&principal_len.to_le_bytes());
         out.extend_from_slice(&self.sys_from.0.to_le_bytes());
         out.extend_from_slice(&self.sys_to.0.to_le_bytes());
+        out.extend_from_slice(&self.provenance.txn_id.0.to_le_bytes());
+        out.extend_from_slice(&self.provenance.committed_at.0.to_le_bytes());
         out.extend_from_slice(&self.business_key.0);
         out.extend_from_slice(&self.payload);
+        out.extend_from_slice(&self.provenance.principal.0);
         Ok(())
     }
 
@@ -179,19 +206,35 @@ impl Version {
                 .try_into()
                 .expect("4-byte slice always converts"),
         ) as usize;
+        let principal_len = u32::from_le_bytes(
+            bytes[8..12]
+                .try_into()
+                .expect("4-byte slice always converts"),
+        ) as usize;
         let sys_from = i64::from_le_bytes(
-            bytes[8..16]
+            bytes[12..20]
                 .try_into()
                 .expect("8-byte slice always converts"),
         );
         let sys_to = i64::from_le_bytes(
-            bytes[16..24]
+            bytes[20..28]
+                .try_into()
+                .expect("8-byte slice always converts"),
+        );
+        let txn_id = u64::from_le_bytes(
+            bytes[28..36]
+                .try_into()
+                .expect("8-byte slice always converts"),
+        );
+        let committed_at = i64::from_le_bytes(
+            bytes[36..44]
                 .try_into()
                 .expect("8-byte slice always converts"),
         );
         let total = HEADER_LEN
             .checked_add(business_len)
             .and_then(|v| v.checked_add(payload_len))
+            .and_then(|v| v.checked_add(principal_len))
             .ok_or(DeltaError::Corrupt("frame length overflows usize"))?;
         if total > MAX_VERSION_FRAME_LEN {
             return Err(DeltaError::Corrupt(
@@ -201,13 +244,23 @@ impl Version {
         if bytes.len() < total {
             return Err(DeltaError::Corrupt("frame body shorter than declared"));
         }
-        let business_key = BusinessKey(bytes[HEADER_LEN..HEADER_LEN + business_len].to_vec());
-        let payload = bytes[HEADER_LEN + business_len..total].to_vec();
+        // Body fields follow the fixed header in declaration order:
+        // business_key, then payload, then principal.
+        let bk_end = HEADER_LEN + business_len;
+        let payload_end = bk_end + payload_len;
+        let business_key = BusinessKey(bytes[HEADER_LEN..bk_end].to_vec());
+        let payload = bytes[bk_end..payload_end].to_vec();
+        let principal = Principal(bytes[payload_end..total].to_vec());
         Ok((
             Self {
                 business_key,
                 sys_from: SystemTimeMicros(sys_from),
                 sys_to: SystemTimeMicros(sys_to),
+                provenance: Provenance {
+                    txn_id: TxnId(txn_id),
+                    committed_at: SystemTimeMicros(committed_at),
+                    principal,
+                },
                 payload,
             },
             total,
@@ -225,6 +278,13 @@ mod tests {
             business_key: BusinessKey::new(key.to_vec()),
             sys_from: SystemTimeMicros(sys_from),
             sys_to: SYSTEM_TIME_OPEN,
+            // Provenance varies with sys_from so the round-trip exercises real
+            // values in every field, not a constant the codec could mishandle.
+            provenance: Provenance {
+                txn_id: TxnId(u64::try_from(sys_from).unwrap_or(0)),
+                committed_at: SystemTimeMicros(sys_from),
+                principal: Principal::new(b"tester".to_vec()),
+            },
             payload: payload.to_vec(),
         }
     }
@@ -256,9 +316,12 @@ mod tests {
 
     #[test]
     fn empty_key_and_payload_are_legal() {
-        // A zero-length business_key and payload is a degenerate but valid
-        // case — the encoding shouldn't special-case it.
-        let original = v(b"", 0, b"");
+        // A zero-length business_key, payload, *and* principal is a degenerate
+        // but valid case — the encoding shouldn't special-case it. All three
+        // variable-length fields empty means the frame is exactly the fixed
+        // header.
+        let mut original = v(b"", 0, b"");
+        original.provenance.principal = Principal::new(Vec::new());
         let bytes = original.encoded().expect("encode");
         assert_eq!(bytes.len(), HEADER_LEN);
         let (parsed, n) = Version::decode(&bytes).expect("decode");
@@ -290,6 +353,11 @@ mod tests {
             business_key: BusinessKey::new(b"k".to_vec()),
             sys_from: SystemTimeMicros(0),
             sys_to: SYSTEM_TIME_OPEN,
+            provenance: Provenance {
+                txn_id: TxnId(1),
+                committed_at: SystemTimeMicros(0),
+                principal: Principal::new(b"tester".to_vec()),
+            },
             payload: vec![0u8; MAX_VERSION_FRAME_LEN + 1],
         };
         let err = big.check_encodable().unwrap_err();

@@ -177,6 +177,10 @@ fn encode_column(col: ColumnId, rows: &[Version]) -> Result<EncodedColumn, Segme
             // zero-length "no stats" sentinel and rely on key-range pruning
             // through `BusinessKey` instead. Bounded key-shaped bytes
             // columns continue to emit lex-min/max.
+            // Key-shaped bytes columns emit lex-min/max; unbounded ones
+            // (`Payload`, and `Principal` which the txn layer sizes) emit the
+            // "no stats" sentinel to keep the footer bounded — same reasoning
+            // as `Payload`.
             let collect_stats = matches!(col, ColumnId::BusinessKey);
             let mut payload = Vec::new();
             let mut min: Option<&[u8]> = None;
@@ -225,15 +229,27 @@ fn extract_bytes(col: ColumnId, row: &Version) -> &[u8] {
     match col {
         ColumnId::BusinessKey => row.business_key.as_bytes(),
         ColumnId::Payload => &row.payload,
-        ColumnId::SysFrom | ColumnId::SysTo => unreachable!("not a bytes column"),
+        ColumnId::Principal => row.provenance.principal.as_bytes(),
+        ColumnId::SysFrom | ColumnId::SysTo | ColumnId::TxnId | ColumnId::CommittedAt => {
+            unreachable!("not a bytes column")
+        }
     }
 }
 
+// `txn_id.0 as i64` is an intentional, lossless bit reinterpretation (the
+// reader reverses it with `as u64`); the wrap is the point, not a hazard.
+#[allow(clippy::cast_possible_wrap)]
 fn extract_i64(col: ColumnId, row: &Version) -> i64 {
     match col {
         ColumnId::SysFrom => row.sys_from.0,
         ColumnId::SysTo => row.sys_to.0,
-        ColumnId::BusinessKey | ColumnId::Payload => unreachable!("not an i64 column"),
+        // `txn_id` is a u64; store its bits in the i64 column (lossless
+        // round-trip — see `ColumnId::TxnId`).
+        ColumnId::TxnId => row.provenance.txn_id.0 as i64,
+        ColumnId::CommittedAt => row.provenance.committed_at.0,
+        ColumnId::BusinessKey | ColumnId::Payload | ColumnId::Principal => {
+            unreachable!("not an i64 column")
+        }
     }
 }
 

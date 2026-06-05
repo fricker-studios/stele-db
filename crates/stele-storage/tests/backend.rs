@@ -15,6 +15,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
 use stele_storage::backend::{Disk, DiskFile, FaultOp, Faults, LocalDisk, MemDisk};
 use stele_storage::delta::{BusinessKey, Version};
@@ -156,18 +157,33 @@ fn sample_versions() -> Vec<Version> {
             business_key: BusinessKey::new(b"a".to_vec()),
             sys_from: SystemTimeMicros(10),
             sys_to: SystemTimeMicros(20),
+            provenance: Provenance::new(
+                TxnId(10),
+                SystemTimeMicros(10),
+                Principal::new(b"svc".to_vec()),
+            ),
             payload: b"a-v0".to_vec(),
         },
         Version {
             business_key: BusinessKey::new(b"a".to_vec()),
             sys_from: SystemTimeMicros(20),
             sys_to: SYSTEM_TIME_OPEN,
+            provenance: Provenance::new(
+                TxnId(20),
+                SystemTimeMicros(20),
+                Principal::new(b"svc".to_vec()),
+            ),
             payload: b"a-v1".to_vec(),
         },
         Version {
             business_key: BusinessKey::new(b"big".to_vec()),
             sys_from: SystemTimeMicros(1),
             sys_to: SYSTEM_TIME_OPEN,
+            provenance: Provenance::new(
+                TxnId(1),
+                SystemTimeMicros(1),
+                Principal::new(b"svc".to_vec()),
+            ),
             payload: blob,
         },
     ]

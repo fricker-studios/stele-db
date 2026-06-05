@@ -27,10 +27,17 @@ use std::io;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use stele_common::provenance::{Principal, TxnId};
 use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
 use stele_storage::systime::{SysTimeError, SysTimeWriter};
 use stele_storage::wal::{Disk, DiskFile};
+
+/// A throwaway principal for write-path tests that don't themselves assert on
+/// provenance values (the provenance round-trip is covered in `provenance.rs`).
+fn who() -> Principal {
+    Principal::new(b"tester".to_vec())
+}
 
 // --- MemDisk: minimal in-memory Disk for tests ------------------------------
 
@@ -186,12 +193,24 @@ fn insert_then_update_leaves_one_closed_and_one_open_version() {
     let key = BusinessKey::new(b"acct-42".to_vec());
 
     let c0 = writer
-        .insert(&mut delta, key.clone(), b"balance=100".to_vec())
+        .insert(
+            &mut delta,
+            key.clone(),
+            b"balance=100".to_vec(),
+            TxnId(10),
+            Principal::new(b"writer-a".to_vec()),
+        )
         .unwrap();
     // Move the clock forward for the update's commit timestamp.
     clock.set(2_000);
     let c1 = writer
-        .update(&mut delta, key.clone(), b"balance=150".to_vec())
+        .update(
+            &mut delta,
+            key.clone(),
+            b"balance=150".to_vec(),
+            TxnId(20),
+            Principal::new(b"writer-b".to_vec()),
+        )
         .unwrap();
 
     assert!(c0 < c1, "the update's commit must be after the insert's");
@@ -211,11 +230,26 @@ fn insert_then_update_leaves_one_closed_and_one_open_version() {
         closed.sys_to, SYSTEM_TIME_OPEN,
         "prior period must be closed"
     );
+    // Closing the prior period must not rewrite its provenance: it keeps the
+    // insert's txn/principal and committed_at = its own sys_from (c0).
+    assert_eq!(closed.provenance.txn_id, TxnId(10));
+    assert_eq!(
+        closed.provenance.principal,
+        Principal::new(b"writer-a".to_vec())
+    );
+    assert_eq!(closed.provenance.committed_at, c0);
 
     // Second version: opened at c1, still current.
     assert_eq!(open.sys_from, c1);
     assert_eq!(open.sys_to, SYSTEM_TIME_OPEN, "current period stays open");
     assert_eq!(open.payload, b"balance=150");
+    // The new version carries the update's provenance, committed_at = c1.
+    assert_eq!(open.provenance.txn_id, TxnId(20));
+    assert_eq!(
+        open.provenance.principal,
+        Principal::new(b"writer-b".to_vec())
+    );
+    assert_eq!(open.provenance.committed_at, c1);
 
     // The close abuts the new open — no gap, no overlap.
     assert_eq!(closed.sys_to, open.sys_from);
@@ -228,10 +262,10 @@ fn insert_on_a_live_key_is_rejected() {
     let key = BusinessKey::new(b"dup".to_vec());
 
     writer
-        .insert(&mut delta, key.clone(), b"first".to_vec())
+        .insert(&mut delta, key.clone(), b"first".to_vec(), TxnId(1), who())
         .unwrap();
     let err = writer
-        .insert(&mut delta, key, b"second".to_vec())
+        .insert(&mut delta, key, b"second".to_vec(), TxnId(2), who())
         .unwrap_err();
     assert!(matches!(err, SysTimeError::KeyExists));
 }
@@ -244,7 +278,7 @@ fn update_or_delete_without_a_live_version_is_rejected() {
 
     assert!(matches!(
         writer
-            .update(&mut delta, key.clone(), b"x".to_vec())
+            .update(&mut delta, key.clone(), b"x".to_vec(), TxnId(1), who())
             .unwrap_err(),
         SysTimeError::KeyNotFound
     ));
@@ -262,7 +296,7 @@ fn delete_closes_the_live_period_and_leaves_no_open_version() {
     let key = BusinessKey::new(b"k".to_vec());
 
     writer
-        .insert(&mut delta, key.clone(), b"v".to_vec())
+        .insert(&mut delta, key.clone(), b"v".to_vec(), TxnId(1), who())
         .unwrap();
     let closed_at = writer.delete(&mut delta, &key).unwrap();
 
@@ -287,13 +321,13 @@ fn reinsert_after_delete_opens_a_new_period_with_a_gap() {
     let key = BusinessKey::new(b"k".to_vec());
 
     writer
-        .insert(&mut delta, key.clone(), b"a".to_vec())
+        .insert(&mut delta, key.clone(), b"a".to_vec(), TxnId(1), who())
         .unwrap();
     clock.set(200);
     let deleted_at = writer.delete(&mut delta, &key).unwrap();
     clock.set(300);
     let reopened_at = writer
-        .insert(&mut delta, key.clone(), b"b".to_vec())
+        .insert(&mut delta, key.clone(), b"b".to_vec(), TxnId(2), who())
         .unwrap();
 
     let mut chains = drain_chains(&mut delta);
@@ -331,7 +365,7 @@ fn version_chains_are_non_overlapping_and_gap_free_under_seed_sweep() {
         let mut live: Vec<bool> = vec![false; KEY_POOL as usize];
 
         let ops = 30 + rng.range(40);
-        for _ in 0..ops {
+        for op in 0..ops {
             // Drive the clock adversarially: sometimes forward, sometimes flat,
             // sometimes backwards. The writer's monotonic guard must absorb it.
             let jitter = rng.next_u64() % 7;
@@ -342,11 +376,12 @@ fn version_chains_are_non_overlapping_and_gap_free_under_seed_sweep() {
             let key_idx = rng.range(KEY_POOL) as usize;
             let key = BusinessKey::new(vec![b'k', key_idx as u8]);
             let payload = format!("s{seed}-k{key_idx}").into_bytes();
+            let txn = TxnId(op);
 
             if live[key_idx] {
-                writer.update(&mut delta, key, payload).unwrap();
+                writer.update(&mut delta, key, payload, txn, who()).unwrap();
             } else {
-                writer.insert(&mut delta, key, payload).unwrap();
+                writer.insert(&mut delta, key, payload, txn, who()).unwrap();
                 live[key_idx] = true;
             }
         }

@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
 use stele_storage::delta::{BusinessKey, Snapshot, Version};
 use stele_storage::segment::{ColumnId, Predicate, SegmentReader, SegmentWriter, ZoneBound};
@@ -136,6 +137,11 @@ fn version(key: &[u8], sys_from: i64, sys_to: i64, payload: &[u8]) -> Version {
         business_key: BusinessKey::new(key.to_vec()),
         sys_from: SystemTimeMicros(sys_from),
         sys_to: SystemTimeMicros(sys_to),
+        provenance: Provenance::new(
+            TxnId(u64::try_from(sys_from).unwrap_or(0)),
+            SystemTimeMicros(sys_from),
+            Principal::new(format!("svc-{sys_from}").into_bytes()),
+        ),
         payload: payload.to_vec(),
     }
 }

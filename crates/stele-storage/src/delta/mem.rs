@@ -114,6 +114,7 @@ fn live_version_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stele_common::provenance::{Principal, Provenance, TxnId};
     use stele_common::time::SYSTEM_TIME_OPEN;
 
     fn v(key: &[u8], sys_from: i64, sys_to: SystemTimeMicros, payload: &[u8]) -> Version {
@@ -121,6 +122,11 @@ mod tests {
             business_key: BusinessKey::new(key.to_vec()),
             sys_from: SystemTimeMicros(sys_from),
             sys_to,
+            provenance: Provenance::new(
+                TxnId(u64::try_from(sys_from).unwrap_or(0)),
+                SystemTimeMicros(sys_from),
+                Principal::new(b"tester".to_vec()),
+            ),
             payload: payload.to_vec(),
         }
     }

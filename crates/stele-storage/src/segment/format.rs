@@ -16,7 +16,17 @@ pub(super) const TRAILER_MAGIC: [u8; 8] = *b"STLSEGFT";
 /// On-disk format version embedded in the header. Bump on any
 /// backwards-incompatible layout change; readers refuse newer versions
 /// outright.
-pub(super) const FORMAT_VERSION: u16 = 1;
+///
+/// * **v1** — the four-column implicit `Version` schema (business_key, sys_from,
+///   sys_to, payload).
+/// * **v2** — adds the three always-on provenance columns (`txn_id`,
+///   `committed_at`, `principal`), ids 4..=6 ([STL-93]). This is a
+///   backwards-incompatible layout change: a v1 reader encountering the new
+///   column ids would fail with a confusing `Corrupt("unknown column id")`
+///   mid-footer, so the version bump makes a v1 reader reject a v2 segment
+///   cleanly at the header with [`SegmentError::UnsupportedVersion`](super::SegmentError::UnsupportedVersion)
+///   instead.
+pub(super) const FORMAT_VERSION: u16 = 2;
 
 /// Header size in bytes — magic (8) + version (2) + flags (2) + reserved (4).
 pub(super) const HEADER_LEN: usize = 16;
@@ -30,10 +40,12 @@ pub(super) const CHUNK_HEADER_LEN: usize = 16;
 
 /// Logical schema id stored in the footer.
 ///
-/// v0.1 has exactly one implicit schema — the four `Version` fields — so the
-/// id is hard-coded. Once [STL-98] lands the versioned catalog, this becomes a
-/// real schema reference resolved through the catalog at read time; the
-/// footer field is wide enough already that no format change is needed.
+/// v0.1 has exactly one implicit schema — the seven `Version` columns (the four
+/// data/temporal fields plus the three provenance columns, [`FORMAT_VERSION`]
+/// v2) — so the id is hard-coded. Once [STL-98] lands the versioned catalog,
+/// this becomes a real schema reference resolved through the catalog at read
+/// time; the footer field is wide enough already that no format change is
+/// needed.
 pub(super) const SCHEMA_ID_IMPLICIT_VERSION: u32 = 0;
 
 /// Column codecs the format can describe. v0.1 emits [`Codec::Plain`]; the
@@ -75,6 +87,19 @@ pub enum ColumnId {
     SysTo = 2,
     /// Opaque payload bytes (variable-length).
     Payload = 3,
+    /// Provenance: writing transaction id (fixed 8 bytes). Stored in the `i64`
+    /// column layout — `txn_id` is logically a `u64`
+    /// ([`stele_common::provenance::TxnId`]); the writer reinterprets the bits
+    /// (`u64 as i64`) and the reader reverses it (`i64 as u64`), a lossless
+    /// round-trip. Only the zone-map ordering would differ for ids ≥ 2^63,
+    /// unreachable for the same reason the system-time `i64` axis is.
+    TxnId = 4,
+    /// Provenance: commit timestamp (fixed `i64`, microseconds) —
+    /// [`stele_common::provenance::Provenance::committed_at`].
+    CommittedAt = 5,
+    /// Provenance: opaque principal bytes (variable-length) —
+    /// [`stele_common::provenance::Principal`].
+    Principal = 6,
 }
 
 impl ColumnId {
@@ -83,12 +108,24 @@ impl ColumnId {
     /// a single source of truth for the column set — adding a column here
     /// flows into both writer/reader and every test that iterates the
     /// schema, no shadow constants left to drift.
-    pub const ALL: [Self; 4] = [Self::BusinessKey, Self::SysFrom, Self::SysTo, Self::Payload];
+    ///
+    /// The three provenance columns ([`Self::TxnId`], [`Self::CommittedAt`],
+    /// [`Self::Principal`]) sit at the end — additions never renumber the
+    /// frozen ids 0..=3 ([architecture §3.2](../../../../../docs/02-architecture.md#32-on-disk-segment-format)).
+    pub const ALL: [Self; 7] = [
+        Self::BusinessKey,
+        Self::SysFrom,
+        Self::SysTo,
+        Self::Payload,
+        Self::TxnId,
+        Self::CommittedAt,
+        Self::Principal,
+    ];
 
     pub(super) const fn ty(self) -> ColumnType {
         match self {
-            Self::BusinessKey | Self::Payload => ColumnType::Bytes,
-            Self::SysFrom | Self::SysTo => ColumnType::I64,
+            Self::BusinessKey | Self::Payload | Self::Principal => ColumnType::Bytes,
+            Self::SysFrom | Self::SysTo | Self::TxnId | Self::CommittedAt => ColumnType::I64,
         }
     }
 
@@ -98,6 +135,9 @@ impl ColumnId {
             1 => Some(Self::SysFrom),
             2 => Some(Self::SysTo),
             3 => Some(Self::Payload),
+            4 => Some(Self::TxnId),
+            5 => Some(Self::CommittedAt),
+            6 => Some(Self::Principal),
             _ => None,
         }
     }

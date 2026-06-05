@@ -31,8 +31,13 @@
 //! layout is schema-driven rather than self-describing — the reader knows the
 //! schema, so the bytes need carry no tag. A future segment writer can lift the
 //! prefix into real `valid_from` / `valid_to` columns for zone-map pruning (the
-//! [`crate::segment`] zone maps already handle them generically); the provenance
-//! section of [STL-93] layers onto the same stored payload.
+//! [`crate::segment`] zone maps already handle them generically).
+//!
+//! Provenance ([STL-93]) is *not* in the payload: unlike valid-time it is
+//! always-on and first-class, carried as dedicated [`Version`](crate::delta::Version)
+//! fields and segment columns. [`ValidTimeWriter`] simply forwards the caller's
+//! `txn_id` / `principal` down to the system-time writer, which stamps them at
+//! commit.
 //!
 //! ## What this is *not*
 //!
@@ -50,6 +55,7 @@
 //! w.insert(&mut delta, key.clone(), Some(v), b"salary=100".to_vec())?;
 //! ```
 
+use stele_common::provenance::{Principal, TxnId};
 use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
 
 use crate::delta::{BusinessKey, Delta};
@@ -259,9 +265,11 @@ impl<C: Clock> ValidTimeWriter<C> {
         key: BusinessKey,
         valid: Option<ValidInterval>,
         payload: Vec<u8>,
+        txn_id: TxnId,
+        principal: Principal,
     ) -> Result<SystemTimeMicros, ValidTimeError> {
         let framed = frame_payload(self.valid_time, valid, payload)?;
-        Ok(self.inner.insert(delta, key, framed)?)
+        Ok(self.inner.insert(delta, key, framed, txn_id, principal)?)
     }
 
     /// Supersede the live version of `key`: close the prior system-time period
@@ -281,9 +289,11 @@ impl<C: Clock> ValidTimeWriter<C> {
         key: BusinessKey,
         valid: Option<ValidInterval>,
         payload: Vec<u8>,
+        txn_id: TxnId,
+        principal: Principal,
     ) -> Result<SystemTimeMicros, ValidTimeError> {
         let framed = frame_payload(self.valid_time, valid, payload)?;
-        Ok(self.inner.update(delta, key, framed)?)
+        Ok(self.inner.update(delta, key, framed, txn_id, principal)?)
     }
 
     /// Close the live version of `key` on the system axis without re-opening — a

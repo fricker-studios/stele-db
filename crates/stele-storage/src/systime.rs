@@ -10,9 +10,15 @@
 //! before staging rows into the delta tier
 //! ([architecture §3.4](../../../docs/02-architecture.md#34-write-path-sequence)):
 //!
-//! * **`sys_from` is stamped, never supplied.** A writer hands over a key and a
-//!   payload; [`SysTimeWriter`] sets `sys_from` to the transaction's commit
-//!   timestamp. There is no API that lets a caller choose it.
+//! * **`sys_from` is stamped, never supplied.** A writer hands over a key, a
+//!   payload, and the commit's provenance (`txn_id` + `principal`);
+//!   [`SysTimeWriter`] sets `sys_from` to the transaction's commit timestamp.
+//!   There is no API that lets a caller choose it. `committed_at` is stamped the
+//!   same way (it equals `sys_from` on this path); `txn_id` and `principal` are
+//!   the caller's to supply — the transaction manager hands them down at commit
+//!   ([architecture §8](../../../docs/02-architecture.md#8-lineage--provenance-subsystem),
+//!   invariant 5). Provenance is stored inline on the version, never
+//!   reconstructed.
 //! * **Updates close the prior period.** An [`SysTimeWriter::update`] writes a
 //!   new open version *and* a logical close on the previous version's `sys_to`
 //!   (it abuts: the old period ends exactly where the new one begins). A
@@ -51,6 +57,7 @@
 //! // delta now holds two versions for `key`: [c0, c1) and [c1, +∞).
 //! ```
 
+use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros};
 
 use crate::delta::{BusinessKey, Delta, Snapshot, Version};
@@ -127,12 +134,14 @@ impl<C: Clock> SysTimeWriter<C> {
         delta: &mut Delta<D>,
         key: BusinessKey,
         payload: Vec<u8>,
+        txn_id: TxnId,
+        principal: Principal,
     ) -> Result<SystemTimeMicros, SysTimeError> {
         let commit = self.next_commit_ts()?;
         if current_open(delta, &key, commit)?.is_some() {
             return Err(SysTimeError::KeyExists);
         }
-        delta.insert(open_version(key, commit, payload))?;
+        delta.insert(open_version(key, commit, payload, txn_id, principal))?;
         Ok(commit)
     }
 
@@ -151,10 +160,12 @@ impl<C: Clock> SysTimeWriter<C> {
         delta: &mut Delta<D>,
         key: BusinessKey,
         payload: Vec<u8>,
+        txn_id: TxnId,
+        principal: Principal,
     ) -> Result<SystemTimeMicros, SysTimeError> {
         let commit = self.next_commit_ts()?;
         close_prior(delta, &key, commit)?;
-        delta.insert(open_version(key, commit, payload))?;
+        delta.insert(open_version(key, commit, payload, txn_id, principal))?;
         Ok(commit)
     }
 
@@ -207,6 +218,11 @@ impl<C: Clock> SysTimeWriter<C> {
 /// `sys_to = commit`. Re-inserting the same `(business_key, sys_from)` is the
 /// delta tier's idempotent replace, so this updates the period end in place
 /// rather than appending a duplicate.
+///
+/// The prior version's **provenance is preserved untouched**: closing a period
+/// is bookkeeping by the superseding transaction, not a rewrite of who wrote
+/// the closed version. Only `sys_to` changes; `txn_id` / `committed_at` /
+/// `principal` keep their birth values.
 fn close_prior<D: Disk>(
     delta: &mut Delta<D>,
     key: &BusinessKey,
@@ -218,12 +234,23 @@ fn close_prior<D: Disk>(
     Ok(())
 }
 
-/// Build an open version `[commit, +∞)` for `key`.
-const fn open_version(key: BusinessKey, commit: SystemTimeMicros, payload: Vec<u8>) -> Version {
+/// Build an open version `[commit, +∞)` for `key`, stamping provenance.
+///
+/// `committed_at` is set to `commit` — the writer stamps it exactly as it
+/// stamps `sys_from`. `txn_id` and `principal` come from the caller (the
+/// transaction manager), per [architecture §8](../../../docs/02-architecture.md#8-lineage--provenance-subsystem).
+const fn open_version(
+    key: BusinessKey,
+    commit: SystemTimeMicros,
+    payload: Vec<u8>,
+    txn_id: TxnId,
+    principal: Principal,
+) -> Version {
     Version {
         business_key: key,
         sys_from: commit,
         sys_to: SYSTEM_TIME_OPEN,
+        provenance: Provenance::new(txn_id, commit, principal),
         payload,
     }
 }

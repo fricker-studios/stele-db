@@ -10,6 +10,7 @@
 //! enforced here by keeping this crate `no_std`-friendly in spirit (we still link
 //! `std`, but avoid `tokio`, file I/O, and global state).
 
+pub mod provenance;
 pub mod time;
 
 /// Stele's default Postgres-wire listen port ([ADR-0017](../../../docs/adr/0017-default-network-port-5454.md)).

@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 
+use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
 use stele_storage::wal::{Checkpoint, Disk, DiskFile, Wal, WalConfig};
@@ -120,6 +121,13 @@ fn version(key: &[u8], sys_from: i64, sys_to: SystemTimeMicros, payload: &[u8]) 
         business_key: BusinessKey::new(key.to_vec()),
         sys_from: SystemTimeMicros(sys_from),
         sys_to,
+        // Provenance tracks sys_from so the crash-replay sweep round-trips real
+        // provenance bytes through encode/decode, not a constant.
+        provenance: Provenance::new(
+            TxnId(u64::try_from(sys_from).unwrap_or(0)),
+            SystemTimeMicros(sys_from),
+            Principal::new(format!("svc-{sys_from}").into_bytes()),
+        ),
         payload: payload.to_vec(),
     }
 }
