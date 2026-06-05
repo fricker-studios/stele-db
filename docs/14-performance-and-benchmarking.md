@@ -38,8 +38,8 @@ Before any timing is recorded, a benchmark **asserts its result is correct** (ag
 ## 4. Methodology principles
 
 1. **Reproducible.** Pinned hardware spec, pinned engine version ([ADR-0005](adr/0005-reproducible-builds-pinned-toolchain.md)), and the **full config published** alongside every result. Anyone can re-run it.
-2. **Representative data.** Real-shaped datasets and query mixes, including temporal/historical depth — not toy tables that flatter the engine.
-3. **Distributions, not averages.** Report **p50 / p95 / p99 (and max)**, throughput, *and* variance across runs. A mean alone hides tail latency.
+2. **Representative data — skewed, not uniform.** Real-shaped datasets with temporal depth: **Zipfian** key + version-depth skew (a few keys with thousands of revisions), the **entities×versions** axis (1M keys × 1000 versions ≠ 1B × 1), month-end bursts, and **steady-state runs long enough that compaction kicks in mid-benchmark**. Benchmark on the **substrate you deploy on** (cloud object storage ≠ local NVMe). Adapt **TPC-H/TPC-DS** with as-of predicates and use **TPC-BiH** bitemporal patterns.
+3. **Distributions, measured right.** Report **p50 / p90 / p99 / p99.9 / max** via **HdrHistogram**, plus throughput and cross-run variance. Use **open-loop** load generation (wrk2 / Gatling open model / YCSB intended-rate) to avoid **coordinated omission**, which understates tail latency 10–100× under saturation. Report **visibility lag** (submit→queryable) as an SLA. A mean alone is marketing.
 4. **Warm vs cold disclosed.** Cache state, tier placement (hot/cold/[frozen](adr/0021-storage-lifecycle-tiered-archival.md)), and whether a [restore](adr/0021-storage-lifecycle-tiered-archival.md) was involved are always stated.
 5. **Apples-to-apples.** Comparisons run competitors on the **same hardware** with **reasonable, documented** tuning — never a strawman config for the other system.
 6. **Open harness.** The benchmark code and configs are source-available ([BSL](07-licensing-and-oss.md)) so results are auditable, not asserted.

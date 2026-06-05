@@ -30,6 +30,10 @@ Use the [template](_template.md) for new records. Number sequentially.
 | [0020](0020-crypto-shredding-erasure.md) | Right-to-erasure & data-lifecycle: layered (namespace-drop + crypto-shredding) | Accepted |
 | [0021](0021-storage-lifecycle-tiered-archival.md) | Storage lifecycle: system-time-driven tiered archival | Accepted |
 | [0022](0022-clock-synchronization-and-ordering.md) | Clock synchronization & cross-node time ordering (NTP + HLC + fencing) | Accepted |
+| [0023](0023-append-only-record-model-validity-index.md) | Append-only record model: derived validity index (no stored `sys_to`) | Accepted |
+| [0024](0024-time-representation.md) | Time representation: µs / int64 / +∞ sentinel / sequence | Accepted |
+| [0025](0025-valid-time-indexing.md) | Valid-time indexing & the scatter problem | Accepted |
+| [0026](0026-verifiable-audit-log.md) | Verifiable audit log (hash-chain + Merkle proofs) | Accepted |
 
 ## Conventions
 

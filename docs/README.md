@@ -26,10 +26,11 @@ This `/docs` set is the **single source of truth** for the project's vision, arc
 | 13 | [**Glossary**](13-glossary.md) | Plain-language definitions of every key term, cross-linked to the owning docs. |
 | 14 | [**Performance & Benchmarking**](14-performance-and-benchmarking.md) | The asymmetric contract; what we benchmark; correctness-gated, reproducible, no-cherry-picking methodology; the do-not-regress gate; cost-performance; claims policy. |
 | 15 | [**Commercialization & Sustainability**](15-commercialization-and-sustainability.md) | Directional & light: open-core model; what's always free; possible revenue avenues; the Solvia long-game; anti-rug-pull commitments. |
+| 16 | [**Bitemporal Semantics**](16-bitemporal-semantics.md) | The formal spec every test checks against: visibility function, half-open + `+∞` rules, tie-break, coalescing, what's enforced vs punted. |
 
 ## Supporting material
 
-- [**Architecture Decision Records**](adr/README.md) — one record per significant decision (Context / Decision / Status / Consequences). Twenty-two ADRs to date.
+- [**Architecture Decision Records**](adr/README.md) — one record per significant decision (Context / Decision / Status / Consequences). Twenty-six ADRs to date.
 - [**Assumptions log**](assumptions.md) — the running ledger of what was decided on faith, and the open questions.
 
 ## The thesis in four SQL statements
@@ -72,6 +73,10 @@ SELECT balance FROM account FOR SYSTEM_TIME AS OF (now() - interval '1 second') 
 | Tenancy | **Namespaces** as first-class isolation + lifecycle units (per-namespace keys, audited drop); app maps tenant→namespace | [0020](adr/0020-crypto-shredding-erasure.md) · [0009](adr/0009-data-vault-conceptual-seam.md) |
 | Storage lifecycle | **System-time-driven tiered archival** (hot→Standard→Glacier), keeps all data; async restore; engine-native | [0021](adr/0021-storage-lifecycle-tiered-archival.md) |
 | Clocks (distributed) | **NTP required** + **Hybrid Logical Clocks** + max-skew self-fencing; PTP/cloud-time-sync optional | [0022](adr/0022-clock-synchronization-and-ordering.md) |
+| Record model | **No stored `sys_to`** — derived, rebuildable validity index; true append-only | [0023](adr/0023-append-only-record-model-validity-index.md) |
+| Time | **µs / int64 / +∞ sentinel / per-commit sequence** (no 2262 cliff) | [0024](adr/0024-time-representation.md) |
+| Valid-time pruning | **Dedicated index** (zone maps prune system-time only; valid-time scatters) | [0025](adr/0025-valid-time-indexing.md) |
+| Tamper-evidence | **Headline pillar:** hash-chain ~v0.2, Merkle proofs ~v0.5, third-party-verifiable | [0026](adr/0026-verifiable-audit-log.md) |
 
 ---
 

@@ -86,24 +86,33 @@ flowchart TB
 
 This is the conceptual heart. Every logical row is a **chain of versions**, each tagged on two independent time axes.
 
-- **System time** `[sys_from, sys_to)` — when the *database* held this version. Always present. Set by the committing transaction. Half-open intervals; `sys_to = +∞` (a sentinel "until changed") for the current version.
+- **System time** `[sys_from, sys_to)` — when the *database* held this version. Always present; set by the committing transaction. Half-open. **`sys_to` is not stored on the record** — it is *derived* (the next version's `sys_from`, or `+∞` for the current version) and materialized **once** into the validity index ([ADR-0023](adr/0023-append-only-record-model-validity-index.md)). Times are µs/int64 with a `+∞` sentinel and a per-commit `seq` tiebreak ([ADR-0024](adr/0024-time-representation.md)).
 - **Valid time** `[valid_from, valid_to)` — when the fact is *true in the modeled world*. Per-table opt-in. Supplied by the writer.
+- **Decision/knowledge time** — a third axis is *reserved but off by default*; the record + catalog shape leave room to add it later with no re-architecting ([assumption A2'](assumptions.md)).
 
 ```mermaid
 erDiagram
     LOGICAL_ROW ||--o{ VERSION : "has history of"
+    VERSION ||--o| VALIDITY_INDEX : "sys_to materialized once into"
     VERSION {
         bytes  business_key      "user/PK or hash key"
         ts     sys_from          "system-time start (commit)"
-        ts     sys_to            "system-time end (+inf if current)"
         ts     valid_from        "valid-time start (opt-in)"
         ts     valid_to          "valid-time end (opt-in)"
+        u64    seq               "per-commit total-order tiebreak"
         u64    txn_id            "writing transaction"
         ts     committed_at      "commit timestamp"
         text   principal         "who/what wrote it"
         bytes  payload           "the column values"
     }
+    VALIDITY_INDEX {
+        bytes  business_key      "key"
+        ts     sys_from          "the version this closes"
+        ts     sys_to            "DERIVED, written once (never on the record)"
+    }
 ```
+
+> **No stored `sys_to`.** Version records are append-only and never mutated; a version's system-time end lives only in the *derived, rebuildable* validity index, written once when the superseding assertion commits ([ADR-0023](adr/0023-append-only-record-model-validity-index.md)). This is what makes the append-only / tamper-evidence claims hold under scrutiny.
 
 A **bitemporal query** picks a point (or range) on each axis. "As we believed on 2026-01-31 (system), about the state of the world on 2026-01-15 (valid)" selects, per business key, the version whose `sys` interval contains 2026-01-31 *and* whose `valid` interval contains 2026-01-15.
 
@@ -307,6 +316,8 @@ The catalog also exposes **`pg_catalog`/`information_schema` shims** so the Post
 
 **Namespaces as isolation + lifecycle units.** Schemas/namespaces are a first-class boundary: each can carry its own [encryption key, residency, and access policy](10-security-and-compliance.md#9-hardening--operational-security), and supports an **audited drop** that decommissions a whole namespace as a clean break — the basis for tenant offboarding and [namespace-drop erasure](10-security-and-compliance.md#the-append-only-vs-right-to-erasure-tension-handled-not-hand-waved). This is a *general* tenancy primitive: the app (e.g., Solvia) maps tenants to namespaces; the engine never knows what a tenant *is* ([ADR-0009](adr/0009-data-vault-conceptual-seam.md), [ADR-0020](adr/0020-crypto-shredding-erasure.md)).
 
+**Manifest/catalog scalability is a first-class concern.** In append-only, object-tiered systems the **catalog/manifest usually becomes the bottleneck before the data layer does** (the Hive-metastore / early-Iceberg lesson): millions of segment/manifest entries make catalog queries and commit times the limiter. The catalog is designed for this — compact, incrementally-snapshotted manifest state, with catalog query latency and commit time tracked as file count grows ([06](06-testing-strategy.md), [14](14-performance-and-benchmarking.md)).
+
 ---
 
 ## 6. Query layer
@@ -425,7 +436,7 @@ flowchart TB
     obj -. "immutability ⇒ trivially shareable<br/>across readers" .-> computeN
 ```
 
-Why this shape: immutable segments mean **read scale-out is nearly free** (any node can read any cached segment with no coherence protocol). The hard part — and what Raft solves — is agreeing on *which segments are current* (the manifest) and coordinating commit order. Consistency for this phase is validated with **Jepsen-style testing before any multi-node production claim** ([06](06-testing-strategy.md), Charter §8).
+Why this shape: immutable segments mean **read scale-out is nearly free** (any node can read any cached segment with no coherence protocol). The hard part — and what Raft solves — is agreeing on *which segments are current* (the manifest) and coordinating commit order. Consistency for this phase is validated with **Jepsen-style testing before any multi-node production claim** ([06](06-testing-strategy.md), Charter §8). **Stele is CP:** under a network partition it **rejects writes rather than accept-and-reconcile divergent histories** — audit integrity is chosen over availability, because reconciling conflicting system-time histories would corrupt the audit record ([ADR-0006](adr/0006-distribution-later-shared-storage.md)).
 
 **Data distribution & co-location.** Within this shape, a table may declare a **distribution key** — typically a [stable hash key](01-feature-plan.md#a5--hash-keys--mergeupsert) — and rows partition across nodes by its hash; frequently-joined tables can be **co-located** (co-partitioned on the same key) so those joins stay node-local with no shuffle. These are generic sharded-analytics primitives, but they are deliberately part of the [integration groundwork](adr/0011-hash-distribution-integration-groundwork.md) ([ADR-0011](adr/0011-hash-distribution-integration-groundwork.md)): they make hash-keyed models — Data Vault among them — distribute and join cleanly, while the engine stays ignorant of what a hub or satellite is ([ADR-0009](adr/0009-data-vault-conceptual-seam.md)).
 
@@ -498,5 +509,8 @@ These are test-enforced ([06](06-testing-strategy.md)) and amendable only via AD
 6. **The columnstore is correct without any secondary index.** Indexes are accelerators only.
 7. **The storage/txn core is deterministic** and runnable under the simulation scheduler.
 8. **History within a dataset is immutable; a whole namespace has a lifecycle.** Sealed segments are never rewritten (invariant 1), but creating and *dropping* an entire namespace is a legitimate, audited, coarse operation — a drop is implemented as destroying the namespace's key, not mutating segments ([ADR-0020](adr/0020-crypto-shredding-erasure.md)).
+9. **`sys_to` is never stored on a record.** The append-only log is the source of truth; a version's system-time end lives only in the *derived, rebuildable* validity index ([ADR-0023](adr/0023-append-only-record-model-validity-index.md)).
+10. **The commit log is hash-chained and verifiable.** Tampering with any historical record is detectable; an auditor can verify inclusion/consistency without trusting the operator ([ADR-0026](adr/0026-verifiable-audit-log.md)).
+11. **Distributed Stele is CP.** Writes are rejected under partition; divergent histories are never reconciled ([ADR-0006](adr/0006-distribution-later-shared-storage.md)).
 
 Each box in the diagrams above traces to an [ADR](adr/README.md); each ADR traces back to the [Charter](00-charter.md).

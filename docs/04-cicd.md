@@ -63,6 +63,7 @@ These **must** be green to merge into `main`:
 | **Deterministic simulation** | `stele-sim` long-seed runs ([06](06-testing-strategy.md)) |
 | **Benchmark regression** | `criterion` + a stored baseline gate |
 | **Crash/recovery** | sim-driven kill-and-recover suites |
+| **Cross-version reproducibility** | replay archived data + queries against the new build; assert **byte-identical** as-of results (release gate — [06 §10](06-testing-strategy.md#10-bitemporal-specific-test-additions-considerations-review)) |
 
 ---
 

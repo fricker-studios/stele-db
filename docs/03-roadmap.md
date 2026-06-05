@@ -42,6 +42,7 @@ Each milestone has an **exit criterion** — the thing that must be *true and te
 - **Minimal pg-wire (simple query):** `psql` connects and runs `CREATE`/`INSERT`/`SELECT`.
 - `stele` CLI seed; structured logging.
 - Deterministic simulation harness scaffolding ([06](06-testing-strategy.md)) — even thin, it starts here.
+- **Formal [bitemporal semantics spec](16-bitemporal-semantics.md)** written first; append-only record model with a **derived validity index** (no stored `sys_to`, [ADR-0023](adr/0023-append-only-record-model-validity-index.md)); µs/`+∞` time ([ADR-0024](adr/0024-time-representation.md)).
 
 > **Exit criterion:** from a clean clone, a contributor can start the engine, connect with `psql`, insert rows, *update one*, and run an `AS OF` query that returns the **pre-update** value — and a kill-during-write test recovers to a consistent state. The identity is demonstrable.
 
@@ -52,13 +53,14 @@ Each milestone has an **exit criterion** — the thing that must be *true and te
 - **Per-row provenance** (who/what/when), inline.
 - **Hash keys**; pg-wire **extended query** (prepared statements) so drivers work.
 - Immutable-segment invariant test-enforced.
+- **Hash-chained commit log** — tamper-evidence from day one ([ADR-0026](adr/0026-verifiable-audit-log.md)).
 
 > **Exit criterion:** a bitemporal `AS OF (system, valid)`-shaped workload returns provably correct results under the [correctness oracle](06-testing-strategy.md), and a JDBC/psycopg driver can run a parameterized query.
 
 ### v0.3 — Historization, indexing, and operability
 - **Temporal `MERGE`/upsert** + bulk ingest (`COPY`).
 - Bitemporal `AS OF` joins; subqueries/CTEs; `EXPLAIN ANALYZE`.
-- **B-tree / hash / bloom** secondary indexes (adequate point access).
+- **B-tree / hash / bloom** secondary indexes (adequate point access); **valid-time index** for scatter-resistant pruning ([ADR-0025](adr/0025-valid-time-indexing.md)).
 - **Compaction** (history-preserving) + checkpoints.
 - **Backup/restore**; **pluggable storage backends** (local/memory/s3 traits).
 - AuthN (SCRAM) + TLS; Prometheus metrics; health endpoints.
@@ -78,6 +80,7 @@ Each milestone has an **exit criterion** — the thing that must be *true and te
 - **Object-store cold tier + hot cache + PITR** land in **v0.4**; v0.5 builds the usable-by-outsiders surface on top.
 - **Change-feed / diff-between-two-times**; window functions; recursive CTEs.
 - **RBAC**; access auditing; idempotent ingest.
+- **Verifiable audit log** — Merkle inclusion/consistency proofs an auditor checks *without trusting the operator* ([ADR-0026](adr/0026-verifiable-audit-log.md)).
 - **Temporal integrity** (temporal PK/FK).
 - **Driver/ORM compatibility matrix** verified (psql, JDBC, psycopg, pgx, SQLAlchemy).
 - `pg_catalog`/`information_schema` shims (BI-tool introspection begins to work).

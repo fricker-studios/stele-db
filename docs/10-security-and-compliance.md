@@ -78,7 +78,7 @@ flowchart TB
 The [A.2 immutability](01-feature-plan.md#a2--append-only--immutable-storage--historization) and [A.4 lineage/provenance](01-feature-plan.md#a4--lineage--provenance-first-class) primitives provide, for free, what most systems bolt on:
 
 - **Tamper-evidence:** sealed segments are immutable and checksummed; a destructive change is impossible through normal paths and detectable otherwise ([architecture invariants](02-architecture.md#12-cross-cutting-architectural-invariants)).
-- **Cryptographic verifiability:** commits are **hash-chained (Merkle)** so an auditor can verify the entire history wasn't altered, even by someone with storage access — bumped to a v0.7 pillar feature ([01 §A.4](01-feature-plan.md#a4--lineage--provenance-first-class)).
+- **Cryptographic verifiability (headline):** a **hash-chained commit log (from ~v0.2)** plus **Merkle inclusion/consistency proofs (by ~v0.5)** let an auditor verify history wasn't altered — *without trusting the operator* ([ADR-0026](adr/0026-verifiable-audit-log.md)). Field-level [crypto-shredding](adr/0020-crypto-shredding-erasure.md) preserves these proofs for unaffected records (proofs are over commitments, not cleartext).
 - **Forensics by time-travel:** "what did the system hold at 02:00 on the day of the incident, and who wrote it?" is a query, not a backup restore.
 - **Non-repudiation:** every version carries its writing principal and commit time, captured at commit, stored inline.
 
@@ -125,6 +125,7 @@ Layered, least-privilege:
 - **Column-level security & dynamic masking** — column grants plus masking/redaction of sensitive fields (PII/PHI/PAN) so analysts see only what they're entitled to (v0.7).
 - **ABAC / policy engine** — attribute/policy-based access (purpose, data classification, clearance) beyond static roles (v0.7+).
 - The **admin/control-plane API shares the same identities and authZ** as the SQL surface ([ADR-0016](adr/0016-admin-control-plane-api.md)) — one authorization model, not two.
+- **Temporal access control.** Time-travel must never become a privilege-escalation channel: an as-of read enforces the **current** access policy by default (you cannot read data as-of a time *before* you had access), with an optional as-of-policy mode where a use case genuinely requires it.
 
 ## 7. Access auditing & monitoring
 

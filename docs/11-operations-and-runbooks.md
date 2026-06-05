@@ -18,6 +18,7 @@ Stele exposes Prometheus/OpenMetrics, OpenTelemetry traces, structured logs, and
 | **Storage growth / cost** | Append-only grows forever ([§7](#7-capacity--cost)). | Growth rate anomaly; tier-mix drift. |
 | **Replica lag** (distributed) | Stale reads / failover readiness. | Lag > target. |
 | **KMS reachability** | No KMS → no decrypt of at-rest data ([ADR-0019](adr/0019-encryption-at-rest-kms.md)). | KMS errors / latency. |
+| **Temporal-specific metrics** | You can't benchmark or debug what you can't see — instrument *before* perf work. | per-query block reads, **version-chain depth**, **visibility lag** (submit→queryable), clock-uncertainty window, compaction stats. |
 
 ## 2. Incident response
 

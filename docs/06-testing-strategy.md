@@ -200,6 +200,26 @@ Until every box is checked, Stele runs **synthetic and contributor data only.** 
 
 ---
 
+## 10. Bitemporal-specific test additions (considerations review)
+
+Each maps to a documented hole.
+
+**Differential oracle against DuckDB/Postgres.** Beyond the in-engine reference model ([§4](#4-correctness-oracles-the-temporal-heart)), reimplement the bitemporal queries naïvely in **DuckDB** (primary) and Postgres and **diff** on ≥10⁶ randomized ops — zero divergence is the bar. Add **metamorphic** tests: interval splits/reorderings and coalescing must not change any query result ([16 §9](16-bitemporal-semantics.md)).
+
+**Concurrency hazards.**
+- **Concurrent-supersede race:** two writers superseding the same key must not both open a current version — assert the per-key serialization point; never two overlapping open system-time intervals ([ADR-0023](adr/0023-append-only-record-model-validity-index.md)).
+- **Hermitage** isolation suite + **temporal write skew** (two txns each insert a valid-time interval that *together* violate no-overlap).
+- **Commit-throughput ceiling:** the manifest/commit path serializes — find and report the OCC retry/abort rate and the hard commit ceiling.
+- **Idempotency under replay/out-of-order:** re-ingesting the same event dedupes; version count + as-of results unchanged.
+
+**Cross-version reproducibility regression (existential).** A permanent suite replays **old data + old queries against every new engine version** and asserts **byte-identical** output — "reproduce the 2023 filing" must survive format changes, compaction, GC, and upgrades. Wired into CI as a release gate ([04](04-cicd.md)).
+
+**Manifest/catalog scale.** Catalog query latency + commit time as segment/manifest count grows into the millions — the catalog usually saturates before the data layer ([02 §5](02-architecture.md#5-catalog--metadata)).
+
+**Valid-time scatter.** Heavily-backdated data; measure scan amplification on valid-time filters with/without the [valid-time index](adr/0025-valid-time-indexing.md).
+
+---
+
 ## Tooling summary
 
 | Layer | Tool(s) |

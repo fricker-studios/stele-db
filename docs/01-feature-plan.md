@@ -69,9 +69,9 @@ These are the reason Stele exists. They get the novelty budget.
 |---|---|---|---|
 | **Per-row transaction provenance** | Each version records the writing transaction id, commit time, and an auth principal (who/what/when). | Must | **v0.2** |
 | **Provenance query surface** | Pseudo-columns / system functions to read a row's provenance inline (`_stele_txn_id`, `_stele_committed_at`, `_stele_principal`). | Must | **v0.3** |
-| **Immutable audit log** | The WAL/commit log is itself an auditable, append-only record; tamper-evident hashing optional. | Should | **v0.5** |
+| **Hash-chained commit log** | The commit log is append-only and **hash-chained** so tampering with any historical record is detectable — and it is the source of truth for the derived validity index ([ADR-0023](adr/0023-append-only-record-model-validity-index.md), [ADR-0026](adr/0026-verifiable-audit-log.md)). | Must | **v0.2** |
 | **Derivation lineage (opt-in)** | "This row was computed from those input rows by that statement." Column/row-level lineage graph. Expensive; opt-in. | Later | **v0.7+** |
-| **Cryptographic verifiability** | Merkle/hash-chained commits so an external auditor can verify history wasn't altered — a [security pillar](#b8--security-authz--data-protection-pillar) feature, bumped earlier accordingly. | Should | **v0.7** |
+| **Cryptographic verifiability (Merkle proofs)** | Merkle inclusion/consistency proofs an external auditor verifies **without trusting the operator** — the headline tamper-evidence pillar ([ADR-0026](adr/0026-verifiable-audit-log.md)). | Should | **v0.5** |
 
 ## A.5 — Hash keys & MERGE/upsert
 
@@ -88,7 +88,8 @@ These are the reason Stele exists. They get the novelty budget.
 |---|---|---|---|
 | **Columnar storage + encodings** | Dictionary, RLE, bit-packing, FOR (frame-of-reference), delta; per-column codec selection. | Must | **v0.1** |
 | **Vectorized scan/aggregation** | Batch-at-a-time (Arrow-shaped) execution; SIMD-friendly. | Must | **v0.2** |
-| **Zone maps / min-max + zone skipping** | Per-segment statistics to skip blocks during scans (incl. time-range skipping). | Must | **v0.2** |
+| **Zone maps / min-max + zone skipping** | Per-segment statistics to skip blocks during scans (incl. system-time skipping, which is monotonic and prunes well). | Must | **v0.2** |
+| **Valid-time index (scatter-resistant)** | Valid-time prunes via a **dedicated index, not zone maps** — late-arriving/backdated valid-times scatter and defeat block min/max ([ADR-0025](adr/0025-valid-time-indexing.md)). | Should | **v0.3** |
 | **B-tree / point-lookup index** | A secondary access path giving *adequate* point lookups and small range reads. | Should | **v0.3** |
 | **Bloom filters / hash index** | Accelerate hash-key point lookups and MERGE probes. | Should | **v0.3** |
 | **Late materialization** | Defer column fetches until after predicate filtering. | Should | **v0.5** |
