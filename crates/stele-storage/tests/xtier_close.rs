@@ -1,0 +1,484 @@
+//! Cross-segment system-time close — integration tests (STL-127).
+//!
+//! These exercise closing a prior system-time period when the open version has
+//! already been flushed out of the delta tier into a **sealed segment**, so the
+//! close cannot re-stage it (invariant 1 forbids mutating a sealed segment) and
+//! must become an appended [`CloseMarker`](stele_storage::delta::CloseMarker).
+//!
+//! * **Round-trip** — DoD bullet 1: insert → `flush_to_segment` → update; a
+//!   snapshot scan merging segment + delta returns exactly two versions, the
+//!   sealed one closed at the new commit plus a new open one.
+//! * **Interval invariant across a flush boundary** — DoD bullet 2: for any
+//!   business key, the `[sys_from, sys_to)` intervals stay non-overlapping and
+//!   gap-free with updates/deletes interleaved with flushes, over a seed sweep.
+//! * **Invariant 1** — DoD bullet 3: no code path mutates the sealed segment;
+//!   the segment's bytes are byte-for-byte unchanged after a cross-segment close.
+
+#![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use stele_common::provenance::{Principal, Provenance, TxnId};
+use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros};
+use stele_storage::backend::{Disk, DiskFile, MemDisk};
+use stele_storage::delta::{BusinessKey, CloseMarker, Delta, DeltaConfig, Snapshot, Version};
+use stele_storage::merge;
+use stele_storage::segment::{SegmentReader, SegmentWriter};
+use stele_storage::systime::{SealedVersions, SysTimeWriter};
+
+fn who() -> Principal {
+    Principal::new(b"tester".to_vec())
+}
+
+fn new_delta() -> Delta<MemDisk> {
+    Delta::open(MemDisk::new(), DeltaConfig::default()).unwrap()
+}
+
+/// A hand-driven clock behind a shared atomic — satisfies `Clock: Send + Sync`.
+#[derive(Clone)]
+struct StubClock(Arc<AtomicI64>);
+impl StubClock {
+    fn new(start: i64) -> Self {
+        Self(Arc::new(AtomicI64::new(start)))
+    }
+    fn advance(&self, by: i64) {
+        self.0.fetch_add(by, Ordering::Relaxed);
+    }
+}
+impl Clock for StubClock {
+    fn now(&self) -> SystemTimeMicros {
+        SystemTimeMicros(self.0.load(Ordering::Relaxed))
+    }
+}
+
+/// Tiny xorshift64* — deterministic, dependency-free; matches the other storage
+/// tests so a failing seed reproduces bit-for-bit (ADR-0010).
+struct Rng(u64);
+impl Rng {
+    const fn new(seed: u64) -> Self {
+        Self(seed.wrapping_add(0x9E37_79B9_7F4A_7C15))
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+    fn range(&mut self, n: u64) -> u64 {
+        self.next_u64() % n
+    }
+}
+
+/// Write `rows` into a fresh sealed segment and read every version back — the
+/// real columnar flush boundary, not a stand-in. Returns what a reader sees.
+fn seal(disk: &MemDisk, name: &str, rows: Vec<Version>) -> Vec<Version> {
+    let mut writer = SegmentWriter::create(disk, name).expect("create segment");
+    for v in rows {
+        writer.push(v).expect("push");
+    }
+    writer.finish().expect("finish");
+    SegmentReader::open(disk, name)
+        .expect("open segment")
+        .read_versions()
+        .expect("read versions")
+}
+
+/// The raw on-disk bytes of a sealed segment — used to prove invariant 1.
+fn raw_bytes(disk: &MemDisk, name: &str) -> Vec<u8> {
+    let file = disk.open(name).expect("open file");
+    let mut buf = vec![0u8; file.len() as usize];
+    let n = file.read_at(0, &mut buf).expect("read");
+    assert_eq!(n, buf.len(), "short read on segment bytes");
+    buf
+}
+
+/// Reconstruct one key's full version chain across the sealed pool and the delta
+/// tier, folding the delta's close markers — the cross-tier read path a query
+/// executor performs ([`merge::fold_chains`]).
+fn merged_chain(delta: &Delta<MemDisk>, sealed: &[Version], key: &BusinessKey) -> Vec<Version> {
+    let delta_versions = delta.candidate_versions(key).expect("candidates");
+    let sealed_versions = sealed.iter().filter(|v| &v.business_key == key).cloned();
+    let markers: Vec<CloseMarker> = delta
+        .close_markers()
+        .filter(|m| &m.business_key == key)
+        .cloned()
+        .collect();
+    let chains = merge::fold_chains(sealed_versions.chain(delta_versions), markers);
+    chains
+        .get(key)
+        .map(|c| c.values().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Wrap one key's reconstructed chain in the `BTreeMap` shape
+/// [`merge::resolve_snapshot`] expects, so a test can snapshot-resolve it.
+fn chains_of(
+    key: &BusinessKey,
+    chain: &[Version],
+) -> BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Version>> {
+    let mut chains = BTreeMap::new();
+    chains.insert(
+        key.clone(),
+        chain.iter().map(|v| (v.sys_from, v.clone())).collect(),
+    );
+    chains
+}
+
+// --- Round-trip (DoD bullet 1) ----------------------------------------------
+
+#[test]
+fn update_across_a_flush_boundary_closes_the_sealed_version_via_a_marker() {
+    let mut delta = new_delta();
+    let seg_disk = MemDisk::new();
+    let clock = StubClock::new(1_000);
+    let mut writer = SysTimeWriter::new(clock.clone());
+    let key = BusinessKey::new(b"acct-42".to_vec());
+
+    // Insert, then flush the open version out of the delta into a sealed segment.
+    let c0 = writer
+        .insert(
+            &mut delta,
+            &SealedVersions::default(),
+            key.clone(),
+            b"balance=100".to_vec(),
+            TxnId(10),
+            Principal::new(b"writer-a".to_vec()),
+        )
+        .unwrap();
+    let sealed = seal(&seg_disk, "seg-0.seg", delta.flush_to_segment().unwrap());
+    assert_eq!(sealed.len(), 1, "one open version flushed");
+    assert_eq!(sealed[0].sys_to, SYSTEM_TIME_OPEN, "it is sealed open");
+    let bytes_after_seal = raw_bytes(&seg_disk, "seg-0.seg");
+
+    // The update's live version now lives ONLY in the sealed segment.
+    clock.advance(1_000);
+    let lookup = SealedVersions::new(sealed.clone());
+    let c1 = writer
+        .update(
+            &mut delta,
+            &lookup,
+            key.clone(),
+            b"balance=150".to_vec(),
+            TxnId(20),
+            Principal::new(b"writer-b".to_vec()),
+        )
+        .unwrap();
+    assert!(c0 < c1);
+
+    // The close did not re-stage a full version — it appended a single marker.
+    assert_eq!(delta.close_markers().count(), 1, "exactly one close marker");
+    let marker = delta.close_markers().next().unwrap();
+    assert_eq!(marker.business_key, key);
+    assert_eq!(marker.sys_from, c0, "marker targets the sealed version");
+    assert_eq!(marker.sys_to, c1);
+
+    // Invariant 1: the sealed segment's bytes are unchanged by the close.
+    assert_eq!(
+        raw_bytes(&seg_disk, "seg-0.seg"),
+        bytes_after_seal,
+        "the sealed segment must not be mutated by a cross-segment close",
+    );
+
+    // The merged read returns exactly two versions: the sealed one closed at c1,
+    // and the new open one — with the sealed version's body and birth provenance
+    // intact, plus the close provenance from the marker.
+    let chain = merged_chain(&delta, &sealed, &key);
+    assert_eq!(chain.len(), 2, "segment + delta merge ⇒ two versions");
+    let (closed, open) = (&chain[0], &chain[1]);
+
+    assert_eq!(closed.sys_from, c0);
+    assert_eq!(
+        closed.sys_to, c1,
+        "the sealed version is closed at the update"
+    );
+    assert_eq!(
+        closed.payload, b"balance=100",
+        "body preserved from segment"
+    );
+    assert_eq!(
+        closed.provenance.txn_id,
+        TxnId(10),
+        "birth provenance intact"
+    );
+    assert_eq!(closed.provenance.committed_at, c0);
+    assert_eq!(
+        closed.closed_by,
+        Some(Provenance::new(
+            TxnId(20),
+            c1,
+            Principal::new(b"writer-b".to_vec())
+        )),
+        "the close records the superseding transaction",
+    );
+
+    assert_eq!(open.sys_from, c1);
+    assert_eq!(open.sys_to, SYSTEM_TIME_OPEN, "the new version stays open");
+    assert_eq!(open.payload, b"balance=150");
+    assert_eq!(open.closed_by, None);
+
+    // Snapshot resolution sees one live version on each side of the close.
+    let chains = chains_of(&key, &chain);
+    let before = merge::resolve_snapshot(&chains, Snapshot(c0));
+    assert_eq!(before.len(), 1);
+    assert_eq!(
+        before[0].sys_from, c0,
+        "before the close, the old version is live"
+    );
+    let after = merge::resolve_snapshot(&chains, Snapshot(c1));
+    assert_eq!(
+        after[0].sys_from, c1,
+        "at the close, the new version is live"
+    );
+}
+
+#[test]
+fn delete_across_a_flush_boundary_closes_the_sealed_version_and_leaves_no_open() {
+    let mut delta = new_delta();
+    let seg_disk = MemDisk::new();
+    let clock = StubClock::new(50);
+    let mut writer = SysTimeWriter::new(clock.clone());
+    let key = BusinessKey::new(b"k".to_vec());
+
+    let c0 = writer
+        .insert(
+            &mut delta,
+            &SealedVersions::default(),
+            key.clone(),
+            b"v".to_vec(),
+            TxnId(1),
+            who(),
+        )
+        .unwrap();
+    let sealed = seal(&seg_disk, "seg.seg", delta.flush_to_segment().unwrap());
+
+    clock.advance(100);
+    let lookup = SealedVersions::new(sealed.clone());
+    let deleted_at = writer
+        .delete(
+            &mut delta,
+            &lookup,
+            &key,
+            TxnId(2),
+            Principal::new(b"deleter".to_vec()),
+        )
+        .unwrap();
+
+    // A delete-across-flush is a marker too — no successor version.
+    assert_eq!(
+        delta.candidate_versions(&key).unwrap().len(),
+        0,
+        "no new version staged"
+    );
+    let chain = merged_chain(&delta, &sealed, &key);
+    assert_eq!(
+        chain.len(),
+        1,
+        "the key has exactly the one (now closed) version"
+    );
+    assert_eq!(chain[0].sys_from, c0);
+    assert_eq!(
+        chain[0].sys_to, deleted_at,
+        "delete closes the sealed period"
+    );
+    assert_ne!(chain[0].sys_to, SYSTEM_TIME_OPEN);
+    assert_eq!(
+        chain[0].closed_by,
+        Some(Provenance::new(
+            TxnId(2),
+            deleted_at,
+            Principal::new(b"deleter".to_vec())
+        )),
+        "the tombstone carries the deleting transaction's provenance",
+    );
+
+    // Nothing is live after the delete.
+    let chains = chains_of(&key, &chain);
+    assert!(merge::resolve_snapshot(&chains, Snapshot(SystemTimeMicros(i64::MAX - 1))).is_empty());
+}
+
+#[test]
+fn insert_on_a_key_live_only_in_a_segment_is_rejected() {
+    // The liveness check must span tiers: a key whose live version is sealed is
+    // still live, so a re-insert is a KeyExists error, not a silent second open.
+    let mut delta = new_delta();
+    let seg_disk = MemDisk::new();
+    let mut writer = SysTimeWriter::new(StubClock::new(1));
+    let key = BusinessKey::new(b"dup".to_vec());
+
+    writer
+        .insert(
+            &mut delta,
+            &SealedVersions::default(),
+            key.clone(),
+            b"a".to_vec(),
+            TxnId(1),
+            who(),
+        )
+        .unwrap();
+    let sealed = seal(&seg_disk, "s.seg", delta.flush_to_segment().unwrap());
+
+    let lookup = SealedVersions::new(sealed);
+    let err = writer
+        .insert(&mut delta, &lookup, key, b"b".to_vec(), TxnId(2), who())
+        .unwrap_err();
+    assert!(
+        matches!(err, stele_storage::systime::SysTimeError::KeyExists),
+        "re-inserting a key live in a segment must be rejected, got {err:?}",
+    );
+}
+
+// --- Interval invariant across a flush boundary (DoD bullet 2) ---------------
+
+/// What op created a given version — the boundary to it abuts iff it was an
+/// update; an insert after a delete opens a fresh period with a real gap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Born {
+    Insert,
+    Update,
+}
+
+/// Assert one key's reconstructed `chain` upholds the bitemporal invariant:
+/// strictly-increasing, non-overlapping intervals; every superseded period
+/// closed; update boundaries abut while delete→re-insert boundaries leave a gap
+/// (read off `born`); and exactly one open period iff the key is currently
+/// `live`, always the newest.
+fn assert_chain_invariant(seed: u64, k: usize, chain: &[Version], born: &[Born], live: bool) {
+    assert_eq!(
+        chain.len(),
+        born.len(),
+        "seed {seed} key {k}: chain length must match the ops that opened a period",
+    );
+    if chain.is_empty() {
+        return;
+    }
+
+    for (i, w) in chain.windows(2).enumerate() {
+        let (lo, hi) = (&w[0], &w[1]);
+        assert!(
+            lo.sys_from < hi.sys_from,
+            "seed {seed} key {k}: starts must strictly increase",
+        );
+        assert!(
+            lo.sys_to <= hi.sys_from,
+            "seed {seed} key {k}: intervals overlap",
+        );
+        assert_ne!(
+            lo.sys_to, SYSTEM_TIME_OPEN,
+            "seed {seed} key {k}: a superseded period is still open",
+        );
+        // An update abuts the prior period exactly; an insert after a delete
+        // opens a fresh period strictly later (a real gap).
+        let born_hi = born[i + 1];
+        match born_hi {
+            Born::Update => assert_eq!(
+                lo.sys_to, hi.sys_from,
+                "seed {seed} key {k}: consecutive update periods must abut",
+            ),
+            Born::Insert => assert!(
+                lo.sys_to < hi.sys_from,
+                "seed {seed} key {k}: delete→re-insert must leave a gap",
+            ),
+        }
+    }
+
+    // At most one open period, and only when the key is currently live.
+    let open = chain
+        .iter()
+        .filter(|v| v.sys_to == SYSTEM_TIME_OPEN)
+        .count();
+    if live {
+        assert_eq!(
+            open, 1,
+            "seed {seed} key {k}: a live key has one open period"
+        );
+        assert_eq!(
+            chain.last().unwrap().sys_to,
+            SYSTEM_TIME_OPEN,
+            "seed {seed} key {k}: the open period is the newest",
+        );
+    } else {
+        assert_eq!(
+            open, 0,
+            "seed {seed} key {k}: a deleted key has no open period"
+        );
+    }
+}
+
+#[test]
+fn chains_stay_non_overlapping_and_gap_free_across_flush_boundaries() {
+    const KEY_POOL: u64 = 5;
+
+    for seed in 0u64..120 {
+        let mut rng = Rng::new(seed);
+        let mut delta = new_delta();
+        let seg_disk = MemDisk::new();
+        let clock = StubClock::new(1);
+        let mut writer = SysTimeWriter::new(clock.clone());
+
+        // Everything flushed so far, as a reader sees it; rebuilt per flush.
+        let mut sealed: Vec<Version> = Vec::new();
+        let mut next_seg = 0u64;
+        // Per key: liveness and the op that created each version, in order.
+        let mut live = vec![false; KEY_POOL as usize];
+        let mut born: Vec<Vec<Born>> = vec![Vec::new(); KEY_POOL as usize];
+
+        let ops = 40 + rng.range(40);
+        for op in 0..ops {
+            // Advance the clock by a small, occasionally-zero amount; the
+            // writer's monotonic guard keeps commits strictly increasing.
+            clock.advance((rng.range(3)) as i64);
+
+            // ~1 in 5 ops is a flush: drain the delta's versions into a new
+            // sealed segment and fold them into the reader-visible pool. Markers
+            // deliberately stay in the delta until compaction.
+            if rng.range(5) == 0 {
+                let drained = delta.flush_to_segment().unwrap();
+                if !drained.is_empty() {
+                    let name = format!("seg-{next_seg}.seg");
+                    next_seg += 1;
+                    sealed.extend(seal(&seg_disk, &name, drained));
+                }
+                continue;
+            }
+
+            let k = rng.range(KEY_POOL) as usize;
+            let key = BusinessKey::new(vec![b'k', k as u8]);
+            let lookup = SealedVersions::new(sealed.clone());
+            let txn = TxnId(op);
+            let payload = format!("s{seed}-k{k}-o{op}").into_bytes();
+
+            if live[k] {
+                // Half the time supersede, half the time delete.
+                if rng.range(2) == 0 {
+                    writer
+                        .delete(&mut delta, &lookup, &key, txn, who())
+                        .unwrap();
+                    live[k] = false;
+                } else {
+                    writer
+                        .update(&mut delta, &lookup, key, payload, txn, who())
+                        .unwrap();
+                    born[k].push(Born::Update);
+                }
+            } else {
+                writer
+                    .insert(&mut delta, &lookup, key, payload, txn, who())
+                    .unwrap();
+                live[k] = true;
+                born[k].push(Born::Insert);
+            }
+        }
+
+        // Reconstruct each key's full chain across every segment + the delta and
+        // assert the bitemporal invariant holds across the flush boundaries.
+        for k in 0..KEY_POOL as usize {
+            let key = BusinessKey::new(vec![b'k', k as u8]);
+            let chain = merged_chain(&delta, &sealed, &key);
+            assert_chain_invariant(seed, k, &chain, &born[k], live[k]);
+        }
+    }
+}

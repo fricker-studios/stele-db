@@ -30,7 +30,7 @@ use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Version};
 use stele_storage::segment::{ColumnId, SegmentReader, SegmentWriter};
-use stele_storage::systime::SysTimeWriter;
+use stele_storage::systime::{EmptySealed, SysTimeWriter};
 use stele_storage::wal::{Disk, DiskFile};
 
 // --- MemDisk: minimal in-memory Disk for tests ------------------------------
@@ -157,6 +157,7 @@ fn every_persisted_version_carries_its_three_provenance_columns() {
         writer
             .insert(
                 &mut delta,
+                &EmptySealed,
                 BusinessKey::new(key.clone()),
                 format!("balance={i}").into_bytes(),
                 TxnId(i),

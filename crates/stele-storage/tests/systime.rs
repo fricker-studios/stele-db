@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
-use stele_storage::systime::{SysTimeError, SysTimeWriter};
+use stele_storage::systime::{EmptySealed, SysTimeError, SysTimeWriter};
 use stele_storage::wal::{Disk, DiskFile};
 
 /// A throwaway principal for write-path tests that don't themselves assert on
@@ -195,6 +195,7 @@ fn insert_then_update_leaves_one_closed_and_one_open_version() {
     let c0 = writer
         .insert(
             &mut delta,
+            &EmptySealed,
             key.clone(),
             b"balance=100".to_vec(),
             TxnId(10),
@@ -206,6 +207,7 @@ fn insert_then_update_leaves_one_closed_and_one_open_version() {
     let c1 = writer
         .update(
             &mut delta,
+            &EmptySealed,
             key.clone(),
             b"balance=150".to_vec(),
             TxnId(20),
@@ -275,10 +277,24 @@ fn insert_on_a_live_key_is_rejected() {
     let key = BusinessKey::new(b"dup".to_vec());
 
     writer
-        .insert(&mut delta, key.clone(), b"first".to_vec(), TxnId(1), who())
+        .insert(
+            &mut delta,
+            &EmptySealed,
+            key.clone(),
+            b"first".to_vec(),
+            TxnId(1),
+            who(),
+        )
         .unwrap();
     let err = writer
-        .insert(&mut delta, key, b"second".to_vec(), TxnId(2), who())
+        .insert(
+            &mut delta,
+            &EmptySealed,
+            key,
+            b"second".to_vec(),
+            TxnId(2),
+            who(),
+        )
         .unwrap_err();
     assert!(matches!(err, SysTimeError::KeyExists));
 }
@@ -291,13 +307,20 @@ fn update_or_delete_without_a_live_version_is_rejected() {
 
     assert!(matches!(
         writer
-            .update(&mut delta, key.clone(), b"x".to_vec(), TxnId(1), who())
+            .update(
+                &mut delta,
+                &EmptySealed,
+                key.clone(),
+                b"x".to_vec(),
+                TxnId(1),
+                who()
+            )
             .unwrap_err(),
         SysTimeError::KeyNotFound
     ));
     assert!(matches!(
         writer
-            .delete(&mut delta, &key, TxnId(2), who())
+            .delete(&mut delta, &EmptySealed, &key, TxnId(2), who())
             .unwrap_err(),
         SysTimeError::KeyNotFound
     ));
@@ -311,11 +334,19 @@ fn delete_closes_the_live_period_and_leaves_no_open_version() {
     let key = BusinessKey::new(b"k".to_vec());
 
     writer
-        .insert(&mut delta, key.clone(), b"v".to_vec(), TxnId(1), who())
+        .insert(
+            &mut delta,
+            &EmptySealed,
+            key.clone(),
+            b"v".to_vec(),
+            TxnId(1),
+            who(),
+        )
         .unwrap();
     let closed_at = writer
         .delete(
             &mut delta,
+            &EmptySealed,
             &key,
             TxnId(2),
             Principal::new(b"deleter".to_vec()),
@@ -355,13 +386,29 @@ fn reinsert_after_delete_opens_a_new_period_with_a_gap() {
     let key = BusinessKey::new(b"k".to_vec());
 
     writer
-        .insert(&mut delta, key.clone(), b"a".to_vec(), TxnId(1), who())
+        .insert(
+            &mut delta,
+            &EmptySealed,
+            key.clone(),
+            b"a".to_vec(),
+            TxnId(1),
+            who(),
+        )
         .unwrap();
     clock.set(200);
-    let deleted_at = writer.delete(&mut delta, &key, TxnId(2), who()).unwrap();
+    let deleted_at = writer
+        .delete(&mut delta, &EmptySealed, &key, TxnId(2), who())
+        .unwrap();
     clock.set(300);
     let reopened_at = writer
-        .insert(&mut delta, key.clone(), b"b".to_vec(), TxnId(2), who())
+        .insert(
+            &mut delta,
+            &EmptySealed,
+            key.clone(),
+            b"b".to_vec(),
+            TxnId(2),
+            who(),
+        )
         .unwrap();
 
     let mut chains = drain_chains(&mut delta);
@@ -413,9 +460,13 @@ fn version_chains_are_non_overlapping_and_gap_free_under_seed_sweep() {
             let txn = TxnId(op);
 
             if live[key_idx] {
-                writer.update(&mut delta, key, payload, txn, who()).unwrap();
+                writer
+                    .update(&mut delta, &EmptySealed, key, payload, txn, who())
+                    .unwrap();
             } else {
-                writer.insert(&mut delta, key, payload, txn, who()).unwrap();
+                writer
+                    .insert(&mut delta, &EmptySealed, key, payload, txn, who())
+                    .unwrap();
                 live[key_idx] = true;
             }
         }
