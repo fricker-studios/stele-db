@@ -29,6 +29,8 @@ Stele follows **Semantic Versioning** intent, with pre-1.0 numbers signaling *ca
 
 Each milestone has an **exit criterion** — the thing that must be *true and tested* before the next begins. The criteria, not the calendar, gate progress.
 
+> **Anchors vs. checkpoints.** Three releases are **anchors** — v0.1 ("it is what it claims"), v0.5 ("a real database"), v1.0 ("you can trust it"). The intervening versions are **checkpoints** that split each anchor's leap into independently-provable steps (e.g. v0.4 lands the object-store tier *before* v0.5 builds the ecosystem on it; v0.9 freezes and dry-runs the trust gate *before* v1.0 signs it off). The ordering is still the only commitment; the pace is whatever quality demands.
+
 ### v0.1 — Bitemporal core (the identity proof)
 *The minimum-interesting demo ([assumption A3](assumptions.md)).*
 
@@ -63,8 +65,17 @@ Each milestone has an **exit criterion** — the thing that must be *true and te
 
 > **Exit criterion:** a million-row historized `MERGE` workload compacts without losing a single version; backup→restore round-trips byte-for-byte; metrics and `EXPLAIN ANALYZE` are usable for debugging.
 
+### v0.4 — Object-store tier & point-in-time recovery
+*The storage-durability half of "a real database" — landed before the SQL-surface and ecosystem half so each can be proven on its own.*
+
+- **S3-compatible cold tier** behind v0.3's pluggable backend traits; **local hot cache** (LRU) on NVMe.
+- **Incremental backup** + **point-in-time recovery (PITR)** over the object-store dataset.
+- **Late materialization** (defer column fetches until after predicate filtering) so object-store reads stay cheap.
+
+> **Exit criterion:** a sustained analytical workload reads *mostly from object storage* and survives the simulation suite's fault injection, and a restore to an arbitrary past instant round-trips byte-for-byte.
+
 ### v0.5 — "A real database" (the second anchor)
-- **Object-store cold tier + local hot cache**; incremental backup; **PITR**.
+- **Object-store cold tier + hot cache + PITR** land in **v0.4**; v0.5 builds the usable-by-outsiders surface on top.
 - **Change-feed / diff-between-two-times**; window functions; recursive CTEs.
 - **RBAC**; access auditing; idempotent ingest.
 - **Temporal integrity** (temporal PK/FK).
@@ -73,20 +84,44 @@ Each milestone has an **exit criterion** — the thing that must be *true and te
 
 > **Exit criterion:** Stele runs a sustained analytical workload reading mostly from object storage, survives the simulation suite's fault injection over long runs, and a real third party can point a standard Postgres driver at it and build something.
 
-### v0.7 — Separation, replication, and depth
+### v0.6 — Data protection, lifecycle & audit depth
+*Protect the data and deepen the audit trail before scaling reads out across nodes.*
+
+- **Encryption at rest**; **row-/column-level security** (policy-enforced access).
+- **Derivation lineage** (opt-in) — "this row was computed from those inputs by that statement."
+- **Tiered archival / storage lifecycle** — system-time-driven cold→frozen tiering with async restore; **time-era compaction**; controls append-only cost growth ([ADR-0021](adr/0021-storage-lifecycle-tiered-archival.md)).
+
+> **Exit criterion:** row/column policies hold under the simulation suite's fault injection, derivation lineage reconstructs a row's inputs, and cold→frozen tiering keeps *every byte* with an explicit async restore path.
+
+### v0.7 — Separation & replication
 - **Storage/compute separation** (stateless-ish compute over shared storage).
-- **Tiered archival / storage lifecycle** — system-time-driven cold→frozen tiering with async restore; controls append-only cost growth ([ADR-0021](adr/0021-storage-lifecycle-tiered-archival.md)).
 - **Read replicas** (WAL streaming); **serializable (SSI)** opt-in.
-- **Derivation lineage** (opt-in); row/column security; encryption at rest.
 - **BI/admin tool compatibility** (DBeaver, Grafana, Metabase) validated.
 
 > **Exit criterion:** two compute nodes serve reads over one shared object-store dataset with no coherence bugs (immutability dividend), and a BI tool dashboards live against Stele.
 
+### v0.8 — Extensibility & write-replication groundwork
+*The last feature additions before the format freeze.*
+
+- **Extension API v1** (so third-party extensions can build against a stable surface ahead of the v1.0 freeze).
+- **Synchronous-replication groundwork** (toward write durability across nodes).
+- **Materialized views** with temporal-aware refresh; **UDF / stored-procedure groundwork**.
+
+> **Exit criterion:** a third-party extension loads and runs against the v1 API, the sync-replication groundwork survives fault injection, and the feature set is declared **frozen** (no new surface before v1.0).
+
+### v0.9 — Release candidate (freeze & trust-gate dry run)
+*Everything that must be true for v1.0 except the formal sign-off.*
+
+- **On-disk format freeze**, forward-compatible from here.
+- **Complete docs site**; security posture documented; **deprecation policy** drafted.
+- **Trust-gate checklist dry run** — sim/oracle/recovery/backup/community all exercised end-to-end ([Charter §8](00-charter.md#8-the-trust-gate-no-production-data-stated-plainly)).
+
+> **Exit criterion:** the trust-gate checklist passes a full dry run and the format is frozen-forward — leaving v1.0 as the formal stamp, not a feature push.
+
 ### v1.0 — Hardened & trustworthy (the third anchor)
-- Semver-stable API + **forward-compatible on-disk format** from here.
-- **Cryptographic audit verifiability** (Merkle/hash-chained commits).
-- Synchronous-replication groundwork; extension API v1.
-- Complete docs site; security posture documented; deprecation policy.
+- **Semver-stable API** + the **forward-compatible on-disk format** guarantee (frozen at v0.9) is now *promised*.
+- **Cryptographic audit verifiability** (Merkle/hash-chained commits) — the capstone trust feature.
+- Extension API v1 (v0.8) and sync-replication groundwork (v0.8) declared stable; complete docs site (v0.9) published.
 - **The [trust gate](00-charter.md#8-the-trust-gate-no-production-data-stated-plainly) is formally met** → first production use becomes *permissible*.
 
 > **Exit criterion:** the trust gate's checklist (sim/oracle/recovery/backup/community) is fully green, the format is frozen-forward, and an external auditor could verify history integrity cryptographically.
@@ -102,9 +137,13 @@ Each milestone has an **exit criterion** — the thing that must be *true and te
 flowchart LR
     v01["v0.1<br/>Bitemporal core"] --> v02["v0.2<br/>Full bitemporality<br/>+ vectorized exec"]
     v02 --> v03["v0.3<br/>MERGE, indexes,<br/>backup, ops"]
-    v03 --> v05["v0.5<br/>Object store,<br/>security, ecosystem"]
-    v05 --> v07["v0.7<br/>Storage/compute split,<br/>replicas, lineage"]
-    v07 --> v10["v1.0<br/>Hardened,<br/>trust-gate met"]
+    v03 --> v04["v0.4<br/>Object-store tier<br/>+ PITR"]
+    v04 --> v05["v0.5<br/>SQL surface,<br/>security, ecosystem"]
+    v05 --> v06["v0.6<br/>Data protection,<br/>lifecycle, lineage"]
+    v06 --> v07["v0.7<br/>Storage/compute split,<br/>read replicas"]
+    v07 --> v08["v0.8<br/>Extension API,<br/>sync-repl groundwork"]
+    v08 --> v09["v0.9<br/>Release candidate<br/>(freeze + trust dry run)"]
+    v09 --> v10["v1.0<br/>Hardened,<br/>trust-gate met"]
     v10 --> v20["v2.0+<br/>Distribution,<br/>cloud, Solvia path"]
 ```
 

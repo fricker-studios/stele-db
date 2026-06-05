@@ -15,7 +15,9 @@ This document is the complete feature inventory for Stele, split into **(A) the 
 
 ## Milestone shorthand
 
-Milestones are *ordered*, not dated (this is a no-deadline track — see [03](03-roadmap.md)). The labels: **v0.1**, **v0.2**, **v0.3**, **v0.5**, **v0.7**, **v1.0**, **v2.0+**. Their meaning is defined in the [roadmap](03-roadmap.md#versioning).
+Milestones are *ordered*, not dated (this is a no-deadline track — see [03](03-roadmap.md)). The labels: **v0.1**, **v0.2**, **v0.3**, **v0.4**, **v0.5**, **v0.6**, **v0.7**, **v0.8**, **v0.9**, **v1.0**, **v2.0+**. Their meaning is defined in the [roadmap](03-roadmap.md#milestone-sequence-ordered-undated).
+
+> The in-between versions (v0.4, v0.6, v0.8, v0.9) are **checkpoints** that subdivide the v0.5 / v0.7 / v1.0 anchors; the [roadmap](03-roadmap.md#milestone-sequence-ordered-undated) is authoritative for what each contains. A few feature rows below still carry their original anchor tag (e.g. the object-store tier as v0.5) where the roadmap has since pulled them into a checkpoint — retagging those rows is a tracked follow-up, not a contradiction.
 
 ---
 
