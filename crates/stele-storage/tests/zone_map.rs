@@ -26,9 +26,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use stele_common::provenance::{Principal, Provenance, TxnId};
-use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
+use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros, ValidTimeMicros};
 use stele_storage::delta::{BusinessKey, Snapshot, Version};
 use stele_storage::segment::{ColumnId, Predicate, SegmentReader, SegmentWriter, ZoneBound};
+use stele_storage::validtime::{ValidInterval, frame_payload};
 use stele_storage::wal::{Disk, DiskFile};
 
 // --- CountingDisk: a MemDisk that counts read_at calls ----------------------
@@ -396,4 +397,175 @@ fn might_contain_never_prunes_a_real_match() {
             );
         }
     }
+}
+
+// --- DoD: valid-time zone-map pruning (STL-117) -----------------------------
+
+/// A valid-time version: framed payload (16-byte `[valid_from, valid_to)`
+/// prefix + user bytes, [STL-92]) over a system interval `[0, open)` so only
+/// the *valid* axis distinguishes the rows.
+fn valid_version(key: &[u8], valid_from: i64, valid_to: i64) -> Version {
+    let interval = ValidInterval::new(ValidTimeMicros(valid_from), ValidTimeMicros(valid_to))
+        .expect("well-formed valid interval");
+    let payload = frame_payload(true, Some(interval), b"row".to_vec()).expect("frame payload");
+    Version {
+        business_key: BusinessKey::new(key.to_vec()),
+        sys_from: SystemTimeMicros(0),
+        sys_to: SYSTEM_TIME_OPEN,
+        provenance: Provenance::new(
+            TxnId(1),
+            SystemTimeMicros(0),
+            Principal::new(b"svc".to_vec()),
+        ),
+        payload,
+    }
+}
+
+fn write_valid_segment(disk: &CountingDisk, name: &str, versions: &[Version]) {
+    let mut w = SegmentWriter::create_valid_time(disk, name).expect("create valid-time writer");
+    for v in versions {
+        w.push(v.clone()).expect("push");
+    }
+    w.finish().expect("finish");
+}
+
+/// The ticket's Definition of done: a valid-time range query skips segments
+/// whose valid-interval min/max cannot match. Two segments on disjoint
+/// valid-from ranges; a `Predicate::Range` on `valid_from` prunes the one that
+/// provably can't intersect — gated by `might_contain`, the pruned segment
+/// incurs zero column-chunk reads.
+#[test]
+fn valid_time_range_query_prunes_non_overlapping_segments() {
+    let disk = CountingDisk::new();
+
+    // "early" facts hold for valid_from in [10, 15]; "late" for [100, 110].
+    write_valid_segment(
+        &disk,
+        "vt-early.seg",
+        &[valid_version(b"a", 10, 50), valid_version(b"b", 15, 60)],
+    );
+    write_valid_segment(
+        &disk,
+        "vt-late.seg",
+        &[valid_version(b"c", 100, 200), valid_version(b"d", 110, 300)],
+    );
+
+    let readers = [
+        SegmentReader::open(&disk, "vt-early.seg").expect("open early"),
+        SegmentReader::open(&disk, "vt-late.seg").expect("open late"),
+    ];
+
+    // Every row is visible across the whole system axis ([0, open)), so only
+    // the valid axis can prune here.
+    let snapshot = snap(1);
+
+    // Facts whose valid_from is in [100, 150]: the late segment straddles it;
+    // the early segment (max valid_from 15) provably cannot match.
+    let by_valid_from = Predicate::Range {
+        column: ColumnId::ValidFrom,
+        low: ZoneBound::I64(100),
+        high: ZoneBound::I64(150),
+    };
+
+    disk.reset_reads();
+    let keep: Vec<bool> = readers
+        .iter()
+        .map(|r| r.might_contain(&by_valid_from, snapshot))
+        .collect();
+    assert_eq!(
+        disk.reads(),
+        0,
+        "valid-axis pruning must work off the resident zone map — no chunk I/O"
+    );
+    assert_eq!(
+        keep,
+        vec![false, true],
+        "early segment valid_from [10,15] cannot intersect query [100,150]"
+    );
+
+    // Symmetric prune on the other boundary column: facts whose valid_to is in
+    // [40, 55] keep early (valid_to [50,60]) and prune late (valid_to [200,300]).
+    let by_valid_to = Predicate::Range {
+        column: ColumnId::ValidTo,
+        low: ZoneBound::I64(40),
+        high: ZoneBound::I64(55),
+    };
+    assert!(
+        readers[0].might_contain(&by_valid_to, snapshot),
+        "early segment valid_to [50,60] overlaps query [40,55]"
+    );
+    assert!(
+        !readers[1].might_contain(&by_valid_to, snapshot),
+        "late segment valid_to [200,300] cannot intersect query [40,55]"
+    );
+
+    // I/O proof: scanning only the kept segment is strictly cheaper than
+    // scanning both — the prune saved reads, it didn't just happen to be right.
+    disk.reset_reads();
+    for (r, &k) in readers.iter().zip(&keep) {
+        if k {
+            let _ = r.read_versions().expect("read");
+        }
+    }
+    let pruned_reads = disk.reads();
+    disk.reset_reads();
+    for r in &readers {
+        let _ = r.read_versions().expect("read");
+    }
+    let full_reads = disk.reads();
+    assert!(
+        pruned_reads < full_reads,
+        "pruned scan ({pruned_reads} reads) must be cheaper than scanning both ({full_reads} reads)"
+    );
+}
+
+/// The valid-time prefix is *lifted* into first-class columns: the zone map
+/// records their min/max, and the framed payload still round-trips byte-for-byte
+/// (the lift is additive — nothing that reads `payload` is disturbed).
+#[test]
+fn valid_time_columns_populate_zone_map_and_round_trip() {
+    let disk = CountingDisk::new();
+    let rows = [
+        valid_version(b"a", 30, 90),
+        valid_version(b"b", 10, 100),
+        valid_version(b"c", 20, 80),
+    ];
+    write_valid_segment(&disk, "vt.seg", &rows);
+    let r = SegmentReader::open(&disk, "vt.seg").expect("open");
+    let zm = r.zone_map();
+
+    let vf = zm.column(ColumnId::ValidFrom).expect("valid_from stats");
+    assert_eq!(vf.min, ZoneBound::I64(10));
+    assert_eq!(vf.max, ZoneBound::I64(30));
+
+    let vt = zm.column(ColumnId::ValidTo).expect("valid_to stats");
+    assert_eq!(vt.min, ZoneBound::I64(80));
+    assert_eq!(vt.max, ZoneBound::I64(100));
+
+    let read = r.read_versions().expect("read versions");
+    assert_eq!(read, rows.to_vec(), "framed payload round-trips unchanged");
+}
+
+/// A system-only table opts out of valid-time, so its segment carries no
+/// `valid_from` / `valid_to` columns: the zone map exposes none, and a
+/// valid-axis predicate can never prune it (no stats ⇒ conservatively kept).
+#[test]
+fn system_only_segment_has_no_valid_time_columns() {
+    let disk = CountingDisk::new();
+    write_segment(&disk, "sys.seg", &[version(b"k", 10, 100, b"v")]);
+    let r = SegmentReader::open(&disk, "sys.seg").expect("open");
+
+    assert!(r.zone_map().column(ColumnId::ValidFrom).is_none());
+    assert!(r.zone_map().column(ColumnId::ValidTo).is_none());
+    assert!(
+        r.might_contain(
+            &Predicate::Range {
+                column: ColumnId::ValidFrom,
+                low: ZoneBound::I64(1000),
+                high: ZoneBound::I64(2000),
+            },
+            snap(50),
+        ),
+        "a valid-axis predicate must not prune a segment that has no valid-time stats"
+    );
 }

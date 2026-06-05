@@ -17,6 +17,7 @@
 use crate::backend::{Disk, DiskFile};
 use crate::checksum::crc32c;
 use crate::delta::Version;
+use crate::validtime::unframe_payload;
 
 use super::SegmentError;
 use super::format::{
@@ -33,14 +34,41 @@ use super::format::{
 pub struct SegmentWriter<F: DiskFile> {
     file: F,
     rows: Vec<Version>,
+    /// Whether this segment's table tracks valid-time. When set, [`finish`]
+    /// lifts the payload's valid-time prefix into the `valid_from` / `valid_to`
+    /// columns ([STL-117]); when clear, those columns are absent.
+    valid_time: bool,
 }
 
 impl<F: DiskFile> SegmentWriter<F> {
-    /// Create a new sealed segment file at `name` on `disk`. Errors with
+    /// Create a new sealed segment file at `name` on `disk` for a **system-only**
+    /// table (no valid-time columns). Errors with
     /// [`std::io::ErrorKind::AlreadyExists`] (surfaced as
     /// [`SegmentError::Io`]) if the file already exists — sealed segments
     /// are immutable, so the writer never opens an existing file for append.
     pub fn create<D: Disk<File = F>>(disk: &D, name: &str) -> Result<Self, SegmentError> {
+        Self::create_inner(disk, name, false)
+    }
+
+    /// Create a new sealed segment file at `name` on `disk` for a **valid-time**
+    /// table. Every pushed [`Version`]'s payload must carry the 16-byte
+    /// valid-time prefix ([`crate::validtime::frame_payload`], [STL-92]);
+    /// [`finish`](Self::finish) decodes it into first-class `valid_from` /
+    /// `valid_to` columns so the planner can prune on the valid axis ([STL-117]).
+    ///
+    /// Same immutability and `AlreadyExists` semantics as [`Self::create`].
+    pub fn create_valid_time<D: Disk<File = F>>(
+        disk: &D,
+        name: &str,
+    ) -> Result<Self, SegmentError> {
+        Self::create_inner(disk, name, true)
+    }
+
+    fn create_inner<D: Disk<File = F>>(
+        disk: &D,
+        name: &str,
+        valid_time: bool,
+    ) -> Result<Self, SegmentError> {
         let mut file = disk.create(name)?;
         let mut header = Vec::with_capacity(HEADER_LEN);
         header.extend_from_slice(&HEADER_MAGIC);
@@ -52,6 +80,7 @@ impl<F: DiskFile> SegmentWriter<F> {
         Ok(Self {
             file,
             rows: Vec::new(),
+            valid_time,
         })
     }
 
@@ -73,11 +102,13 @@ impl<F: DiskFile> SegmentWriter<F> {
     /// in the format's sense — no writer API can reach it.
     pub fn finish(mut self) -> Result<(), SegmentError> {
         // Per-column buffers. Row order is preserved: column i's k-th value
-        // came from `self.rows[k]`.
-        let mut chunks: Vec<EncodedChunk> = Vec::with_capacity(ColumnId::ALL.len());
+        // came from `self.rows[k]`. A valid-time table's schema carries the
+        // two extra `valid_from` / `valid_to` columns ([STL-117]).
+        let schema = ColumnId::schema(self.valid_time);
+        let mut chunks: Vec<EncodedChunk> = Vec::with_capacity(schema.len());
         let mut offset: u64 = HEADER_LEN as u64;
 
-        for &col in &ColumnId::ALL {
+        for &col in schema {
             let encoded = encode_column(col, &self.rows)?;
             // Each chunk is laid out contiguously in `(business_key, sys_from,
             // sys_to, payload)` order. The footer records the absolute
@@ -211,7 +242,14 @@ fn encode_column(col: ColumnId, rows: &[Version]) -> Result<EncodedColumn, Segme
             let mut min: Option<i64> = None;
             let mut max: Option<i64> = None;
             for row in rows {
-                let v = extract_i64(col, row);
+                // The `valid_from` / `valid_to` columns are lifted from the
+                // payload's valid-time prefix (fallible — a truncated frame is
+                // rejected); every other i64 column reads a `Version` field
+                // directly.
+                let v = match col {
+                    ColumnId::ValidFrom | ColumnId::ValidTo => extract_valid_i64(col, row)?,
+                    _ => extract_i64(col, row),
+                };
                 payload.extend_from_slice(&v.to_le_bytes());
                 min = Some(min.map_or(v, |m| m.min(v)));
                 max = Some(max.map_or(v, |m| m.max(v)));
@@ -230,7 +268,12 @@ fn extract_bytes(col: ColumnId, row: &Version) -> &[u8] {
         ColumnId::BusinessKey => row.business_key.as_bytes(),
         ColumnId::Payload => &row.payload,
         ColumnId::Principal => row.provenance.principal.as_bytes(),
-        ColumnId::SysFrom | ColumnId::SysTo | ColumnId::TxnId | ColumnId::CommittedAt => {
+        ColumnId::SysFrom
+        | ColumnId::SysTo
+        | ColumnId::TxnId
+        | ColumnId::CommittedAt
+        | ColumnId::ValidFrom
+        | ColumnId::ValidTo => {
             unreachable!("not a bytes column")
         }
     }
@@ -247,10 +290,32 @@ fn extract_i64(col: ColumnId, row: &Version) -> i64 {
         // round-trip — see `ColumnId::TxnId`).
         ColumnId::TxnId => row.provenance.txn_id.0 as i64,
         ColumnId::CommittedAt => row.provenance.committed_at.0,
+        // The valid-time columns are not `Version` fields — they are lifted
+        // from the payload prefix by `extract_valid_i64`, which the caller
+        // routes to directly.
+        ColumnId::ValidFrom | ColumnId::ValidTo => {
+            unreachable!("valid-time columns are extracted via extract_valid_i64")
+        }
         ColumnId::BusinessKey | ColumnId::Payload | ColumnId::Principal => {
             unreachable!("not an i64 column")
         }
     }
+}
+
+// Lift one of the two valid-time boundaries out of `row`'s payload prefix.
+// Only called for a valid-time table's segment, where every payload was framed
+// by [`crate::validtime::frame_payload`] and therefore carries the prefix; a
+// frame too short to hold it is a malformed input row, surfaced as `Corrupt`.
+fn extract_valid_i64(col: ColumnId, row: &Version) -> Result<i64, SegmentError> {
+    let (interval, _user) = unframe_payload(true, &row.payload).map_err(|_| {
+        SegmentError::Corrupt("valid-time payload too short to lift valid_from/valid_to columns")
+    })?;
+    let interval = interval.expect("valid-time enabled ⇒ unframe yields an interval");
+    Ok(match col {
+        ColumnId::ValidFrom => interval.from.0,
+        ColumnId::ValidTo => interval.to.0,
+        _ => unreachable!("not a valid-time column"),
+    })
 }
 
 fn encode_footer(row_count: usize, chunks: &[EncodedChunk]) -> Result<Vec<u8>, SegmentError> {
