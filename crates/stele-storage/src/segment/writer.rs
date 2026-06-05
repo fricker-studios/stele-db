@@ -19,7 +19,7 @@ use stele_common::time::SYSTEM_TIME_OPEN;
 use crate::backend::{Disk, DiskFile};
 use crate::checksum::crc32c;
 use crate::delta::Version;
-use crate::validtime::unframe_payload;
+use crate::validtime::{VALID_TIME_PREFIX_LEN, unframe_payload};
 
 use super::SegmentError;
 use super::format::{
@@ -38,7 +38,9 @@ pub struct SegmentWriter<F: DiskFile> {
     rows: Vec<Version>,
     /// Whether this segment's table tracks valid-time. When set, [`finish`]
     /// lifts the payload's valid-time prefix into the `valid_from` / `valid_to`
-    /// columns ([STL-117]); when clear, those columns are absent.
+    /// columns ([STL-117]) and stores only the bare user payload in the
+    /// `payload` column ([STL-119]); when clear, those columns are absent and
+    /// the payload is stored verbatim.
     valid_time: bool,
 }
 
@@ -56,7 +58,10 @@ impl<F: DiskFile> SegmentWriter<F> {
     /// table. Every pushed [`Version`]'s payload must carry the 16-byte
     /// valid-time prefix ([`crate::validtime::frame_payload`], [STL-92]);
     /// [`finish`](Self::finish) decodes it into first-class `valid_from` /
-    /// `valid_to` columns so the planner can prune on the valid axis ([STL-117]).
+    /// `valid_to` columns so the planner can prune on the valid axis ([STL-117]),
+    /// then stores only the bare user payload in the `payload` column so the
+    /// interval is not persisted twice ([STL-119]). A reader re-frames the
+    /// payload from the columns ([`crate::validtime::reframe_payload`]).
     ///
     /// Same immutability and `AlreadyExists` semantics as [`Self::create`].
     pub fn create_valid_time<D: Disk<File = F>>(
@@ -226,11 +231,18 @@ fn encode_column(
             // size. The close-provenance principal ([`ColumnId::ClosedByPrincipal`],
             // STL-118) is just another bytes column here — empty on open
             // versions, which collapses to the "no stats" sentinel.
+            //
+            // `valid_pairs` is `Some` exactly for a valid-time segment, where
+            // the `payload` column stores only the bare user payload — the
+            // 16-byte interval prefix is carried by the valid_from / valid_to
+            // columns instead ([STL-119]). `extract_bytes` strips it for the
+            // `Payload` column when that holds.
+            let valid_time = valid_pairs.is_some();
             let mut payload = Vec::new();
             let mut min: Option<&[u8]> = None;
             let mut max: Option<&[u8]> = None;
             for row in rows {
-                let bytes = extract_bytes(col, row);
+                let bytes = extract_bytes(col, row, valid_time)?;
                 let len = u32::try_from(bytes.len()).map_err(|_| {
                     SegmentError::TooLarge("value length exceeds u32::MAX in one chunk")
                 })?;
@@ -314,16 +326,35 @@ fn bounded_max_prefix(value: &[u8]) -> Vec<u8> {
     Vec::new()
 }
 
-fn extract_bytes(col: ColumnId, row: &Version) -> &[u8] {
+fn extract_bytes(col: ColumnId, row: &Version, valid_time: bool) -> Result<&[u8], SegmentError> {
     match col {
-        ColumnId::BusinessKey => row.business_key.as_bytes(),
-        ColumnId::Payload => &row.payload,
-        ColumnId::Principal => row.provenance.principal.as_bytes(),
+        ColumnId::BusinessKey => Ok(row.business_key.as_bytes()),
+        // On a valid-time segment the interval lives in the valid_from /
+        // valid_to columns, so the payload column stores only the bare user
+        // payload — strip the 16-byte prefix rather than persist it twice
+        // ([STL-119]). `decode_valid_pairs` already decoded *and validated*
+        // every row's interval up front, so here we only need to drop the fixed
+        // prefix length — slice it off directly rather than re-parse and
+        // re-validate the interval per row on the flush hot path. The `get`
+        // still guards a truncated payload as `Corrupt`. A system-only segment
+        // stores the payload verbatim.
+        ColumnId::Payload => {
+            if valid_time {
+                row.payload
+                    .get(VALID_TIME_PREFIX_LEN..)
+                    .ok_or(SegmentError::Corrupt(
+                        "valid-time payload shorter than its interval prefix",
+                    ))
+            } else {
+                Ok(&row.payload)
+            }
+        }
+        ColumnId::Principal => Ok(row.provenance.principal.as_bytes()),
         // Empty on an open version; the closing principal's bytes otherwise.
-        ColumnId::ClosedByPrincipal => row
+        ColumnId::ClosedByPrincipal => Ok(row
             .closed_by
             .as_ref()
-            .map_or(&[][..], |c| c.principal.as_bytes()),
+            .map_or(&[][..], |c| c.principal.as_bytes())),
         ColumnId::SysFrom
         | ColumnId::SysTo
         | ColumnId::TxnId

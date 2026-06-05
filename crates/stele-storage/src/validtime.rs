@@ -29,11 +29,16 @@
 //! Whether the prefix is present is governed by the table's catalog flag
 //! (`stele_catalog::TableTemporal::valid_time_enabled`), the same way a columnar
 //! layout is schema-driven rather than self-describing — the reader knows the
-//! schema, so the bytes need carry no tag. The segment writer lifts this prefix
-//! into first-class `valid_from` / `valid_to` columns at flush for zone-map
-//! pruning ([STL-117]) — see
-//! [`SegmentWriter::create_valid_time`](crate::segment::SegmentWriter::create_valid_time);
-//! the [`crate::segment`] zone maps then prune the valid axis generically.
+//! schema, so the bytes need carry no tag. The prefix above is the *delta-tier*
+//! framing: it rides on [`Version::payload`](crate::delta::Version) through the
+//! WAL and memtable. At flush the segment writer lifts the interval into
+//! first-class `valid_from` / `valid_to` columns for zone-map pruning ([STL-117])
+//! and stores only the **bare** user payload in the segment, dropping the now
+//! redundant prefix ([STL-119]) — see
+//! [`SegmentWriter::create_valid_time`](crate::segment::SegmentWriter::create_valid_time).
+//! On read the segment re-frames the payload from those columns
+//! ([`reframe_payload`]) so a reconstructed `Version` is byte-identical; the
+//! [`crate::segment`] zone maps prune the valid axis generically.
 //!
 //! Provenance ([STL-93]) is *not* in the payload: unlike valid-time it is
 //! always-on and first-class, carried as dedicated [`Version`](crate::delta::Version)
@@ -208,6 +213,32 @@ pub fn unframe_payload(
     } else {
         Ok((None, stored))
     }
+}
+
+/// Rebuild the framed payload from a bare user payload and its raw valid-time
+/// boundaries, reproducing byte-for-byte the 16-byte little-endian prefix that
+/// [`frame_payload`] would have stored.
+///
+/// The byte-level inverse of the strip [`unframe_payload`] performs. A
+/// valid-time *segment* stores only the bare payload, with the interval lifted
+/// into first-class `valid_from` / `valid_to` columns ([STL-117]) and the
+/// redundant prefix dropped ([STL-119]); on read the segment recovers the
+/// boundaries from those i64 columns and calls this to reconstruct the framed
+/// payload, so a rebuilt [`crate::delta::Version`] round-trips exactly as
+/// written.
+///
+/// Takes the raw boundary microseconds rather than a [`ValidInterval`] because
+/// that is precisely what the i64 columns yield, and reconstruction must
+/// reproduce the stored bytes verbatim — re-imposing [`ValidInterval::new`]'s
+/// `from < to` check here would only invent a failure mode the stored bytes
+/// cannot exhibit.
+#[must_use]
+pub fn reframe_payload(valid_from: i64, valid_to: i64, user: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(VALID_TIME_PREFIX_LEN + user.len());
+    out.extend_from_slice(&valid_from.to_le_bytes());
+    out.extend_from_slice(&valid_to.to_le_bytes());
+    out.extend_from_slice(user);
+    out
 }
 
 /// Stamps both temporal axes as writes flow into the delta tier: system-time
@@ -403,6 +434,27 @@ mod tests {
             unframe_payload(true, &short),
             Err(ValidTimeError::Truncated)
         ));
+    }
+
+    #[test]
+    fn reframe_is_the_byte_inverse_of_the_segment_strip() {
+        // A valid-time segment stores the bare payload + the interval columns;
+        // `reframe_payload` rebuilds exactly the framed bytes `frame_payload`
+        // produced, so a reconstructed Version round-trips byte-for-byte.
+        let framed = frame_payload(true, Some(iv(7, 42)), b"salary=100".to_vec()).unwrap();
+        let (interval, user) = unframe_payload(true, &framed).unwrap();
+        let interval = interval.unwrap();
+        let reframed = reframe_payload(interval.from.0, interval.to.0, user);
+        assert_eq!(reframed, framed, "reframe rebuilds the exact stored bytes");
+    }
+
+    #[test]
+    fn reframe_handles_an_empty_user_payload() {
+        let reframed = reframe_payload(1, 2, b"");
+        assert_eq!(reframed.len(), VALID_TIME_PREFIX_LEN);
+        let (interval, user) = unframe_payload(true, &reframed).unwrap();
+        assert_eq!(interval, Some(iv(1, 2)));
+        assert!(user.is_empty());
     }
 
     #[test]
