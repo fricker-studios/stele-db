@@ -101,7 +101,8 @@ impl<F: DiskFile> SegmentReader<F> {
 
     /// Schema id stored in the footer. v0.1 always returns `0` (the implicit
     /// `Version` schema); [`Self::open`] rejects any other value, so callers
-    /// can treat this as a constant for as long as the format version is `1`.
+    /// can treat this as a constant while the catalog ([STL-98]) is not yet the
+    /// schema authority.
     #[must_use]
     pub const fn schema_id(&self) -> u32 {
         self.footer.schema_id

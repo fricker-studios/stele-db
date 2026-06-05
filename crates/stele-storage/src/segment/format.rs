@@ -16,7 +16,17 @@ pub(super) const TRAILER_MAGIC: [u8; 8] = *b"STLSEGFT";
 /// On-disk format version embedded in the header. Bump on any
 /// backwards-incompatible layout change; readers refuse newer versions
 /// outright.
-pub(super) const FORMAT_VERSION: u16 = 1;
+///
+/// * **v1** — the four-column implicit `Version` schema (business_key, sys_from,
+///   sys_to, payload).
+/// * **v2** — adds the three always-on provenance columns (`txn_id`,
+///   `committed_at`, `principal`), ids 4..=6 ([STL-93]). This is a
+///   backwards-incompatible layout change: a v1 reader encountering the new
+///   column ids would fail with a confusing `Corrupt("unknown column id")`
+///   mid-footer, so the version bump makes a v1 reader reject a v2 segment
+///   cleanly at the header with [`SegmentError::UnsupportedVersion`](super::SegmentError::UnsupportedVersion)
+///   instead.
+pub(super) const FORMAT_VERSION: u16 = 2;
 
 /// Header size in bytes — magic (8) + version (2) + flags (2) + reserved (4).
 pub(super) const HEADER_LEN: usize = 16;
@@ -30,10 +40,12 @@ pub(super) const CHUNK_HEADER_LEN: usize = 16;
 
 /// Logical schema id stored in the footer.
 ///
-/// v0.1 has exactly one implicit schema — the four `Version` fields — so the
-/// id is hard-coded. Once [STL-98] lands the versioned catalog, this becomes a
-/// real schema reference resolved through the catalog at read time; the
-/// footer field is wide enough already that no format change is needed.
+/// v0.1 has exactly one implicit schema — the seven `Version` columns (the four
+/// data/temporal fields plus the three provenance columns, [`FORMAT_VERSION`]
+/// v2) — so the id is hard-coded. Once [STL-98] lands the versioned catalog,
+/// this becomes a real schema reference resolved through the catalog at read
+/// time; the footer field is wide enough already that no format change is
+/// needed.
 pub(super) const SCHEMA_ID_IMPLICIT_VERSION: u32 = 0;
 
 /// Column codecs the format can describe. v0.1 emits [`Codec::Plain`]; the
