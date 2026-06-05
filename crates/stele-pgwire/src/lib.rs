@@ -720,17 +720,25 @@ mod tests {
 
         let handle = tokio::spawn(Server::new(addr).run());
 
-        // `Server::run` binds asynchronously; connect-retry until it is listening.
+        // `Server::run` binds asynchronously; connect-retry until it is listening
+        // (up to ~2s, generous for a loaded CI runner). Bail out loudly if the
+        // server task itself exits early — e.g. a bind failure — instead of
+        // spinning the whole budget against a socket that will never come up and
+        // then panicking with a misleading "timed out" message.
         let mut maybe_client = None;
-        for _ in 0..100 {
+        for _ in 0..200 {
+            assert!(
+                !handle.is_finished(),
+                "server task exited before accepting a connection (bind error on {addr}?)"
+            );
             if let Ok(c) = TcpStream::connect(addr).await {
                 maybe_client = Some(c);
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         let mut client =
-            maybe_client.expect("server should bind and accept within the retry budget");
+            maybe_client.expect("server should bind and accept within the 2s retry budget");
 
         let mut ssl = BytesMut::with_capacity(8);
         ssl.put_i32(8);
