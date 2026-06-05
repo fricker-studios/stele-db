@@ -69,7 +69,9 @@ pub enum BindError {
 
     /// A schema- or database-qualified name (`schema.table`). v0.1 has a single
     /// implicit namespace, so only bare names resolve unambiguously.
-    #[error("qualified table name {0:?} — only bare names are {ROADMAP}")]
+    #[error(
+        "qualified table name {0:?} — only bare names are supported; qualified names are {ROADMAP}"
+    )]
     QualifiedName(String),
 
     /// A `CREATE TABLE` declared no columns.

@@ -106,7 +106,7 @@ impl Catalog {
     /// Register a table whose first schema version takes effect at system time
     /// `at`.
     ///
-    /// If `name` was previously [`drop`](Self::drop_table)ped, this *continues*
+    /// If `name` was previously dropped via [`drop_table`](Self::drop_table), this *continues*
     /// that name's timeline: a fresh schema version is appended after the gap the
     /// drop left, so a read `AS OF` an instant inside the old, dropped era still
     /// resolves the original schema while reads after `at` see the new one. A
@@ -318,8 +318,10 @@ impl Catalog {
         // table's first version.
         let started = versions.partition_point(|v| v.sys_from <= snapshot);
         let candidate = &versions[started.checked_sub(1)?];
-        // The chain is contiguous, so this `sys_to` check only ever fails at the
-        // `< first.sys_from` edge already handled above — kept for exactness.
+        // A dropped (and possibly re-created) name can leave gaps between
+        // versions, so this `sys_to` check also rejects a snapshot that falls
+        // past the candidate's end — whether that is the dropped era's tail or a
+        // gap before the next re-creation.
         (snapshot < candidate.sys_to).then_some(&candidate.schema)
     }
 

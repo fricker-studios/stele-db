@@ -125,10 +125,16 @@ fn table_level_constraints_and_ctas_and_qualified_names_are_rejected() {
         bind_one("CREATE TABLE t AS SELECT 1"),
         Err(BindError::Unsupported(_))
     ));
-    assert!(matches!(
-        bind_one("CREATE TABLE public.t (id INT) WITH SYSTEM VERSIONING"),
-        Err(BindError::QualifiedName(_))
-    ));
+    let qualified = bind_one("CREATE TABLE public.t (id INT) WITH SYSTEM VERSIONING")
+        .expect_err("qualified name");
+    assert!(matches!(qualified, BindError::QualifiedName(_)));
+    // The diagnostic must not read as if bare names were the unsupported ones.
+    let msg = qualified.to_string();
+    assert!(
+        msg.contains("only bare names are supported")
+            && msg.contains("qualified names are not supported"),
+        "confusing qualified-name diagnostic: {msg}"
+    );
 }
 
 #[test]
