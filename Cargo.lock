@@ -437,6 +437,7 @@ dependencies = [
  "clap",
  "stele-common",
  "stele-storage",
+ "stele-txn",
 ]
 
 [[package]]
@@ -463,6 +464,7 @@ version = "0.1.0"
 dependencies = [
  "stele-common",
  "stele-storage",
+ "thiserror",
 ]
 
 [[package]]
