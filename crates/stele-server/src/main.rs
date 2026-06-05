@@ -19,6 +19,7 @@ struct Args {
     listen: SocketAddr,
 
     /// Dev mode: verbose tracing, no auth, scratch storage. Never enable in production.
+    /// Ignored when `--config` is given — a config file always runs in non-dev mode.
     #[arg(long, default_value_t = true)]
     dev: bool,
 

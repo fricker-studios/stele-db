@@ -33,6 +33,8 @@ enum Cmd {
 struct ServerArgs {
     #[arg(long)]
     listen: Option<std::net::SocketAddr>,
+    /// Dev mode: verbose tracing, no auth, scratch storage.
+    /// Ignored when `--config` is given — a config file always runs in non-dev mode.
     #[arg(long, default_value_t = true)]
     dev: bool,
     /// Path to a `stele.toml`. When set, config (including `[storage] backend`)
@@ -46,7 +48,8 @@ fn main() -> anyhow::Result<()> {
     match args.cmd {
         Cmd::Server(s) => {
             let cfg = match s.config {
-                // The file owns configuration; `--listen` still overrides the port.
+                // The file owns configuration; `--listen` still overrides the
+                // full listen address (host + port). `--dev` has no effect here.
                 Some(path) => {
                     let mut cfg = stele_server::Config::load(path)?;
                     if let Some(addr) = s.listen {
