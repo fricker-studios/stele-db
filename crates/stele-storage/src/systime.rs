@@ -64,7 +64,7 @@
 //! Once a key's open version has been flushed into a **sealed segment**, the
 //! close can no longer re-stage it — invariant 1 forbids mutating a sealed
 //! segment. [`SysTimeWriter::update`] / [`SysTimeWriter::delete`] then append a
-//! [`CloseMarker`](crate::delta::CloseMarker) instead, naming the sealed
+//! [`CloseMarker`] instead, naming the sealed
 //! version and the new `sys_to`; the read path ([`crate::merge`]) folds the
 //! marker onto the sealed version to surface the closed interval. The writer
 //! tells the two cases apart through the [`SealedLookup`] it is handed ([STL-127]).
@@ -230,7 +230,10 @@ impl<C: Clock> SysTimeWriter<C> {
         if resolve_live(delta, sealed, &key, commit)?.is_some() {
             return Err(SysTimeError::KeyExists);
         }
-        apply(delta, vec![open_version(key, commit, payload, txn_id, principal)])?;
+        apply(
+            delta,
+            vec![open_version(key, commit, payload, txn_id, principal)],
+        )?;
         Ok(commit)
     }
 
@@ -265,7 +268,10 @@ impl<C: Clock> SysTimeWriter<C> {
         // identity as `closed_by`) and opens the new one — same `txn_id` /
         // `principal` for both halves.
         close_prior(delta, sealed, &key, commit, txn_id, principal.clone())?;
-        apply(delta, vec![open_version(key, commit, payload, txn_id, principal)])?;
+        apply(
+            delta,
+            vec![open_version(key, commit, payload, txn_id, principal)],
+        )?;
         Ok(commit)
     }
 
