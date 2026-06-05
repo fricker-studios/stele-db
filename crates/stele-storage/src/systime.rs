@@ -29,8 +29,17 @@
 //! timestamps it is stamped with strictly increase. [`SysTimeWriter`] guarantees
 //! that locally: each commit timestamp is `max(clock.now(), previous + 1)`, so a
 //! stalled or regressing wall clock can never produce two versions with the same
-//! `sys_from` or an out-of-order close. Global commit ordering across
-//! transactions (and, later, across nodes) is the transaction manager's job
+//! `sys_from` or an out-of-order close.
+//!
+//! **Scope of the guard.** The `previous + 1` high-water mark lives *in the
+//! writer instance* — it starts empty on [`SysTimeWriter::new`] and resets if the
+//! writer is recreated (e.g. after a restart). So the monotonicity guarantee
+//! holds *within one writer's lifetime*, not across restarts: a caller that
+//! constructs a fresh writer must supply a commit clock that does not read
+//! earlier than the newest `sys_from` already persisted — otherwise the first
+//! commit of the new writer could stamp behind existing versions. Re-establishing
+//! that high-water mark on recovery, and global commit ordering across
+//! transactions and (later) nodes, is the transaction manager's job
 //! ([architecture §9](../../../docs/02-architecture.md#9-transaction--concurrency-model),
 //! [ADR-0022](../../../docs/adr/0022-clock-synchronization-and-ordering.md)); this
 //! guard is what keeps the single-writer storage path correct on its own.
@@ -60,6 +69,15 @@ pub enum SysTimeError {
     /// live version — nothing to close.
     #[error("business key has no live version")]
     KeyNotFound,
+
+    /// The system-time domain is exhausted: the next commit timestamp would
+    /// reach the `+∞` open sentinel ([`SYSTEM_TIME_OPEN`]). A `sys_from` at the
+    /// sentinel would be indistinguishable from an open period and break
+    /// snapshot resolution, so the write is refused instead. Practically
+    /// unreachable — it needs a clock reading at `i64::MAX` or ~9.2e18 commits —
+    /// but enforced in **all** builds, not just debug.
+    #[error("system-time domain exhausted: next commit would reach the +∞ sentinel")]
+    TimeExhausted,
 
     /// An error bubbled up from the delta tier (I/O on a spill, or a frame too
     /// large to encode).
@@ -110,7 +128,7 @@ impl<C: Clock> SysTimeWriter<C> {
         key: BusinessKey,
         payload: Vec<u8>,
     ) -> Result<SystemTimeMicros, SysTimeError> {
-        let commit = self.next_commit_ts();
+        let commit = self.next_commit_ts()?;
         if current_open(delta, &key, commit)?.is_some() {
             return Err(SysTimeError::KeyExists);
         }
@@ -134,7 +152,7 @@ impl<C: Clock> SysTimeWriter<C> {
         key: BusinessKey,
         payload: Vec<u8>,
     ) -> Result<SystemTimeMicros, SysTimeError> {
-        let commit = self.next_commit_ts();
+        let commit = self.next_commit_ts()?;
         close_prior(delta, &key, commit)?;
         delta.insert(open_version(key, commit, payload))?;
         Ok(commit)
@@ -154,25 +172,34 @@ impl<C: Clock> SysTimeWriter<C> {
         delta: &mut Delta<D>,
         key: &BusinessKey,
     ) -> Result<SystemTimeMicros, SysTimeError> {
-        let commit = self.next_commit_ts();
+        let commit = self.next_commit_ts()?;
         close_prior(delta, key, commit)?;
         Ok(commit)
     }
 
     /// Allocate the next commit timestamp: at least the clock's reading, and
     /// strictly greater than the previous one. See the [module docs](self).
-    fn next_commit_ts(&mut self) -> SystemTimeMicros {
+    ///
+    /// # Errors
+    ///
+    /// [`SysTimeError::TimeExhausted`] if the next timestamp would reach the
+    /// `+∞` open sentinel — refused in all builds so a real `sys_from` can never
+    /// masquerade as an open period. `last_commit` is left untouched on error,
+    /// so a retry behaves identically.
+    fn next_commit_ts(&mut self) -> Result<SystemTimeMicros, SysTimeError> {
         let now = self.clock.now();
         let ts = match self.last_commit {
             Some(prev) if now <= prev => SystemTimeMicros(prev.0.saturating_add(1)),
             _ => now,
         };
-        // The open sentinel is +∞; a real commit must stay strictly below it so
-        // it can never be mistaken for an open period. Reaching this bound takes
-        // ~9.2e18 commits, so it is an assertion, not a runtime branch.
-        debug_assert_ne!(ts, SYSTEM_TIME_OPEN, "commit timestamp reached +∞ sentinel");
+        // A commit must stay strictly below the +∞ open sentinel, or it would be
+        // indistinguishable from an open period. Enforced in every build, not
+        // just via debug_assert — the cost is one comparison.
+        if ts >= SYSTEM_TIME_OPEN {
+            return Err(SysTimeError::TimeExhausted);
+        }
         self.last_commit = Some(ts);
-        ts
+        Ok(ts)
     }
 }
 
@@ -247,20 +274,51 @@ mod tests {
         let clock = StubClock::new(100);
         let mut writer = SysTimeWriter::new(clock);
 
-        let a = writer.next_commit_ts();
+        let a = writer.next_commit_ts().unwrap();
         // Clock does not move: the guard must still advance.
-        let b = writer.next_commit_ts();
+        let b = writer.next_commit_ts().unwrap();
         // Clock regresses: still must advance.
         writer.clock.set(50);
-        let c = writer.next_commit_ts();
+        let c = writer.next_commit_ts().unwrap();
         // Clock jumps far ahead: take the larger value.
         writer.clock.set(10_000);
-        let d = writer.next_commit_ts();
+        let d = writer.next_commit_ts().unwrap();
 
         assert_eq!(a, SystemTimeMicros(100));
         assert_eq!(b, SystemTimeMicros(101));
         assert_eq!(c, SystemTimeMicros(102));
         assert_eq!(d, SystemTimeMicros(10_000));
         assert!(a < b && b < c && c < d);
+    }
+
+    #[test]
+    fn commit_at_the_open_sentinel_is_refused_in_all_builds() {
+        // A clock reading at the +∞ sentinel must not be stamped as a real
+        // commit — it would be indistinguishable from an open period. Enforced
+        // via a typed error, not a debug-only assertion.
+        let clock = StubClock::new(SYSTEM_TIME_OPEN.0);
+        let mut writer = SysTimeWriter::new(clock);
+        assert!(matches!(
+            writer.next_commit_ts(),
+            Err(SysTimeError::TimeExhausted)
+        ));
+        // The failed allocation left no high-water mark behind.
+        assert_eq!(writer.last_commit(), None);
+    }
+
+    #[test]
+    fn commit_one_below_the_sentinel_is_allowed_but_the_next_is_refused() {
+        // The monotonic guard would push the *next* commit to the sentinel; that
+        // step must fail rather than wrap into +∞.
+        let clock = StubClock::new(SYSTEM_TIME_OPEN.0 - 1);
+        let mut writer = SysTimeWriter::new(clock);
+        assert_eq!(
+            writer.next_commit_ts().unwrap(),
+            SystemTimeMicros(SYSTEM_TIME_OPEN.0 - 1)
+        );
+        assert!(matches!(
+            writer.next_commit_ts(),
+            Err(SysTimeError::TimeExhausted)
+        ));
     }
 }
