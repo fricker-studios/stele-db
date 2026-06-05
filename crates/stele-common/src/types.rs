@@ -13,7 +13,7 @@
 //!    self-describing-given-the-type byte encoding ([`ScalarValue::encode`] /
 //!    [`ScalarValue::decode`]). This is the "stored exactly, read back exactly"
 //!    contract the ticket's round-trip Definition of Done rests on.
-//! 3. [`Codec`] — the *choice* of physical encoding for a column. The on-disk
+//! 3. [`ColumnCodec`] — the *choice* of physical encoding for a column. The on-disk
 //!    codec tag in the segment writer is a separate, storage-private concern;
 //!    this enum is the planner-facing policy ([architecture §3.2](../../../docs/02-architecture.md#32-on-disk-segment-format)).
 //!
@@ -27,7 +27,7 @@
 //!   `Option<ScalarValue>` at the column/cell — keeping NULL out of the value
 //!   enum means [`ScalarValue::logical_type`] is total, never ambiguous.
 //! * **Not** the storage codec implementations. v0.1 storage emits only the
-//!   plain layout; [`Codec::Dictionary`] / [`Codec::Delta`] are the *intended*
+//!   plain layout; [`ColumnCodec::Dictionary`] / [`ColumnCodec::Delta`] are the *intended*
 //!   choice per type and are honored as those codecs land in the segment writer
 //!   (the format already dispatches on a per-chunk codec tag, so they drop in
 //!   without an on-disk format bump).
@@ -154,23 +154,23 @@ impl LogicalType {
     /// This is the per-column *choice* the ticket calls for, expressed as
     /// type-directed policy rather than baked into the writer:
     ///
-    /// * [`Codec::Dictionary`] for [`Self::Text`] — string columns are usually
+    /// * [`ColumnCodec::Dictionary`] for [`Self::Text`] — string columns are usually
     ///   low-cardinality (statuses, enums, country codes), where a dictionary
     ///   collapses repeats hard.
-    /// * [`Codec::Delta`] for [`Self::Timestamp`] and [`Self::Date`] — temporal
+    /// * [`ColumnCodec::Delta`] for [`Self::Timestamp`] and [`Self::Date`] — temporal
     ///   columns trend monotonic, so successive deltas are tiny.
-    /// * [`Codec::Plain`] for the fixed-width numerics and `bool`, which a
+    /// * [`ColumnCodec::Plain`] for the fixed-width numerics and `bool`, which a
     ///   general codec rarely beats at v0.1 scale.
     ///
-    /// The choice is advisory: storage may fall back to [`Codec::Plain`] for any
+    /// The choice is advisory: storage may fall back to [`ColumnCodec::Plain`] for any
     /// column until the richer codecs land in the segment writer, since the
     /// per-chunk codec tag is the dispatch point ([architecture §3.2](../../../docs/02-architecture.md#32-on-disk-segment-format)).
     #[must_use]
-    pub const fn default_codec(self) -> Codec {
+    pub const fn default_codec(self) -> ColumnCodec {
         match self {
-            Self::Text => Codec::Dictionary,
-            Self::Timestamp | Self::Date => Codec::Delta,
-            Self::Int4 | Self::Int8 | Self::Bool => Codec::Plain,
+            Self::Text => ColumnCodec::Dictionary,
+            Self::Timestamp | Self::Date => ColumnCodec::Delta,
+            Self::Int4 | Self::Int8 | Self::Bool => ColumnCodec::Plain,
         }
     }
 }
@@ -189,7 +189,7 @@ impl fmt::Display for LogicalType {
 /// other variants are the chosen default for their types ([`LogicalType::default_codec`])
 /// and become effective as the writer grows to honor them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Codec {
+pub enum ColumnCodec {
     /// Verbatim, fixed- or length-prefixed layout. The universal fallback.
     Plain,
     /// Dictionary + small codes — wins on low-cardinality columns (most `TEXT`).
@@ -368,12 +368,12 @@ mod tests {
 
     #[test]
     fn default_codec_follows_the_documented_policy() {
-        assert_eq!(LogicalType::Text.default_codec(), Codec::Dictionary);
-        assert_eq!(LogicalType::Timestamp.default_codec(), Codec::Delta);
-        assert_eq!(LogicalType::Date.default_codec(), Codec::Delta);
-        assert_eq!(LogicalType::Int4.default_codec(), Codec::Plain);
-        assert_eq!(LogicalType::Int8.default_codec(), Codec::Plain);
-        assert_eq!(LogicalType::Bool.default_codec(), Codec::Plain);
+        assert_eq!(LogicalType::Text.default_codec(), ColumnCodec::Dictionary);
+        assert_eq!(LogicalType::Timestamp.default_codec(), ColumnCodec::Delta);
+        assert_eq!(LogicalType::Date.default_codec(), ColumnCodec::Delta);
+        assert_eq!(LogicalType::Int4.default_codec(), ColumnCodec::Plain);
+        assert_eq!(LogicalType::Int8.default_codec(), ColumnCodec::Plain);
+        assert_eq!(LogicalType::Bool.default_codec(), ColumnCodec::Plain);
     }
 
     #[test]
