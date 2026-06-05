@@ -35,17 +35,34 @@ struct ServerArgs {
     listen: Option<std::net::SocketAddr>,
     #[arg(long, default_value_t = true)]
     dev: bool,
+    /// Path to a `stele.toml`. When set, config (including `[storage] backend`)
+    /// comes from the file instead of dev defaults.
+    #[arg(long)]
+    config: Option<std::path::PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.cmd {
         Cmd::Server(s) => {
-            let mut cfg = stele_server::Config::default();
-            if let Some(addr) = s.listen {
-                cfg.listen = addr;
-            }
-            cfg.dev = s.dev;
+            let cfg = match s.config {
+                // The file owns configuration; `--listen` still overrides the port.
+                Some(path) => {
+                    let mut cfg = stele_server::Config::load(path)?;
+                    if let Some(addr) = s.listen {
+                        cfg.listen = addr;
+                    }
+                    cfg
+                }
+                None => {
+                    let mut cfg = stele_server::Config::dev();
+                    if let Some(addr) = s.listen {
+                        cfg.listen = addr;
+                    }
+                    cfg.dev = s.dev;
+                    cfg
+                }
+            };
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?

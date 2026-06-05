@@ -19,9 +19,12 @@ path = "src/main.rs"
 [dependencies]
 stele-pgwire       = { workspace = true }
 stele-lineage      = { workspace = true }
+stele-storage      = { workspace = true }
 stele-common       = { workspace = true }
 anyhow             = { workspace = true }
 clap               = { workspace = true }
+serde              = { workspace = true }
+toml               = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -3,36 +3,151 @@
 //! Kept thin: the `main` binary parses args and invokes [`run`].
 //! `stele-cli` depends on this crate so that `stele server …` can dispatch the
 //! same code path as `stele-server` directly.
+//!
+//! ## Configuration
+//!
+//! Operators run with a `stele.toml` ([05 — configuration](../../../docs/05-dev-environment.md#configuration));
+//! [`Config::from_toml_str`] / [`Config::load`] parse it. The five-minute path
+//! needs no file: [`Config::dev`] supplies safe defaults (a local backend under a
+//! scratch dir). [STL-116] wires the `[storage] backend` selection through to the
+//! [`AnyDisk`] the engine constructs at boot.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use serde::Deserialize;
 use stele_common::DEFAULT_PG_PORT;
 use stele_pgwire::Server as PgServer;
+use stele_storage::backend::{AnyDisk, BackendKind};
 use tokio::signal;
 use tracing::info;
 
-/// Engine configuration. Plenty more knobs will land — keep this struct as the
-/// single point everyone reads from.
-#[derive(Debug, Clone, Copy)]
+/// Default data directory for non-dev runs that omit `[server] data_dir`
+/// (matches the `stele.toml` example in [05 — configuration](../../../docs/05-dev-environment.md#configuration)).
+const DEFAULT_DATA_DIR: &str = "/var/lib/stele";
+
+/// Resolved engine configuration — the single point everyone reads from.
+///
+/// Built either from defaults ([`Config::dev`]) or a parsed `stele.toml`
+/// ([`Config::from_toml_str`] / [`Config::load`]). Plenty more knobs will land.
+#[derive(Debug, Clone)]
 pub struct Config {
+    /// pg-wire listen address.
     pub listen: SocketAddr,
+    /// Dev mode: verbose tracing, no auth, scratch storage.
     pub dev: bool,
+    /// Which storage backend the engine boots on.
+    pub backend: BackendKind,
+    /// Data directory the `local` backend roots itself at (ignored by `memory`).
+    pub data_dir: PathBuf,
+}
+
+impl Config {
+    /// Dev defaults — the five-minute path, no config file required: local
+    /// backend in a per-process scratch dir, verbose tracing
+    /// ([05](../../../docs/05-dev-environment.md#configuration)).
+    #[must_use]
+    pub fn dev() -> Self {
+        Self {
+            listen: default_listen(),
+            dev: true,
+            backend: BackendKind::Local,
+            data_dir: dev_scratch_dir(),
+        }
+    }
+
+    /// Parse a `stele.toml` document into a `Config` (a non-dev, operator run).
+    ///
+    /// # Errors
+    /// Returns an error if the TOML is malformed or `[storage] backend` is not a
+    /// recognized backend name.
+    pub fn from_toml_str(s: &str) -> anyhow::Result<Self> {
+        let file: FileConfig = toml::from_str(s).context("parsing stele.toml")?;
+        file.resolve()
+    }
+
+    /// Read and parse `stele.toml` from `path`.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be read, the TOML is malformed, or
+    /// `[storage] backend` is invalid.
+    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading config file {}", path.display()))?;
+        Self::from_toml_str(&text)
+    }
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PG_PORT),
-            dev: true,
-        }
+        Self::dev()
     }
 }
 
-/// Boot the engine: install tracing, start the pgwire listener, wait for SIGINT.
+/// The raw `stele.toml` shape this ticket models. Unknown sections (`[wal]`,
+/// `[telemetry]`, `[storage.cache]`, …) are ignored by serde, so a richer config
+/// file still parses — those knobs land in later tickets.
+#[derive(Debug, Default, Deserialize)]
+struct FileConfig {
+    #[serde(default)]
+    server: ServerSection,
+    #[serde(default)]
+    storage: StorageSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ServerSection {
+    listen: Option<SocketAddr>,
+    data_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StorageSection {
+    /// Kept as a raw string so the parse error (and its clear message) is owned
+    /// by [`BackendKind`]'s [`FromStr`](std::str::FromStr), not serde.
+    backend: Option<String>,
+}
+
+impl FileConfig {
+    fn resolve(self) -> anyhow::Result<Config> {
+        let backend = match self.storage.backend.as_deref() {
+            Some(s) => s
+                .parse::<BackendKind>()
+                .map_err(|e| anyhow::anyhow!("[storage] {e}"))?,
+            None => BackendKind::Local,
+        };
+        Ok(Config {
+            listen: self.server.listen.unwrap_or_else(default_listen),
+            dev: false,
+            backend,
+            data_dir: self
+                .server
+                .data_dir
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR)),
+        })
+    }
+}
+
+/// Boot the engine: install tracing, construct the configured storage backend,
+/// start the pgwire listener, wait for SIGINT.
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     init_tracing(cfg.dev);
     info!(?cfg, "stele-server: starting");
+
+    // Construct the backend the operator selected. The WAL + delta + segment
+    // assembly site (a later ticket) will take this `disk`; for now constructing
+    // it proves the `[storage] backend` wiring end-to-end and surfaces a clear
+    // error if e.g. the local data dir is not creatable.
+    let disk = AnyDisk::open(cfg.backend, &cfg.data_dir)
+        .with_context(|| format!("opening {} storage backend", cfg.backend))?;
+    info!(
+        backend = %cfg.backend,
+        data_dir = %cfg.data_dir.display(),
+        "storage backend ready"
+    );
+    let _ = disk;
 
     let pg = PgServer::new(cfg.listen);
 
@@ -43,6 +158,16 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+const fn default_listen() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PG_PORT)
+}
+
+/// A per-process scratch directory for `--dev`, under the OS temp dir so a fresh
+/// clone needs no setup and leaves nothing behind in the source tree.
+fn dev_scratch_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("stele-dev-{}", std::process::id()))
 }
 
 fn init_tracing(dev: bool) {
@@ -57,4 +182,68 @@ fn init_tracing(dev: bool) {
         .with_target(true)
         .with_level(true)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_backend_parses_from_storage_section() {
+        let cfg = Config::from_toml_str("[storage]\nbackend = \"memory\"\n").unwrap();
+        assert_eq!(cfg.backend, BackendKind::Memory);
+        assert!(!cfg.dev);
+    }
+
+    #[test]
+    fn local_backend_uses_configured_data_dir() {
+        let toml = "[server]\ndata_dir = \"/srv/stele\"\n[storage]\nbackend = \"local\"\n";
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.backend, BackendKind::Local);
+        assert_eq!(cfg.data_dir, PathBuf::from("/srv/stele"));
+    }
+
+    #[test]
+    fn listen_is_parsed_from_server_section() {
+        let cfg = Config::from_toml_str("[server]\nlisten = \"127.0.0.1:6000\"\n").unwrap();
+        assert_eq!(cfg.listen, "127.0.0.1:6000".parse().unwrap());
+    }
+
+    #[test]
+    fn missing_storage_section_defaults_to_local() {
+        let cfg = Config::from_toml_str("[server]\ndata_dir = \"/srv/stele\"\n").unwrap();
+        assert_eq!(cfg.backend, BackendKind::Local);
+    }
+
+    #[test]
+    fn empty_config_defaults_to_local_and_default_data_dir() {
+        let cfg = Config::from_toml_str("").unwrap();
+        assert_eq!(cfg.backend, BackendKind::Local);
+        assert_eq!(cfg.data_dir, PathBuf::from(DEFAULT_DATA_DIR));
+        assert_eq!(cfg.listen, default_listen());
+    }
+
+    #[test]
+    fn invalid_backend_is_a_clear_config_error() {
+        let err = Config::from_toml_str("[storage]\nbackend = \"s3\"\n").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("[storage]"), "{msg}");
+        assert!(msg.contains("\"s3\""), "{msg}");
+        assert!(msg.contains("local") && msg.contains("memory"), "{msg}");
+    }
+
+    #[test]
+    fn unknown_sections_are_ignored() {
+        // A forward-compatible file with knobs this ticket doesn't model yet.
+        let toml = "[storage]\nbackend = \"memory\"\n\n[wal]\nfsync = \"on_commit\"\n\n[telemetry]\ntracing = \"info\"\n";
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.backend, BackendKind::Memory);
+    }
+
+    #[test]
+    fn dev_defaults_to_local_in_scratch() {
+        let cfg = Config::dev();
+        assert!(cfg.dev);
+        assert_eq!(cfg.backend, BackendKind::Local);
+    }
 }
