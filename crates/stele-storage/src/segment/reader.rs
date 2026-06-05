@@ -30,6 +30,7 @@ use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
 use crate::backend::{Disk, DiskFile};
 use crate::checksum::crc32c;
 use crate::delta::{BusinessKey, Version};
+use crate::validtime::reframe_payload;
 
 use super::SegmentError;
 use super::format::{
@@ -242,6 +243,36 @@ impl<F: DiskFile> SegmentReader<F> {
                 "per-column value counts disagree within row-group",
             ));
         }
+        // On a valid-time segment the payload column holds only the bare user
+        // payload ([STL-119]); re-frame each one in place from the first-class
+        // valid_from / valid_to columns so the reconstructed Version is
+        // byte-for-byte what was written. The footer carrying the valid-time
+        // columns is the signal — the read path stays oblivious to whether the
+        // stored bytes were framed or split. The row loop below `mem::take`s the
+        // reframed bytes out.
+        //
+        // The two columns are written as a pair, so they must be present
+        // together: exactly one present is a corrupt footer (or an unsupported
+        // schema) that would otherwise silently return unframed payloads.
+        let has_valid_from = self.has_column(ColumnId::ValidFrom);
+        let has_valid_to = self.has_column(ColumnId::ValidTo);
+        if has_valid_from != has_valid_to {
+            return Err(SegmentError::Corrupt(
+                "valid-time columns must be present as a pair (valid_from with valid_to)",
+            ));
+        }
+        if has_valid_from {
+            let valid_from = self.read_i64_column(ColumnId::ValidFrom)?;
+            let valid_to = self.read_i64_column(ColumnId::ValidTo)?;
+            if valid_from.len() != n || valid_to.len() != n {
+                return Err(SegmentError::Corrupt(
+                    "valid-time column value counts disagree within row-group",
+                ));
+            }
+            for i in 0..n {
+                payloads[i] = reframe_payload(valid_from[i], valid_to[i], &payloads[i]);
+            }
+        }
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             // `ClosedAt`'s `SYSTEM_TIME_OPEN` sentinel is the presence
@@ -294,6 +325,16 @@ impl<F: DiskFile> SegmentReader<F> {
             }
         }
         seen.then_some(total)
+    }
+
+    /// Whether any row-group declares `col` in the footer. Footer-derived, so
+    /// it costs no column-chunk I/O — the cheap test for an opt-in column such
+    /// as the valid-time pair ([`ColumnId::ValidFrom`] / [`ColumnId::ValidTo`]).
+    fn has_column(&self, col: ColumnId) -> bool {
+        self.footer
+            .row_groups
+            .iter()
+            .any(|rg| rg.columns.iter().any(|c| c.column_id == col))
     }
 }
 

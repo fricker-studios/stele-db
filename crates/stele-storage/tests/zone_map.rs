@@ -31,7 +31,7 @@ use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros, ValidTimeMicros};
 use stele_storage::delta::{BusinessKey, Snapshot, Version};
 use stele_storage::segment::{ColumnId, Predicate, SegmentReader, SegmentWriter, ZoneBound};
-use stele_storage::validtime::{ValidInterval, frame_payload};
+use stele_storage::validtime::{VALID_TIME_PREFIX_LEN, ValidInterval, frame_payload};
 use stele_storage::wal::{Disk, DiskFile};
 
 // --- CountingDisk: a MemDisk that counts read_at calls ----------------------
@@ -551,6 +551,51 @@ fn valid_time_columns_populate_zone_map_and_round_trip() {
 
     let read = r.read_versions().expect("read versions");
     assert_eq!(read, rows.to_vec(), "framed payload round-trips unchanged");
+}
+
+/// DoD ([STL-119]): a valid-time segment stores each user payload exactly once.
+/// The 16-byte interval prefix lives only in the `valid_from` / `valid_to`
+/// columns — it is *not* duplicated in the `payload` column. Proven by comparing
+/// the payload column's on-disk byte size against a system-only segment storing
+/// the same bare user payloads: equal means no prefix duplication (a v3-style
+/// segment that kept the prefix would be `16 * row_count` bytes larger).
+#[test]
+fn valid_time_segment_stores_user_payload_once() {
+    let disk = CountingDisk::new();
+
+    // The valid-time rows carry `b"row"` as their *user* payload (see
+    // `valid_version`), framed with an interval. The system-only rows store the
+    // same bare `b"row"`. The interval must not inflate the payload column.
+    let vt_rows = [
+        valid_version(b"a", 30, 90),
+        valid_version(b"b", 10, 100),
+        valid_version(b"c", 20, 80),
+    ];
+    write_valid_segment(&disk, "vt-once.seg", &vt_rows);
+
+    let sys_rows = [
+        version(b"a", 0, SYSTEM_TIME_OPEN.0, b"row"),
+        version(b"b", 0, SYSTEM_TIME_OPEN.0, b"row"),
+        version(b"c", 0, SYSTEM_TIME_OPEN.0, b"row"),
+    ];
+    write_segment(&disk, "sys-once.seg", &sys_rows);
+
+    let vt = SegmentReader::open(&disk, "vt-once.seg").expect("open vt");
+    let sys = SegmentReader::open(&disk, "sys-once.seg").expect("open sys");
+
+    let vt_payload = vt
+        .column_byte_len(ColumnId::Payload)
+        .expect("vt payload column present");
+    let sys_payload = sys
+        .column_byte_len(ColumnId::Payload)
+        .expect("sys payload column present");
+    assert_eq!(
+        vt_payload,
+        sys_payload,
+        "valid-time payload column must store only the bare user payload — no \
+         duplicated interval prefix (would be {} bytes larger)",
+        VALID_TIME_PREFIX_LEN * vt_rows.len()
+    );
 }
 
 /// A system-only table opts out of valid-time, so its segment carries no

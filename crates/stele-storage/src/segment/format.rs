@@ -34,7 +34,8 @@ pub(super) const TRAILER_MAGIC: [u8; 8] = *b"STLSEGFT";
 ///   source of truth for which columns a given segment actually holds; the
 ///   version marks the generation, and bumping it makes a v2 reader reject a
 ///   valid-time segment cleanly at the header rather than choking on column
-///   id 7 mid-footer.
+///   id 7 mid-footer. v3 still stored the interval *twice* — once as the
+///   columns, once as the surviving 16-byte payload prefix.
 /// * **v4** — adds the three always-on close-provenance columns
 ///   (`closed_by_txn`, `closed_at`, `closed_by_principal`), ids 9..=11
 ///   ([STL-118]): who closed each version's system-time period and when. Like
@@ -43,7 +44,18 @@ pub(super) const TRAILER_MAGIC: [u8; 8] = *b"STLSEGFT";
 ///   sentinel (`SYSTEM_TIME_OPEN`) to mean "not closed". Same
 ///   backwards-incompatible reasoning as v2/v3: a new column-id set is a clean
 ///   header-level reject for an older reader.
-pub(super) const FORMAT_VERSION: u16 = 4;
+/// * **v5** — stops duplicating the valid-time interval ([STL-119]). A
+///   valid-time segment now stores only the *bare* user payload in the
+///   `payload` column; the interval lives solely in `valid_from` / `valid_to`,
+///   and the reader re-frames the payload from those columns on read
+///   ([`crate::validtime::reframe_payload`]). This is a backwards-incompatible
+///   change to the `payload` column's meaning for valid-time segments — a v4
+///   reader would return a bare payload, and reading a v4 segment with a v5
+///   reader would double-frame it — so the version bump makes the two
+///   generations reject each other at the header rather than silently corrupt
+///   the payload. System-only segments are byte-identical to v4; the bump
+///   covers them too so one generation number describes the whole format.
+pub(super) const FORMAT_VERSION: u16 = 5;
 
 /// Header size in bytes — magic (8) + version (2) + flags (2) + reserved (4).
 pub(super) const HEADER_LEN: usize = 16;
