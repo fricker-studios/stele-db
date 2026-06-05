@@ -15,3 +15,5 @@ workspace = true
 [dependencies]
 stele-catalog = { workspace = true }
 stele-common  = { workspace = true }
+sqlparser     = { workspace = true }
+thiserror     = { workspace = true }
