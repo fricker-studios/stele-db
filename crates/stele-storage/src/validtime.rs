@@ -29,9 +29,11 @@
 //! Whether the prefix is present is governed by the table's catalog flag
 //! (`stele_catalog::TableTemporal::valid_time_enabled`), the same way a columnar
 //! layout is schema-driven rather than self-describing — the reader knows the
-//! schema, so the bytes need carry no tag. A future segment writer can lift the
-//! prefix into real `valid_from` / `valid_to` columns for zone-map pruning (the
-//! [`crate::segment`] zone maps already handle them generically).
+//! schema, so the bytes need carry no tag. The segment writer lifts this prefix
+//! into first-class `valid_from` / `valid_to` columns at flush for zone-map
+//! pruning ([STL-117]) — see
+//! [`SegmentWriter::create_valid_time`](crate::segment::SegmentWriter::create_valid_time);
+//! the [`crate::segment`] zone maps then prune the valid axis generically.
 //!
 //! Provenance ([STL-93]) is *not* in the payload: unlike valid-time it is
 //! always-on and first-class, carried as dedicated [`Version`](crate::delta::Version)

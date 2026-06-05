@@ -26,7 +26,16 @@ pub(super) const TRAILER_MAGIC: [u8; 8] = *b"STLSEGFT";
 ///   mid-footer, so the version bump makes a v1 reader reject a v2 segment
 ///   cleanly at the header with [`SegmentError::UnsupportedVersion`](super::SegmentError::UnsupportedVersion)
 ///   instead.
-pub(super) const FORMAT_VERSION: u16 = 2;
+/// * **v3** — adds the per-table opt-in valid-time pair (`valid_from`,
+///   `valid_to`), ids 7..=8 ([STL-117]). Unlike provenance these are *not*
+///   on every segment: only a valid-time table's segments carry them, lifted
+///   from the payload's 16-byte prefix ([`crate::validtime`], [STL-92]) so the
+///   planner can prune on the valid axis. The footer's column list is the
+///   source of truth for which columns a given segment actually holds; the
+///   version marks the generation, and bumping it makes a v2 reader reject a
+///   valid-time segment cleanly at the header rather than choking on column
+///   id 7 mid-footer.
+pub(super) const FORMAT_VERSION: u16 = 3;
 
 /// Header size in bytes — magic (8) + version (2) + flags (2) + reserved (4).
 pub(super) const HEADER_LEN: usize = 16;
@@ -60,9 +69,11 @@ pub(super) const MAX_BYTES_STAT_PREFIX_LEN: usize = 64;
 
 /// Logical schema id stored in the footer.
 ///
-/// v0.1 has exactly one implicit schema — the seven `Version` columns (the four
-/// data/temporal fields plus the three provenance columns, [`FORMAT_VERSION`]
-/// v2) — so the id is hard-coded. Once [STL-98] lands the versioned catalog,
+/// v0.1 has exactly one implicit schema — the seven always-on `Version` columns
+/// (the four data/temporal fields plus the three provenance columns,
+/// [`FORMAT_VERSION`] v2), optionally extended with the valid-time pair for a
+/// valid-time table ([`FORMAT_VERSION`] v3) — so the id is hard-coded. Once
+/// [STL-98] lands the versioned catalog,
 /// this becomes a real schema reference resolved through the catalog at read
 /// time; the footer field is wide enough already that no format change is
 /// needed.
@@ -120,6 +131,16 @@ pub enum ColumnId {
     /// Provenance: opaque principal bytes (variable-length) —
     /// [`stele_common::provenance::Principal`].
     Principal = 6,
+    /// Valid-time period start (fixed `i64`, microseconds) — the inclusive
+    /// `valid_from` boundary, lifted at flush from the payload's valid-time
+    /// prefix ([`crate::validtime`], [STL-92]). Present only on a valid-time
+    /// table's segments (format v3); absent otherwise.
+    ValidFrom = 7,
+    /// Valid-time period end (fixed `i64`, microseconds) — the exclusive
+    /// `valid_to` boundary; `i64::MAX` for an open-ended fact
+    /// ([`stele_common::time::VALID_TIME_OPEN`]). Present only on a valid-time
+    /// table's segments, alongside [`Self::ValidFrom`].
+    ValidTo = 8,
 }
 
 impl ColumnId {
@@ -132,6 +153,12 @@ impl ColumnId {
     /// The three provenance columns ([`Self::TxnId`], [`Self::CommittedAt`],
     /// [`Self::Principal`]) sit at the end — additions never renumber the
     /// frozen ids 0..=3 ([architecture §3.2](../../../../../docs/02-architecture.md#32-on-disk-segment-format)).
+    ///
+    /// This is the **always-on** set, present on every segment. A valid-time
+    /// table's segments additionally carry [`Self::ValidFrom`] /
+    /// [`Self::ValidTo`]; use the crate-internal `schema` helper to get the full
+    /// ordered set for a given valid-time policy rather than iterating `ALL`
+    /// directly when the opt-in columns matter.
     pub const ALL: [Self; 7] = [
         Self::BusinessKey,
         Self::SysFrom,
@@ -142,10 +169,44 @@ impl ColumnId {
         Self::Principal,
     ];
 
+    /// The always-on set ([`Self::ALL`]) extended with the valid-time pair —
+    /// the column set a *valid-time* table's segment carries, in writer/reader
+    /// canonical order. The valid-time columns sit at the end so the always-on
+    /// ids keep their frozen positions.
+    const ALL_WITH_VALID_TIME: [Self; 9] = [
+        Self::BusinessKey,
+        Self::SysFrom,
+        Self::SysTo,
+        Self::Payload,
+        Self::TxnId,
+        Self::CommittedAt,
+        Self::Principal,
+        Self::ValidFrom,
+        Self::ValidTo,
+    ];
+
+    /// The ordered column set a segment carries given the table's valid-time
+    /// opt-in: [`Self::ALL`] for a system-only table, or that set plus
+    /// `valid_from` / `valid_to` when the table tracks valid-time ([STL-117]).
+    /// The writer iterates this to lay out chunks; the reader recovers the set
+    /// from the footer's column list, so the two never drift.
+    pub(super) const fn schema(valid_time: bool) -> &'static [Self] {
+        if valid_time {
+            &Self::ALL_WITH_VALID_TIME
+        } else {
+            &Self::ALL
+        }
+    }
+
     pub(super) const fn ty(self) -> ColumnType {
         match self {
             Self::BusinessKey | Self::Payload | Self::Principal => ColumnType::Bytes,
-            Self::SysFrom | Self::SysTo | Self::TxnId | Self::CommittedAt => ColumnType::I64,
+            Self::SysFrom
+            | Self::SysTo
+            | Self::TxnId
+            | Self::CommittedAt
+            | Self::ValidFrom
+            | Self::ValidTo => ColumnType::I64,
         }
     }
 
@@ -158,6 +219,8 @@ impl ColumnId {
             4 => Some(Self::TxnId),
             5 => Some(Self::CommittedAt),
             6 => Some(Self::Principal),
+            7 => Some(Self::ValidFrom),
+            8 => Some(Self::ValidTo),
             _ => None,
         }
     }

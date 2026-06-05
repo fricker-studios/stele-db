@@ -33,11 +33,13 @@
 //! * if `max(sys_to) <= snapshot`, *every* row was already superseded at the
 //!   snapshot — none is visible; skip.
 //!
-//! Valid-time columns ([STL-92]) are not part of the v0.1 schema yet, but the
-//! zone map is keyed by [`ColumnId`] and the writer computes min/max for every
-//! column generically, so a `valid_from` / `valid_to` range predicate prunes
-//! through the same [`Predicate::Range`] path the moment those columns land —
-//! no change to this module required.
+//! Valid-time pruning rides the *same* generic machinery. A valid-time table's
+//! segment carries `valid_from` / `valid_to` as first-class `i64` columns,
+//! lifted at flush from the payload's valid-time prefix ([STL-117], [STL-92]).
+//! The zone map is keyed by [`ColumnId`] and the writer computes min/max for
+//! every column generically, so a `valid_from` / `valid_to` [`Predicate::Range`]
+//! prunes through [`ZoneMap::might_contain`] with no valid-time-specific code
+//! here — exactly as the design anticipated.
 
 use std::cmp::Ordering;
 

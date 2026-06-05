@@ -45,7 +45,8 @@ pub enum ColumnData {
     /// [`ColumnId::Payload`], or [`ColumnId::Principal`]).
     Bytes(Vec<Vec<u8>>),
     /// Fixed-width `i64` column ([`ColumnId::SysFrom`], [`ColumnId::SysTo`],
-    /// [`ColumnId::TxnId`], or [`ColumnId::CommittedAt`]).
+    /// [`ColumnId::TxnId`], [`ColumnId::CommittedAt`], or — on a valid-time
+    /// table's segment — [`ColumnId::ValidFrom`] / [`ColumnId::ValidTo`]).
     I64(Vec<i64>),
 }
 
@@ -441,7 +442,19 @@ fn decode_stat(col: ColumnId, bytes: &[u8]) -> Result<Option<ZoneBound>, Segment
 /// this collapses to a copy; the fold keeps the segment-level digest correct
 /// once multi-row-group writes land.
 fn build_zone_map(footer: &Footer) -> ZoneMap {
-    let bounds = ColumnId::ALL.into_iter().map(|col| {
+    // Fold over the columns the footer actually declares, not a fixed list:
+    // the always-on set plus, for a valid-time table, valid_from / valid_to
+    // ([STL-117]). Collecting the present ids keeps this schema-agnostic — a
+    // future opt-in column flows through without touching this fold.
+    let mut present: Vec<ColumnId> = Vec::new();
+    for rg in &footer.row_groups {
+        for c in &rg.columns {
+            if !present.contains(&c.column_id) {
+                present.push(c.column_id);
+            }
+        }
+    }
+    let bounds = present.into_iter().map(|col| {
         let mut min: Option<ZoneBound> = None;
         let mut max: Option<ZoneBound> = None;
         for rg in &footer.row_groups {
