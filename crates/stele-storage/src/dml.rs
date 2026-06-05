@@ -205,9 +205,7 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     ) -> Result<DmlOutcome, DmlError> {
         let record = encode_redo(&versions)?;
         let wal = self.wal.append(&record)?;
-        for version in versions {
-            delta.insert(version)?;
-        }
+        crate::systime::apply(delta, versions)?;
         Ok(DmlOutcome { commit, wal })
     }
 }
@@ -236,10 +234,10 @@ pub fn replay<D: Disk>(
     let mut applied = 0;
     for record in wal.replay_from(checkpoint) {
         let payload = record?;
-        for version in decode_redo(&payload)? {
-            delta.insert(version)?;
-            applied += 1;
-        }
+        let versions = decode_redo(&payload)?;
+        applied += versions.len();
+        // The same application point the forward DmlWriter path uses.
+        crate::systime::apply(delta, versions)?;
     }
     Ok(applied)
 }

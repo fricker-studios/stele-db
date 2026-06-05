@@ -60,7 +60,7 @@
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros};
 
-use crate::delta::{BusinessKey, Delta, Snapshot, Version};
+use crate::delta::{BusinessKey, Delta, DeltaError, Snapshot, Version};
 use crate::wal::Disk;
 
 /// Errors surfaced from the system-time write path.
@@ -305,13 +305,20 @@ impl<C: Clock> SysTimeWriter<C> {
 /// Apply a resolved redo set to the delta tier: insert each version in order.
 ///
 /// The single application point shared by every write path. A forward write
-/// (via [`SysTimeWriter::insert`] and friends) and a crash-recovery replay
-/// ([`crate::dml::replay`]) both funnel their resolved versions through here, so
+/// (via [`SysTimeWriter::insert`] and friends), the WAL-logging DML writer
+/// ([`crate::dml::DmlWriter`]), and a crash-recovery replay
+/// ([`crate::dml::replay`]) all funnel their resolved versions through here, so
 /// "the same code path under sim and under real I/O" is structural, not a
 /// promise. Re-inserting the same `(business_key, sys_from)` is the delta tier's
 /// idempotent replace, which is what makes replay safe to run over already-
 /// applied records.
-fn apply<D: Disk>(delta: &mut Delta<D>, versions: Vec<Version>) -> Result<(), SysTimeError> {
+///
+/// Returns the raw [`DeltaError`] so each caller maps it onto its own error type
+/// (`SysTimeError::Delta` here, `DmlError::Delta` in [`crate::dml`]) via `?`.
+pub(crate) fn apply<D: Disk>(
+    delta: &mut Delta<D>,
+    versions: Vec<Version>,
+) -> Result<(), DeltaError> {
     for version in versions {
         delta.insert(version)?;
     }
