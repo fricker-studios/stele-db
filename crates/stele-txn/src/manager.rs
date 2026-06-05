@@ -105,8 +105,16 @@ pub enum TxnError {
     TimeExhausted,
 
     /// The commit record could not be appended to or fsynced on the WAL. The
-    /// commit is *not* applied — the cursor and conflict index are left untouched
-    /// — so the transaction may be retried.
+    /// in-memory state (cursor, conflict index) is left untouched either way, but
+    /// the durability outcome differs by sub-case:
+    ///
+    /// * **Append failed:** nothing was staged — the transaction is cleanly
+    ///   retryable.
+    /// * **Append succeeded, fsync (`tick`) failed:** the record may still become
+    ///   durable on a later fsync or segment rotation, so this transaction's
+    ///   durability is *indeterminate* until recovery resolves it from the log.
+    ///   Recovery is the source of truth here, not this return value. Hardening an
+    ///   fsync failure into a terminal manager state is v0.2 recovery work.
     #[error(transparent)]
     Wal(#[from] WalError),
 }
@@ -233,7 +241,16 @@ impl<C: Clock, D: Disk> TxnManager<C, D> {
     #[allow(clippy::significant_drop_tightening)]
     pub fn begin(&self) -> Transaction {
         let mut st = self.state.lock().expect("txn manager mutex poisoned");
-        let snapshot = self.clock.now().max(st.cursor);
+        // A snapshot must stay strictly below the +∞ open sentinel: a reader at
+        // the sentinel resolves no open version (the delta resolver's `sys_to > s`
+        // test fails at exactly `s == SYSTEM_TIME_OPEN`). A saturating clock
+        // reading (`SystemClock::now()` clamps to `i64::MAX`) is therefore pulled
+        // back below it — mirroring the storage writer's all-builds sentinel guard.
+        let snapshot = self
+            .clock
+            .now()
+            .max(st.cursor)
+            .min(SystemTimeMicros(SYSTEM_TIME_OPEN.0 - 1));
         st.cursor = snapshot;
         let txn_id = TxnId(st.next_txn);
         st.next_txn += 1;
@@ -259,8 +276,9 @@ impl<C: Clock, D: Disk> TxnManager<C, D> {
     ///   signal. No state is mutated.
     /// * [`TxnError::TimeExhausted`] if the next timestamp would reach the `+∞`
     ///   sentinel.
-    /// * [`TxnError::Wal`] if the commit record cannot be logged or fsynced. The
-    ///   commit is not applied; the transaction may be retried.
+    /// * [`TxnError::Wal`] if the commit record cannot be logged or fsynced — see
+    ///   the variant docs for the append-failed (cleanly retryable) versus
+    ///   fsync-failed (durability indeterminate) distinction.
     //
     // The state lock is intentionally held across the WAL append+fsync: it is what
     // makes the conflict check, the timestamp assignment, the durable log write,
@@ -285,7 +303,12 @@ impl<C: Clock, D: Disk> TxnManager<C, D> {
 
         // Assign the commit timestamp: at least the clock, strictly above the
         // cursor (so it beats every outstanding snapshot), and below the sentinel.
-        let commit_ts = self.clock.now().max(SystemTimeMicros(st.cursor.0 + 1));
+        // `saturating_add` mirrors `SysTimeWriter` — the sentinel check below
+        // rejects the saturated value rather than letting `+ 1` overflow.
+        let commit_ts = self
+            .clock
+            .now()
+            .max(SystemTimeMicros(st.cursor.0.saturating_add(1)));
         if commit_ts >= SYSTEM_TIME_OPEN {
             return Err(TxnError::TimeExhausted);
         }
@@ -572,5 +595,28 @@ mod tests {
         a.write(BusinessKey::new(b"k".to_vec()));
         // next commit = max(clock, cursor+1) = SYSTEM_TIME_OPEN -> refused.
         assert!(matches!(mgr.commit(&a), Err(TxnError::TimeExhausted)));
+    }
+
+    /// A clock saturated at the `+∞` sentinel (as `SystemClock::now()` does at the
+    /// end of the representable range) must not hand out a snapshot *at* the
+    /// sentinel — a reader there would resolve no open version. The snapshot is
+    /// pulled back to one below it, where reads still work.
+    #[test]
+    fn snapshot_never_reaches_the_open_sentinel() {
+        let mgr = manager(StubClock::new(SYSTEM_TIME_OPEN.0));
+        let r = mgr.begin();
+        assert_eq!(r.snapshot().0, SystemTimeMicros(SYSTEM_TIME_OPEN.0 - 1));
+
+        // A version open at that clamped snapshot is still visible.
+        let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+        let key = BusinessKey::new(b"k".to_vec());
+        delta
+            .insert(open_version(
+                &key,
+                TxnId(1),
+                SystemTimeMicros(SYSTEM_TIME_OPEN.0 - 1),
+            ))
+            .expect("stage open version");
+        assert!(read(&delta, &key, r.snapshot()).is_some());
     }
 }

@@ -507,8 +507,12 @@ pub fn run_mvcc_seed(seed: u64) -> u64 {
                     digest = fnv1a(digest, &committed.commit_ts.0.to_le_bytes());
                     stage_committed_write(&mut delta, &keys[k], txn.id(), committed.commit_ts);
                 }
-                // A clean retry signal — folded as a distinct outcome byte.
-                Err(_) => digest = fnv1a(digest, &[0]),
+                // The only expected failure is a write-write conflict — folded as
+                // a distinct outcome byte. Any other error (WAL failure, time
+                // exhaustion) is a real regression, not a workload outcome, so the
+                // seed fails loudly rather than silently digesting a "valid" run.
+                Err(stele_txn::TxnError::Conflict) => digest = fnv1a(digest, &[0]),
+                Err(other) => panic!("unexpected commit error in MVCC seed: {other}"),
             }
         }
 
