@@ -60,7 +60,7 @@
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros};
 
-use crate::delta::{BusinessKey, Delta, Snapshot, Version};
+use crate::delta::{BusinessKey, Delta, DeltaError, Snapshot, Version};
 use crate::wal::Disk;
 
 /// Errors surfaced from the system-time write path.
@@ -137,11 +137,8 @@ impl<C: Clock> SysTimeWriter<C> {
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<SystemTimeMicros, SysTimeError> {
-        let commit = self.next_commit_ts()?;
-        if current_open(delta, &key, commit)?.is_some() {
-            return Err(SysTimeError::KeyExists);
-        }
-        delta.insert(open_version(key, commit, payload, txn_id, principal))?;
+        let (commit, versions) = self.stage_insert(delta, key, payload, txn_id, principal)?;
+        apply(delta, versions)?;
         Ok(commit)
     }
 
@@ -163,12 +160,8 @@ impl<C: Clock> SysTimeWriter<C> {
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<SystemTimeMicros, SysTimeError> {
-        let commit = self.next_commit_ts()?;
-        // The superseding transaction both closes the prior period (stamping its
-        // identity as `closed_by`) and opens the new one — same `txn_id` /
-        // `principal` for both halves.
-        close_prior(delta, &key, commit, txn_id, principal.clone())?;
-        delta.insert(open_version(key, commit, payload, txn_id, principal))?;
+        let (commit, versions) = self.stage_update(delta, key, payload, txn_id, principal)?;
+        apply(delta, versions)?;
         Ok(commit)
     }
 
@@ -195,9 +188,92 @@ impl<C: Clock> SysTimeWriter<C> {
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<SystemTimeMicros, SysTimeError> {
-        let commit = self.next_commit_ts()?;
-        close_prior(delta, key, commit, txn_id, principal)?;
+        let (commit, versions) = self.stage_delete(delta, key, txn_id, principal)?;
+        apply(delta, versions)?;
         Ok(commit)
+    }
+
+    /// Resolve an insert into the redo set it stages — **without** touching the
+    /// delta tier. Returns the stamped commit timestamp and the version(s) to
+    /// apply (a single open version `[commit, +∞)`).
+    ///
+    /// This is the resolution half of the write path: it stamps the commit
+    /// timestamp and builds the rows, but leaves *applying* them to the caller.
+    /// [`Self::insert`] applies them straight to the delta; the DML write path
+    /// ([`crate::dml`]) logs them to the WAL first, then applies the same set —
+    /// so a forward write and a crash-recovery replay run identical inserts
+    /// ([architecture §3.4](../../../docs/02-architecture.md#34-write-path-sequence)).
+    ///
+    /// # Errors
+    ///
+    /// [`SysTimeError::KeyExists`] if `key` already has a live version (the
+    /// commit timestamp is still consumed, matching [`Self::insert`]);
+    /// [`SysTimeError::TimeExhausted`] from the commit-timestamp allocator.
+    pub fn stage_insert<D: Disk>(
+        &mut self,
+        delta: &Delta<D>,
+        key: BusinessKey,
+        payload: Vec<u8>,
+        txn_id: TxnId,
+        principal: Principal,
+    ) -> Result<(SystemTimeMicros, Vec<Version>), SysTimeError> {
+        let commit = self.next_commit_ts()?;
+        if current_open(delta, &key, commit)?.is_some() {
+            return Err(SysTimeError::KeyExists);
+        }
+        Ok((
+            commit,
+            vec![open_version(key, commit, payload, txn_id, principal)],
+        ))
+    }
+
+    /// Resolve an update into the redo set it stages — the prior version closed
+    /// at `commit` plus the new open version `[commit, +∞)` — without touching
+    /// the delta tier. The two abut, so the chain stays gap-free. See
+    /// [`Self::stage_insert`] for why resolution is split from application.
+    ///
+    /// # Errors
+    ///
+    /// [`SysTimeError::KeyNotFound`] if `key` has no live version;
+    /// [`SysTimeError::TimeExhausted`] from the commit-timestamp allocator;
+    /// delta-tier read errors as [`SysTimeError::Delta`].
+    pub fn stage_update<D: Disk>(
+        &mut self,
+        delta: &Delta<D>,
+        key: BusinessKey,
+        payload: Vec<u8>,
+        txn_id: TxnId,
+        principal: Principal,
+    ) -> Result<(SystemTimeMicros, Vec<Version>), SysTimeError> {
+        let commit = self.next_commit_ts()?;
+        // The superseding transaction both closes the prior period (stamping its
+        // identity as `closed_by`) and opens the new one — same `txn_id` /
+        // `principal` for both halves.
+        let closed = closed_prior_version(delta, &key, commit, txn_id, principal.clone())?;
+        let opened = open_version(key, commit, payload, txn_id, principal);
+        Ok((commit, vec![closed, opened]))
+    }
+
+    /// Resolve a delete into the redo set it stages — the prior version closed
+    /// at `commit`, with no successor — without touching the delta tier. See
+    /// [`Self::stage_insert`] for why resolution is split from application, and
+    /// [`Self::delete`] for the tombstone-provenance semantics.
+    ///
+    /// # Errors
+    ///
+    /// [`SysTimeError::KeyNotFound`] if `key` has no live version;
+    /// [`SysTimeError::TimeExhausted`] from the commit-timestamp allocator;
+    /// delta-tier read errors as [`SysTimeError::Delta`].
+    pub fn stage_delete<D: Disk>(
+        &mut self,
+        delta: &Delta<D>,
+        key: &BusinessKey,
+        txn_id: TxnId,
+        principal: Principal,
+    ) -> Result<(SystemTimeMicros, Vec<Version>), SysTimeError> {
+        let commit = self.next_commit_ts()?;
+        let closed = closed_prior_version(delta, key, commit, txn_id, principal)?;
+        Ok((commit, vec![closed]))
     }
 
     /// Allocate the next commit timestamp: at least the clock's reading, and
@@ -226,10 +302,34 @@ impl<C: Clock> SysTimeWriter<C> {
     }
 }
 
-/// Close `key`'s current open version at `commit` by re-staging it with
-/// `sys_to = commit` and the closing transaction's provenance. Re-inserting the
-/// same `(business_key, sys_from)` is the delta tier's idempotent replace, so
-/// this updates the period in place rather than appending a duplicate.
+/// Apply a resolved redo set to the delta tier: insert each version in order.
+///
+/// The single application point shared by every write path. A forward write
+/// (via [`SysTimeWriter::insert`] and friends), the WAL-logging DML writer
+/// ([`crate::dml::DmlWriter`]), and a crash-recovery replay
+/// ([`crate::dml::replay`]) all funnel their resolved versions through here, so
+/// "the same code path under sim and under real I/O" is structural, not a
+/// promise. Re-inserting the same `(business_key, sys_from)` is the delta tier's
+/// idempotent replace, which is what makes replay safe to run over already-
+/// applied records.
+///
+/// Returns the raw [`DeltaError`] so each caller maps it onto its own error type
+/// (`SysTimeError::Delta` here, `DmlError::Delta` in [`crate::dml`]) via `?`.
+pub(crate) fn apply<D: Disk>(
+    delta: &mut Delta<D>,
+    versions: Vec<Version>,
+) -> Result<(), DeltaError> {
+    for version in versions {
+        delta.insert(version)?;
+    }
+    Ok(())
+}
+
+/// Build (but do **not** apply) the closed form of `key`'s current open version:
+/// the same row re-stamped with `sys_to = commit` and the closing transaction's
+/// provenance. Applying it is an idempotent replace of the same
+/// `(business_key, sys_from)`, so the period is updated in place rather than
+/// duplicated.
 ///
 /// The prior version's **birth provenance is preserved untouched**: closing a
 /// period is bookkeeping by the superseding transaction, not a rewrite of who
@@ -240,18 +340,17 @@ impl<C: Clock> SysTimeWriter<C> {
 /// no successor version to carry that identity, so recording it here is the only
 /// place "who closed this period" survives ([architecture §3.1](../../../docs/02-architecture.md#31-tiered-layout-lsm-flavored-history-preserving),
 /// [STL-118]).
-fn close_prior<D: Disk>(
-    delta: &mut Delta<D>,
+fn closed_prior_version<D: Disk>(
+    delta: &Delta<D>,
     key: &BusinessKey,
     commit: SystemTimeMicros,
     txn_id: TxnId,
     principal: Principal,
-) -> Result<(), SysTimeError> {
+) -> Result<Version, SysTimeError> {
     let mut prior = current_open(delta, key, commit)?.ok_or(SysTimeError::KeyNotFound)?;
     prior.sys_to = commit;
     prior.closed_by = Some(Provenance::new(txn_id, commit, principal));
-    delta.insert(prior)?;
-    Ok(())
+    Ok(prior)
 }
 
 /// Build an open version `[commit, +∞)` for `key`, stamping provenance.

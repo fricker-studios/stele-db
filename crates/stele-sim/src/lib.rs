@@ -27,9 +27,11 @@ use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros, ValidTimeMicros};
 use stele_storage::backend::{Disk, DiskFile, FaultOp, Faults, MemDisk};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Version};
+use stele_storage::dml::{self, DmlWriter};
 use stele_storage::segment::{SegmentReader, SegmentWriter};
 use stele_storage::systime::SysTimeWriter;
 use stele_storage::validtime::{ValidInterval, ValidTimeWriter, unframe_payload};
+use stele_storage::wal::{Checkpoint, Wal, WalConfig};
 
 /// A deterministic, strictly-increasing clock for seeded scenarios.
 ///
@@ -345,6 +347,77 @@ pub fn run_delete_seed(seed: u64) -> u64 {
     digest
 }
 
+/// Play a seeded insert/update/delete workload through the **full DML write
+/// path** — WAL → delta — then rebuild the delta purely from the WAL and fold
+/// the reconstructed chain into the digest.
+///
+/// Where [`run_delete_seed`] drives the system-time writer straight into the
+/// delta, this drives [`DmlWriter`]: each op resolves, appends a redo record to
+/// the WAL, and stages into the delta ([STL-94]). After the workload the WAL is
+/// fsync'd and replayed into a *fresh* delta, and that reconstructed chain is
+/// what gets digested — so the seed sweep regresses on the redo-record codec and
+/// the WAL→delta recovery path, not just the in-memory writer. Same seed ⇒ same
+/// digest.
+#[must_use]
+pub fn run_dml_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut rng = Rng::new(seed);
+    let wal = Wal::open(MemDisk::new(), WalConfig::default()).expect("open wal");
+    let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+    // System-only table (`valid_time = false`): payloads carry no interval prefix.
+    let mut writer = DmlWriter::new(wal.clone(), StepClock::new(1), false);
+
+    let key_count = 1 + rng.below_usize(6);
+    let mut live = vec![false; key_count];
+    let ops = 8 + rng.below(24);
+    for op in 0..ops {
+        let k = rng.below_usize(key_count);
+        let key = BusinessKey::new(format!("k-{k:04}").into_bytes());
+        let txn = TxnId(op);
+        let principal_len = rng.below_usize(8);
+        let principal = Principal::new(rng.bytes(principal_len));
+        if live[k] {
+            if rng.below(2) == 0 {
+                writer
+                    .delete(&mut delta, &key, txn, principal)
+                    .expect("delete");
+                live[k] = false;
+            } else {
+                let payload_len = rng.below_usize(16);
+                let payload = rng.bytes(payload_len);
+                writer
+                    .update(&mut delta, key, None, payload, txn, principal)
+                    .expect("update");
+            }
+        } else {
+            let payload_len = rng.below_usize(16);
+            let payload = rng.bytes(payload_len);
+            writer
+                .insert(&mut delta, key, None, payload, txn, principal)
+                .expect("insert");
+            live[k] = true;
+        }
+    }
+    wal.tick().expect("group-commit fsync");
+
+    // Rebuild the delta from the WAL alone, then digest the reconstructed chain.
+    let mut replayed = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+    dml::replay(&wal, &mut replayed, Checkpoint::BEGIN).expect("replay");
+
+    let mut digest = FNV_OFFSET;
+    for v in replayed.flush_to_segment().expect("flush") {
+        digest = fnv1a(digest, v.business_key.as_bytes());
+        digest = fnv1a(digest, &v.sys_from.0.to_le_bytes());
+        digest = fnv1a(digest, &v.sys_to.0.to_le_bytes());
+        digest = fnv1a(digest, &v.provenance.txn_id.0.to_le_bytes());
+        digest = fnv1a(digest, &v.provenance.committed_at.0.to_le_bytes());
+        digest = fnv1a(digest, v.provenance.principal.as_bytes());
+        digest = fold_closed_by(digest, v.closed_by.as_ref());
+        digest = fnv1a(digest, &v.payload);
+    }
+    digest
+}
+
 /// Play a seeded sequence of operations against a [`MemDisk`] whose
 /// fault schedule is also seed-derived, and return the per-operation
 /// success/failure pattern.
@@ -456,6 +529,26 @@ mod tests {
         assert!(
             digests.len() > 1,
             "delete/close-provenance workload must actually depend on the seed"
+        );
+    }
+
+    #[test]
+    fn dml_seed_is_reproducible() {
+        for seed in 0..64 {
+            assert_eq!(
+                run_dml_seed(seed),
+                run_dml_seed(seed),
+                "seed {seed} must replay to an identical DML digest"
+            );
+        }
+    }
+
+    #[test]
+    fn dml_distinct_seeds_diverge() {
+        let digests: std::collections::HashSet<u64> = (0..64).map(run_dml_seed).collect();
+        assert!(
+            digests.len() > 1,
+            "the WAL→delta DML workload must actually depend on the seed"
         );
     }
 }

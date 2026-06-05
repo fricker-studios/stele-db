@@ -30,8 +30,9 @@ fn main() {
         let digest = stele_sim::run_storage_seed(seed);
         let vt_digest = stele_sim::run_validtime_seed(seed);
         let del_digest = stele_sim::run_delete_seed(seed);
+        let dml_digest = stele_sim::run_dml_seed(seed);
         println!(
-            "stele-sim: seed {seed} → storage digest {digest:#018x} · valid-time digest {vt_digest:#018x} · delete digest {del_digest:#018x}"
+            "stele-sim: seed {seed} → storage digest {digest:#018x} · valid-time digest {vt_digest:#018x} · delete digest {del_digest:#018x} · dml digest {dml_digest:#018x}"
         );
     } else if args.seeds == 0 {
         println!("stele-sim: no seeds requested (pass --seeds N or --seed S)");
@@ -47,6 +48,8 @@ fn main() {
             sweep =
                 (sweep ^ stele_sim::run_validtime_seed(seed)).wrapping_mul(0x0000_0100_0000_01B3);
             sweep = (sweep ^ stele_sim::run_delete_seed(seed)).wrapping_mul(0x0000_0100_0000_01B3);
+            // The full DML write path: WAL redo records replayed back into a delta.
+            sweep = (sweep ^ stele_sim::run_dml_seed(seed)).wrapping_mul(0x0000_0100_0000_01B3);
         }
         println!(
             "stele-sim: swept {} seed(s) over the in-memory backend → sweep digest {sweep:#018x}",
