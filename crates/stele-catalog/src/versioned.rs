@@ -690,10 +690,16 @@ mod tests {
         assert!(cat.resolve("t", SystemTimeMicros(300)).is_none());
     }
 
-    /// DoD bullet 2: over a randomized DDL history, every table's schema-version
-    /// intervals tile `[creation, +∞)` with no gaps and no overlaps, with exactly
-    /// one open tail and strictly positive widths. Walks the private interval
-    /// chain directly — the structural invariant the public `resolve` rests on.
+    /// DoD bullet 2: over a randomized create + `add_column` history (no drops),
+    /// every table's schema-version intervals tile `[creation, +∞)` with no gaps
+    /// and no overlaps, with exactly one open tail and strictly positive widths.
+    /// Walks the private interval chain directly — the structural invariant the
+    /// public `resolve` rests on for *live* tables.
+    ///
+    /// Dropping relaxes this: a dropped table's tail is closed (no open tail),
+    /// and re-creating the name may leave a gap between eras. Non-overlap and
+    /// positive widths still hold; those drop/re-create cases are pinned by the
+    /// dedicated `drop_table` tests above rather than this gap-free sweep.
     #[test]
     fn schema_version_intervals_are_gap_free_and_non_overlapping() {
         let mut rng = Rng::new(0xCA7A_106D);

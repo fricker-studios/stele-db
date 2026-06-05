@@ -74,6 +74,12 @@ pub enum BindError {
     )]
     QualifiedName(String),
 
+    /// A single-part table name that is not a plain identifier (e.g. a
+    /// dialect-specific function-valued name part). Not *qualified* — just not a
+    /// name v0.1 can use.
+    #[error("table name {0:?} is not a plain identifier")]
+    InvalidTableName(String),
+
     /// A `CREATE TABLE` declared no columns.
     #[error("CREATE TABLE {0:?} declares no columns")]
     NoColumns(String),
@@ -309,10 +315,13 @@ fn bind_drop_table(names: &[ObjectName], if_exists: bool) -> Result<DdlStatement
 /// Extract a single, unqualified identifier from an [`ObjectName`].
 fn bare_name(name: &ObjectName) -> Result<String, BindError> {
     match name.0.as_slice() {
+        // A lone identifier part is the only accepted form. A single *non*-ident
+        // part (e.g. a dialect-specific function-valued name) is malformed, not
+        // qualified — keep the two diagnostics distinct.
         [part] => part
             .as_ident()
             .map(|id| id.value.clone())
-            .ok_or_else(|| BindError::QualifiedName(name.to_string())),
+            .ok_or_else(|| BindError::InvalidTableName(name.to_string())),
         _ => Err(BindError::QualifiedName(name.to_string())),
     }
 }

@@ -21,13 +21,17 @@ fmt:
     cargo fmt --all
 
 # fmt-check + clippy (warnings = errors) + typos. Mirrors the CI `quick` job.
+# fmt/clippy (and test/doc) are deterministic with just the pinned toolchain, so
+# they are the "green locally ⇒ green in CI" core. Spelling is **best-effort**:
+# `typos` needs a separate install, so when it is absent this prints a note and
+# moves on rather than forcing every contributor to install it — CI's `quick`
+# job still runs it, so a typo can only land red there, never silently merge.
 lint:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets --all-features -- -D warnings
-    # Spelling, same as CI's `quick` job. Run strictly when `typos` is installed;
-    # otherwise note it (so a missing tool doesn't mask real failures, and CI
-    # still catches them). Install with: cargo install --locked typos-cli
-    if command -v typos >/dev/null 2>&1; then typos; else echo "note: typos-cli not installed — skipping (CI runs it)"; fi
+    # Strict when installed (real failures propagate); a note when not.
+    # Install to match CI with: cargo install --locked --version 1.39.0 typos-cli
+    if command -v typos >/dev/null 2>&1; then typos; else echo "note: typos-cli not installed — skipping (best-effort; CI's quick job runs it)"; fi
 
 # Rustdoc build with warnings denied. Mirrors the CI `docs build` job — a
 # broken intra-doc link or bad doc comment fails CI even when tests pass.
