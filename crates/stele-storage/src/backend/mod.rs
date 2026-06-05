@@ -34,9 +34,11 @@
 use std::io;
 use std::path::{Component, Path};
 
+pub mod any;
 pub mod local;
 pub mod memory;
 
+pub use any::{AnyDisk, AnyFile, BackendKind, ParseBackendKindError};
 pub use local::{LocalDisk, LocalFile};
 pub use memory::{Fault, FaultOp, Faults, MemDisk, MemFile};
 
