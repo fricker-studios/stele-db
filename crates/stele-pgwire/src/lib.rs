@@ -648,4 +648,100 @@ mod tests {
         drop(client);
         server.await.unwrap().unwrap();
     }
+
+    #[tokio::test]
+    async fn ssl_then_gss_requests_are_refused_then_handshake_proceeds() {
+        use tokio::io::AsyncWriteExt;
+        // The startup phase must tolerate an SSLRequest and a GSSEncRequest ahead
+        // of the real StartupMessage, answering each negotiation probe with a lone
+        // 'N' (TLS/GSS unsupported in v0.1) and then completing the handshake.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_connection(stream, peer).await
+        });
+
+        let mut client = TcpStream::connect(bound).await.unwrap();
+
+        // Both negotiation probes share the 8-byte startup shape: Int32 length(8)
+        // + Int32 code. Each must be refused with a single 'N'.
+        for code in [SSL_REQUEST_CODE, GSS_ENC_REQUEST_CODE] {
+            let mut probe = BytesMut::with_capacity(8);
+            probe.put_i32(8);
+            probe.put_i32(code);
+            client.write_all(&probe).await.unwrap();
+            let mut b = [0u8; 1];
+            client.read_exact(&mut b).await.unwrap();
+            assert_eq!(
+                b[0], b'N',
+                "negotiation code {code} must be refused with 'N'"
+            );
+        }
+
+        // Now the real StartupMessage — the handshake should proceed to ReadyForQuery.
+        let body = b"user\0stele\0database\0stele\0\0";
+        let length = 8 + body.len();
+        let mut startup = BytesMut::with_capacity(length);
+        startup.put_i32(i32::try_from(length).unwrap());
+        startup.put_i32(PROTOCOL_3_0);
+        startup.put_slice(body);
+        client.write_all(&startup).await.unwrap();
+
+        loop {
+            let mut h = [0u8; 5];
+            client.read_exact(&mut h).await.unwrap();
+            let len = usize::try_from(i32::from_be_bytes(h[1..5].try_into().unwrap())).unwrap();
+            let mut payload = vec![0u8; len - 4];
+            if !payload.is_empty() {
+                client.read_exact(&mut payload).await.unwrap();
+            }
+            if h[0] == MSG_READY_FOR_QUERY {
+                assert_eq!(payload, b"I");
+                break;
+            }
+        }
+
+        let term: [u8; 5] = [MSG_TERMINATE, 0, 0, 0, 4];
+        client.write_all(&term).await.unwrap();
+        drop(client);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_boots_and_refuses_ssl_with_n() {
+        use tokio::io::AsyncWriteExt;
+        // DoD bullet 2, encoded as a regression test: booting the public listener
+        // and probing it with an SSLRequest yields the 'N' refusal byte. Reserve a
+        // free port via a throwaway bind, then hand it to the real `Server::run`.
+        let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let handle = tokio::spawn(Server::new(addr).run());
+
+        // `Server::run` binds asynchronously; connect-retry until it is listening.
+        let mut maybe_client = None;
+        for _ in 0..100 {
+            if let Ok(c) = TcpStream::connect(addr).await {
+                maybe_client = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let mut client =
+            maybe_client.expect("server should bind and accept within the retry budget");
+
+        let mut ssl = BytesMut::with_capacity(8);
+        ssl.put_i32(8);
+        ssl.put_i32(SSL_REQUEST_CODE);
+        client.write_all(&ssl).await.unwrap();
+
+        let mut b = [0u8; 1];
+        client.read_exact(&mut b).await.unwrap();
+        assert_eq!(b[0], b'N', "a TCP probe must see the 'N' SSL-refusal byte");
+
+        drop(client);
+        handle.abort();
+    }
 }
