@@ -85,6 +85,19 @@ pub enum CatalogError {
         /// The current open version's start, which `at` must exceed.
         current_from: i64,
     },
+
+    /// A schema change carried a system time at or past the open-interval
+    /// sentinel (`SYSTEM_TIME_OPEN`, `i64::MAX`). That value is reserved to mark
+    /// a version as still open, so a finite snapshot can never fall in
+    /// `[SYSTEM_TIME_OPEN, …)` — the change would be unresolvable. Mirrors
+    /// `stele-storage`'s `SysTimeError::TimeExhausted`.
+    #[error("schema change for table {table:?} at sys_time {at} is at or past the open sentinel")]
+    SystemTimeExhausted {
+        /// The table whose schema change was rejected.
+        table: String,
+        /// The offending change's system time.
+        at: i64,
+    },
 }
 
 /// The two boundary columns of a table's valid-time period, captured from a

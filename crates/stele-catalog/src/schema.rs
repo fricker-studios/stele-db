@@ -16,9 +16,10 @@ use crate::{CatalogError, TableTemporal};
 /// Allocated by the [`Catalog`](crate::Catalog) — monotonic, never reused — and
 /// stored in each sealed segment's footer (`schema_id`, a `u32`) so a read can
 /// resolve the exact column layout a segment was written under, even after the
-/// table's schema has since changed. The implicit v0.1 segment schema is id `0`
-/// (`SCHEMA_ID_IMPLICIT_VERSION` in `stele-storage`); the catalog allocates from
-/// there as DDL evolves a table.
+/// table's schema has since changed. Id `0` is **reserved** for the implicit
+/// v0.1 segment schema (`SCHEMA_ID_IMPLICIT_VERSION` in `stele-storage`), so the
+/// catalog allocates from `1` upward — a footer's `schema_id == 0` therefore
+/// never ambiguously resolves to a catalog-allocated table schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SchemaId(pub u32);
 

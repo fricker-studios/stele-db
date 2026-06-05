@@ -39,14 +39,30 @@ struct SchemaVersion {
 /// the [`SchemaId`] into the segment-footer write path are follow-ups; the
 /// resolution semantics this type fixes are what the binder and the on-disk
 /// `schema_id` reference both build on.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Catalog {
     /// Per table, its schema versions ordered by `sys_from`, oldest first. The
     /// last entry is always the open one (`sys_to == SYSTEM_TIME_OPEN`).
     tables: BTreeMap<String, Vec<SchemaVersion>>,
     /// Monotonic schema-id allocator. Ids are never reused, so a footer's
-    /// recorded id always names exactly one historical schema.
+    /// recorded id always names exactly one historical schema. Starts at
+    /// [`FIRST_SCHEMA_ID`], reserving `0` (see [`SchemaId`]).
     next_schema_id: u32,
+}
+
+/// The first id the catalog allocates. Id `0` is reserved for the implicit v0.1
+/// segment schema (`SCHEMA_ID_IMPLICIT_VERSION` in `stele-storage`), so a sealed
+/// segment's `schema_id == 0` can never be mistaken for a catalog-allocated
+/// table schema once the footer→catalog lookup lands.
+const FIRST_SCHEMA_ID: u32 = 1;
+
+impl Default for Catalog {
+    fn default() -> Self {
+        Self {
+            tables: BTreeMap::new(),
+            next_schema_id: FIRST_SCHEMA_ID,
+        }
+    }
 }
 
 impl Catalog {
@@ -68,6 +84,8 @@ impl Catalog {
     ///
     /// # Errors
     ///
+    /// - [`CatalogError::SystemTimeExhausted`] if `at` is at or past the
+    ///   open-interval sentinel [`SYSTEM_TIME_OPEN`].
     /// - [`CatalogError::TableAlreadyExists`] if `name` is already registered.
     /// - [`CatalogError::DuplicateColumn`] / [`CatalogError::InvalidColumnName`]
     ///   if the column list is malformed.
@@ -79,6 +97,12 @@ impl Catalog {
         at: SystemTimeMicros,
     ) -> Result<SchemaId, CatalogError> {
         let name = name.into();
+        if at >= SYSTEM_TIME_OPEN {
+            return Err(CatalogError::SystemTimeExhausted {
+                table: name,
+                at: at.0,
+            });
+        }
         if self.tables.contains_key(&name) {
             return Err(CatalogError::TableAlreadyExists(name));
         }
@@ -105,6 +129,10 @@ impl Catalog {
     /// # Errors
     ///
     /// - [`CatalogError::UnknownTable`] if `name` is not registered.
+    /// - [`CatalogError::SystemTimeExhausted`] if `at` is at or past the
+    ///   open-interval sentinel [`SYSTEM_TIME_OPEN`] — closing the prior version
+    ///   there and opening a new one at the same sentinel would silently drop the
+    ///   change for every finite snapshot.
     /// - [`CatalogError::DuplicateColumn`] if the table already has the column.
     /// - [`CatalogError::NonMonotonicSchemaChange`] if `at` is not strictly after
     ///   the current version's `sys_from` — system time never moves backward, and
@@ -122,6 +150,12 @@ impl Catalog {
             .last()
             .expect("a registered table always has at least one schema version");
 
+        if at >= SYSTEM_TIME_OPEN {
+            return Err(CatalogError::SystemTimeExhausted {
+                table: name.to_owned(),
+                at: at.0,
+            });
+        }
         if at <= current.sys_from {
             return Err(CatalogError::NonMonotonicSchemaChange {
                 table: name.to_owned(),
@@ -312,6 +346,62 @@ mod tests {
                 table: "t".to_owned(),
                 at: 5,
                 current_from: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn allocation_reserves_id_zero_for_the_implicit_segment_schema() {
+        let mut cat = Catalog::new();
+        // First catalog-allocated id is 1, not 0 — 0 belongs to storage's
+        // implicit v0.1 segment schema, so a footer's `schema_id == 0` can never
+        // collide with a catalog-allocated table schema.
+        let first = cat
+            .create_table(
+                "t",
+                vec![col("a")],
+                TableTemporal::system_only(),
+                SystemTimeMicros(1),
+            )
+            .expect("create");
+        assert_eq!(first, SchemaId(1));
+        let second = cat
+            .add_column("t", col("b"), SystemTimeMicros(2))
+            .expect("add column");
+        assert_eq!(second, SchemaId(2));
+    }
+
+    #[test]
+    fn a_schema_change_at_or_past_the_open_sentinel_is_rejected() {
+        let mut cat = Catalog::new();
+        // create_table cannot stamp the +∞ sentinel — it would be a zero-width,
+        // unresolvable version.
+        assert_eq!(
+            cat.create_table(
+                "t",
+                vec![col("a")],
+                TableTemporal::system_only(),
+                SYSTEM_TIME_OPEN
+            ),
+            Err(CatalogError::SystemTimeExhausted {
+                table: "t".to_owned(),
+                at: i64::MAX,
+            })
+        );
+        cat.create_table(
+            "t",
+            vec![col("a")],
+            TableTemporal::system_only(),
+            SystemTimeMicros(1),
+        )
+        .expect("create");
+        // …and neither can a later add_column, even though MAX is "after" the
+        // current version's finite start.
+        assert_eq!(
+            cat.add_column("t", col("b"), SYSTEM_TIME_OPEN),
+            Err(CatalogError::SystemTimeExhausted {
+                table: "t".to_owned(),
+                at: i64::MAX,
             })
         );
     }

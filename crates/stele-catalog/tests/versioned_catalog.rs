@@ -149,11 +149,11 @@ fn catalog_resolves_identically_to_a_naive_reference_model() {
             match (got, expect) {
                 (None, None) => {}
                 (Some(schema), Some((_, want_cols))) => {
-                    let mut got_names: Vec<&str> =
+                    // Assert *ordered* equality — `TableSchema` contracts columns
+                    // in declaration order, so a reordering bug must fail here.
+                    let got_names: Vec<&str> =
                         schema.columns().iter().map(ColumnDef::name).collect();
-                    let mut want_names: Vec<&str> = want_cols.iter().map(String::as_str).collect();
-                    got_names.sort_unstable();
-                    want_names.sort_unstable();
+                    let want_names: Vec<&str> = want_cols.iter().map(String::as_str).collect();
                     assert_eq!(
                         got_names, want_names,
                         "schema mismatch at snapshot {snap} for {t}"
