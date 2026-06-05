@@ -223,8 +223,10 @@ fn encode_column(col: ColumnId, rows: &[Version]) -> Result<EncodedColumn, Segme
 /// stat. A byte prefix is lex-`<=` the value it came from, so the prefix is a
 /// sound lower bound for every value in the column — pruning against it can
 /// never drop a real match. An empty result (the min value is itself empty)
-/// reuses the footer's zero-length "no stats" sentinel, so that column simply
-/// contributes no lower bound; this is conservative, never wrong.
+/// encodes as the footer's zero-length "no stats" sentinel; because the reader
+/// records a zone entry only when *both* bounds are present (`ZoneMap::from_bounds`),
+/// that drops the column's zone for the segment entirely — no pruning on either
+/// side. Conservative, never wrong.
 fn bounded_min_prefix(value: &[u8]) -> Vec<u8> {
     value[..value.len().min(MAX_BYTES_STAT_PREFIX_LEN)].to_vec()
 }
@@ -234,9 +236,10 @@ fn bounded_min_prefix(value: &[u8]) -> Vec<u8> {
 /// bound; otherwise keep the first `MAX_BYTES_STAT_PREFIX_LEN` bytes and
 /// increment them — drop any trailing `0xFF` bytes and bump the last byte below
 /// `0xFF` — so the result is `>=` every value sharing that prefix. A prefix that
-/// is *all* `0xFF` has no shorter upper bound representable, so the column emits
-/// the zero-length "no stats" sentinel and never prunes on its max; still
-/// conservative, never a false negative.
+/// is *all* `0xFF` has no shorter upper bound representable, so it encodes as the
+/// zero-length "no stats" sentinel; as with an empty min, the column then records
+/// no zone entry for the segment (an entry needs both bounds), so it never prunes
+/// at all — still conservative, never a false negative.
 fn bounded_max_prefix(value: &[u8]) -> Vec<u8> {
     if value.len() <= MAX_BYTES_STAT_PREFIX_LEN {
         return value.to_vec();

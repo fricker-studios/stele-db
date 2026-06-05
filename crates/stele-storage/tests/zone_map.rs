@@ -423,21 +423,25 @@ fn stress_bytes(rng: &mut Lcg, len: usize) -> Vec<u8> {
 /// whether a visible, predicate-satisfying row truly exists by exact byte
 /// comparison; `might_contain` must never answer `false` when it does.
 ///
-/// The invariant holds for any cap value, so the test stays agnostic to
-/// `MAX_BYTES_STAT_PREFIX_LEN` — it only needs payloads long enough that
-/// truncation definitely happens, which lengths `>= 48` guarantee.
+/// The invariant holds for any cap value, so the test stays agnostic to the
+/// exact `MAX_BYTES_STAT_PREFIX_LEN`; it only needs every payload to be longer
+/// than the cap so the min-truncation / max-round-up paths are exercised on
+/// every row. The cap is an internal writer constant (64 at time of writing),
+/// so the floor below is set well clear of it — raise it if the cap ever grows
+/// past ~96.
 #[test]
 fn might_contain_never_prunes_a_real_match_on_truncated_payload() {
     for seed in 0..300u64 {
         let mut rng = Lcg(seed.wrapping_mul(2_654_435_761).wrapping_add(7));
         let disk = CountingDisk::new();
 
-        // 1..=6 rows, each with an over-cap payload drawn from the stress
-        // alphabet so the prefix truncation/rounding is genuinely exercised.
+        // 1..=6 rows, each with a payload comfortably over the prefix cap
+        // (97..=144 bytes), drawn from the stress alphabet so the truncation
+        // and round-up paths run for every row.
         let row_count = 1 + rng.below(6);
         let mut rows = Vec::new();
         for i in 0..row_count {
-            let payload_len = 48 + rng.below(42) as usize; // 48..=89 bytes
+            let payload_len = 97 + rng.below(48) as usize; // 97..=144 bytes, always over-cap
             let payload = stress_bytes(&mut rng, payload_len);
             let sys_from = rng.below(100) as i64;
             let sys_to = if rng.below(4) == 0 {
