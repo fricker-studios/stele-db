@@ -145,14 +145,9 @@ impl ValidInterval {
         }
         let from = i64::from_le_bytes(bytes[0..8].try_into().expect("8-byte slice converts"));
         let to = i64::from_le_bytes(bytes[8..16].try_into().expect("8-byte slice converts"));
-        // No re-validation of `from < to` here: the prefix was written by
-        // `encode_prefix` from a `ValidInterval` that `new` already checked, and
-        // re-deriving the invariant on the read path would mask corruption as a
-        // logic error. The delta tier's frame CRC (WAL) is the corruption guard.
-        Ok(Self {
-            from: ValidTimeMicros(from),
-            to: ValidTimeMicros(to),
-        })
+        // Re-validate the invariant on decode so corrupted bytes can't create an
+        // invalid interval.
+        Self::new(ValidTimeMicros(from), ValidTimeMicros(to))
     }
 }
 
