@@ -30,9 +30,12 @@ struct SchemaVersion {
 /// A versioned catalog of table schemas.
 ///
 /// Holds, per table, the ordered chain of schema versions its DDL history has
-/// produced. The chain is gap-free and non-overlapping by construction: a DDL
-/// change closes the open version exactly where the new one starts, so the
-/// versions tile `[creation, +∞)` and exactly one is open at any time.
+/// produced. Adjacent versions never overlap: a schema change closes the open
+/// version exactly where the next one starts. A live table's chain tiles
+/// `[creation, +∞)` with exactly one open tail; a [dropped](Self::drop_table)
+/// table's tail is *closed* (and re-creating the name later may leave a gap for
+/// the dropped era) — so resolution is by interval containment, never by
+/// assuming an open tail.
 ///
 /// v0.1 keeps the catalog **in memory**. Persisting it onto the same
 /// sealed-segment substrate as user tables ("eat our own dog food") and wiring
@@ -42,7 +45,8 @@ struct SchemaVersion {
 #[derive(Debug)]
 pub struct Catalog {
     /// Per table, its schema versions ordered by `sys_from`, oldest first. The
-    /// last entry is always the open one (`sys_to == SYSTEM_TIME_OPEN`).
+    /// last entry is the open one (`sys_to == SYSTEM_TIME_OPEN`) while the table
+    /// is live; a dropped table's last entry is closed instead.
     tables: BTreeMap<String, Vec<SchemaVersion>>,
     /// Monotonic schema-id allocator. Ids are never reused, so a footer's
     /// recorded id always names exactly one historical schema. Starts at
@@ -72,6 +76,19 @@ impl Catalog {
         Self::default()
     }
 
+    /// The table's currently *live* (open-tailed) schema version, or `None` if
+    /// the table is absent or has been dropped.
+    ///
+    /// A dropped table keeps its history — older versions still
+    /// [`resolve`](Self::resolve) `AS OF` the past — but has no open tail, so it
+    /// is not a valid target for a mutation (`add_column`, `drop_table`) and a
+    /// fresh `create_table` of the same name continues its timeline rather than
+    /// colliding.
+    fn open_version(&self, name: &str) -> Option<&SchemaVersion> {
+        let last = self.tables.get(name)?.last()?;
+        (last.sys_to == SYSTEM_TIME_OPEN).then_some(last)
+    }
+
     /// Hand out the next never-reused schema id.
     ///
     /// Uses a checked increment: ids must stay unique for footer→schema
@@ -86,14 +103,22 @@ impl Catalog {
         Ok(id)
     }
 
-    /// Register a brand-new table whose first schema version takes effect at
-    /// system time `at`.
+    /// Register a table whose first schema version takes effect at system time
+    /// `at`.
+    ///
+    /// If `name` was previously dropped via [`drop_table`](Self::drop_table), this *continues*
+    /// that name's timeline: a fresh schema version is appended after the gap the
+    /// drop left, so a read `AS OF` an instant inside the old, dropped era still
+    /// resolves the original schema while reads after `at` see the new one. A
+    /// name that is currently live cannot be re-created.
     ///
     /// # Errors
     ///
     /// - [`CatalogError::SystemTimeExhausted`] if `at` is at or past the
     ///   open-interval sentinel [`SYSTEM_TIME_OPEN`].
-    /// - [`CatalogError::TableAlreadyExists`] if `name` is already registered.
+    /// - [`CatalogError::TableAlreadyExists`] if `name` is already live.
+    /// - [`CatalogError::TableRecreatedBeforeDrop`] if `name` was dropped and `at`
+    ///   precedes the drop — re-creation may not overlap the dropped era.
     /// - [`CatalogError::DuplicateColumn`] / [`CatalogError::InvalidColumnName`]
     ///   if the column list is malformed.
     /// - [`CatalogError::SchemaIdExhausted`] if the `u32` id space is used up.
@@ -111,19 +136,38 @@ impl Catalog {
                 at: at.0,
             });
         }
-        if self.tables.contains_key(&name) {
+        if self.open_version(&name).is_some() {
             return Err(CatalogError::TableAlreadyExists(name));
         }
         let schema_id = self.alloc_schema_id()?;
         let schema = TableSchema::new(schema_id, columns, temporal)?;
-        self.tables.insert(
-            name,
-            vec![SchemaVersion {
-                sys_from: at,
-                sys_to: SYSTEM_TIME_OPEN,
-                schema,
-            }],
-        );
+        let version = SchemaVersion {
+            sys_from: at,
+            sys_to: SYSTEM_TIME_OPEN,
+            schema,
+        };
+        match self.tables.get_mut(&name) {
+            // A previously dropped name: extend its existing version chain. The
+            // new open version must begin at or after the prior (closed) version's
+            // end, or the two system-time intervals would overlap.
+            Some(versions) => {
+                let dropped_at = versions
+                    .last()
+                    .expect("a registered table always has at least one schema version")
+                    .sys_to;
+                if at < dropped_at {
+                    return Err(CatalogError::TableRecreatedBeforeDrop {
+                        table: name,
+                        at: at.0,
+                        dropped_at: dropped_at.0,
+                    });
+                }
+                versions.push(version);
+            }
+            None => {
+                self.tables.insert(name, vec![version]);
+            }
+        }
         Ok(schema_id)
     }
 
@@ -152,12 +196,11 @@ impl Catalog {
         column: ColumnDef,
         at: SystemTimeMicros,
     ) -> Result<SchemaId, CatalogError> {
+        // Only a live table can take a schema change; a dropped name does not
+        // currently exist, so adding to it would silently resurrect it.
         let current = self
-            .tables
-            .get(name)
-            .ok_or_else(|| CatalogError::UnknownTable(name.to_owned()))?
-            .last()
-            .expect("a registered table always has at least one schema version");
+            .open_version(name)
+            .ok_or_else(|| CatalogError::UnknownTable(name.to_owned()))?;
 
         if at >= SYSTEM_TIME_OPEN {
             return Err(CatalogError::SystemTimeExhausted {
@@ -197,13 +240,72 @@ impl Catalog {
         Ok(schema_id)
     }
 
+    /// Logically drop a table, effective at system time `at`.
+    ///
+    /// The drop is a **catalog version transition, not a deletion**: it closes
+    /// the table's open schema version at `at` and appends nothing. From `at`
+    /// onward the name no longer [`resolve`](Self::resolve)s, but a read `AS OF`
+    /// any earlier instant still sees the table under the schema that was live
+    /// then — its history, and every sealed segment, is untouched (the
+    /// no-in-place-mutation invariant). The name may later be re-created with
+    /// [`create_table`](Self::create_table).
+    ///
+    /// Returns the [`SchemaId`] of the version that was closed.
+    ///
+    /// # Errors
+    ///
+    /// - [`CatalogError::UnknownTable`] if `name` is absent or already dropped —
+    ///   only a live table can be dropped.
+    /// - [`CatalogError::SystemTimeExhausted`] if `at` is at or past the
+    ///   open-interval sentinel [`SYSTEM_TIME_OPEN`]; closing there would leave a
+    ///   zero-width final era no finite snapshot could fall in.
+    /// - [`CatalogError::NonMonotonicSchemaChange`] if `at` is not strictly after
+    ///   the open version's start — system time never moves backward, and a
+    ///   zero-width version would break the gap-free/non-overlapping invariant.
+    pub fn drop_table(
+        &mut self,
+        name: &str,
+        at: SystemTimeMicros,
+    ) -> Result<SchemaId, CatalogError> {
+        let (sys_from, schema_id) = {
+            let current = self
+                .open_version(name)
+                .ok_or_else(|| CatalogError::UnknownTable(name.to_owned()))?;
+            (current.sys_from, current.schema.schema_id())
+        };
+        if at >= SYSTEM_TIME_OPEN {
+            return Err(CatalogError::SystemTimeExhausted {
+                table: name.to_owned(),
+                at: at.0,
+            });
+        }
+        if at <= sys_from {
+            return Err(CatalogError::NonMonotonicSchemaChange {
+                table: name.to_owned(),
+                at: at.0,
+                current_from: sys_from.0,
+            });
+        }
+        // Close the open tail in place; appending no successor is what makes the
+        // table cease to exist from `at` onward.
+        self.tables
+            .get_mut(name)
+            .expect("open version checked above")
+            .last_mut()
+            .expect("a registered table always has at least one schema version")
+            .sys_to = at;
+        Ok(schema_id)
+    }
+
     /// Resolve a table name to the schema in effect at `snapshot` — the
     /// binder-facing read ([architecture §6](../../../docs/02-architecture.md#6-query-layer)).
     ///
-    /// Returns `None` if the table does not exist *or* did not yet exist at
-    /// `snapshot` (its first version starts strictly after it). Containment is
-    /// half-open: the returned version satisfies `sys_from <= snapshot < sys_to`,
-    /// matching how the storage core bounds a row's system-time interval.
+    /// Returns `None` if the table does not exist, did not yet exist at
+    /// `snapshot` (its first version starts strictly after it), or had already
+    /// been [dropped](Self::drop_table) by then (the drop closed its final era at
+    /// or before `snapshot`). Containment is half-open: the returned version
+    /// satisfies `sys_from <= snapshot < sys_to`, matching how the storage core
+    /// bounds a row's system-time interval.
     ///
     /// Versions are kept in ascending `sys_from` order, so the lookup is an
     /// `O(log n)` binary search rather than a scan — planning-time resolution
@@ -216,8 +318,10 @@ impl Catalog {
         // table's first version.
         let started = versions.partition_point(|v| v.sys_from <= snapshot);
         let candidate = &versions[started.checked_sub(1)?];
-        // The chain is contiguous, so this `sys_to` check only ever fails at the
-        // `< first.sys_from` edge already handled above — kept for exactness.
+        // A dropped (and possibly re-created) name can leave gaps between
+        // versions, so this `sys_to` check also rejects a snapshot that falls
+        // past the candidate's end — whether that is the dropped era's tail or a
+        // gap before the next re-creation.
         (snapshot < candidate.sys_to).then_some(&candidate.schema)
     }
 
@@ -423,10 +527,179 @@ mod tests {
         );
     }
 
-    /// DoD bullet 2: over a randomized DDL history, every table's schema-version
-    /// intervals tile `[creation, +∞)` with no gaps and no overlaps, with exactly
-    /// one open tail and strictly positive widths. Walks the private interval
-    /// chain directly — the structural invariant the public `resolve` rests on.
+    #[test]
+    fn drop_table_logically_closes_the_open_version_without_deleting_history() {
+        let mut cat = Catalog::new();
+        let id = cat
+            .create_table(
+                "t",
+                vec![col("a")],
+                TableTemporal::system_only(),
+                SystemTimeMicros(100),
+            )
+            .expect("create");
+
+        // Dropping closes the open era and returns the id it closed.
+        assert_eq!(cat.drop_table("t", SystemTimeMicros(200)), Ok(id));
+
+        // Before the drop the table still resolves (history preserved); at and
+        // after the drop it is gone — a catalog transition, not a deletion.
+        assert_eq!(
+            cat.resolve("t", SystemTimeMicros(150))
+                .map(TableSchema::schema_id),
+            Some(id)
+        );
+        assert!(cat.resolve("t", SystemTimeMicros(200)).is_none());
+        assert!(cat.resolve("t", SystemTimeMicros(250)).is_none());
+        // …and the id is still reachable by footer lookup for old segments.
+        assert_eq!(cat.schema_by_id(id).map(TableSchema::schema_id), Some(id));
+    }
+
+    #[test]
+    fn drop_table_unknown_or_already_dropped_is_unknown_table() {
+        let mut cat = Catalog::new();
+        assert_eq!(
+            cat.drop_table("missing", SystemTimeMicros(1)),
+            Err(CatalogError::UnknownTable("missing".to_owned()))
+        );
+        cat.create_table(
+            "t",
+            vec![col("a")],
+            TableTemporal::system_only(),
+            SystemTimeMicros(1),
+        )
+        .expect("create");
+        cat.drop_table("t", SystemTimeMicros(2)).expect("drop");
+        // A second drop sees no live version.
+        assert_eq!(
+            cat.drop_table("t", SystemTimeMicros(3)),
+            Err(CatalogError::UnknownTable("t".to_owned()))
+        );
+    }
+
+    #[test]
+    fn drop_table_must_advance_system_time_and_cannot_use_the_open_sentinel() {
+        let mut cat = Catalog::new();
+        cat.create_table(
+            "t",
+            vec![col("a")],
+            TableTemporal::system_only(),
+            SystemTimeMicros(10),
+        )
+        .expect("create");
+        // At or before the open version's start: no backward or zero-width close.
+        assert_eq!(
+            cat.drop_table("t", SystemTimeMicros(10)),
+            Err(CatalogError::NonMonotonicSchemaChange {
+                table: "t".to_owned(),
+                at: 10,
+                current_from: 10,
+            })
+        );
+        // The +∞ sentinel can never be a finite drop instant.
+        assert_eq!(
+            cat.drop_table("t", SYSTEM_TIME_OPEN),
+            Err(CatalogError::SystemTimeExhausted {
+                table: "t".to_owned(),
+                at: i64::MAX,
+            })
+        );
+    }
+
+    #[test]
+    fn a_dropped_name_can_be_re_created_and_continues_its_timeline() {
+        let mut cat = Catalog::new();
+        let first = cat
+            .create_table(
+                "t",
+                vec![col("a")],
+                TableTemporal::system_only(),
+                SystemTimeMicros(100),
+            )
+            .expect("create");
+        cat.drop_table("t", SystemTimeMicros(200)).expect("drop");
+
+        // Re-create after the drop — a fresh schema version under a new id.
+        let second = cat
+            .create_table(
+                "t",
+                vec![col("b")],
+                TableTemporal::system_only(),
+                SystemTimeMicros(300),
+            )
+            .expect("re-create");
+        assert_ne!(first, second);
+
+        // The old era resolves to the old schema, the dropped gap to nothing, and
+        // the new era to the new schema — the name's whole timeline survives.
+        assert_eq!(
+            cat.resolve("t", SystemTimeMicros(150))
+                .map(TableSchema::schema_id),
+            Some(first)
+        );
+        assert!(cat.resolve("t", SystemTimeMicros(250)).is_none());
+        assert_eq!(
+            cat.resolve("t", SystemTimeMicros(350))
+                .map(TableSchema::schema_id),
+            Some(second)
+        );
+    }
+
+    #[test]
+    fn re_creating_a_name_before_its_drop_overlaps_and_is_rejected() {
+        let mut cat = Catalog::new();
+        cat.create_table(
+            "t",
+            vec![col("a")],
+            TableTemporal::system_only(),
+            SystemTimeMicros(100),
+        )
+        .expect("create");
+        cat.drop_table("t", SystemTimeMicros(200)).expect("drop");
+        assert_eq!(
+            cat.create_table(
+                "t",
+                vec![col("b")],
+                TableTemporal::system_only(),
+                SystemTimeMicros(150)
+            ),
+            Err(CatalogError::TableRecreatedBeforeDrop {
+                table: "t".to_owned(),
+                at: 150,
+                dropped_at: 200,
+            })
+        );
+    }
+
+    #[test]
+    fn add_column_on_a_dropped_table_does_not_resurrect_it() {
+        let mut cat = Catalog::new();
+        cat.create_table(
+            "t",
+            vec![col("a")],
+            TableTemporal::system_only(),
+            SystemTimeMicros(100),
+        )
+        .expect("create");
+        cat.drop_table("t", SystemTimeMicros(200)).expect("drop");
+        assert_eq!(
+            cat.add_column("t", col("b"), SystemTimeMicros(300)),
+            Err(CatalogError::UnknownTable("t".to_owned()))
+        );
+        // Still dropped — the failed add changed nothing.
+        assert!(cat.resolve("t", SystemTimeMicros(300)).is_none());
+    }
+
+    /// DoD bullet 2: over a randomized create + `add_column` history (no drops),
+    /// every table's schema-version intervals tile `[creation, +∞)` with no gaps
+    /// and no overlaps, with exactly one open tail and strictly positive widths.
+    /// Walks the private interval chain directly — the structural invariant the
+    /// public `resolve` rests on for *live* tables.
+    ///
+    /// Dropping relaxes this: a dropped table's tail is closed (no open tail),
+    /// and re-creating the name may leave a gap between eras. Non-overlap and
+    /// positive widths still hold; those drop/re-create cases are pinned by the
+    /// dedicated `drop_table` tests above rather than this gap-free sweep.
     #[test]
     fn schema_version_intervals_are_gap_free_and_non_overlapping() {
         let mut rng = Rng::new(0xCA7A_106D);
