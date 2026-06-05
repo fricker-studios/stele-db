@@ -42,6 +42,9 @@ anyhow             = "1.0"
 bytes              = "1.7"
 clap               = { version = "4.5", features = ["derive"] }
 serde              = { version = "1.0", features = ["derive"] }
+# `recursive-protection` (a default feature) pulls `stacker` → a build-dep that
+# needs a newer toolchain than our pinned 1.85; we drop it and keep just `std`.
+sqlparser          = { version = "0.62", default-features = false, features = ["std"] }
 thiserror          = "2.0"
 toml               = "0.8"
 tokio              = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
