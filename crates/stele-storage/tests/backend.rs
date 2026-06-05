@@ -162,6 +162,13 @@ fn sample_versions() -> Vec<Version> {
                 SystemTimeMicros(10),
                 Principal::new(b"svc".to_vec()),
             ),
+            // A closed version: exercise close-provenance round-tripping on
+            // both backends (STL-118). Closed at sys_to=20 by txn 20.
+            closed_by: Some(Provenance::new(
+                TxnId(20),
+                SystemTimeMicros(20),
+                Principal::new(b"svc".to_vec()),
+            )),
             payload: b"a-v0".to_vec(),
         },
         Version {
@@ -173,6 +180,7 @@ fn sample_versions() -> Vec<Version> {
                 SystemTimeMicros(20),
                 Principal::new(b"svc".to_vec()),
             ),
+            closed_by: None,
             payload: b"a-v1".to_vec(),
         },
         Version {
@@ -184,6 +192,7 @@ fn sample_versions() -> Vec<Version> {
                 SystemTimeMicros(1),
                 Principal::new(b"svc".to_vec()),
             ),
+            closed_by: None,
             payload: blob,
         },
     ]

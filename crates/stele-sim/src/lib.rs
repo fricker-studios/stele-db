@@ -28,6 +28,7 @@ use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros, ValidTimeMic
 use stele_storage::backend::{Disk, DiskFile, FaultOp, Faults, MemDisk};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Version};
 use stele_storage::segment::{SegmentReader, SegmentWriter};
+use stele_storage::systime::SysTimeWriter;
 use stele_storage::validtime::{ValidInterval, ValidTimeWriter, unframe_payload};
 
 /// A deterministic, strictly-increasing clock for seeded scenarios.
@@ -110,6 +111,24 @@ fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Fold a version's optional close-provenance into the running digest ([STL-118]).
+/// A leading presence byte distinguishes an open version (`0`) from a closed one
+/// (`1`, followed by the closing transaction's `txn_id` / `committed_at` /
+/// `principal`) so the oracle is sensitive to *who closed a period*, not just to
+/// the fact that one was closed.
+fn fold_closed_by(mut digest: u64, closed_by: Option<&Provenance>) -> u64 {
+    match closed_by {
+        Some(c) => {
+            digest = fnv1a(digest, &[1]);
+            digest = fnv1a(digest, &c.txn_id.0.to_le_bytes());
+            digest = fnv1a(digest, &c.committed_at.0.to_le_bytes());
+            digest = fnv1a(digest, c.principal.as_bytes());
+        }
+        None => digest = fnv1a(digest, &[0]),
+    }
+    digest
+}
+
 /// Play a seeded storage workload against a fresh [`MemDisk`] and return a
 /// digest of every version read back.
 ///
@@ -140,16 +159,38 @@ pub fn run_storage_seed(seed: u64) -> u64 {
             let txn_id = u64::try_from(rng.next_i64_nonneg()).unwrap_or(0);
             let principal_len = rng.below_usize(8);
             let principal = rng.bytes(principal_len);
+            // Roughly half the rows are *closed* versions carrying a second
+            // (close) provenance group, so the round-trip exercises the v3
+            // close-provenance columns deterministically ([STL-118]). A closed
+            // version's `sys_to` and `closed_at` are real values below the open
+            // sentinel; an open one keeps `SYSTEM_TIME_OPEN` and `None`.
+            let (sys_to, closed_by) = if rng.below(2) == 0 {
+                let closed_at = sys_from + 1 + (rng.next_i64_nonneg() % 1_000);
+                let closer_txn = u64::try_from(rng.next_i64_nonneg()).unwrap_or(0);
+                let closer_principal_len = rng.below_usize(8);
+                let closer_principal = rng.bytes(closer_principal_len);
+                (
+                    SystemTimeMicros(closed_at),
+                    Some(Provenance::new(
+                        TxnId(closer_txn),
+                        SystemTimeMicros(closed_at),
+                        Principal::new(closer_principal),
+                    )),
+                )
+            } else {
+                (SYSTEM_TIME_OPEN, None)
+            };
             writer
                 .push(Version {
                     business_key: BusinessKey::new(key),
                     sys_from: SystemTimeMicros(sys_from),
-                    sys_to: SYSTEM_TIME_OPEN,
+                    sys_to,
                     provenance: Provenance::new(
                         TxnId(txn_id),
                         SystemTimeMicros(sys_from),
                         Principal::new(principal),
                     ),
+                    closed_by,
                     payload,
                 })
                 .expect("push version");
@@ -172,6 +213,7 @@ pub fn run_storage_seed(seed: u64) -> u64 {
             digest = fnv1a(digest, &v.provenance.txn_id.0.to_le_bytes());
             digest = fnv1a(digest, &v.provenance.committed_at.0.to_le_bytes());
             digest = fnv1a(digest, v.provenance.principal.as_bytes());
+            digest = fold_closed_by(digest, v.closed_by.as_ref());
             digest = fnv1a(digest, &v.payload);
         }
     }
@@ -232,6 +274,73 @@ pub fn run_validtime_seed(seed: u64) -> u64 {
         digest = fnv1a(digest, &valid.from.0.to_le_bytes());
         digest = fnv1a(digest, &valid.to.0.to_le_bytes());
         digest = fnv1a(digest, user);
+    }
+    digest
+}
+
+/// Play a seeded insert/update/delete workload through the real system-time
+/// write path and return a digest folding every version's close-provenance.
+///
+/// Where [`run_storage_seed`] hand-builds closed versions to exercise the
+/// segment columns, this drives the *writer* ([`SysTimeWriter`]): each op either
+/// opens a key, supersedes it (closing the prior period), or deletes it (closing
+/// without re-opening). The drained chain is folded — system interval, birth
+/// provenance, and `closed_by` — so the oracle covers "who closed each period"
+/// end-to-end through the delta-tier encode/decode, including the delete case
+/// where no successor version carries that identity ([STL-118]). Same seed ⇒
+/// same digest.
+#[must_use]
+pub fn run_delete_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut rng = Rng::new(seed);
+    let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+    let mut writer = SysTimeWriter::new(StepClock::new(1));
+
+    let key_count = 1 + rng.below_usize(6);
+    let mut live = vec![false; key_count];
+    let ops = 8 + rng.below(24);
+    for op in 0..ops {
+        let k = rng.below_usize(key_count);
+        let key = BusinessKey::new(format!("k-{k:04}").into_bytes());
+        let txn = TxnId(op);
+        let principal_len = rng.below_usize(8);
+        let principal = Principal::new(rng.bytes(principal_len));
+        if live[k] {
+            // A live key is either superseded (close + re-open) or deleted
+            // (close, no re-open) — both record `principal` as the closer.
+            if rng.below(2) == 0 {
+                writer
+                    .delete(&mut delta, &key, txn, principal)
+                    .expect("delete");
+                live[k] = false;
+            } else {
+                let payload_len = rng.below_usize(16);
+                let payload = rng.bytes(payload_len);
+                writer
+                    .update(&mut delta, key, payload, txn, principal)
+                    .expect("update");
+            }
+        } else {
+            let payload_len = rng.below_usize(16);
+            let payload = rng.bytes(payload_len);
+            writer
+                .insert(&mut delta, key, payload, txn, principal)
+                .expect("insert");
+            live[k] = true;
+        }
+    }
+
+    // `flush_to_segment` drains in `(business_key, sys_from)` order — deterministic.
+    let mut digest = FNV_OFFSET;
+    for v in delta.flush_to_segment().expect("flush") {
+        digest = fnv1a(digest, v.business_key.as_bytes());
+        digest = fnv1a(digest, &v.sys_from.0.to_le_bytes());
+        digest = fnv1a(digest, &v.sys_to.0.to_le_bytes());
+        digest = fnv1a(digest, &v.provenance.txn_id.0.to_le_bytes());
+        digest = fnv1a(digest, &v.provenance.committed_at.0.to_le_bytes());
+        digest = fnv1a(digest, v.provenance.principal.as_bytes());
+        digest = fold_closed_by(digest, v.closed_by.as_ref());
+        digest = fnv1a(digest, &v.payload);
     }
     digest
 }
@@ -327,6 +436,26 @@ mod tests {
         assert!(
             digests.len() > 1,
             "valid-time workload must actually depend on the seed"
+        );
+    }
+
+    #[test]
+    fn delete_seed_is_reproducible() {
+        for seed in 0..64 {
+            assert_eq!(
+                run_delete_seed(seed),
+                run_delete_seed(seed),
+                "seed {seed} must replay to an identical delete-provenance digest"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_distinct_seeds_diverge() {
+        let digests: std::collections::HashSet<u64> = (0..64).map(run_delete_seed).collect();
+        assert!(
+            digests.len() > 1,
+            "delete/close-provenance workload must actually depend on the seed"
         );
     }
 }

@@ -135,6 +135,7 @@ fn version(key: &[u8], sys_from: i64, sys_to: SystemTimeMicros, payload: &[u8]) 
             SystemTimeMicros(sys_from),
             Principal::new(format!("svc-{sys_from}").into_bytes()),
         ),
+        closed_by: None,
         payload: payload.to_vec(),
     }
 }

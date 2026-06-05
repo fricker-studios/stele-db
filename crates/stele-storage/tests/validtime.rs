@@ -29,7 +29,7 @@ use std::io;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use stele_common::provenance::{Principal, TxnId};
+use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros, VALID_TIME_OPEN, ValidTimeMicros};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
 use stele_storage::validtime::{ValidInterval, ValidTimeError, ValidTimeWriter, unframe_payload};
@@ -280,7 +280,14 @@ fn delete_closes_the_system_period_and_preserves_the_valid_interval() {
             who(),
         )
         .unwrap();
-    let closed_at = writer.delete(&mut delta, &key).unwrap();
+    let closed_at = writer
+        .delete(
+            &mut delta,
+            &key,
+            TxnId(7),
+            Principal::new(b"deleter".to_vec()),
+        )
+        .unwrap();
 
     // Nothing is live after the delete on the system axis.
     let live = delta
@@ -298,6 +305,17 @@ fn delete_closes_the_system_period_and_preserves_the_valid_interval() {
     // The valid interval the row was written with is untouched by the delete.
     let (valid, _) = unframe_payload(true, &versions[0].payload).unwrap();
     assert_eq!(valid, Some(interval(100, 200)));
+    // The delete's identity is recorded as close-provenance on the system axis,
+    // forwarded verbatim through the valid-time writer (STL-118).
+    assert_eq!(
+        versions[0].closed_by,
+        Some(Provenance::new(
+            TxnId(7),
+            closed_at,
+            Principal::new(b"deleter".to_vec())
+        )),
+        "valid-time delete still records who closed the period"
+    );
 }
 
 // --- Per-table policy -------------------------------------------------------

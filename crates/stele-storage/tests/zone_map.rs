@@ -145,6 +145,7 @@ fn version(key: &[u8], sys_from: i64, sys_to: i64, payload: &[u8]) -> Version {
             SystemTimeMicros(sys_from),
             Principal::new(format!("svc-{sys_from}").into_bytes()),
         ),
+        closed_by: None,
         payload: payload.to_vec(),
     }
 }
@@ -422,6 +423,7 @@ fn valid_version(key: &[u8], valid_from: i64, valid_to: i64) -> Version {
             SystemTimeMicros(0),
             Principal::new(b"svc".to_vec()),
         ),
+        closed_by: None,
         payload,
     }
 }

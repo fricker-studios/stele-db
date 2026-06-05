@@ -14,6 +14,16 @@
 //!   carried as first-class fields here (and as first-class columns in a sealed
 //!   segment) rather than inside `payload` — so it survives WAL replay and
 //!   compresses on its own column statistics ([STL-93]).
+//! * `closed_by` — the provenance of the transaction that *closed* this
+//!   version's system-time period, if it has been closed. `None` while the
+//!   version is open (`sys_to = SYSTEM_TIME_OPEN`); `Some` once an
+//!   [`update`](crate::systime::SysTimeWriter::update) or a
+//!   [`delete`](crate::systime::SysTimeWriter::delete) stamps `sys_to`. This is
+//!   the "tombstones are logical period-closes … they carry their own
+//!   provenance" of [architecture §3.1](../../../../docs/02-architecture.md#31-tiered-layout-lsm-flavored-history-preserving)
+//!   ([STL-118]): for a `delete` there is no successor version, so the closing
+//!   transaction's identity would otherwise be lost. The *birth* provenance
+//!   above is never touched by a close — corrections append, never rewrite.
 //! * `payload` — the column values, encoded by a layer above. The delta tier
 //!   treats this as opaque bytes.
 //!
@@ -27,15 +37,22 @@
 //!
 //! [`Version::encode`] / [`Version::decode`] share one binary frame, used for
 //! both WAL records and spill files. Layout (little-endian, fixed header is
-//! 44 B; the three variable-length fields follow in order):
+//! [`HEADER_LEN`] B; the four variable-length fields follow in order):
 //!
 //! ```text
-//! +-----------------+----------------+------------------+------------+----------+-----------+----------------+
-//! | business_len:u32| payload_len:u32| principal_len:u32| sys_from:i64| sys_to:i64| txn_id:u64 | committed_at:i64|
-//! +-----------------+----------------+------------------+------------+----------+-----------+----------------+
-//! | business_key bytes … | payload bytes … | principal bytes … |
-//! +----------------------+-----------------+-------------------+
+//! +------------------+----------------+------------------+-------------------------+
+//! | business_len:u32 | payload_len:u32| principal_len:u32| closed_principal_len:u32|
+//! +------------------+----------------+------------------+-------------------------+
+//! | sys_from:i64 | sys_to:i64 | txn_id:u64 | committed_at:i64 | closed_txn:u64 | closed_at:i64 | closed_present:u8 |
+//! +--------------+------------+------------+------------------+----------------+---------------+-------------------+
+//! | business_key bytes … | payload bytes … | principal bytes … | closed_principal bytes … |
+//! +----------------------+-----------------+-------------------+--------------------------+
 //! ```
+//!
+//! `closed_present` is the discriminator for the optional [`Version::closed_by`]
+//! group: `0` means the period is open (the `closed_*` fields are zero and no
+//! `closed_principal` bytes follow); `1` means the version was closed and the
+//! group carries the closing transaction's provenance.
 //!
 //! No CRC here — the WAL frames its own records ([`crate::wal`]), and spill
 //! files are non-durable by design (the delta is rebuilt from WAL on crash).
@@ -45,10 +62,10 @@ use stele_common::time::SystemTimeMicros;
 
 use super::DeltaError;
 
-/// Fixed header size in bytes for the [`Version`] binary encoding: three `u32`
-/// lengths (12) + `sys_from`/`sys_to`/`committed_at` `i64` (24) + `txn_id` `u64`
-/// (8).
-pub(crate) const HEADER_LEN: usize = 44;
+/// Fixed header size in bytes for the [`Version`] binary encoding: four `u32`
+/// lengths (16) + `sys_from`/`sys_to`/`committed_at`/`closed_at` `i64` (32) +
+/// `txn_id`/`closed_txn` `u64` (16) + `closed_present` `u8` (1).
+pub(crate) const HEADER_LEN: usize = 65;
 
 /// Per-frame ceiling for a delta-tier `Version` (16 MiB).
 ///
@@ -96,6 +113,11 @@ pub struct Version {
     pub sys_to: SystemTimeMicros,
     /// Inline provenance captured at commit — invariant 5. Always present.
     pub provenance: Provenance,
+    /// Provenance of the transaction that closed this version's system-time
+    /// period — `None` while the version is open, `Some` once it is superseded
+    /// or deleted ([STL-118]). "Tombstones are logical period-closes … they
+    /// carry their own provenance" — [architecture §3.1](../../../../docs/02-architecture.md#31-tiered-layout-lsm-flavored-history-preserving).
+    pub closed_by: Option<Provenance>,
     pub payload: Vec<u8>,
 }
 
@@ -111,6 +133,15 @@ impl Version {
             + self.business_key.0.len()
             + self.payload.len()
             + self.provenance.principal.0.len()
+            + self.closed_principal_len()
+    }
+
+    /// Byte length of the closing transaction's principal, or `0` when the
+    /// version is still open. Centralizes the `closed_by`-as-bytes accounting
+    /// shared by [`Self::encoded_size`], [`Self::check_encodable`], and
+    /// [`Self::encode`].
+    fn closed_principal_len(&self) -> usize {
+        self.closed_by.as_ref().map_or(0, |c| c.principal.0.len())
     }
 
     /// Verify the version can be encoded — i.e. its component sizes fit in
@@ -127,6 +158,7 @@ impl Version {
         if u32::try_from(self.business_key.0.len()).is_err()
             || u32::try_from(self.payload.len()).is_err()
             || u32::try_from(self.provenance.principal.0.len()).is_err()
+            || u32::try_from(self.closed_principal_len()).is_err()
         {
             return Err(DeltaError::TooLarge(self.encoded_size()));
         }
@@ -156,17 +188,34 @@ impl Version {
             .map_err(|_| DeltaError::TooLarge(self.encoded_size()))?;
         let principal_len = u32::try_from(self.provenance.principal.0.len())
             .map_err(|_| DeltaError::TooLarge(self.encoded_size()))?;
+        let closed_principal_len = u32::try_from(self.closed_principal_len())
+            .map_err(|_| DeltaError::TooLarge(self.encoded_size()))?;
+        // The optional close group: when absent, the closing fields encode as
+        // zeros and no `closed_principal` bytes follow. `closed_present` is the
+        // sole authority on decode — see the module-level frame layout.
+        let closed_present: u8 = u8::from(self.closed_by.is_some());
+        let (closed_txn, closed_at) = self
+            .closed_by
+            .as_ref()
+            .map_or((0u64, 0i64), |c| (c.txn_id.0, c.committed_at.0));
         out.reserve(self.encoded_size());
         out.extend_from_slice(&business_len.to_le_bytes());
         out.extend_from_slice(&payload_len.to_le_bytes());
         out.extend_from_slice(&principal_len.to_le_bytes());
+        out.extend_from_slice(&closed_principal_len.to_le_bytes());
         out.extend_from_slice(&self.sys_from.0.to_le_bytes());
         out.extend_from_slice(&self.sys_to.0.to_le_bytes());
         out.extend_from_slice(&self.provenance.txn_id.0.to_le_bytes());
         out.extend_from_slice(&self.provenance.committed_at.0.to_le_bytes());
+        out.extend_from_slice(&closed_txn.to_le_bytes());
+        out.extend_from_slice(&closed_at.to_le_bytes());
+        out.push(closed_present);
         out.extend_from_slice(&self.business_key.0);
         out.extend_from_slice(&self.payload);
         out.extend_from_slice(&self.provenance.principal.0);
+        if let Some(closed) = &self.closed_by {
+            out.extend_from_slice(&closed.principal.0);
+        }
         Ok(())
     }
 
@@ -196,45 +245,27 @@ impl Version {
         if bytes.len() < HEADER_LEN {
             return Err(DeltaError::Corrupt("short read on version header"));
         }
-        let business_len = u32::from_le_bytes(
-            bytes[0..4]
-                .try_into()
-                .expect("4-byte slice always converts"),
-        ) as usize;
-        let payload_len = u32::from_le_bytes(
-            bytes[4..8]
-                .try_into()
-                .expect("4-byte slice always converts"),
-        ) as usize;
-        let principal_len = u32::from_le_bytes(
-            bytes[8..12]
-                .try_into()
-                .expect("4-byte slice always converts"),
-        ) as usize;
-        let sys_from = i64::from_le_bytes(
-            bytes[12..20]
-                .try_into()
-                .expect("8-byte slice always converts"),
-        );
-        let sys_to = i64::from_le_bytes(
-            bytes[20..28]
-                .try_into()
-                .expect("8-byte slice always converts"),
-        );
-        let txn_id = u64::from_le_bytes(
-            bytes[28..36]
-                .try_into()
-                .expect("8-byte slice always converts"),
-        );
-        let committed_at = i64::from_le_bytes(
-            bytes[36..44]
-                .try_into()
-                .expect("8-byte slice always converts"),
-        );
+        // Fixed-offset readers over the header — `bytes.len() >= HEADER_LEN`
+        // is checked above, so every fixed field is in bounds.
+        let rd_u32 = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().expect("4 bytes"));
+        let rd_i64 = |o: usize| i64::from_le_bytes(bytes[o..o + 8].try_into().expect("8 bytes"));
+        let rd_u64 = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().expect("8 bytes"));
+        let business_len = rd_u32(0) as usize;
+        let payload_len = rd_u32(4) as usize;
+        let principal_len = rd_u32(8) as usize;
+        let closed_principal_len = rd_u32(12) as usize;
+        let sys_from = rd_i64(16);
+        let sys_to = rd_i64(24);
+        let txn_id = rd_u64(32);
+        let committed_at = rd_i64(40);
+        let closed_txn = rd_u64(48);
+        let closed_at = rd_i64(56);
+        let closed_present = bytes[64];
         let total = HEADER_LEN
             .checked_add(business_len)
             .and_then(|v| v.checked_add(payload_len))
             .and_then(|v| v.checked_add(principal_len))
+            .and_then(|v| v.checked_add(closed_principal_len))
             .ok_or(DeltaError::Corrupt("frame length overflows usize"))?;
         if total > MAX_VERSION_FRAME_LEN {
             return Err(DeltaError::Corrupt(
@@ -244,13 +275,38 @@ impl Version {
         if bytes.len() < total {
             return Err(DeltaError::Corrupt("frame body shorter than declared"));
         }
+        // A closed group declares `closed_present = 1` *and* (only then) may
+        // carry `closed_principal` bytes. An open frame must declare neither —
+        // reject a `closed_principal_len > 0` on an open frame as corruption
+        // rather than silently dropping the bytes.
+        if closed_present == 0 && closed_principal_len != 0 {
+            return Err(DeltaError::Corrupt(
+                "open frame declares closing-principal bytes",
+            ));
+        }
         // Body fields follow the fixed header in declaration order:
-        // business_key, then payload, then principal.
+        // business_key, payload, principal, then closed_principal.
         let bk_end = HEADER_LEN + business_len;
         let payload_end = bk_end + payload_len;
+        let principal_end = payload_end + principal_len;
         let business_key = BusinessKey(bytes[HEADER_LEN..bk_end].to_vec());
         let payload = bytes[bk_end..payload_end].to_vec();
-        let principal = Principal(bytes[payload_end..total].to_vec());
+        let principal = Principal(bytes[payload_end..principal_end].to_vec());
+        let closed_by = match closed_present {
+            0 => None,
+            1 => Some(Provenance {
+                txn_id: TxnId(closed_txn),
+                committed_at: SystemTimeMicros(closed_at),
+                principal: Principal(bytes[principal_end..total].to_vec()),
+            }),
+            // The discriminator is a strict 0/1 boolean; any other value is a
+            // corrupt frame, not a present group — reject rather than fabricate.
+            _ => {
+                return Err(DeltaError::Corrupt(
+                    "invalid closed-present discriminator (not 0 or 1)",
+                ));
+            }
+        };
         Ok((
             Self {
                 business_key,
@@ -261,6 +317,7 @@ impl Version {
                     committed_at: SystemTimeMicros(committed_at),
                     principal,
                 },
+                closed_by,
                 payload,
             },
             total,
@@ -285,6 +342,7 @@ mod tests {
                 committed_at: SystemTimeMicros(sys_from),
                 principal: Principal::new(b"tester".to_vec()),
             },
+            closed_by: None,
             payload: payload.to_vec(),
         }
     }
@@ -297,6 +355,49 @@ mod tests {
         assert_eq!(parsed, original);
         assert_eq!(consumed, bytes.len());
         assert_eq!(parsed.encoded_size(), bytes.len());
+    }
+
+    #[test]
+    fn closed_by_round_trips_through_the_frame() {
+        // A version whose period was closed carries a second provenance group;
+        // it must survive encode/decode with every field intact ([STL-118]).
+        let mut original = v(b"acct", 7, b"balance=0");
+        original.sys_to = SystemTimeMicros(99);
+        original.closed_by = Some(Provenance {
+            txn_id: TxnId(4242),
+            committed_at: SystemTimeMicros(99),
+            principal: Principal::new(b"deleter".to_vec()),
+        });
+        let bytes = original.encoded().expect("encode");
+        let (parsed, consumed) = Version::decode(&bytes).expect("decode");
+        assert_eq!(parsed, original);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(parsed.encoded_size(), bytes.len());
+    }
+
+    #[test]
+    fn open_frame_with_a_stray_closing_principal_len_is_corruption() {
+        // An open version (closed_present = 0) must not declare any
+        // closed_principal bytes. Hand-forge a frame that does and confirm the
+        // decoder rejects it rather than silently swallowing the bytes.
+        let mut forged = v(b"k", 1, b"x").encoded().expect("encode");
+        // closed_principal_len lives at header bytes [12..16]; closed_present is
+        // byte 64 (left at 0). Claim one closing-principal byte without adding
+        // it — and append one body byte so the length check passes first.
+        forged[12..16].copy_from_slice(&1u32.to_le_bytes());
+        forged.push(0u8);
+        let err = Version::decode(&forged).unwrap_err();
+        assert!(matches!(err, DeltaError::Corrupt(_)));
+    }
+
+    #[test]
+    fn closed_present_discriminator_other_than_0_or_1_is_corruption() {
+        // The presence byte is a strict boolean; a corrupt frame must not be
+        // able to fabricate a `closed_by` group by setting it to, say, 2.
+        let mut forged = v(b"k", 1, b"x").encoded().expect("encode");
+        forged[64] = 2; // closed_present lives at byte 64
+        let err = Version::decode(&forged).unwrap_err();
+        assert!(matches!(err, DeltaError::Corrupt(_)));
     }
 
     #[test]
@@ -358,6 +459,7 @@ mod tests {
                 committed_at: SystemTimeMicros(0),
                 principal: Principal::new(b"tester".to_vec()),
             },
+            closed_by: None,
             payload: vec![0u8; MAX_VERSION_FRAME_LEN + 1],
         };
         let err = big.check_encodable().unwrap_err();

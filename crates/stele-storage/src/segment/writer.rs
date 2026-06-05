@@ -14,6 +14,8 @@
 //! segments append-rejecting at the type level
 //! ([architecture §12 invariant 1](../../../../../docs/02-architecture.md#12-cross-cutting-architectural-invariants)).
 
+use stele_common::time::SYSTEM_TIME_OPEN;
+
 use crate::backend::{Disk, DiskFile};
 use crate::checksum::crc32c;
 use crate::delta::Version;
@@ -213,14 +215,17 @@ fn encode_column(
             //
             // Every bytes column can be an unbounded blob — `Payload` runs up
             // to `MAX_VERSION_FRAME_LEN` (16 MiB) per row, and `BusinessKey` /
-            // `Principal` are only bounded by the same frame ceiling — so
-            // inlining a full lex-min/max would let one row push the footer
-            // past the `u32` `footer_len` limit. Instead we record a bounded
-            // prefix capped at `MAX_BYTES_STAT_PREFIX_LEN`: the min prefix is
-            // truncated *down* and the max prefix is rounded *up*, so the
-            // `[min, max]` envelope stays a superset of the real value range
-            // and `might_contain` keeps its no-false-negatives contract. This
-            // caps every bytes column's footer cost regardless of value size.
+            // `Principal` / `ClosedByPrincipal` are only bounded by the same
+            // frame ceiling — so inlining a full lex-min/max would let one row
+            // push the footer past the `u32` `footer_len` limit. Instead we
+            // record a bounded prefix capped at `MAX_BYTES_STAT_PREFIX_LEN`: the
+            // min prefix is truncated *down* and the max prefix is rounded *up*,
+            // so the `[min, max]` envelope stays a superset of the real value
+            // range and `might_contain` keeps its no-false-negatives contract.
+            // This caps every bytes column's footer cost regardless of value
+            // size. The close-provenance principal ([`ColumnId::ClosedByPrincipal`],
+            // STL-118) is just another bytes column here — empty on open
+            // versions, which collapses to the "no stats" sentinel.
             let mut payload = Vec::new();
             let mut min: Option<&[u8]> = None;
             let mut max: Option<&[u8]> = None;
@@ -314,12 +319,19 @@ fn extract_bytes(col: ColumnId, row: &Version) -> &[u8] {
         ColumnId::BusinessKey => row.business_key.as_bytes(),
         ColumnId::Payload => &row.payload,
         ColumnId::Principal => row.provenance.principal.as_bytes(),
+        // Empty on an open version; the closing principal's bytes otherwise.
+        ColumnId::ClosedByPrincipal => row
+            .closed_by
+            .as_ref()
+            .map_or(&[][..], |c| c.principal.as_bytes()),
         ColumnId::SysFrom
         | ColumnId::SysTo
         | ColumnId::TxnId
         | ColumnId::CommittedAt
         | ColumnId::ValidFrom
-        | ColumnId::ValidTo => {
+        | ColumnId::ValidTo
+        | ColumnId::ClosedByTxn
+        | ColumnId::ClosedAt => {
             unreachable!("not a bytes column")
         }
     }
@@ -336,13 +348,24 @@ fn extract_i64(col: ColumnId, row: &Version) -> i64 {
         // round-trip — see `ColumnId::TxnId`).
         ColumnId::TxnId => row.provenance.txn_id.0 as i64,
         ColumnId::CommittedAt => row.provenance.committed_at.0,
+        // Close-provenance: `0` / the `SYSTEM_TIME_OPEN` sentinel on an open
+        // version. `ClosedAt`'s sentinel is the presence discriminator the
+        // reader keys off — see `ColumnId::ClosedAt`.
+        ColumnId::ClosedByTxn => row.closed_by.as_ref().map_or(0, |c| c.txn_id.0 as i64),
+        ColumnId::ClosedAt => row
+            .closed_by
+            .as_ref()
+            .map_or(SYSTEM_TIME_OPEN.0, |c| c.committed_at.0),
         // The valid-time columns are not `Version` fields — they are lifted
         // from the payload prefix by `decode_valid_pairs`, which the caller
         // reads from directly.
         ColumnId::ValidFrom | ColumnId::ValidTo => {
             unreachable!("valid-time columns are extracted via decode_valid_pairs")
         }
-        ColumnId::BusinessKey | ColumnId::Payload | ColumnId::Principal => {
+        ColumnId::BusinessKey
+        | ColumnId::Payload
+        | ColumnId::Principal
+        | ColumnId::ClosedByPrincipal => {
             unreachable!("not an i64 column")
         }
     }

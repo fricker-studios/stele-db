@@ -27,7 +27,7 @@ use std::io;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use stele_common::provenance::{Principal, TxnId};
+use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
 use stele_storage::systime::{SysTimeError, SysTimeWriter};
@@ -238,6 +238,17 @@ fn insert_then_update_leaves_one_closed_and_one_open_version() {
         Principal::new(b"writer-a".to_vec())
     );
     assert_eq!(closed.provenance.committed_at, c0);
+    // …but the close *adds* who closed it: the superseding transaction's
+    // identity, with committed_at = the new sys_to (c1) — STL-118.
+    assert_eq!(
+        closed.closed_by,
+        Some(Provenance::new(
+            TxnId(20),
+            c1,
+            Principal::new(b"writer-b".to_vec())
+        )),
+        "an updated prior version records its closer"
+    );
 
     // Second version: opened at c1, still current.
     assert_eq!(open.sys_from, c1);
@@ -250,6 +261,8 @@ fn insert_then_update_leaves_one_closed_and_one_open_version() {
         Principal::new(b"writer-b".to_vec())
     );
     assert_eq!(open.provenance.committed_at, c1);
+    // The current (open) version has not been closed, so it carries no closer.
+    assert_eq!(open.closed_by, None, "an open version has no closer");
 
     // The close abuts the new open — no gap, no overlap.
     assert_eq!(closed.sys_to, open.sys_from);
@@ -283,7 +296,9 @@ fn update_or_delete_without_a_live_version_is_rejected() {
         SysTimeError::KeyNotFound
     ));
     assert!(matches!(
-        writer.delete(&mut delta, &key).unwrap_err(),
+        writer
+            .delete(&mut delta, &key, TxnId(2), who())
+            .unwrap_err(),
         SysTimeError::KeyNotFound
     ));
 }
@@ -298,7 +313,14 @@ fn delete_closes_the_live_period_and_leaves_no_open_version() {
     writer
         .insert(&mut delta, key.clone(), b"v".to_vec(), TxnId(1), who())
         .unwrap();
-    let closed_at = writer.delete(&mut delta, &key).unwrap();
+    let closed_at = writer
+        .delete(
+            &mut delta,
+            &key,
+            TxnId(2),
+            Principal::new(b"deleter".to_vec()),
+        )
+        .unwrap();
 
     // No version is live after the delete.
     let live = delta
@@ -311,6 +333,18 @@ fn delete_closes_the_live_period_and_leaves_no_open_version() {
     assert_eq!(versions.len(), 1);
     assert_eq!(versions[0].sys_to, closed_at, "delete closes the period");
     assert_ne!(versions[0].sys_to, SYSTEM_TIME_OPEN);
+    // The birth provenance is the inserting txn; the *close* records the
+    // deleting txn — the only place a delete's identity survives (STL-118).
+    assert_eq!(versions[0].provenance.txn_id, TxnId(1));
+    assert_eq!(
+        versions[0].closed_by,
+        Some(Provenance::new(
+            TxnId(2),
+            closed_at,
+            Principal::new(b"deleter".to_vec())
+        )),
+        "the tombstone carries the deleting transaction's provenance"
+    );
 }
 
 #[test]
@@ -324,7 +358,7 @@ fn reinsert_after_delete_opens_a_new_period_with_a_gap() {
         .insert(&mut delta, key.clone(), b"a".to_vec(), TxnId(1), who())
         .unwrap();
     clock.set(200);
-    let deleted_at = writer.delete(&mut delta, &key).unwrap();
+    let deleted_at = writer.delete(&mut delta, &key, TxnId(2), who()).unwrap();
     clock.set(300);
     let reopened_at = writer
         .insert(&mut delta, key.clone(), b"b".to_vec(), TxnId(2), who())
