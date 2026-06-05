@@ -51,7 +51,10 @@ jobs:
           CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
         run: |
           echo "Sanitizer ${{ matrix.san }} stub — wire real test invocation in STL follow-up."
-          cargo build --workspace --all-features
+          # Explicit +nightly: the repo's rust-toolchain.toml pins 1.85.0, and a
+          # directory toolchain override outranks the nightly installed above.
+          # Only a +toolchain arg beats the file — same trick the miri job uses.
+          cargo +nightly build --workspace --all-features
 
   miri:
     if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'full-ci')
