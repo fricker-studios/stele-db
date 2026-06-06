@@ -263,13 +263,9 @@ mod tests {
     /// 56 spills to a second. Both must hash correctly.
     #[test]
     fn padding_boundary_is_correct() {
-        assert_eq!(
-            sha256(&[b'x'; 55]).to_hex(),
-            sha256(&[b'x'; 55]).to_hex(),
-            "deterministic",
-        );
-        // Distinct lengths give distinct digests — a sanity check that padding
-        // encodes the length, not just the bytes.
+        // Distinct lengths across the one-/two-block padding boundary give
+        // distinct digests — a sanity check that padding encodes the length, not
+        // just the bytes. (Determinism itself is covered by `digest_is_deterministic`.)
         assert_ne!(sha256(&[b'x'; 55]), sha256(&[b'x'; 56]));
         assert_ne!(sha256(&[b'x'; 63]), sha256(&[b'x'; 64]));
     }

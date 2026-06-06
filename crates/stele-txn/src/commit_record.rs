@@ -52,8 +52,8 @@
 //! proofs (~v0.5) build on; the chain is over the **log**, independent of the
 //! derived validity index.
 //!
-//! [ADR-0024]: https://allegromusic.atlassian.net/browse/STL-137
-//! [ADR-0026]: https://allegromusic.atlassian.net/browse/STL-137
+//! [ADR-0024]: ../../../docs/adr/0024-time-representation.md
+//! [ADR-0026]: ../../../docs/adr/0026-verifiable-audit-log.md
 
 use stele_common::hash::{Digest, SHA256_LEN, sha256};
 use stele_common::provenance::TxnId;
@@ -76,12 +76,12 @@ pub struct CommitRecord {
     /// The per-commit monotonic sequence number — the total-order tiebreak for
     /// same-µs commits ([ADR-0024]). See the [module docs](self).
     ///
-    /// [ADR-0024]: https://allegromusic.atlassian.net/browse/STL-137
+    /// [ADR-0024]: ../../../docs/adr/0024-time-representation.md
     pub seq: u64,
     /// The SHA-256 digest of the **prior** commit record's frame — the
     /// hash-chain link ([ADR-0026]). [`Digest::ZERO`] for the first record.
     ///
-    /// [ADR-0026]: https://allegromusic.atlassian.net/browse/STL-137
+    /// [ADR-0026]: ../../../docs/adr/0026-verifiable-audit-log.md
     pub prev_hash: Digest,
 }
 
@@ -108,7 +108,7 @@ impl CommitRecord {
     /// [`verify_chain`](crate::chain::verify_chain) pass recomputes it to check
     /// the chain is intact ([ADR-0026]).
     ///
-    /// [ADR-0026]: https://allegromusic.atlassian.net/browse/STL-137
+    /// [ADR-0026]: ../../../docs/adr/0026-verifiable-audit-log.md
     #[must_use]
     pub fn hash(&self) -> Digest {
         sha256(&self.encode())

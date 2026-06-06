@@ -17,7 +17,7 @@
 //! the anchor. The chain is over the **log** — the source of truth — independent
 //! of the derived validity index.
 //!
-//! [ADR-0026]: https://allegromusic.atlassian.net/browse/STL-137
+//! [ADR-0026]: ../../../docs/adr/0026-verifiable-audit-log.md
 
 use stele_common::hash::Digest;
 use stele_storage::wal::WalError;

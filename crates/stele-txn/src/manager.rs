@@ -51,11 +51,11 @@
 //!
 //! Every accepted commit appends one [`CommitRecord`] carrying two facts beyond
 //! the transaction id and timestamp: a per-commit monotonic `seq`
-//! ([ADR-0024](https://allegromusic.atlassian.net/browse/STL-137)) that totally
+//! ([ADR-0024](../../../docs/adr/0024-time-representation.md)) that totally
 //! orders commits independent of the µs `commit_ts` — the tiebreak for same-tick
 //! writes — and the [SHA-256](stele_common::hash) of the prior record, so the log
 //! is a hash chain anchored at [`Digest::ZERO`]
-//! ([ADR-0026](https://allegromusic.atlassian.net/browse/STL-137)). The manager
+//! ([ADR-0026](../../../docs/adr/0026-verifiable-audit-log.md)). The manager
 //! holds the running head ([`commit_head`](TxnManager::commit_head)); a
 //! [`verify_chain`](crate::chain::verify_chain) pass over the WAL detects any
 //! tampered historical record. `seq` and the head advance only on a *durable*
@@ -191,7 +191,7 @@ pub struct Committed {
     /// will carry ([STL-141]). Distinct from `txn_id`: only *committed*
     /// transactions consume a `seq`.
     ///
-    /// [ADR-0024]: https://allegromusic.atlassian.net/browse/STL-137
+    /// [ADR-0024]: ../../../docs/adr/0024-time-representation.md
     /// [STL-141]: https://allegromusic.atlassian.net/browse/STL-141
     pub seq: u64,
 }
@@ -210,13 +210,13 @@ struct State {
     /// on a successful commit, so it counts commits, not begins — the total-order
     /// tiebreak for same-µs writes.
     ///
-    /// [ADR-0024]: https://allegromusic.atlassian.net/browse/STL-137
+    /// [ADR-0024]: ../../../docs/adr/0024-time-representation.md
     next_seq: u64,
     /// The running head of the hash-chained commit log ([ADR-0026]): the hash of
     /// the most recently committed record, carried as the next record's
     /// `prev_hash`. [`Digest::ZERO`] before the first commit (genesis).
     ///
-    /// [ADR-0026]: https://allegromusic.atlassian.net/browse/STL-137
+    /// [ADR-0026]: ../../../docs/adr/0026-verifiable-audit-log.md
     commit_head: Digest,
     /// Per business key, the commit timestamp of its most recent committer. A
     /// committing transaction conflicts iff one of its keys appears here with a
@@ -385,8 +385,10 @@ impl<C: Clock, D: Disk> TxnManager<C, D> {
         };
 
         // Durability first: append + fsync the commit record before any in-memory
-        // state moves, so a WAL failure leaves the manager exactly as it was and
-        // the transaction is cleanly retryable.
+        // state moves, so a WAL failure leaves the manager exactly as it was. An
+        // append failure is cleanly retryable; an append that succeeds but whose
+        // fsync (`tick`) fails leaves durability *indeterminate* until recovery —
+        // the append/fsync distinction the `TxnError::Wal` variant docs spell out.
         self.wal.append(&record.encode())?;
         self.wal.tick()?;
 
@@ -428,7 +430,7 @@ impl<C: Clock, D: Disk> TxnManager<C, D> {
     /// it to [`verify_chain_to`](crate::chain::verify_chain_to) to detect even a
     /// wholesale rewrite of the log, which the bare chain walk cannot catch.
     ///
-    /// [ADR-0026]: https://allegromusic.atlassian.net/browse/STL-137
+    /// [ADR-0026]: ../../../docs/adr/0026-verifiable-audit-log.md
     #[must_use]
     pub fn commit_head(&self) -> Digest {
         self.state
@@ -767,7 +769,9 @@ mod tests {
         assert_eq!(verified.head, head);
         verify_chain_to(reopen().replay_from(Checkpoint::BEGIN), head).expect("anchored verify");
 
-        // Tamper with record 1 in place on the backing store, then re-verify.
+        // Replay the manager-written frames, forge record 1, and verify the
+        // tampered sequence — the chain-verify pass is pure over the frames, so
+        // there's no need to write the forgery back to disk.
         let frames: Vec<Vec<u8>> = reopen()
             .replay_from(Checkpoint::BEGIN)
             .map(|r| r.unwrap())
