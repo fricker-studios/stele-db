@@ -15,6 +15,12 @@
 //! * **Interval invariant across a flush boundary** — for any business key, the
 //!   `[sys_from, sys_to)` intervals stay non-overlapping and gap-free with
 //!   updates/deletes interleaved with flushes, over a seed sweep.
+//! * **Differential oracle across a flush boundary** ([STL-135], DoD bullet 1) —
+//!   the same random INSERT/UPDATE/DELETE workload is replayed against a naive
+//!   in-memory reference model ([06 §4](../../../docs/06-testing-strategy.md#4-correctness-oracles-the-temporal-heart)),
+//!   and every key's reconstructed chain (version `sys_from` + index `sys_to`) is
+//!   asserted *element-for-element equal* to the model — a stronger check than the
+//!   structural invariant above.
 //! * **Invariant 1** — no code path mutates the sealed segment; its bytes are
 //!   byte-for-byte unchanged after a cross-segment close (the close is an index
 //!   append, not a segment rewrite).
@@ -516,4 +522,241 @@ fn chains_stay_non_overlapping_and_gap_free_across_flush_boundaries() {
             assert_chain_invariant(seed, k, &chain, &born[k], live[k]);
         }
     }
+}
+
+// --- Differential oracle across a flush boundary (STL-135, DoD bullet 1) ------
+
+/// A deliberately naive reference model of the bitemporal record per
+/// [16 §1](../../../docs/16-bitemporal-semantics.md): every key maps to its full
+/// list of versions, built by replaying the op log with no tiers, no merging, and
+/// no index — "too simple to be wrong" ([06 §4]). The engine's reconstructed
+/// chain is asserted *differential-equal* to this. The model materializes each
+/// version's `sys_to` itself when a later op closes the period — which is exactly
+/// what the validity index must reproduce on the engine side, the heart of
+/// [STL-135] / [ADR-0023].
+#[derive(Default)]
+struct Oracle {
+    chains: BTreeMap<BusinessKey, Vec<OracleVersion>>,
+}
+
+/// The projection the differential test compares on: the system-time interval,
+/// the body, the birth provenance, and the close provenance. The model holds it
+/// directly; an engine [`Version`] is reduced to it by [`project`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct OracleVersion {
+    sys_from: SystemTimeMicros,
+    sys_to: SystemTimeMicros,
+    payload: Vec<u8>,
+    provenance: Provenance,
+    closed_by: Option<Provenance>,
+}
+
+impl Oracle {
+    /// Open a new period `[commit, +∞)` for `key` — the model side of an INSERT,
+    /// or of the new version an UPDATE opens.
+    fn open(
+        &mut self,
+        key: &BusinessKey,
+        commit: SystemTimeMicros,
+        payload: Vec<u8>,
+        who: &Provenance,
+    ) {
+        self.chains
+            .entry(key.clone())
+            .or_default()
+            .push(OracleVersion {
+                sys_from: commit,
+                sys_to: SYSTEM_TIME_OPEN,
+                payload,
+                provenance: who.clone(),
+                closed_by: None,
+            });
+    }
+
+    /// Close `key`'s currently-open period at `commit`, stamping the closer — the
+    /// model side of the write-once validity-index entry an UPDATE or DELETE makes.
+    fn close(&mut self, key: &BusinessKey, commit: SystemTimeMicros, closer: &Provenance) {
+        let last = self
+            .chains
+            .get_mut(key)
+            .expect("a live key has a chain")
+            .last_mut()
+            .expect("a live key has an open version");
+        assert_eq!(
+            last.sys_to, SYSTEM_TIME_OPEN,
+            "the model only ever closes a currently-open period",
+        );
+        last.sys_to = commit;
+        last.closed_by = Some(closer.clone());
+    }
+
+    /// One key's modeled chain, oldest first (empty if the key was never written).
+    fn chain(&self, key: &BusinessKey) -> Vec<OracleVersion> {
+        self.chains.get(key).cloned().unwrap_or_default()
+    }
+}
+
+/// Reduce an engine [`Version`] to the fields the oracle models, so the two are
+/// compared on identical terms: the engine's overlay supplies `sys_to` /
+/// `closed_by` from the index, the body and birth provenance from the record.
+fn project(v: &Version) -> OracleVersion {
+    OracleVersion {
+        sys_from: v.sys_from,
+        sys_to: v.sys_to,
+        payload: v.payload.clone(),
+        provenance: v.provenance.clone(),
+        closed_by: v.closed_by.clone(),
+    }
+}
+
+#[test]
+fn engine_chain_is_differential_equal_to_the_oracle_across_flush_boundaries() {
+    const KEY_POOL: u64 = 5;
+
+    for seed in 0u64..120 {
+        let mut rng = Rng::new(seed);
+        let mut delta = new_delta();
+        // The validity index is the authority for every version's end across the
+        // flush boundary; the model never sees it — a divergence means the engine
+        // mis-materialized a close.
+        let mut index = new_index();
+        let seg_disk = MemDisk::new();
+        let clock = StubClock::new(1);
+        let mut writer = SysTimeWriter::new(clock.clone());
+
+        let mut sealed: Vec<Version> = Vec::new();
+        let mut next_seg = 0u64;
+        let mut live = vec![false; KEY_POOL as usize];
+        let mut oracle = Oracle::default();
+
+        let ops = 40 + rng.range(40);
+        for op in 0..ops {
+            clock.advance((rng.range(3)) as i64);
+
+            // ~1 in 5 ops flushes the delta into a fresh sealed segment. The
+            // model is oblivious to tiering, which is the point: a flush must not
+            // change any reconstructed chain — the close stays in the index.
+            if rng.range(5) == 0 {
+                let drained = delta.flush_to_segment().unwrap();
+                if !drained.is_empty() {
+                    let name = format!("seg-{next_seg}.seg");
+                    next_seg += 1;
+                    let rows = seal(&seg_disk, &name, drained);
+                    // DoD bullet 2: a sealed version is raw-*open* — its end is
+                    // never on the record, only ever in the validity index.
+                    assert!(
+                        rows.iter().all(|v| v.sys_to == SYSTEM_TIME_OPEN),
+                        "seed {seed}: a flushed version must carry no sys_to (it lives in the index)",
+                    );
+                    sealed.extend(rows);
+                }
+                continue;
+            }
+
+            let k = rng.range(KEY_POOL) as usize;
+            let key = BusinessKey::new(vec![b'k', k as u8]);
+            // The writer only resolves the *current* key against the sealed pool,
+            // so hand it just that key's sealed versions rather than cloning the
+            // whole (growing) pool every op.
+            let lookup = SealedVersions::new(
+                sealed
+                    .iter()
+                    .filter(|v| v.business_key == key)
+                    .cloned()
+                    .collect(),
+            );
+            let txn = TxnId(op);
+            let principal = Principal::new(format!("p{op}").into_bytes());
+            let payload = format!("s{seed}-k{k}-o{op}").into_bytes();
+
+            if live[k] {
+                if rng.range(2) == 0 {
+                    let at = writer
+                        .delete(
+                            &mut delta,
+                            &mut index,
+                            &lookup,
+                            &key,
+                            txn,
+                            principal.clone(),
+                        )
+                        .unwrap();
+                    oracle.close(&key, at, &Provenance::new(txn, at, principal));
+                    live[k] = false;
+                } else {
+                    let at = writer
+                        .update(
+                            &mut delta,
+                            &mut index,
+                            &lookup,
+                            key.clone(),
+                            payload.clone(),
+                            txn,
+                            principal.clone(),
+                        )
+                        .unwrap();
+                    // An update closes the prior period and opens the new one at
+                    // the same commit, so both halves share that provenance
+                    // (committed_at == the boundary).
+                    let prov = Provenance::new(txn, at, principal);
+                    oracle.close(&key, at, &prov);
+                    oracle.open(&key, at, payload, &prov);
+                }
+            } else {
+                let at = writer
+                    .insert(
+                        &mut delta,
+                        &mut index,
+                        &lookup,
+                        key.clone(),
+                        payload.clone(),
+                        txn,
+                        principal.clone(),
+                    )
+                    .unwrap();
+                oracle.open(&key, at, payload, &Provenance::new(txn, at, principal));
+                live[k] = true;
+            }
+        }
+
+        // Reconstruct each key's chain across every segment + the delta + the
+        // index and assert it matches the model element-for-element.
+        for k in 0..KEY_POOL as usize {
+            let key = BusinessKey::new(vec![b'k', k as u8]);
+            let engine = merged_chain(&delta, &sealed, &index, &key);
+            assert_oracle_equal(seed, k, &engine, &oracle.chain(&key));
+        }
+    }
+}
+
+/// Assert one key's engine `chain` is differential-equal to the `model` and,
+/// directly, upholds the structural sub-properties the DoD names — so a failure
+/// reports *which* property broke, not just "≠ model".
+///
+/// Equality already subsumes "non-overlapping and gap-free": the model abuts on
+/// update and only gaps on delete→re-insert, so any stray gap, overlap, or
+/// mis-close diverges. The windowed sub-properties run *first* so a structural
+/// break is reported as that specific property rather than as a bulk "≠ model"
+/// panic; the element-for-element equality is the final, stricter check.
+fn assert_oracle_equal(seed: u64, k: usize, chain: &[Version], model: &[OracleVersion]) {
+    let engine: Vec<OracleVersion> = chain.iter().map(project).collect();
+    for w in engine.windows(2) {
+        let (lo, hi) = (&w[0], &w[1]);
+        assert!(
+            lo.sys_from < hi.sys_from,
+            "seed {seed} key {k}: starts must strictly increase",
+        );
+        assert!(
+            lo.sys_to <= hi.sys_from,
+            "seed {seed} key {k}: intervals overlap",
+        );
+        assert_ne!(
+            lo.sys_to, SYSTEM_TIME_OPEN,
+            "seed {seed} key {k}: a superseded period is still open",
+        );
+    }
+    assert_eq!(
+        engine, model,
+        "seed {seed} key {k}: engine chain diverged from the oracle",
+    );
 }
