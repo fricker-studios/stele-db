@@ -59,7 +59,11 @@
 //! // valid-time table: every write carries the interval; both axes populated.
 //! let mut w = ValidTimeWriter::new(SystemClock, true);
 //! let v = ValidInterval::new(ValidTimeMicros(day(1)), VALID_TIME_OPEN)?;
-//! w.insert(&mut delta, key.clone(), Some(v), b"salary=100".to_vec())?;
+//! // A supersession resolves the prior live version across the delta tier and
+//! // the sealed segments: pass `EmptySealed` when the table has none, or a
+//! // `SealedSegments` built from its segment set (the DML path does the latter).
+//! w.insert(&mut delta, &mut index, &EmptySealed, key.clone(), Some(v),
+//!          b"salary=100".to_vec(), txn_id, principal)?;
 //! ```
 
 use stele_common::provenance::{Principal, TxnId};
