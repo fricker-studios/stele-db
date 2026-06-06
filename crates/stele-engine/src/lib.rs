@@ -537,12 +537,19 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .catalog
             .resolve(table, snapshot)
             .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
-        let columns: Vec<(String, LogicalType)> = schema
+        // Zip the schema's columns with the storage ids they map to (first column
+        // → business key, second → payload) so the projected arity always matches
+        // the header. A table with fewer than two columns projects only what it
+        // has, never a header that disagrees with the materialized cells.
+        let projection: Vec<(ColumnId, (String, LogicalType))> = schema
             .columns()
             .iter()
-            .take(2)
-            .map(|c| (c.name().to_owned(), c.ty()))
+            .zip([ColumnId::BusinessKey, ColumnId::Payload])
+            .map(|(c, id)| (id, (c.name().to_owned(), c.ty())))
             .collect();
+        let column_ids: Vec<ColumnId> = projection.iter().map(|(id, _)| *id).collect();
+        let columns: Vec<(String, LogicalType)> =
+            projection.into_iter().map(|(_, col)| col).collect();
 
         let readers = state.engine.open_segment_readers()?;
         let out = SnapshotScan::new(
@@ -551,10 +558,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             &readers,
             Snapshot(snapshot),
         )
-        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .project(column_ids.clone())
         .execute()?;
 
-        let rows = batch_to_rows(&out.batch, &[ColumnId::BusinessKey, ColumnId::Payload]);
+        let rows = batch_to_rows(&out.batch, &column_ids);
         Ok(StatementOutcome::Rows(SelectResult { columns, rows }))
     }
 
@@ -834,6 +841,49 @@ mod tests {
             panic!("SELECT must return rows");
         };
         assert_eq!(result.rows.len(), 0, "no rows yet, but the table resolves");
+    }
+
+    #[test]
+    fn select_on_a_single_column_table_keeps_header_and_cells_aligned() {
+        // A one-column table projects only the business key, so the header and the
+        // materialized cells stay the same width — no silent truncation/mislabel
+        // from a fixed two-column projection over a narrower schema.
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE solo (id INT PRIMARY KEY) WITH SYSTEM VERSIONING",
+            ))
+            .expect("create single-column table");
+        engine
+            .insert(
+                "solo",
+                BusinessKey::new(b"1".to_vec()),
+                None,
+                Vec::new(),
+                0,
+                TxnId(1),
+                Principal::new(b"demo".to_vec()),
+            )
+            .expect("insert");
+
+        let StatementOutcome::Rows(result) = engine
+            .execute(&parse_one("SELECT id FROM solo"))
+            .expect("select")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            result.columns,
+            vec![("id".to_owned(), LogicalType::Int4)],
+            "only the key column is projected"
+        );
+        assert!(
+            result
+                .rows
+                .iter()
+                .all(|row| row.len() == result.columns.len()),
+            "every row has exactly one cell, matching the header"
+        );
     }
 
     #[test]

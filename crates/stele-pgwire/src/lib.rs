@@ -124,6 +124,7 @@ const SQLSTATE_SYNTAX_ERROR: &str = "42601";
 const SQLSTATE_DUPLICATE_TABLE: &str = "42P07";
 const SQLSTATE_UNDEFINED_TABLE: &str = "42P01";
 const SQLSTATE_DUPLICATE_COLUMN: &str = "42701";
+const SQLSTATE_UNDEFINED_COLUMN: &str = "42703";
 const SQLSTATE_INVALID_TABLE_DEFINITION: &str = "42P16";
 const SQLSTATE_INTERNAL_ERROR: &str = "XX000";
 // A literal in a `WHERE` / `VALUES` that does not match its column's type — the
@@ -630,19 +631,20 @@ const fn command_tag_for(summary: DmlSummary) -> CommandTag {
 /// client classifies it the way it would against Postgres.
 ///
 /// DDL-specific catalog failures reuse [`sqlstate_for`]; the cases unique to the
-/// read / write path are an unknown table (`42P01`) and a bad literal in a `WHERE`
-/// or `VALUES` (`22P02`, invalid text representation). Shapes outside the v0.1
-/// surface map to `0A000` (`feature_not_supported`).
+/// read / write path are an unknown table (`42P01`), an unknown column (`42703`),
+/// and a bad literal in a `WHERE` or `VALUES` (`22P02`, invalid text
+/// representation). Shapes outside the v0.1 surface map to `0A000`
+/// (`feature_not_supported`).
 const fn sqlstate_for_query(err: &EngineError) -> &'static str {
     match err {
         EngineError::Bind(_) => SQLSTATE_SYNTAX_ERROR,
         EngineError::Select(SelectError::UnknownTable(_) | SelectError::TableNotLive { .. })
-        | EngineError::Dml(
-            DmlError::UnknownTable(_)
-            | DmlError::TableNotLive { .. }
-            | DmlError::UnknownColumn { .. },
-        )
+        | EngineError::Dml(DmlError::UnknownTable(_) | DmlError::TableNotLive { .. })
         | EngineError::UnknownTable(_) => SQLSTATE_UNDEFINED_TABLE,
+        // A named column the schema does not contain — Postgres's undefined_column,
+        // distinct from undefined_table, so a client can branch on it.
+        EngineError::Select(SelectError::UnknownColumn { .. })
+        | EngineError::Dml(DmlError::UnknownColumn { .. }) => SQLSTATE_UNDEFINED_COLUMN,
         EngineError::Dml(DmlError::BadLiteral { .. } | DmlError::TypeMismatch { .. }) => {
             SQLSTATE_INVALID_TEXT_REPRESENTATION
         }
