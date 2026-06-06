@@ -296,8 +296,10 @@ pub struct ValidityIndex<D: Disk> {
     /// Next spill index to allocate — `max(existing) + 1` at open even though the
     /// existing files are discarded, so a delayed remove can't clash a new write.
     next_spill_index: u64,
-    /// Spill indices written this lifetime, ascending.
-    live_spills: Vec<u64>,
+    /// Spills written this lifetime, ascending by index. Each carries an
+    /// in-memory key-range + bloom summary ([`spill::SpillMeta`]) so a point
+    /// lookup reads only the spills that may hold the key ([STL-142]).
+    live_spills: Vec<spill::SpillMeta>,
 }
 
 impl<D: Disk> ValidityIndex<D> {
@@ -368,9 +370,10 @@ impl<D: Disk> ValidityIndex<D> {
     /// The materialized end of the version `(key, sys_from)`, or `None` while the
     /// version is still open (no close has committed).
     ///
-    /// Checks the resident entries first, then each spill — a point lookup that
-    /// reads a spill only when the entry is not resident. Closes are tiny and
-    /// usually resident, so spilling stays rare ([the module docs](super)).
+    /// Checks the resident entries first, then only the spills whose in-memory
+    /// summary says they *may* hold `key` — a point lookup reads `O(matching
+    /// spills)`, not every spill ([STL-142]). Closes are tiny and usually
+    /// resident, so spilling stays rare to begin with ([the module docs](super)).
     ///
     /// # Errors
     ///
@@ -383,8 +386,11 @@ impl<D: Disk> ValidityIndex<D> {
         if let Some(interval) = self.mem.get(&(key.clone(), sys_from)) {
             return Ok(Some(interval.clone()));
         }
-        for &idx in &self.live_spills {
-            for close in spill::read_spill(&self.disk, idx)? {
+        for meta in &self.live_spills {
+            if !meta.may_contain(key) {
+                continue;
+            }
+            for close in spill::read_spill(&self.disk, meta.index)? {
                 if &close.business_key == key && close.sys_from == sys_from {
                     return Ok(Some(close.interval()));
                 }
@@ -410,9 +416,13 @@ impl<D: Disk> ValidityIndex<D> {
         let mut out: BTreeMap<SystemTimeMicros, ClosedInterval> = BTreeMap::new();
         // Spilled entries first, resident last — a resident entry supersedes a
         // spilled one for the same version (they never disagree, but this keeps
-        // the merge order well-defined, mirroring the delta tier).
-        for &idx in &self.live_spills {
-            for close in spill::read_spill(&self.disk, idx)? {
+        // the merge order well-defined, mirroring the delta tier). Only spills
+        // whose summary may hold `key` are read ([STL-142]).
+        for meta in &self.live_spills {
+            if !meta.may_contain(key) {
+                continue;
+            }
+            for close in spill::read_spill(&self.disk, meta.index)? {
                 if &close.business_key == key {
                     out.insert(close.sys_from, close.interval());
                 }
@@ -424,6 +434,68 @@ impl<D: Disk> ValidityIndex<D> {
             out.insert(*sys_from, interval.clone());
         }
         Ok(out)
+    }
+
+    /// Materialized closes for a *set* of keys, reading the fewest spills.
+    ///
+    /// The read-path fold ([`crate::merge::fold_chains`]) needs every close for a
+    /// handful of keys. Two strategies cost differently once the index has
+    /// spilled: probing each key against the in-memory spill summaries and
+    /// reading only the spills that may hold one of them, versus one full
+    /// [`Self::materialize`] sweep that reads every spill once. This picks the
+    /// cheaper by counting — it reads the **union** of spills that may hold a
+    /// requested key, but only when that union is *smaller* than the full spill
+    /// set; otherwise it falls back to the single sweep ([STL-142]).
+    ///
+    /// The returned map is keyed `(business_key, sys_from)` like
+    /// [`Self::materialize`]. In the full-sweep branch it contains every entry in
+    /// the index, not just those for `keys`; the fold overlays by key, so the
+    /// extras are simply ignored.
+    ///
+    /// # Errors
+    ///
+    /// [`ValidityError::Corrupt`] / [`ValidityError::Io`] loading a spill file.
+    pub fn closes_for_keys(
+        &self,
+        keys: &std::collections::BTreeSet<BusinessKey>,
+    ) -> Result<BTreeMap<(BusinessKey, SystemTimeMicros), ClosedInterval>, ValidityError> {
+        use std::ops::Bound::Included;
+        // Spills that may hold at least one requested key — each read at most once.
+        let selected: Vec<&spill::SpillMeta> = self
+            .live_spills
+            .iter()
+            .filter(|meta| keys.iter().any(|k| meta.may_contain(k)))
+            .collect();
+        // If the selective path would touch as many spills as a full sweep, the
+        // sweep is at least as cheap and simpler — take it.
+        if selected.len() >= self.live_spills.len() {
+            return self.materialize();
+        }
+        let mut out: BTreeMap<(BusinessKey, SystemTimeMicros), ClosedInterval> = BTreeMap::new();
+        for meta in selected {
+            for close in spill::read_spill(&self.disk, meta.index)? {
+                if keys.contains(&close.business_key) {
+                    out.insert(close.target(), close.interval());
+                }
+            }
+        }
+        // Resident entries for each key — a contiguous run in the `(key, sys_from)`
+        // map, so range-scan just that run rather than the whole map.
+        for key in keys {
+            let lo = (key.clone(), SystemTimeMicros(i64::MIN));
+            let hi = (key.clone(), SystemTimeMicros(i64::MAX));
+            for ((_, sys_from), interval) in self.mem.range((Included(lo), Included(hi))) {
+                out.insert((key.clone(), *sys_from), interval.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Number of live spill files — the read path uses it to choose between a
+    /// per-key probe and a full [`Self::materialize`] sweep.
+    #[must_use]
+    pub fn spill_count(&self) -> usize {
+        self.live_spills.len()
     }
 
     /// The `sys_from` of the version active at system-time `at` for `key`, when
@@ -519,8 +591,8 @@ impl<D: Disk> ValidityIndex<D> {
         &self,
     ) -> Result<BTreeMap<(BusinessKey, SystemTimeMicros), ClosedInterval>, ValidityError> {
         let mut out: BTreeMap<(BusinessKey, SystemTimeMicros), ClosedInterval> = BTreeMap::new();
-        for &idx in &self.live_spills {
-            for close in spill::read_spill(&self.disk, idx)? {
+        for meta in &self.live_spills {
+            for close in spill::read_spill(&self.disk, meta.index)? {
                 out.insert(close.target(), close.interval());
             }
         }
@@ -571,8 +643,8 @@ impl<D: Disk> ValidityIndex<D> {
             .collect();
         let idx = self.next_spill_index;
         self.next_spill_index += 1;
-        spill::write_spill(&self.disk, idx, &closes)?;
-        self.live_spills.push(idx);
+        let meta = spill::write_spill(&self.disk, idx, &closes)?;
+        self.live_spills.push(meta);
         self.mem.clear();
         self.byte_size = 0;
         Ok(())
@@ -725,6 +797,63 @@ mod tests {
         // A conflicting re-close of the *spilled* entry is still refused.
         let err = idx.insert_close(close(b"k", 0, 11, b"a")).unwrap_err();
         assert!(matches!(err, ValidityError::AlreadyClosed));
+    }
+
+    // --- closes_for_keys (STL-142) ------------------------------------------
+
+    fn spilling_index() -> ValidityIndex<MemDisk> {
+        // Tiny threshold so closes spill almost immediately.
+        ValidityIndex::open(
+            MemDisk::new(),
+            ValidityConfig {
+                spill_threshold_bytes: 1,
+            },
+        )
+        .expect("open")
+    }
+
+    #[test]
+    fn closes_for_keys_matches_a_filtered_materialize() {
+        // Whichever branch it takes, the result for the requested keys must equal
+        // the full materialization restricted to those keys.
+        let mut idx = spilling_index();
+        for (k, sf) in [
+            (b"a".as_slice(), 0),
+            (b"a", 100),
+            (b"b", 10),
+            (b"c", 5),
+            (b"d", 7),
+        ] {
+            idx.insert_close(close(k, sf, sf + 1, b"x"))
+                .expect("insert");
+        }
+        let all = idx.materialize().expect("materialize");
+        let keys: std::collections::BTreeSet<BusinessKey> =
+            [bk(b"a"), bk(b"c")].into_iter().collect();
+        let got = idx.closes_for_keys(&keys).expect("subset");
+        let want: BTreeMap<_, _> = all
+            .iter()
+            .filter(|((k, _), _)| keys.contains(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        assert_eq!(got, want);
+        // The single-key set still resolves both of `a`'s closes.
+        let one: std::collections::BTreeSet<BusinessKey> = std::iter::once(bk(b"a")).collect();
+        let got_a = idx.closes_for_keys(&one).expect("one");
+        assert_eq!(got_a.len(), 2);
+    }
+
+    #[test]
+    fn closes_for_keys_full_sweep_branch_returns_everything() {
+        // When the requested set spans every spill, the sweep branch fires and
+        // returns the whole index — a superset the fold overlays by key.
+        let mut idx = spilling_index();
+        idx.insert_close(close(b"a", 0, 1, b"x")).expect("c0");
+        idx.insert_close(close(b"b", 0, 1, b"x")).expect("c1");
+        let keys: std::collections::BTreeSet<BusinessKey> =
+            [bk(b"a"), bk(b"b")].into_iter().collect();
+        let got = idx.closes_for_keys(&keys).expect("sweep");
+        assert_eq!(got, idx.materialize().expect("materialize"));
     }
 
     // --- sys_upper_bound (STL-139) ------------------------------------------

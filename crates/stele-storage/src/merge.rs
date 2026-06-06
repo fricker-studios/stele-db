@@ -59,10 +59,13 @@ fn overlay_chain(
 /// wins — pass the delta versions last so freshly-staged state supersedes a
 /// stale segment copy.
 ///
-/// The index is **materialized once** ([`ValidityIndex::materialize`]) — a single
-/// pass over its spills — and then overlaid in memory, so a fold over `K` keys
-/// costs O(spills) reads, not O(K × spills). Each key's entries are a contiguous
-/// `(business_key, sys_from)` run, so the overlay range-scans just that run.
+/// The index closes are gathered by [`ValidityIndex::closes_for_keys`], which
+/// reads only the spills that may hold one of the fold's keys when that is fewer
+/// than a full sweep, and otherwise materializes once — so a small / point fold
+/// against a spilled index does work sub-linear in the total spilled closes
+/// rather than scanning every spill ([STL-142]). Each key's entries are a
+/// contiguous `(business_key, sys_from)` run, so the overlay range-scans just
+/// that run.
 ///
 /// # Errors
 ///
@@ -78,7 +81,8 @@ pub fn fold_chains<D: Disk>(
             .or_default()
             .insert(v.sys_from, v);
     }
-    let closes = index.materialize()?;
+    let keys: std::collections::BTreeSet<BusinessKey> = chains.keys().cloned().collect();
+    let closes = index.closes_for_keys(&keys)?;
     for (key, chain) in &mut chains {
         let lo = (key.clone(), SystemTimeMicros(i64::MIN));
         let hi = (key.clone(), SystemTimeMicros(i64::MAX));
