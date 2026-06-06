@@ -24,13 +24,13 @@
 //!
 //! ## Not yet wired through the loop
 //!
-//! This ticket ([STL-104]) lands the **wire-format mechanism** — the outbound
-//! message encoders and the [`CommandTag`] strings — and proves it with the
-//! constant-`SELECT` path. Routing statements that touch storage rides on the
-//! pieces that build on this one:
+//! [STL-104] landed the **wire-format mechanism** — the outbound message
+//! encoders and the [`CommandTag`] strings — proven with the constant-`SELECT`
+//! path, and [STL-105] added the **per-type text encoder set**
+//! (`INT4`/`INT8`/`TEXT`/`BOOL`/`TIMESTAMP`/`DATE`, in the `text_format` module)
+//! that any `DataRow` value is rendered through. Routing statements that touch storage
+//! rides on the pieces that build on these:
 //!
-//! * The **per-type text encoder set** (`INT4`/`TEXT`/`BOOL`/`TIMESTAMP`/…) is
-//!   [STL-105]; v0.1 here only formats integer literals.
 //! * **`CREATE` / `DROP TABLE`** routing (parse → `bind_ddl` → catalog) is
 //!   [STL-131], which also owns the server-session `Catalog` + commit clock.
 //! * **`INSERT` / `UPDATE` / `DELETE`** and **table `SELECT`** routing need that
@@ -52,6 +52,8 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+mod text_format;
+
 use std::io;
 use std::net::SocketAddr;
 
@@ -61,6 +63,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, instrument, warn};
 
 pub use stele_common::DEFAULT_PG_PORT;
+
+use stele_common::types::{LogicalType, ScalarValue};
 
 // The wire front end leans on stele-sql for parsing; `sqlparser` is re-exported
 // from there, so matching on the AST adds no new dependency.
@@ -100,18 +104,9 @@ const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
 const SQLSTATE_PROTOCOL_VIOLATION: &str = "08P01";
 const SQLSTATE_SYNTAX_ERROR: &str = "42601";
 
-// Postgres type OIDs for the integer literals the constant-`SELECT` path emits.
-// The full v0.1 type vocabulary (TEXT/BOOL/TIMESTAMP/…) and its text encoders
-// are STL-105's concern; we only need the integer OIDs to describe `SELECT 1`.
-const OID_INT4: i32 = 23;
-const OID_INT8: i32 = 20;
-
-// Text/format size advertised in `RowDescription` for the integer OIDs: the
-// on-the-wire `typlen` (fixed-width), not the rendered text length.
-const TYPLEN_INT4: i16 = 4;
-const TYPLEN_INT8: i16 = 8;
-
 // Text format code for `RowDescription` fields (binary is 1; a v0.2 concern).
+// The per-type OID and `typlen` advertised per field now come from the value's
+// [`LogicalType`] (`pg_oid` / [`text_format::pg_typlen`]).
 const FORMAT_TEXT: i16 = 0;
 
 // DoS guard: cap how large a single frame we will allocate for. The Postgres
@@ -306,13 +301,18 @@ impl CommandTag {
     }
 }
 
-/// One column of a constant `SELECT` result: its reported name, type OID, and
-/// already-text-encoded value.
-struct ConstColumn {
+/// One column of a single-row simple-query result: its reported name, its
+/// [`LogicalType`] (which drives the `RowDescription` OID + `typlen`), and the
+/// row's cell value — `None` is SQL `NULL`, rendered as the length-`-1`
+/// sentinel in the `DataRow`.
+///
+/// The type is carried rather than the OID so a column always renders its value
+/// ([`text_format::encode_text`]) and describes itself ([`LogicalType::pg_oid`],
+/// [`text_format::pg_typlen`]) from one source of truth.
+struct ResultColumn {
     name: String,
-    type_oid: i32,
-    typlen: i16,
-    text: String,
+    ty: LogicalType,
+    value: Option<ScalarValue>,
 }
 
 /// Handle one simple-query (`Q`) message: parse the SQL, then reply for each
@@ -380,9 +380,10 @@ async fn handle_simple_query(stream: &mut TcpStream, sql: &str) -> Result<(), Wi
 /// — `SELECT 1`, `SELECT 1, 2 AS k`. Returns the columns to send back, or `None`
 /// for anything that needs the binder/executor (a `FROM`, a `WHERE`, non-integer
 /// or computed expressions). Integer-only keeps this honest: it is the canonical
-/// connectivity smoke test, not a back-door scalar evaluator (STL-105 owns the
-/// real type-encoder set).
-fn constant_select(stmt: &Statement) -> Option<Vec<ConstColumn>> {
+/// connectivity smoke test, not a back-door scalar evaluator. The full v0.1
+/// scalar set has text encoders ([`text_format`]); they reach the wire through
+/// the table-read path the routing tickets add, not through this literal probe.
+fn constant_select(stmt: &Statement) -> Option<Vec<ResultColumn>> {
     let SqlStatement::Query(query) = &stmt.body else {
         return None;
     };
@@ -405,17 +406,15 @@ fn constant_select(stmt: &Statement) -> Option<Vec<ConstColumn>> {
             _ => return None,
         };
         let parsed = integer_literal(expr)?;
-        let (type_oid, typlen) = if i32::try_from(parsed).is_ok() {
-            (OID_INT4, TYPLEN_INT4)
-        } else {
-            (OID_INT8, TYPLEN_INT8)
-        };
-        columns.push(ConstColumn {
+        // A literal that fits `i32` is `int4`, matching Postgres's typing of a
+        // small integer constant; anything wider escalates to `int8`.
+        let value =
+            i32::try_from(parsed).map_or_else(|_| ScalarValue::Int8(parsed), ScalarValue::Int4);
+        columns.push(ResultColumn {
             // Postgres labels an unaliased expression column `?column?`.
             name: alias.unwrap_or_else(|| "?column?".to_owned()),
-            type_oid,
-            typlen,
-            text: parsed.to_string(),
+            ty: value.logical_type(),
+            value: Some(value),
         });
     }
     Some(columns)
@@ -664,21 +663,19 @@ async fn write_empty_query_response(stream: &mut TcpStream) -> io::Result<()> {
 /// The Postgres column-count fields in `RowDescription` / `DataRow` are Int16,
 /// so a result wider than `i16::MAX` columns cannot be described. Reject it
 /// rather than clamp the count and emit a frame whose body and header disagree.
-fn column_count(columns: &[ConstColumn]) -> Result<i16, WireError> {
+fn column_count(columns: &[ResultColumn]) -> Result<i16, WireError> {
     i16::try_from(columns.len())
         .map_err(|_| WireError::Protocol("result has more than 32767 columns"))
 }
 
-/// `RowDescription` ('T') — one field descriptor per result column.
+/// Build the `RowDescription` ('T') payload — one field descriptor per column.
 ///
 /// Per field: name (cstring), table OID (Int32), column attr number (Int16),
 /// type OID (Int32), type size (Int16), type modifier (Int32), format code
-/// (Int16). We have no real relation behind these constant columns, so table
-/// OID and attr number are `0`, and the type modifier is `-1` (none).
-async fn write_row_description(
-    stream: &mut TcpStream,
-    columns: &[ConstColumn],
-) -> Result<(), WireError> {
+/// (Int16). We have no real relation behind these columns, so table OID and
+/// attr number are `0`, and the type modifier is `-1` (none). The OID and size
+/// come from each column's [`LogicalType`].
+fn row_description_payload(columns: &[ResultColumn]) -> Result<BytesMut, WireError> {
     let count = column_count(columns)?;
     let mut payload = BytesMut::new();
     payload.put_i16(count);
@@ -687,28 +684,57 @@ async fn write_row_description(
         payload.put_u8(0);
         payload.put_i32(0); // table OID — not a stored relation
         payload.put_i16(0); // column attribute number
-        payload.put_i32(col.type_oid);
-        payload.put_i16(col.typlen);
+        // The RowDescription dataTypeOID field is a 4-byte OID. Write the `u32`
+        // bits directly rather than narrowing to `i32` — narrowing would panic
+        // on a future OID > i32::MAX, and `put_u32` emits exactly the big-endian
+        // bytes a Postgres backend does.
+        payload.put_u32(col.ty.pg_oid());
+        payload.put_i16(text_format::pg_typlen(col.ty));
         payload.put_i32(-1); // type modifier
         payload.put_i16(FORMAT_TEXT);
     }
-    write_framed(stream, MSG_ROW_DESCRIPTION, &payload).await?;
-    Ok(())
+    Ok(payload)
 }
 
-/// `DataRow` ('D') — one value per column, in text format. The constant-`SELECT`
-/// path always has a value, so this never emits the `NULL` sentinel (length
-/// `-1`); the general path that does will arrive with the type-encoder set
-/// (STL-105).
-async fn write_data_row(stream: &mut TcpStream, columns: &[ConstColumn]) -> Result<(), WireError> {
+/// Build the `DataRow` ('D') payload — one cell per column, in text format. A
+/// `None` cell is SQL `NULL`, encoded as the length-`-1` sentinel with no value
+/// bytes; a present value is rendered through [`text_format::encode_text`].
+fn data_row_payload(columns: &[ResultColumn]) -> Result<BytesMut, WireError> {
     let count = column_count(columns)?;
     let mut payload = BytesMut::new();
     payload.put_i16(count);
     for col in columns {
-        let bytes = col.text.as_bytes();
-        payload.put_i32(i32::try_from(bytes.len()).unwrap_or(i32::MAX));
-        payload.put_slice(bytes);
+        match &col.value {
+            None => payload.put_i32(-1),
+            Some(value) => {
+                let text = text_format::encode_text(value);
+                let bytes = text.as_bytes();
+                // The DataRow length prefix is an Int32. Clamping an oversized
+                // value would desync the client (prefix would not match the
+                // bytes written), so refuse it rather than emit a torn frame.
+                let len = i32::try_from(bytes.len())
+                    .map_err(|_| WireError::Protocol("DataRow value exceeds 2 GiB"))?;
+                payload.put_i32(len);
+                payload.put_slice(bytes);
+            }
+        }
     }
+    Ok(payload)
+}
+
+/// `RowDescription` ('T').
+async fn write_row_description(
+    stream: &mut TcpStream,
+    columns: &[ResultColumn],
+) -> Result<(), WireError> {
+    let payload = row_description_payload(columns)?;
+    write_framed(stream, MSG_ROW_DESCRIPTION, &payload).await?;
+    Ok(())
+}
+
+/// `DataRow` ('D').
+async fn write_data_row(stream: &mut TcpStream, columns: &[ResultColumn]) -> Result<(), WireError> {
+    let payload = data_row_payload(columns)?;
     write_framed(stream, MSG_DATA_ROW, &payload).await?;
     Ok(())
 }
@@ -848,22 +874,26 @@ mod tests {
         let cols = constant_select(&one[0]).expect("SELECT 1 is constant");
         assert_eq!(cols.len(), 1);
         assert_eq!(cols[0].name, "?column?");
-        assert_eq!(cols[0].type_oid, OID_INT4);
-        assert_eq!(cols[0].text, "1");
+        assert_eq!(cols[0].ty, LogicalType::Int4);
+        assert_eq!(cols[0].value, Some(ScalarValue::Int4(1)));
 
         // Alias is honored; a wide literal escalates to INT8.
         let aliased = stele_sql::parse("SELECT 5000000000 AS big").unwrap();
         let cols = constant_select(&aliased[0]).expect("constant");
         assert_eq!(cols[0].name, "big");
-        assert_eq!(cols[0].type_oid, OID_INT8);
+        assert_eq!(cols[0].ty, LogicalType::Int8);
+        assert_eq!(cols[0].value, Some(ScalarValue::Int8(5_000_000_000)));
 
         // A leading sign is folded — `-1` parses as unary minus over a Number.
         let neg = stele_sql::parse("SELECT -1").unwrap();
         let cols = constant_select(&neg[0]).expect("SELECT -1 is constant");
-        assert_eq!(cols[0].type_oid, OID_INT4);
-        assert_eq!(cols[0].text, "-1");
+        assert_eq!(cols[0].ty, LogicalType::Int4);
+        assert_eq!(cols[0].value, Some(ScalarValue::Int4(-1)));
         let pos = stele_sql::parse("SELECT +5 AS five").unwrap();
-        assert_eq!(constant_select(&pos[0]).unwrap()[0].text, "5");
+        assert_eq!(
+            constant_select(&pos[0]).unwrap()[0].value,
+            Some(ScalarValue::Int4(5))
+        );
 
         // A table read, a filter, or a non-integer expression is not constant.
         for sql in [
@@ -878,6 +908,148 @@ mod tests {
                 "{sql} must defer to the binder"
             );
         }
+    }
+
+    /// Parse a `DataRow` payload into its per-column cells: `None` is the NULL
+    /// sentinel (length `-1`), `Some(bytes)` is a present text-format value.
+    fn parse_data_row(payload: &[u8]) -> Vec<Option<Vec<u8>>> {
+        let count = i16::from_be_bytes(payload[0..2].try_into().unwrap());
+        let mut cells = Vec::new();
+        let mut pos = 2;
+        for _ in 0..count {
+            let len = i32::from_be_bytes(payload[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            if len == -1 {
+                cells.push(None); // -1 is the *only* NULL sentinel
+            } else {
+                let n = usize::try_from(len).expect("a non-NULL length is non-negative");
+                let end = pos + n;
+                cells.push(Some(payload[pos..end].to_vec()));
+                pos = end;
+            }
+        }
+        assert_eq!(pos, payload.len(), "DataRow payload fully consumed");
+        cells
+    }
+
+    #[test]
+    fn data_row_encodes_null_as_negative_one_length() {
+        // A NULL cell is the length `-1` sentinel with no value bytes; present
+        // cells carry their text-format bytes. (STL-105 Definition of Done.)
+        let columns = vec![
+            ResultColumn {
+                name: "a".into(),
+                ty: LogicalType::Int4,
+                value: Some(ScalarValue::Int4(7)),
+            },
+            ResultColumn {
+                name: "b".into(),
+                ty: LogicalType::Text,
+                value: None,
+            },
+            ResultColumn {
+                name: "c".into(),
+                ty: LogicalType::Text,
+                value: Some(ScalarValue::Text("hi".into())),
+            },
+        ];
+        let payload = data_row_payload(&columns).expect("payload");
+        assert_eq!(
+            parse_data_row(&payload),
+            vec![Some(b"7".to_vec()), None, Some(b"hi".to_vec())]
+        );
+    }
+
+    #[test]
+    fn data_row_renders_every_scalar_type_in_text_format() {
+        // Drive each v0.1 type through the real DataRow builder so the wire path
+        // — not just the encoder unit — proves the Postgres text rendering.
+        let columns = vec![
+            ResultColumn {
+                name: "i4".into(),
+                ty: LogicalType::Int4,
+                value: Some(ScalarValue::Int4(-42)),
+            },
+            ResultColumn {
+                name: "i8".into(),
+                ty: LogicalType::Int8,
+                value: Some(ScalarValue::Int8(5_000_000_000)),
+            },
+            ResultColumn {
+                name: "t".into(),
+                ty: LogicalType::Text,
+                value: Some(ScalarValue::Text("hé🦀".into())),
+            },
+            ResultColumn {
+                name: "b".into(),
+                ty: LogicalType::Bool,
+                value: Some(ScalarValue::Bool(false)),
+            },
+            ResultColumn {
+                name: "ts".into(),
+                ty: LogicalType::Timestamp,
+                value: Some(ScalarValue::Timestamp(1_700_000_000_000_000)),
+            },
+            ResultColumn {
+                name: "d".into(),
+                ty: LogicalType::Date,
+                value: Some(ScalarValue::Date(19_675)),
+            },
+        ];
+        let cells = parse_data_row(&data_row_payload(&columns).expect("payload"));
+        let rendered: Vec<String> = cells
+            .into_iter()
+            .map(|c| String::from_utf8(c.expect("non-null")).unwrap())
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "-42",
+                "5000000000",
+                "hé🦀",
+                "f",
+                "2023-11-14 22:13:20",
+                "2023-11-14",
+            ]
+        );
+    }
+
+    #[test]
+    fn row_description_advertises_pg_oid_and_typlen_per_type() {
+        // Each field's dataTypeOID + typlen come from the column's LogicalType.
+        let columns: Vec<ResultColumn> = LogicalType::ALL
+            .iter()
+            .map(|&ty| ResultColumn {
+                name: ty.pg_type_name().to_owned(),
+                ty,
+                value: None,
+            })
+            .collect();
+        let payload = row_description_payload(&columns).expect("payload");
+        let count = i16::from_be_bytes(payload[0..2].try_into().unwrap());
+        assert_eq!(usize::try_from(count).unwrap(), LogicalType::ALL.len());
+
+        let mut pos = 2;
+        for &ty in &LogicalType::ALL {
+            // name cstring
+            let name_end = payload[pos..].iter().position(|&b| b == 0).unwrap() + pos;
+            assert_eq!(&payload[pos..name_end], ty.pg_type_name().as_bytes());
+            pos = name_end + 1;
+            pos += 4 + 2; // table OID + attr number
+            let oid = i32::from_be_bytes(payload[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let typlen = i16::from_be_bytes(payload[pos..pos + 2].try_into().unwrap());
+            pos += 2;
+            let typmod = i32::from_be_bytes(payload[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let format = i16::from_be_bytes(payload[pos..pos + 2].try_into().unwrap());
+            pos += 2;
+            assert_eq!(oid, i32::try_from(ty.pg_oid()).unwrap(), "{ty} OID");
+            assert_eq!(typlen, text_format::pg_typlen(ty), "{ty} typlen");
+            assert_eq!(typmod, -1, "{ty} typmod is none");
+            assert_eq!(format, FORMAT_TEXT, "{ty} is text format");
+        }
+        assert_eq!(pos, payload.len());
     }
 
     #[test]
