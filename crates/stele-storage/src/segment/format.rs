@@ -95,13 +95,26 @@ pub(super) const TRAILER_MAGIC: [u8; 8] = *b"STLSEGFT";
 ///   backwards-incompatible reasoning as v2–v7: a v7 reader encountering column
 ///   id 14 in the footer would fail with a confusing `Corrupt("unknown column
 ///   id")` mid-footer, so the bump makes it reject the segment cleanly at the
-///   header instead. The v0.1 chain does not yet *order* on `(sys_from, seq)`
-///   (the column is carried, not yet load-bearing); that follow-up is STL-141
-///   Part B and needs no further format change. `seq` is still *not* on the
-///   retraction tombstone — ordering deletes by `seq` rides with Part B; adding
-///   it there is a length-prefixed footer field that needs no `FORMAT_VERSION`
-///   bump.
-pub(super) const FORMAT_VERSION: u16 = 8;
+///   header instead. The v0.1 chain does not yet *order* on `(sys_from, seq)` at
+///   this generation (the column is carried, not yet load-bearing); that follow-up
+///   is STL-141 Part B (STL-145), which lands as **v9**.
+///
+/// * **v9** — **adds the per-commit `seq` to the retraction tombstone**
+///   ([`ColumnId::RetractSeq`], id 15; STL-145,
+///   [ADR-0024](../../../../../docs/adr/0024-time-representation.md)). STL-141
+///   Part B makes `(sys_from, seq)` load-bearing in the read / merge / index
+///   paths; deletes must be totally ordered against a same-tick sibling too, so
+///   the retraction section gains `seq` (the [`crate::validity::Close::seq`] of
+///   the deleted version). Like every column addition since v2 this is a new
+///   column id, and *that* is why it bumps the generation rather than riding v8:
+///   the footer parser rejects an unknown column id mid-footer
+///   (`Corrupt("unknown column id in footer")`), so without a bump an older v8
+///   reader would choke on id 15 instead of rejecting cleanly at the header, and
+///   this reader could not tell a v8 retraction segment (no `retract_seq` column)
+///   from a corrupt one. The version bump restores the clean header-level reject
+///   ([`SegmentError::UnsupportedVersion`](super::SegmentError::UnsupportedVersion))
+///   in both directions. The version row-group is byte-identical to v8.
+pub(super) const FORMAT_VERSION: u16 = 9;
 
 /// Header size in bytes — magic (8) + version (2) + flags (2) + reserved (4).
 pub(super) const HEADER_LEN: usize = 16;
@@ -232,8 +245,16 @@ pub enum ColumnId {
     /// `i64` column like [`Self::TxnId`]) — [`crate::delta::Version::seq`]. The
     /// total-order tiebreak for versions sharing the same µs `sys_from`
     /// ([ADR-0024], STL-141). Always-on, on every segment's version row-group
-    /// (format v8); never in the retraction section.
+    /// (format v8).
     Seq = 14,
+    /// Retraction tombstone: the `seq` of the version this delete closes (fixed 8
+    /// bytes, `u64` bits in the `i64` column like [`Self::Seq`]) —
+    /// [`crate::validity::Close::seq`]. Completes the deleted version's
+    /// `(sys_from, seq)` identity so a delete is totally ordered against a
+    /// same-tick sibling ([ADR-0024], STL-145). Present only in the segment's
+    /// retraction section, alongside the other tombstone columns (format v9 — a
+    /// new column id bumps the generation, see the `FORMAT_VERSION` note above).
+    RetractSeq = 15,
 }
 
 impl ColumnId {
@@ -285,13 +306,16 @@ impl ColumnId {
     /// The ordered tombstone column set a segment's **retraction section**
     /// carries (format v7, STL-143), in writer/reader canonical order. These
     /// mirror the [`crate::validity::Close`] fields — the business key, the
-    /// closed version's `sys_from`, the close timestamp, and the closing
-    /// transaction's provenance triple — with no payload. Present only when the
-    /// segment holds at least one retraction; the footer's retraction-section
-    /// column list is the source of truth, so writer and reader never drift.
-    pub(super) const RETRACTION: [Self; 6] = [
+    /// closed version's `sys_from` and `seq`, the close timestamp, and the closing
+    /// transaction's provenance triple — with no payload. The `seq` (STL-145)
+    /// completes the deleted version's `(sys_from, seq)` identity so deletes are
+    /// totally ordered. Present only when the segment holds at least one
+    /// retraction; the footer's retraction-section column list is the source of
+    /// truth, so writer and reader never drift.
+    pub(super) const RETRACTION: [Self; 7] = [
         Self::RetractKey,
         Self::RetractSysFrom,
+        Self::RetractSeq,
         Self::RetractClosedAt,
         Self::RetractClosedByTxn,
         Self::RetractClosedByCommittedAt,
@@ -327,6 +351,7 @@ impl ColumnId {
             | Self::ValidFrom
             | Self::ValidTo
             | Self::RetractSysFrom
+            | Self::RetractSeq
             | Self::RetractClosedAt
             | Self::RetractClosedByTxn
             | Self::RetractClosedByCommittedAt => ColumnType::I64,
@@ -350,6 +375,7 @@ impl ColumnId {
             12 => Some(Self::RetractClosedByCommittedAt),
             13 => Some(Self::RetractClosedByPrincipal),
             14 => Some(Self::Seq),
+            15 => Some(Self::RetractSeq),
             _ => None,
         }
     }

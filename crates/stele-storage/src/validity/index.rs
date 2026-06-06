@@ -32,18 +32,26 @@ pub struct ClosedInterval {
 /// logs so the index is rebuildable ([the "appended close" of STL-127, realigned
 /// under ADR-0023](super)).
 ///
-/// It names the version it closes by `(business_key, sys_from)` — the same key
-/// the delta tier and sealed segments cluster a version chain by — and supplies
-/// the materialized `sys_to` plus the closing transaction's provenance. The
-/// closed version's body (payload, birth provenance) is never touched: a close
-/// is bookkeeping by the superseding/deleting transaction, not a rewrite of who
-/// wrote the closed version.
+/// It names the version it closes by `(business_key, sys_from, seq)` — the same
+/// key the delta tier and sealed segments cluster a version chain by once `seq`
+/// is load-bearing ([ADR-0024], STL-141 Part B) — and supplies the materialized
+/// `sys_to` plus the closing transaction's provenance. The closed version's body
+/// (payload, birth provenance) is never touched: a close is bookkeeping by the
+/// superseding/deleting transaction, not a rewrite of who wrote the closed
+/// version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Close {
     /// The business key of the version being closed.
     pub business_key: BusinessKey,
-    /// The `sys_from` of the version this close refers to — the match key.
+    /// The `sys_from` of the version this close refers to — part of the match key.
     pub sys_from: SystemTimeMicros,
+    /// The `seq` of the version this close refers to — the per-commit tiebreak
+    /// that completes the match key ([ADR-0024]). Two versions of one key can
+    /// share a `sys_from` once the writer no longer force-bumps the timestamp
+    /// (STL-145), so `(sys_from, seq)` is what uniquely names the closed version;
+    /// keying on `sys_from` alone would let one close collide with and overwrite
+    /// the other.
+    pub seq: u64,
     /// The materialized end stamped on the closed period; the interval becomes
     /// `[sys_from, sys_to)`.
     pub sys_to: SystemTimeMicros,
@@ -52,8 +60,9 @@ pub struct Close {
 }
 
 /// Fixed header size for the [`Close`] binary frame: `business_len`/`principal_len`
-/// `u32` (8) + `sys_from`/`sys_to`/`closed_at` `i64` (24) + `closed_txn` `u64` (8).
-const HEADER_LEN: usize = 40;
+/// `u32` (8) + `sys_from`/`sys_to`/`closed_at` `i64` (24) + `seq`/`closed_txn`
+/// `u64` (16).
+const HEADER_LEN: usize = 48;
 
 /// Per-frame ceiling for an encoded [`Close`] (16 MiB) — the same bound the
 /// delta tier and the WAL apply, so a close frame can never legitimately exceed
@@ -61,9 +70,9 @@ const HEADER_LEN: usize = 40;
 pub const MAX_CLOSE_FRAME_LEN: usize = 16 * 1024 * 1024;
 
 impl Close {
-    /// The `(business_key, sys_from)` this close materializes an end for.
-    fn target(&self) -> (BusinessKey, SystemTimeMicros) {
-        (self.business_key.clone(), self.sys_from)
+    /// The `(business_key, sys_from, seq)` this close materializes an end for.
+    fn target(&self) -> (BusinessKey, SystemTimeMicros, u64) {
+        (self.business_key.clone(), self.sys_from, self.seq)
     }
 
     /// The value half of the entry.
@@ -97,9 +106,12 @@ impl Close {
     /// spill writer so both paths use one wire format. Layout (little-endian):
     ///
     /// ```text
-    /// | business_len:u32 | principal_len:u32 | sys_from:i64 | sys_to:i64 |
+    /// | business_len:u32 | principal_len:u32 | sys_from:i64 | seq:u64 | sys_to:i64 |
     /// | closed_txn:u64 | closed_at:i64 | business_key bytes … | principal bytes … |
     /// ```
+    ///
+    /// `seq` sits next to `sys_from`, the timestamp it disambiguates — the closed
+    /// version's per-commit tiebreak ([ADR-0024], STL-145).
     ///
     /// # Errors
     ///
@@ -114,6 +126,7 @@ impl Close {
         out.extend_from_slice(&business_len.to_le_bytes());
         out.extend_from_slice(&principal_len.to_le_bytes());
         out.extend_from_slice(&self.sys_from.0.to_le_bytes());
+        out.extend_from_slice(&self.seq.to_le_bytes());
         out.extend_from_slice(&self.sys_to.0.to_le_bytes());
         out.extend_from_slice(&self.closed_by.txn_id.0.to_le_bytes());
         out.extend_from_slice(&self.closed_by.committed_at.0.to_le_bytes());
@@ -151,9 +164,10 @@ impl Close {
         let business_len = rd_u32(0) as usize;
         let principal_len = rd_u32(4) as usize;
         let sys_from = rd_i64(8);
-        let sys_to = rd_i64(16);
-        let closed_txn = rd_u64(24);
-        let closed_at = rd_i64(32);
+        let seq = rd_u64(16);
+        let sys_to = rd_i64(24);
+        let closed_txn = rd_u64(32);
+        let closed_at = rd_i64(40);
         let total = HEADER_LEN
             .checked_add(business_len)
             .and_then(|v| v.checked_add(principal_len))
@@ -173,6 +187,7 @@ impl Close {
             Self {
                 business_key,
                 sys_from: SystemTimeMicros(sys_from),
+                seq,
                 sys_to: SystemTimeMicros(sys_to),
                 closed_by: Provenance {
                     txn_id: TxnId(closed_txn),
@@ -288,9 +303,11 @@ pub enum ValidityError {
 pub struct ValidityIndex<D: Disk> {
     disk: D,
     config: ValidityConfig,
-    /// `(business_key, sys_from) → materialized end`. Resident entries; the
-    /// spilled ones live in `live_spills`.
-    mem: BTreeMap<(BusinessKey, SystemTimeMicros), ClosedInterval>,
+    /// `(business_key, sys_from, seq) → materialized end`. Resident entries; the
+    /// spilled ones live in `live_spills`. The `seq` is part of the key so two
+    /// same-`sys_from` versions of one key each get their own close instead of
+    /// colliding (STL-145, [ADR-0024]).
+    mem: BTreeMap<(BusinessKey, SystemTimeMicros, u64), ClosedInterval>,
     /// Running sum of [`Close::encoded_size`] for the resident entries.
     byte_size: u64,
     /// Next spill index to allocate — `max(existing) + 1` at open even though the
@@ -339,7 +356,7 @@ impl<D: Disk> ValidityIndex<D> {
     /// from the encode/spill path.
     pub fn insert_close(&mut self, close: Close) -> Result<(), ValidityError> {
         close.check_encodable()?;
-        if let Some(existing) = self.close_of(&close.business_key, close.sys_from)? {
+        if let Some(existing) = self.close_of(&close.business_key, close.sys_from, close.seq)? {
             return if existing == close.interval() {
                 Ok(()) // idempotent replay
             } else {
@@ -357,18 +374,24 @@ impl<D: Disk> ValidityIndex<D> {
         let Close {
             business_key,
             sys_from,
+            seq,
             sys_to,
             closed_by,
         } = close;
         self.mem.insert(
-            (business_key, sys_from),
+            (business_key, sys_from, seq),
             ClosedInterval { sys_to, closed_by },
         );
         Ok(())
     }
 
-    /// The materialized end of the version `(key, sys_from)`, or `None` while the
-    /// version is still open (no close has committed).
+    /// The materialized end of the version `(key, sys_from, seq)`, or `None` while
+    /// the version is still open (no close has committed).
+    ///
+    /// `seq` is the per-commit tiebreak that, with `sys_from`, uniquely names the
+    /// version ([ADR-0024], STL-145): two versions of one key can share a
+    /// `sys_from`, so the lookup must match on `seq` too or it could return the
+    /// wrong version's end.
     ///
     /// Checks the resident entries first, then only the spills whose in-memory
     /// summary says they *may* hold `key` — a point lookup reads `O(matching
@@ -382,8 +405,9 @@ impl<D: Disk> ValidityIndex<D> {
         &self,
         key: &BusinessKey,
         sys_from: SystemTimeMicros,
+        seq: u64,
     ) -> Result<Option<ClosedInterval>, ValidityError> {
-        if let Some(interval) = self.mem.get(&(key.clone(), sys_from)) {
+        if let Some(interval) = self.mem.get(&(key.clone(), sys_from, seq)) {
             return Ok(Some(interval.clone()));
         }
         for meta in &self.live_spills {
@@ -391,7 +415,7 @@ impl<D: Disk> ValidityIndex<D> {
                 continue;
             }
             for close in spill::read_spill(&self.disk, meta.index)? {
-                if &close.business_key == key && close.sys_from == sys_from {
+                if &close.business_key == key && close.sys_from == sys_from && close.seq == seq {
                     return Ok(Some(close.interval()));
                 }
             }
@@ -399,11 +423,13 @@ impl<D: Disk> ValidityIndex<D> {
         Ok(None)
     }
 
-    /// Every materialized close for `key`, keyed by the version's `sys_from`.
+    /// Every materialized close for `key`, keyed by the version's
+    /// `(sys_from, seq)`.
     ///
     /// The read path ([`crate::merge`]) overlays these onto the key's candidate
     /// versions to stamp each one's `sys_to` / `closed_by` before resolving a
-    /// snapshot. Merges the resident entries with every spill.
+    /// snapshot. Keying on `(sys_from, seq)` keeps two same-`sys_from` versions'
+    /// closes distinct (STL-145). Merges the resident entries with every spill.
     ///
     /// # Errors
     ///
@@ -411,9 +437,9 @@ impl<D: Disk> ValidityIndex<D> {
     pub fn closes_for(
         &self,
         key: &BusinessKey,
-    ) -> Result<BTreeMap<SystemTimeMicros, ClosedInterval>, ValidityError> {
+    ) -> Result<BTreeMap<(SystemTimeMicros, u64), ClosedInterval>, ValidityError> {
         use std::ops::Bound::Included;
-        let mut out: BTreeMap<SystemTimeMicros, ClosedInterval> = BTreeMap::new();
+        let mut out: BTreeMap<(SystemTimeMicros, u64), ClosedInterval> = BTreeMap::new();
         // Spilled entries first, resident last — a resident entry supersedes a
         // spilled one for the same version (they never disagree, but this keeps
         // the merge order well-defined, mirroring the delta tier). Only spills
@@ -424,14 +450,14 @@ impl<D: Disk> ValidityIndex<D> {
             }
             for close in spill::read_spill(&self.disk, meta.index)? {
                 if &close.business_key == key {
-                    out.insert(close.sys_from, close.interval());
+                    out.insert((close.sys_from, close.seq), close.interval());
                 }
             }
         }
-        let lo = (key.clone(), SystemTimeMicros(i64::MIN));
-        let hi = (key.clone(), SystemTimeMicros(i64::MAX));
-        for ((_, sys_from), interval) in self.mem.range((Included(lo), Included(hi))) {
-            out.insert(*sys_from, interval.clone());
+        let lo = (key.clone(), SystemTimeMicros(i64::MIN), u64::MIN);
+        let hi = (key.clone(), SystemTimeMicros(i64::MAX), u64::MAX);
+        for ((_, sys_from, seq), interval) in self.mem.range((Included(lo), Included(hi))) {
+            out.insert((*sys_from, *seq), interval.clone());
         }
         Ok(out)
     }
@@ -447,7 +473,7 @@ impl<D: Disk> ValidityIndex<D> {
     /// requested key, but only when that union is *smaller* than the full spill
     /// set; otherwise it falls back to the single sweep ([STL-142]).
     ///
-    /// The returned map is keyed `(business_key, sys_from)` like
+    /// The returned map is keyed `(business_key, sys_from, seq)` like
     /// [`Self::materialize`]. In the full-sweep branch it contains every entry in
     /// the index, not just those for `keys`; the fold overlays by key, so the
     /// extras are simply ignored.
@@ -458,7 +484,7 @@ impl<D: Disk> ValidityIndex<D> {
     pub fn closes_for_keys(
         &self,
         keys: &std::collections::BTreeSet<BusinessKey>,
-    ) -> Result<BTreeMap<(BusinessKey, SystemTimeMicros), ClosedInterval>, ValidityError> {
+    ) -> Result<BTreeMap<(BusinessKey, SystemTimeMicros, u64), ClosedInterval>, ValidityError> {
         use std::ops::Bound::Included;
         // Spills that may hold at least one requested key — each read at most once.
         // Built incrementally so that the instant every spill is selected (a full
@@ -473,7 +499,8 @@ impl<D: Disk> ValidityIndex<D> {
                 }
             }
         }
-        let mut out: BTreeMap<(BusinessKey, SystemTimeMicros), ClosedInterval> = BTreeMap::new();
+        let mut out: BTreeMap<(BusinessKey, SystemTimeMicros, u64), ClosedInterval> =
+            BTreeMap::new();
         for meta in selected {
             for close in spill::read_spill(&self.disk, meta.index)? {
                 if keys.contains(&close.business_key) {
@@ -481,13 +508,14 @@ impl<D: Disk> ValidityIndex<D> {
                 }
             }
         }
-        // Resident entries for each key — a contiguous run in the `(key, sys_from)`
-        // map, so range-scan just that run rather than the whole map.
+        // Resident entries for each key — a contiguous run in the
+        // `(key, sys_from, seq)` map, so range-scan just that run rather than the
+        // whole map.
         for key in keys {
-            let lo = (key.clone(), SystemTimeMicros(i64::MIN));
-            let hi = (key.clone(), SystemTimeMicros(i64::MAX));
-            for ((_, sys_from), interval) in self.mem.range((Included(lo), Included(hi))) {
-                out.insert((key.clone(), *sys_from), interval.clone());
+            let lo = (key.clone(), SystemTimeMicros(i64::MIN), u64::MIN);
+            let hi = (key.clone(), SystemTimeMicros(i64::MAX), u64::MAX);
+            for ((_, sys_from, seq), interval) in self.mem.range((Included(lo), Included(hi))) {
+                out.insert((key.clone(), *sys_from, *seq), interval.clone());
             }
         }
         Ok(out)
@@ -500,12 +528,16 @@ impl<D: Disk> ValidityIndex<D> {
         self.live_spills.len()
     }
 
-    /// The `sys_from` of the version active at system-time `at` for `key`, when
-    /// `at` falls inside a **materialized** (closed) interval — a direct
+    /// The `(sys_from, seq)` of the version active at system-time `at` for `key`,
+    /// when `at` falls inside a **materialized** (closed) interval — a direct
     /// range-containment lookup, no version-chain walk
     /// ([DoD of STL-133](super)).
     ///
-    /// Returns the greatest `sys_from ≤ at` whose materialized `sys_to > at`.
+    /// Returns the greatest `(sys_from, seq)` with `sys_from ≤ at` whose
+    /// materialized `sys_to > at`. The `seq` component breaks a `sys_from` tie so
+    /// the highest-`seq` version at a shared tick wins ([ADR-0024], STL-145); a
+    /// same-tick superseded version closes degenerately (`sys_to == sys_from`) and
+    /// so is filtered out by the `sys_to > at` test, never returned.
     /// `None` means `at` is not covered by any closed interval for the key: it
     /// is either before the key's first version or in its currently-*open* tail,
     /// which the read path resolves against the version set ([`crate::merge`]) —
@@ -518,13 +550,13 @@ impl<D: Disk> ValidityIndex<D> {
         &self,
         key: &BusinessKey,
         at: SystemTimeMicros,
-    ) -> Result<Option<SystemTimeMicros>, ValidityError> {
+    ) -> Result<Option<(SystemTimeMicros, u64)>, ValidityError> {
         let closes = self.closes_for(key)?;
         Ok(closes
-            .range(..=at)
+            .range(..=(at, u64::MAX))
             .next_back()
             .filter(|(_, interval)| interval.sys_to > at)
-            .map(|(sys_from, _)| *sys_from))
+            .map(|(&key, _)| key))
     }
 
     /// The system-time **upper bound** over a set of versions named by
@@ -545,8 +577,9 @@ impl<D: Disk> ValidityIndex<D> {
     /// is *moved* into the `BTreeMap` probe tuple rather than cloned (unlike
     /// [`Self::close_of`], whose borrowed signature forces a clone). Only the rare
     /// resident-miss-with-spills case falls back to [`Self::close_of`]'s
-    /// per-lookup spill scan. Takes owned `(BusinessKey, SystemTimeMicros)` items
-    /// for exactly this reason — feed it [`SegmentReader::version_keys`] directly.
+    /// per-lookup spill scan. Takes owned `(BusinessKey, SystemTimeMicros, u64)`
+    /// items — the version's `(key, sys_from, seq)` identity (STL-145) — for
+    /// exactly this reason; feed it [`SegmentReader::version_keys`] directly.
     ///
     /// [`SegmentReader::version_keys`]: crate::segment::SegmentReader::version_keys
     ///
@@ -555,14 +588,14 @@ impl<D: Disk> ValidityIndex<D> {
     /// [`ValidityError::Corrupt`] / [`ValidityError::Io`] loading a spill file.
     pub fn sys_upper_bound<I>(&self, versions: I) -> Result<SysUpperBound, ValidityError>
     where
-        I: IntoIterator<Item = (BusinessKey, SystemTimeMicros)>,
+        I: IntoIterator<Item = (BusinessKey, SystemTimeMicros, u64)>,
     {
         let mut max_sys_to = SystemTimeMicros(i64::MIN);
-        for (key, sys_from) in versions {
+        for (key, sys_from, seq) in versions {
             // Move the key into the lookup tuple — the resident probe needs no
             // clone. Recover it from the tuple only when a resident miss with
             // live spills forces a spill scan.
-            let probe = (key, sys_from);
+            let probe = (key, sys_from, seq);
             if let Some(interval) = self.mem.get(&probe) {
                 max_sys_to = max_sys_to.max(interval.sys_to);
                 continue;
@@ -571,8 +604,8 @@ impl<D: Disk> ValidityIndex<D> {
                 // Not resident and nothing spilled ⇒ the version is open ⇒ +∞.
                 return Ok(SysUpperBound::Unbounded);
             }
-            let (key, sys_from) = probe;
-            match self.close_of(&key, sys_from)? {
+            let (key, sys_from, seq) = probe;
+            match self.close_of(&key, sys_from, seq)? {
                 Some(interval) => max_sys_to = max_sys_to.max(interval.sys_to),
                 // An open version's end is +∞: the set can never be pruned.
                 None => return Ok(SysUpperBound::Unbounded),
@@ -591,8 +624,9 @@ impl<D: Disk> ValidityIndex<D> {
     /// [`ValidityError::Corrupt`] / [`ValidityError::Io`] loading a spill file.
     pub fn materialize(
         &self,
-    ) -> Result<BTreeMap<(BusinessKey, SystemTimeMicros), ClosedInterval>, ValidityError> {
-        let mut out: BTreeMap<(BusinessKey, SystemTimeMicros), ClosedInterval> = BTreeMap::new();
+    ) -> Result<BTreeMap<(BusinessKey, SystemTimeMicros, u64), ClosedInterval>, ValidityError> {
+        let mut out: BTreeMap<(BusinessKey, SystemTimeMicros, u64), ClosedInterval> =
+            BTreeMap::new();
         for meta in &self.live_spills {
             for close in spill::read_spill(&self.disk, meta.index)? {
                 out.insert(close.target(), close.interval());
@@ -636,9 +670,10 @@ impl<D: Disk> ValidityIndex<D> {
         let closes: Vec<Close> = self
             .mem
             .iter()
-            .map(|((business_key, sys_from), interval)| Close {
+            .map(|((business_key, sys_from, seq), interval)| Close {
                 business_key: business_key.clone(),
                 sys_from: *sys_from,
+                seq: *seq,
                 sys_to: interval.sys_to,
                 closed_by: interval.closed_by.clone(),
             })
@@ -659,9 +694,16 @@ mod tests {
     use crate::backend::MemDisk;
 
     fn close(key: &[u8], sys_from: i64, sys_to: i64, closer: &[u8]) -> Close {
+        // `seq` defaults to 0 here — the same-`sys_from` tiebreak is exercised in
+        // the bitemporal oracle; these unit tests use distinct `sys_from` values.
+        close_seq(key, sys_from, 0, sys_to, closer)
+    }
+
+    fn close_seq(key: &[u8], sys_from: i64, seq: u64, sys_to: i64, closer: &[u8]) -> Close {
         Close {
             business_key: BusinessKey::new(key.to_vec()),
             sys_from: SystemTimeMicros(sys_from),
+            seq,
             sys_to: SystemTimeMicros(sys_to),
             closed_by: Provenance::new(
                 TxnId(u64::try_from(sys_to).unwrap_or(0)),
@@ -708,12 +750,12 @@ mod tests {
         let mut idx = index();
         idx.insert_close(close(b"k", 10, 20, b"a")).expect("insert");
         let got = idx
-            .close_of(&BusinessKey::new(b"k".to_vec()), SystemTimeMicros(10))
+            .close_of(&BusinessKey::new(b"k".to_vec()), SystemTimeMicros(10), 0)
             .expect("lookup");
         assert_eq!(got.unwrap().sys_to, SystemTimeMicros(20));
         // A version with no close is open.
         assert!(
-            idx.close_of(&BusinessKey::new(b"k".to_vec()), SystemTimeMicros(20))
+            idx.close_of(&BusinessKey::new(b"k".to_vec()), SystemTimeMicros(20), 0)
                 .expect("lookup")
                 .is_none()
         );
@@ -747,16 +789,16 @@ mod tests {
         let k = BusinessKey::new(b"k".to_vec());
         assert_eq!(
             idx.active_at(&k, SystemTimeMicros(5)).expect("at 5"),
-            Some(SystemTimeMicros(0)),
+            Some((SystemTimeMicros(0), 0)),
         );
         assert_eq!(
             idx.active_at(&k, SystemTimeMicros(15)).expect("at 15"),
-            Some(SystemTimeMicros(10)),
+            Some((SystemTimeMicros(10), 0)),
         );
         // At the exact close point the interval is already exclusive-closed.
         assert_eq!(
             idx.active_at(&k, SystemTimeMicros(10)).expect("at 10"),
-            Some(SystemTimeMicros(10)),
+            Some((SystemTimeMicros(10), 0)),
         );
         // Beyond every closed interval ⇒ open tail, not the index's to answer.
         assert_eq!(
@@ -765,6 +807,41 @@ mod tests {
         );
         // Before the first version.
         idx.insert_close(close(b"k", 0, 10, b"a")).expect("idem");
+    }
+
+    #[test]
+    fn same_sys_from_closes_keyed_by_seq_do_not_collide() {
+        // Two versions of one key share sys_from=10 (the writer no longer
+        // force-bumps the timestamp, STL-145). Each is closed to a *different*
+        // sys_to. Keyed on sys_from alone the second close would be rejected as a
+        // conflicting re-close of the first; the (sys_from, seq) key keeps them
+        // distinct, so both materialize and resolve independently.
+        let mut idx = index();
+        idx.insert_close(close_seq(b"k", 10, 0, 20, b"a"))
+            .expect("seq 0");
+        idx.insert_close(close_seq(b"k", 10, 1, 30, b"b"))
+            .expect("seq 1");
+        let k = BusinessKey::new(b"k".to_vec());
+        assert_eq!(
+            idx.close_of(&k, SystemTimeMicros(10), 0)
+                .unwrap()
+                .unwrap()
+                .sys_to,
+            SystemTimeMicros(20),
+        );
+        assert_eq!(
+            idx.close_of(&k, SystemTimeMicros(10), 1)
+                .unwrap()
+                .unwrap()
+                .sys_to,
+            SystemTimeMicros(30),
+        );
+        assert_eq!(idx.len().expect("len"), 2, "both closes survive");
+        // A conflicting re-close of the *same* (sys_from, seq) is still refused.
+        let err = idx
+            .insert_close(close_seq(b"k", 10, 0, 21, b"a"))
+            .unwrap_err();
+        assert!(matches!(err, ValidityError::AlreadyClosed));
     }
 
     #[test]
@@ -782,14 +859,14 @@ mod tests {
         // The first entry is on a spill, the second resident — both must resolve.
         let k = BusinessKey::new(b"k".to_vec());
         assert_eq!(
-            idx.close_of(&k, SystemTimeMicros(0))
+            idx.close_of(&k, SystemTimeMicros(0), 0)
                 .expect("spilled")
                 .unwrap()
                 .sys_to,
             SystemTimeMicros(10),
         );
         assert_eq!(
-            idx.close_of(&k, SystemTimeMicros(10))
+            idx.close_of(&k, SystemTimeMicros(10), 0)
                 .expect("resident")
                 .unwrap()
                 .sys_to,
@@ -835,7 +912,7 @@ mod tests {
         let got = idx.closes_for_keys(&keys).expect("subset");
         let want: BTreeMap<_, _> = all
             .iter()
-            .filter(|((k, _), _)| keys.contains(k))
+            .filter(|((k, _, _), _)| keys.contains(k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         assert_eq!(got, want);
@@ -871,9 +948,9 @@ mod tests {
         idx.insert_close(close(b"a", 100, 250, b"x")).expect("c1");
         idx.insert_close(close(b"b", 10, 200, b"x")).expect("c2");
         let keys = [
-            (bk(b"a"), SystemTimeMicros(0)),
-            (bk(b"a"), SystemTimeMicros(100)),
-            (bk(b"b"), SystemTimeMicros(10)),
+            (bk(b"a"), SystemTimeMicros(0), 0),
+            (bk(b"a"), SystemTimeMicros(100), 0),
+            (bk(b"b"), SystemTimeMicros(10), 0),
         ];
         let bound = idx.sys_upper_bound(keys).expect("bound");
         assert_eq!(bound, SysUpperBound::Bounded(SystemTimeMicros(250)));
@@ -886,8 +963,8 @@ mod tests {
         // (b, 10) has no close → it is open, so the whole set is unbounded even
         // though `a` is closed.
         let keys = [
-            (bk(b"a"), SystemTimeMicros(0)),
-            (bk(b"b"), SystemTimeMicros(10)),
+            (bk(b"a"), SystemTimeMicros(0), 0),
+            (bk(b"b"), SystemTimeMicros(10), 0),
         ];
         let bound = idx.sys_upper_bound(keys).expect("bound");
         assert_eq!(bound, SysUpperBound::Unbounded);
@@ -901,7 +978,7 @@ mod tests {
     fn empty_set_is_vacuously_superseded() {
         let idx = index();
         let bound = idx
-            .sys_upper_bound(std::iter::empty::<(BusinessKey, SystemTimeMicros)>())
+            .sys_upper_bound(std::iter::empty::<(BusinessKey, SystemTimeMicros, u64)>())
             .expect("bound");
         assert_eq!(bound, SysUpperBound::Bounded(SystemTimeMicros(i64::MIN)));
         assert!(bound.superseded_at_or_before(SystemTimeMicros(0)));
@@ -913,7 +990,7 @@ mod tests {
         // already superseded *at* the snapshot and the segment prunes.
         let mut idx = index();
         idx.insert_close(close(b"a", 0, 100, b"x")).expect("c0");
-        let keys = [(bk(b"a"), SystemTimeMicros(0))];
+        let keys = [(bk(b"a"), SystemTimeMicros(0), 0)];
         let bound = idx.sys_upper_bound(keys).expect("bound");
         assert!(bound.superseded_at_or_before(SystemTimeMicros(100)));
         assert!(!bound.superseded_at_or_before(SystemTimeMicros(99)));
@@ -932,8 +1009,8 @@ mod tests {
         idx.insert_close(close(b"a", 0, 100, b"x")).expect("c0");
         idx.insert_close(close(b"a", 100, 300, b"x")).expect("c1");
         let keys = [
-            (bk(b"a"), SystemTimeMicros(0)),
-            (bk(b"a"), SystemTimeMicros(100)),
+            (bk(b"a"), SystemTimeMicros(0), 0),
+            (bk(b"a"), SystemTimeMicros(100), 0),
         ];
         let bound = idx.sys_upper_bound(keys).expect("bound");
         assert_eq!(bound, SysUpperBound::Bounded(SystemTimeMicros(300)));

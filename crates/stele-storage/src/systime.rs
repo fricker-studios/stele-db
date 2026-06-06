@@ -43,20 +43,30 @@
 //!
 //! ## Commit-timestamp monotonicity
 //!
-//! The per-key chain is non-overlapping and gap-free **iff** the commit
-//! timestamps it is stamped with strictly increase. [`SysTimeWriter`] guarantees
-//! that locally: each commit timestamp is `max(clock.now(), previous + 1)`, so a
-//! stalled or regressing wall clock can never produce two versions with the same
-//! `sys_from` or an out-of-order close.
+//! The per-key chain is totally ordered by `(sys_from, seq)`: the **real** commit
+//! µs first, then the per-commit sequence number that breaks a same-tick tie
+//! ([ADR-0024](../../../docs/adr/0024-time-representation.md)). [`SysTimeWriter`]
+//! stamps `sys_from` with exactly what the clock reads and **never mutates it** —
+//! two commits at the same µs keep that µs and are ordered by their distinct
+//! `seq` (STL-145). This replaced the older `max(clock.now(), previous + 1)`
+//! *force-bump*, which manufactured a strictly-increasing `sys_from` by lying
+//! about the timestamp; the honest µs plus `seq` is the [ADR-0024] model.
 //!
-//! **Scope of the guard.** The `previous + 1` high-water mark lives *in the
-//! writer instance* — it starts empty on [`SysTimeWriter::new`] and resets if the
-//! writer is recreated (e.g. after a restart). So the monotonicity guarantee
-//! holds *within one writer's lifetime*, not across restarts: a caller that
-//! constructs a fresh writer must supply a commit clock that does not read
-//! earlier than the newest `sys_from` already persisted. Re-establishing that
-//! high-water mark on recovery, and global commit ordering across transactions
-//! and (later) nodes, is the transaction manager's job
+//! **The monotonicity guard survives only as a non-regression check.** The
+//! writer still tracks the high-water mark of the `sys_from` it has stamped, but
+//! it no longer bumps a stalled reading — it only *rejects* a clock that reads
+//! strictly **earlier** than that mark ([`SysTimeError::ClockRegressed`]), since
+//! a backwards-moving clock would let a new version sort before an existing one.
+//! A repeated (stalled) tick is allowed; a regressing one is refused.
+//!
+//! **Scope of the guard.** The high-water mark lives *in the writer instance* —
+//! it starts empty on [`SysTimeWriter::new`] and resets if the writer is
+//! recreated (e.g. after a restart). So the non-regression guarantee holds
+//! *within one writer's lifetime*, not across restarts: a caller that constructs
+//! a fresh writer must supply a commit clock that does not read earlier than the
+//! newest `sys_from` already persisted, and a `seq` that continues to increase.
+//! Re-establishing that high-water mark on recovery, and global commit ordering
+//! across transactions and (later) nodes, is the transaction manager's job
 //! ([architecture §9](../../../docs/02-architecture.md#9-transaction--concurrency-model),
 //! [ADR-0022](../../../docs/adr/0022-clock-synchronization-and-ordering.md)); this
 //! guard is what keeps the single-writer storage path correct on its own.
@@ -230,10 +240,10 @@ impl<F: DiskFile> SealedLookup for SealedSegments<'_, F> {
             value: ZoneBound::Bytes(key.as_bytes().to_vec()),
         };
         // Resolve liveness at the open sentinel so the system-time slice never
-        // prunes: the writer probes at a freshly-allocated commit strictly
-        // greater than every persisted `sys_from`, so any segment holding the
-        // key must be kept regardless of how old its rows are. Only the
-        // business-key zone map gets to rule a segment out here.
+        // prunes: the writer probes at a freshly-allocated commit `≥` every
+        // persisted `sys_from`, so any segment holding the key must be kept
+        // regardless of how old its rows are. Only the business-key zone map gets
+        // to rule a segment out here.
         let snapshot = Snapshot(SYSTEM_TIME_OPEN);
         let mut out = Vec::new();
         for reader in self.readers {
@@ -273,6 +283,17 @@ pub enum SysTimeError {
     /// but enforced in **all** builds, not just debug.
     #[error("system-time domain exhausted: next commit would reach the +∞ sentinel")]
     TimeExhausted,
+
+    /// The commit clock read **earlier** than a `sys_from` this writer already
+    /// stamped. Since [ADR-0024] (STL-145) the writer keeps the real µs and orders
+    /// same-tick commits by `seq` rather than force-bumping the timestamp, so a
+    /// repeated tick is fine — but a clock that moves *backwards* would let a new
+    /// version sort before an existing one and break the per-key timeline, so it
+    /// is refused. Re-establishing the high-water mark on recovery and global
+    /// ordering across transactions remain the transaction manager's job
+    /// ([architecture §9]); this guard keeps the single-writer path correct.
+    #[error("commit clock regressed below the last stamped sys_from")]
+    ClockRegressed,
 
     /// An error bubbled up from the delta tier (I/O on a spill, or a frame too
     /// large to encode).
@@ -390,8 +411,9 @@ impl<C: Clock> SysTimeWriter<C> {
             resolve_live(delta, sealed, index, &key, commit)?.ok_or(SysTimeError::KeyNotFound)?;
         // The superseding transaction both closes the prior period (stamping its
         // identity as `closed_by`) and opens the new one — same `txn_id` /
-        // `principal` for both halves. `seq` rides only on the new open version;
-        // the close is a validity-index entry and carries no `seq`.
+        // `principal` for both halves. The new open version carries the caller's
+        // `seq`; the close carries the *prior* version's `seq` as part of its
+        // (sys_from, seq) match key (STL-145).
         apply(
             delta,
             index,
@@ -550,26 +572,32 @@ impl<C: Clock> SysTimeWriter<C> {
         ))
     }
 
-    /// Allocate the next commit timestamp: at least the clock's reading, and
-    /// strictly greater than the previous one. See the [module docs](self).
+    /// Allocate the next commit timestamp: the clock's **real** reading, refused
+    /// only if it regressed below the last one or reached the `+∞` sentinel. See
+    /// the [module docs](self).
+    ///
+    /// The timestamp is **never mutated** ([ADR-0024], STL-145): a clock that
+    /// reads the same µs as the previous commit is accepted as-is, and `seq` (the
+    /// caller's per-commit counter) gives the two same-tick versions their total
+    /// order. The monotonicity guard survives only as a *non-regression check*.
     ///
     /// # Errors
     ///
-    /// [`SysTimeError::TimeExhausted`] if the next timestamp would reach the
-    /// `+∞` open sentinel — refused in all builds so a real `sys_from` can never
-    /// masquerade as an open period. `last_commit` is left untouched on error,
-    /// so a retry behaves identically.
+    /// [`SysTimeError::ClockRegressed`] if the reading is strictly less than the
+    /// last stamped `sys_from`. [`SysTimeError::TimeExhausted`] if it would reach
+    /// the `+∞` open sentinel — refused in all builds so a real `sys_from` can
+    /// never masquerade as an open period. `last_commit` is left untouched on
+    /// either error, so a retry behaves identically.
     fn next_commit_ts(&mut self) -> Result<SystemTimeMicros, SysTimeError> {
         let now = self.clock.now();
-        let ts = match self.last_commit {
-            Some(prev) if now <= prev => SystemTimeMicros(prev.0.saturating_add(1)),
-            _ => now,
-        };
-        if ts >= SYSTEM_TIME_OPEN {
+        if matches!(self.last_commit, Some(prev) if now < prev) {
+            return Err(SysTimeError::ClockRegressed);
+        }
+        if now >= SYSTEM_TIME_OPEN {
             return Err(SysTimeError::TimeExhausted);
         }
-        self.last_commit = Some(ts);
-        Ok(ts)
+        self.last_commit = Some(now);
+        Ok(now)
     }
 }
 
@@ -636,6 +664,9 @@ fn close_of(
     Close {
         business_key: key.clone(),
         sys_from: prior.sys_from,
+        // The closed version's own `seq` completes the (sys_from, seq) match key,
+        // so a same-tick supersession closes the right sibling (STL-145).
+        seq: prior.seq,
         sys_to: commit,
         closed_by: Provenance::new(txn_id, commit, principal),
     }
@@ -669,10 +700,12 @@ const fn open_version(
 /// The version of `key` live at `at`, resolved across the **delta tier, the
 /// sealed segments, and the validity index** ([`crate::merge::resolve_open`]).
 ///
-/// `at` is the freshly-allocated commit timestamp, strictly greater than every
-/// `sys_from` already on the key's chain, so the open version (if one exists) is
-/// always the one returned — scanning at [`SYSTEM_TIME_OPEN`] would instead
-/// exclude it, since the resolver's `sys_to > at` test fails at that exact point.
+/// `at` is the freshly-allocated commit timestamp, `≥` every `sys_from` already
+/// on the key's chain (it may now *equal* the newest one at a shared tick, since
+/// the writer no longer force-bumps, STL-145). The resolver scans up to
+/// `(at, u64::MAX)`, so the open version with the greatest `(sys_from, seq)` is
+/// the one returned — scanning at [`SYSTEM_TIME_OPEN`] would instead exclude it,
+/// since the resolver's `sys_to > at` test fails at that exact point.
 fn resolve_live<D: Disk, I: Disk, S: SealedLookup>(
     delta: &Delta<D>,
     sealed: &S,
@@ -716,22 +749,51 @@ mod tests {
     }
 
     #[test]
-    fn commit_timestamps_strictly_increase_despite_a_stalled_clock() {
+    fn a_stalled_clock_repeats_the_tick_instead_of_bumping_it() {
+        // The force-bump is gone (STL-145): a stalled clock yields the *same* µs,
+        // not `previous + 1`. Same-tick commits are ordered by `seq`, not by a
+        // manufactured timestamp, so the writer hands back exactly what the clock
+        // reads on each call.
         let clock = StubClock::new(100);
         let mut writer = SysTimeWriter::new(clock);
 
         let a = writer.next_commit_ts().unwrap();
-        let b = writer.next_commit_ts().unwrap();
-        writer.clock.set(50);
-        let c = writer.next_commit_ts().unwrap();
+        let b = writer.next_commit_ts().unwrap(); // clock still at 100
         writer.clock.set(10_000);
-        let d = writer.next_commit_ts().unwrap();
+        let c = writer.next_commit_ts().unwrap();
 
         assert_eq!(a, SystemTimeMicros(100));
-        assert_eq!(b, SystemTimeMicros(101));
-        assert_eq!(c, SystemTimeMicros(102));
-        assert_eq!(d, SystemTimeMicros(10_000));
-        assert!(a < b && b < c && c < d);
+        assert_eq!(
+            b,
+            SystemTimeMicros(100),
+            "a repeated tick is kept, not bumped"
+        );
+        assert_eq!(c, SystemTimeMicros(10_000));
+        assert_eq!(writer.last_commit(), Some(SystemTimeMicros(10_000)));
+    }
+
+    #[test]
+    fn a_regressing_clock_is_refused() {
+        // A clock that moves *backwards* below the high-water mark would let a new
+        // version sort before an existing one; the non-regression guard rejects
+        // it rather than mutating the timestamp. `last_commit` is untouched on
+        // error, so a retry at a non-regressing reading behaves identically.
+        let clock = StubClock::new(100);
+        let mut writer = SysTimeWriter::new(clock);
+        assert_eq!(writer.next_commit_ts().unwrap(), SystemTimeMicros(100));
+        writer.clock.set(99);
+        assert!(matches!(
+            writer.next_commit_ts(),
+            Err(SysTimeError::ClockRegressed)
+        ));
+        assert_eq!(
+            writer.last_commit(),
+            Some(SystemTimeMicros(100)),
+            "the high-water mark is left intact on a rejected regression",
+        );
+        // Recovering to the mark (a repeated tick) is allowed again.
+        writer.clock.set(100);
+        assert_eq!(writer.next_commit_ts().unwrap(), SystemTimeMicros(100));
     }
 
     #[test]
@@ -746,13 +808,23 @@ mod tests {
     }
 
     #[test]
-    fn commit_one_below_the_sentinel_is_allowed_but_the_next_is_refused() {
+    fn commit_one_below_the_sentinel_is_allowed_then_the_sentinel_is_refused() {
+        // A real reading one µs below the sentinel is a legal `sys_from`. Without
+        // the force-bump a repeated reading there is *still* allowed (same tick,
+        // ordered by seq) — only a clock that actually advances to the sentinel is
+        // refused, since a `sys_from` at `+∞` would masquerade as an open period.
         let clock = StubClock::new(SYSTEM_TIME_OPEN.0 - 1);
         let mut writer = SysTimeWriter::new(clock);
         assert_eq!(
             writer.next_commit_ts().unwrap(),
             SystemTimeMicros(SYSTEM_TIME_OPEN.0 - 1)
         );
+        assert_eq!(
+            writer.next_commit_ts().unwrap(),
+            SystemTimeMicros(SYSTEM_TIME_OPEN.0 - 1),
+            "a repeated sub-sentinel tick is kept, not bumped into the sentinel",
+        );
+        writer.clock.set(SYSTEM_TIME_OPEN.0);
         assert!(matches!(
             writer.next_commit_ts(),
             Err(SysTimeError::TimeExhausted)

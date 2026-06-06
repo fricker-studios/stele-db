@@ -208,6 +208,11 @@ pub fn run_storage_seed(seed: u64) -> u64 {
 fn fold_version(mut digest: u64, v: &Version) -> u64 {
     digest = fnv1a(digest, v.business_key.as_bytes());
     digest = fnv1a(digest, &v.sys_from.0.to_le_bytes());
+    // `seq` is part of a version's identity — the per-commit total-order tiebreak
+    // ([ADR-0024], STL-145). Fold it next to `sys_from`, the timestamp it
+    // disambiguates, so the determinism oracle catches a dropped or transposed
+    // seq the same way it would a wrong `sys_from`.
+    digest = fnv1a(digest, &v.seq.to_le_bytes());
     digest = fnv1a(digest, &v.sys_to.0.to_le_bytes());
     digest = fnv1a(digest, &v.provenance.txn_id.0.to_le_bytes());
     digest = fnv1a(digest, &v.provenance.committed_at.0.to_le_bytes());
@@ -287,6 +292,7 @@ pub fn run_validtime_seed(seed: u64) -> u64 {
         let valid = valid.expect("valid-time table carries an interval");
         digest = fnv1a(digest, v.business_key.as_bytes());
         digest = fnv1a(digest, &v.sys_from.0.to_le_bytes());
+        digest = fnv1a(digest, &v.seq.to_le_bytes());
         digest = fnv1a(digest, &v.sys_to.0.to_le_bytes());
         digest = fnv1a(digest, &v.provenance.txn_id.0.to_le_bytes());
         digest = fnv1a(digest, &v.provenance.committed_at.0.to_le_bytes());
@@ -549,9 +555,10 @@ pub fn run_recovery_index_seed(seed: u64) -> u64 {
 
     // Digest the (identical) rebuilt index for the determinism sweep.
     let mut digest = FNV_OFFSET;
-    for ((key, sys_from), interval) in &after {
+    for ((key, sys_from, seq), interval) in &after {
         digest = fnv1a(digest, key.as_bytes());
         digest = fnv1a(digest, &sys_from.0.to_le_bytes());
+        digest = fnv1a(digest, &seq.to_le_bytes());
         digest = fnv1a(digest, &interval.sys_to.0.to_le_bytes());
         digest = fold_closed_by(digest, Some(&interval.closed_by));
     }
@@ -581,6 +588,7 @@ fn stage_committed_write(
             .insert_close(Close {
                 business_key: key.clone(),
                 sys_from: open.sys_from,
+                seq: open.seq,
                 sys_to: commit,
                 closed_by: Provenance::new(txn_id, commit, Principal::new(b"sim".to_vec())),
             })

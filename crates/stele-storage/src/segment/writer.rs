@@ -329,6 +329,9 @@ fn encode_retraction_column(
             encode_bytes_values(closes.iter().map(|c| c.closed_by.principal.as_bytes()))
         }
         ColumnId::RetractSysFrom => Ok(encode_i64_values(closes.iter().map(|c| c.sys_from.0))),
+        // `seq` is a u64; store its bits in the i64 column (lossless round-trip —
+        // see `ColumnId::RetractSeq`, same reinterpretation as `TxnId`).
+        ColumnId::RetractSeq => Ok(encode_i64_values(closes.iter().map(|c| c.seq as i64))),
         ColumnId::RetractClosedAt => Ok(encode_i64_values(closes.iter().map(|c| c.sys_to.0))),
         ColumnId::RetractClosedByTxn => Ok(encode_i64_values(
             closes.iter().map(|c| c.closed_by.txn_id.0 as i64),
@@ -470,6 +473,7 @@ fn extract_bytes(col: ColumnId, row: &Version, valid_time: bool) -> Result<&[u8]
         }
         ColumnId::RetractKey
         | ColumnId::RetractSysFrom
+        | ColumnId::RetractSeq
         | ColumnId::RetractClosedAt
         | ColumnId::RetractClosedByTxn
         | ColumnId::RetractClosedByCommittedAt
@@ -503,6 +507,7 @@ fn extract_i64(col: ColumnId, row: &Version) -> i64 {
         }
         ColumnId::RetractKey
         | ColumnId::RetractSysFrom
+        | ColumnId::RetractSeq
         | ColumnId::RetractClosedAt
         | ColumnId::RetractClosedByTxn
         | ColumnId::RetractClosedByCommittedAt

@@ -212,21 +212,26 @@ impl<F: DiskFile> SegmentReader<F> {
     }
 
     /// Project the segment's version identities — each row's
-    /// `(business_key, sys_from)` pair — in row order.
+    /// `(business_key, sys_from, seq)` triple — in row order.
     ///
     /// The minimal read the validity-index segment prune needs: it touches only
-    /// the two narrow key columns ([`ColumnId::BusinessKey`] and
-    /// [`ColumnId::SysFrom`]), not the payload or provenance columns. A planner
-    /// feeds these to [`ValidityIndex::sys_upper_bound`](crate::validity::ValidityIndex::sys_upper_bound)
+    /// the three narrow key columns ([`ColumnId::BusinessKey`],
+    /// [`ColumnId::SysFrom`], and [`ColumnId::Seq`]), not the payload or provenance
+    /// columns. A planner feeds these to
+    /// [`ValidityIndex::sys_upper_bound`](crate::validity::ValidityIndex::sys_upper_bound)
     /// to derive the segment's system-time upper bound and skip the segment's
     /// bulk columns entirely when every row is already superseded at the read
-    /// snapshot ([STL-139]).
-    pub fn version_keys(&self) -> Result<Vec<(BusinessKey, SystemTimeMicros)>, SegmentError> {
+    /// snapshot ([STL-139]). The `seq` completes each version's `(sys_from, seq)`
+    /// identity so the bound probes the right index entry when two versions share
+    /// a `sys_from` ([ADR-0024], STL-145).
+    #[allow(clippy::cast_sign_loss)] // `seq` round-trips i64-bits → u64 (see `ColumnId::Seq`).
+    pub fn version_keys(&self) -> Result<Vec<(BusinessKey, SystemTimeMicros, u64)>, SegmentError> {
         let mut business_keys = self.read_bytes_column(ColumnId::BusinessKey)?;
         let sys_from = self.read_i64_column(ColumnId::SysFrom)?;
-        if business_keys.len() != sys_from.len() {
+        let seqs = self.read_i64_column(ColumnId::Seq)?;
+        if business_keys.len() != sys_from.len() || business_keys.len() != seqs.len() {
             return Err(SegmentError::Corrupt(
-                "business_key / sys_from value counts disagree within row-group",
+                "business_key / sys_from / seq value counts disagree within row-group",
             ));
         }
         // `mem::take` the owned key bytes out — the column vector is discarded at
@@ -234,7 +239,14 @@ impl<F: DiskFile> SegmentReader<F> {
         Ok(business_keys
             .iter_mut()
             .zip(sys_from)
-            .map(|(bk, sf)| (BusinessKey::new(std::mem::take(bk)), SystemTimeMicros(sf)))
+            .zip(seqs)
+            .map(|((bk, sf), seq)| {
+                (
+                    BusinessKey::new(std::mem::take(bk)),
+                    SystemTimeMicros(sf),
+                    seq as u64,
+                )
+            })
             .collect())
     }
 
@@ -351,6 +363,7 @@ impl<F: DiskFile> SegmentReader<F> {
         let mut keys = self.read_retraction_bytes(ColumnId::RetractKey)?;
         let mut principals = self.read_retraction_bytes(ColumnId::RetractClosedByPrincipal)?;
         let sys_from = self.read_retraction_i64(ColumnId::RetractSysFrom)?;
+        let seqs = self.read_retraction_i64(ColumnId::RetractSeq)?;
         let closed_at = self.read_retraction_i64(ColumnId::RetractClosedAt)?;
         let closed_txn = self.read_retraction_i64(ColumnId::RetractClosedByTxn)?;
         let closed_committed = self.read_retraction_i64(ColumnId::RetractClosedByCommittedAt)?;
@@ -359,6 +372,7 @@ impl<F: DiskFile> SegmentReader<F> {
         if ![
             principals.len(),
             sys_from.len(),
+            seqs.len(),
             closed_at.len(),
             closed_txn.len(),
             closed_committed.len(),
@@ -375,6 +389,9 @@ impl<F: DiskFile> SegmentReader<F> {
             out.push(Close {
                 business_key: BusinessKey::new(std::mem::take(&mut keys[i])),
                 sys_from: SystemTimeMicros(sys_from[i]),
+                // `seq` round-trips i64-bits → u64, the reverse of the writer's
+                // `as i64` reinterpretation (see `ColumnId::RetractSeq`).
+                seq: seqs[i] as u64,
                 sys_to: SystemTimeMicros(closed_at[i]),
                 closed_by: Provenance {
                     txn_id: TxnId(closed_txn[i] as u64),

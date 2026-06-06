@@ -177,7 +177,7 @@ fn drain_chains(
 ) -> BTreeMap<BusinessKey, Vec<Version>> {
     let mut map: BTreeMap<BusinessKey, Vec<Version>> = BTreeMap::new();
     for mut v in delta.flush_to_segment().unwrap() {
-        if let Some(ci) = index.close_of(&v.business_key, v.sys_from).unwrap() {
+        if let Some(ci) = index.close_of(&v.business_key, v.sys_from, v.seq).unwrap() {
             v.sys_to = ci.sys_to;
             v.closed_by = Some(ci.closed_by);
         }

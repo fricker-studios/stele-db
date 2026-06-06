@@ -194,7 +194,7 @@ fn four_statement_identity_demo_resolves_the_pre_update_value_via_the_index() {
     );
     assert_eq!(
         index
-            .close_of(&key, c0)
+            .close_of(&key, c0, 0)
             .expect("lookup")
             .expect("c0 closed")
             .sys_to,
@@ -286,7 +286,7 @@ fn kill_mid_write_then_recover_serves_the_correct_as_of() {
     // The close was reconstructed into the index, not onto any record.
     assert_eq!(
         recovered_index
-            .close_of(&key, c0)
+            .close_of(&key, c0, 0)
             .expect("lookup")
             .expect("closed")
             .sys_to,

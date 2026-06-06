@@ -122,9 +122,11 @@ pub struct Delta<D: Disk> {
     /// into a sealed segment. Kept in ascending order.
     live_spills: Vec<u64>,
     /// Retraction tombstones (logical deletes) staged since the last flush,
-    /// keyed `(business_key, sys_from)` by the version they close. Drained into
-    /// the sealed segment at flush ([`Self::take_retractions`]) so the deletion
-    /// gap survives a from-scratch validity-index rebuild ([ADR-0023], STL-143).
+    /// keyed `(business_key, sys_from, seq)` by the version they close. Drained
+    /// into the sealed segment at flush ([`Self::take_retractions`]) so the
+    /// deletion gap survives a from-scratch validity-index rebuild ([ADR-0023],
+    /// STL-143). The `seq` is part of the key so a delete of one same-tick version
+    /// does not displace a tombstone for its sibling (STL-145).
     ///
     /// **v0.1 keeps these resident** — they are tiny and rare relative to
     /// versions, so they never spill to disk. Like the version tier the delta
@@ -132,7 +134,7 @@ pub struct Delta<D: Disk> {
     /// replay re-stages each retraction through [`Self::stage_retraction`]
     /// (idempotent on `(business_key, sys_from)`). Retraction spill is a noted
     /// follow-up once delete-heavy workloads make resident size a concern.
-    retractions: BTreeMap<(BusinessKey, SystemTimeMicros), Close>,
+    retractions: BTreeMap<(BusinessKey, SystemTimeMicros, u64), Close>,
 }
 
 impl<D: Disk> Delta<D> {
@@ -251,20 +253,20 @@ impl<D: Disk> Delta<D> {
     ///
     /// Surfaces I/O or corruption errors loading spill files.
     pub fn flush_to_segment(&mut self) -> Result<Vec<Version>, DeltaError> {
-        let mut merged: BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Version>> =
+        let mut merged: BTreeMap<BusinessKey, BTreeMap<(SystemTimeMicros, u64), Version>> =
             BTreeMap::new();
         for v in self.mem.drain_sorted() {
             merged
                 .entry(v.business_key.clone())
                 .or_default()
-                .insert(v.sys_from, v);
+                .insert((v.sys_from, v.seq), v);
         }
         for &idx in &self.live_spills {
             for v in spill::read_spill(&self.disk, idx)? {
                 merged
                     .entry(v.business_key.clone())
                     .or_default()
-                    .insert(v.sys_from, v);
+                    .insert((v.sys_from, v.seq), v);
             }
         }
         // Remove spills only after a successful merge — if a read failed
@@ -282,7 +284,7 @@ impl<D: Disk> Delta<D> {
     /// Stage a retraction tombstone (a logical delete — a [`Close`] with no
     /// successor version) for persistence at the next flush.
     ///
-    /// Idempotent on `(business_key, sys_from)`: re-staging the identical
+    /// Idempotent on `(business_key, sys_from, seq)`: re-staging the identical
     /// retraction (the property WAL replay relies on) overwrites the entry with
     /// an equal one. A retraction targeting the same version with a *different*
     /// close is not expected — the validity index is the write-once authority and
@@ -292,12 +294,14 @@ impl<D: Disk> Delta<D> {
     /// Unlike [`Self::insert`], staging a retraction never spills: v0.1 keeps the
     /// tombstone buffer resident (tiny and rare relative to versions).
     pub fn stage_retraction(&mut self, close: Close) {
-        self.retractions
-            .insert((close.business_key.clone(), close.sys_from), close);
+        self.retractions.insert(
+            (close.business_key.clone(), close.sys_from, close.seq),
+            close,
+        );
     }
 
-    /// Drain every staged retraction in `(business_key, sys_from)` order and clear
-    /// the buffer — the tombstone half of a flush, paired with
+    /// Drain every staged retraction in `(business_key, sys_from, seq)` order and
+    /// clear the buffer — the tombstone half of a flush, paired with
     /// [`Self::flush_to_segment`]. The caller pushes these into the same sealed
     /// segment as the drained versions ([`crate::segment::SegmentWriter::push_retraction`]),
     /// making the segment store self-contained for a from-scratch rebuild

@@ -160,6 +160,7 @@ fn retraction(key: &[u8], target: i64, closed_at: i64, txn: u64) -> Close {
     Close {
         business_key: BusinessKey::new(key.to_vec()),
         sys_from: SystemTimeMicros(target),
+        seq: 0,
         sys_to: SystemTimeMicros(closed_at),
         closed_by: Provenance::new(
             TxnId(txn),
