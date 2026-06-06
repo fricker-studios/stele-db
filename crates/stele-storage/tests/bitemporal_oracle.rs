@@ -123,7 +123,7 @@ fn gen_valid(rng: &mut Rng, vmax: i64) -> ValidInterval {
 
 /// One asserted version in the bitemporal reference: a half-open system-time
 /// period `[sys_from, sys_to)` carrying a half-open valid-time interval
-/// `[valid_from, valid_to)` and a value. `sys_to == `[`SYSTEM_TIME_OPEN`] is the
+/// `[valid_from, valid_to)` and a value. `sys_to == SYSTEM_TIME_OPEN` is the
 /// currently-live period; per [ADR-0023] the end is *not* asserted independently —
 /// it is materialized as the next assertion's `sys_from`.
 #[derive(Clone, Debug)]
@@ -403,26 +403,30 @@ fn bitemporal_as_of_is_differential_equal_across_both_axes_and_recovery() {
 
 // --- 2. focused, documented sys_to-mutation catch --------------------------
 
-/// The canonical [ADR-0023] failure, hand-built so the corrupted boundary is
-/// unmistakable: `INSERT "A" valid [0,100) @ sys=1000` then `UPDATE "B" @ sys=2000`.
-/// The truth at the supersession boundary `(2000, 50)` is `"B"`. Shifting the
-/// prior period's close one tick late lets `"A"` linger to `[1000, 2001)`; a
-/// stale-close read then returns `"A"`, diverging from the engine's `"B"` — the
-/// equality the differential asserts catches it.
+/// The canonical [ADR-0023] failure, made unmistakable: `INSERT "A"` then
+/// `UPDATE "B"` (both valid `[0,100)`) in a real engine, with the reference model
+/// pinned to the *engine's own* commit times `c0 < c1`. At the supersession
+/// boundary `(c1, 50)` the truth is `"B"`. Shifting the prior period's close one
+/// tick late lets `"A"` linger to `[c0, c1 + 1)`; a stale-close read then returns
+/// `"A"`, diverging from the engine's `"B"` — exactly the equality the differential
+/// asserts.
 #[test]
 fn a_deliberate_sys_to_mutation_is_caught_by_the_oracle() {
+    // The engine answers the history; `c0`/`c1` are its actual commit times, so the
+    // reference and the probes ride the same timeline as the engine.
+    let (c0, c1, truth) = two_version_engine();
     let model = vec![
         Tuple {
             key: 0,
-            sys_from: 1_000,
-            sys_to: 2_000,
+            sys_from: c0,
+            sys_to: c1,
             valid_from: 0,
             valid_to: 100,
             value: b"A".to_vec(),
         },
         Tuple {
             key: 0,
-            sys_from: 2_000,
+            sys_from: c1,
             sys_to: SYSTEM_TIME_OPEN.0,
             valid_from: 0,
             valid_to: 100,
@@ -430,38 +434,36 @@ fn a_deliberate_sys_to_mutation_is_caught_by_the_oracle() {
         },
     ];
 
-    // The engine answers the same hand history; its read is the ground truth.
-    let truth = two_version_engine_truth();
     assert_eq!(
         truth,
         Some(b"B".to_vec()),
-        "the engine returns the post-update value"
+        "the engine returns the post-update value at the boundary",
     );
     assert_eq!(
         truth,
-        reference_as_of(&model, 0, 2_000, 50),
-        "the aligned reference agrees with the engine",
+        reference_as_of(&model, 0, c1, 50),
+        "the aligned reference agrees with the engine at the boundary",
     );
 
     // Now corrupt the close: sys_to materialized one tick past the successor.
     let mutated = mutate_first_close(&model, 1).expect("a closed period exists");
     assert_eq!(
-        buggy_as_of(&mutated, 0, 2_000, 50),
+        buggy_as_of(&mutated, 0, c1, 50),
         Some(b"A".to_vec()),
         "a stale close resurrects the prior value at the boundary",
     );
     assert_ne!(
         truth,
-        buggy_as_of(&mutated, 0, 2_000, 50),
+        buggy_as_of(&mutated, 0, c1, 50),
         "the oracle catches a sys_to materialized later than the successor's sys_from",
     );
 }
 
-/// Replays the focused `INSERT "A"` / `UPDATE "B"` history (valid `[0,100)`) into a
-/// real engine and reads `AS OF (sys=2000, valid=50)` — well after both commits, so
-/// the live version is the update. The engine's ground truth for the mutation test
-/// above.
-fn two_version_engine_truth() -> Option<Vec<u8>> {
+/// Replay the focused `INSERT "A"` / `UPDATE "B"` history (valid `[0,100)`) into a
+/// real engine and return `(insert_commit, update_commit, value AS OF (update_commit,
+/// valid=50))` — the engine's ground truth at the supersession boundary, on its own
+/// timeline so the focused test never hard-codes a clock position.
+fn two_version_engine() -> (i64, i64, Option<Vec<u8>>) {
     let wal = Wal::open(MemDisk::new(), WalConfig::default()).expect("wal");
     let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
     let mut index = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("idx");
@@ -470,30 +472,36 @@ fn two_version_engine_truth() -> Option<Vec<u8>> {
     let key = BusinessKey::new(vec![b'k', 0]);
     let valid = ValidInterval::new(ValidTimeMicros(0), ValidTimeMicros(100)).expect("interval");
 
-    dml.insert(
-        &mut delta,
-        &mut index,
-        key.clone(),
-        Some(valid),
-        b"A".to_vec(),
-        TxnId(1),
-        who(),
-    )
-    .expect("insert");
-    dml.update(
-        &mut delta,
-        &mut index,
-        key,
-        Some(valid),
-        b"B".to_vec(),
-        TxnId(2),
-        who(),
-    )
-    .expect("update");
+    let c0 = dml
+        .insert(
+            &mut delta,
+            &mut index,
+            key.clone(),
+            Some(valid),
+            b"A".to_vec(),
+            TxnId(1),
+            who(),
+        )
+        .expect("insert")
+        .commit
+        .0;
+    let c1 = dml
+        .update(
+            &mut delta,
+            &mut index,
+            key,
+            Some(valid),
+            b"B".to_vec(),
+            TxnId(2),
+            who(),
+        )
+        .expect("update")
+        .commit
+        .0;
 
-    // Read well past both commits: the system-live version is the update.
-    let live = engine_live(&delta, &index, 2_000);
-    engine_point(live.get(&0), 50)
+    // Read at the supersession boundary: the update is live from `c1` onward.
+    let live = engine_live(&delta, &index, c1);
+    (c0, c1, engine_point(live.get(&0), 50))
 }
 
 // --- 3. metamorphic invariance ---------------------------------------------
