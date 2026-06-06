@@ -50,6 +50,7 @@ use stele_common::time::{
 use stele_storage::backend::MemDisk;
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot};
 use stele_storage::dml::{self, DmlWriter};
+use stele_storage::systime::EmptySealed;
 use stele_storage::validity::{ValidityConfig, ValidityIndex};
 use stele_storage::validtime::{ValidInterval, unframe_payload};
 use stele_storage::wal::{Checkpoint, Wal, WalConfig};
@@ -262,7 +263,7 @@ fn run_seed(seed: u64) -> Scenario {
         if live[k as usize] {
             if rng.range(2) == 0 {
                 let c = dml
-                    .delete(&mut delta, &mut index, &key, txn, who())
+                    .delete(&mut delta, &mut index, &EmptySealed, &key, txn, who())
                     .expect("delete")
                     .commit;
                 close_open(&mut model, k, c.0);
@@ -274,6 +275,7 @@ fn run_seed(seed: u64) -> Scenario {
                     .update(
                         &mut delta,
                         &mut index,
+                        &EmptySealed,
                         key,
                         Some(interval),
                         value.clone(),
@@ -299,6 +301,7 @@ fn run_seed(seed: u64) -> Scenario {
                 .insert(
                     &mut delta,
                     &mut index,
+                    &EmptySealed,
                     key,
                     Some(interval),
                     value.clone(),
@@ -476,6 +479,7 @@ fn two_version_engine() -> (i64, i64, Option<Vec<u8>>) {
         .insert(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key.clone(),
             Some(valid),
             b"A".to_vec(),
@@ -489,6 +493,7 @@ fn two_version_engine() -> (i64, i64, Option<Vec<u8>>) {
         .update(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key,
             Some(valid),
             b"B".to_vec(),

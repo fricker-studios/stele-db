@@ -35,6 +35,7 @@ use stele_storage::backend::MemDisk;
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
 use stele_storage::dml::{self, DmlWriter};
 use stele_storage::merge;
+use stele_storage::systime::EmptySealed;
 use stele_storage::validity::{ValidityConfig, ValidityIndex};
 use stele_storage::validtime::{ValidInterval, unframe_payload};
 use stele_storage::wal::{Checkpoint, Wal, WalConfig};
@@ -123,6 +124,7 @@ fn insert_update_delete_flow_through_wal_then_delta() {
         .insert(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key.clone(),
             None,
             b"v0".to_vec(),
@@ -135,6 +137,7 @@ fn insert_update_delete_flow_through_wal_then_delta() {
         .update(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key.clone(),
             None,
             b"v1".to_vec(),
@@ -147,6 +150,7 @@ fn insert_update_delete_flow_through_wal_then_delta() {
         .delete(
             &mut delta,
             &mut index,
+            &EmptySealed,
             &key,
             TxnId(3),
             Principal::new(b"deleter".to_vec()),
@@ -197,6 +201,7 @@ fn insert_on_a_live_key_is_rejected_through_the_dml_path() {
     dml.insert(
         &mut delta,
         &mut index,
+        &EmptySealed,
         key.clone(),
         None,
         b"a".to_vec(),
@@ -208,6 +213,7 @@ fn insert_on_a_live_key_is_rejected_through_the_dml_path() {
         .insert(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key,
             None,
             b"b".to_vec(),
@@ -244,8 +250,15 @@ fn wal_replay_reconstructs_the_delta_under_seed_sweep() {
             let txn = TxnId(op);
             if live[k] {
                 if rng.range(2) == 0 {
-                    dml.delete(&mut live_delta, &mut live_index, &key, txn, who())
-                        .expect("delete");
+                    dml.delete(
+                        &mut live_delta,
+                        &mut live_index,
+                        &EmptySealed,
+                        &key,
+                        txn,
+                        who(),
+                    )
+                    .expect("delete");
                     live[k] = false;
                 } else {
                     let from = (rng.range(1_000_000)) as i64;
@@ -256,6 +269,7 @@ fn wal_replay_reconstructs_the_delta_under_seed_sweep() {
                     dml.update(
                         &mut live_delta,
                         &mut live_index,
+                        &EmptySealed,
                         key,
                         Some(iv),
                         b"u".to_vec(),
@@ -272,6 +286,7 @@ fn wal_replay_reconstructs_the_delta_under_seed_sweep() {
                 dml.insert(
                     &mut live_delta,
                     &mut live_index,
+                    &EmptySealed,
                     key,
                     Some(iv),
                     b"i".to_vec(),
@@ -346,7 +361,7 @@ fn timeline_reconstructs_with_no_gaps_or_overlaps_under_seed_sweep() {
                 if rng.range(2) == 0 {
                     // DELETE: close the open period, no successor.
                     let commit = dml
-                        .delete(&mut delta, &mut index, &key, txn, who())
+                        .delete(&mut delta, &mut index, &EmptySealed, &key, txn, who())
                         .expect("delete")
                         .commit;
                     close_open(&mut model[k], commit.0);
@@ -354,7 +369,16 @@ fn timeline_reconstructs_with_no_gaps_or_overlaps_under_seed_sweep() {
                 } else {
                     // UPDATE: close the open period at `commit`, open a new one.
                     let commit = dml
-                        .update(&mut delta, &mut index, key, None, b"u".to_vec(), txn, who())
+                        .update(
+                            &mut delta,
+                            &mut index,
+                            &EmptySealed,
+                            key,
+                            None,
+                            b"u".to_vec(),
+                            txn,
+                            who(),
+                        )
                         .expect("update")
                         .commit;
                     close_open(&mut model[k], commit.0);
@@ -367,7 +391,16 @@ fn timeline_reconstructs_with_no_gaps_or_overlaps_under_seed_sweep() {
             } else {
                 // INSERT: open a fresh period (a gap from any prior delete).
                 let commit = dml
-                    .insert(&mut delta, &mut index, key, None, b"i".to_vec(), txn, who())
+                    .insert(
+                        &mut delta,
+                        &mut index,
+                        &EmptySealed,
+                        key,
+                        None,
+                        b"i".to_vec(),
+                        txn,
+                        who(),
+                    )
                     .expect("insert")
                     .commit;
                 model[k].push(Period {

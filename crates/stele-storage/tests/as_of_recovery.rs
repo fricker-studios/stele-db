@@ -42,7 +42,7 @@ use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
 use stele_storage::dml::{self, DmlWriter};
 use stele_storage::merge;
 use stele_storage::segment::{SegmentReader, SegmentWriter};
-use stele_storage::systime::{SealedVersions, SysTimeWriter};
+use stele_storage::systime::{EmptySealed, SealedVersions, SysTimeWriter};
 use stele_storage::validity::{ValidityConfig, ValidityIndex};
 use stele_storage::wal::{Checkpoint, Wal, WalConfig};
 
@@ -221,6 +221,7 @@ fn kill_mid_write_then_recover_serves_the_correct_as_of() {
         .insert(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key.clone(),
             None,
             b"100".to_vec(),
@@ -233,6 +234,7 @@ fn kill_mid_write_then_recover_serves_the_correct_as_of() {
         .update(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key.clone(),
             None,
             b"250".to_vec(),
@@ -375,7 +377,7 @@ fn recovery_rebuilds_the_index_and_serves_correct_as_of_under_seed_sweep() {
             if live[k] {
                 if rng.range(2) == 0 {
                     let c = dml
-                        .delete(&mut delta, &mut index, &key, txn, who())
+                        .delete(&mut delta, &mut index, &EmptySealed, &key, txn, who())
                         .expect("delete")
                         .commit;
                     close_open(&mut model[k], c.0);
@@ -386,6 +388,7 @@ fn recovery_rebuilds_the_index_and_serves_correct_as_of_under_seed_sweep() {
                         .update(
                             &mut delta,
                             &mut index,
+                            &EmptySealed,
                             key,
                             None,
                             payload.clone(),
@@ -407,6 +410,7 @@ fn recovery_rebuilds_the_index_and_serves_correct_as_of_under_seed_sweep() {
                     .insert(
                         &mut delta,
                         &mut index,
+                        &EmptySealed,
                         key,
                         None,
                         payload.clone(),

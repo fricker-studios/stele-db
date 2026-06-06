@@ -55,7 +55,7 @@ use stele_common::provenance::{Principal, TxnId};
 use stele_common::time::{Clock, SystemTimeMicros};
 
 use crate::delta::{BusinessKey, Delta, DeltaError, Version};
-use crate::systime::{Redo, SysTimeError};
+use crate::systime::{Redo, SealedLookup, SysTimeError};
 use crate::validity::{Close, ValidityError, ValidityIndex};
 use crate::validtime::{ValidInterval, ValidTimeError, ValidTimeWriter};
 use crate::wal::{Checkpoint, Disk, LogOffset, Wal, WalError};
@@ -143,16 +143,24 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
 
     /// `INSERT`: open a fresh `[commit, +∞)` period for `key`.
     ///
+    /// `sealed` is the table's sealed-segment lookup (typically a
+    /// [`SealedSegments`](crate::systime::SealedSegments) built from the segment
+    /// set, or [`EmptySealed`](crate::systime::EmptySealed) when there are none),
+    /// passed per call so it always reflects the segments live at this commit —
+    /// the duplicate-key check spans it, so a key whose live version sits only in
+    /// a sealed segment is correctly rejected ([STL-140]).
+    ///
     /// # Errors
     ///
     /// [`DmlError::Resolve`] if `key` already has a live version or the
     /// valid-time policy is violated; [`DmlError::Wal`] / [`DmlError::Delta`] on
     /// a log or staging failure.
-    #[allow(clippy::too_many_arguments)] // tier handles + key/valid/payload + provenance triple
-    pub fn insert<I: Disk>(
+    #[allow(clippy::too_many_arguments)] // tier handles + sealed + key/valid/payload + provenance triple
+    pub fn insert<I: Disk, S: SealedLookup>(
         &mut self,
         delta: &mut Delta<D>,
         index: &mut ValidityIndex<I>,
+        sealed: &S,
         key: BusinessKey,
         valid: Option<ValidInterval>,
         payload: Vec<u8>,
@@ -161,23 +169,30 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     ) -> Result<DmlOutcome, DmlError> {
         let (commit, redos) = self
             .writer
-            .stage_insert(delta, index, key, valid, payload, txn_id, principal)?;
+            .stage_insert(delta, index, sealed, key, valid, payload, txn_id, principal)?;
         self.log_and_apply(delta, index, commit, redos)
     }
 
     /// `UPDATE`: close `key`'s prior period at `commit` and open a new
     /// `[commit, +∞)` one. Never overwrites — both rows are appended.
     ///
+    /// The prior period is resolved across the delta tier, the `sealed` segments,
+    /// and the validity index, so an `UPDATE` closes a live version that lives
+    /// only in a sealed segment — materializing the close in the index while the
+    /// new open version stages in the delta ([STL-140]). See [`Self::insert`] for
+    /// `sealed`.
+    ///
     /// # Errors
     ///
     /// [`DmlError::Resolve`] if `key` has no live version or the valid-time
     /// policy is violated; [`DmlError::Wal`] / [`DmlError::Delta`] on a log or
     /// staging failure.
-    #[allow(clippy::too_many_arguments)] // tier handles + key/valid/payload + provenance triple
-    pub fn update<I: Disk>(
+    #[allow(clippy::too_many_arguments)] // tier handles + sealed + key/valid/payload + provenance triple
+    pub fn update<I: Disk, S: SealedLookup>(
         &mut self,
         delta: &mut Delta<D>,
         index: &mut ValidityIndex<I>,
+        sealed: &S,
         key: BusinessKey,
         valid: Option<ValidInterval>,
         payload: Vec<u8>,
@@ -186,7 +201,7 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     ) -> Result<DmlOutcome, DmlError> {
         let (commit, redos) = self
             .writer
-            .stage_update(delta, index, key, valid, payload, txn_id, principal)?;
+            .stage_update(delta, index, sealed, key, valid, payload, txn_id, principal)?;
         self.log_and_apply(delta, index, commit, redos)
     }
 
@@ -194,21 +209,26 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     /// tombstone expressed as a period close, carrying the deleting
     /// transaction's provenance ([STL-118]).
     ///
+    /// The prior period is resolved across the delta tier, the `sealed` segments,
+    /// and the validity index, so a `DELETE` retracts a live version that lives
+    /// only in a sealed segment ([STL-140]). See [`Self::insert`] for `sealed`.
+    ///
     /// # Errors
     ///
     /// [`DmlError::Resolve`] if `key` has no live version; [`DmlError::Wal`] /
     /// [`DmlError::Delta`] on a log or staging failure.
-    pub fn delete<I: Disk>(
+    pub fn delete<I: Disk, S: SealedLookup>(
         &mut self,
         delta: &mut Delta<D>,
         index: &mut ValidityIndex<I>,
+        sealed: &S,
         key: &BusinessKey,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<DmlOutcome, DmlError> {
         let (commit, redos) = self
             .writer
-            .stage_delete(delta, index, key, txn_id, principal)?;
+            .stage_delete(delta, index, sealed, key, txn_id, principal)?;
         self.log_and_apply(delta, index, commit, redos)
     }
 

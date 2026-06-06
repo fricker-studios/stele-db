@@ -67,7 +67,7 @@ use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
 
 use crate::backend::Disk;
 use crate::delta::{BusinessKey, Delta};
-use crate::systime::{EmptySealed, Redo, SysTimeError, SysTimeWriter};
+use crate::systime::{Redo, SealedLookup, SysTimeError, SysTimeWriter};
 use crate::validity::ValidityIndex;
 
 /// Length of the little-endian valid-time prefix stamped on a stored payload:
@@ -252,13 +252,15 @@ pub fn reframe_payload(valid_from: i64, valid_to: i64, user: &[u8]) -> Vec<u8> {
 /// crate stays free of a catalog dependency by taking the resolved policy as a
 /// `bool`.
 ///
-/// This wrapper forwards an [`EmptySealed`] lookup to the bare [`SysTimeWriter`],
-/// so a supersession resolves the prior live version against the delta tier and
-/// the validity index only. Threading a real
-/// [`SealedLookup`](crate::systime::SealedLookup) through the valid-time path —
-/// so a sealed live version can be closed too — is a follow-up once the DML
-/// layer owns the segment set. (A close is always a write-once append to the
-/// validity index regardless of tier, [ADR-0023].)
+/// Each write threads a caller-supplied [`SealedLookup`] down to the bare
+/// [`SysTimeWriter`], so a supersession resolves the prior live version across
+/// the delta tier, the sealed segments, **and** the validity index ([STL-140]).
+/// The DML write path ([`crate::dml`]) builds that lookup from the table's
+/// segment set — typically a [`SealedSegments`](crate::systime::SealedSegments)
+/// that zone-map–prunes per key; a table with no sealed segments passes
+/// [`EmptySealed`](crate::systime::EmptySealed). A sealed live version is closed
+/// the same way a delta-resident one is: a write-once append to the validity
+/// index regardless of tier ([ADR-0023]).
 #[derive(Debug)]
 pub struct ValidTimeWriter<C: Clock> {
     inner: SysTimeWriter<C>,
@@ -301,11 +303,12 @@ impl<C: Clock> ValidTimeWriter<C> {
     /// [`ValidTimeError::ValidTimeNotSupported`]) before anything is staged;
     /// otherwise whatever the system-time path returns (e.g.
     /// [`SysTimeError::KeyExists`]).
-    #[allow(clippy::too_many_arguments)] // tier handles + key/valid/payload + provenance triple
-    pub fn insert<D: Disk, I: Disk>(
+    #[allow(clippy::too_many_arguments)] // tier handles + sealed + key/valid/payload + provenance triple
+    pub fn insert<D: Disk, I: Disk, S: SealedLookup>(
         &mut self,
         delta: &mut Delta<D>,
         index: &mut ValidityIndex<I>,
+        sealed: &S,
         key: BusinessKey,
         valid: Option<ValidInterval>,
         payload: Vec<u8>,
@@ -315,7 +318,7 @@ impl<C: Clock> ValidTimeWriter<C> {
         let framed = frame_payload(self.valid_time, valid, payload)?;
         Ok(self
             .inner
-            .insert(delta, index, &EmptySealed, key, framed, txn_id, principal)?)
+            .insert(delta, index, sealed, key, framed, txn_id, principal)?)
     }
 
     /// Supersede the live version of `key`: close the prior system-time period
@@ -329,11 +332,12 @@ impl<C: Clock> ValidTimeWriter<C> {
     /// Policy mismatches as in [`Self::insert`]; otherwise the system-time path's
     /// errors (e.g.
     /// [`SysTimeError::KeyNotFound`]).
-    #[allow(clippy::too_many_arguments)] // tier handles + key/valid/payload + provenance triple
-    pub fn update<D: Disk, I: Disk>(
+    #[allow(clippy::too_many_arguments)] // tier handles + sealed + key/valid/payload + provenance triple
+    pub fn update<D: Disk, I: Disk, S: SealedLookup>(
         &mut self,
         delta: &mut Delta<D>,
         index: &mut ValidityIndex<I>,
+        sealed: &S,
         key: BusinessKey,
         valid: Option<ValidInterval>,
         payload: Vec<u8>,
@@ -343,7 +347,7 @@ impl<C: Clock> ValidTimeWriter<C> {
         let framed = frame_payload(self.valid_time, valid, payload)?;
         Ok(self
             .inner
-            .update(delta, index, &EmptySealed, key, framed, txn_id, principal)?)
+            .update(delta, index, sealed, key, framed, txn_id, principal)?)
     }
 
     /// Close the live version of `key` on the system axis without re-opening — a
@@ -362,17 +366,18 @@ impl<C: Clock> ValidTimeWriter<C> {
     ///
     /// The system-time path's errors (e.g.
     /// [`SysTimeError::KeyNotFound`]).
-    pub fn delete<D: Disk, I: Disk>(
+    pub fn delete<D: Disk, I: Disk, S: SealedLookup>(
         &mut self,
         delta: &mut Delta<D>,
         index: &mut ValidityIndex<I>,
+        sealed: &S,
         key: &BusinessKey,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<SystemTimeMicros, ValidTimeError> {
         Ok(self
             .inner
-            .delete(delta, index, &EmptySealed, key, txn_id, principal)?)
+            .delete(delta, index, sealed, key, txn_id, principal)?)
     }
 
     /// Resolve an insert into the redo set it stages — both temporal axes
@@ -385,11 +390,12 @@ impl<C: Clock> ValidTimeWriter<C> {
     ///
     /// Policy mismatches as in [`Self::insert`]; otherwise the system-time
     /// resolution's errors (e.g. [`SysTimeError::KeyExists`]).
-    #[allow(clippy::too_many_arguments)] // tier handles + key/valid/payload + provenance triple
-    pub fn stage_insert<D: Disk, I: Disk>(
+    #[allow(clippy::too_many_arguments)] // tier handles + sealed + key/valid/payload + provenance triple
+    pub fn stage_insert<D: Disk, I: Disk, S: SealedLookup>(
         &mut self,
         delta: &Delta<D>,
         index: &ValidityIndex<I>,
+        sealed: &S,
         key: BusinessKey,
         valid: Option<ValidInterval>,
         payload: Vec<u8>,
@@ -399,7 +405,7 @@ impl<C: Clock> ValidTimeWriter<C> {
         let framed = frame_payload(self.valid_time, valid, payload)?;
         Ok(self
             .inner
-            .stage_insert(delta, index, key, framed, txn_id, principal)?)
+            .stage_insert(delta, index, sealed, key, framed, txn_id, principal)?)
     }
 
     /// Resolve an update into the redo set it stages — the prior version closed
@@ -410,11 +416,12 @@ impl<C: Clock> ValidTimeWriter<C> {
     ///
     /// Policy mismatches as in [`Self::insert`]; otherwise the system-time
     /// resolution's errors (e.g. [`SysTimeError::KeyNotFound`]).
-    #[allow(clippy::too_many_arguments)] // tier handles + key/valid/payload + provenance triple
-    pub fn stage_update<D: Disk, I: Disk>(
+    #[allow(clippy::too_many_arguments)] // tier handles + sealed + key/valid/payload + provenance triple
+    pub fn stage_update<D: Disk, I: Disk, S: SealedLookup>(
         &mut self,
         delta: &Delta<D>,
         index: &ValidityIndex<I>,
+        sealed: &S,
         key: BusinessKey,
         valid: Option<ValidInterval>,
         payload: Vec<u8>,
@@ -424,7 +431,7 @@ impl<C: Clock> ValidTimeWriter<C> {
         let framed = frame_payload(self.valid_time, valid, payload)?;
         Ok(self
             .inner
-            .stage_update(delta, index, key, framed, txn_id, principal)?)
+            .stage_update(delta, index, sealed, key, framed, txn_id, principal)?)
     }
 
     /// Resolve a delete into the redo set it stages — the prior version closed,
@@ -434,17 +441,18 @@ impl<C: Clock> ValidTimeWriter<C> {
     /// # Errors
     ///
     /// The system-time resolution's errors (e.g. [`SysTimeError::KeyNotFound`]).
-    pub fn stage_delete<D: Disk, I: Disk>(
+    pub fn stage_delete<D: Disk, I: Disk, S: SealedLookup>(
         &mut self,
         delta: &Delta<D>,
         index: &ValidityIndex<I>,
+        sealed: &S,
         key: &BusinessKey,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<(SystemTimeMicros, Vec<Redo>), ValidTimeError> {
         Ok(self
             .inner
-            .stage_delete(delta, index, key, txn_id, principal)?)
+            .stage_delete(delta, index, sealed, key, txn_id, principal)?)
     }
 }
 

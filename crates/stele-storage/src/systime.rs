@@ -72,10 +72,10 @@
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros};
 
-use crate::backend::Disk;
+use crate::backend::{Disk, DiskFile};
 use crate::delta::{BusinessKey, Delta, Snapshot, Version};
 use crate::merge;
-use crate::segment::SegmentError;
+use crate::segment::{ColumnId, Predicate, SegmentError, SegmentReader, ZoneBound};
 use crate::validity::{Close, ValidityError, ValidityIndex};
 
 /// One entry of a resolved redo set — the unit the WAL logs and a forward write
@@ -175,6 +175,79 @@ impl SealedLookup for SealedVersions {
             .filter(|v| &v.business_key == key)
             .cloned()
             .collect())
+    }
+}
+
+/// A [`SealedLookup`] over a borrowed set of open [`SegmentReader`]s, pruned per
+/// key by each segment's resident zone map.
+///
+/// This is the lookup the DML / valid-time write path hands its
+/// [`ValidTimeWriter`](crate::validtime::ValidTimeWriter) so a supersession can
+/// close a live version that lives only in a sealed segment, **before** reading a
+/// single column chunk of a segment the key cannot be in ([STL-140]).
+///
+/// Unlike [`SealedVersions`], which keeps every segment's rows resident and
+/// filters the whole set on each lookup, this consults only the segments a
+/// business-key zone-map prune cannot rule out: a `[min, max]` business-key
+/// range that does not bracket `key` proves the key is absent, so that segment
+/// is skipped without I/O ([`ZoneMap::might_contain`](crate::segment::ZoneMap::might_contain),
+/// [architecture §3.3](../../../docs/02-architecture.md#33-how-b-tree-and-columnstore-coexist)).
+/// A kept segment is materialized with [`SegmentReader::read_versions`] and
+/// filtered to `key`; v0.1 has no per-key secondary index yet, so within a kept
+/// segment the scan is still whole-segment — the per-key index is the follow-up
+/// the [module docs](self) anticipate.
+///
+/// The readers are borrowed, not owned: the caller (the executor / DML write
+/// path) holds the table's segment set and rebuilds the lookup per operation, so
+/// it always reflects the segments live *at that commit* — a flush between two
+/// writes is picked up on the next lookup.
+pub struct SealedSegments<'a, F: DiskFile> {
+    readers: &'a [SegmentReader<F>],
+}
+
+// `SegmentReader` is not `Debug` (it guards a `DiskFile` handle), so derive is
+// out; surface the segment count and elide the readers.
+impl<F: DiskFile> std::fmt::Debug for SealedSegments<'_, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedSegments")
+            .field("segments", &self.readers.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, F: DiskFile> SealedSegments<'a, F> {
+    /// Build a lookup over `readers` — the open segments of one table.
+    #[must_use]
+    pub const fn new(readers: &'a [SegmentReader<F>]) -> Self {
+        Self { readers }
+    }
+}
+
+impl<F: DiskFile> SealedLookup for SealedSegments<'_, F> {
+    fn versions_for(&self, key: &BusinessKey) -> Result<Vec<Version>, SegmentError> {
+        let predicate = Predicate::Eq {
+            column: ColumnId::BusinessKey,
+            value: ZoneBound::Bytes(key.as_bytes().to_vec()),
+        };
+        // Resolve liveness at the open sentinel so the system-time slice never
+        // prunes: the writer probes at a freshly-allocated commit strictly
+        // greater than every persisted `sys_from`, so any segment holding the
+        // key must be kept regardless of how old its rows are. Only the
+        // business-key zone map gets to rule a segment out here.
+        let snapshot = Snapshot(SYSTEM_TIME_OPEN);
+        let mut out = Vec::new();
+        for reader in self.readers {
+            if !reader.might_contain(&predicate, snapshot) {
+                continue;
+            }
+            out.extend(
+                reader
+                    .read_versions()?
+                    .into_iter()
+                    .filter(|v| &v.business_key == key),
+            );
+        }
+        Ok(out)
     }
 }
 
@@ -374,25 +447,30 @@ impl<C: Clock> SysTimeWriter<C> {
     /// ([`crate::dml`]) logs the redo to the WAL first, then applies the same set
     /// — so a forward write and a crash-recovery replay run identical operations.
     ///
-    /// Liveness here is resolved against the **delta tier and the index** only
-    /// (no sealed lookup), matching the delta-resident DML path.
+    /// Liveness here spans the **delta tier, the sealed segments, and the
+    /// index** — a key whose live version has been flushed into a sealed segment
+    /// still has one, so re-opening it is rejected just as for a delta-resident
+    /// version. Pass [`EmptySealed`] when the table has no sealed segments.
     ///
     /// # Errors
     ///
     /// [`SysTimeError::KeyExists`] if `key` already has a live version (the
     /// commit timestamp is still consumed, matching [`Self::insert`]);
-    /// [`SysTimeError::TimeExhausted`] from the allocator.
-    pub fn stage_insert<D: Disk, I: Disk>(
+    /// [`SysTimeError::TimeExhausted`] from the allocator; a [`SealedLookup`]
+    /// read error.
+    #[allow(clippy::too_many_arguments)] // tier handles + sealed + key/payload + provenance triple
+    pub fn stage_insert<D: Disk, I: Disk, S: SealedLookup>(
         &mut self,
         delta: &Delta<D>,
         index: &ValidityIndex<I>,
+        sealed: &S,
         key: BusinessKey,
         payload: Vec<u8>,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<(SystemTimeMicros, Vec<Redo>), SysTimeError> {
         let commit = self.next_commit_ts()?;
-        if current_open(delta, index, &key, commit)?.is_some() {
+        if resolve_live(delta, sealed, index, &key, commit)?.is_some() {
             return Err(SysTimeError::KeyExists);
         }
         Ok((
@@ -407,21 +485,28 @@ impl<C: Clock> SysTimeWriter<C> {
     /// plus the new open version `[commit, +∞)` — without touching the delta tier
     /// or index. See [`Self::stage_insert`].
     ///
+    /// Liveness spans the delta tier, the sealed segments, and the index (see
+    /// [`Self::stage_insert`]); pass [`EmptySealed`] when there are no sealed
+    /// segments.
+    ///
     /// # Errors
     ///
     /// [`SysTimeError::KeyNotFound`] if `key` has no live version;
-    /// [`SysTimeError::TimeExhausted`]; delta/index read errors.
-    pub fn stage_update<D: Disk, I: Disk>(
+    /// [`SysTimeError::TimeExhausted`]; delta/index/segment read errors.
+    #[allow(clippy::too_many_arguments)] // tier handles + sealed + key/payload + provenance triple
+    pub fn stage_update<D: Disk, I: Disk, S: SealedLookup>(
         &mut self,
         delta: &Delta<D>,
         index: &ValidityIndex<I>,
+        sealed: &S,
         key: BusinessKey,
         payload: Vec<u8>,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<(SystemTimeMicros, Vec<Redo>), SysTimeError> {
         let commit = self.next_commit_ts()?;
-        let prior = current_open(delta, index, &key, commit)?.ok_or(SysTimeError::KeyNotFound)?;
+        let prior =
+            resolve_live(delta, sealed, index, &key, commit)?.ok_or(SysTimeError::KeyNotFound)?;
         let close = close_of(&key, &prior, commit, txn_id, principal.clone());
         let opened = open_version(key, commit, payload, txn_id, principal);
         Ok((commit, vec![Redo::Close(close), Redo::Insert(opened)]))
@@ -432,20 +517,26 @@ impl<C: Clock> SysTimeWriter<C> {
     /// [`Self::stage_insert`] for why resolution is split from application, and
     /// [`Self::delete`] for the tombstone-provenance semantics.
     ///
+    /// Liveness spans the delta tier, the sealed segments, and the index (see
+    /// [`Self::stage_insert`]); pass [`EmptySealed`] when there are no sealed
+    /// segments.
+    ///
     /// # Errors
     ///
     /// [`SysTimeError::KeyNotFound`] if `key` has no live version;
-    /// [`SysTimeError::TimeExhausted`]; delta/index read errors.
-    pub fn stage_delete<D: Disk, I: Disk>(
+    /// [`SysTimeError::TimeExhausted`]; delta/index/segment read errors.
+    pub fn stage_delete<D: Disk, I: Disk, S: SealedLookup>(
         &mut self,
         delta: &Delta<D>,
         index: &ValidityIndex<I>,
+        sealed: &S,
         key: &BusinessKey,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<(SystemTimeMicros, Vec<Redo>), SysTimeError> {
         let commit = self.next_commit_ts()?;
-        let prior = current_open(delta, index, key, commit)?.ok_or(SysTimeError::KeyNotFound)?;
+        let prior =
+            resolve_live(delta, sealed, index, key, commit)?.ok_or(SysTimeError::KeyNotFound)?;
         Ok((
             commit,
             vec![Redo::Retract(close_of(
@@ -584,25 +675,6 @@ fn resolve_live<D: Disk, I: Disk, S: SealedLookup>(
     Ok(merge::resolve_open(
         &delta_versions,
         &sealed_versions,
-        index,
-        key,
-        Snapshot(at),
-    )?)
-}
-
-/// The version of `key` live at `at`, resolved across the **delta tier and the
-/// validity index** only (no sealed segments) — the resolver the staging path
-/// uses, matching the delta-resident DML write path.
-fn current_open<D: Disk, I: Disk>(
-    delta: &Delta<D>,
-    index: &ValidityIndex<I>,
-    key: &BusinessKey,
-    at: SystemTimeMicros,
-) -> Result<Option<Version>, SysTimeError> {
-    let delta_versions = delta.candidate_versions(key)?;
-    Ok(merge::resolve_open(
-        &delta_versions,
-        &[],
         index,
         key,
         Snapshot(at),
