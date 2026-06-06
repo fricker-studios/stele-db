@@ -37,7 +37,7 @@
 //! [`AsOfError::Unsupported`] rather than a wrong instant.
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArguments, Select, SelectItem, SetExpr,
+    BinaryOperator, Expr, FunctionArguments, GroupByExpr, Query, Select, SelectItem, SetExpr,
     Statement as SqlStatement, TableFactor, Value,
 };
 use stele_catalog::{Catalog, SchemaId};
@@ -106,6 +106,25 @@ pub enum SelectError {
     /// columns only.
     #[error("v0.1 projects `*` or bare column names only ({0})")]
     UnsupportedProjection(String),
+
+    /// The query carried a clause outside the v0.1 single-table snapshot-scan
+    /// surface (`WITH`, `ORDER BY`, `LIMIT`/`OFFSET`/`FETCH`, `DISTINCT`,
+    /// `GROUP BY`, `HAVING`, locking, …). [`BoundSelect`] does not carry these,
+    /// so accepting them would silently drop user intent — they are rejected.
+    #[error("v0.1 does not support `{0}` in a SELECT")]
+    UnsupportedClause(&'static str),
+
+    /// A projected column is not present in the table's schema **at the resolved
+    /// snapshot** — it does not exist, or was only added after the `AS OF`
+    /// instant. Caught at bind time rather than deferred to a confusing executor
+    /// error.
+    #[error("column {column:?} does not exist in table {table:?} at the AS OF snapshot")]
+    UnknownColumn {
+        /// The table read.
+        table: String,
+        /// The projected column that the resolved schema does not contain.
+        column: String,
+    },
 
     /// `FOR VALID_TIME AS OF` was given. The parser accepts it (and tags the
     /// axis) so the binder can reject it with this precise message; valid-time
@@ -199,27 +218,38 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
     let projection = bind_projection(select)?;
     let snapshot = resolve_snapshot(stmt, ctx.snapshot)?;
 
-    let schema_id = match ctx.catalog.resolve(table, snapshot) {
-        Some(schema) => schema.schema_id(),
-        None => {
-            return Err(match ctx.catalog.history_start(table) {
-                None => SelectError::UnknownTable(table.to_owned()),
-                Some(first) if snapshot < first => SelectError::BeforeHistory {
-                    table: table.to_owned(),
-                    snapshot: snapshot.0,
-                    first_commit: first.0,
-                },
-                Some(_) => SelectError::TableNotLive {
-                    table: table.to_owned(),
-                    snapshot: snapshot.0,
-                },
-            });
-        }
+    let Some(schema) = ctx.catalog.resolve(table, snapshot) else {
+        return Err(match ctx.catalog.history_start(table) {
+            None => SelectError::UnknownTable(table.to_owned()),
+            Some(first) if snapshot < first => SelectError::BeforeHistory {
+                table: table.to_owned(),
+                snapshot: snapshot.0,
+                first_commit: first.0,
+            },
+            Some(_) => SelectError::TableNotLive {
+                table: table.to_owned(),
+                snapshot: snapshot.0,
+            },
+        });
     };
+
+    // Every named projected column must exist in the schema live *at the
+    // snapshot* — a column added after the `AS OF` instant is not yet present
+    // and is rejected here rather than deferred to the executor.
+    if let Projection::Columns(columns) = &projection {
+        for column in columns {
+            if schema.column(column).is_none() {
+                return Err(SelectError::UnknownColumn {
+                    table: table.to_owned(),
+                    column: column.clone(),
+                });
+            }
+        }
+    }
 
     Ok(BoundSelect {
         table: table.to_owned(),
-        schema_id,
+        schema_id: schema.schema_id(),
         snapshot,
         projection,
     })
@@ -299,12 +329,28 @@ pub fn resolve_as_of(expr: &Expr, now: SystemTimeMicros) -> Result<SystemTimeMic
 fn integer_instant(value: &Value) -> Result<SystemTimeMicros, AsOfError> {
     match value {
         Value::Number(digits, _) => digits.parse::<i64>().map(SystemTimeMicros).map_err(|_| {
-            AsOfError::Unsupported(format!("non-integer timestamp literal `{digits}`"))
+            // A digits-only literal that fails to parse is an integer too large
+            // for the system-time range — surface that as `Overflow`, not as a
+            // misleading "non-integer" diagnostic. A genuinely non-integer
+            // literal (a decimal/scientific float) keeps the latter.
+            if is_integer_literal(digits) {
+                AsOfError::Overflow
+            } else {
+                AsOfError::Unsupported(format!("non-integer timestamp literal `{digits}`"))
+            }
         }),
         other => Err(AsOfError::Unsupported(format!(
             "literal `{other}` is not an instant"
         ))),
     }
+}
+
+/// Whether `s` is a plain base-10 integer literal (optional leading `-`, then
+/// only ASCII digits) — used to tell an overflowing integer apart from a
+/// non-integer numeric literal.
+fn is_integer_literal(s: &str) -> bool {
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Whether a parsed function call is a no-argument `now()` (case-insensitive,
@@ -410,17 +456,106 @@ fn describe_expr(expr: &Expr) -> String {
     }
 }
 
-/// The single `SELECT` body of a query statement.
+/// The single `SELECT` body of a query statement, after rejecting every query-
+/// and select-level clause outside the v0.1 single-table snapshot-scan surface.
+///
+/// [`BoundSelect`] carries only a table, snapshot, and projection — so a clause
+/// it cannot represent (`ORDER BY`, `LIMIT`, `GROUP BY`, …) must be rejected,
+/// not silently dropped when the plan is later executed.
 fn single_select(body: &SqlStatement) -> Result<&Select, SelectError> {
     let SqlStatement::Query(query) = body else {
         return Err(SelectError::NotSelect);
     };
-    match query.body.as_ref() {
-        SetExpr::Select(select) => Ok(select),
-        SetExpr::Query(_) => Err(SelectError::UnsupportedFrom("parenthesized subquery")),
-        SetExpr::SetOperation { .. } => Err(SelectError::UnsupportedFrom("UNION/INTERSECT/EXCEPT")),
-        _ => Err(SelectError::NotSelect),
+    reject_unsupported_query_clauses(query)?;
+    let select = match query.body.as_ref() {
+        SetExpr::Select(select) => select,
+        SetExpr::Query(_) => return Err(SelectError::UnsupportedFrom("parenthesized subquery")),
+        SetExpr::SetOperation { .. } => {
+            return Err(SelectError::UnsupportedFrom("UNION/INTERSECT/EXCEPT"));
+        }
+        _ => return Err(SelectError::NotSelect),
+    };
+    reject_unsupported_select_clauses(select)?;
+    Ok(select)
+}
+
+/// Reject query-level clauses outside the v0.1 surface. `WHERE` lives on the
+/// inner `Select` and is deliberately *kept* (lowered downstream); everything
+/// that reshapes or reorders the result set is rejected.
+fn reject_unsupported_query_clauses(query: &Query) -> Result<(), SelectError> {
+    let reject = |what| Err(SelectError::UnsupportedClause(what));
+    if query.with.is_some() {
+        return reject("WITH (CTE)");
     }
+    if query.order_by.is_some() {
+        return reject("ORDER BY");
+    }
+    if query.limit_clause.is_some() {
+        return reject("LIMIT/OFFSET");
+    }
+    if query.fetch.is_some() {
+        return reject("FETCH");
+    }
+    if !query.locks.is_empty() {
+        return reject("FOR UPDATE/SHARE");
+    }
+    Ok(())
+}
+
+/// Reject select-level clauses outside the v0.1 surface — anything that
+/// aggregates, deduplicates, limits, or otherwise transforms the row set
+/// [`BoundSelect`] does not model. `WHERE` ([`Select::selection`]) is allowed.
+fn reject_unsupported_select_clauses(select: &Select) -> Result<(), SelectError> {
+    let reject = |what| Err(SelectError::UnsupportedClause(what));
+    if select.distinct.is_some() {
+        return reject("DISTINCT");
+    }
+    if select.top.is_some() {
+        return reject("TOP");
+    }
+    if select.into.is_some() {
+        return reject("SELECT INTO");
+    }
+    // `GROUP BY ALL`, or `GROUP BY <exprs>` / a trailing modifier — only the
+    // empty `Expressions(<none>, <none>)` is "no grouping".
+    if !matches!(&select.group_by, GroupByExpr::Expressions(exprs, modifiers) if exprs.is_empty() && modifiers.is_empty())
+    {
+        return reject("GROUP BY");
+    }
+    if select.having.is_some() {
+        return reject("HAVING");
+    }
+    if select.qualify.is_some() {
+        return reject("QUALIFY");
+    }
+    if !select.named_window.is_empty() {
+        return reject("WINDOW");
+    }
+    if !select.lateral_views.is_empty() {
+        return reject("LATERAL VIEW");
+    }
+    if select.prewhere.is_some() {
+        return reject("PREWHERE");
+    }
+    if select.exclude.is_some() {
+        return reject("EXCLUDE");
+    }
+    if select.value_table_mode.is_some() {
+        return reject("SELECT AS VALUE/STRUCT");
+    }
+    if !select.cluster_by.is_empty() {
+        return reject("CLUSTER BY");
+    }
+    if !select.distribute_by.is_empty() {
+        return reject("DISTRIBUTE BY");
+    }
+    if !select.sort_by.is_empty() {
+        return reject("SORT BY");
+    }
+    if !select.connect_by.is_empty() {
+        return reject("CONNECT BY");
+    }
+    Ok(())
 }
 
 /// The single, unqualified table name a `SELECT` reads from.
@@ -671,6 +806,69 @@ mod tests {
             catalog: &catalog,
         };
         assert_eq!(bind_select(&stmt, &ctx), Err(SelectError::ValidTimeAsOf));
+    }
+
+    #[test]
+    fn overflowing_integer_literal_is_overflow_not_non_integer() {
+        // A digits-only literal too large for i64 must read as Overflow…
+        assert_eq!(
+            as_of("SELECT x FROM t FOR SYSTEM_TIME AS OF 99999999999999999999999"),
+            Err(AsOfError::Overflow)
+        );
+        // …while a genuine non-integer numeric literal stays Unsupported.
+        assert!(matches!(
+            as_of("SELECT x FROM t FOR SYSTEM_TIME AS OF 1.5"),
+            Err(AsOfError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn unsupported_query_and_select_clauses_are_rejected() {
+        let catalog = catalog_with_account(1_000);
+        let ctx = BindContext {
+            snapshot: NOW,
+            catalog: &catalog,
+        };
+        for sql in [
+            "SELECT balance FROM account ORDER BY balance",
+            "SELECT balance FROM account LIMIT 1",
+            "SELECT DISTINCT balance FROM account",
+            "SELECT balance FROM account GROUP BY balance",
+            "SELECT balance FROM account GROUP BY balance HAVING balance > 0",
+            "WITH t AS (SELECT 1) SELECT balance FROM account",
+        ] {
+            let stmt = parse_one(sql);
+            assert!(
+                matches!(
+                    bind_select(&stmt, &ctx),
+                    Err(SelectError::UnsupportedClause(_))
+                ),
+                "expected UnsupportedClause for: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn projecting_an_unknown_column_is_rejected_at_bind_time() {
+        let catalog = catalog_with_account(1_000);
+        let ctx = BindContext {
+            snapshot: NOW,
+            catalog: &catalog,
+        };
+        let stmt = parse_one("SELECT nonesuch FROM account");
+        assert_eq!(
+            bind_select(&stmt, &ctx),
+            Err(SelectError::UnknownColumn {
+                table: "account".to_owned(),
+                column: "nonesuch".to_owned(),
+            })
+        );
+        // The demo's real columns still bind.
+        let ok = parse_one("SELECT id, balance FROM account");
+        assert_eq!(
+            bind_select(&ok, &ctx).expect("bind").projection,
+            Projection::Columns(vec!["id".to_owned(), "balance".to_owned()])
+        );
     }
 
     #[test]
