@@ -325,6 +325,23 @@ impl Catalog {
         (snapshot < candidate.sys_to).then_some(&candidate.schema)
     }
 
+    /// The system time the table's recorded history begins — its first schema
+    /// version's `sys_from` — or `None` if the name was never created.
+    ///
+    /// The binder uses this to tell two `AS OF` failures apart: a snapshot that
+    /// precedes a table's very first version (a *before-history* read) versus a
+    /// name the catalog has never heard of. [`resolve`](Self::resolve) collapses
+    /// both to `None`; this recovers the distinction. The first version's start
+    /// is the table's earliest era even across a drop/re-create, since
+    /// [`create_table`](Self::create_table) only ever *appends* to the chain.
+    #[must_use]
+    pub fn history_start(&self, table_name: &str) -> Option<SystemTimeMicros> {
+        self.tables
+            .get(table_name)
+            .and_then(|versions| versions.first())
+            .map(|version| version.sys_from)
+    }
+
     /// Look up a schema by the id a sealed segment's footer records.
     ///
     /// Footers store the [`SchemaId`] their rows were written under

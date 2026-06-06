@@ -24,14 +24,16 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use stele_catalog::{Catalog, ColumnDef, TableTemporal};
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
+use stele_common::types::LogicalType;
 use stele_exec::{Column, SnapshotScan};
 use stele_storage::backend::{Disk, DiskFile, FaultOp, Faults, MemDisk, MemFile};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
 use stele_storage::dml::{self, DmlWriter};
 use stele_storage::merge;
-use stele_storage::segment::{ColumnId, Predicate, SegmentReader, SegmentWriter};
+use stele_storage::segment::{ColumnId, Predicate, SegmentReader, SegmentWriter, ZoneBound};
 use stele_storage::systime::{EmptySealed, SealedSegments, SysTimeWriter};
 use stele_storage::validity::{Close, ValidityConfig, ValidityIndex};
 use stele_storage::validtime::{ValidInterval, ValidTimeWriter, unframe_payload};
@@ -985,6 +987,226 @@ pub fn run_snapshot_scan_seed(seed: u64) -> u64 {
     digest
 }
 
+/// A catalog holding the identity demo's `account` table, created early enough
+/// (system time 1) that every later read in these scenarios is within history.
+fn account_catalog() -> Catalog {
+    let mut catalog = Catalog::new();
+    catalog
+        .create_table(
+            "account",
+            vec![
+                ColumnDef::new("id", LogicalType::Int4).expect("column id"),
+                ColumnDef::new("balance", LogicalType::Int4).expect("column balance"),
+            ],
+            TableTemporal::system_only(),
+            SystemTimeMicros(1),
+        )
+        .expect("create account");
+    catalog
+}
+
+/// Resolve a probe snapshot through the **real SQL binder** — parse
+/// `SELECT * FROM account FOR SYSTEM_TIME AS OF <micros>`, bind it against
+/// `catalog`, and assert the bound snapshot is exactly `s`. The harness stands
+/// in for the pgwire query loop ([STL-104]) that will own this lowering; the
+/// assertion is the binding half of the AS-OF correctness story ([STL-101]).
+fn resolve_via_binder(catalog: &Catalog, s: SystemTimeMicros) -> SystemTimeMicros {
+    let sql = format!("SELECT * FROM account FOR SYSTEM_TIME AS OF {}", s.0);
+    let stmts = stele_sql::parse(&sql).expect("parse AS OF probe");
+    let ctx = stele_sql::BindContext {
+        // For an integer-literal `AS OF`, `now()` is unused — supply the
+        // snapshot itself so the context is well-formed regardless.
+        snapshot: s,
+        catalog,
+    };
+    let bound = stele_sql::bind_select(&stmts[0], &ctx).expect("bind AS OF probe");
+    assert_eq!(
+        bound.snapshot, s,
+        "binder must resolve AS OF {} to itself",
+        s.0
+    );
+    bound.snapshot
+}
+
+/// The four-statement identity demo, end-to-end ([README](../../../README.md)).
+///
+/// `CREATE`, `INSERT … 100`, `UPDATE … 250`, then
+/// `SELECT … FOR SYSTEM_TIME AS OF (now() - interval '1 second')` reads back the
+/// **pre-update** row. Returns that row's payload — the test asserts it is the
+/// `INSERT`-era `100`, never the `250` the `UPDATE` wrote (STL-101 DoD).
+///
+/// The `AS OF` clause is the README's verbatim string; it is folded by the real
+/// [`stele_sql::bind_select`] binder. With `now()` one second after the insert,
+/// `now() - interval '1 second'` lands on the insert instant — strictly before
+/// the update — so the bound snapshot resolves the version that held `100`.
+///
+/// # Panics
+///
+/// Panics if any stage (DDL, DML, parse, bind, scan) fails, or if the binder
+/// does not fold the `AS OF` to the insert instant — correctness regressions,
+/// not workload outcomes.
+#[must_use]
+pub fn four_statement_identity_demo() -> Vec<u8> {
+    // (1) CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING.
+    let catalog = account_catalog();
+
+    // The one table's storage tiers.
+    let wal = Wal::open(MemDisk::new(), WalConfig::default()).expect("open wal");
+    let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+    let mut index = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+    // Commit clock starts above the catalog's creation time, so the row history
+    // is strictly inside the table's lifetime.
+    let mut writer = DmlWriter::new(wal, StepClock::new(10), false);
+    let key = BusinessKey::new(b"1".to_vec());
+    let who = Principal::new(b"demo".to_vec());
+
+    // (2) INSERT INTO account VALUES (1, 100). Payload is opaque at v0.1 (no row
+    // codec yet); `b"100"` stands for the balance value.
+    let t_insert = writer
+        .insert(
+            &mut delta,
+            &mut index,
+            &EmptySealed,
+            key.clone(),
+            None,
+            b"100".to_vec(),
+            0,
+            TxnId(1),
+            who.clone(),
+        )
+        .expect("insert")
+        .commit;
+
+    // (3) UPDATE account SET balance = 250 WHERE id = 1.
+    let t_update = writer
+        .update(
+            &mut delta,
+            &mut index,
+            &EmptySealed,
+            key,
+            None,
+            b"250".to_vec(),
+            0,
+            TxnId(2),
+            who,
+        )
+        .expect("update")
+        .commit;
+    assert!(
+        t_update > t_insert,
+        "the update must commit after the insert"
+    );
+
+    // (4) SELECT balance FROM account
+    //       FOR SYSTEM_TIME AS OF (now() - interval '1 second') WHERE id = 1;
+    let now = SystemTimeMicros(t_insert.0 + 1_000_000);
+    let sql = "SELECT balance FROM account \
+               FOR SYSTEM_TIME AS OF (now() - interval '1 second') WHERE id = 1";
+    let stmts = stele_sql::parse(sql).expect("parse demo SELECT");
+    let ctx = stele_sql::BindContext {
+        snapshot: now,
+        catalog: &catalog,
+    };
+    let bound = stele_sql::bind_select(&stmts[0], &ctx).expect("bind demo SELECT");
+    assert_eq!(
+        bound.snapshot, t_insert,
+        "AS OF (now() - interval '1 second') must fold to the insert instant",
+    );
+
+    // Lower the bound select to a SnapshotScan — the glue the pgwire query loop
+    // will own (STL-104). `WHERE id = 1` is the business-key equality.
+    let readers: Vec<SegmentReader<MemFile>> = Vec::new();
+    let out = SnapshotScan::new(&delta, &index, &readers, Snapshot(bound.snapshot))
+        .project(vec![ColumnId::Payload])
+        .filter(Predicate::Eq {
+            column: ColumnId::BusinessKey,
+            value: ZoneBound::Bytes(b"1".to_vec()),
+        })
+        .execute()
+        .expect("snapshot scan");
+
+    let Some((_, Column::Bytes(payloads))) = out.batch.columns.into_iter().next() else {
+        panic!("scan must project the payload as a bytes column");
+    };
+    let [payload] = <[Vec<u8>; 1]>::try_from(payloads).expect("exactly one row for id = 1");
+    payload
+}
+
+/// Read a seeded insert/update/delete history back **through the SQL binder**.
+///
+/// Each probe is resolved from an `AS OF <micros>` clause through the real SQL
+/// binder, and the scan at the bound snapshot is checked against the same independent
+/// reference oracle [`run_snapshot_scan_seed`] uses ([docs/06 §4], STL-138).
+/// Where that sweep drives the executor directly, this drives it *via AS-OF
+/// resolution* — so the seed sweep regresses on the binder picking the right
+/// instant and the executor reading the right version together (STL-101 DoD).
+/// Same seed ⇒ same digest.
+///
+/// [docs/06 §4]: ../../../docs/06-testing-strategy.md#4-correctness-oracles-the-temporal-heart
+///
+/// # Panics
+///
+/// Panics if the binder mis-resolves a probe, or if a scan disagrees with the
+/// reference oracle — correctness regressions, not workload outcomes.
+#[must_use]
+pub fn run_as_of_resolution_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut rng = Rng::new(seed);
+    let catalog = account_catalog();
+    let wal = Wal::open(MemDisk::new(), WalConfig::default()).expect("open wal");
+    let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+    let mut index = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+    // Clock base well above the catalog creation (1), so every probe — including
+    // `first - 1` — stays within the table's history and the binder resolves it.
+    let mut writer = DmlWriter::new(wal, StepClock::new(1_000), false);
+    let readers: Vec<SegmentReader<MemFile>> = Vec::new();
+    let mut oracle: ScanOracle = BTreeMap::new();
+
+    let key_count = 1 + rng.below_usize(4);
+    let keys: Vec<BusinessKey> = (0..key_count)
+        .map(|i| BusinessKey::new(format!("k-{i:04}").into_bytes()))
+        .collect();
+    let mut live = vec![false; key_count];
+    let mut commits: Vec<SystemTimeMicros> = Vec::new();
+
+    let ops = 8 + rng.below(24);
+    for op in 0..ops {
+        let k = rng.below_usize(key_count);
+        let is_delete = live[k] && rng.below(4) == 0;
+        let (commit, new_live) = apply_scan_op(
+            &mut writer,
+            &mut delta,
+            &mut index,
+            &readers,
+            &mut oracle,
+            keys[k].clone(),
+            op,
+            live[k],
+            is_delete,
+        );
+        live[k] = new_live;
+        commits.push(commit);
+    }
+
+    // Probe just before the first commit, at every commit, and just past the
+    // last — each routed through the binder before the scan.
+    let mut probes: Vec<SystemTimeMicros> = Vec::new();
+    if let Some(first) = commits.first() {
+        probes.push(SystemTimeMicros(first.0 - 1));
+    }
+    probes.extend(commits.iter().copied());
+    if let Some(last) = commits.last() {
+        probes.push(SystemTimeMicros(last.0 + 1));
+    }
+
+    let mut digest = FNV_OFFSET;
+    for s in probes {
+        let resolved = resolve_via_binder(&catalog, s);
+        digest = verify_scan_at(seed, &delta, &index, &readers, &oracle, resolved, digest);
+    }
+    digest
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1141,6 +1363,41 @@ mod tests {
         assert!(
             digests.len() > 1,
             "the snapshot-scan read workload must actually depend on the seed"
+        );
+    }
+
+    #[test]
+    fn four_statement_demo_reads_the_pre_update_value() {
+        // The v0.1 identity: an AS OF before the update reads 100, never the 250
+        // the update wrote — history is never destroyed (STL-101 DoD).
+        assert_eq!(
+            four_statement_identity_demo(),
+            b"100".to_vec(),
+            "AS OF (now() - interval '1 second') must read the pre-update value",
+        );
+    }
+
+    #[test]
+    fn as_of_resolution_seed_is_reproducible() {
+        // Each seed also asserts (internally) that the binder resolves every
+        // probe to its intended instant and that the scan at the bound snapshot
+        // matches the reference oracle (STL-101 DoD).
+        for seed in 0..64 {
+            assert_eq!(
+                run_as_of_resolution_seed(seed),
+                run_as_of_resolution_seed(seed),
+                "seed {seed} must replay to an identical AS-OF-resolution digest"
+            );
+        }
+    }
+
+    #[test]
+    fn as_of_resolution_distinct_seeds_diverge() {
+        let digests: std::collections::HashSet<u64> =
+            (0..64).map(run_as_of_resolution_seed).collect();
+        assert!(
+            digests.len() > 1,
+            "the AS-OF-resolution read workload must actually depend on the seed"
         );
     }
 }

@@ -436,8 +436,10 @@ name = "stele-sim"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "stele-catalog",
  "stele-common",
  "stele-exec",
+ "stele-sql",
  "stele-storage",
  "stele-txn",
 ]

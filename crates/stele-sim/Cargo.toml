@@ -21,4 +21,6 @@ stele-storage = { workspace = true }
 stele-common  = { workspace = true }
 stele-txn     = { workspace = true }
 stele-exec    = { workspace = true }
+stele-sql     = { workspace = true }
+stele-catalog = { workspace = true }
 clap          = { workspace = true }
