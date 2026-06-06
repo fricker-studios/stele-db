@@ -67,7 +67,29 @@ pub(super) const TRAILER_MAGIC: [u8; 8] = *b"STLSEGFT";
 ///   header-level reject for an older reader. This is what makes the append-only
 ///   / tamper-evidence claims hold under scrutiny: nothing on the durable record
 ///   can be rewritten to say a version's period ended.
-pub(super) const FORMAT_VERSION: u16 = 6;
+/// * **v7** — **persists retractions (logical deletes) as payload-less tombstone
+///   rows** (STL-143, [ADR-0023](../../../../../docs/adr/0023-append-only-record-model-validity-index.md)).
+///   A delete is a "close with no successor", which version adjacency cannot
+///   reconstruct — so a from-scratch rebuild from segments would silently
+///   resurrect a deleted row across the deletion gap
+///   ([docs/16 §12](../../../../../docs/16-bitemporal-semantics.md#12-deletes-retractions--the-deletion-gap)).
+///   v7 stores retractions in a **separate footer section** as six tombstone
+///   columns (ids 8..=13: `retract_key`, `retract_sys_from`, `retract_closed_at`,
+///   `retract_closed_by_txn`, `retract_closed_by_committed_at`,
+///   `retract_closed_by_principal`) — the [`crate::validity::Close`] fields, no
+///   payload. They are present only when the segment holds at least one
+///   retraction (the optional-columns pattern, like the valid-time pair), carry
+///   their **own** value count (independent of the version row count), and get
+///   per-column zone-map stats for free. This makes the segment store
+///   self-contained for an index rebuild even after WAL truncation. The version
+///   row-group is byte-identical to v6; the bump makes a v6 reader reject a v7
+///   segment cleanly at the header rather than choke on column id 8 in the
+///   footer's new section.
+///
+/// `seq` is intentionally *not* on the tombstone yet: a version-record `seq`
+/// (STL-141) has not landed, so there is nothing to carry. Adding it is a
+/// length-prefixed footer field that needs no `FORMAT_VERSION` bump.
+pub(super) const FORMAT_VERSION: u16 = 7;
 
 /// Header size in bytes — magic (8) + version (2) + flags (2) + reserved (4).
 pub(super) const HEADER_LEN: usize = 16;
@@ -171,6 +193,28 @@ pub enum ColumnId {
     /// ([`stele_common::time::VALID_TIME_OPEN`]). Present only on a valid-time
     /// table's segments, alongside [`Self::ValidFrom`].
     ValidTo = 7,
+    /// Retraction tombstone: the business key of the deleted version
+    /// (variable-length bytes). Mirrors [`crate::validity::Close::business_key`].
+    /// Present only in the segment's retraction section (format v7), never in the
+    /// version row-group.
+    RetractKey = 8,
+    /// Retraction tombstone: the `sys_from` of the version this delete closes
+    /// (fixed `i64`) — [`crate::validity::Close::sys_from`].
+    RetractSysFrom = 9,
+    /// Retraction tombstone: the system-time the period was closed at (fixed
+    /// `i64`) — [`crate::validity::Close::sys_to`], the "closed_at" of the delete.
+    RetractClosedAt = 10,
+    /// Retraction tombstone: the deleting transaction id (fixed 8 bytes, `u64`
+    /// bits in the `i64` column like [`Self::TxnId`]) —
+    /// `Close::closed_by.txn_id`. The "who deleted" of delete provenance.
+    RetractClosedByTxn = 11,
+    /// Retraction tombstone: the deleting transaction's commit timestamp (fixed
+    /// `i64`) — `Close::closed_by.committed_at`. The "when deleted" of delete
+    /// provenance.
+    RetractClosedByCommittedAt = 12,
+    /// Retraction tombstone: the deleting principal (variable-length bytes) —
+    /// `Close::closed_by.principal`. The "by whom" of delete provenance.
+    RetractClosedByPrincipal = 13,
 }
 
 impl ColumnId {
@@ -215,11 +259,29 @@ impl ColumnId {
         Self::ValidTo,
     ];
 
+    /// The ordered tombstone column set a segment's **retraction section**
+    /// carries (format v7, STL-143), in writer/reader canonical order. These
+    /// mirror the [`crate::validity::Close`] fields — the business key, the
+    /// closed version's `sys_from`, the close timestamp, and the closing
+    /// transaction's provenance triple — with no payload. Present only when the
+    /// segment holds at least one retraction; the footer's retraction-section
+    /// column list is the source of truth, so writer and reader never drift.
+    pub(super) const RETRACTION: [Self; 6] = [
+        Self::RetractKey,
+        Self::RetractSysFrom,
+        Self::RetractClosedAt,
+        Self::RetractClosedByTxn,
+        Self::RetractClosedByCommittedAt,
+        Self::RetractClosedByPrincipal,
+    ];
+
     /// The ordered column set a segment carries given the table's valid-time
     /// opt-in: [`Self::ALL`] for a system-only table, or that set plus
     /// `valid_from` / `valid_to` when the table tracks valid-time ([STL-117]).
     /// The writer iterates this to lay out chunks; the reader recovers the set
-    /// from the footer's column list, so the two never drift.
+    /// from the footer's column list, so the two never drift. This is the
+    /// **version** row-group schema; retraction tombstones live in their own
+    /// footer section ([`Self::RETRACTION`]), not here.
     pub(super) const fn schema(valid_time: bool) -> &'static [Self] {
         if valid_time {
             &Self::ALL_WITH_VALID_TIME
@@ -230,10 +292,20 @@ impl ColumnId {
 
     pub(super) const fn ty(self) -> ColumnType {
         match self {
-            Self::BusinessKey | Self::Payload | Self::Principal => ColumnType::Bytes,
-            Self::SysFrom | Self::TxnId | Self::CommittedAt | Self::ValidFrom | Self::ValidTo => {
-                ColumnType::I64
-            }
+            Self::BusinessKey
+            | Self::Payload
+            | Self::Principal
+            | Self::RetractKey
+            | Self::RetractClosedByPrincipal => ColumnType::Bytes,
+            Self::SysFrom
+            | Self::TxnId
+            | Self::CommittedAt
+            | Self::ValidFrom
+            | Self::ValidTo
+            | Self::RetractSysFrom
+            | Self::RetractClosedAt
+            | Self::RetractClosedByTxn
+            | Self::RetractClosedByCommittedAt => ColumnType::I64,
         }
     }
 
@@ -247,6 +319,12 @@ impl ColumnId {
             5 => Some(Self::Principal),
             6 => Some(Self::ValidFrom),
             7 => Some(Self::ValidTo),
+            8 => Some(Self::RetractKey),
+            9 => Some(Self::RetractSysFrom),
+            10 => Some(Self::RetractClosedAt),
+            11 => Some(Self::RetractClosedByTxn),
+            12 => Some(Self::RetractClosedByCommittedAt),
+            13 => Some(Self::RetractClosedByPrincipal),
             _ => None,
         }
     }

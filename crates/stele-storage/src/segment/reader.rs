@@ -30,6 +30,7 @@ use stele_common::time::SystemTimeMicros;
 use crate::backend::{Disk, DiskFile};
 use crate::checksum::crc32c;
 use crate::delta::{BusinessKey, Version};
+use crate::validity::Close;
 use crate::validtime::reframe_payload;
 
 use super::SegmentError;
@@ -66,6 +67,13 @@ pub struct SegmentReader<F: DiskFile> {
 struct Footer {
     schema_id: u32,
     row_groups: Vec<RowGroup>,
+    /// The retraction section's tombstone columns (format v7, STL-143) — empty
+    /// when the segment holds no deletes. Each column shares `retraction_count`
+    /// as its value count, independent of any row-group's row count.
+    retractions: Vec<ColumnChunkMeta>,
+    /// Number of retraction tombstone rows — the shared value count for every
+    /// column in [`Self::retractions`].
+    retraction_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +294,111 @@ impl<F: DiskFile> SegmentReader<F> {
         Ok(out)
     }
 
+    /// Read this segment's retraction tombstones (format v7, STL-143) — the
+    /// durable record of every logical delete the segment holds, each a
+    /// [`Close`] with the deleted version's `(business_key, sys_from)`, the close
+    /// timestamp (`sys_to`), and the deleting transaction's provenance.
+    ///
+    /// Returns an empty vector when the segment has no retraction section (a
+    /// delete-free segment writes no tombstone columns). The retraction columns
+    /// share their own value count, decoupled from the version row count, so a
+    /// segment can carry zero versions and several tombstones (a flush whose only
+    /// activity was deletes), or vice versa.
+    ///
+    /// This is what makes the segment store **self-contained for a from-scratch
+    /// validity-index rebuild** ([`crate::rebuild`]): supersession closes are
+    /// re-derived from version adjacency, but a delete has no successor, so its
+    /// close survives only here. Also the queryable home of delete provenance
+    /// ("who deleted, when") after WAL truncation.
+    #[allow(clippy::cast_sign_loss)] // `closed_by_txn` round-trips i64-bits → u64 (see `ColumnId::TxnId`).
+    pub fn read_retractions(&self) -> Result<Vec<Close>, SegmentError> {
+        use stele_common::provenance::Provenance;
+        if self.footer.retractions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut keys = self.read_retraction_bytes(ColumnId::RetractKey)?;
+        let mut principals = self.read_retraction_bytes(ColumnId::RetractClosedByPrincipal)?;
+        let sys_from = self.read_retraction_i64(ColumnId::RetractSysFrom)?;
+        let closed_at = self.read_retraction_i64(ColumnId::RetractClosedAt)?;
+        let closed_txn = self.read_retraction_i64(ColumnId::RetractClosedByTxn)?;
+        let closed_committed = self.read_retraction_i64(ColumnId::RetractClosedByCommittedAt)?;
+
+        let n = keys.len();
+        if ![
+            principals.len(),
+            sys_from.len(),
+            closed_at.len(),
+            closed_txn.len(),
+            closed_committed.len(),
+        ]
+        .iter()
+        .all(|&len| len == n)
+        {
+            return Err(SegmentError::Corrupt(
+                "per-column value counts disagree within retraction section",
+            ));
+        }
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(Close {
+                business_key: BusinessKey::new(std::mem::take(&mut keys[i])),
+                sys_from: SystemTimeMicros(sys_from[i]),
+                sys_to: SystemTimeMicros(closed_at[i]),
+                closed_by: Provenance {
+                    txn_id: TxnId(closed_txn[i] as u64),
+                    committed_at: SystemTimeMicros(closed_committed[i]),
+                    principal: Principal::new(std::mem::take(&mut principals[i])),
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    /// Read one retraction-section column from [`Footer::retractions`] (not a
+    /// row-group). Mirrors [`Self::read_column`]'s late-materialization +
+    /// per-chunk CRC, but the retraction section is a single chunk per column.
+    fn read_retraction_column(&self, col: ColumnId) -> Result<ColumnData, SegmentError> {
+        let meta = self
+            .footer
+            .retractions
+            .iter()
+            .find(|c| c.column_id == col)
+            .ok_or(SegmentError::Corrupt(
+                "retraction column missing from segment",
+            ))?;
+        let payload = read_chunk_payload(&self.file, meta)?;
+        match col.ty() {
+            ColumnType::Bytes => {
+                let mut out: Vec<Vec<u8>> = Vec::new();
+                decode_bytes_chunk(&payload, meta.value_count, &mut out)?;
+                Ok(ColumnData::Bytes(out))
+            }
+            ColumnType::I64 => {
+                let mut out: Vec<i64> = Vec::new();
+                decode_i64_chunk(&payload, meta.value_count, &mut out)?;
+                Ok(ColumnData::I64(out))
+            }
+        }
+    }
+
+    fn read_retraction_bytes(&self, col: ColumnId) -> Result<Vec<Vec<u8>>, SegmentError> {
+        match self.read_retraction_column(col)? {
+            ColumnData::Bytes(v) => Ok(v),
+            ColumnData::I64(_) => Err(SegmentError::Corrupt(
+                "retraction column data type mismatched expected schema",
+            )),
+        }
+    }
+
+    fn read_retraction_i64(&self, col: ColumnId) -> Result<Vec<i64>, SegmentError> {
+        match self.read_retraction_column(col)? {
+            ColumnData::I64(v) => Ok(v),
+            ColumnData::Bytes(_) => Err(SegmentError::Corrupt(
+                "retraction column data type mismatched expected schema",
+            )),
+        }
+    }
+
     /// Total on-disk bytes the chunk(s) for `col` occupy across every
     /// row-group, including each chunk's 16-byte header — or `None` if the
     /// column is absent from the segment.
@@ -401,49 +514,38 @@ fn parse_footer(bytes: &[u8]) -> Result<Footer, SegmentError> {
         // up-front allocation.
         let mut columns: Vec<ColumnChunkMeta> = Vec::new();
         for _ in 0..column_count {
-            let column_id_raw = p.u16()?;
-            let column_id = ColumnId::from_u16(column_id_raw)
-                .ok_or(SegmentError::Corrupt("unknown column id in footer"))?;
-            let codec_raw = p.u8()?;
-            let codec = Codec::from_byte(codec_raw)
-                .ok_or(SegmentError::Corrupt("unknown codec in footer"))?;
-            let _reserved = p.u8()?;
-            let offset = p.u64()?;
-            let length = p.u64()?;
-            let value_count = p.u32()?;
-            let _reserved = p.u32()?;
-            // Stats feed zone-map pruning (STL-89). A zero-length field is the
-            // writer's "no stats" sentinel; a non-empty field is decoded into a
-            // typed bound matching the column's `ColumnType`. The declared
-            // lengths are bounded by the footer-CRC envelope, so an oversized
-            // length can't escape the footer.
-            let min_len = p.u32()? as usize;
-            let min_bytes = p.bytes(min_len)?;
-            let max_len = p.u32()? as usize;
-            let max_bytes = p.bytes(max_len)?;
-            let stat_min = decode_stat(column_id, min_bytes)?;
-            let stat_max = decode_stat(column_id, max_bytes)?;
             // Every column in a row-group shares the row-group's row count.
             // Detect a footer that claims a row count contradicting its own
             // per-column figures at open time, so the inconsistency surfaces
-            // here rather than as a silent disagreement between
-            // `row_count()` and what a projection actually returns.
-            if value_count != row_count {
-                return Err(SegmentError::Corrupt(
-                    "column value_count disagrees with row-group row_count",
-                ));
-            }
-            columns.push(ColumnChunkMeta {
-                column_id,
-                codec,
-                offset,
-                length,
-                value_count,
-                stat_min,
-                stat_max,
-            });
+            // here rather than as a silent disagreement between `row_count()`
+            // and what a projection actually returns.
+            columns.push(parse_chunk_meta(&mut p, row_count, "row-group row_count")?);
         }
         row_groups.push(RowGroup { row_count, columns });
+    }
+    // Retraction section (format v7, STL-143): a tombstone-row count followed by
+    // that many column metas. Always present in a v7 footer — `0` columns when
+    // the segment holds no deletes. Each retraction column shares
+    // `retraction_count` as its value count, *not* any row-group's row count.
+    let retraction_count = p.u32()?;
+    let retraction_column_count = p.u32()?;
+    let mut retractions: Vec<ColumnChunkMeta> = Vec::new();
+    for _ in 0..retraction_column_count {
+        retractions.push(parse_chunk_meta(
+            &mut p,
+            retraction_count,
+            "retraction_count",
+        )?);
+    }
+    // The two retraction counts move together: the writer emits either an empty
+    // section (both zero) or the full tombstone column set with a positive row
+    // count. A footer claiming tombstone rows but no columns (or vice versa) would
+    // let `read_retractions` silently return empty on the `is_empty` short-circuit,
+    // masking the corruption — reject it here instead.
+    if (retraction_count == 0) != retractions.is_empty() {
+        return Err(SegmentError::Corrupt(
+            "retraction section inconsistent: row count and column presence disagree",
+        ));
     }
     if !p.is_empty() {
         return Err(SegmentError::Corrupt("trailing bytes in footer"));
@@ -451,6 +553,57 @@ fn parse_footer(bytes: &[u8]) -> Result<Footer, SegmentError> {
     Ok(Footer {
         schema_id,
         row_groups,
+        retractions,
+        retraction_count,
+    })
+}
+
+/// Parse one column-chunk meta from the footer, verifying its `value_count`
+/// matches `expected_value_count` (the row-group row count, or the retraction
+/// count). `what` names that expectation for the typed corruption error. Shared
+/// by the version row-group and the retraction-section parse so the two never
+/// drift in layout.
+fn parse_chunk_meta(
+    p: &mut Parser,
+    expected_value_count: u32,
+    what: &'static str,
+) -> Result<ColumnChunkMeta, SegmentError> {
+    let column_id_raw = p.u16()?;
+    let column_id = ColumnId::from_u16(column_id_raw)
+        .ok_or(SegmentError::Corrupt("unknown column id in footer"))?;
+    let codec_raw = p.u8()?;
+    let codec =
+        Codec::from_byte(codec_raw).ok_or(SegmentError::Corrupt("unknown codec in footer"))?;
+    let _reserved = p.u8()?;
+    let offset = p.u64()?;
+    let length = p.u64()?;
+    let value_count = p.u32()?;
+    let _reserved = p.u32()?;
+    // Stats feed zone-map pruning (STL-89). A zero-length field is the writer's
+    // "no stats" sentinel; a non-empty field is decoded into a typed bound
+    // matching the column's `ColumnType`. The declared lengths are bounded by the
+    // footer-CRC envelope, so an oversized length can't escape the footer.
+    let min_len = p.u32()? as usize;
+    let min_bytes = p.bytes(min_len)?;
+    let max_len = p.u32()? as usize;
+    let max_bytes = p.bytes(max_len)?;
+    let stat_min = decode_stat(column_id, min_bytes)?;
+    let stat_max = decode_stat(column_id, max_bytes)?;
+    if value_count != expected_value_count {
+        // One typed message; `what` distinguishes which section disagreed.
+        return Err(SegmentError::Corrupt(match what {
+            "retraction_count" => "retraction column value_count disagrees with retraction_count",
+            _ => "column value_count disagrees with row-group row_count",
+        }));
+    }
+    Ok(ColumnChunkMeta {
+        column_id,
+        codec,
+        offset,
+        length,
+        value_count,
+        stat_min,
+        stat_max,
     })
 }
 
@@ -482,21 +635,29 @@ fn decode_stat(col: ColumnId, bytes: &[u8]) -> Result<Option<ZoneBound>, Segment
 fn build_zone_map(footer: &Footer) -> ZoneMap {
     // Fold over the columns the footer actually declares, not a fixed list:
     // the always-on set plus, for a valid-time table, valid_from / valid_to
-    // ([STL-117]). Collecting the present ids keeps this schema-agnostic — a
-    // future opt-in column flows through without touching this fold.
+    // ([STL-117]), plus the retraction tombstone columns when present (v7,
+    // STL-143). Collecting the present ids keeps this schema-agnostic — a future
+    // opt-in column flows through without touching this fold, and a tombstone
+    // column prunes (e.g. by `retract_key` or `retract_closed_at`) exactly like a
+    // version column.
+    let all_metas = || {
+        footer
+            .row_groups
+            .iter()
+            .flat_map(|rg| rg.columns.iter())
+            .chain(footer.retractions.iter())
+    };
     let mut present: Vec<ColumnId> = Vec::new();
-    for rg in &footer.row_groups {
-        for c in &rg.columns {
-            if !present.contains(&c.column_id) {
-                present.push(c.column_id);
-            }
+    for c in all_metas() {
+        if !present.contains(&c.column_id) {
+            present.push(c.column_id);
         }
     }
     let bounds = present.into_iter().map(|col| {
         let mut min: Option<ZoneBound> = None;
         let mut max: Option<ZoneBound> = None;
-        for rg in &footer.row_groups {
-            for c in rg.columns.iter().filter(|c| c.column_id == col) {
+        {
+            for c in all_metas().filter(|c| c.column_id == col) {
                 // Compare by reference (`ZoneBound` isn't `Copy`); replace only
                 // on a *provable* same-variant ordering. Every chunk for one
                 // column shares that column's type, so the fold always sees a
@@ -729,6 +890,9 @@ mod tests {
             out.extend_from_slice(&0u32.to_le_bytes()); // stat_max_len
             offset += 16;
         }
+        // Retraction section (format v7): empty for these version-only fixtures.
+        out.extend_from_slice(&0u32.to_le_bytes()); // retraction_count
+        out.extend_from_slice(&0u32.to_le_bytes()); // retraction_column_count
         out
     }
 
@@ -767,6 +931,26 @@ mod tests {
         for col in &footer.row_groups[0].columns {
             assert_eq!(col.value_count, 7);
         }
+    }
+
+    #[test]
+    fn inconsistent_retraction_section_is_rejected() {
+        // A footer claiming 3 tombstone rows but 0 retraction columns: a reader
+        // that trusted only the column list would silently report no deletes,
+        // masking the corruption. The self-consistency check must reject it.
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u32.to_le_bytes()); // schema_id
+        out.extend_from_slice(&0u32.to_le_bytes()); // flags
+        out.extend_from_slice(&1u32.to_le_bytes()); // row_group_count
+        out.extend_from_slice(&0u32.to_le_bytes()); // row_count
+        out.extend_from_slice(&0u32.to_le_bytes()); // column_count
+        out.extend_from_slice(&3u32.to_le_bytes()); // retraction_count (non-zero)
+        out.extend_from_slice(&0u32.to_le_bytes()); // retraction_column_count (zero)
+        let err = parse_footer(&out).unwrap_err();
+        assert!(
+            matches!(err, SegmentError::Corrupt(msg) if msg.contains("retraction section inconsistent")),
+            "count/column disagreement must be rejected, got {err:?}"
+        );
     }
 
     #[test]

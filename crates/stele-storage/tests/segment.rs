@@ -23,7 +23,10 @@ use std::sync::{Arc, Mutex};
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::SystemTimeMicros;
 use stele_storage::delta::{BusinessKey, Version};
-use stele_storage::segment::{ColumnData, ColumnId, SegmentError, SegmentReader, SegmentWriter};
+use stele_storage::segment::{
+    ColumnData, ColumnId, SegmentError, SegmentReader, SegmentWriter, ZoneBound,
+};
+use stele_storage::validity::Close;
 use stele_storage::wal::{Disk, DiskFile};
 
 // --- MemDisk: minimal in-memory Disk for tests ------------------------------
@@ -148,6 +151,115 @@ fn write_segment(disk: &MemDisk, name: &str, versions: &[Version]) {
         w.push(v.clone()).expect("push");
     }
     w.finish().expect("finish");
+}
+
+/// A retraction tombstone closing `(key, target)` at `closed_at` by `txn` —
+/// mirrors the [`Close`] the delete write path stages into the delta tier (STL-143).
+fn retraction(key: &[u8], target: i64, closed_at: i64, txn: u64) -> Close {
+    Close {
+        business_key: BusinessKey::new(key.to_vec()),
+        sys_from: SystemTimeMicros(target),
+        sys_to: SystemTimeMicros(closed_at),
+        closed_by: Provenance::new(
+            TxnId(txn),
+            SystemTimeMicros(closed_at),
+            Principal::new(format!("deleter-{txn}").into_bytes()),
+        ),
+    }
+}
+
+/// Write a segment carrying both versions and retraction tombstones (format v7),
+/// then read both sections back.
+fn round_trip(
+    disk: &MemDisk,
+    name: &str,
+    versions: &[Version],
+    retractions: &[Close],
+) -> (Vec<Version>, Vec<Close>) {
+    let mut w = SegmentWriter::create(disk, name).expect("create writer");
+    for v in versions {
+        w.push(v.clone()).expect("push");
+    }
+    for r in retractions {
+        w.push_retraction(r.clone()).expect("push retraction");
+    }
+    w.finish().expect("finish");
+    let reader = SegmentReader::open(disk, name).expect("open");
+    let v = reader.read_versions().expect("read versions");
+    let r = reader.read_retractions().expect("read retractions");
+    (v, r)
+}
+
+/// Retraction tombstones survive the columnar round-trip alongside versions,
+/// independently of the version row count (format v7, STL-143).
+#[test]
+fn retractions_round_trip_alongside_versions() {
+    let disk = MemDisk::new();
+    let versions = vec![version(b"a", 10, b"a0"), version(b"a", 30, b"a2")];
+    // Two tombstones — note: more versions than retractions, so the section's
+    // value count is genuinely decoupled from the row-group row count.
+    let retractions = vec![retraction(b"a", 10, 20, 7), retraction(b"b", 5, 25, 9)];
+    let (got_v, got_r) = round_trip(&disk, "rt.seg", &versions, &retractions);
+
+    assert_eq!(got_v.len(), 2, "versions round-trip unchanged");
+    assert_eq!(got_r, retractions, "tombstones round-trip field-for-field");
+}
+
+/// A delete-only flush (no surviving versions in this segment) still produces a
+/// valid segment whose tombstones read back — the version row count is zero while
+/// the retraction count is not.
+#[test]
+fn retraction_only_segment_round_trips() {
+    let disk = MemDisk::new();
+    let retractions = vec![retraction(b"gone", 1, 2, 3)];
+    let (got_v, got_r) = round_trip(&disk, "tombs.seg", &[], &retractions);
+    assert!(got_v.is_empty(), "no versions in a delete-only segment");
+    assert_eq!(got_r, retractions);
+}
+
+/// A segment with no deletes writes no retraction columns at all (the
+/// optional-columns pattern); `read_retractions` returns empty.
+#[test]
+fn segment_without_deletes_has_no_retraction_section() {
+    let disk = MemDisk::new();
+    let (_v, got_r) = round_trip(&disk, "clean.seg", &sample_workload(), &[]);
+    assert!(
+        got_r.is_empty(),
+        "no tombstone columns when nothing was deleted"
+    );
+}
+
+/// Tombstone columns are zone-map-prunable: the retraction `retract_key` and
+/// `retract_closed_at` columns carry min/max stats in the resident zone map, so
+/// the planner can skip a segment whose tombstones cannot match.
+#[test]
+fn retraction_columns_populate_the_zone_map() {
+    let disk = MemDisk::new();
+    let retractions = vec![
+        retraction(b"a", 10, 20, 1),
+        retraction(b"m", 30, 40, 2),
+        retraction(b"z", 50, 60, 3),
+    ];
+    let mut w = SegmentWriter::create(&disk, "zm.seg").expect("create");
+    w.push(version(b"a", 10, b"a")).expect("push");
+    for r in retractions {
+        w.push_retraction(r).expect("push retraction");
+    }
+    w.finish().expect("finish");
+    let reader = SegmentReader::open(&disk, "zm.seg").expect("open");
+    let zm = reader.zone_map();
+
+    let key_zone = zm
+        .column(ColumnId::RetractKey)
+        .expect("retract_key has a zone entry");
+    assert_eq!(key_zone.min, ZoneBound::Bytes(b"a".to_vec()));
+    assert_eq!(key_zone.max, ZoneBound::Bytes(b"z".to_vec()));
+
+    let closed_zone = zm
+        .column(ColumnId::RetractClosedAt)
+        .expect("retract_closed_at has a zone entry");
+    assert_eq!(closed_zone.min, ZoneBound::I64(20));
+    assert_eq!(closed_zone.max, ZoneBound::I64(60));
 }
 
 /// A representative workload: a handful of business keys with version chains
