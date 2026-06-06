@@ -890,9 +890,8 @@ fn segment_bound(
     reader: &SegmentReader<CountingFile>,
     index: &ValidityIndex<MemDisk>,
 ) -> SysUpperBound {
-    let keys = reader.version_keys().expect("version keys");
     index
-        .sys_upper_bound(keys.iter().map(|(k, s)| (k, *s)))
+        .sys_upper_bound(reader.version_keys().expect("version keys"))
         .expect("upper bound")
 }
 

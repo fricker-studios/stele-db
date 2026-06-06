@@ -189,7 +189,7 @@ impl Close {
 /// derived from the [`ValidityIndex`] ([`ValidityIndex::sys_upper_bound`]).
 ///
 /// It answers the question a sealed segment's zone map cannot — the segment
-/// stores only `sys_from`, never `sys_to` (v6, [ADR-0023](super)) — namely
+/// stores only `sys_from`, never `sys_to` (v6, [ADR-0023]) — namely
 /// *whether every row in a segment was already superseded at a snapshot*. That
 /// restores the upper-bound ("all rows already superseded") half of the
 /// system-time segment prune the zone map lost when `sys_to` left the record
@@ -466,22 +466,39 @@ impl<D: Disk> ValidityIndex<D> {
     /// index is *open*, so a single open version forces `Unbounded` and the
     /// segment is kept (never a false negative).
     ///
-    /// Short-circuits to `Unbounded` on the first open version. Resident entries
-    /// resolve from memory; a (rare) spilled entry costs the same per-lookup
-    /// spill scan as [`Self::close_of`], which this iterates.
+    /// Short-circuits to `Unbounded` on the first open version. The hot path —
+    /// resident entries, no spills — is **allocation-free**: each version's key
+    /// is *moved* into the `BTreeMap` probe tuple rather than cloned (unlike
+    /// [`Self::close_of`], whose borrowed signature forces a clone). Only the rare
+    /// resident-miss-with-spills case falls back to [`Self::close_of`]'s
+    /// per-lookup spill scan. Takes owned `(BusinessKey, SystemTimeMicros)` items
+    /// for exactly this reason — feed it [`SegmentReader::version_keys`] directly.
     ///
     /// [`SegmentReader::version_keys`]: crate::segment::SegmentReader::version_keys
     ///
     /// # Errors
     ///
     /// [`ValidityError::Corrupt`] / [`ValidityError::Io`] loading a spill file.
-    pub fn sys_upper_bound<'a, I>(&self, versions: I) -> Result<SysUpperBound, ValidityError>
+    pub fn sys_upper_bound<I>(&self, versions: I) -> Result<SysUpperBound, ValidityError>
     where
-        I: IntoIterator<Item = (&'a BusinessKey, SystemTimeMicros)>,
+        I: IntoIterator<Item = (BusinessKey, SystemTimeMicros)>,
     {
         let mut max_sys_to = SystemTimeMicros(i64::MIN);
         for (key, sys_from) in versions {
-            match self.close_of(key, sys_from)? {
+            // Move the key into the lookup tuple — the resident probe needs no
+            // clone. Recover it from the tuple only when a resident miss with
+            // live spills forces a spill scan.
+            let probe = (key, sys_from);
+            if let Some(interval) = self.mem.get(&probe) {
+                max_sys_to = max_sys_to.max(interval.sys_to);
+                continue;
+            }
+            if self.live_spills.is_empty() {
+                // Not resident and nothing spilled ⇒ the version is open ⇒ +∞.
+                return Ok(SysUpperBound::Unbounded);
+            }
+            let (key, sys_from) = probe;
+            match self.close_of(&key, sys_from)? {
                 Some(interval) => max_sys_to = max_sys_to.max(interval.sys_to),
                 // An open version's end is +∞: the set can never be pruned.
                 None => return Ok(SysUpperBound::Unbounded),
@@ -727,9 +744,7 @@ mod tests {
             (bk(b"a"), SystemTimeMicros(100)),
             (bk(b"b"), SystemTimeMicros(10)),
         ];
-        let bound = idx
-            .sys_upper_bound(keys.iter().map(|(k, s)| (k, *s)))
-            .expect("bound");
+        let bound = idx.sys_upper_bound(keys).expect("bound");
         assert_eq!(bound, SysUpperBound::Bounded(SystemTimeMicros(250)));
     }
 
@@ -743,9 +758,7 @@ mod tests {
             (bk(b"a"), SystemTimeMicros(0)),
             (bk(b"b"), SystemTimeMicros(10)),
         ];
-        let bound = idx
-            .sys_upper_bound(keys.iter().map(|(k, s)| (k, *s)))
-            .expect("bound");
+        let bound = idx.sys_upper_bound(keys).expect("bound");
         assert_eq!(bound, SysUpperBound::Unbounded);
         assert!(
             !bound.superseded_at_or_before(SystemTimeMicros(i64::MAX)),
@@ -757,7 +770,7 @@ mod tests {
     fn empty_set_is_vacuously_superseded() {
         let idx = index();
         let bound = idx
-            .sys_upper_bound(std::iter::empty::<(&BusinessKey, SystemTimeMicros)>())
+            .sys_upper_bound(std::iter::empty::<(BusinessKey, SystemTimeMicros)>())
             .expect("bound");
         assert_eq!(bound, SysUpperBound::Bounded(SystemTimeMicros(i64::MIN)));
         assert!(bound.superseded_at_or_before(SystemTimeMicros(0)));
@@ -770,9 +783,7 @@ mod tests {
         let mut idx = index();
         idx.insert_close(close(b"a", 0, 100, b"x")).expect("c0");
         let keys = [(bk(b"a"), SystemTimeMicros(0))];
-        let bound = idx
-            .sys_upper_bound(keys.iter().map(|(k, s)| (k, *s)))
-            .expect("bound");
+        let bound = idx.sys_upper_bound(keys).expect("bound");
         assert!(bound.superseded_at_or_before(SystemTimeMicros(100)));
         assert!(!bound.superseded_at_or_before(SystemTimeMicros(99)));
     }
@@ -793,9 +804,7 @@ mod tests {
             (bk(b"a"), SystemTimeMicros(0)),
             (bk(b"a"), SystemTimeMicros(100)),
         ];
-        let bound = idx
-            .sys_upper_bound(keys.iter().map(|(k, s)| (k, *s)))
-            .expect("bound");
+        let bound = idx.sys_upper_bound(keys).expect("bound");
         assert_eq!(bound, SysUpperBound::Bounded(SystemTimeMicros(300)));
     }
 }
