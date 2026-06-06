@@ -133,6 +133,33 @@ just cli shell            # open the interactive stele shell
 
 ---
 
+## Logging
+
+The engine emits **structured logs** through [`tracing`](https://docs.rs/tracing) — never `println!` in non-test code — with a per-connection span carrying the client's peer address, so concurrent connections stay legible. The global subscriber is installed once at server startup (STL-107).
+
+**Verbosity** is an [`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) directive read from `RUST_LOG`. When `RUST_LOG` is unset, the default is mode-dependent:
+
+| Mode            | Default filter      |
+| --------------- | ------------------- |
+| dev (`--dev`)   | `info,stele=debug`  |
+| operator (file) | `info`              |
+
+`RUST_LOG`, when set, always wins. Directives are crate/module targets (Stele's crates compile to `stele_*` targets):
+
+```bash
+RUST_LOG=stele_pgwire=trace just dev   # trace the wire front end; everything else stays at info
+RUST_LOG=warn just dev                 # quiet — warnings and errors only
+RUST_LOG=stele=debug,stele_storage=trace just dev
+```
+
+**Format** is text by default; set `STELE_LOG_FORMAT=json` for one JSON object per line, the shape a production log shipper ingests. Any other value (or unset) is the human-readable text formatter — a typo degrades to readable logs, it never drops output.
+
+```bash
+STELE_LOG_FORMAT=json stele-server --config stele.toml   # production: structured JSON
+```
+
+---
+
 ## The `stele` CLI
 
 One binary, two modes:

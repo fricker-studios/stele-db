@@ -54,7 +54,9 @@ tokio              = { version = "1.40", features = ["rt-multi-thread", "net", "
 # integration test (STL-147 DoD). Never a runtime dependency of a shipped crate.
 tokio-postgres     = "0.7"
 tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# `json` enables the line-delimited JSON formatter for production
+# (`STELE_LOG_FORMAT=json`, STL-107); it pulls in `serde_json` + `tracing-serde`.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 [workspace.lints.rust]
 unsafe_code     = "warn"
