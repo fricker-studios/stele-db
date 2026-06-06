@@ -43,5 +43,6 @@ mod index;
 mod spill;
 
 pub use index::{
-    Close, ClosedInterval, MAX_CLOSE_FRAME_LEN, ValidityConfig, ValidityError, ValidityIndex,
+    Close, ClosedInterval, MAX_CLOSE_FRAME_LEN, SysUpperBound, ValidityConfig, ValidityError,
+    ValidityIndex,
 };

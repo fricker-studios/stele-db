@@ -36,7 +36,7 @@ use stele_storage::backend::MemDisk;
 use stele_storage::delta::{BusinessKey, Snapshot, Version};
 use stele_storage::merge::{fold_chains, resolve_snapshot};
 use stele_storage::segment::{ColumnId, Predicate, SegmentReader, SegmentWriter, ZoneBound};
-use stele_storage::validity::{Close, ValidityConfig, ValidityIndex};
+use stele_storage::validity::{Close, SysUpperBound, ValidityConfig, ValidityIndex};
 use stele_storage::validtime::{VALID_TIME_PREFIX_LEN, ValidInterval, frame_payload};
 use stele_storage::wal::{Disk, DiskFile};
 
@@ -860,6 +860,216 @@ fn might_contain_never_prunes_a_real_valid_time_match() {
                 !real_match || kept,
                 "seed {seed}: might_contain pruned a valid-time segment holding a real match \
                  (snapshot={snapshot:?}, predicate={predicate:?}, rows={rows:?})"
+            );
+        }
+    }
+}
+
+// --- DoD: validity-index–backed segment prune (STL-139) ---------------------
+
+/// Record a materialized close `(key, sys_from) -> sys_to` in the index. The
+/// closer provenance is immaterial to the prune, so it is filled in mechanically.
+fn insert_close(index: &mut ValidityIndex<MemDisk>, key: &[u8], sys_from: i64, sys_to: i64) {
+    index
+        .insert_close(Close {
+            business_key: BusinessKey::new(key.to_vec()),
+            sys_from: SystemTimeMicros(sys_from),
+            sys_to: SystemTimeMicros(sys_to),
+            closed_by: Provenance::new(
+                TxnId(u64::try_from(sys_to).unwrap_or(0)),
+                SystemTimeMicros(sys_to),
+                Principal::new(b"closer".to_vec()),
+            ),
+        })
+        .expect("insert close");
+}
+
+/// Derive a segment's system-time upper bound from the index over its version
+/// identities — the planner's per-segment prune input ([STL-139]).
+fn segment_bound(
+    reader: &SegmentReader<CountingFile>,
+    index: &ValidityIndex<MemDisk>,
+) -> SysUpperBound {
+    index
+        .sys_upper_bound(reader.version_keys().expect("version keys"))
+        .expect("upper bound")
+}
+
+/// STL-139 DoD #1 (selectivity): the validity-index prune restores the
+/// upper-bound ("all rows already superseded") system-time skip the zone map lost
+/// when `sys_to` left the segment (v6, ADR-0023).
+///
+/// Three disjoint eras. era0's rows are all closed at 100; at snapshot 150 the
+/// zone map alone *keeps* era0 (it only prunes rows born after the snapshot), but
+/// the index proves every era0 row superseded at/before 150, so the planner skips
+/// it — matching pre-STL-133 selectivity and saving era0's bulk-column reads. The
+/// kept set still resolves to exactly the rows live at 150 (no visible row
+/// dropped).
+#[test]
+fn validity_index_prune_skips_an_all_superseded_segment() {
+    let disk = CountingDisk::new();
+    write_segment(
+        &disk,
+        "era0.seg",
+        &[version(b"a", 0, b"a@era0"), version(b"b", 10, b"b@era0")],
+    );
+    write_segment(
+        &disk,
+        "era1.seg",
+        &[version(b"a", 100, b"a@era1"), version(b"b", 100, b"b@era1")],
+    );
+    write_segment(
+        &disk,
+        "era2.seg",
+        &[version(b"a", 200, b"a@era2"), version(b"b", 200, b"b@era2")],
+    );
+
+    // era0 rows close at 100, era1 rows at 200, era2 rows stay open.
+    let mut index = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+    insert_close(&mut index, b"a", 0, 100);
+    insert_close(&mut index, b"b", 10, 100);
+    insert_close(&mut index, b"a", 100, 200);
+    insert_close(&mut index, b"b", 100, 200);
+
+    let names = ["era0.seg", "era1.seg", "era2.seg"];
+    let readers: Vec<SegmentReader<_>> = names
+        .iter()
+        .map(|n| SegmentReader::open(&disk, n).expect("open"))
+        .collect();
+    let snapshot = snap(150);
+
+    // The zone map alone keeps era0 and era1 (both have rows born <= 150) and
+    // prunes only era2 (born at 200) — the one-sided lower-bound prune.
+    let zone_keep: Vec<bool> = readers
+        .iter()
+        .map(|r| r.might_contain(&Predicate::All, snapshot))
+        .collect();
+    assert_eq!(zone_keep, vec![true, true, false]);
+
+    // The index upper bounds: era0 fully closed at 100, era1 at 200, era2 open.
+    let bounds: Vec<SysUpperBound> = readers.iter().map(|r| segment_bound(r, &index)).collect();
+    assert_eq!(bounds[0], SysUpperBound::Bounded(SystemTimeMicros(100)));
+    assert_eq!(bounds[1], SysUpperBound::Bounded(SystemTimeMicros(200)));
+    assert_eq!(bounds[2], SysUpperBound::Unbounded);
+
+    // Composed planner decision: keep iff the zone map keeps AND the index has
+    // not proven the segment fully superseded at the snapshot.
+    let keep: Vec<bool> = readers
+        .iter()
+        .zip(&bounds)
+        .map(|(r, b)| {
+            r.might_contain(&Predicate::All, snapshot) && !b.superseded_at_or_before(snapshot.0)
+        })
+        .collect();
+    assert_eq!(
+        keep,
+        vec![false, true, false],
+        "era0 now prunes on the index upper bound (all rows superseded at 100 <= 150)"
+    );
+
+    // No visible row dropped: resolving the index-kept set still yields exactly
+    // the two era1 rows live at snapshot 150.
+    let mut raw = Vec::new();
+    for (r, &k) in readers.iter().zip(&keep) {
+        if k {
+            raw.extend(r.read_versions().expect("read"));
+        }
+    }
+    let chains = fold_chains(raw, &index).expect("fold");
+    let live = resolve_snapshot(&chains, snapshot);
+    assert_eq!(live.len(), 2);
+    assert_eq!(live[0].payload, b"a@era1");
+    assert_eq!(live[1].payload, b"b@era1");
+
+    // I/O proof: pruning era0 on the index avoids its bulk-column reads. The
+    // index-composed keep scans only era1's chunks; the zone-only keep would also
+    // scan era0 — strictly more reads.
+    disk.reset_reads();
+    for (r, &k) in readers.iter().zip(&keep) {
+        if k {
+            let _ = r.read_versions().expect("read");
+        }
+    }
+    let reads_index_pruned = disk.reads();
+    disk.reset_reads();
+    for (r, &k) in readers.iter().zip(&zone_keep) {
+        if k {
+            let _ = r.read_versions().expect("read");
+        }
+    }
+    let reads_zone_only = disk.reads();
+    assert!(
+        reads_index_pruned < reads_zone_only,
+        "index prune ({reads_index_pruned} reads) must scan less than the zone-only keep \
+         ({reads_zone_only} reads) — it skipped era0's bulk columns"
+    );
+}
+
+/// STL-139 DoD #2 (no false negatives): the validity-index prune never drops a
+/// visible row. A seeded sweep builds segments with open and closed versions
+/// interleaved, records the closes in the index, then for many snapshots asserts
+/// the soundness contract — whenever the prune fires
+/// (`superseded_at_or_before`), a brute-force oracle confirms no row of the
+/// segment is visible at that snapshot. The bound's open/closed classification is
+/// checked against the oracle too: `Unbounded` exactly when some row is open.
+#[test]
+fn validity_index_prune_never_drops_a_visible_row() {
+    let keys: [&[u8]; 4] = [b"a", b"g", b"m", b"t"];
+    for seed in 0..300u64 {
+        let mut rng = Lcg(seed.wrapping_mul(2_654_435_761).wrapping_add(11));
+        let disk = CountingDisk::new();
+        let mut index =
+            ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+
+        // 1..=8 rows with *distinct* (key, sys_from) targets — the index is
+        // write-once per target, so duplicates are skipped. Each row is either
+        // open (no close recorded) or closed at a sys_to strictly after its
+        // sys_from. `rows` tracks the intended period end for the oracle; the
+        // segment itself stores only birth state (v6, ADR-0023).
+        let row_count = 1 + rng.below(8);
+        let mut rows: Vec<(Version, i64)> = Vec::new();
+        let mut used: std::collections::HashSet<(Vec<u8>, i64)> = std::collections::HashSet::new();
+        for _ in 0..row_count {
+            let key = keys[rng.below(keys.len() as u64) as usize];
+            let sys_from = rng.below(100) as i64;
+            if !used.insert((key.to_vec(), sys_from)) {
+                continue; // duplicate target — skip to keep the index write-once
+            }
+            let sys_to = if rng.below(4) == 0 {
+                SYSTEM_TIME_OPEN.0 // open: no close in the index
+            } else {
+                let to = sys_from + 1 + rng.below(100) as i64;
+                insert_close(&mut index, key, sys_from, to);
+                to
+            };
+            rows.push((version(key, sys_from, b"p"), sys_to));
+        }
+        let versions: Vec<Version> = rows.iter().map(|(v, _)| v.clone()).collect();
+        write_segment(&disk, "s.seg", &versions);
+        let reader = SegmentReader::open(&disk, "s.seg").expect("open");
+
+        let bound = segment_bound(&reader, &index);
+        let any_open = rows.iter().any(|(_, sys_to)| *sys_to == SYSTEM_TIME_OPEN.0);
+        assert_eq!(
+            matches!(bound, SysUpperBound::Unbounded),
+            any_open,
+            "seed {seed}: the bound is Unbounded exactly when some row is open (rows={rows:?})"
+        );
+
+        for _ in 0..24 {
+            let snapshot = snap(rng.below(220) as i64 - 5); // includes out-of-range
+            let pruned = bound.superseded_at_or_before(snapshot.0);
+
+            // Oracle: is any row visible at the snapshot? Visible iff
+            // sys_from <= snapshot < sys_to (the closed-period window).
+            let any_visible = rows
+                .iter()
+                .any(|(v, sys_to)| v.sys_from.0 <= snapshot.0.0 && snapshot.0.0 < *sys_to);
+
+            assert!(
+                !pruned || !any_visible,
+                "seed {seed}: index prune fired but a visible row exists \
+                 (snapshot={snapshot:?}, rows={rows:?})"
             );
         }
     }
