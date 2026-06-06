@@ -286,12 +286,15 @@ fn encode_column(
             encode_bytes_values(vals.into_iter())
         }
         ColumnType::I64 => {
-            let mut vals: Vec<i64> = Vec::with_capacity(rows.len());
-            for (i, row) in rows.iter().enumerate() {
-                // The `valid_from` / `valid_to` columns read from the per-row
-                // prefix decoded once up front (`decode_valid_pairs`); every
-                // other i64 column reads a `Version` field directly.
-                let v = match col {
+            // Stream the per-row values straight into the encoder — no
+            // intermediate `Vec<i64>`. `rows.iter().enumerate().map(..)` is an
+            // `ExactSizeIterator`, so `encode_i64_values` still reserves the full
+            // payload from `size_hint` up front. The `valid_from` / `valid_to`
+            // columns read from the prefix decoded once up front
+            // (`decode_valid_pairs`); every other i64 column reads a `Version`
+            // field directly.
+            Ok(encode_i64_values(rows.iter().enumerate().map(
+                |(i, row)| match col {
                     ColumnId::ValidFrom => {
                         valid_pairs.expect("valid-time schema carries decoded pairs")[i].0
                     }
@@ -299,10 +302,8 @@ fn encode_column(
                         valid_pairs.expect("valid-time schema carries decoded pairs")[i].1
                     }
                     _ => extract_i64(col, row),
-                };
-                vals.push(v);
-            }
-            Ok(encode_i64_values(vals.into_iter()))
+                },
+            )))
         }
     }
 }
