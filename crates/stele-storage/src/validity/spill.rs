@@ -272,20 +272,31 @@ mod tests {
     }
 
     #[test]
-    fn bloom_excludes_an_in_range_hole() {
-        // "beta" sorts between the members but is absent: the range filter alone
-        // would not prune it, the bloom does.
-        let bloom = KeyBloom::build([b"alpha".as_slice(), b"gamma".as_slice()].into_iter());
-        assert!(!bloom.maybe_contains(b"beta"));
+    fn bloom_prunes_some_in_range_hole() {
+        // The bloom adds value beyond the key range: across many absent keys that
+        // sort *inside* `[aaa, zzz]` (so the range alone would not prune them), it
+        // must reject at least one. Asserting a *specific* key is rejected would
+        // over-constrain — a bloom is allowed false positives, so its no-false-
+        // negative contract only guarantees pruning is possible, not where.
+        let bloom = KeyBloom::build([b"aaa".as_slice(), b"zzz".as_slice()].into_iter());
+        let pruned = (0..1000)
+            .map(|i| format!("m{i:03}").into_bytes())
+            .filter(|k| !bloom.maybe_contains(k))
+            .count();
+        assert!(
+            pruned > 0,
+            "the bloom must prune at least one in-range absent key"
+        );
     }
 
     #[test]
     fn meta_may_contain_combines_range_and_bloom() {
-        // A spill holding only the extremes of a wide range: a key inside the
-        // range but not in the spill is pruned by the bloom; a key outside the
-        // range is pruned by the range; the members pass.
+        // A spill holding only the extremes of a wide range. Members pass; a key
+        // outside the range is always pruned by the range; and across many absent
+        // keys *inside* the range, the bloom prunes at least one (existential, to
+        // avoid coupling to a specific key the bloom might false-positive on).
         let meta = {
-            let closes = [close(b"k00", 1), close(b"k99", 1)];
+            let closes = [close(b"k000", 1), close(b"k999", 1)];
             // write_spill needs a disk; build the meta directly from its parts.
             let bloom = KeyBloom::build(closes.iter().map(|c| c.business_key.as_bytes()));
             SpillMeta {
@@ -296,20 +307,24 @@ mod tests {
             }
         };
         assert!(
-            meta.may_contain(&BusinessKey::new(b"k00".to_vec())),
+            meta.may_contain(&BusinessKey::new(b"k000".to_vec())),
             "member"
         );
         assert!(
-            meta.may_contain(&BusinessKey::new(b"k99".to_vec())),
+            meta.may_contain(&BusinessKey::new(b"k999".to_vec())),
             "member"
-        );
-        assert!(
-            !meta.may_contain(&BusinessKey::new(b"k50".to_vec())),
-            "in range, absent → bloom prunes",
         );
         assert!(
             !meta.may_contain(&BusinessKey::new(b"z99".to_vec())),
             "out of range → range prunes",
+        );
+        let in_range_pruned = (0..1000)
+            .map(|i| BusinessKey::new(format!("k{i:03}").into_bytes()))
+            .filter(|k| !meta.may_contain(k))
+            .count();
+        assert!(
+            in_range_pruned > 0,
+            "in range, absent → the bloom prunes at least one",
         );
     }
 

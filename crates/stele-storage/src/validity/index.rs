@@ -461,15 +461,17 @@ impl<D: Disk> ValidityIndex<D> {
     ) -> Result<BTreeMap<(BusinessKey, SystemTimeMicros), ClosedInterval>, ValidityError> {
         use std::ops::Bound::Included;
         // Spills that may hold at least one requested key — each read at most once.
-        let selected: Vec<&spill::SpillMeta> = self
-            .live_spills
-            .iter()
-            .filter(|meta| keys.iter().any(|k| meta.may_contain(k)))
-            .collect();
-        // If the selective path would touch as many spills as a full sweep, the
-        // sweep is at least as cheap and simpler — take it.
-        if selected.len() >= self.live_spills.len() {
-            return self.materialize();
+        // Built incrementally so that the instant every spill is selected (a full
+        // sweep is then at least as cheap) we bail to `materialize` without
+        // finishing the scan or setting up any per-key spill read.
+        let mut selected: Vec<&spill::SpillMeta> = Vec::new();
+        for meta in &self.live_spills {
+            if keys.iter().any(|k| meta.may_contain(k)) {
+                selected.push(meta);
+                if selected.len() == self.live_spills.len() {
+                    return self.materialize();
+                }
+            }
         }
         let mut out: BTreeMap<(BusinessKey, SystemTimeMicros), ClosedInterval> = BTreeMap::new();
         for meta in selected {
