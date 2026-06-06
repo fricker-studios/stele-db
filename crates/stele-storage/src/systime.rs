@@ -389,8 +389,9 @@ impl<C: Clock> SysTimeWriter<C> {
         let prior =
             resolve_live(delta, sealed, index, &key, commit)?.ok_or(SysTimeError::KeyNotFound)?;
         // The superseding transaction both closes the prior period (stamping its
-        // identity as `closed_by`) and opens the new one — same `seq` / `txn_id` /
-        // `principal` for both halves.
+        // identity as `closed_by`) and opens the new one — same `txn_id` /
+        // `principal` for both halves. `seq` rides only on the new open version;
+        // the close is a validity-index entry and carries no `seq`.
         apply(
             delta,
             index,

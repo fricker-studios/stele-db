@@ -170,9 +170,9 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<DmlOutcome, DmlError> {
-        let (commit, redos) = self
-            .writer
-            .stage_insert(delta, index, sealed, key, valid, payload, seq, txn_id, principal)?;
+        let (commit, redos) = self.writer.stage_insert(
+            delta, index, sealed, key, valid, payload, seq, txn_id, principal,
+        )?;
         self.log_and_apply(delta, index, commit, redos)
     }
 
@@ -205,9 +205,9 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<DmlOutcome, DmlError> {
-        let (commit, redos) = self
-            .writer
-            .stage_update(delta, index, sealed, key, valid, payload, seq, txn_id, principal)?;
+        let (commit, redos) = self.writer.stage_update(
+            delta, index, sealed, key, valid, payload, seq, txn_id, principal,
+        )?;
         self.log_and_apply(delta, index, commit, redos)
     }
 
