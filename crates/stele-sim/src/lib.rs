@@ -21,16 +21,18 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
-use stele_storage::backend::{Disk, DiskFile, FaultOp, Faults, MemDisk};
+use stele_exec::{Column, SnapshotScan};
+use stele_storage::backend::{Disk, DiskFile, FaultOp, Faults, MemDisk, MemFile};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
 use stele_storage::dml::{self, DmlWriter};
 use stele_storage::merge;
-use stele_storage::segment::{SegmentReader, SegmentWriter};
-use stele_storage::systime::{EmptySealed, SysTimeWriter};
+use stele_storage::segment::{ColumnId, Predicate, SegmentReader, SegmentWriter};
+use stele_storage::systime::{EmptySealed, SealedSegments, SysTimeWriter};
 use stele_storage::validity::{Close, ValidityConfig, ValidityIndex};
 use stele_storage::validtime::{ValidInterval, ValidTimeWriter, unframe_payload};
 use stele_storage::wal::{Checkpoint, Wal, WalConfig};
@@ -743,6 +745,246 @@ pub fn run_fault_seed(seed: u64) -> Vec<bool> {
         .collect()
 }
 
+/// Collapse a [`SnapshotScan`] result projecting `[BusinessKey, Payload]` into a
+/// `{key → payload}` map — the shape the reference oracle also produces, so the
+/// two compare directly.
+fn scan_map(out: &stele_exec::ScanOutput) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let column = |col: ColumnId| {
+        out.batch
+            .columns
+            .iter()
+            .find(|(c, _)| *c == col)
+            .map(|(_, d)| d)
+    };
+    let (Some(Column::Bytes(keys)), Some(Column::Bytes(payloads))) =
+        (column(ColumnId::BusinessKey), column(ColumnId::Payload))
+    else {
+        panic!("scan must project BusinessKey and Payload as bytes columns");
+    };
+    keys.iter().cloned().zip(payloads.iter().cloned()).collect()
+}
+
+/// The reference oracle: per key, the committed timeline of payload-or-delete,
+/// keyed by the commit `sys_from`. Tier-agnostic — it models *logical* state, so
+/// it is an independent check on the merged read path, not a mirror of it.
+type ScanOracle = BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Option<Vec<u8>>>>;
+
+/// Apply one seeded DML op through [`DmlWriter`], recording the same logical
+/// effect into the reference `oracle`. `sealed` is built from every segment
+/// flushed so far so the writer's liveness resolution is correct across flush
+/// boundaries ([STL-140]). Returns `(commit, new_live)` for the key.
+#[allow(clippy::too_many_arguments)] // tier handles + sealed + oracle + key/op/state
+fn apply_scan_op(
+    writer: &mut DmlWriter<StepClock, MemDisk>,
+    delta: &mut Delta<MemDisk>,
+    index: &mut ValidityIndex<MemDisk>,
+    readers: &[SegmentReader<MemFile>],
+    oracle: &mut ScanOracle,
+    key: BusinessKey,
+    op: u64,
+    is_live: bool,
+    is_delete: bool,
+) -> (SystemTimeMicros, bool) {
+    let txn = TxnId(op);
+    let who = Principal::new(b"sim".to_vec());
+    let sealed = SealedSegments::new(readers);
+    if is_live && is_delete {
+        let c = writer
+            .delete(delta, index, &sealed, &key, txn, who)
+            .expect("delete")
+            .commit;
+        oracle.entry(key).or_default().insert(c, None);
+        return (c, false);
+    }
+    let payload = format!("v{op}").into_bytes();
+    let c = if is_live {
+        writer
+            .update(
+                delta,
+                index,
+                &sealed,
+                key.clone(),
+                None,
+                payload.clone(),
+                0,
+                txn,
+                who,
+            )
+            .expect("update")
+            .commit
+    } else {
+        writer
+            .insert(
+                delta,
+                index,
+                &sealed,
+                key.clone(),
+                None,
+                payload.clone(),
+                0,
+                txn,
+                who,
+            )
+            .expect("insert")
+            .commit
+    };
+    oracle.entry(key).or_default().insert(c, Some(payload));
+    (c, true)
+}
+
+/// Flush the resident delta into a fresh sealed segment and append its reader —
+/// the columnar flush boundary the scan must merge across.
+fn flush_into_segment(
+    seg_disk: &MemDisk,
+    name: &str,
+    delta: &mut Delta<MemDisk>,
+    readers: &mut Vec<SegmentReader<MemFile>>,
+) {
+    let rows = delta.flush_to_segment().expect("flush");
+    let mut w = SegmentWriter::create(seg_disk, name).expect("create segment");
+    for v in rows {
+        w.push(v).expect("push");
+    }
+    w.finish().expect("finish");
+    readers.push(SegmentReader::open(seg_disk, name).expect("open"));
+}
+
+/// Scan at one snapshot and assert it against the oracle and the prune invariant,
+/// folding the agreed answer into `digest`.
+fn verify_scan_at(
+    seed: u64,
+    delta: &Delta<MemDisk>,
+    index: &ValidityIndex<MemDisk>,
+    readers: &[SegmentReader<MemFile>],
+    oracle: &ScanOracle,
+    s: SystemTimeMicros,
+    digest: u64,
+) -> u64 {
+    let snapshot = Snapshot(s);
+    let out = SnapshotScan::new(delta, index, readers, snapshot)
+        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .execute()
+        .expect("snapshot scan");
+
+    // Prune invariant: the scan reads exactly the segments the zone maps did not
+    // prune at this snapshot (STL-100 DoD bullet 2).
+    let survivors = readers
+        .iter()
+        .filter(|r| r.might_contain(&Predicate::All, snapshot))
+        .count();
+    assert_eq!(
+        out.stats.segments_scanned, survivors,
+        "seed {seed}: segment reads must equal zone-map survivors at {s:?}",
+    );
+    assert_eq!(out.stats.segments_pruned, readers.len() - survivors);
+
+    // Oracle equivalence: the merged scan equals the tier-agnostic reference.
+    let got = scan_map(&out);
+    let mut want: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    for (key, timeline) in oracle {
+        if let Some((_, Some(payload))) = timeline.range(..=s).next_back() {
+            want.insert(key.as_bytes().to_vec(), payload.clone());
+        }
+    }
+    assert_eq!(
+        got, want,
+        "seed {seed}: snapshot scan disagrees with the reference oracle at {s:?}",
+    );
+
+    let mut digest = digest;
+    for (key, payload) in &want {
+        digest = fnv1a(digest, key);
+        digest = fnv1a(digest, payload);
+    }
+    let reads = u64::try_from(out.stats.segments_scanned).expect("read count fits u64");
+    fnv1a(digest, &reads.to_le_bytes())
+}
+
+/// Read a seeded, flush-interleaved workload back through [`SnapshotScan`].
+///
+/// Plays insert/update/delete with periodic flushes to sealed segments, then
+/// checks every snapshot against an independent in-memory reference oracle.
+/// This is the AS-OF correctness oracle the read path requires
+/// ([docs/06 §4](../../../docs/06-testing-strategy.md#4-correctness-oracles-the-temporal-heart),
+/// STL-100): the reference oracle models each key's history with no
+/// knowledge of tiers, so "the value of key `k` at `S`" is its latest event at or
+/// before `S`. The scan — merging the delta tier, however many sealed segments
+/// the seed flushed, and the validity index across those flush boundaries — must
+/// agree at every probe, and its segment-read count must equal the zone-map
+/// survivors (the prune invariant, DoD bullet 2). The returned digest folds every
+/// agreed `(snapshot, key, payload)` and read count. Same seed ⇒ same digest.
+///
+/// # Panics
+///
+/// Panics if the scan disagrees with the reference oracle, or if the segment
+/// read count differs from the zone-map survivor count — correctness
+/// regressions, not workload outcomes.
+#[must_use]
+pub fn run_snapshot_scan_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut rng = Rng::new(seed);
+    let seg_disk = MemDisk::new();
+    let wal = Wal::open(MemDisk::new(), WalConfig::default()).expect("open wal");
+    let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("open delta");
+    let mut index = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+    let mut writer = DmlWriter::new(wal, StepClock::new(1), false);
+    let mut readers: Vec<SegmentReader<MemFile>> = Vec::new();
+    let mut oracle: ScanOracle = BTreeMap::new();
+    let mut seg_idx = 0u32;
+
+    let key_count = 1 + rng.below_usize(5);
+    let keys: Vec<BusinessKey> = (0..key_count)
+        .map(|i| BusinessKey::new(format!("k-{i:04}").into_bytes()))
+        .collect();
+    let mut live = vec![false; key_count];
+    let mut commits: Vec<SystemTimeMicros> = Vec::new();
+
+    let ops = 12 + rng.below(36);
+    for op in 0..ops {
+        let k = rng.below_usize(key_count);
+        // Drawn only when the key is live, so the rng stream is independent of the
+        // (later) insert path — keeping every seed's op sequence deterministic.
+        let is_delete = live[k] && rng.below(4) == 0;
+        let (commit, new_live) = apply_scan_op(
+            &mut writer,
+            &mut delta,
+            &mut index,
+            &readers,
+            &mut oracle,
+            keys[k].clone(),
+            op,
+            live[k],
+            is_delete,
+        );
+        live[k] = new_live;
+        commits.push(commit);
+
+        if rng.below(3) == 0 && delta.byte_size() > 0 {
+            let name = format!("seg-{seg_idx:04}.seg");
+            seg_idx += 1;
+            flush_into_segment(&seg_disk, &name, &mut delta, &mut readers);
+        }
+    }
+
+    // Probe before any write, at every commit boundary, and just past the last —
+    // exercising the oracle equivalence across the whole timeline, with both
+    // resident-delta and fully-sealed tails depending on the seed's flushes.
+    let mut probes: Vec<SystemTimeMicros> = Vec::new();
+    if let Some(first) = commits.first() {
+        probes.push(SystemTimeMicros(first.0 - 1));
+    }
+    probes.extend(commits.iter().copied());
+    if let Some(last) = commits.last() {
+        probes.push(SystemTimeMicros(last.0 + 1));
+    }
+
+    let mut digest = FNV_OFFSET;
+    for s in probes {
+        digest = verify_scan_at(seed, &delta, &index, &readers, &oracle, s, digest);
+    }
+    digest
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,6 +1118,29 @@ mod tests {
         assert!(
             digests.len() > 1,
             "the MVCC commit/conflict workload must actually depend on the seed"
+        );
+    }
+
+    #[test]
+    fn snapshot_scan_seed_is_reproducible() {
+        // Each seed also asserts (internally) that the executor's merged AS-OF
+        // read matches the in-memory reference oracle and that segment reads
+        // equal the zone-map survivors at every probe (STL-100 DoD).
+        for seed in 0..64 {
+            assert_eq!(
+                run_snapshot_scan_seed(seed),
+                run_snapshot_scan_seed(seed),
+                "seed {seed} must replay to an identical snapshot-scan digest"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_scan_distinct_seeds_diverge() {
+        let digests: std::collections::HashSet<u64> = (0..64).map(run_snapshot_scan_seed).collect();
+        assert!(
+            digests.len() > 1,
+            "the snapshot-scan read workload must actually depend on the seed"
         );
     }
 }

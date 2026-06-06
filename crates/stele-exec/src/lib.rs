@@ -8,6 +8,10 @@
 //! scheduler ([ADR-0010](../../../docs/adr/0010-deterministic-simulation-testing.md))
 //! — no `tokio::spawn`, no wall-clock reads.
 //!
-//! Scaffold only at v0.1.
+//! v0.1 lands the read-path glue: [`SnapshotScan`], which merges the delta tier
+//! and the sealed segments into one snapshot-resolved, projected batch
+//! ([STL-100]).
 
-#![allow(dead_code)]
+mod snapshot_scan;
+
+pub use snapshot_scan::{Batch, Column, ScanError, ScanOutput, ScanStats, SnapshotScan};

@@ -16,3 +16,4 @@ workspace = true
 stele-storage = { workspace = true }
 stele-txn     = { workspace = true }
 stele-common  = { workspace = true }
+thiserror     = { workspace = true }
