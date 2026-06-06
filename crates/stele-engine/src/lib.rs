@@ -46,7 +46,7 @@ use stele_catalog::{Catalog, CatalogError};
 use stele_common::provenance::{Principal, TxnId};
 use stele_common::time::{Clock, SystemTimeMicros};
 use stele_exec::{Batch, ScanError, SnapshotScan};
-use stele_sql::ddl::DdlStatement;
+use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::select::SelectError;
 use stele_sql::{BindContext, BindError, Statement, bind_ddl, bind_select};
 use stele_storage::backend::Disk;
@@ -208,10 +208,11 @@ pub enum EngineError {
     #[error(transparent)]
     Scan(#[from] ScanError),
 
-    /// A statement named a table with no storage tier — it was never created, or
-    /// was dropped. (DDL keeps the catalog and the tier map in lock-step, so this
-    /// is reachable only via a stale name.)
-    #[error("table {0:?} has no storage tier in this session")]
+    /// A statement named a table that is not **live** in this session — it was
+    /// never created, or has been dropped. (A dropped table's tier is retained for
+    /// history, but the catalog no longer resolves the name at the current
+    /// snapshot, so writes and reads against it are refused.)
+    #[error("table {0:?} is not a live table in this session")]
     UnknownTable(String),
 
     /// A statement kind the session engine does not yet route. `INSERT` /
@@ -240,8 +241,10 @@ pub struct SessionEngine<C: Clock + Clone, D: Disk + Clone> {
     clock: MonotonicClock<C>,
     disk: D,
     tables: BTreeMap<String, TableState<C, D>>,
-    /// The next per-table namespace index to hand out — monotonic, so a dropped
-    /// and re-created name never reuses a prior table's on-disk slice.
+    /// The next per-table namespace index to hand out — only ever increases, so
+    /// each newly created table gets its own on-disk slice. A dropped name whose
+    /// tier is still resident keeps that slice on re-creation (the tier is reused,
+    /// not reopened), so its history is never dropped.
     next_namespace: u64,
 }
 
@@ -308,40 +311,58 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
 
     /// Apply a bound DDL statement, taking effect at the commit clock's next
     /// instant, and reconcile the tier map.
+    ///
+    /// For `CREATE TABLE` the storage tier is stood up **before** the catalog
+    /// mutation: if the backend fails to open the tier the statement aborts, so
+    /// the catalog never names a table with no storage behind it.
     fn apply_ddl(&mut self, ddl: DdlStatement) -> Result<StatementOutcome, EngineError> {
         let at = self.clock.now();
-        // `apply` consumes the bound statement (and owns the `IF EXISTS` no-op
-        // semantics); capture what standing up the tier needs first.
-        let to_create = match &ddl {
-            DdlStatement::CreateTable { name, temporal, .. } => {
-                Some((name.clone(), temporal.valid_time_enabled()))
+        match ddl {
+            DdlStatement::CreateTable {
+                name,
+                columns,
+                temporal,
+            } => {
+                // Open the tier first (for a fresh name only — a re-created name
+                // whose tier is still resident keeps it, so history is never
+                // dropped). A backend failure here propagates before the catalog
+                // is touched.
+                let tier = if self.tables.contains_key(&name) {
+                    None
+                } else {
+                    Some(self.open_tier(temporal.valid_time_enabled())?)
+                };
+                let schema_id = self
+                    .catalog
+                    .create_table(name.clone(), columns, temporal, at)?;
+                if let Some(tier) = tier {
+                    self.tables.insert(name, tier);
+                }
+                Ok(StatementOutcome::Ddl {
+                    tag: DdlOutcome::Created(schema_id).command_tag(),
+                })
             }
-            DdlStatement::DropTable { .. } => None,
-        };
-        let outcome = ddl.apply(&mut self.catalog, at)?;
-        if let Some((name, valid_time)) = to_create {
-            self.create_tier(&name, valid_time);
+            // A drop never opens storage; `apply` owns the `IF EXISTS` no-op.
+            DdlStatement::DropTable { .. } => {
+                let outcome = ddl.apply(&mut self.catalog, at)?;
+                Ok(StatementOutcome::Ddl {
+                    tag: outcome.command_tag(),
+                })
+            }
         }
-        Ok(StatementOutcome::Ddl {
-            tag: outcome.command_tag(),
-        })
     }
 
-    /// Stand up a fresh storage tier for `name` on its own namespace, unless one
-    /// already exists (a re-created name keeps its prior tier so history is never
-    /// dropped).
-    fn create_tier(&mut self, name: &str, valid_time: bool) {
-        if self.tables.contains_key(name) {
-            return;
-        }
-        let idx = self.next_namespace;
+    /// Open a fresh storage tier on the next namespace, advancing the namespace
+    /// counter only once the open succeeds.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Storage`] if the backend cannot open the tier's files.
+    fn open_tier(&mut self, valid_time: bool) -> Result<TableState<C, D>, EngineError> {
+        let disk = NamespacedDisk::new(self.disk.clone(), self.next_namespace);
+        let engine = Engine::open(disk, self.clock.clone(), valid_time)?;
         self.next_namespace += 1;
-        let disk = NamespacedDisk::new(self.disk.clone(), idx);
-        // `Engine::open` on a fresh namespace cannot fail to open empty tiers, but
-        // surface any backend error rather than panic.
-        let engine = Engine::open(disk, self.clock.clone(), valid_time)
-            .expect("opening empty tiers on a fresh namespace");
-        self.tables.insert(name.to_owned(), TableState { engine });
+        Ok(TableState { engine })
     }
 
     /// Run a snapshot scan over `table`'s tiers at `snapshot`, projecting the
@@ -437,7 +458,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         Ok(state.engine.delete(key, txn_id, principal)?)
     }
 
+    /// The mutable tier for `table`, but only if it names a **live** table.
+    ///
+    /// A dropped table keeps its tier resident (history is preserved), so a tier
+    /// in the map is not on its own proof the name is writable — the catalog is.
+    /// Guarding here keeps the typed DML writers from mutating a logically dropped
+    /// (or never-created) table.
     fn table_mut(&mut self, table: &str) -> Result<&mut TableState<C, D>, EngineError> {
+        if self.catalog.resolve(table, self.clock.current()).is_none() {
+            return Err(EngineError::UnknownTable(table.to_owned()));
+        }
         self.tables
             .get_mut(table)
             .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))
@@ -638,6 +668,29 @@ mod tests {
             .execute(&parse_one("SELECT id FROM account"))
             .unwrap_err();
         assert!(matches!(err, EngineError::Select(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn dml_against_a_dropped_table_is_refused() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("DROP TABLE account"))
+            .expect("drop");
+        // The tier is kept for history, but the catalog no longer resolves the
+        // name — a typed write must not mutate a logically dropped table.
+        let err = engine
+            .insert(
+                "account",
+                BusinessKey::new(b"1".to_vec()),
+                None,
+                b"100".to_vec(),
+                0,
+                TxnId(1),
+                Principal::new(b"demo".to_vec()),
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::UnknownTable(_)), "got {err:?}");
     }
 
     #[test]
