@@ -13,13 +13,16 @@ authors.workspace      = true
 workspace = true
 
 [dependencies]
-stele-sql    = { workspace = true }
-stele-exec   = { workspace = true }
-stele-common = { workspace = true }
-bytes        = { workspace = true }
-thiserror    = { workspace = true }
-tokio        = { workspace = true }
-tracing      = { workspace = true }
+stele-sql     = { workspace = true }
+stele-exec    = { workspace = true }
+stele-common  = { workspace = true }
+stele-engine  = { workspace = true }
+stele-storage = { workspace = true }
+stele-catalog = { workspace = true }
+bytes         = { workspace = true }
+thiserror     = { workspace = true }
+tokio         = { workspace = true }
+tracing       = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt"] }
