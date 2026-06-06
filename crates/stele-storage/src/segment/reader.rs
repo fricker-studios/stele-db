@@ -537,6 +537,16 @@ fn parse_footer(bytes: &[u8]) -> Result<Footer, SegmentError> {
             "retraction_count",
         )?);
     }
+    // The two retraction counts move together: the writer emits either an empty
+    // section (both zero) or the full tombstone column set with a positive row
+    // count. A footer claiming tombstone rows but no columns (or vice versa) would
+    // let `read_retractions` silently return empty on the `is_empty` short-circuit,
+    // masking the corruption — reject it here instead.
+    if (retraction_count == 0) != retractions.is_empty() {
+        return Err(SegmentError::Corrupt(
+            "retraction section inconsistent: row count and column presence disagree",
+        ));
+    }
     if !p.is_empty() {
         return Err(SegmentError::Corrupt("trailing bytes in footer"));
     }
@@ -921,6 +931,26 @@ mod tests {
         for col in &footer.row_groups[0].columns {
             assert_eq!(col.value_count, 7);
         }
+    }
+
+    #[test]
+    fn inconsistent_retraction_section_is_rejected() {
+        // A footer claiming 3 tombstone rows but 0 retraction columns: a reader
+        // that trusted only the column list would silently report no deletes,
+        // masking the corruption. The self-consistency check must reject it.
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u32.to_le_bytes()); // schema_id
+        out.extend_from_slice(&0u32.to_le_bytes()); // flags
+        out.extend_from_slice(&1u32.to_le_bytes()); // row_group_count
+        out.extend_from_slice(&0u32.to_le_bytes()); // row_count
+        out.extend_from_slice(&0u32.to_le_bytes()); // column_count
+        out.extend_from_slice(&3u32.to_le_bytes()); // retraction_count (non-zero)
+        out.extend_from_slice(&0u32.to_le_bytes()); // retraction_column_count (zero)
+        let err = parse_footer(&out).unwrap_err();
+        assert!(
+            matches!(err, SegmentError::Corrupt(msg) if msg.contains("retraction section inconsistent")),
+            "count/column disagreement must be rejected, got {err:?}"
+        );
     }
 
     #[test]

@@ -181,7 +181,7 @@ fn round_trip(
         w.push(v.clone()).expect("push");
     }
     for r in retractions {
-        w.push_retraction(r.clone());
+        w.push_retraction(r.clone()).expect("push retraction");
     }
     w.finish().expect("finish");
     let reader = SegmentReader::open(disk, name).expect("open");
@@ -243,7 +243,7 @@ fn retraction_columns_populate_the_zone_map() {
     let mut w = SegmentWriter::create(&disk, "zm.seg").expect("create");
     w.push(version(b"a", 10, b"a")).expect("push");
     for r in retractions {
-        w.push_retraction(r);
+        w.push_retraction(r).expect("push retraction");
     }
     w.finish().expect("finish");
     let reader = SegmentReader::open(&disk, "zm.seg").expect("open");

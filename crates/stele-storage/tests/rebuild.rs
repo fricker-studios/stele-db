@@ -116,7 +116,7 @@ fn seal(
         writer.push(v).expect("push");
     }
     for r in retractions {
-        writer.push_retraction(r);
+        writer.push_retraction(r).expect("push retraction");
     }
     writer.finish().expect("finish");
     let reader = SegmentReader::open(disk, name).expect("open segment");

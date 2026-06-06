@@ -116,8 +116,24 @@ impl<F: DiskFile> SegmentWriter<F> {
     /// row is not yet on disk; [`finish`](Self::finish) commits the retraction
     /// chunks after the version row-group. A segment with no retractions writes no
     /// retraction columns at all.
-    pub fn push_retraction(&mut self, close: Close) {
+    ///
+    /// # Errors
+    ///
+    /// [`SegmentError::TooLarge`] if the tombstone's `business_key` or closing
+    /// `principal` exceeds the `u32` length the retraction columns are framed
+    /// with — preflighted here so the error localizes to the offending row, just
+    /// as [`push`](Self::push) does for a [`Version`], rather than surfacing late
+    /// in [`finish`](Self::finish).
+    pub fn push_retraction(&mut self, close: Close) -> Result<(), SegmentError> {
+        if u32::try_from(close.business_key.as_bytes().len()).is_err()
+            || u32::try_from(close.closed_by.principal.as_bytes().len()).is_err()
+        {
+            return Err(SegmentError::TooLarge(
+                "retraction key/principal length exceeds u32::MAX in one chunk",
+            ));
+        }
         self.retractions.push(close);
+        Ok(())
     }
 
     /// Seal the segment: emit every buffered row as one row-group, then write
@@ -365,7 +381,10 @@ fn encode_bytes_values<'a>(
 /// bytes each. An empty column emits zero-length stat fields (the "no stats"
 /// sentinel).
 fn encode_i64_values(values: impl Iterator<Item = i64>) -> EncodedColumn {
-    let mut payload = Vec::new();
+    // 8 LE bytes per value — reserve from the iterator's lower bound to avoid
+    // re-growing the payload on a large column (the version path used to size
+    // this from `rows.len()`).
+    let mut payload = Vec::with_capacity(values.size_hint().0.saturating_mul(8));
     let mut min: Option<i64> = None;
     let mut max: Option<i64> = None;
     for v in values {
