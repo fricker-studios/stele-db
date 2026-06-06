@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use serde::Deserialize;
 use stele_common::DEFAULT_PG_PORT;
+use stele_common::time::SystemClock;
+use stele_engine::SessionEngine;
 use stele_pgwire::Server as PgServer;
 use stele_storage::backend::{AnyDisk, BackendKind};
 use tokio::signal;
@@ -136,10 +138,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     init_tracing(cfg.dev);
     info!(?cfg, "stele-server: starting");
 
-    // Construct the backend the operator selected. The WAL + delta + segment
-    // assembly site (a later ticket) will take this `disk`; for now constructing
-    // it proves the `[storage] backend` wiring end-to-end and surfaces a clear
-    // error if e.g. the local data dir is not creatable.
+    // Construct the backend the operator selected, then stand up the per-session
+    // engine on it — the Catalog + commit clock + per-table storage tiers that
+    // hold state across statements (STL-148). The pgwire loop will route parsed
+    // statements through `engine.execute` once DDL/DML wiring lands (STL-131 /
+    // STL-147); for now the daemon owns the engine instead of dropping the disk.
     let disk = AnyDisk::open(cfg.backend, &cfg.data_dir)
         .with_context(|| format!("opening {} storage backend", cfg.backend))?;
     info!(
@@ -147,7 +150,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         data_dir = %cfg.data_dir.display(),
         "storage backend ready"
     );
-    let _ = disk;
+    let engine = SessionEngine::open(disk, SystemClock);
+    info!("session engine ready");
 
     let pg = PgServer::new(cfg.listen);
 
@@ -157,6 +161,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             info!("received SIGINT, shutting down");
         }
     }
+
+    // Held across the whole serve loop; the pgwire routing tickets (STL-131 /
+    // STL-147) give `engine.execute` a caller. Dropped explicitly on shutdown.
+    drop(engine);
     Ok(())
 }
 

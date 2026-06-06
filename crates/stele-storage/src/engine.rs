@@ -402,6 +402,39 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     pub fn segment_names(&self) -> &[String] {
         &self.segment_names
     }
+
+    /// The delta tier handle, for a read operator (the `SnapshotScan` in
+    /// `stele-exec`) that needs to fold the resident rows itself. The point-lookup
+    /// [`as_of`](Self::as_of) merges the tiers internally; a full vectorized scan
+    /// borrows the tiers directly via this and [`index`](Self::index) /
+    /// [`open_segment_readers`](Self::open_segment_readers).
+    #[must_use]
+    pub const fn delta(&self) -> &Delta<D> {
+        &self.delta
+    }
+
+    /// The validity index handle — the system-time `sys_to` ends a read operator
+    /// overlays onto the delta + sealed candidates. See [`delta`](Self::delta).
+    #[must_use]
+    pub const fn index(&self) -> &ValidityIndex<D> {
+        &self.index
+    }
+
+    /// Re-open a [`SegmentReader`] over each validated sealed segment, in sorted
+    /// order — the sealed tier a full scan reads alongside the [`delta`](Self::delta)
+    /// tier. Each reader re-validates the segment header/footer CRC on open; the
+    /// engine keeps only the segment *names* resident (not open file handles), so
+    /// a scan materializes readers on demand here.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Segment`] if a segment fails to open or re-validate.
+    pub fn open_segment_readers(&self) -> Result<Vec<SegmentReader<D::File>>, EngineError> {
+        self.segment_names
+            .iter()
+            .map(|name| SegmentReader::open(&self.disk, name).map_err(EngineError::from))
+            .collect()
+    }
 }
 
 /// Build the canonical sealed-segment filename for `index`.

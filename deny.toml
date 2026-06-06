@@ -41,6 +41,7 @@ exceptions = [
     { allow = ["BUSL-1.1"], name = "stele-txn" },
     { allow = ["BUSL-1.1"], name = "stele-sql" },
     { allow = ["BUSL-1.1"], name = "stele-exec" },
+    { allow = ["BUSL-1.1"], name = "stele-engine" },
     { allow = ["BUSL-1.1"], name = "stele-pgwire" },
     { allow = ["BUSL-1.1"], name = "stele-lineage" },
     { allow = ["BUSL-1.1"], name = "stele-server" },

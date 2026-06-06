@@ -8,6 +8,7 @@ members = [
     "crates/stele-txn",
     "crates/stele-sql",
     "crates/stele-exec",
+    "crates/stele-engine",
     "crates/stele-pgwire",
     "crates/stele-lineage",
     "crates/stele-server",
@@ -32,6 +33,7 @@ stele-catalog  = { path = "crates/stele-catalog",  version = "0.1.0" }
 stele-txn      = { path = "crates/stele-txn",      version = "0.1.0" }
 stele-sql      = { path = "crates/stele-sql",      version = "0.1.0" }
 stele-exec     = { path = "crates/stele-exec",     version = "0.1.0" }
+stele-engine   = { path = "crates/stele-engine",   version = "0.1.0" }
 stele-pgwire   = { path = "crates/stele-pgwire",   version = "0.1.0" }
 stele-lineage  = { path = "crates/stele-lineage",  version = "0.1.0" }
 stele-server   = { path = "crates/stele-server",   version = "0.1.0" }
