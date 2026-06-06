@@ -215,6 +215,20 @@ pub enum EngineError {
     #[error("table {0:?} is not a live table in this session")]
     UnknownTable(String),
 
+    /// A `CREATE TABLE` re-created a still-resident dropped table under a
+    /// different valid-time policy than its retained tier was opened with. The
+    /// tier's writer bakes the policy in, so v0.1 refuses the change rather than
+    /// enforcing the stale one; re-creating with the original policy (or after a
+    /// fresh boot) is fine. Re-opening the tier under the new policy is a deferred
+    /// follow-up.
+    #[error(
+        "table {table:?} cannot be re-created with a different valid-time policy in the same session"
+    )]
+    ValidTimePolicyChange {
+        /// The re-created table name.
+        table: String,
+    },
+
     /// A statement kind the session engine does not yet route. `INSERT` /
     /// `UPDATE` / `DELETE` binding lands in [STL-149]; until then they reach the
     /// engine through the typed write methods, not `execute`.
@@ -227,6 +241,9 @@ pub enum EngineError {
 /// One table's live state inside a session.
 struct TableState<C: Clock + Clone, D: Disk + Clone> {
     engine: Engine<MonotonicClock<C>, NamespacedDisk<D>>,
+    /// The valid-time policy the tier's writer was opened with. Baked into the
+    /// `DmlWriter`, so a re-create that changes it cannot reuse this tier.
+    valid_time: bool,
 }
 
 /// The per-connection database engine: the catalog, the commit clock, and the
@@ -323,14 +340,20 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 columns,
                 temporal,
             } => {
-                // Open the tier first (for a fresh name only — a re-created name
-                // whose tier is still resident keeps it, so history is never
-                // dropped). A backend failure here propagates before the catalog
-                // is touched.
-                let tier = if self.tables.contains_key(&name) {
-                    None
-                } else {
-                    Some(self.open_tier(temporal.valid_time_enabled())?)
+                let valid_time = temporal.valid_time_enabled();
+                // A re-created name whose tier is still resident keeps it, so
+                // history is never dropped — but only if the valid-time policy is
+                // unchanged: the tier's writer bakes the policy in, so reusing it
+                // under a different policy would silently enforce the stale one
+                // (re-opening the tier with the new policy is the deferred
+                // alternative). A fresh name opens its tier first, so a backend
+                // failure aborts before the catalog is touched.
+                let tier = match self.tables.get(&name).map(|s| s.valid_time) {
+                    Some(prev) if prev != valid_time => {
+                        return Err(EngineError::ValidTimePolicyChange { table: name });
+                    }
+                    Some(_) => None,
+                    None => Some(self.open_tier(valid_time)?),
                 };
                 let schema_id = self
                     .catalog
@@ -362,7 +385,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let disk = NamespacedDisk::new(self.disk.clone(), self.next_namespace);
         let engine = Engine::open(disk, self.clock.clone(), valid_time)?;
         self.next_namespace += 1;
-        Ok(TableState { engine })
+        Ok(TableState { engine, valid_time })
     }
 
     /// Run a snapshot scan over `table`'s tiers at `snapshot`, projecting the
@@ -691,6 +714,65 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, EngineError::UnknownTable(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn recreate_with_a_different_valid_time_policy_is_refused() {
+        let mut engine = session();
+        // System-only table, then dropped (tier retained for history).
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("DROP TABLE account"))
+            .expect("drop");
+        // Re-create the same name as a valid-time table: the retained tier's
+        // writer was opened system-only, so the policy change is refused rather
+        // than silently enforcing the stale policy.
+        let err = engine
+            .execute(&parse_one(
+                "CREATE TABLE account (id INT PRIMARY KEY, vf TIMESTAMP, vt TIMESTAMP) \
+                 WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::ValidTimePolicyChange { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn recreate_with_the_same_policy_reuses_the_tier() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .insert(
+                "account",
+                BusinessKey::new(b"1".to_vec()),
+                None,
+                b"100".to_vec(),
+                0,
+                TxnId(1),
+                Principal::new(b"demo".to_vec()),
+            )
+            .expect("insert");
+        engine
+            .execute(&parse_one("DROP TABLE account"))
+            .expect("drop");
+        // Same (system-only) policy on re-create: the tier is reused, so the
+        // pre-drop history is still readable.
+        engine
+            .execute(&parse_one(CREATE))
+            .expect("re-create same policy");
+        let StatementOutcome::Rows(batch) = engine
+            .execute(&parse_one("SELECT id FROM account"))
+            .expect("select")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            payload_column(&batch),
+            &[b"100".to_vec()],
+            "history survives"
+        );
     }
 
     #[test]
