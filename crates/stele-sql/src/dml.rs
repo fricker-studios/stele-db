@@ -607,8 +607,9 @@ fn key_predicate(
             "a WHERE that is not `<key> = <literal>`".to_owned(),
         ));
     };
-    // Accept the column on either side: `id = 1` or `1 = id`.
-    let (column, value) = match (column_ref(left), column_ref(right)) {
+    // Accept the column on either side: `id = 1` or `1 = id`. A qualified column
+    // (`t.id`) surfaces `QualifiedName`, not the generic "not `<key> = <literal>`".
+    let (column, value) = match (column_side(left)?, column_side(right)?) {
         (Some(column), None) => (column, right.as_ref()),
         (None, Some(column)) => (column, left.as_ref()),
         _ => {
@@ -626,13 +627,24 @@ fn key_predicate(
     fold_value(value, table, key_col)
 }
 
-/// The column name an expression references, peeling parentheses; `None` for any
-/// non-column expression (so a literal side is told apart from a column side).
-fn column_ref(expr: &Expr) -> Option<&str> {
+/// The column name a `WHERE` side references, peeling parentheses.
+///
+/// `Ok(Some(name))` for a bare identifier, `Ok(None)` for a non-column expression
+/// (so a literal side is told apart from a column side), and
+/// [`Err(QualifiedName)`](DmlError::QualifiedName) for a qualified column like
+/// `t.id` — a clearer diagnostic than the generic "not `<key> = <literal>`".
+fn column_side(expr: &Expr) -> Result<Option<&str>, DmlError> {
     match expr {
-        Expr::Identifier(id) => Some(id.value.as_str()),
-        Expr::Nested(inner) => column_ref(inner),
-        _ => None,
+        Expr::Identifier(id) => Ok(Some(id.value.as_str())),
+        Expr::CompoundIdentifier(parts) => Err(DmlError::QualifiedName(
+            parts
+                .iter()
+                .map(|p| p.value.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
+        )),
+        Expr::Nested(inner) => column_side(inner),
+        _ => Ok(None),
     }
 }
 
@@ -1083,6 +1095,15 @@ mod tests {
                 table: "account".to_owned(),
                 column: "nonesuch".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn qualified_column_in_where_is_rejected_as_qualified_name() {
+        let catalog = account_catalog();
+        assert_eq!(
+            bind("DELETE FROM account WHERE account.id = 1", &catalog),
+            Err(DmlError::QualifiedName("account.id".to_owned()))
         );
     }
 
