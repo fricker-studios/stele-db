@@ -180,18 +180,72 @@ fn dev_scratch_dir() -> PathBuf {
     std::env::temp_dir().join(format!("stele-dev-{}", std::process::id()))
 }
 
+/// The environment variable that selects the log output format.
+const LOG_FORMAT_ENV: &str = "STELE_LOG_FORMAT";
+
+/// The verbosity filter applied when [`RUST_LOG`](EnvFilter::try_from_default_env)
+/// is unset: chatty for dev, quiet for an operator run.
+const fn default_filter(dev: bool) -> &'static str {
+    if dev { "info,stele=debug" } else { "info" }
+}
+
+/// How the subscriber renders each event — selected by `STELE_LOG_FORMAT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogFormat {
+    /// Human-readable text, the dev default.
+    Text,
+    /// One JSON object per line, for production log shippers
+    /// (`STELE_LOG_FORMAT=json`).
+    Json,
+}
+
+impl LogFormat {
+    /// Resolve the format from a raw `STELE_LOG_FORMAT` value. The match is
+    /// trimmed and case-insensitive; an unset, empty, or unrecognized value
+    /// falls back to [`LogFormat::Text`] so a typo degrades to readable logs
+    /// rather than silently changing format or dropping output.
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("json") => Self::Json,
+            _ => Self::Text,
+        }
+    }
+
+    /// Read [`LOG_FORMAT_ENV`] from the process environment.
+    fn from_env() -> Self {
+        Self::parse(std::env::var(LOG_FORMAT_ENV).ok().as_deref())
+    }
+}
+
+/// Install the global tracing subscriber.
+///
+/// Verbosity honors `RUST_LOG` (an [`EnvFilter`] directive string such as
+/// `stele_pgwire=trace`); when it is unset the [`default_filter`] for the mode
+/// applies. Output is human-readable text unless `STELE_LOG_FORMAT=json`
+/// selects the line-delimited JSON formatter for production
+/// ([05 — logging](../../../docs/05-dev-environment.md#logging)).
+///
+/// Uses `try_init`, so a second call (e.g. a test that already installed a
+/// subscriber) is a no-op rather than a panic.
 fn init_tracing(dev: bool) {
     use tracing_subscriber::{EnvFilter, fmt};
 
-    let default_filter = if dev { "info,stele=debug" } else { "info" };
     let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter(dev)));
 
-    let _ = fmt()
+    let builder = fmt()
         .with_env_filter(filter)
         .with_target(true)
-        .with_level(true)
-        .try_init();
+        .with_level(true);
+
+    match LogFormat::from_env() {
+        LogFormat::Json => {
+            let _ = builder.json().try_init();
+        }
+        LogFormat::Text => {
+            let _ = builder.try_init();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -255,5 +309,30 @@ mod tests {
         let cfg = Config::dev();
         assert!(cfg.dev);
         assert_eq!(cfg.backend, BackendKind::Local);
+    }
+
+    #[test]
+    fn log_format_selects_json_only_for_the_json_value() {
+        // The one value that opts into production JSON, including casing/padding
+        // a shell or orchestrator might introduce.
+        assert_eq!(LogFormat::parse(Some("json")), LogFormat::Json);
+        assert_eq!(LogFormat::parse(Some("JSON")), LogFormat::Json);
+        assert_eq!(LogFormat::parse(Some("  json  ")), LogFormat::Json);
+    }
+
+    #[test]
+    fn log_format_falls_back_to_text() {
+        // Unset, empty, and unrecognized all degrade to readable text rather
+        // than silently swallowing logs.
+        assert_eq!(LogFormat::parse(None), LogFormat::Text);
+        assert_eq!(LogFormat::parse(Some("")), LogFormat::Text);
+        assert_eq!(LogFormat::parse(Some("text")), LogFormat::Text);
+        assert_eq!(LogFormat::parse(Some("pretty")), LogFormat::Text);
+    }
+
+    #[test]
+    fn default_filter_is_verbose_in_dev_quiet_otherwise() {
+        assert_eq!(default_filter(true), "info,stele=debug");
+        assert_eq!(default_filter(false), "info");
     }
 }
