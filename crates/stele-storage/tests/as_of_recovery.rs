@@ -317,17 +317,29 @@ fn reference_as_of(model: &[Vec<Period>], s: i64) -> BTreeMap<BusinessKey, Vec<u
 
 /// The engine's answer at snapshot `s`: range-scan the delta tier, resolving each
 /// version's end from the validity index, and project to `key → payload`.
+///
+/// A duplicate key is a hard failure, not a silent overwrite: at any snapshot at
+/// most one version per key may be live (the [2D-tiling invariant], docs/16 §5),
+/// so two live rows for one key is exactly the correctness bug this oracle exists
+/// to catch — collecting into the map blind would hide it.
 fn engine_as_of(
     delta: &Delta<MemDisk>,
     index: &ValidityIndex<MemDisk>,
     s: i64,
 ) -> BTreeMap<BusinessKey, Vec<u8>> {
-    delta
+    let mut live = BTreeMap::new();
+    for v in delta
         .range_scan(.., Snapshot(SystemTimeMicros(s)), index)
         .expect("scan")
-        .into_iter()
-        .map(|v| (v.business_key, v.payload))
-        .collect()
+    {
+        let key = v.business_key.clone();
+        assert!(
+            live.insert(v.business_key, v.payload).is_none(),
+            "@ s={s}: range_scan returned two live versions for {key:?} — \
+             the at-most-one-active-version invariant is broken",
+        );
+    }
+    live
 }
 
 /// Over a seed sweep of random INSERT/UPDATE/DELETE histories: at *every* boundary
