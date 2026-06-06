@@ -418,9 +418,12 @@ name = "stele-pgwire"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "stele-catalog",
  "stele-common",
+ "stele-engine",
  "stele-exec",
  "stele-sql",
+ "stele-storage",
  "thiserror",
  "tokio",
  "tracing",

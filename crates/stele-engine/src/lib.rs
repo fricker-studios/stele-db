@@ -45,6 +45,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use stele_catalog::{Catalog, CatalogError};
 use stele_common::provenance::{Principal, TxnId};
 use stele_common::time::{Clock, SystemTimeMicros};
+use stele_common::types::LogicalType;
 use stele_exec::{Batch, ScanError, SnapshotScan};
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::select::SelectError;
@@ -183,6 +184,22 @@ pub enum StatementOutcome {
     Rows(Batch),
 }
 
+/// A live table's shape at the current read snapshot, for catalog introspection.
+///
+/// The pgwire front end's `pg_catalog` shim (the `psql \d` path, [STL-131]) reads
+/// these to answer "what columns does this table have?" without reaching into the
+/// catalog's internals. Each entry is a live table — one the catalog resolves at
+/// the engine's current instant — and its columns in declaration order.
+///
+/// [STL-131]: https://allegromusic.atlassian.net/browse/STL-131
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableDescription {
+    /// The table's name.
+    pub name: String,
+    /// The table's columns, in declaration order: each a `(name, type)` pair.
+    pub columns: Vec<(String, LogicalType)>,
+}
+
 /// Errors surfaced from the session engine.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -288,6 +305,35 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     #[must_use]
     pub const fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// The live tables and their columns at the current read snapshot.
+    ///
+    /// "Live" means the catalog resolves the name at the commit clock's current
+    /// instant — a dropped table keeps its tier resident for history but is not
+    /// reported here, so the result matches what a `\d`-style introspection query
+    /// should see *now*. Tables are returned in name order (the tier map is a
+    /// [`BTreeMap`]). Feeds the pgwire `pg_catalog` shim ([STL-131]).
+    ///
+    /// [STL-131]: https://allegromusic.atlassian.net/browse/STL-131
+    #[must_use]
+    pub fn describe_live_tables(&self) -> Vec<TableDescription> {
+        let snapshot = self.clock.current();
+        self.tables
+            .keys()
+            .filter_map(|name| {
+                let schema = self.catalog.resolve(name, snapshot)?;
+                let columns = schema
+                    .columns()
+                    .iter()
+                    .map(|c| (c.name().to_owned(), c.ty()))
+                    .collect();
+                Some(TableDescription {
+                    name: name.clone(),
+                    columns,
+                })
+            })
+            .collect()
     }
 
     /// Execute one parsed [`Statement`] against the session.
@@ -806,6 +852,48 @@ mod tests {
         let c = clock.now();
         assert!(a.0 < b.0 && b.0 < c.0, "shared mark advances across clones");
         assert_eq!(clock.current(), c, "current() is the last value handed out");
+    }
+
+    #[test]
+    fn describe_live_tables_reports_columns_and_excludes_dropped() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create account");
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE ledger (id INT PRIMARY KEY, amount INT) WITH SYSTEM VERSIONING",
+            ))
+            .expect("create ledger");
+
+        // Both tables are live; columns come back in declaration order.
+        let live = engine.describe_live_tables();
+        assert_eq!(
+            live,
+            vec![
+                TableDescription {
+                    name: "account".to_owned(),
+                    columns: vec![
+                        ("id".to_owned(), LogicalType::Int4),
+                        ("balance".to_owned(), LogicalType::Int4),
+                    ],
+                },
+                TableDescription {
+                    name: "ledger".to_owned(),
+                    columns: vec![
+                        ("id".to_owned(), LogicalType::Int4),
+                        ("amount".to_owned(), LogicalType::Int4),
+                    ],
+                },
+            ]
+        );
+
+        // A dropped table is no longer live, so it drops out of the listing even
+        // though its tier stays resident for history.
+        engine
+            .execute(&parse_one("DROP TABLE account"))
+            .expect("drop account");
+        let live = engine.describe_live_tables();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].name, "ledger");
     }
 
     fn payload_column(batch: &Batch) -> &[Vec<u8>] {

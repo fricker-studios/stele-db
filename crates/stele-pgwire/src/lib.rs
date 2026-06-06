@@ -52,10 +52,12 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+mod pg_catalog;
 mod text_format;
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -64,14 +66,20 @@ use tracing::{debug, error, info, instrument, warn};
 
 pub use stele_common::DEFAULT_PG_PORT;
 
+use stele_catalog::CatalogError;
+use stele_common::time::Clock;
 use stele_common::types::{LogicalType, ScalarValue};
+use stele_engine::{EngineError, SessionEngine, StatementOutcome, TableDescription};
+use stele_storage::backend::Disk;
 
 // The wire front end leans on stele-sql for parsing; `sqlparser` is re-exported
 // from there, so matching on the AST adds no new dependency.
-use stele_sql::Statement;
 use stele_sql::sqlparser::ast::{
     Expr, SelectItem, SetExpr, Statement as SqlStatement, UnaryOperator, Value,
 };
+use stele_sql::{BindError, Statement, bind_ddl};
+
+use pg_catalog::Introspection;
 
 // ---------------------------------------------------------------------------
 // Protocol constants
@@ -103,6 +111,14 @@ const MSG_EMPTY_QUERY_RESPONSE: u8 = b'I';
 const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
 const SQLSTATE_PROTOCOL_VIOLATION: &str = "08P01";
 const SQLSTATE_SYNTAX_ERROR: &str = "42601";
+// DDL-routing SQLSTATEs (STL-131): the standard Postgres codes for the catalog
+// failures a `CREATE`/`DROP TABLE` can hit, so a stock client classifies them
+// the way it would against Postgres.
+const SQLSTATE_DUPLICATE_TABLE: &str = "42P07";
+const SQLSTATE_UNDEFINED_TABLE: &str = "42P01";
+const SQLSTATE_DUPLICATE_COLUMN: &str = "42701";
+const SQLSTATE_INVALID_TABLE_DEFINITION: &str = "42P16";
+const SQLSTATE_INTERNAL_ERROR: &str = "XX000";
 
 // Text format code for `RowDescription` fields (binary is 1; a v0.2 concern).
 // The per-type OID and `typlen` advertised per field now come from the value's
@@ -121,16 +137,68 @@ const MAX_MESSAGE_PAYLOAD_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
 // version checks don't refuse us; the build component declares Stele.
 const REPORTED_SERVER_VERSION: &str = "16.0 (Stele 0.1.0-dev)";
 
+/// What the simple-query loop needs from the session engine.
+///
+/// The engine's `<Clock, Disk>` generics are erased here so the connection
+/// handler and [`Server`] carry one concrete handle type rather than threading
+/// generics through every layer.
+///
+/// This trait, behind a [`SharedSession`], is where the ticket's "decide where
+/// the `Catalog` + commit clock live" lands ([STL-131]): **one** [`SessionEngine`]
+/// shared across every connection, so a `CREATE TABLE` on any connection is
+/// visible to the next statement — including a later `\d` — instead of
+/// per-connection state a reconnect would silently lose. (Durable catalog state
+/// across a *restart* still needs catalog persistence, a separate concern.)
+///
+/// [STL-131]: https://allegromusic.atlassian.net/browse/STL-131
+pub trait SessionHandle: Send {
+    /// Run one parsed statement against the session — see
+    /// [`SessionEngine::execute`].
+    fn execute(&mut self, stmt: &Statement) -> Result<StatementOutcome, EngineError>;
+
+    /// The live tables and their columns at the current snapshot, for the
+    /// `pg_catalog` `\d` shim — see [`SessionEngine::describe_live_tables`].
+    fn describe_live_tables(&self) -> Vec<TableDescription>;
+}
+
+impl<C, D> SessionHandle for SessionEngine<C, D>
+where
+    C: Clock + Clone + Send + 'static,
+    D: Disk + Clone + Send + 'static,
+{
+    fn execute(&mut self, stmt: &Statement) -> Result<StatementOutcome, EngineError> {
+        Self::execute(self, stmt)
+    }
+
+    fn describe_live_tables(&self) -> Vec<TableDescription> {
+        Self::describe_live_tables(self)
+    }
+}
+
+/// A session handle shared across connections: one engine behind a mutex, with
+/// the `Arc` cloned into each connection task.
+///
+/// The guard is taken only for the **synchronous** `execute` / `describe_live_tables`
+/// call and dropped before any `await`, so a lock is never held across wire I/O
+/// (and one slow client cannot stall another mid-statement). The runtime-agnostic
+/// core stays unaware of `tokio`: this is a plain [`std::sync::Mutex`], locked and
+/// released entirely within synchronous helpers.
+pub type SharedSession = Arc<Mutex<dyn SessionHandle>>;
+
 /// pgwire front-end entry point. Bind, accept, dispatch.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 pub struct Server {
-    pub listen_addr: SocketAddr,
+    listen_addr: SocketAddr,
+    session: SharedSession,
 }
 
 impl Server {
     #[must_use]
-    pub const fn new(listen_addr: SocketAddr) -> Self {
-        Self { listen_addr }
+    pub fn new(listen_addr: SocketAddr, session: SharedSession) -> Self {
+        Self {
+            listen_addr,
+            session,
+        }
     }
 
     /// Bind the listen socket and serve connections until cancelled by the caller.
@@ -155,8 +223,9 @@ impl Server {
             debug!(%peer, "accepted connection");
             // Disable Nagle — short Postgres messages don't benefit from coalescing.
             let _ = stream.set_nodelay(true);
+            let session = Arc::clone(&self.session);
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, peer).await {
+                if let Err(e) = handle_connection(stream, peer, session).await {
                     warn!(%peer, error = %e, "connection closed with error");
                 }
             });
@@ -185,8 +254,12 @@ pub enum WireError {
 // Connection handler
 // ---------------------------------------------------------------------------
 
-#[instrument(skip(stream), fields(%peer))]
-async fn handle_connection(mut stream: TcpStream, peer: SocketAddr) -> Result<(), WireError> {
+#[instrument(skip(stream, session), fields(%peer))]
+async fn handle_connection(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    session: SharedSession,
+) -> Result<(), WireError> {
     // --- 1. Startup phase --------------------------------------------------
     let startup = read_startup(&mut stream).await?;
     debug!(?startup.params, "startup complete");
@@ -234,7 +307,7 @@ async fn handle_connection(mut stream: TcpStream, peer: SocketAddr) -> Result<()
                 // whether one of them errored (Postgres aborts the batch on the
                 // first error). `handle_simple_query` writes the per-statement
                 // replies; the trailing ReadyForQuery is ours.
-                handle_simple_query(&mut stream, &q).await?;
+                handle_simple_query(&mut stream, &q, &session).await?;
                 write_ready_for_query(&mut stream).await?;
             }
             other => {
@@ -266,10 +339,13 @@ async fn handle_connection(mut stream: TcpStream, peer: SocketAddr) -> Result<()
 /// `SELECT n`, `INSERT 0 n` (the leading `0` is the long-dead OID field, still
 /// emitted as `0`), `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`.
 ///
-/// Only [`CommandTag::Select`] is wired to a live path in this ticket; the DML
-/// and DDL variants exist so the routing tickets that build on the wire format
-/// ([STL-131] and the DML-routing follow-up) have one tested place to render
-/// their tags rather than re-deriving the convention.
+/// [`CommandTag::Select`] is on the live path (constant `SELECT` and the
+/// `pg_catalog` shim). DDL routing writes the engine's own tag
+/// ([`DdlOutcome::command_tag`](stele_sql::DdlOutcome::command_tag)) to the
+/// `CommandComplete` directly, so [`CommandTag::CreateTable`] /
+/// [`CommandTag::DropTable`] stay as the one tested place that pins the
+/// convention; the `INSERT`/`UPDATE`/`DELETE` variants land on the wire with DML
+/// routing (STL-147).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandTag {
     /// `SELECT n` — `n` rows returned.
@@ -322,11 +398,20 @@ struct ResultColumn {
 /// Dispatch in v0.1:
 /// * empty / whitespace-only input → `EmptyQueryResponse`;
 /// * a parse failure → `ErrorResponse` (SQLSTATE `42601`), no further statements;
+/// * a `pg_catalog` `\d` introspection query → `RowDescription` + `DataRow`s from
+///   the live catalog (the minimal shim, STL-131);
+/// * `CREATE` / `DROP TABLE` → routed through the session engine; success is a
+///   `CommandComplete` with the engine's tag, a failure an `ErrorResponse` that
+///   aborts the batch (STL-131);
 /// * a constant `SELECT` (tableless, integer-literal projection) →
 ///   `RowDescription` + one `DataRow` + `CommandComplete`;
-/// * anything that touches storage → `ErrorResponse` (SQLSTATE `0A000`), and the
-///   batch stops there, mirroring Postgres aborting on the first error.
-async fn handle_simple_query(stream: &mut TcpStream, sql: &str) -> Result<(), WireError> {
+/// * a table read or DML → `ErrorResponse` (SQLSTATE `0A000`); the batch stops
+///   there, mirroring Postgres aborting on the first error (routing is STL-147).
+async fn handle_simple_query(
+    stream: &mut TcpStream,
+    sql: &str,
+    session: &SharedSession,
+) -> Result<(), WireError> {
     if sql.trim().is_empty() {
         debug!("empty simple query");
         return write_empty_query_response(stream)
@@ -354,26 +439,191 @@ async fn handle_simple_query(stream: &mut TcpStream, sql: &str) -> Result<(), Wi
     }
 
     for stmt in &statements {
-        if let Some(columns) = constant_select(stmt) {
-            write_row_description(stream, &columns).await?;
-            write_data_row(stream, &columns).await?;
-            write_command_complete(stream, &CommandTag::Select(1)).await?;
-        } else {
-            // Table reads, DML, and DDL all need the server-session engine that
-            // does not exist yet; route them politely and abort the batch.
-            info!(query = %sql, "statement not yet routable through the simple-query loop");
-            write_error_response(
-                stream,
-                "ERROR",
-                SQLSTATE_FEATURE_NOT_SUPPORTED,
-                "v0.1 simple query runs constant SELECT only; table reads, DML, \
-                 and DDL over the wire arrive in STL-131 and the DML-routing follow-up",
-            )
-            .await?;
-            return Ok(());
+        // (1) `pg_catalog` introspection (`psql \d`) — answered from the live
+        // catalog through the minimal shim, ahead of every other route since
+        // these are `SELECT`s that would otherwise fall to the deferral arm.
+        if let Some(intro) = pg_catalog::classify(stmt) {
+            let (header, rows) = introspection_reply(&intro, session);
+            write_row_description(stream, &header).await?;
+            for row in &rows {
+                write_data_row(stream, row).await?;
+            }
+            let n = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+            write_command_complete(stream, &CommandTag::Select(n)).await?;
+            continue;
+        }
+
+        // (2) DDL — `CREATE` / `DROP TABLE` routed through the session engine
+        // (STL-131). `bind_ddl` is the classifier: `Ok` means it is DDL, a
+        // non-`NotDdl` error means it is malformed DDL we surface as such.
+        match bind_ddl(stmt) {
+            Ok(_) => match run_ddl(session, stmt) {
+                Ok(tag) => write_command_complete_tag(stream, tag).await?,
+                Err(e) => {
+                    info!(query = %sql, error = %e, "DDL failed");
+                    write_error_response(stream, "ERROR", sqlstate_for(&e), &e.to_string()).await?;
+                    return Ok(());
+                }
+            },
+            Err(BindError::NotDdl) => {
+                // (3) A constant `SELECT` (STL-104); otherwise table reads / DML
+                // still need the routing the follow-up owns (STL-147), so they
+                // are politely deferred and the batch aborts.
+                if let Some(columns) = constant_select(stmt) {
+                    write_row_description(stream, &columns).await?;
+                    write_data_row(stream, &columns).await?;
+                    write_command_complete(stream, &CommandTag::Select(1)).await?;
+                } else {
+                    info!(query = %sql, "statement not yet routable through the simple-query loop");
+                    write_error_response(
+                        stream,
+                        "ERROR",
+                        SQLSTATE_FEATURE_NOT_SUPPORTED,
+                        "v0.1 simple query runs constant SELECT and CREATE/DROP TABLE; \
+                         table reads and DML over the wire arrive in STL-147",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                // Malformed DDL — surface the bind error and abort the batch.
+                info!(query = %sql, error = %e, "DDL bind failed");
+                write_error_response(stream, "ERROR", SQLSTATE_SYNTAX_ERROR, &e.to_string())
+                    .await?;
+                return Ok(());
+            }
         }
     }
     Ok(())
+}
+
+/// Route a bound-DDL statement through the shared session engine and return its
+/// `CommandComplete` tag (`CREATE TABLE` / `DROP TABLE`).
+///
+/// The mutex guard is taken and released entirely here — a synchronous call —
+/// so it is never held across the caller's `await` writes. A poisoned mutex is
+/// recovered rather than propagated, so one panicking connection cannot wedge
+/// the whole server.
+fn run_ddl(session: &SharedSession, stmt: &Statement) -> Result<&'static str, EngineError> {
+    let mut engine = session.lock().unwrap_or_else(PoisonError::into_inner);
+    match engine.execute(stmt)? {
+        StatementOutcome::Ddl { tag } => Ok(tag),
+        // `bind_ddl` already classified this as DDL, so `execute` routes it to the
+        // DDL arm; a `Rows` outcome would be an internal contract break.
+        StatementOutcome::Rows(_) => Err(EngineError::Unsupported(
+            "DDL statement unexpectedly produced rows",
+        )),
+    }
+}
+
+/// Build the `(RowDescription header, DataRows)` reply for a recognized
+/// `pg_catalog` introspection query, reading the live tables under the session
+/// lock and releasing it before any wire write.
+///
+/// Shapes are fixed and documented (see [`pg_catalog`]): a relation lookup
+/// returns `(oid, nspname, relname)` for the named table (zero rows if absent);
+/// an attribute lookup returns `(attname, atttypname, attnum)` per column of the
+/// table whose synthetic `oid` matches (zero rows if none).
+fn introspection_reply(
+    intro: &Introspection,
+    session: &SharedSession,
+) -> (Vec<ResultColumn>, Vec<Vec<ResultColumn>>) {
+    let live = session
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .describe_live_tables();
+
+    match intro {
+        Introspection::Relation { name } => {
+            let header = vec![
+                field("oid", LogicalType::Int4),
+                field("nspname", LogicalType::Text),
+                field("relname", LogicalType::Text),
+            ];
+            let rows = live
+                .iter()
+                .find(|t| &t.name == name)
+                .map(|t| {
+                    vec![vec![
+                        cell(ScalarValue::Int4(oid_as_i32(&t.name))),
+                        cell(ScalarValue::Text("public".to_owned())),
+                        cell(ScalarValue::Text(t.name.clone())),
+                    ]]
+                })
+                .unwrap_or_default();
+            (header, rows)
+        }
+        Introspection::Attributes { oid } => {
+            let header = vec![
+                field("attname", LogicalType::Text),
+                field("atttypname", LogicalType::Text),
+                field("attnum", LogicalType::Int4),
+            ];
+            let rows = live
+                .iter()
+                .find(|t| pg_catalog::oid_for(&t.name) == *oid)
+                .map(|t| {
+                    t.columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (col_name, col_ty))| {
+                            let attnum = i32::try_from(i + 1).unwrap_or(i32::MAX);
+                            vec![
+                                cell(ScalarValue::Text(col_name.clone())),
+                                cell(ScalarValue::Text(col_ty.pg_type_name().to_owned())),
+                                cell(ScalarValue::Int4(attnum)),
+                            ]
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (header, rows)
+        }
+    }
+}
+
+/// A `RowDescription` field: a named column of a given type, with no cell value
+/// (the value is carried per-row in the `DataRow`s).
+fn field(name: &str, ty: LogicalType) -> ResultColumn {
+    ResultColumn {
+        name: name.to_owned(),
+        ty,
+        value: None,
+    }
+}
+
+/// A `DataRow` cell carrying a present value; the name is unused by the
+/// `DataRow` encoder, so it is left empty.
+const fn cell(value: ScalarValue) -> ResultColumn {
+    ResultColumn {
+        name: String::new(),
+        ty: value.logical_type(),
+        value: Some(value),
+    }
+}
+
+/// A table's synthetic `oid` as a clean `int4` (the hash is masked into the
+/// non-negative `i32` range, so the conversion never loses information).
+fn oid_as_i32(name: &str) -> i32 {
+    i32::try_from(pg_catalog::oid_for(name)).unwrap_or(i32::MAX)
+}
+
+/// The standard Postgres SQLSTATE for a DDL-routing failure, so a stock client
+/// classifies it the way it would against Postgres.
+const fn sqlstate_for(err: &EngineError) -> &'static str {
+    match err {
+        EngineError::Bind(_) => SQLSTATE_SYNTAX_ERROR,
+        EngineError::Catalog(CatalogError::TableAlreadyExists(_)) => SQLSTATE_DUPLICATE_TABLE,
+        EngineError::Catalog(CatalogError::UnknownTable(_)) => SQLSTATE_UNDEFINED_TABLE,
+        EngineError::Catalog(CatalogError::DuplicateColumn(_)) => SQLSTATE_DUPLICATE_COLUMN,
+        EngineError::Catalog(_) | EngineError::ValidTimePolicyChange { .. } => {
+            SQLSTATE_INVALID_TABLE_DEFINITION
+        }
+        // Storage/scan/select/unknown-table/unsupported can't arise from a DDL
+        // route, but map them rather than panic if the contract ever shifts.
+        _ => SQLSTATE_INTERNAL_ERROR,
+    }
 }
 
 /// Recognize a constant, tableless `SELECT` whose projection is integer literals
@@ -741,9 +991,15 @@ async fn write_data_row(stream: &mut TcpStream, columns: &[ResultColumn]) -> Res
 
 /// `CommandComplete` ('C') — the statement's [`CommandTag`] as a cstring.
 async fn write_command_complete(stream: &mut TcpStream, tag: &CommandTag) -> io::Result<()> {
-    let rendered = tag.render();
-    let mut payload = BytesMut::with_capacity(rendered.len() + 1);
-    payload.put_slice(rendered.as_bytes());
+    write_command_complete_tag(stream, &tag.render()).await
+}
+
+/// `CommandComplete` ('C') for a tag string produced elsewhere — the DDL route
+/// writes the engine's own tag ([`DdlOutcome::command_tag`](stele_sql::DdlOutcome::command_tag))
+/// directly rather than round-tripping it through [`CommandTag`].
+async fn write_command_complete_tag(stream: &mut TcpStream, tag: &str) -> io::Result<()> {
+    let mut payload = BytesMut::with_capacity(tag.len() + 1);
+    payload.put_slice(tag.as_bytes());
     payload.put_u8(0);
     write_framed(stream, MSG_COMMAND_COMPLETE, &payload).await
 }
@@ -785,6 +1041,28 @@ const fn default_parameter_status() -> [(&'static str, &'static str); 7] {
 mod tests {
     use super::*;
 
+    use stele_common::time::SystemTimeMicros;
+    use stele_storage::backend::MemDisk;
+
+    /// A constant inner clock; the engine's [`MonotonicClock`](stele_engine) turns
+    /// its readings into the strictly increasing `1, 2, 3, …` the DDL timeline
+    /// needs, and keeps the tests deterministic (no wall-clock reads).
+    #[derive(Debug, Clone, Copy)]
+    struct TestClock;
+    impl Clock for TestClock {
+        fn now(&self) -> SystemTimeMicros {
+            SystemTimeMicros(0)
+        }
+    }
+
+    /// A fresh server session over an in-memory backend — the real
+    /// [`SessionEngine`], so the DDL and `\d` tests exercise the production route
+    /// end to end (a `CREATE TABLE` actually registers a table and stands up its
+    /// tiers). Connection-protocol tests that never touch storage just ignore it.
+    fn test_session() -> SharedSession {
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), TestClock)))
+    }
+
     /// Read one typed backend message: `(kind, payload)` with the 5-byte header
     /// stripped. Panics on EOF — a test that loses the connection mid-protocol
     /// should fail loudly.
@@ -816,6 +1094,41 @@ mod tests {
         client.write_all(&q).await.unwrap();
     }
 
+    /// Send a simple query and collect every backend message up to (but not
+    /// including) the trailing `ReadyForQuery` — the whole reply to one `Q`.
+    async fn run_simple(client: &mut TcpStream, sql: &str) -> Vec<(u8, Vec<u8>)> {
+        send_query(client, sql).await;
+        let mut msgs = Vec::new();
+        loop {
+            let (kind, payload) = read_message(client).await;
+            if kind == MSG_READY_FOR_QUERY {
+                break;
+            }
+            msgs.push((kind, payload));
+        }
+        msgs
+    }
+
+    /// The field names of a `RowDescription` payload, skipping each field's
+    /// fixed 18-byte metadata tail (table OID, attr, type OID, typlen, typmod,
+    /// format).
+    fn parse_row_description_names(payload: &[u8]) -> Vec<String> {
+        let count = i16::from_be_bytes(payload[0..2].try_into().unwrap());
+        let mut names = Vec::new();
+        let mut pos = 2;
+        for _ in 0..count {
+            let end = payload[pos..].iter().position(|&b| b == 0).unwrap() + pos;
+            names.push(String::from_utf8(payload[pos..end].to_vec()).unwrap());
+            pos = end + 1 + 18;
+        }
+        names
+    }
+
+    /// The `CommandComplete` tag string (NUL stripped) from its payload.
+    fn command_tag(payload: &[u8]) -> String {
+        String::from_utf8(payload[..payload.len() - 1].to_vec()).unwrap()
+    }
+
     /// Stand up `handle_connection` on an ephemeral port, complete the startup
     /// handshake from the client side, and return `(server_join, client)` poised
     /// at `ReadyForQuery`.
@@ -825,7 +1138,7 @@ mod tests {
         let bound = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_connection(stream, peer).await
+            handle_connection(stream, peer, test_session()).await
         });
         let mut client = TcpStream::connect(bound).await.unwrap();
 
@@ -1092,7 +1405,7 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_connection(stream, peer).await
+            handle_connection(stream, peer, test_session()).await
         });
 
         let mut client = TcpStream::connect(bound).await.unwrap();
@@ -1183,7 +1496,7 @@ mod tests {
         let bound = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_connection(stream, peer).await
+            handle_connection(stream, peer, test_session()).await
         });
 
         let mut client = TcpStream::connect(bound).await.unwrap();
@@ -1255,7 +1568,7 @@ mod tests {
         let bound = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_connection(stream, peer).await
+            handle_connection(stream, peer, test_session()).await
         });
 
         let mut client = TcpStream::connect(bound).await.unwrap();
@@ -1314,7 +1627,7 @@ mod tests {
         let addr = reserved.local_addr().unwrap();
         drop(reserved);
 
-        let handle = tokio::spawn(Server::new(addr).run());
+        let handle = tokio::spawn(Server::new(addr, test_session()).run());
 
         // `Server::run` binds asynchronously; connect-retry until it is listening
         // (up to ~2s, generous for a loaded CI runner). Bail out loudly if the
@@ -1408,8 +1721,9 @@ mod tests {
     #[tokio::test]
     async fn table_read_is_politely_deferred() {
         let (server, mut client) = connect_past_handshake().await;
-        // A real table read needs the server-session engine (STL-131); until
-        // then it is feature_not_supported, never a crash or a wrong answer.
+        // A real table read needs the table-read wire path (STL-147); STL-131
+        // routes only DDL, so this stays feature_not_supported — never a crash or
+        // a wrong answer.
         send_query(&mut client, "SELECT balance FROM account").await;
 
         let (kind, payload) = read_message(&mut client).await;
@@ -1423,6 +1737,184 @@ mod tests {
 
         let (kind, _) = read_message(&mut client).await;
         assert_eq!(kind, MSG_READY_FOR_QUERY);
+        terminate(server, client).await;
+    }
+
+    const CREATE_ACCOUNT: &str =
+        "CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING";
+
+    #[tokio::test]
+    async fn create_table_over_the_wire_returns_command_complete() {
+        let (server, mut client) = connect_past_handshake().await;
+        let msgs = run_simple(&mut client, CREATE_ACCOUNT).await;
+        // A CREATE replies with exactly one CommandComplete tagged `CREATE TABLE`
+        // — no RowDescription/DataRow — then the caller's ReadyForQuery.
+        assert_eq!(msgs.len(), 1, "DDL emits only CommandComplete: {msgs:?}");
+        assert_eq!(msgs[0].0, MSG_COMMAND_COMPLETE);
+        assert_eq!(command_tag(&msgs[0].1), "CREATE TABLE");
+        terminate(server, client).await;
+    }
+
+    #[tokio::test]
+    async fn drop_table_over_the_wire_returns_command_complete() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+        let msgs = run_simple(&mut client, "DROP TABLE account").await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].0, MSG_COMMAND_COMPLETE);
+        assert_eq!(command_tag(&msgs[0].1), "DROP TABLE");
+        terminate(server, client).await;
+    }
+
+    #[tokio::test]
+    async fn drop_if_exists_absent_is_a_command_complete_not_an_error() {
+        let (server, mut client) = connect_past_handshake().await;
+        let msgs = run_simple(&mut client, "DROP TABLE IF EXISTS nope").await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].0, MSG_COMMAND_COMPLETE, "IF EXISTS no-op succeeds");
+        assert_eq!(command_tag(&msgs[0].1), "DROP TABLE");
+        terminate(server, client).await;
+    }
+
+    #[tokio::test]
+    async fn re_creating_a_table_is_a_duplicate_table_error() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+        // The second CREATE of the same name fails; the catalog error surfaces as
+        // an ErrorResponse carrying the duplicate-table SQLSTATE, and the engine
+        // state is unchanged.
+        let msgs = run_simple(&mut client, CREATE_ACCOUNT).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].0, MSG_ERROR_RESPONSE);
+        assert!(
+            msgs[0]
+                .1
+                .windows(5)
+                .any(|w| w == SQLSTATE_DUPLICATE_TABLE.as_bytes()),
+            "a re-create carries SQLSTATE 42P07: {:?}",
+            msgs[0].1
+        );
+        terminate(server, client).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unknown_table_is_an_undefined_table_error() {
+        let (server, mut client) = connect_past_handshake().await;
+        // DROP without IF EXISTS of a never-created table is an error (42P01).
+        let msgs = run_simple(&mut client, "DROP TABLE ghost").await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].0, MSG_ERROR_RESPONSE);
+        assert!(
+            msgs[0]
+                .1
+                .windows(5)
+                .any(|w| w == SQLSTATE_UNDEFINED_TABLE.as_bytes()),
+            "an unknown DROP carries SQLSTATE 42P01: {:?}",
+            msgs[0].1
+        );
+        terminate(server, client).await;
+    }
+
+    /// The ticket's Definition of Done, realized with an in-process synthetic
+    /// client (there is no `psql` in CI — the real-binary golden is STL-150):
+    /// `CREATE TABLE account …` then `\d account` resolves the table's columns
+    /// over the wire. `\d` is the two `pg_catalog` introspection queries `psql`
+    /// fires — relation lookup then attribute list — driven here directly.
+    #[tokio::test]
+    async fn psql_backslash_d_resolves_a_created_tables_columns() {
+        let (server, mut client) = connect_past_handshake().await;
+
+        // CREATE the demo table.
+        let created = run_simple(&mut client, CREATE_ACCOUNT).await;
+        assert_eq!(command_tag(&created[0].1), "CREATE TABLE");
+
+        // `\d` step 1: resolve `account` in pg_class to its oid.
+        let lookup = run_simple(
+            &mut client,
+            "SELECT c.oid, c.relname FROM pg_catalog.pg_class c WHERE c.relname = 'account'",
+        )
+        .await;
+        assert_eq!(lookup[0].0, MSG_ROW_DESCRIPTION);
+        assert_eq!(
+            parse_row_description_names(&lookup[0].1),
+            vec!["oid", "nspname", "relname"]
+        );
+        assert_eq!(lookup[1].0, MSG_DATA_ROW, "one row: the relation exists");
+        let row = parse_data_row(&lookup[1].1);
+        let oid = String::from_utf8(row[0].clone().expect("oid present")).unwrap();
+        assert_eq!(row[2].as_deref(), Some(b"account".as_ref()), "relname");
+        assert_eq!(command_tag(&lookup[2].1), "SELECT 1");
+
+        // `\d` step 2: list the relation's columns from pg_attribute by that oid.
+        let attrs = run_simple(
+            &mut client,
+            &format!(
+                "SELECT a.attname FROM pg_catalog.pg_attribute a \
+                 WHERE a.attrelid = {oid} AND a.attnum > 0 ORDER BY a.attnum"
+            ),
+        )
+        .await;
+        assert_eq!(attrs[0].0, MSG_ROW_DESCRIPTION);
+        assert_eq!(
+            parse_row_description_names(&attrs[0].1),
+            vec!["attname", "atttypname", "attnum"]
+        );
+        // Two DataRows — the table's two columns, in declaration order.
+        let columns: Vec<(String, String, String)> = attrs
+            .iter()
+            .filter(|(kind, _)| *kind == MSG_DATA_ROW)
+            .map(|(_, payload)| {
+                let cells = parse_data_row(payload);
+                let text = |i: usize| String::from_utf8(cells[i].clone().unwrap()).unwrap();
+                (text(0), text(1), text(2))
+            })
+            .collect();
+        assert_eq!(
+            columns,
+            vec![
+                ("id".to_owned(), "int4".to_owned(), "1".to_owned()),
+                ("balance".to_owned(), "int4".to_owned(), "2".to_owned()),
+            ],
+            "\\d account lists both columns with their types"
+        );
+        let tag = command_tag(&attrs.last().unwrap().1);
+        assert_eq!(tag, "SELECT 2");
+
+        terminate(server, client).await;
+    }
+
+    #[tokio::test]
+    async fn backslash_d_on_a_missing_table_is_empty_not_an_error() {
+        let (server, mut client) = connect_past_handshake().await;
+        // No table created — the relation lookup resolves to zero rows (psql then
+        // prints "Did not find any relation named ..."), never an ErrorResponse.
+        let lookup = run_simple(
+            &mut client,
+            "SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relname = 'ghost'",
+        )
+        .await;
+        assert_eq!(lookup[0].0, MSG_ROW_DESCRIPTION);
+        assert!(
+            lookup.iter().all(|(kind, _)| *kind != MSG_DATA_ROW),
+            "no rows for an unknown relation"
+        );
+        assert_eq!(command_tag(&lookup.last().unwrap().1), "SELECT 0");
+        terminate(server, client).await;
+    }
+
+    #[tokio::test]
+    async fn create_then_select_one_still_round_trips_on_the_same_connection() {
+        // DDL routing must not disturb the constant-SELECT path that shares the
+        // loop: a CREATE followed by `SELECT 1` both work on one connection.
+        let (server, mut client) = connect_past_handshake().await;
+        let created = run_simple(&mut client, CREATE_ACCOUNT).await;
+        assert_eq!(command_tag(&created[0].1), "CREATE TABLE");
+
+        let select = run_simple(&mut client, "SELECT 1").await;
+        assert_eq!(select[0].0, MSG_ROW_DESCRIPTION);
+        assert_eq!(select[1].0, MSG_DATA_ROW);
+        assert_eq!(&select[1].1[6..], b"1");
+        assert_eq!(command_tag(&select[2].1), "SELECT 1");
         terminate(server, client).await;
     }
 }
