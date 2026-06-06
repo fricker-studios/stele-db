@@ -390,6 +390,7 @@ dependencies = [
  "stele-common",
  "stele-storage",
  "stele-txn",
+ "thiserror",
 ]
 
 [[package]]
@@ -436,6 +437,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "stele-common",
+ "stele-exec",
  "stele-storage",
  "stele-txn",
 ]
