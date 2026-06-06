@@ -344,7 +344,7 @@ fn predicate_filters_to_one_key() {
     let mut dml = DmlWriter::new(wal, StepClock::new(1_000), false);
 
     let mut last = SystemTimeMicros(0);
-    for id in 1..=3 {
+    for id in 1..=5 {
         last = dml
             .insert(
                 &mut delta,
@@ -363,14 +363,14 @@ fn predicate_filters_to_one_key() {
 
     let segments: [SegmentReader<MemFile>; 0] = [];
 
-    // No predicate → all three keys.
+    // No predicate → all five keys.
     let all = SnapshotScan::new(&delta, &index, &segments, Snapshot(last))
         .project(vec![ColumnId::BusinessKey])
         .execute()
         .expect("scan all");
-    assert_eq!(all.batch.rows, 3);
+    assert_eq!(all.batch.rows, 5);
 
-    // id = 2 → exactly one row.
+    // id = 2 → exactly one row (the business-key range pushes into the delta scan).
     let one = SnapshotScan::new(&delta, &index, &segments, Snapshot(last))
         .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
         .filter(Predicate::Eq {
@@ -382,6 +382,23 @@ fn predicate_filters_to_one_key() {
     assert_eq!(one.batch.rows, 1);
     assert_eq!(one_bytes(&one, ColumnId::BusinessKey), key_of(2).as_bytes());
     assert_eq!(one_bytes(&one, ColumnId::Payload), b"row-2");
+
+    // 2 <= id <= 4 → keys 2,3,4 — the Range branch of the key-range pushdown
+    // must stay conservative (drop nothing in [2, 4]).
+    let mid = SnapshotScan::new(&delta, &index, &segments, Snapshot(last))
+        .project(vec![ColumnId::BusinessKey])
+        .filter(Predicate::Range {
+            column: ColumnId::BusinessKey,
+            low: key_bound(2),
+            high: key_bound(4),
+        })
+        .execute()
+        .expect("scan 2..=4");
+    let keys: Vec<Vec<u8>> = match &mid.batch.columns[0].1 {
+        Column::Bytes(rows) => rows.clone(),
+        Column::I64(_) => panic!("business key is a bytes column"),
+    };
+    assert_eq!(keys, vec![key_of(2).0, key_of(3).0, key_of(4).0]);
 }
 
 // --- zone-map prune accounting (DoD bullet 2) ------------------------------

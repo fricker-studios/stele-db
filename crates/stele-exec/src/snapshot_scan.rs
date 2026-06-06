@@ -58,6 +58,7 @@
 //! read-count invariant stays a clean function of the zone maps alone.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 
 use stele_storage::backend::{Disk, DiskFile};
 use stele_storage::delta::{BusinessKey, Delta, DeltaError, Snapshot, Version};
@@ -235,8 +236,16 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
     /// Resolve one version per key, live at the snapshot, across both tiers,
     /// returning the rows alongside the segment-pruning [`ScanStats`].
     fn resolve_rows(&self) -> Result<(Vec<Version>, ScanStats), ScanError> {
-        // The delta tier resolves its own staged versions at the snapshot.
-        let delta_live = self.delta.range_scan(.., self.snapshot, self.index)?;
+        // The delta tier resolves its own staged versions at the snapshot. Bound
+        // its scan by the business-key range the predicate implies (predicate
+        // pushdown for the delta tier) so a selective `WHERE business_key = …`
+        // does not walk the whole keyspace — the segment side is already pruned
+        // by `might_contain` below. The range is conservative (never drops a key
+        // the predicate could match) and the row filter still applies.
+        let key_range = predicate_key_range(&self.predicate);
+        let delta_live = self
+            .delta
+            .range_scan(key_range, self.snapshot, self.index)?;
 
         // Prune sealed segments by zone map, then fold + resolve the survivors.
         let mut scanned = 0usize;
@@ -364,5 +373,75 @@ fn within(value: &ZoneBound, low: &ZoneBound, high: &ZoneBound) -> bool {
         (ZoneBound::I64(c), ZoneBound::I64(l), ZoneBound::I64(h)) => l <= c && c <= h,
         (ZoneBound::Bytes(c), ZoneBound::Bytes(l), ZoneBound::Bytes(h)) => l <= c && c <= h,
         _ => true,
+    }
+}
+
+/// The `[business_key]` value of a predicate term, or `None` when the term does
+/// not constrain the business key (a different column, or a non-bytes bound).
+const fn business_key_bytes(column: ColumnId, bound: &ZoneBound) -> Option<&Vec<u8>> {
+    match (column, bound) {
+        (ColumnId::BusinessKey, ZoneBound::Bytes(v)) => Some(v),
+        _ => None,
+    }
+}
+
+/// Derive the conservative business-key range a predicate implies, so the delta
+/// tier's scan is bounded for a selective query (predicate pushdown). A predicate
+/// that does not constrain the business key yields an unbounded range — every key
+/// is a candidate and the row-level filter still applies. The range only ever
+/// *widens* relative to the true match set, so it can never drop a matching key.
+fn predicate_key_range(predicate: &Predicate) -> (Bound<BusinessKey>, Bound<BusinessKey>) {
+    match predicate {
+        Predicate::All => (Bound::Unbounded, Bound::Unbounded),
+        Predicate::Eq { column, value } => {
+            business_key_bytes(*column, value).map_or((Bound::Unbounded, Bound::Unbounded), |v| {
+                let key = BusinessKey::new(v.clone());
+                (Bound::Included(key.clone()), Bound::Included(key))
+            })
+        }
+        Predicate::Range { column, low, high } => {
+            match (
+                business_key_bytes(*column, low),
+                business_key_bytes(*column, high),
+            ) {
+                (Some(l), Some(h)) => (
+                    Bound::Included(BusinessKey::new(l.clone())),
+                    Bound::Included(BusinessKey::new(h.clone())),
+                ),
+                _ => (Bound::Unbounded, Bound::Unbounded),
+            }
+        }
+        // Every conjunct must hold, so the combined range is the intersection of
+        // the parts' ranges — the tightest lower and upper bound across them.
+        Predicate::And(parts) => {
+            parts
+                .iter()
+                .fold((Bound::Unbounded, Bound::Unbounded), |(lo, hi), p| {
+                    let (plo, phi) = predicate_key_range(p);
+                    (tighter_lower(lo, plo), tighter_upper(hi, phi))
+                })
+        }
+    }
+}
+
+/// The tighter (larger) of two inclusive lower bounds; `Unbounded` is the
+/// identity. Only `Included` / `Unbounded` are produced upstream — any other
+/// bound widens conservatively to `Unbounded` rather than risk dropping a key.
+fn tighter_lower(a: Bound<BusinessKey>, b: Bound<BusinessKey>) -> Bound<BusinessKey> {
+    match (a, b) {
+        (Bound::Included(x), Bound::Included(y)) => Bound::Included(x.max(y)),
+        (Bound::Unbounded, other @ Bound::Included(_))
+        | (other @ Bound::Included(_), Bound::Unbounded) => other,
+        _ => Bound::Unbounded,
+    }
+}
+
+/// The tighter (smaller) of two inclusive upper bounds; see [`tighter_lower`].
+fn tighter_upper(a: Bound<BusinessKey>, b: Bound<BusinessKey>) -> Bound<BusinessKey> {
+    match (a, b) {
+        (Bound::Included(x), Bound::Included(y)) => Bound::Included(x.min(y)),
+        (Bound::Unbounded, other @ Bound::Included(_))
+        | (other @ Bound::Included(_), Bound::Unbounded) => other,
+        _ => Bound::Unbounded,
     }
 }
