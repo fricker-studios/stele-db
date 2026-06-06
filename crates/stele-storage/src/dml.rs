@@ -294,6 +294,54 @@ pub fn replay<D: Disk, I: Disk>(
     Ok(applied)
 }
 
+/// Replay like [`replay`], but **tolerate a torn record at the log tail**.
+///
+/// That torn record is the half-written one a mid-write crash leaves behind
+/// ([STL-102], [architecture §3.6](../../../docs/02-architecture.md#36-crash-recovery)) —
+/// the difference between *verifying* an intact log and *recovering* a crashed
+/// one. [`replay`] propagates the WAL's torn-write signal as an error —
+/// right for a log expected to be whole. Recovery instead expects the tail to be
+/// torn: the only durability point is the fsync ([`crate::wal`] invariant 2), so a
+/// crash can shear the record being appended *after* the last fsync. Every record
+/// the WAL surfaces before that point is a complete frame with a verified CRC, so
+/// stopping at the **first** corruption ([`crate::wal`]'s "yield `Err`, then
+/// `None`" contract) drops exactly the unsynced tail and keeps every durable
+/// record — converging to the committed prefix.
+///
+/// Only the WAL's torn-frame signal ([`std::io::ErrorKind::InvalidData`]) is tolerated.
+/// A genuine read failure, or a CRC-*valid* payload that fails to decode into a
+/// redo set (a real logic/format bug, not a torn write), still propagates — a torn
+/// tail is dropped, corruption inside the durable region is not swallowed.
+/// Returns the number of redo entries applied from the surviving prefix.
+///
+/// # Errors
+///
+/// [`DmlError::Wal`] on a non-torn I/O failure; [`DmlError::Delta`] /
+/// [`DmlError::Validity`] if a CRC-valid record fails to decode; [`DmlError::Apply`]
+/// if a structure rejects the apply.
+pub fn recover_replay<D: Disk, I: Disk>(
+    wal: &Wal<D>,
+    delta: &mut Delta<D>,
+    index: &mut ValidityIndex<I>,
+    checkpoint: Checkpoint,
+) -> Result<usize, DmlError> {
+    let mut applied = 0;
+    for record in wal.replay_from(checkpoint) {
+        let payload = match record {
+            Ok(payload) => payload,
+            // The WAL's torn-write contract: a sheared tail surfaces as
+            // `InvalidData`, then the iterator stops. That is the expected end of
+            // a crashed log — keep the prefix already applied and return.
+            Err(WalError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidData => break,
+            Err(other) => return Err(other.into()),
+        };
+        let redos = decode_redo(&payload)?;
+        applied += redos.len();
+        crate::systime::apply(delta, index, redos)?;
+    }
+    Ok(applied)
+}
+
 /// Tag byte for a [`Redo::Insert`] frame in a WAL redo record.
 const REDO_TAG_INSERT: u8 = 0;
 /// Tag byte for a [`Redo::Close`] frame in a WAL redo record.
@@ -464,5 +512,62 @@ mod tests {
     fn unknown_redo_tag_is_corruption() {
         let err = decode_redo(&[0xFFu8]).unwrap_err();
         assert!(matches!(err, DmlError::Delta(DeltaError::Corrupt(_))));
+    }
+
+    /// A torn record at the log tail makes [`replay`] error (it verifies an intact
+    /// log) but [`recover_replay`] tolerate it (it recovers a crashed one): both
+    /// apply the durable prefix, then recovery stops at the shear while plain
+    /// replay propagates it ([STL-102]).
+    #[test]
+    fn recover_replay_tolerates_a_torn_tail_that_replay_rejects() {
+        use stele_common::provenance::{Principal, Provenance};
+        use stele_common::time::SystemTimeMicros;
+
+        use crate::backend::{Disk, DiskFile, MemDisk};
+        use crate::delta::{Delta, DeltaConfig};
+        use crate::validity::{ValidityConfig, ValidityIndex};
+        use crate::wal::{Wal, WalConfig};
+
+        let disk = MemDisk::new();
+        let wal = Wal::open(disk.clone(), WalConfig::default()).expect("wal");
+        // One complete, durable insert record.
+        let record = encode_redo(&[Redo::Insert(Version::open(
+            BusinessKey::new(b"k".to_vec()),
+            SystemTimeMicros(1),
+            0,
+            Provenance::new(TxnId(1), SystemTimeMicros(1), Principal::new(b"a".to_vec())),
+            b"v".to_vec(),
+        ))])
+        .expect("encode");
+        wal.append(&record).expect("append");
+        wal.tick().expect("fsync");
+        // A crash mid-append of the next record: stray bytes that frame as a torn
+        // record (a length/crc header that cannot verify a complete payload).
+        let mut seg = disk
+            .open("wal-00000000000000000000.log")
+            .expect("open wal segment");
+        seg.append(&[0xFF; 6]).expect("append torn tail");
+        seg.sync().expect("sync");
+
+        // Plain replay rejects the torn tail.
+        let mut d = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
+        let mut i = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+        assert!(
+            matches!(
+                replay(&wal, &mut d, &mut i, Checkpoint::BEGIN),
+                Err(DmlError::Wal(_)),
+            ),
+            "plain replay propagates the torn-write signal",
+        );
+
+        // Recovery tolerates it and applies the one durable record.
+        let mut d = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
+        let mut i = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+        let applied =
+            recover_replay(&wal, &mut d, &mut i, Checkpoint::BEGIN).expect("recover tolerates");
+        assert_eq!(
+            applied, 1,
+            "the durable prefix is applied, the torn tail dropped"
+        );
     }
 }

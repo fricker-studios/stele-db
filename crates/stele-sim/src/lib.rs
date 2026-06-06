@@ -32,6 +32,7 @@ use stele_exec::{Column, SnapshotScan};
 use stele_storage::backend::{Disk, DiskFile, FaultOp, Faults, MemDisk, MemFile};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
 use stele_storage::dml::{self, DmlWriter};
+use stele_storage::engine::Engine;
 use stele_storage::merge;
 use stele_storage::segment::{ColumnId, Predicate, SegmentReader, SegmentWriter, ZoneBound};
 use stele_storage::systime::{EmptySealed, SealedSegments, SysTimeWriter};
@@ -560,6 +561,150 @@ pub fn run_recovery_index_seed(seed: u64) -> u64 {
     // Digest the (identical) rebuilt index for the determinism sweep.
     let mut digest = FNV_OFFSET;
     for ((key, sys_from, seq), interval) in &after {
+        digest = fnv1a(digest, key.as_bytes());
+        digest = fnv1a(digest, &sys_from.0.to_le_bytes());
+        digest = fnv1a(digest, &seq.to_le_bytes());
+        digest = fnv1a(digest, &interval.sys_to.0.to_le_bytes());
+        digest = fold_closed_by(digest, Some(&interval.closed_by));
+    }
+    digest
+}
+
+/// Kill and `recover` a seeded [`Engine`] workload, asserting it converges.
+///
+/// Plays a seeded insert/update/delete workload through the full [`Engine`] boot
+/// path — with periodic checkpoints — then crashes and recovers, converging to a
+/// consistent state with an *exactly* rebuilt validity index ([STL-102] DoD).
+///
+/// Where [`run_recovery_index_seed`] drives the low-level [`DmlWriter`] +
+/// [`dml::replay`] directly, this drives the [`Engine`] recovery *driver*: each op
+/// goes through [`Engine::insert`] / [`Engine::update`] / [`Engine::delete`], a
+/// checkpoint is taken at seed-chosen points (the periodic + graceful-shutdown
+/// fsyncs the boot flow keys off), and after the workload the engine is dropped
+/// (the crash) and [`Engine::recover`] rebuilds the delta and index from the WAL
+/// alone. A tier-agnostic reference oracle records each key's committed timeline.
+/// Two correctness properties are asserted, then folded into the digest: the
+/// recovered validity index materializes byte-for-byte to the pre-crash one, and
+/// the recovered `AS OF` read matches the reference oracle at every commit
+/// boundary. Same seed ⇒ same digest.
+///
+/// # Panics
+///
+/// Panics if the rebuilt index differs from the pre-crash one, or if a recovered
+/// `AS OF` disagrees with the reference oracle — correctness regressions, not
+/// workload outcomes.
+#[must_use]
+pub fn run_engine_recover_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut rng = Rng::new(seed);
+    let disk = MemDisk::new();
+
+    // Tier-agnostic reference oracle: per key, the committed payload-or-delete
+    // timeline keyed by commit `sys_from`. An independent model, not a mirror of
+    // the engine's merged read path.
+    let mut oracle: BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Option<Vec<u8>>>> =
+        BTreeMap::new();
+    let mut commits: Vec<SystemTimeMicros> = Vec::new();
+
+    let key_count = 1 + rng.below_usize(6);
+    let keys: Vec<BusinessKey> = (0..key_count)
+        .map(|i| BusinessKey::new(format!("k-{i:04}").into_bytes()))
+        .collect();
+
+    let before_index = {
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1), false).expect("open engine");
+        let mut live = vec![false; key_count];
+        let ops = 8 + rng.below(24);
+        for op in 0..ops {
+            let k = rng.below_usize(key_count);
+            let key = keys[k].clone();
+            let txn = TxnId(op);
+            let principal_len = rng.below_usize(8);
+            let principal = Principal::new(rng.bytes(principal_len));
+            let commit = if live[k] {
+                if rng.below(2) == 0 {
+                    let c = engine.delete(&key, txn, principal).expect("delete").commit;
+                    oracle.entry(key).or_default().insert(c, None);
+                    live[k] = false;
+                    c
+                } else {
+                    let payload_len = rng.below_usize(16);
+                    let payload = rng.bytes(payload_len);
+                    let c = engine
+                        .update(key.clone(), None, payload.clone(), 0, txn, principal)
+                        .expect("update")
+                        .commit;
+                    oracle.entry(key).or_default().insert(c, Some(payload));
+                    c
+                }
+            } else {
+                let payload_len = rng.below_usize(16);
+                let payload = rng.bytes(payload_len);
+                let c = engine
+                    .insert(key.clone(), None, payload.clone(), 0, txn, principal)
+                    .expect("insert")
+                    .commit;
+                oracle.entry(key).or_default().insert(c, Some(payload));
+                live[k] = true;
+                c
+            };
+            commits.push(commit);
+            // A periodic checkpoint at seed-chosen points — the fsync + durable
+            // fence the recovery flow records.
+            if rng.below(3) == 0 {
+                engine.checkpoint().expect("periodic checkpoint");
+            }
+        }
+        // Graceful-shutdown checkpoint, then drop the engine — the crash.
+        engine.checkpoint().expect("shutdown checkpoint");
+        engine
+            .materialize_index()
+            .expect("materialize pre-crash index")
+    };
+
+    // Recover through the driver: validate segments, load checkpoint, replay WAL,
+    // rebuild the delta + index.
+    let recovered = Engine::recover(disk, StepClock::new(1_000_000), false).expect("recover");
+    let after_index = recovered
+        .materialize_index()
+        .expect("materialize rebuilt index");
+    assert_eq!(
+        before_index, after_index,
+        "seed {seed}: recovery must rebuild the exact validity index",
+    );
+
+    // The recovered `AS OF` must match the reference oracle at every boundary —
+    // just before the first commit and at every commit thereafter.
+    let mut probes: Vec<SystemTimeMicros> = Vec::new();
+    if let Some(first) = commits.first() {
+        probes.push(SystemTimeMicros(first.0 - 1));
+    }
+    probes.extend(commits.iter().copied());
+
+    let mut digest = FNV_OFFSET;
+    for s in probes {
+        for key in &keys {
+            let want = oracle
+                .get(key)
+                .and_then(|timeline| timeline.range(..=s).next_back())
+                .and_then(|(_, payload)| payload.clone());
+            let got = recovered.as_of_payload(key, Snapshot(s)).expect("as_of");
+            assert_eq!(
+                got, want,
+                "seed {seed} @ s={s:?} key {key:?}: recovered AS OF must match the oracle",
+            );
+            digest = fnv1a(digest, key.as_bytes());
+            match got {
+                Some(payload) => {
+                    digest = fnv1a(digest, &[1]);
+                    digest = fnv1a(digest, &payload);
+                }
+                None => digest = fnv1a(digest, &[0]),
+            }
+        }
+    }
+    // Fold the (identical) rebuilt index for the determinism sweep.
+    for ((key, sys_from, seq), interval) in &after_index {
         digest = fnv1a(digest, key.as_bytes());
         digest = fnv1a(digest, &sys_from.0.to_le_bytes());
         digest = fnv1a(digest, &seq.to_le_bytes());
@@ -1320,6 +1465,30 @@ mod tests {
         assert!(
             digests.len() > 1,
             "the WAL→index rebuild workload must actually depend on the seed"
+        );
+    }
+
+    #[test]
+    fn engine_recover_seed_is_reproducible() {
+        // Each seed also asserts (internally) that the driver-recovered engine
+        // rebuilds the exact validity index and that every recovered AS-OF read
+        // matches the reference oracle ([STL-102] DoD).
+        for seed in 0..64 {
+            assert_eq!(
+                run_engine_recover_seed(seed),
+                run_engine_recover_seed(seed),
+                "seed {seed} must replay to an identical engine-recovery digest"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_recover_distinct_seeds_diverge() {
+        let digests: std::collections::HashSet<u64> =
+            (0..64).map(run_engine_recover_seed).collect();
+        assert!(
+            digests.len() > 1,
+            "the engine kill-and-recover workload must actually depend on the seed"
         );
     }
 
