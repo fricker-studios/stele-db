@@ -121,14 +121,15 @@ pub enum DmlError {
     #[error("{0} is not supported in v0.1 DML")]
     Unsupported(String),
 
-    /// A schema- or database-qualified table name. v0.1 has a single implicit
-    /// namespace, so only bare names resolve.
-    #[error("qualified table name {0:?} — only bare names are supported in v0.1")]
+    /// A schema- or database-qualified name (a table or column with more than
+    /// one part, e.g. `public.account` or `account.id`). v0.1 has a single
+    /// implicit namespace, so only bare names resolve.
+    #[error("qualified name {0:?} — only bare names are supported in v0.1")]
     QualifiedName(String),
 
-    /// A single-part name that is not a plain identifier.
-    #[error("table name {0:?} is not a plain identifier")]
-    InvalidTableName(String),
+    /// A single-part name (table or column) that is not a plain identifier.
+    #[error("name {0:?} is not a plain identifier")]
+    InvalidName(String),
 
     /// The catalog has never registered this table name.
     #[error("unknown table {0:?}")]
@@ -206,6 +207,16 @@ pub enum DmlError {
         /// The table written.
         table: String,
         /// The required column with no supplied value.
+        column: String,
+    },
+
+    /// An `INSERT` column list named the same column twice. Keeping the last
+    /// value would silently bind the wrong key/payload, so it is rejected.
+    #[error("INSERT into {table:?} names column {column:?} more than once")]
+    DuplicateColumn {
+        /// The table written.
+        table: String,
+        /// The column named more than once.
         column: String,
     },
 
@@ -330,10 +341,18 @@ fn bind_insert(insert: &Insert, ctx: &BindContext) -> Result<BoundDml, DmlError>
                     found: row.len(),
                 });
             }
-            (
-                value_for(&table, key_col, cols, row, schema)?,
-                value_for(&table, payload_col, cols, row, schema)?,
-            )
+            let names = validated_columns(&table, cols, schema)?;
+            let value_for = |column: &ColumnDef| {
+                names
+                    .iter()
+                    .position(|n| n == column.name())
+                    .map(|i| &row[i])
+                    .ok_or_else(|| DmlError::MissingColumn {
+                        table: table.clone(),
+                        column: column.name().to_owned(),
+                    })
+            };
+            (value_for(key_col)?, value_for(payload_col)?)
         }
     };
 
@@ -394,19 +413,18 @@ fn single_values_row(insert: &Insert) -> Result<&[Expr], DmlError> {
     }
 }
 
-/// The value expression supplied for `column` in an `INSERT` with an explicit
-/// column list — by matching `column`'s name in `cols` to the same position in
-/// `row`. Every name in `cols` must be a real column; a required `column` with no
-/// entry is a [`MissingColumn`](DmlError::MissingColumn).
-fn value_for<'a>(
+/// Resolve an `INSERT` column list to bare names in positional order, rejecting a
+/// name that is not a real column ([`UnknownColumn`](DmlError::UnknownColumn)) or
+/// that repeats ([`DuplicateColumn`](DmlError::DuplicateColumn) — keeping only the
+/// last value for a repeated name would silently bind the wrong cell). The caller
+/// then matches a target column to the value at its position in this list.
+fn validated_columns(
     table: &str,
-    column: &ColumnDef,
     cols: &[ObjectName],
-    row: &'a [Expr],
     schema: &TableSchema,
-) -> Result<&'a Expr, DmlError> {
-    let mut found = None;
-    for (i, name) in cols.iter().enumerate() {
+) -> Result<Vec<String>, DmlError> {
+    let mut names: Vec<String> = Vec::with_capacity(cols.len());
+    for name in cols {
         let name = bare_name(name)?;
         if schema.column(&name).is_none() {
             return Err(DmlError::UnknownColumn {
@@ -414,14 +432,15 @@ fn value_for<'a>(
                 column: name,
             });
         }
-        if name == column.name() {
-            found = Some(&row[i]);
+        if names.iter().any(|prev| prev == &name) {
+            return Err(DmlError::DuplicateColumn {
+                table: table.to_owned(),
+                column: name,
+            });
         }
+        names.push(name);
     }
-    found.ok_or_else(|| DmlError::MissingColumn {
-        table: table.to_owned(),
-        column: column.name().to_owned(),
-    })
+    Ok(names)
 }
 
 // ---------------------------------------------------------------------------
@@ -750,7 +769,7 @@ fn single_ident(name: &ObjectName) -> Result<&str, DmlError> {
         [part] => part
             .as_ident()
             .map(|id| id.value.as_str())
-            .ok_or_else(|| DmlError::InvalidTableName(name.to_string())),
+            .ok_or_else(|| DmlError::InvalidName(name.to_string())),
         _ => Err(DmlError::QualifiedName(name.to_string())),
     }
 }
@@ -1063,6 +1082,22 @@ mod tests {
             Err(DmlError::UnknownColumn {
                 table: "account".to_owned(),
                 column: "nonesuch".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn duplicate_column_in_insert_list_is_rejected() {
+        let catalog = account_catalog();
+        // Keeping the last `id` would silently bind the wrong key — reject it.
+        assert_eq!(
+            bind(
+                "INSERT INTO account (id, balance, id) VALUES (1, 100, 2)",
+                &catalog
+            ),
+            Err(DmlError::DuplicateColumn {
+                table: "account".to_owned(),
+                column: "id".to_owned(),
             })
         );
     }
