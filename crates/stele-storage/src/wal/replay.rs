@@ -40,6 +40,17 @@ impl<D: Disk> Replay<D> {
         }
     }
 
+    /// The log position the iterator has reached: after a successfully-yielded
+    /// record this is the start of the *next* record; after the iterator yields a
+    /// corruption `Err`, it is the start of the **corrupt record** (a failed read
+    /// does not advance the cursor). Recovery compares this against the durable
+    /// checkpoint fence to tell a torn unsynced tail from corruption in the
+    /// durable prefix ([`crate::dml::recover_replay`]).
+    #[must_use]
+    pub const fn position(&self) -> LogOffset {
+        self.position
+    }
+
     fn read_next(&mut self) -> Result<Option<Vec<u8>>, WalError> {
         loop {
             // `self.segments` is sorted (produced by `known_segments`), so we

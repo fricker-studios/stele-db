@@ -175,6 +175,15 @@ impl SealedVersions {
     pub const fn new(versions: Vec<Version>) -> Self {
         Self { versions }
     }
+
+    /// The underlying sealed versions — so a holder (e.g. the
+    /// [`Engine`](crate::engine::Engine)) can both pass `&self` as a
+    /// [`SealedLookup`] to the write path *and* read the rows for its merge path,
+    /// without keeping a second copy.
+    #[must_use]
+    pub fn versions(&self) -> &[Version] {
+        &self.versions
+    }
 }
 
 impl SealedLookup for SealedVersions {

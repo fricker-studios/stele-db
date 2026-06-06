@@ -294,6 +294,72 @@ pub fn replay<D: Disk, I: Disk>(
     Ok(applied)
 }
 
+/// Replay like [`replay`], but **tolerate a torn record past the durable fence**.
+///
+/// This is the difference between *verifying* an intact log and *recovering* a
+/// crashed one ([STL-102], [architecture §3.6](../../../docs/02-architecture.md#36-crash-recovery)).
+/// [`replay`] propagates the WAL's torn-write signal as an error — right for a log
+/// expected to be whole. Recovery instead expects the *tail* to be torn: the only
+/// durability point is the fsync ([`crate::wal`] invariant 2), so a crash can shear
+/// the record being appended *after* the last fsync.
+///
+/// `from` is where replay starts; `fence` is the last fully-flushed offset
+/// (the persisted checkpoint, or [`LogOffset::ZERO`] when none survives). It
+/// replays the full range from `from` and, on the WAL's torn-frame
+/// signal ([`std::io::ErrorKind::InvalidData`]), uses the **start offset of the
+/// corrupt record** ([`Replay::position`](crate::wal::Replay::position)) to decide:
+///
+/// * **at or after `fence`** — the unsynced tail a mid-write crash left behind. Stop
+///   and keep the durable prefix already applied; this is the expected end of a
+///   crashed log.
+/// * **before `fence`** — a record the checkpoint vouched durable is corrupt. That is
+///   real durable-region corruption, **not** a torn tail, and propagates as an error
+///   rather than being silently truncated.
+///
+/// A non-torn I/O error, or a CRC-*valid* payload that fails to decode (a logic/format
+/// bug, not a torn write), always propagates. Returns the number of redo entries
+/// applied from the surviving prefix.
+///
+/// v0.1 replays from [`Checkpoint::BEGIN`] (the full log) and rebuilds the validity
+/// index from it per [ADR-0023]; `fence` here is the *durability boundary*, not yet a
+/// replay-*skip* — that realignment rides STL-133 / STL-136.
+///
+/// # Errors
+///
+/// [`DmlError::Wal`] on a non-torn I/O failure or corruption before `fence`;
+/// [`DmlError::Delta`] / [`DmlError::Validity`] if a CRC-valid record fails to decode;
+/// [`DmlError::Apply`] if a structure rejects the apply.
+pub fn recover_replay<D: Disk, I: Disk>(
+    wal: &Wal<D>,
+    delta: &mut Delta<D>,
+    index: &mut ValidityIndex<I>,
+    from: Checkpoint,
+    fence: LogOffset,
+) -> Result<usize, DmlError> {
+    let mut applied = 0;
+    let mut replay = wal.replay_from(from);
+    while let Some(record) = replay.next() {
+        let payload = match record {
+            Ok(payload) => payload,
+            Err(WalError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
+                // The cursor sits at the start of the corrupt record (a failed read
+                // does not advance it). Past the fence ⇒ the unsynced tail of a
+                // crash: drop it. At/under the fence ⇒ the checkpoint vouched this
+                // record durable, so its corruption is a real fault, not a torn tail.
+                if replay.position() >= fence {
+                    break;
+                }
+                return Err(WalError::Io(e).into());
+            }
+            Err(other) => return Err(other.into()),
+        };
+        let redos = decode_redo(&payload)?;
+        applied += redos.len();
+        crate::systime::apply(delta, index, redos)?;
+    }
+    Ok(applied)
+}
+
 /// Tag byte for a [`Redo::Insert`] frame in a WAL redo record.
 const REDO_TAG_INSERT: u8 = 0;
 /// Tag byte for a [`Redo::Close`] frame in a WAL redo record.
@@ -464,5 +530,83 @@ mod tests {
     fn unknown_redo_tag_is_corruption() {
         let err = decode_redo(&[0xFFu8]).unwrap_err();
         assert!(matches!(err, DmlError::Delta(DeltaError::Corrupt(_))));
+    }
+
+    /// The torn-tail gate, three ways: plain [`replay`] rejects a torn tail (it
+    /// verifies an intact log); [`recover_replay`] *tolerates* it when the shear is
+    /// at/after the durable fence (the unsynced tail of a crash); but it stays
+    /// *fatal* when the fence claims the corrupt region durable — corruption inside
+    /// the durable prefix is never silently truncated ([STL-102]).
+    #[test]
+    fn recover_replay_gates_a_torn_tail_on_the_durable_fence() {
+        use stele_common::provenance::{Principal, Provenance};
+        use stele_common::time::SystemTimeMicros;
+
+        use crate::backend::{Disk, DiskFile, MemDisk};
+        use crate::delta::{Delta, DeltaConfig};
+        use crate::validity::{ValidityConfig, ValidityIndex};
+        use crate::wal::{LogOffset, Wal, WalConfig};
+
+        let disk = MemDisk::new();
+        let wal = Wal::open(disk.clone(), WalConfig::default()).expect("wal");
+        // One complete, durable insert record.
+        let record = encode_redo(&[Redo::Insert(Version::open(
+            BusinessKey::new(b"k".to_vec()),
+            SystemTimeMicros(1),
+            0,
+            Provenance::new(TxnId(1), SystemTimeMicros(1), Principal::new(b"a".to_vec())),
+            b"v".to_vec(),
+        ))])
+        .expect("encode");
+        wal.append(&record).expect("append");
+        wal.tick().expect("fsync");
+        // The fence is the durable end *before* the shear — exactly where a
+        // mid-append crash would tear the next record.
+        let fence = wal.durable_end();
+        // A crash mid-append of the next record: stray bytes that frame as a torn
+        // record (a length/crc header that cannot verify a complete payload).
+        let mut seg = disk
+            .open("wal-00000000000000000000.log")
+            .expect("open wal segment");
+        seg.append(&[0xFF; 6]).expect("append torn tail");
+        seg.sync().expect("sync");
+
+        // 1. Plain replay rejects the torn tail.
+        let mut d = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
+        let mut i = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+        assert!(
+            matches!(
+                replay(&wal, &mut d, &mut i, Checkpoint::BEGIN),
+                Err(DmlError::Wal(_)),
+            ),
+            "plain replay propagates the torn-write signal",
+        );
+
+        // 2. Recovery with the fence *at* the shear tolerates it and applies the
+        //    one durable record.
+        let mut d = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
+        let mut i = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+        let applied = recover_replay(&wal, &mut d, &mut i, Checkpoint::BEGIN, fence)
+            .expect("recover tolerates a tail at/after the fence");
+        assert_eq!(
+            applied, 1,
+            "the durable prefix is applied, the torn tail dropped"
+        );
+
+        // 3. A fence that claims the corrupt region durable makes the same shear
+        //    fatal — durable-prefix corruption is not swallowed.
+        let beyond = LogOffset {
+            segment_index: fence.segment_index,
+            byte_offset: fence.byte_offset + 100,
+        };
+        let mut d = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
+        let mut i = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+        assert!(
+            matches!(
+                recover_replay(&wal, &mut d, &mut i, Checkpoint::BEGIN, beyond),
+                Err(DmlError::Wal(_)),
+            ),
+            "corruption before the fence is fatal, not a tolerated tail",
+        );
     }
 }
