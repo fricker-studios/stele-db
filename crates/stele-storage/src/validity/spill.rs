@@ -253,6 +253,7 @@ mod tests {
         Close {
             business_key: BusinessKey::new(key.to_vec()),
             sys_from: SystemTimeMicros(sys_from),
+            seq: 0,
             sys_to: SystemTimeMicros(sys_from + 1),
             closed_by: Provenance::new(
                 TxnId(1),

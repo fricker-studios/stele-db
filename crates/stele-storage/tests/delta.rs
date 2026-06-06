@@ -147,6 +147,7 @@ fn close(index: &mut ValidityIndex<MemDisk>, key: &[u8], sys_from: i64, sys_to: 
         .insert_close(Close {
             business_key: BusinessKey::new(key.to_vec()),
             sys_from: SystemTimeMicros(sys_from),
+            seq: 0,
             sys_to: SystemTimeMicros(sys_to),
             closed_by: Provenance::new(
                 TxnId(u64::try_from(sys_to).unwrap_or(0)),

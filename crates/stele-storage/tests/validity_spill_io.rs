@@ -146,6 +146,7 @@ fn close(key: &str, sys_from: i64) -> Close {
     Close {
         business_key: bk(key),
         sys_from: SystemTimeMicros(sys_from),
+        seq: 0,
         sys_to: SystemTimeMicros(sys_from + 10),
         closed_by: Provenance::new(
             TxnId(1),
@@ -200,7 +201,7 @@ fn point_close_of_reads_only_the_matching_spill() {
     // A spilled key: exactly one spill can hold it.
     disk.reset_reads();
     let got = idx
-        .close_of(&bk(&key_at(4)), SystemTimeMicros(10))
+        .close_of(&bk(&key_at(4)), SystemTimeMicros(10), 0)
         .expect("lookup");
     assert_eq!(got.unwrap().sys_to, SystemTimeMicros(20));
     assert_eq!(
@@ -217,7 +218,7 @@ fn point_close_of_for_an_absent_key_reads_nothing() {
     // Out of every spill's key range → pruned without a single read.
     disk.reset_reads();
     let got = idx
-        .close_of(&bk("zzz9"), SystemTimeMicros(10))
+        .close_of(&bk("zzz9"), SystemTimeMicros(10), 0)
         .expect("lookup");
     assert!(got.is_none());
     assert_eq!(disk.reads(), 0, "an absent key reads no spill");
@@ -243,7 +244,7 @@ fn small_fold_reads_only_matching_spills_large_fold_sweeps() {
     // Small fold: one key → one matching spill.
     disk.reset_reads();
     let chains = fold_chains(vec![open_version(&key_at(4), 10)], &idx).expect("fold");
-    let v = &chains[&bk(&key_at(4))][&SystemTimeMicros(10)];
+    let v = &chains[&bk(&key_at(4))][&(SystemTimeMicros(10), 0)];
     assert_eq!(
         v.sys_to,
         SystemTimeMicros(20),

@@ -1,8 +1,8 @@
 //! In-memory sorted store for the delta tier.
 //!
-//! Layout: per business key, an ordered map keyed by `sys_from`. This keeps
-//! a key's version chain physically contiguous and makes snapshot resolution
-//! a single `range(..=snapshot).next_back()` per key
+//! Layout: per business key, an ordered map keyed by `(sys_from, seq)`. This
+//! keeps a key's version chain physically contiguous and makes snapshot
+//! resolution a single `range(..=snapshot).next_back()` per key
 //! ([architecture §3.1](../../../../docs/02-architecture.md#31-tiered-layout-lsm-flavored-history-preserving)).
 //!
 //! The tier holds **raw** versions only — it does not store or resolve `sys_to`
@@ -20,10 +20,12 @@ use super::version::{BusinessKey, Version};
 /// In-memory portion of the delta tier.
 #[derive(Debug, Default)]
 pub(super) struct MemTier {
-    /// `business_key → (sys_from → version)`. The outer map gives ordered
-    /// range scans over keys; the inner gives ordered access to a single
-    /// key's version chain.
-    rows: BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Version>>,
+    /// `business_key → ((sys_from, seq) → version)`. The outer map gives ordered
+    /// range scans over keys; the inner gives ordered access to a single key's
+    /// version chain. The inner key carries `seq` so two versions sharing a
+    /// `sys_from` (the writer no longer force-bumps the timestamp, STL-145) each
+    /// keep their slot instead of one overwriting the other.
+    rows: BTreeMap<BusinessKey, BTreeMap<(SystemTimeMicros, u64), Version>>,
     /// Running sum of `Version::encoded_size()` across every row. The spill
     /// decision is taken against this counter so the in-memory and on-spill
     /// thresholds describe the same units.
@@ -35,13 +37,13 @@ impl MemTier {
         Self::default()
     }
 
-    /// Insert a version. Replaying the same `(business_key, sys_from)` twice
+    /// Insert a version. Replaying the same `(business_key, sys_from, seq)` twice
     /// is idempotent — the second insert overwrites the first and the byte
     /// counter is adjusted, so WAL replay never double-counts a record.
     pub(super) fn insert(&mut self, version: Version) {
         let added = version.encoded_size() as u64;
         let chain = self.rows.entry(version.business_key.clone()).or_default();
-        if let Some(prev) = chain.insert(version.sys_from, version) {
+        if let Some(prev) = chain.insert((version.sys_from, version.seq), version) {
             // Replace: subtract the displaced row's contribution.
             self.byte_size = self.byte_size.saturating_sub(prev.encoded_size() as u64);
         }
@@ -59,13 +61,13 @@ impl MemTier {
         self.rows.values().map(BTreeMap::len).sum()
     }
 
-    /// Iterate every stored version in `(business_key, sys_from)` order —
+    /// Iterate every stored version in `(business_key, sys_from, seq)` order —
     /// the input ordering a segment writer expects.
     pub(super) fn iter(&self) -> impl Iterator<Item = &Version> {
         self.rows.values().flat_map(|chain| chain.values())
     }
 
-    /// Drain every stored version in `(business_key, sys_from)` order and
+    /// Drain every stored version in `(business_key, sys_from, seq)` order and
     /// reset state. Used by both `flush_to_segment` and the spill path.
     pub(super) fn drain_sorted(&mut self) -> Vec<Version> {
         let rows = std::mem::take(&mut self.rows);

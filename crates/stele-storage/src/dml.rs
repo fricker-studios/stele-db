@@ -384,6 +384,9 @@ mod tests {
         let close = Redo::Close(Close {
             business_key: BusinessKey::new(b"k".to_vec()),
             sys_from: SystemTimeMicros(10),
+            // A non-zero `seq` proves the closed version's tiebreak round-trips
+            // through the WAL close frame (STL-145).
+            seq: 7,
             sys_to: SystemTimeMicros(20),
             closed_by: Provenance::new(
                 TxnId(2),
@@ -421,6 +424,7 @@ mod tests {
         let retract = Redo::Retract(Close {
             business_key: BusinessKey::new(b"acct".to_vec()),
             sys_from: SystemTimeMicros(10),
+            seq: 3,
             sys_to: SystemTimeMicros(30),
             closed_by: Provenance::new(
                 TxnId(7),

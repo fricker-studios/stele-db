@@ -539,7 +539,7 @@ fn delete_provenance_is_queryable_from_the_persisted_retraction() {
         ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("rebuilt");
     rebuild_index_from_segments(seg_versions, seg_retractions, &mut rebuilt).expect("rebuild");
     let close = rebuilt
-        .close_of(&key, birth)
+        .close_of(&key, birth, 0)
         .expect("lookup")
         .expect("the deleted version is closed");
     assert_eq!(close.sys_to, deleted_at);

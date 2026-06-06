@@ -95,12 +95,15 @@ pub(super) const TRAILER_MAGIC: [u8; 8] = *b"STLSEGFT";
 ///   backwards-incompatible reasoning as v2–v7: a v7 reader encountering column
 ///   id 14 in the footer would fail with a confusing `Corrupt("unknown column
 ///   id")` mid-footer, so the bump makes it reject the segment cleanly at the
-///   header instead. The v0.1 chain does not yet *order* on `(sys_from, seq)`
-///   (the column is carried, not yet load-bearing); that follow-up is STL-141
-///   Part B and needs no further format change. `seq` is still *not* on the
-///   retraction tombstone — ordering deletes by `seq` rides with Part B; adding
-///   it there is a length-prefixed footer field that needs no `FORMAT_VERSION`
-///   bump.
+///   header instead. STL-141 Part B (STL-145) makes `(sys_from, seq)` load-bearing
+///   in the read/merge/index paths and also adds [`ColumnId::RetractSeq`] (id 15)
+///   to the retraction section so deletes are totally ordered too. Adding a
+///   tombstone column needs **no `FORMAT_VERSION` bump**: the retraction section
+///   is self-describing — its footer carries a column count and each column's id,
+///   so the reader projects whatever columns the footer lists rather than a fixed
+///   set, and a v8 segment with the extra `retract_seq` column round-trips through
+///   the same generation. (No persisted v8 segment predates Part B — both parts
+///   ship inside the v0.1 pre-release.)
 pub(super) const FORMAT_VERSION: u16 = 8;
 
 /// Header size in bytes — magic (8) + version (2) + flags (2) + reserved (4).
@@ -232,8 +235,17 @@ pub enum ColumnId {
     /// `i64` column like [`Self::TxnId`]) — [`crate::delta::Version::seq`]. The
     /// total-order tiebreak for versions sharing the same µs `sys_from`
     /// ([ADR-0024], STL-141). Always-on, on every segment's version row-group
-    /// (format v8); never in the retraction section.
+    /// (format v8).
     Seq = 14,
+    /// Retraction tombstone: the `seq` of the version this delete closes (fixed 8
+    /// bytes, `u64` bits in the `i64` column like [`Self::Seq`]) —
+    /// [`crate::validity::Close::seq`]. Completes the deleted version's
+    /// `(sys_from, seq)` identity so a delete is totally ordered against a
+    /// same-tick sibling ([ADR-0024], STL-145). Present only in the segment's
+    /// retraction section, alongside the other tombstone columns; added without a
+    /// `FORMAT_VERSION` bump because that section is column-list-driven (see the
+    /// v8 note above).
+    RetractSeq = 15,
 }
 
 impl ColumnId {
@@ -285,13 +297,16 @@ impl ColumnId {
     /// The ordered tombstone column set a segment's **retraction section**
     /// carries (format v7, STL-143), in writer/reader canonical order. These
     /// mirror the [`crate::validity::Close`] fields — the business key, the
-    /// closed version's `sys_from`, the close timestamp, and the closing
-    /// transaction's provenance triple — with no payload. Present only when the
-    /// segment holds at least one retraction; the footer's retraction-section
-    /// column list is the source of truth, so writer and reader never drift.
-    pub(super) const RETRACTION: [Self; 6] = [
+    /// closed version's `sys_from` and `seq`, the close timestamp, and the closing
+    /// transaction's provenance triple — with no payload. The `seq` (STL-145)
+    /// completes the deleted version's `(sys_from, seq)` identity so deletes are
+    /// totally ordered. Present only when the segment holds at least one
+    /// retraction; the footer's retraction-section column list is the source of
+    /// truth, so writer and reader never drift.
+    pub(super) const RETRACTION: [Self; 7] = [
         Self::RetractKey,
         Self::RetractSysFrom,
+        Self::RetractSeq,
         Self::RetractClosedAt,
         Self::RetractClosedByTxn,
         Self::RetractClosedByCommittedAt,
@@ -327,6 +342,7 @@ impl ColumnId {
             | Self::ValidFrom
             | Self::ValidTo
             | Self::RetractSysFrom
+            | Self::RetractSeq
             | Self::RetractClosedAt
             | Self::RetractClosedByTxn
             | Self::RetractClosedByCommittedAt => ColumnType::I64,
@@ -350,6 +366,7 @@ impl ColumnId {
             12 => Some(Self::RetractClosedByCommittedAt),
             13 => Some(Self::RetractClosedByPrincipal),
             14 => Some(Self::Seq),
+            15 => Some(Self::RetractSeq),
             _ => None,
         }
     }

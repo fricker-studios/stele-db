@@ -137,11 +137,14 @@ fn merged_chain(
 fn chains_of(
     key: &BusinessKey,
     chain: &[Version],
-) -> BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Version>> {
+) -> BTreeMap<BusinessKey, BTreeMap<(SystemTimeMicros, u64), Version>> {
     let mut chains = BTreeMap::new();
     chains.insert(
         key.clone(),
-        chain.iter().map(|v| (v.sys_from, v.clone())).collect(),
+        chain
+            .iter()
+            .map(|v| ((v.sys_from, v.seq), v.clone()))
+            .collect(),
     );
     chains
 }
@@ -195,7 +198,7 @@ fn update_across_a_flush_boundary_closes_the_sealed_version_via_the_index() {
     // The close did not re-stage a full version — it appended exactly one entry
     // to the validity index, targeting the sealed version.
     assert_eq!(index.len().unwrap(), 1, "exactly one materialized close");
-    let closed_interval = index.close_of(&key, c0).unwrap().expect("c0 is closed");
+    let closed_interval = index.close_of(&key, c0, 0).unwrap().expect("c0 is closed");
     assert_eq!(closed_interval.sys_to, c1, "the index closes c0 at c1");
 
     // Invariant 1: the sealed segment's bytes are unchanged by the close.
@@ -400,9 +403,11 @@ fn assert_chain_invariant(seed: u64, k: usize, chain: &[Version], born: &[Born],
 
     for (i, w) in chain.windows(2).enumerate() {
         let (lo, hi) = (&w[0], &w[1]);
+        // Totally ordered by (sys_from, seq): starts may tie at a shared tick,
+        // with seq breaking the tie (STL-145).
         assert!(
-            lo.sys_from < hi.sys_from,
-            "seed {seed} key {k}: starts must strictly increase",
+            (lo.sys_from, lo.seq) < (hi.sys_from, hi.seq),
+            "seed {seed} key {k}: chain not ordered by (sys_from, seq)",
         );
         assert!(
             lo.sys_to <= hi.sys_from,
@@ -412,8 +417,10 @@ fn assert_chain_invariant(seed: u64, k: usize, chain: &[Version], born: &[Born],
             lo.sys_to, SYSTEM_TIME_OPEN,
             "seed {seed} key {k}: a superseded period is still open",
         );
-        // An update abuts the prior period exactly; an insert after a delete
-        // opens a fresh period strictly later (a real gap).
+        // An update abuts the prior period exactly. An insert after a delete
+        // opens a fresh period no earlier than the close — a real gap when the
+        // re-insert is a later tick, or a degenerate (empty) gap when the delete
+        // and re-insert land on the *same* tick (`lo.sys_to == hi.sys_from`).
         let born_hi = born[i + 1];
         match born_hi {
             Born::Update => assert_eq!(
@@ -421,8 +428,8 @@ fn assert_chain_invariant(seed: u64, k: usize, chain: &[Version], born: &[Born],
                 "seed {seed} key {k}: consecutive update periods must abut",
             ),
             Born::Insert => assert!(
-                lo.sys_to < hi.sys_from,
-                "seed {seed} key {k}: delete→re-insert must leave a gap",
+                lo.sys_to <= hi.sys_from,
+                "seed {seed} key {k}: delete→re-insert gap must not be negative",
             ),
         }
     }
@@ -473,8 +480,10 @@ fn chains_stay_non_overlapping_and_gap_free_across_flush_boundaries() {
 
         let ops = 40 + rng.range(40);
         for op in 0..ops {
-            // Advance the clock by a small, occasionally-zero amount; the
-            // writer's monotonic guard keeps commits strictly increasing.
+            // Advance the clock by a small, occasionally-zero amount. A zero
+            // advance is a stall: two commits share a `sys_from` and `seq` orders
+            // them (STL-145) — so this sweep also exercises same-tick chains
+            // across a flush boundary, where no version may be dropped.
             clock.advance((rng.range(3)) as i64);
 
             // ~1 in 5 ops is a flush: drain the delta's versions into a new
@@ -496,6 +505,9 @@ fn chains_stay_non_overlapping_and_gap_free_across_flush_boundaries() {
             let txn = TxnId(op);
             let payload = format!("s{seed}-k{k}-o{op}").into_bytes();
 
+            // Distinct, increasing per-commit seq — the manager's total-order
+            // tiebreak, so same-`sys_from` versions never collide.
+            let seq = op;
             if live[k] {
                 // Half the time supersede, half the time delete.
                 if rng.range(2) == 0 {
@@ -505,13 +517,31 @@ fn chains_stay_non_overlapping_and_gap_free_across_flush_boundaries() {
                     live[k] = false;
                 } else {
                     writer
-                        .update(&mut delta, &mut index, &lookup, key, payload, 0, txn, who())
+                        .update(
+                            &mut delta,
+                            &mut index,
+                            &lookup,
+                            key,
+                            payload,
+                            seq,
+                            txn,
+                            who(),
+                        )
                         .unwrap();
                     born[k].push(Born::Update);
                 }
             } else {
                 writer
-                    .insert(&mut delta, &mut index, &lookup, key, payload, 0, txn, who())
+                    .insert(
+                        &mut delta,
+                        &mut index,
+                        &lookup,
+                        key,
+                        payload,
+                        seq,
+                        txn,
+                        who(),
+                    )
                     .unwrap();
                 live[k] = true;
                 born[k].push(Born::Insert);
@@ -550,6 +580,10 @@ struct Oracle {
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct OracleVersion {
     sys_from: SystemTimeMicros,
+    /// Per-commit tiebreak (STL-145). The model carries it so the differential
+    /// verifies the engine preserves `seq` end-to-end through the delta frame,
+    /// the sealed-segment column, and the (sys_from, seq)-keyed index.
+    seq: u64,
     sys_to: SystemTimeMicros,
     payload: Vec<u8>,
     provenance: Provenance,
@@ -563,6 +597,7 @@ impl Oracle {
         &mut self,
         key: &BusinessKey,
         commit: SystemTimeMicros,
+        seq: u64,
         payload: Vec<u8>,
         who: &Provenance,
     ) {
@@ -571,6 +606,7 @@ impl Oracle {
             .or_default()
             .push(OracleVersion {
                 sys_from: commit,
+                seq,
                 sys_to: SYSTEM_TIME_OPEN,
                 payload,
                 provenance: who.clone(),
@@ -607,6 +643,7 @@ impl Oracle {
 fn project(v: &Version) -> OracleVersion {
     OracleVersion {
         sys_from: v.sys_from,
+        seq: v.seq,
         sys_to: v.sys_to,
         payload: v.payload.clone(),
         provenance: v.provenance.clone(),
@@ -696,7 +733,7 @@ fn engine_chain_is_differential_equal_to_the_oracle_across_flush_boundaries() {
                             &lookup,
                             key.clone(),
                             payload.clone(),
-                            0,
+                            op,
                             txn,
                             principal.clone(),
                         )
@@ -706,7 +743,7 @@ fn engine_chain_is_differential_equal_to_the_oracle_across_flush_boundaries() {
                     // (committed_at == the boundary).
                     let prov = Provenance::new(txn, at, principal);
                     oracle.close(&key, at, &prov);
-                    oracle.open(&key, at, payload, &prov);
+                    oracle.open(&key, at, op, payload, &prov);
                 }
             } else {
                 let at = writer
@@ -716,12 +753,12 @@ fn engine_chain_is_differential_equal_to_the_oracle_across_flush_boundaries() {
                         &lookup,
                         key.clone(),
                         payload.clone(),
-                        0,
+                        op,
                         txn,
                         principal.clone(),
                     )
                     .unwrap();
-                oracle.open(&key, at, payload, &Provenance::new(txn, at, principal));
+                oracle.open(&key, at, op, payload, &Provenance::new(txn, at, principal));
                 live[k] = true;
             }
         }
@@ -750,8 +787,8 @@ fn assert_oracle_equal(seed: u64, k: usize, chain: &[Version], model: &[OracleVe
     for w in engine.windows(2) {
         let (lo, hi) = (&w[0], &w[1]);
         assert!(
-            lo.sys_from < hi.sys_from,
-            "seed {seed} key {k}: starts must strictly increase",
+            (lo.sys_from, lo.seq) < (hi.sys_from, hi.seq),
+            "seed {seed} key {k}: chain not ordered by (sys_from, seq)",
         );
         assert!(
             lo.sys_to <= hi.sys_from,

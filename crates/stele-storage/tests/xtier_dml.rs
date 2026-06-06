@@ -183,7 +183,7 @@ fn dml_update_closes_a_version_that_lives_only_in_a_sealed_segment() {
     // sealed version — no record was re-staged (invariant 1).
     assert_eq!(index.len().expect("len"), 1, "one materialized close");
     let closed = index
-        .close_of(&key, c0)
+        .close_of(&key, c0, 0)
         .expect("lookup")
         .expect("c0 is closed");
     assert_eq!(
@@ -263,7 +263,7 @@ fn dml_delete_retracts_a_version_that_lives_only_in_a_sealed_segment() {
     assert!(c0 < c1);
     assert_eq!(
         index
-            .close_of(&key, c0)
+            .close_of(&key, c0, 0)
             .expect("lookup")
             .expect("c0 closed")
             .sys_to,
@@ -377,7 +377,7 @@ fn valid_time_update_closes_a_sealed_version_and_keeps_its_interval() {
     assert!(c0 < c1);
     assert_eq!(
         index
-            .close_of(&key, c0)
+            .close_of(&key, c0, 0)
             .expect("lookup")
             .expect("c0 closed")
             .sys_to,

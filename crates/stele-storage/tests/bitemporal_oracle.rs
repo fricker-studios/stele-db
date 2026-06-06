@@ -83,6 +83,25 @@ impl Clock for StepClock {
     }
 }
 
+/// A deterministic clock that issues each µs **twice** before advancing, so two
+/// consecutive commits land on the *same* `sys_from`. This is the same-tick
+/// collision the force-bump used to paper over (STL-145): with it gone, the two
+/// versions keep the shared µs and are ordered only by their distinct `seq`. The
+/// reading never moves backwards, so the writer's non-regression guard accepts
+/// every tick.
+struct StallClock(AtomicI64);
+impl StallClock {
+    const fn new(start: i64) -> Self {
+        // `2*start` so the emitted value (`counter / 2`) begins at `start`.
+        Self(AtomicI64::new(start * 2))
+    }
+}
+impl Clock for StallClock {
+    fn now(&self) -> SystemTimeMicros {
+        SystemTimeMicros(self.0.fetch_add(1, Ordering::Relaxed) / 2)
+    }
+}
+
 /// Tiny xorshift64* — deterministic, dependency-free; matches the other storage
 /// oracles so a failing seed reproduces bit-for-bit ([ADR-0010]).
 struct Rng(u64);
@@ -131,6 +150,14 @@ fn gen_valid(rng: &mut Rng, vmax: i64) -> ValidInterval {
 struct Tuple {
     key: u8,
     sys_from: i64,
+    /// Per-commit sequence number ([ADR-0024], STL-145). With the force-bump
+    /// gone, two versions of one key can share a `sys_from`; `(sys_from, seq)` is
+    /// the total order, and a same-tick supersession closes the prior version
+    /// degenerately (`sys_to == sys_from`) so only the higher-`seq` version is
+    /// ever live. The brute-force resolver below needs no special case — a
+    /// degenerate `[c, c)` system period contains no point — but the field rides
+    /// on every tuple so the reference and engine fold the same identity.
+    seq: u64,
     sys_to: i64,
     valid_from: i64,
     valid_to: i64,
@@ -143,15 +170,25 @@ struct Tuple {
 /// ([docs/16 §5]); a second live tuple is the bug this oracle exists to catch, so
 /// it is asserted, not silently resolved.
 fn reference_as_of(model: &[Tuple], key: u8, s: i64, v: i64) -> Option<Vec<u8>> {
-    let mut live = model.iter().filter(|t| {
-        t.key == key && t.sys_from <= s && s < t.sys_to && t.valid_from <= v && v < t.valid_to
-    });
-    let first = live.next().map(|t| t.value.clone());
+    let live: Vec<&Tuple> = model
+        .iter()
+        .filter(|t| {
+            t.key == key && t.sys_from <= s && s < t.sys_to && t.valid_from <= v && v < t.valid_to
+        })
+        .collect();
     assert!(
-        live.next().is_none(),
+        live.len() <= 1,
         "more than one tuple live at (s={s}, v={v}) for key {key} — 2D-tiling broken",
     );
-    first
+    // docs/16 §3: among the versions visible at `(s, v)`, the live one is the
+    // maximal by `(sys_from, seq)` — the tiebreak that totally orders same-tick
+    // commits (STL-145). Half-open tiling already makes this set a singleton (a
+    // same-tick supersession leaves the prior with a degenerate `[c, c)` period
+    // that contains no point), so the max *is* that sole element; resolving by
+    // `(sys_from, seq)` explicitly is what folds `seq` into the reference's order.
+    live.into_iter()
+        .max_by_key(|t| (t.sys_from, t.seq))
+        .map(|t| t.value.clone())
 }
 
 /// A *buggy* resolver that models a stale `sys_to`: when two versions overlap on
@@ -242,12 +279,26 @@ struct Scenario {
 /// the engine and the reference, fsync, then crash-rebuild a second engine from the
 /// WAL alone ([`dml::replay`]).
 fn run_seed(seed: u64) -> Scenario {
+    // The default sweep uses a strictly-increasing clock — distinct `sys_from` per
+    // commit. The same-tick variant ([`run_seed_same_tick`]) feeds a stalling
+    // clock so commits collide on `sys_from` and `seq` carries the order.
+    run_seed_with(seed, StepClock::new(START))
+}
+
+/// Like [`run_seed`] but with a clock that issues each µs twice, so consecutive
+/// commits share a `sys_from` and `(sys_from, seq)` ordering is exercised
+/// end-to-end (STL-145).
+fn run_seed_same_tick(seed: u64) -> Scenario {
+    run_seed_with(seed, StallClock::new(START))
+}
+
+fn run_seed_with<C: Clock>(seed: u64, clock: C) -> Scenario {
     let mut rng = Rng::new(seed);
     let wal = Wal::open(MemDisk::new(), WalConfig::default()).expect("wal");
     let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
     let mut index = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("idx");
     // `true`: valid-time opt-in — every write carries an interval (the second axis).
-    let mut dml = DmlWriter::new(wal.clone(), StepClock::new(START), true);
+    let mut dml = DmlWriter::new(wal.clone(), clock, true);
 
     let mut model: Vec<Tuple> = Vec::new();
     let mut live = vec![false; KEY_POOL as usize];
@@ -279,7 +330,7 @@ fn run_seed(seed: u64) -> Scenario {
                         key,
                         Some(interval),
                         value.clone(),
-                        0,
+                        op,
                         txn,
                         who(),
                     )
@@ -289,6 +340,7 @@ fn run_seed(seed: u64) -> Scenario {
                 model.push(Tuple {
                     key: k,
                     sys_from: c.0,
+                    seq: op,
                     sys_to: SYSTEM_TIME_OPEN.0,
                     valid_from: interval.from.0,
                     valid_to: interval.to.0,
@@ -306,7 +358,7 @@ fn run_seed(seed: u64) -> Scenario {
                     key,
                     Some(interval),
                     value.clone(),
-                    0,
+                    op,
                     txn,
                     who(),
                 )
@@ -315,6 +367,7 @@ fn run_seed(seed: u64) -> Scenario {
             model.push(Tuple {
                 key: k,
                 sys_from: c.0,
+                seq: op,
                 sys_to: SYSTEM_TIME_OPEN.0,
                 valid_from: interval.from.0,
                 valid_to: interval.to.0,
@@ -406,6 +459,138 @@ fn bitemporal_as_of_is_differential_equal_across_both_axes_and_recovery() {
     }
 }
 
+// --- 1b. same-tick differential (seq is load-bearing) -----------------------
+
+/// The whole differential, but driven by a clock that issues each µs twice
+/// ([`StallClock`]), so consecutive commits collide on `sys_from` and the only
+/// thing separating them is `seq` (STL-145). The brute-force reference (which
+/// tiles a same-tick supersession as a degenerate `[c, c)` prior plus an open
+/// successor) and the engine — live *and* crash-recovered from the WAL — must
+/// still agree byte-for-byte at every `(sys, valid)` grid point. Keyed on
+/// `sys_from` alone, a same-tick version would be dropped from a chain or an
+/// index entry and the grids would diverge; this is the test that proves they do
+/// not.
+#[test]
+fn same_tick_commits_are_differential_equal_across_both_axes_and_recovery() {
+    for seed in 0u64..80 {
+        let Scenario {
+            delta,
+            index,
+            recovered,
+            recovered_index,
+            model,
+            hi,
+        } = run_seed_same_tick(seed);
+
+        for s in (START - 2)..=(hi + 2) {
+            let live = engine_live(&delta, &index, s);
+            let rlive = engine_live(&recovered, &recovered_index, s);
+            for k in 0..KEY_POOL {
+                let eng = live.get(&k);
+                let reng = rlive.get(&k);
+                for v in (-2)..=(VMAX + 2) {
+                    let expected = reference_as_of(&model, k, s, v);
+                    assert_eq!(
+                        engine_point(eng, v),
+                        expected,
+                        "seed {seed} @ (s={s}, v={v}) key {k}: same-tick live engine vs reference",
+                    );
+                    assert_eq!(
+                        engine_point(reng, v),
+                        expected,
+                        "seed {seed} @ (s={s}, v={v}) key {k}: same-tick recovered engine vs reference",
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The minimal, unmistakable same-tick case ([ADR-0024]/docs/16 §3, STL-145):
+/// an `INSERT` then an `UPDATE` of one key at an **identical** clock µs, with the
+/// transaction manager handing each a distinct `seq`. Both versions keep the
+/// shared `sys_from`; the engine orders them by `seq`, so the post-`UPDATE` value
+/// is the one live at and after that tick. A `sys_from`-only chain would have
+/// dropped one of the two — here neither is lost, and a crash-recovered engine
+/// reproduces the identical result through the seq-bearing WAL close.
+#[test]
+fn two_commits_at_one_tick_are_ordered_by_seq() {
+    let wal = Wal::open(MemDisk::new(), WalConfig::default()).expect("wal");
+    let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
+    let mut index = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("idx");
+    let mut dml = DmlWriter::new(wal.clone(), StallClock::new(START), true);
+    let key = BusinessKey::new(vec![b'k', 0]);
+    let valid = ValidInterval::new(ValidTimeMicros(0), ValidTimeMicros(100)).expect("interval");
+
+    // seq 0 then seq 1 — the manager's per-commit counter. The stalled clock
+    // hands both the same µs.
+    let c0 = dml
+        .insert(
+            &mut delta,
+            &mut index,
+            &EmptySealed,
+            key.clone(),
+            Some(valid),
+            b"A".to_vec(),
+            0,
+            TxnId(1),
+            who(),
+        )
+        .expect("insert")
+        .commit
+        .0;
+    let c1 = dml
+        .update(
+            &mut delta,
+            &mut index,
+            &EmptySealed,
+            key,
+            Some(valid),
+            b"B".to_vec(),
+            1,
+            TxnId(2),
+            who(),
+        )
+        .expect("update")
+        .commit
+        .0;
+    assert_eq!(
+        c0, c1,
+        "the stalled clock forces both commits onto one sys_from"
+    );
+    wal.tick().expect("fsync");
+
+    // At and after the shared tick, the higher-seq UPDATE wins; the INSERT is
+    // superseded (its degenerate [c, c) period is never live), not dropped.
+    let live = engine_live(&delta, &index, c1);
+    assert_eq!(
+        engine_point(live.get(&0), 50),
+        Some(b"B".to_vec()),
+        "the higher-seq version at the shared tick is the live one",
+    );
+    // Strictly before the tick the key did not exist.
+    assert!(!engine_live(&delta, &index, c0 - 1).contains_key(&0));
+
+    // Crash-recover from the WAL alone and re-probe: the seq-bearing close must
+    // round-trip so the rebuilt engine resolves identically.
+    let mut recovered = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
+    let mut recovered_index =
+        ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("idx");
+    dml::replay(
+        &wal,
+        &mut recovered,
+        &mut recovered_index,
+        Checkpoint::BEGIN,
+    )
+    .expect("replay");
+    let rlive = engine_live(&recovered, &recovered_index, c1);
+    assert_eq!(
+        engine_point(rlive.get(&0), 50),
+        Some(b"B".to_vec()),
+        "the recovered engine reproduces the seq-ordered result",
+    );
+}
+
 // --- 2. focused, documented sys_to-mutation catch --------------------------
 
 /// The canonical [ADR-0023] failure, made unmistakable: `INSERT "A"` then
@@ -424,6 +609,7 @@ fn a_deliberate_sys_to_mutation_is_caught_by_the_oracle() {
         Tuple {
             key: 0,
             sys_from: c0,
+            seq: 0,
             sys_to: c1,
             valid_from: 0,
             valid_to: 100,
@@ -432,6 +618,7 @@ fn a_deliberate_sys_to_mutation_is_caught_by_the_oracle() {
         Tuple {
             key: 0,
             sys_from: c1,
+            seq: 0,
             sys_to: SYSTEM_TIME_OPEN.0,
             valid_from: 0,
             valid_to: 100,

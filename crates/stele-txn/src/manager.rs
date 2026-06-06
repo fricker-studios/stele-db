@@ -554,6 +554,9 @@ mod tests {
             .insert_close(Close {
                 business_key: key.clone(),
                 sys_from: c1,
+                // v1 was opened with seq 0 (see `open_version`); the close targets
+                // that same (sys_from, seq) identity (STL-145).
+                seq: 0,
                 sys_to: c2,
                 closed_by: Provenance::new(b_done.txn_id, c2, Principal::new(b"tester".to_vec())),
             })

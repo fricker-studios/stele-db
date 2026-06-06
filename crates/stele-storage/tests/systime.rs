@@ -193,7 +193,7 @@ fn drain_chains(
 ) -> BTreeMap<BusinessKey, Vec<Version>> {
     let mut map: BTreeMap<BusinessKey, Vec<Version>> = BTreeMap::new();
     for mut v in delta.flush_to_segment().unwrap() {
-        if let Some(ci) = index.close_of(&v.business_key, v.sys_from).unwrap() {
+        if let Some(ci) = index.close_of(&v.business_key, v.sys_from, v.seq).unwrap() {
             v.sys_to = ci.sys_to;
             v.closed_by = Some(ci.closed_by);
         }
@@ -467,14 +467,20 @@ fn reinsert_after_delete_opens_a_new_period_with_a_gap() {
 
 // --- Interval invariant (DoD bullet 2) --------------------------------------
 
-/// For any business key, the set of `[sys_from, sys_to)` intervals the writer
-/// stamps is non-overlapping and gap-free.
+/// For any business key, the per-key chain is totally ordered by
+/// `(sys_from, seq)`, non-overlapping, and gap-free.
 ///
 /// Each seed drives a random series of inserts and updates across a small pool
-/// of keys, *with the clock stalling and regressing at random*, then checks the
-/// chain invariant for every key. Updates (not deletes) are the operations that
-/// must keep a key's chain continuous, so the generator uses exactly those — a
-/// delete deliberately introduces a gap and is covered separately above.
+/// of keys, *with the clock stalling at random* (flat or forward, never
+/// backward — the writer no longer force-bumps, so a regressing clock is a
+/// rejected error, exercised separately as a unit test). A stalled clock makes
+/// consecutive commits share a `sys_from`, so the chain invariant is checked on
+/// the `(sys_from, seq)` order: a same-tick supersession closes the prior period
+/// degenerately (`sys_to == sys_from`) and the higher-`seq` version abuts it
+/// (STL-145). `seq` is the per-op counter, distinct and increasing, the
+/// transaction manager's total-order tiebreak. Updates (not deletes) keep a
+/// key's chain continuous, so the generator uses exactly those — a delete
+/// deliberately introduces a gap and is covered separately above.
 #[test]
 fn version_chains_are_non_overlapping_and_gap_free_under_seed_sweep() {
     const KEY_POOL: u64 = 6;
@@ -489,17 +495,21 @@ fn version_chains_are_non_overlapping_and_gap_free_under_seed_sweep() {
 
         let ops = 30 + rng.range(40);
         for op in 0..ops {
-            // Drive the clock adversarially: sometimes forward, sometimes flat,
-            // sometimes backwards. The writer's monotonic guard must absorb it.
-            let jitter = rng.next_u64() % 7;
-            let delta_t = (jitter as i64) - 3; // [-3, +3]
+            // Drive the clock non-adversarially on the system axis: sometimes
+            // forward, sometimes flat (a stall), never backward. A flat tick is
+            // exactly the same-`sys_from` collision `seq` now orders; a backward
+            // tick is a rejected error, so the sweep does not produce one here.
+            let delta_t = (rng.next_u64() % 4) as i64; // [0, +3]
             let cur = clock.now_micros();
-            clock.set((cur + delta_t).max(0));
+            clock.set(cur + delta_t);
 
             let key_idx = rng.range(KEY_POOL) as usize;
             let key = BusinessKey::new(vec![b'k', key_idx as u8]);
             let payload = format!("s{seed}-k{key_idx}").into_bytes();
             let txn = TxnId(op);
+            // The per-commit sequence number: distinct and increasing across the
+            // whole writer, so it totally orders even same-`sys_from` commits.
+            let seq = op;
 
             if live[key_idx] {
                 writer
@@ -509,7 +519,7 @@ fn version_chains_are_non_overlapping_and_gap_free_under_seed_sweep() {
                         &EmptySealed,
                         key,
                         payload,
-                        0,
+                        seq,
                         txn,
                         who(),
                     )
@@ -522,7 +532,7 @@ fn version_chains_are_non_overlapping_and_gap_free_under_seed_sweep() {
                         &EmptySealed,
                         key,
                         payload,
-                        0,
+                        seq,
                         txn,
                         who(),
                     )
@@ -542,18 +552,21 @@ fn version_chains_are_non_overlapping_and_gap_free_under_seed_sweep() {
 
             for w in versions.windows(2) {
                 let (lo, hi) = (&w[0], &w[1]);
-                // Strictly increasing starts ⇒ no two versions share a start.
+                // Totally ordered by (sys_from, seq) ⇒ no two versions share the
+                // full key. Starts may now *tie* (a stalled clock), with seq
+                // breaking the tie (STL-145).
                 assert!(
-                    lo.sys_from < hi.sys_from,
-                    "seed {seed} key {key_idx}: starts must strictly increase"
+                    (lo.sys_from, lo.seq) < (hi.sys_from, hi.seq),
+                    "seed {seed} key {key_idx}: chain not ordered by (sys_from, seq)"
                 );
                 // Half-open, non-overlapping: a period ends no later than the
-                // next begins.
+                // next begins (equal for a same-tick degenerate close).
                 assert!(
                     lo.sys_to <= hi.sys_from,
                     "seed {seed} key {key_idx}: intervals overlap"
                 );
-                // Gap-free: consecutive update periods abut exactly.
+                // Gap-free: consecutive update periods abut exactly — including a
+                // degenerate same-tick close where lo.sys_to == lo.sys_from.
                 assert_eq!(
                     lo.sys_to, hi.sys_from,
                     "seed {seed} key {key_idx}: gap between consecutive periods"
