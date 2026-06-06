@@ -97,3 +97,25 @@ Valid-time is often a **business date**, not an instant ("effective March 2024")
 
 This honesty *is* the product: in a trust-led domain, a precisely-stated guarantee beats an over-claimed one.
 
+## 12. Deletes, retractions & the deletion gap
+
+A **delete is "close, don't reopen":** a retraction closes the current version's system-time period and opens nothing. The key is then **ABSENT** for all `S ≥ closed_at` until (if ever) a later assertion re-opens it. Nothing is physically removed; the deleted version remains queryable as-of the past (physical erasure is the separate [ADR-0020](adr/0020-crypto-shredding-erasure.md) path).
+
+**Retractions are first-class durable records — never inferences.** Version adjacency ("a version's `sys_to` is the next version's `sys_from`") is only valid for *supersessions*, where close and successor share one atomic commit. A delete is a **close with no successor**; adjacency inference cannot represent it. The canonical failure:
+
+```
+INSERT@t0 (V1) → UPDATE@t1 (V2) → UPDATE@t2 (V3) → DELETE@t3 → re-INSERT@t4 (V4)
+adjacency-only rebuild infers V3 = [t2, t4)   ✗  (resurrects the row across [t3, t4))
+with the retraction record:  V3 = [t2, t3), gap [t3, t4), V4 = [t4, +∞)   ✓
+```
+
+**Where retractions durably live** (so a validity-index rebuild can never lose a deletion gap):
+
+1. **WAL** — every retraction is a redo record; the fsync is the durability point.
+2. **Segments** — at delta flush, retractions are persisted as **payload-less tombstone rows** (`key`, target `sys_from`, `closed_at`, `seq`, closing provenance); compaction preserves them like any version. The segment store is therefore **self-contained for a from-scratch rebuild** (versions + retractions fully determine the index), even after WAL truncation.
+3. **Validity-index checkpoints** — routine recovery is *checkpoint + WAL tail*; the full replay always remains possible.
+
+The retraction record is also where **delete provenance** lives ("who deleted this, when, by what statement" is a queryable fact), and the [hash-chained commit log](adr/0026-verifiable-audit-log.md) keeps the delete event tamper-evident.
+
+**Required oracle test:** the delete-then-reinsert gap must survive a **full index rebuild** — as-of results across `[t3, t4)` are byte-identical before and after rebuilding the validity index from segments. An adjacency-inference implementation must fail this test.
+

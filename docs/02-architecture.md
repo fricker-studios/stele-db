@@ -112,7 +112,7 @@ erDiagram
     }
 ```
 
-> **No stored `sys_to`.** Version records are append-only and never mutated; a version's system-time end lives only in the *derived, rebuildable* validity index, written once when the superseding assertion commits ([ADR-0023](adr/0023-append-only-record-model-validity-index.md)). This is what makes the append-only / tamper-evidence claims hold under scrutiny.
+> **No stored `sys_to`.** Version records are append-only and never mutated; a version's system-time end lives only in the *derived, rebuildable* validity index, written once when the superseding assertion — or a delete's **retraction record** — commits ([ADR-0023](adr/0023-append-only-record-model-validity-index.md)). Retractions are persisted (WAL + payload-less tombstone rows in segments) so an index rebuild can never lose a deletion gap ([16 §12](16-bitemporal-semantics.md#12-deletes-retractions--the-deletion-gap)). This is what makes the append-only / tamper-evidence claims hold under scrutiny.
 
 A **bitemporal query** picks a point (or range) on each axis. "As we believed on 2026-01-31 (system), about the state of the world on 2026-01-15 (valid)" selects, per business key, the version whose `sys` interval contains 2026-01-31 *and* whose `valid` interval contains 2026-01-15.
 
