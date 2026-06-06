@@ -15,13 +15,19 @@
 //! always produces the same digest — the determinism property the whole
 //! testing strategy rests on.
 //!
-//! The virtual clock/network and the seeded-fault virtual disk ([STL-109]) land
-//! in later tickets; [`run_fault_seed`] exercises the minimal fault seam the
-//! memory backend already exposes.
+//! The seeded-fault virtual disk ([STL-109]) lands in the `fault_disk` module:
+//! [`run_fault_seed`] drives a [`FaultDisk`] through a seeded workload and folds
+//! its fault-event log into a digest. The virtual clock/network land in
+//! adjacent tickets.
 
 #![allow(dead_code)]
 
+mod fault_disk;
+
+pub use fault_disk::{FaultDisk, FaultEvent, FaultKind, FaultProfile};
+
 use std::collections::BTreeMap;
+use std::io;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use stele_catalog::{Catalog, ColumnDef, TableTemporal};
@@ -29,7 +35,7 @@ use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
 use stele_common::types::LogicalType;
 use stele_exec::{Column, SnapshotScan};
-use stele_storage::backend::{Disk, DiskFile, FaultOp, Faults, MemDisk, MemFile};
+use stele_storage::backend::{Disk, DiskFile, MemDisk, MemFile};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
 use stele_storage::dml::{self, DmlWriter};
 use stele_storage::engine::Engine;
@@ -851,45 +857,128 @@ pub fn run_mvcc_seed(seed: u64) -> u64 {
     digest
 }
 
-/// Play a seeded sequence of operations against a [`MemDisk`] whose
-/// fault schedule is also seed-derived, and return the per-operation
-/// success/failure pattern.
+/// Play a seeded workload against a [`FaultDisk`] and fold every operation
+/// outcome and the disk's seed-keyed fault-event log into a digest ([STL-109]).
 ///
-/// This is a minimal exercise of the memory backend's deterministic fault hook:
-/// the same seed schedules the same faults at the same points, so the returned
-/// pattern is reproducible. The richer seeded-fault virtual disk is [STL-109].
+/// The disk runs a profile that arms **every** fault class — full disk, torn
+/// write, short read, bit flip, slow sync — at probabilities high enough that a
+/// bounded workload trips each, while the seed alone decides *which* operations
+/// are hit. The workload appends seeded payloads, syncs, and reads back at
+/// seeded offsets; each result (and its error kind, if any) plus the structured
+/// fault log is mixed into the digest. Same seed ⇒ identical fault sequence ⇒
+/// identical digest — the determinism contract of the whole harness, now
+/// covering the disk-fault model ([docs/06 §5], [ADR-0010]).
+///
+/// [docs/06 §5]: ../../../docs/06-testing-strategy.md#5-deterministic-simulation-testing-dst--the-centerpiece
+/// [ADR-0010]: ../../../docs/adr/0010-deterministic-simulation-testing.md
 #[must_use]
-pub fn run_fault_seed(seed: u64) -> Vec<bool> {
-    let mut rng = Rng::new(seed);
-    let faults = Faults::new();
+pub fn run_fault_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    // Arm every class. Probabilities are tuned so a bounded workload exercises
+    // each fault while the seed drives which ops are hit; the digest then
+    // regresses on every fault class together.
+    let profile = FaultProfile::none()
+        .with_full_disk(0.03)
+        .with_torn_write(0.15)
+        .with_short_read(0.25)
+        .with_bit_flip(0.20)
+        .with_slow_sync(0.40)
+        .with_max_slow_ticks(64);
+    let disk = FaultDisk::new(seed, profile);
 
-    // Schedule a seed-driven handful of sync faults interleaved with appends.
-    let ops = 8 + rng.below_usize(8);
-    let op_kinds: Vec<FaultOp> = (0..ops)
-        .map(|_| {
-            if rng.below(3) == 0 {
-                FaultOp::Sync
-            } else {
-                FaultOp::Append
+    // A workload RNG independent of the disk's internal fault stream.
+    let mut rng = Rng::new(seed);
+    // `create` can trip the full-disk fault — retry until it lands so the
+    // workload always has a file (each attempt is deterministic).
+    let mut file = loop {
+        if let Ok(f) = disk.create("wal") {
+            break f;
+        }
+    };
+
+    let mut digest = FNV_OFFSET;
+    let ops = 48 + rng.below_usize(48);
+    for _ in 0..ops {
+        match rng.below(4) {
+            0 => {
+                // sync — outcome (and any slow-sync log entry) folded.
+                digest = fold_io(digest, b'S', file.sync().map(|()| 0));
             }
-        })
-        .collect();
-    for &op in &op_kinds {
-        if rng.below(2) == 0 {
-            faults.schedule(op, std::io::ErrorKind::Other);
+            1 => {
+                // read at a seeded offset — fold the returned bytes too.
+                let len = file.len();
+                let offset = if len == 0 { 0 } else { rng.below(len) };
+                let mut buf = vec![0u8; 1 + rng.below_usize(32)];
+                match file.read_at(offset, &mut buf) {
+                    Ok(n) => {
+                        digest = fnv1a(digest, &[b'R', 1]);
+                        digest = fnv1a(digest, &buf[..n]);
+                    }
+                    Err(e) => digest = fold_err(digest, b'R', &e),
+                }
+            }
+            _ => {
+                // append a seeded payload — outcome folded (torn/full disk).
+                let payload_len = 1 + rng.below_usize(16);
+                let payload = rng.bytes(payload_len);
+                digest = fold_io(digest, b'A', file.append(&payload).map(|()| 0));
+            }
         }
     }
 
-    let disk = MemDisk::with_faults(faults);
-    let mut file = disk.create("log").expect("create is not scheduled");
-    op_kinds
-        .iter()
-        .map(|op| match op {
-            FaultOp::Append => file.append(b"record").is_ok(),
-            FaultOp::Sync => file.sync().is_ok(),
-            _ => true,
-        })
-        .collect()
+    // Fold the structured fault log — the seed-keyed sequence the DoD pins down.
+    for ev in disk.events() {
+        digest = fnv1a(digest, &ev.seq.to_le_bytes());
+        digest = fnv1a(digest, &[fault_op_tag(ev.op), fault_kind_tag(ev.kind)]);
+        digest = fnv1a(digest, &ev.detail.to_le_bytes());
+    }
+    digest
+}
+
+/// Fold a `usize`-or-error operation outcome into the digest under a `label`
+/// (which op), so the success/failure *pattern* is part of the seed's identity.
+fn fold_io(digest: u64, label: u8, result: io::Result<usize>) -> u64 {
+    match result {
+        Ok(n) => {
+            let digest = fnv1a(digest, &[label, 1]);
+            fnv1a(digest, &(n as u64).to_le_bytes())
+        }
+        Err(e) => fold_err(digest, label, &e),
+    }
+}
+
+/// Fold an I/O error (its `label` and [`ErrorKind`](io::ErrorKind)) into the
+/// digest — the failures the DoD requires to recur identically per seed.
+fn fold_err(digest: u64, label: u8, err: &io::Error) -> u64 {
+    let digest = fnv1a(digest, &[label, 0]);
+    fnv1a(digest, format!("{:?}", err.kind()).as_bytes())
+}
+
+/// A stable tag byte for a [`FaultOp`](stele_storage::backend::FaultOp), so the
+/// folded fault log is order- and identity-sensitive without depending on the
+/// enum's `Debug` text.
+const fn fault_op_tag(op: stele_storage::backend::FaultOp) -> u8 {
+    use stele_storage::backend::FaultOp;
+    match op {
+        FaultOp::Create => 0,
+        FaultOp::Open => 1,
+        FaultOp::Append => 2,
+        FaultOp::ReadAt => 3,
+        FaultOp::Sync => 4,
+        FaultOp::List => 5,
+        FaultOp::Remove => 6,
+    }
+}
+
+/// A stable tag byte for a [`FaultKind`].
+const fn fault_kind_tag(kind: FaultKind) -> u8 {
+    match kind {
+        FaultKind::BitFlip => 0,
+        FaultKind::ShortRead => 1,
+        FaultKind::TornWrite => 2,
+        FaultKind::SlowSync => 3,
+        FaultKind::FullDisk => 4,
+    }
 }
 
 /// Collapse a [`SnapshotScan`] result projecting `[BusinessKey, Payload]` into a
@@ -1381,8 +1470,21 @@ mod tests {
     #[test]
     fn fault_pattern_is_reproducible() {
         for seed in 0..64 {
-            assert_eq!(run_fault_seed(seed), run_fault_seed(seed));
+            assert_eq!(
+                run_fault_seed(seed),
+                run_fault_seed(seed),
+                "seed {seed} must replay to an identical fault digest"
+            );
         }
+    }
+
+    #[test]
+    fn fault_distinct_seeds_diverge() {
+        let digests: std::collections::HashSet<u64> = (0..64).map(run_fault_seed).collect();
+        assert!(
+            digests.len() > 1,
+            "the seeded-fault disk workload must actually depend on the seed"
+        );
     }
 
     #[test]
