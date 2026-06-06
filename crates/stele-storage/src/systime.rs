@@ -19,7 +19,7 @@
 //!   ([architecture §8](../../../docs/02-architecture.md#8-lineage--provenance-subsystem),
 //!   invariant 5). Provenance is stored inline on the version, never
 //!   reconstructed.
-//! * **Updates close the prior period.** An [`SysTimeWriter::update`] stages a
+//! * **Updates close the prior period.** A [`SysTimeWriter::update`] stages a
 //!   new open version *and* a [`Close`] that materializes the previous version's
 //!   `sys_to` into the [validity index](crate::validity) (it abuts: the old
 //!   period ends exactly where the new one begins). A [`SysTimeWriter::delete`]
