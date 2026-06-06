@@ -430,6 +430,17 @@ impl<C: Clock, D: Disk> TxnManager<C, D> {
     /// it to [`verify_chain_to`](crate::chain::verify_chain_to) to detect even a
     /// wholesale rewrite of the log, which the bare chain walk cannot catch.
     ///
+    /// **Only a reliable witness if no [`TxnError::Wal`] has occurred since
+    /// startup.** `commit_head` advances only after a commit's record is appended
+    /// *and* fsynced, so it tracks the durable log on the happy path. But the
+    /// append-succeeded/fsync-failed case ([`TxnError::Wal`]) leaves a staged
+    /// record that may still reach the WAL on a later fsync or rotation — so the
+    /// durable log can gain a record the in-memory head does not yet reflect, and
+    /// an anchor persisted across that window may later fail to verify even
+    /// though nothing was tampered with. After any WAL error the manager must be
+    /// treated as requiring recovery (a v0.2 concern) before `commit_head` is
+    /// used as an external witness again.
+    ///
     /// [ADR-0026]: ../../../docs/adr/0026-verifiable-audit-log.md
     #[must_use]
     pub fn commit_head(&self) -> Digest {
