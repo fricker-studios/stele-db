@@ -40,6 +40,7 @@ use stele_storage::dml::{self, DmlWriter};
 use stele_storage::merge;
 use stele_storage::rebuild::rebuild_index_from_segments;
 use stele_storage::segment::{SegmentReader, SegmentWriter};
+use stele_storage::systime::EmptySealed;
 use stele_storage::validity::{Close, ValidityConfig, ValidityIndex};
 use stele_storage::wal::{Checkpoint, Wal, WalConfig};
 
@@ -164,6 +165,7 @@ fn resurrection_gap_survives_full_index_rebuild_byte_identical() {
         .insert(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key.clone(),
             None,
             b"v0".to_vec(),
@@ -177,6 +179,7 @@ fn resurrection_gap_survives_full_index_rebuild_byte_identical() {
         .update(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key.clone(),
             None,
             b"v1".to_vec(),
@@ -190,6 +193,7 @@ fn resurrection_gap_survives_full_index_rebuild_byte_identical() {
         .update(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key.clone(),
             None,
             b"v2".to_vec(),
@@ -200,7 +204,7 @@ fn resurrection_gap_survives_full_index_rebuild_byte_identical() {
         .commit;
     clock.advance(10);
     let t3 = dml
-        .delete(&mut delta, &mut index, &key, TxnId(4), who())
+        .delete(&mut delta, &mut index, &EmptySealed, &key, TxnId(4), who())
         .expect("delete")
         .commit;
     clock.advance(10);
@@ -208,6 +212,7 @@ fn resurrection_gap_survives_full_index_rebuild_byte_identical() {
         .insert(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key.clone(),
             None,
             b"v4".to_vec(),
@@ -360,7 +365,7 @@ fn from_scratch_rebuild_equals_wal_replay_under_seed_sweep() {
             if live[k] {
                 if rng.range(2) == 0 {
                     let c = dml
-                        .delete(&mut delta, &mut index, &key, txn, who())
+                        .delete(&mut delta, &mut index, &EmptySealed, &key, txn, who())
                         .expect("delete")
                         .commit;
                     close_open(&mut model[k], c.0);
@@ -371,6 +376,7 @@ fn from_scratch_rebuild_equals_wal_replay_under_seed_sweep() {
                         .update(
                             &mut delta,
                             &mut index,
+                            &EmptySealed,
                             key,
                             None,
                             payload.clone(),
@@ -392,6 +398,7 @@ fn from_scratch_rebuild_equals_wal_replay_under_seed_sweep() {
                     .insert(
                         &mut delta,
                         &mut index,
+                        &EmptySealed,
                         key,
                         None,
                         payload.clone(),
@@ -476,6 +483,7 @@ fn delete_provenance_is_queryable_from_the_persisted_retraction() {
         .insert(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key.clone(),
             None,
             b"payload".to_vec(),
@@ -485,7 +493,14 @@ fn delete_provenance_is_queryable_from_the_persisted_retraction() {
         .expect("insert")
         .commit;
     let deleted_at = dml
-        .delete(&mut delta, &mut index, &key, TxnId(99), deleter.clone())
+        .delete(
+            &mut delta,
+            &mut index,
+            &EmptySealed,
+            &key,
+            TxnId(99),
+            deleter.clone(),
+        )
         .expect("delete")
         .commit;
     wal.tick().expect("fsync");

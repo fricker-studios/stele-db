@@ -265,6 +265,7 @@ pub fn run_validtime_seed(seed: u64) -> u64 {
             .insert(
                 &mut delta,
                 &mut index,
+                &EmptySealed,
                 key,
                 Some(interval),
                 payload,
@@ -401,21 +402,39 @@ pub fn run_dml_seed(seed: u64) -> u64 {
         if live[k] {
             if rng.below(2) == 0 {
                 writer
-                    .delete(&mut delta, &mut index, &key, txn, principal)
+                    .delete(&mut delta, &mut index, &EmptySealed, &key, txn, principal)
                     .expect("delete");
                 live[k] = false;
             } else {
                 let payload_len = rng.below_usize(16);
                 let payload = rng.bytes(payload_len);
                 writer
-                    .update(&mut delta, &mut index, key, None, payload, txn, principal)
+                    .update(
+                        &mut delta,
+                        &mut index,
+                        &EmptySealed,
+                        key,
+                        None,
+                        payload,
+                        txn,
+                        principal,
+                    )
                     .expect("update");
             }
         } else {
             let payload_len = rng.below_usize(16);
             let payload = rng.bytes(payload_len);
             writer
-                .insert(&mut delta, &mut index, key, None, payload, txn, principal)
+                .insert(
+                    &mut delta,
+                    &mut index,
+                    &EmptySealed,
+                    key,
+                    None,
+                    payload,
+                    txn,
+                    principal,
+                )
                 .expect("insert");
             live[k] = true;
         }
@@ -466,21 +485,39 @@ pub fn run_recovery_index_seed(seed: u64) -> u64 {
         if live[k] {
             if rng.below(2) == 0 {
                 writer
-                    .delete(&mut delta, &mut index, &key, txn, principal)
+                    .delete(&mut delta, &mut index, &EmptySealed, &key, txn, principal)
                     .expect("delete");
                 live[k] = false;
             } else {
                 let payload_len = rng.below_usize(16);
                 let payload = rng.bytes(payload_len);
                 writer
-                    .update(&mut delta, &mut index, key, None, payload, txn, principal)
+                    .update(
+                        &mut delta,
+                        &mut index,
+                        &EmptySealed,
+                        key,
+                        None,
+                        payload,
+                        txn,
+                        principal,
+                    )
                     .expect("update");
             }
         } else {
             let payload_len = rng.below_usize(16);
             let payload = rng.bytes(payload_len);
             writer
-                .insert(&mut delta, &mut index, key, None, payload, txn, principal)
+                .insert(
+                    &mut delta,
+                    &mut index,
+                    &EmptySealed,
+                    key,
+                    None,
+                    payload,
+                    txn,
+                    principal,
+                )
                 .expect("insert");
             live[k] = true;
         }

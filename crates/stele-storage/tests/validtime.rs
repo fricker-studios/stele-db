@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros, VALID_TIME_OPEN, ValidTimeMicros};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
+use stele_storage::systime::EmptySealed;
 use stele_storage::validity::{ValidityConfig, ValidityIndex};
 use stele_storage::validtime::{ValidInterval, ValidTimeError, ValidTimeWriter, unframe_payload};
 use stele_storage::wal::{Disk, DiskFile};
@@ -200,6 +201,7 @@ fn insert_into_a_valid_time_table_populates_both_axes_and_reads_filter_on_either
         .insert(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key.clone(),
             Some(interval(100, 200)),
             b"role=ic".to_vec(),
@@ -245,6 +247,7 @@ fn update_opens_a_new_valid_period_and_the_superseded_one_keeps_its_interval() {
         .insert(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key.clone(),
             Some(interval(100, 200)),
             b"role=ic".to_vec(),
@@ -258,6 +261,7 @@ fn update_opens_a_new_valid_period_and_the_superseded_one_keeps_its_interval() {
         .update(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key.clone(),
             Some(interval(200, i64::MAX)),
             b"role=lead".to_vec(),
@@ -301,6 +305,7 @@ fn delete_closes_the_system_period_and_preserves_the_valid_interval() {
         .insert(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key.clone(),
             Some(interval(100, 200)),
             b"role=ic".to_vec(),
@@ -312,6 +317,7 @@ fn delete_closes_the_system_period_and_preserves_the_valid_interval() {
         .delete(
             &mut delta,
             &mut index,
+            &EmptySealed,
             &key,
             TxnId(7),
             Principal::new(b"deleter".to_vec()),
@@ -360,6 +366,7 @@ fn valid_time_table_requires_an_interval_on_every_write() {
         .insert(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key,
             None,
             b"x".to_vec(),
@@ -381,6 +388,7 @@ fn system_only_table_rejects_a_supplied_interval() {
         .insert(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key,
             Some(interval(1, 2)),
             b"x".to_vec(),
@@ -403,6 +411,7 @@ fn system_only_table_stores_payload_with_no_prefix() {
         .insert(
             &mut delta,
             &mut index,
+            &EmptySealed,
             key.clone(),
             None,
             b"plain".to_vec(),
