@@ -19,6 +19,7 @@ path = "src/main.rs"
 [dependencies]
 stele-pgwire       = { workspace = true }
 stele-lineage      = { workspace = true }
+stele-engine       = { workspace = true }
 stele-storage      = { workspace = true }
 stele-common       = { workspace = true }
 anyhow             = { workspace = true }

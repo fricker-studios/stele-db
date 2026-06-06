@@ -384,6 +384,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "stele-engine"
+version = "0.1.0"
+dependencies = [
+ "stele-catalog",
+ "stele-common",
+ "stele-exec",
+ "stele-sql",
+ "stele-storage",
+ "thiserror",
+]
+
+[[package]]
 name = "stele-exec"
 version = "0.1.0"
 dependencies = [
@@ -422,6 +434,7 @@ dependencies = [
  "clap",
  "serde",
  "stele-common",
+ "stele-engine",
  "stele-lineage",
  "stele-pgwire",
  "stele-storage",
