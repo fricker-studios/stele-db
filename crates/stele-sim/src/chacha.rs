@@ -72,6 +72,7 @@ fn chacha20_block(key: &[u32; 8], counter: u32, nonce: &[u32; 3]) -> [u32; 16] {
 #[derive(Debug, Clone)]
 pub struct SeededRng {
     key: [u32; 8],
+    nonce: [u32; 3],
     counter: u32,
     buf: [u32; 16],
     /// Index of the next unused word in `buf`; `16` means "empty, refill first".
@@ -79,26 +80,34 @@ pub struct SeededRng {
 }
 
 impl SeededRng {
-    /// Seed the generator. The `u64` is expanded into a 256-bit key with
-    /// `splitmix64`, so even adjacent seeds produce well-separated key material
-    /// (and therefore unrelated streams).
+    /// Seed the generator. The `u64` is expanded with `splitmix64` into the full
+    /// 256-bit key *and* the 96-bit nonce, so even adjacent seeds produce
+    /// well-separated cipher state (and therefore unrelated streams). Both are
+    /// derived from the seed — there is no fixed key material or nonce.
     #[must_use]
     pub fn new(seed: u64) -> Self {
         let mut s = seed;
-        let mut key = [0u32; 8];
-        for pair in key.chunks_exact_mut(2) {
-            // splitmix64 — a standard, well-mixed `u64 -> u64` step.
+        // splitmix64 — a standard, well-mixed `u64 -> u64` step.
+        let mut splitmix = move || {
             s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
             let mut z = s;
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
-            let b = z.to_le_bytes();
+            z ^ (z >> 31)
+        };
+        // Eleven little-endian `u32` words: eight for the key, three for the
+        // nonce. (Six `u64` draws give twelve words; the last is unused.)
+        let mut words = [0u32; 12];
+        for pair in words.chunks_exact_mut(2) {
+            let b = splitmix().to_le_bytes();
             pair[0] = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
             pair[1] = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
         }
+        let mut key = [0u32; 8];
+        key.copy_from_slice(&words[0..8]);
         Self {
             key,
+            nonce: [words[8], words[9], words[10]],
             counter: 0,
             buf: [0; 16],
             pos: 16,
@@ -107,7 +116,7 @@ impl SeededRng {
 
     /// Generate the next keystream block and reset the read cursor.
     fn refill(&mut self) {
-        self.buf = chacha20_block(&self.key, self.counter, &[0, 0, 0]);
+        self.buf = chacha20_block(&self.key, self.counter, &self.nonce);
         self.counter = self.counter.wrapping_add(1);
         self.pos = 0;
     }
