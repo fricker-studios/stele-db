@@ -27,7 +27,9 @@
 //! [STL-150]: https://allegromusic.atlassian.net/browse/STL-150
 
 use stele_sql::Statement;
-use stele_sql::sqlparser::ast::{Expr, SetExpr, Statement as SqlStatement, TableFactor, Value};
+use stele_sql::sqlparser::ast::{
+    Expr, SetExpr, Statement as SqlStatement, TableFactor, UnaryOperator, Value,
+};
 
 /// A recognized `pg_catalog` introspection query from the `\d` sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,9 +73,12 @@ pub(crate) fn classify(stmt: &Statement) -> Option<Introspection> {
         }
         "pg_attribute" => {
             let oid = where_clause.and_then(first_int_literal)?;
-            // A negative or out-of-range attrelid never matches a real `oid_for`
-            // value; treat it as "no such relation" (an empty `\d`).
-            let oid = u32::try_from(oid).ok()?;
+            // A negative or out-of-range attrelid can't match a real `oid_for`
+            // value (those are non-zero and within the i32 range), so it stays an
+            // introspection query and resolves to zero rows — an empty `\d`.
+            // Saturate to 0 rather than returning `None`, which would drop out of
+            // introspection and wrongly answer `feature_not_supported`.
+            let oid = u32::try_from(oid).unwrap_or(0);
             Some(Introspection::Attributes { oid })
         }
         _ => None,
@@ -131,15 +136,30 @@ fn first_string_literal(expr: &Expr) -> Option<String> {
     })
 }
 
-/// The first integer numeric literal anywhere in an expression tree.
+/// The first integer numeric literal anywhere in an expression tree, honoring a
+/// leading unary minus (`-1` parses as `-(1)`, not a negative literal).
 fn first_int_literal(expr: &Expr) -> Option<i64> {
     walk(expr, &mut |e| match e {
-        Expr::Value(v) => match &v.value {
-            Value::Number(digits, _) => digits.parse::<i64>().ok(),
+        Expr::Value(v) => int_value(&v.value),
+        // A negated literal is matched at the `UnaryOp` node (pre-order), before
+        // the walker would otherwise descend to the unsigned inner number.
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Value(v) => int_value(&v.value).and_then(i64::checked_neg),
             _ => None,
         },
         _ => None,
     })
+}
+
+/// An integer numeric literal's value, or `None` for any non-integer literal.
+fn int_value(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(digits, _) => digits.parse::<i64>().ok(),
+        _ => None,
+    }
 }
 
 /// Pre-order walk of the predicate-shaped expressions `\d`'s filters use,
@@ -203,6 +223,19 @@ mod tests {
              WHERE a.attrelid = {oid} AND a.attnum > 0 ORDER BY a.attnum"
         ));
         assert_eq!(classify(&stmt), Some(Introspection::Attributes { oid }));
+    }
+
+    #[test]
+    fn out_of_range_attrelid_stays_introspection_with_an_unmatchable_oid() {
+        // A negative / overflowing attrelid still classifies as a pg_attribute
+        // lookup (so it answers an empty `\d`, not feature_not_supported); it
+        // saturates to 0, which `oid_for` never produces, so it matches no table.
+        for filter in ["a.attrelid = -1", "a.attrelid = 99999999999999"] {
+            let stmt = parse_one(&format!(
+                "SELECT a.attname FROM pg_catalog.pg_attribute a WHERE {filter}"
+            ));
+            assert_eq!(classify(&stmt), Some(Introspection::Attributes { oid: 0 }));
+        }
     }
 
     #[test]
