@@ -4,7 +4,7 @@
 //! the [`Clock`] trait, which is implemented by:
 //!
 //! * `SystemClock` — production: the OS clock.
-//! * `stele_sim::VirtualClock` (later) — deterministic, advances on demand.
+//! * `stele_sim::VirtualClock` — deterministic, advances on demand.
 //!
 //! Keeping the core off of `SystemTime::now()` is what lets every test seed
 //! reproduce bit-for-bit ([ADR-0010](../../../../docs/adr/0010-deterministic-simulation-testing.md)).

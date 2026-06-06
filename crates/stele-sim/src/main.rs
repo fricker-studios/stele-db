@@ -37,8 +37,9 @@ fn main() {
         let as_of_digest = stele_sim::run_as_of_resolution_seed(seed);
         let engine_rec_digest = stele_sim::run_engine_recover_seed(seed);
         let fault_digest = stele_sim::run_fault_seed(seed);
+        let sched_digest = stele_sim::run_schedule_seed_digest(seed);
         println!(
-            "stele-sim: seed {seed} → storage digest {digest:#018x} · valid-time digest {vt_digest:#018x} · delete digest {del_digest:#018x} · dml digest {dml_digest:#018x} · mvcc digest {mvcc_digest:#018x} · recovery-index digest {rec_digest:#018x} · snapshot-scan digest {scan_digest:#018x} · as-of-resolution digest {as_of_digest:#018x} · engine-recover digest {engine_rec_digest:#018x} · fault digest {fault_digest:#018x}"
+            "stele-sim: seed {seed} → storage digest {digest:#018x} · valid-time digest {vt_digest:#018x} · delete digest {del_digest:#018x} · dml digest {dml_digest:#018x} · mvcc digest {mvcc_digest:#018x} · recovery-index digest {rec_digest:#018x} · snapshot-scan digest {scan_digest:#018x} · as-of-resolution digest {as_of_digest:#018x} · engine-recover digest {engine_rec_digest:#018x} · fault digest {fault_digest:#018x} · schedule digest {sched_digest:#018x}"
         );
     } else if args.seeds == 0 {
         println!("stele-sim: no seeds requested (pass --seeds N or --seed S)");
@@ -48,6 +49,9 @@ fn main() {
         // cancel matching digests) so the sweep stays a sharp regression signal.
         let faults_on = args.fault_injection != "off";
         let mut sweep = 0xCBF2_9CE4_8422_2325u64;
+        // The schedule trace per seed, collected to report how many *distinct*
+        // interleavings the seeds explored — the scheduler's DoD statistic.
+        let mut schedules = std::collections::HashSet::new();
         for seed in 0..args.seeds {
             // Mix both scenarios per seed so the sweep regresses on either the
             // sealed-segment path or the valid-time ingestion path.
@@ -82,9 +86,20 @@ fn main() {
                 sweep =
                     (sweep ^ stele_sim::run_fault_seed(seed)).wrapping_mul(0x0000_0100_0000_01B3);
             }
+            // The cooperative scheduler (STL-108): a seed-determined interleaving
+            // of cooperating tasks over the virtual clock + ChaCha20 RNG. The raw
+            // trace feeds the distinct-schedule count below.
+            sweep = (sweep ^ stele_sim::run_schedule_seed_digest(seed))
+                .wrapping_mul(0x0000_0100_0000_01B3);
+            schedules.insert(stele_sim::run_schedule_seed(seed));
         }
         println!(
             "stele-sim: swept {} seed(s) over the in-memory backend → sweep digest {sweep:#018x}",
+            args.seeds
+        );
+        println!(
+            "stele-sim: scheduler explored {} distinct interleaving(s) across {} seed(s)",
+            schedules.len(),
             args.seeds
         );
         if faults_on {
