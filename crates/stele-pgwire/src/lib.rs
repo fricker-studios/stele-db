@@ -65,7 +65,9 @@ pub use stele_common::DEFAULT_PG_PORT;
 // The wire front end leans on stele-sql for parsing; `sqlparser` is re-exported
 // from there, so matching on the AST adds no new dependency.
 use stele_sql::Statement;
-use stele_sql::sqlparser::ast::{Expr, SelectItem, SetExpr, Statement as SqlStatement, Value};
+use stele_sql::sqlparser::ast::{
+    Expr, SelectItem, SetExpr, Statement as SqlStatement, UnaryOperator, Value,
+};
 
 // ---------------------------------------------------------------------------
 // Protocol constants
@@ -402,15 +404,7 @@ fn constant_select(stmt: &Statement) -> Option<Vec<ConstColumn>> {
             SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
             _ => return None,
         };
-        let Expr::Value(value) = expr else {
-            return None;
-        };
-        let Value::Number(digits, _) = &value.value else {
-            return None;
-        };
-        // Only plain integers in v0.1; anything that does not parse as i64
-        // (decimals, out-of-range) falls through to the binder/executor path.
-        let parsed: i64 = digits.parse().ok()?;
+        let parsed = integer_literal(expr)?;
         let (type_oid, typlen) = if i32::try_from(parsed).is_ok() {
             (OID_INT4, TYPLEN_INT4)
         } else {
@@ -425,6 +419,29 @@ fn constant_select(stmt: &Statement) -> Option<Vec<ConstColumn>> {
         });
     }
     Some(columns)
+}
+
+/// Fold an integer-literal expression to its value, or `None` for anything that
+/// is not one. Handles a leading sign (`SELECT -1` parses as unary `-` over a
+/// `Number`, not a negative literal), since an unsigned `SELECT 1` and a signed
+/// `SELECT -1` are both basic connectivity smoke tests. Decimals and
+/// out-of-`i64`-range values fall through to the binder/executor path.
+fn integer_literal(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            Value::Number(digits, _) => digits.parse().ok(),
+            _ => None,
+        },
+        Expr::UnaryOp { op, expr } => {
+            let inner = integer_literal(expr)?;
+            match op {
+                UnaryOperator::Plus => Some(inner),
+                UnaryOperator::Minus => inner.checked_neg(),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -644,15 +661,27 @@ async fn write_empty_query_response(stream: &mut TcpStream) -> io::Result<()> {
     stream.write_all(&buf).await
 }
 
+/// The Postgres column-count fields in `RowDescription` / `DataRow` are Int16,
+/// so a result wider than `i16::MAX` columns cannot be described. Reject it
+/// rather than clamp the count and emit a frame whose body and header disagree.
+fn column_count(columns: &[ConstColumn]) -> Result<i16, WireError> {
+    i16::try_from(columns.len())
+        .map_err(|_| WireError::Protocol("result has more than 32767 columns"))
+}
+
 /// `RowDescription` ('T') — one field descriptor per result column.
 ///
 /// Per field: name (cstring), table OID (Int32), column attr number (Int16),
 /// type OID (Int32), type size (Int16), type modifier (Int32), format code
 /// (Int16). We have no real relation behind these constant columns, so table
 /// OID and attr number are `0`, and the type modifier is `-1` (none).
-async fn write_row_description(stream: &mut TcpStream, columns: &[ConstColumn]) -> io::Result<()> {
+async fn write_row_description(
+    stream: &mut TcpStream,
+    columns: &[ConstColumn],
+) -> Result<(), WireError> {
+    let count = column_count(columns)?;
     let mut payload = BytesMut::new();
-    payload.put_i16(i16::try_from(columns.len()).unwrap_or(i16::MAX));
+    payload.put_i16(count);
     for col in columns {
         payload.put_slice(col.name.as_bytes());
         payload.put_u8(0);
@@ -663,21 +692,25 @@ async fn write_row_description(stream: &mut TcpStream, columns: &[ConstColumn]) 
         payload.put_i32(-1); // type modifier
         payload.put_i16(FORMAT_TEXT);
     }
-    write_framed(stream, MSG_ROW_DESCRIPTION, &payload).await
+    write_framed(stream, MSG_ROW_DESCRIPTION, &payload).await?;
+    Ok(())
 }
 
-/// `DataRow` ('D') — one value per column, in text format. A `NULL` value is
-/// length `-1`; the constant-`SELECT` path never produces one, but the encoder
-/// honors `None` so later callers can.
-async fn write_data_row(stream: &mut TcpStream, columns: &[ConstColumn]) -> io::Result<()> {
+/// `DataRow` ('D') — one value per column, in text format. The constant-`SELECT`
+/// path always has a value, so this never emits the `NULL` sentinel (length
+/// `-1`); the general path that does will arrive with the type-encoder set
+/// (STL-105).
+async fn write_data_row(stream: &mut TcpStream, columns: &[ConstColumn]) -> Result<(), WireError> {
+    let count = column_count(columns)?;
     let mut payload = BytesMut::new();
-    payload.put_i16(i16::try_from(columns.len()).unwrap_or(i16::MAX));
+    payload.put_i16(count);
     for col in columns {
         let bytes = col.text.as_bytes();
         payload.put_i32(i32::try_from(bytes.len()).unwrap_or(i32::MAX));
         payload.put_slice(bytes);
     }
-    write_framed(stream, MSG_DATA_ROW, &payload).await
+    write_framed(stream, MSG_DATA_ROW, &payload).await?;
+    Ok(())
 }
 
 /// `CommandComplete` ('C') — the statement's [`CommandTag`] as a cstring.
@@ -823,6 +856,14 @@ mod tests {
         let cols = constant_select(&aliased[0]).expect("constant");
         assert_eq!(cols[0].name, "big");
         assert_eq!(cols[0].type_oid, OID_INT8);
+
+        // A leading sign is folded — `-1` parses as unary minus over a Number.
+        let neg = stele_sql::parse("SELECT -1").unwrap();
+        let cols = constant_select(&neg[0]).expect("SELECT -1 is constant");
+        assert_eq!(cols[0].type_oid, OID_INT4);
+        assert_eq!(cols[0].text, "-1");
+        let pos = stele_sql::parse("SELECT +5 AS five").unwrap();
+        assert_eq!(constant_select(&pos[0]).unwrap()[0].text, "5");
 
         // A table read, a filter, or a non-integer expression is not constant.
         for sql in [
