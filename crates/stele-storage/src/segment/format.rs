@@ -82,8 +82,8 @@ pub(super) const CHUNK_HEADER_LEN: usize = 16;
 /// Maximum bytes retained for a variable-length column's zone-map min/max stat.
 ///
 /// Bytes columns ([`ColumnType::Bytes`]) can hold values up to
-/// `MAX_VERSION_FRAME_LEN` (16 MiB) each — `Payload`, `Principal`,
-/// `ClosedByPrincipal`, and even a pathologically long `BusinessKey`. Inlining a
+/// `MAX_VERSION_FRAME_LEN` (16 MiB) each — `Payload`, `Principal`, and even a
+/// pathologically long `BusinessKey`. Inlining a
 /// full lex-min/max of such a value would push the footer past its `u32`
 /// `footer_len` ceiling, so the writer records only a bounded *prefix* of the
 /// lex-min/max instead ([`super::writer`]): the min prefix is truncated *down*

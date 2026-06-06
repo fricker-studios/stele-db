@@ -123,8 +123,10 @@ impl<F: DiskFile> SegmentWriter<F> {
 
         for &col in schema {
             let encoded = encode_column(col, &self.rows, valid_pairs.as_deref())?;
-            // Each chunk is laid out contiguously in `(business_key, sys_from,
-            // sys_to, payload)` order. The footer records the absolute
+            // Each chunk is laid out contiguously in `ColumnId::schema` order
+            // (`business_key`, `sys_from`, `payload`, the three provenance
+            // columns, then the valid-time pair when present) — there is no
+            // stored `sys_to` (v6, [ADR-0023]). The footer records the absolute
             // offset, so the reader projects exactly the columns it wants.
             let length = (CHUNK_HEADER_LEN + encoded.payload.len()) as u64;
             chunks.push(EncodedChunk {
@@ -218,17 +220,14 @@ fn encode_column(
             //
             // Every bytes column can be an unbounded blob — `Payload` runs up
             // to `MAX_VERSION_FRAME_LEN` (16 MiB) per row, and `BusinessKey` /
-            // `Principal` / `ClosedByPrincipal` are only bounded by the same
-            // frame ceiling — so inlining a full lex-min/max would let one row
-            // push the footer past the `u32` `footer_len` limit. Instead we
-            // record a bounded prefix capped at `MAX_BYTES_STAT_PREFIX_LEN`: the
-            // min prefix is truncated *down* and the max prefix is rounded *up*,
-            // so the `[min, max]` envelope stays a superset of the real value
-            // range and `might_contain` keeps its no-false-negatives contract.
-            // This caps every bytes column's footer cost regardless of value
-            // size. The close-provenance principal ([`ColumnId::ClosedByPrincipal`],
-            // STL-118) is just another bytes column here — empty on open
-            // versions, which collapses to the "no stats" sentinel.
+            // `Principal` are only bounded by the same frame ceiling — so
+            // inlining a full lex-min/max would let one row push the footer past
+            // the `u32` `footer_len` limit. Instead we record a bounded prefix
+            // capped at `MAX_BYTES_STAT_PREFIX_LEN`: the min prefix is truncated
+            // *down* and the max prefix is rounded *up*, so the `[min, max]`
+            // envelope stays a superset of the real value range and
+            // `might_contain` keeps its no-false-negatives contract. This caps
+            // every bytes column's footer cost regardless of value size.
             //
             // `valid_pairs` is `Some` exactly for a valid-time segment, where
             // the `payload` column stores only the bare user payload — the
