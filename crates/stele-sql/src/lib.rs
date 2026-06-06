@@ -41,7 +41,16 @@
 //! assert!(stmts[0].is_temporal());
 //! ```
 //!
-//! Binder, planner, and optimizer are still scaffold.
+//! The query binder ([`bind_select`]) folds a `SELECT … FOR SYSTEM_TIME AS OF
+//! <expr>` into a [`BoundSelect`]: it resolves the `AS OF` to a concrete
+//! system-time snapshot (`now()`, `now() ± interval '…'`, or an explicit
+//! instant), defaults to the transaction snapshot when no `AS OF` is given, and
+//! resolves the table against the versioned catalog at that snapshot — surfacing
+//! the documented [before-history](select::SelectError::BeforeHistory) error for
+//! a read older than the table. The snapshot it carries is the `sys_from ≤ s`
+//! bound the executor pushes into zone-map pruning ([STL-101]).
+//!
+//! Planner and cost-based optimizer beyond this are still scaffold.
 
 #![allow(dead_code)]
 
@@ -50,6 +59,7 @@ pub mod ddl;
 pub mod dialect;
 pub mod error;
 mod parser;
+pub mod select;
 pub mod types;
 
 pub use ast::{AsOf, Statement, Temporal, TimeDimension, ValidTimePeriod};
@@ -57,6 +67,9 @@ pub use ddl::{BindError, DdlOutcome, DdlStatement, bind_ddl};
 pub use dialect::SteleDialect;
 pub use error::ParseError;
 pub use parser::parse;
+pub use select::{
+    AsOfError, BindContext, BoundSelect, Projection, SelectError, bind_select, resolve_as_of,
+};
 pub use types::logical_type;
 
 // Re-exported so downstream crates (binder, planner) can name the underlying
