@@ -11,7 +11,10 @@
 //!   never prunes a segment that actually holds a matching, visible row (no
 //!   false negatives), per testing-strategy §4. STL-115 extends the oracle to
 //!   bounded-prefix bytes columns (`Payload`), proving a truncated-down min and
-//!   rounded-up max bound never prune a real value/range match.
+//!   rounded-up max bound never prune a real value/range match. STL-134 extends
+//!   it to the valid-time axis (`valid_from` / `valid_to`), so the no-false-
+//!   negative proof now covers `sys_from` / value / `valid_*` — the full triple
+//!   the segment still stores after `sys_to` moved to the validity index.
 
 #![allow(
     clippy::significant_drop_tightening,
@@ -766,6 +769,96 @@ fn might_contain_never_prunes_a_real_match_on_truncated_payload() {
             assert!(
                 !real_match || kept,
                 "seed {seed}: might_contain pruned a segment holding a real payload match \
+                 (snapshot={snapshot:?}, predicate={predicate:?}, rows={rows:?})"
+            );
+        }
+    }
+}
+
+/// Valid-axis counterpart to [`might_contain_never_prunes_a_real_match`]: the
+/// differential no-false-negative oracle over the **valid-time** columns. This
+/// closes the `valid_*` half of STL-134's Definition of done — "the zone-map
+/// oracle still proves no false-negative pruning on `sys_from` / value /
+/// `valid_*`" — which the system-axis and payload oracles above leave to a
+/// targeted prune test ([`valid_time_range_query_prunes_non_overlapping_segments`])
+/// rather than a seeded differential sweep.
+///
+/// Builds random valid-time segments and fires random `valid_from` / `valid_to`
+/// range probes — single-column and conjoined — asserting `might_contain` never
+/// answers `false` when a visible row truly falls in the queried valid range.
+/// Every row is system-visible (`valid_version` stamps `sys_from = 0`, open) and
+/// the snapshot is non-negative, so `snapshot_overlaps` never prunes here: the
+/// valid axis is the only pruner, isolating the property under test.
+#[test]
+fn might_contain_never_prunes_a_real_valid_time_match() {
+    let keys: [&[u8]; 4] = [b"a", b"g", b"m", b"t"];
+    for seed in 0..200u64 {
+        let mut rng = Lcg(seed.wrapping_mul(2_654_435_761).wrapping_add(3));
+        let disk = CountingDisk::new();
+
+        // 1..=8 valid-time rows with random, well-formed intervals
+        // (`valid_to > valid_from`, the `ValidInterval` contract).
+        let row_count = 1 + rng.below(8);
+        let mut rows: Vec<(Version, i64, i64)> = Vec::new();
+        for _ in 0..row_count {
+            let key = keys[rng.below(keys.len() as u64) as usize];
+            let valid_from = rng.below(100) as i64;
+            let valid_to = valid_from + 1 + rng.below(100) as i64;
+            rows.push((
+                valid_version(key, valid_from, valid_to),
+                valid_from,
+                valid_to,
+            ));
+        }
+        let versions: Vec<Version> = rows.iter().map(|(v, _, _)| v.clone()).collect();
+        write_valid_segment(&disk, "vo.seg", &versions);
+        let reader = SegmentReader::open(&disk, "vo.seg").expect("open");
+
+        // All rows are visible at any non-negative snapshot (born at 0, open).
+        let snapshot = snap(rng.below(50) as i64);
+
+        for _ in 0..20 {
+            // Two independent inclusive i64 ranges. Each deliberately reaches a
+            // little past the [0, ~200) data range on both ends so a healthy
+            // fraction of probes match nothing (exercising the prune path).
+            let vf_lo = rng.below(210) as i64 - 5;
+            let vf_hi = vf_lo + rng.below(120) as i64;
+            let vt_lo = rng.below(210) as i64 - 5;
+            let vt_hi = vt_lo + rng.below(120) as i64;
+            let vf = Predicate::Range {
+                column: ColumnId::ValidFrom,
+                low: ZoneBound::I64(vf_lo),
+                high: ZoneBound::I64(vf_hi),
+            };
+            let vt = Predicate::Range {
+                column: ColumnId::ValidTo,
+                low: ZoneBound::I64(vt_lo),
+                high: ZoneBound::I64(vt_hi),
+            };
+
+            // Three probe shapes: valid_from only, valid_to only, or both
+            // conjoined. The conjunction must be kept whenever a *single* row
+            // satisfies both parts.
+            let shape = rng.below(3);
+            let predicate = match shape {
+                0 => vf,
+                1 => vt,
+                _ => Predicate::And(vec![vf, vt]),
+            };
+
+            // Oracle: a real match is a (visible) row whose valid column(s) fall
+            // in the queried range(s) — every part holding on the *same* row.
+            let in_range = |x: i64, lo: i64, hi: i64| x >= lo && x <= hi;
+            let real_match = rows.iter().any(|(_, valid_from, valid_to)| match shape {
+                0 => in_range(*valid_from, vf_lo, vf_hi),
+                1 => in_range(*valid_to, vt_lo, vt_hi),
+                _ => in_range(*valid_from, vf_lo, vf_hi) && in_range(*valid_to, vt_lo, vt_hi),
+            });
+
+            let kept = reader.might_contain(&predicate, snapshot);
+            assert!(
+                !real_match || kept,
+                "seed {seed}: might_contain pruned a valid-time segment holding a real match \
                  (snapshot={snapshot:?}, predicate={predicate:?}, rows={rows:?})"
             );
         }

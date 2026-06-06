@@ -62,6 +62,35 @@
 //! * Schema evolution. v0.1 has one implicit schema id — 0, the implicit
 //!   `Version` schema. Real schema resolution rides on [STL-98]'s versioned
 //!   catalog.
+//!
+//! ## Format versioning & pre-transition segments (migration note)
+//!
+//! Dropping the stored `sys_to` column (and the close-provenance columns) into
+//! the derived [validity index](crate::validity) bumped the on-disk
+//! `FORMAT_VERSION` v5 → v6 (STL-134,
+//! [ADR-0023](../../../../docs/adr/0023-append-only-record-model-validity-index.md)).
+//! That is a backwards-incompatible layout change: a *pre-transition* segment —
+//! one written at v5 or earlier, which still carries a `sys_to` column — is
+//! **rejected outright at open** with
+//! [`SegmentError::UnsupportedVersion`]. The version check is a single
+//! header-level comparison inside [`SegmentReader::open`]: a reader only decodes
+//! a segment whose advertised version equals the one it was built for, so an old
+//! `sys_to`-bearing footer can never be half-parsed into a v6 `Version`.
+//!
+//! **There is no read-compat shim and no one-shot rewrite tool, by design.**
+//! The on-disk format is a *pre-1.0* surface: it may break between minor
+//! versions, each break documented, and there is no forward-compatibility
+//! promise until v1.0 ([docs/03 roadmap](../../../../docs/03-roadmap.md),
+//! [docs/08 §7](../../../../docs/08-packaging-distribution-and-releases.md#7-versioning--compatibility-policy-the-important-part),
+//! [ADR-0014](../../../../docs/adr/0014-release-channels-and-versioning-policy.md)).
+//! Because no v0.1 on-disk data has been released, no deployed v5 segment
+//! exists to migrate — the "migration" for this change is the clean reject
+//! above, not a converter. Were such a segment to exist, the relocation is
+//! cheap to honour precisely because the validity index is *derived and
+//! rebuildable from the log* ([ADR-0023]): a one-shot rewrite would re-emit the
+//! birth columns at v6 and replay the close records into the index, never
+//! mutating a sealed file. Building that converter is deferred until the format
+//! is stabilised (post-1.0), when a real pre-existing-data migration is owed.
 
 mod format;
 mod reader;
