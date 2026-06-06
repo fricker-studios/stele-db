@@ -684,9 +684,11 @@ fn row_description_payload(columns: &[ResultColumn]) -> Result<BytesMut, WireErr
         payload.put_u8(0);
         payload.put_i32(0); // table OID — not a stored relation
         payload.put_i16(0); // column attribute number
-        // `pg_oid` is a `u32`; the wire field is an Int32. The v0.1 OIDs are all
-        // small well-known values (≤ 1114), so this conversion never fails.
-        payload.put_i32(i32::try_from(col.ty.pg_oid()).expect("v0.1 pg_oid fits in i32"));
+        // The RowDescription dataTypeOID field is a 4-byte OID. Write the `u32`
+        // bits directly rather than narrowing to `i32` — narrowing would panic
+        // on a future OID > i32::MAX, and `put_u32` emits exactly the big-endian
+        // bytes a Postgres backend does.
+        payload.put_u32(col.ty.pg_oid());
         payload.put_i16(text_format::pg_typlen(col.ty));
         payload.put_i32(-1); // type modifier
         payload.put_i16(FORMAT_TEXT);
@@ -707,7 +709,12 @@ fn data_row_payload(columns: &[ResultColumn]) -> Result<BytesMut, WireError> {
             Some(value) => {
                 let text = text_format::encode_text(value);
                 let bytes = text.as_bytes();
-                payload.put_i32(i32::try_from(bytes.len()).unwrap_or(i32::MAX));
+                // The DataRow length prefix is an Int32. Clamping an oversized
+                // value would desync the client (prefix would not match the
+                // bytes written), so refuse it rather than emit a torn frame.
+                let len = i32::try_from(bytes.len())
+                    .map_err(|_| WireError::Protocol("DataRow value exceeds 2 GiB"))?;
+                payload.put_i32(len);
                 payload.put_slice(bytes);
             }
         }
@@ -912,13 +919,13 @@ mod tests {
         for _ in 0..count {
             let len = i32::from_be_bytes(payload[pos..pos + 4].try_into().unwrap());
             pos += 4;
-            match usize::try_from(len) {
-                Err(_) => cells.push(None), // length -1 → NULL
-                Ok(n) => {
-                    let end = pos + n;
-                    cells.push(Some(payload[pos..end].to_vec()));
-                    pos = end;
-                }
+            if len == -1 {
+                cells.push(None); // -1 is the *only* NULL sentinel
+            } else {
+                let n = usize::try_from(len).expect("a non-NULL length is non-negative");
+                let end = pos + n;
+                cells.push(Some(payload[pos..end].to_vec()));
+                pos = end;
             }
         }
         assert_eq!(pos, payload.len(), "DataRow payload fully consumed");
