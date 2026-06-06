@@ -408,10 +408,17 @@ impl<D: Disk> Disk for FaultDisk<D> {
     type File = FaultFile<D::File>;
 
     fn create(&self, name: &str) -> io::Result<Self::File> {
+        // Surface the inner backend's contract errors (InvalidInput for a
+        // non-flat name, AlreadyExists for a duplicate) *before* the full-disk
+        // injection, so a fault can never mask — or spuriously log against — a
+        // call the `Disk` contract says must fail for another reason.
+        let inner = self.inner.create(name)?;
         if self.state.lock().unwrap().plan_create() {
+            // A full disk fails the create: undo the file the inner backend just
+            // made, so nothing is persisted (matching the append/full-disk path).
+            let _ = self.inner.remove(name);
             return Err(full_disk_error());
         }
-        let inner = self.inner.create(name)?;
         Ok(FaultFile {
             inner,
             state: Arc::clone(&self.state),
@@ -501,12 +508,15 @@ mod tests {
     /// determinism tests replay.
     fn run(seed: u64, profile: FaultProfile, appends: usize) -> Vec<FaultEvent> {
         let disk = FaultDisk::new(seed, profile);
-        let mut file = loop {
-            // `create` can hit a full-disk fault; retry until it lands.
+        let mut file = None;
+        for _ in 0..64 {
+            // `create` can hit a full-disk fault; retry a bounded number of times.
             if let Ok(f) = disk.create("wal") {
-                break f;
+                file = Some(f);
+                break;
             }
-        };
+        }
+        let mut file = file.expect("create landed within the retry budget");
         let mut rng = Rng::new(seed);
         for _ in 0..appends {
             let payload_len = 1 + rng.below_usize(16);
@@ -572,6 +582,29 @@ mod tests {
                 .kind(),
             io::ErrorKind::StorageFull,
         );
+    }
+
+    #[test]
+    fn create_contract_errors_take_precedence_over_full_disk() {
+        // Even with the full-disk fault always armed, a non-flat name is an
+        // InvalidInput (the `Disk` contract), not a StorageFull, and logs no
+        // fault — the inner backend rejects it before the injection runs.
+        let disk = FaultDisk::new(0, FaultProfile::none().with_full_disk(1.0));
+        assert_eq!(
+            disk.create("a/b").expect_err("non-flat name").kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        assert_eq!(disk.event_count(), 0, "a rejected name records no fault");
+
+        // A duplicate name is AlreadyExists, again ahead of the full-disk fault.
+        let disk = FaultDisk::new(0, FaultProfile::none());
+        disk.create("x").expect("first create");
+        disk.enable(FaultKind::FullDisk, 1.0);
+        assert_eq!(
+            disk.create("x").expect_err("duplicate name").kind(),
+            io::ErrorKind::AlreadyExists,
+        );
+        assert_eq!(disk.event_count(), 0, "a duplicate records no fault");
     }
 
     #[test]

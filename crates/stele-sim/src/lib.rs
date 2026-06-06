@@ -888,13 +888,12 @@ pub fn run_fault_seed(seed: u64) -> u64 {
 
     // A workload RNG independent of the disk's internal fault stream.
     let mut rng = Rng::new(seed);
-    // `create` can trip the full-disk fault — retry until it lands so the
-    // workload always has a file (each attempt is deterministic).
-    let mut file = loop {
-        if let Ok(f) = disk.create("wal") {
-            break f;
-        }
-    };
+    // `create` can trip the full-disk fault — retry a *bounded* number of times
+    // so a pathological seed/profile can never hang the harness. Each attempt is
+    // deterministic, and the budget is far above any plausible full-disk streak.
+    let mut file = (0..64)
+        .find_map(|_| disk.create("wal").ok())
+        .unwrap_or_else(|| panic!("seed {seed}: create kept hitting the full-disk fault"));
 
     let mut digest = FNV_OFFSET;
     let ops = 48 + rng.below_usize(48);
@@ -951,7 +950,24 @@ fn fold_io(digest: u64, label: u8, result: io::Result<usize>) -> u64 {
 /// digest — the failures the DoD requires to recur identically per seed.
 fn fold_err(digest: u64, label: u8, err: &io::Error) -> u64 {
     let digest = fnv1a(digest, &[label, 0]);
-    fnv1a(digest, format!("{:?}", err.kind()).as_bytes())
+    fnv1a(digest, &[err_kind_tag(err.kind())])
+}
+
+/// A stable tag for the I/O error kinds the fault model and the `Disk` contract
+/// produce, so the digest does not depend on [`io::ErrorKind`]'s `Debug` text
+/// (which is not a stability guarantee) and allocates nothing. An unexpected
+/// kind folds to `255` — distinct, so a new failure mode still shifts the
+/// digest rather than colliding with a known one.
+const fn err_kind_tag(kind: io::ErrorKind) -> u8 {
+    match kind {
+        io::ErrorKind::StorageFull => 1,
+        io::ErrorKind::WriteZero => 2,
+        io::ErrorKind::NotFound => 3,
+        io::ErrorKind::AlreadyExists => 4,
+        io::ErrorKind::InvalidInput => 5,
+        io::ErrorKind::UnexpectedEof => 6,
+        _ => 255,
+    }
 }
 
 /// A stable tag byte for a [`FaultOp`](stele_storage::backend::FaultOp), so the
