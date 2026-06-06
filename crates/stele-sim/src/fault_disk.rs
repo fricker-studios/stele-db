@@ -414,9 +414,13 @@ impl<D: Disk> Disk for FaultDisk<D> {
         // call the `Disk` contract says must fail for another reason.
         let inner = self.inner.create(name)?;
         if self.state.lock().unwrap().plan_create() {
-            // A full disk fails the create: undo the file the inner backend just
-            // made, so nothing is persisted (matching the append/full-disk path).
-            let _ = self.inner.remove(name);
+            // A full disk fails the create: close the handle and undo the file
+            // the inner backend just made, so nothing is persisted (the
+            // FullDisk contract). If the cleanup itself fails we surface *that*
+            // error rather than falsely claiming StorageFull over a file that
+            // still lingers.
+            drop(inner);
+            self.inner.remove(name)?;
             return Err(full_disk_error());
         }
         Ok(FaultFile {
@@ -582,6 +586,8 @@ mod tests {
                 .kind(),
             io::ErrorKind::StorageFull,
         );
+        // The failed create left nothing behind — only the pre-fault "x" remains.
+        assert_eq!(disk.list().expect("list"), vec!["x".to_string()]);
     }
 
     #[test]
