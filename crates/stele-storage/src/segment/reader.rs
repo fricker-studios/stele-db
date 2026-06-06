@@ -250,6 +250,7 @@ impl<F: DiskFile> SegmentReader<F> {
         let mut payloads = self.read_bytes_column(ColumnId::Payload)?;
         let mut principals = self.read_bytes_column(ColumnId::Principal)?;
         let sys_from = self.read_i64_column(ColumnId::SysFrom)?;
+        let seqs = self.read_i64_column(ColumnId::Seq)?;
         let txn_ids = self.read_i64_column(ColumnId::TxnId)?;
         let committed_ats = self.read_i64_column(ColumnId::CommittedAt)?;
 
@@ -258,6 +259,7 @@ impl<F: DiskFile> SegmentReader<F> {
             payloads.len(),
             principals.len(),
             sys_from.len(),
+            seqs.len(),
             txn_ids.len(),
             committed_ats.len(),
         ]
@@ -310,6 +312,9 @@ impl<F: DiskFile> SegmentReader<F> {
             out.push(Version::open(
                 BusinessKey::new(std::mem::take(&mut business_keys[i])),
                 SystemTimeMicros(sys_from[i]),
+                // `seq` round-trips i64-bits → u64, the reverse of the writer's
+                // `as i64` reinterpretation (see `ColumnId::Seq`).
+                seqs[i] as u64,
                 Provenance {
                     txn_id: TxnId(txn_ids[i] as u64),
                     committed_at: SystemTimeMicros(committed_ats[i]),

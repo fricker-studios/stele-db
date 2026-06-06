@@ -205,6 +205,7 @@ fn insert_into_a_valid_time_table_populates_both_axes_and_reads_filter_on_either
             key.clone(),
             Some(interval(100, 200)),
             b"role=ic".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -251,6 +252,7 @@ fn update_opens_a_new_valid_period_and_the_superseded_one_keeps_its_interval() {
             key.clone(),
             Some(interval(100, 200)),
             b"role=ic".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -265,6 +267,7 @@ fn update_opens_a_new_valid_period_and_the_superseded_one_keeps_its_interval() {
             key.clone(),
             Some(interval(200, i64::MAX)),
             b"role=lead".to_vec(),
+            0,
             TxnId(2),
             who(),
         )
@@ -309,6 +312,7 @@ fn delete_closes_the_system_period_and_preserves_the_valid_interval() {
             key.clone(),
             Some(interval(100, 200)),
             b"role=ic".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -370,6 +374,7 @@ fn valid_time_table_requires_an_interval_on_every_write() {
             key,
             None,
             b"x".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -392,6 +397,7 @@ fn system_only_table_rejects_a_supplied_interval() {
             key,
             Some(interval(1, 2)),
             b"x".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -415,6 +421,7 @@ fn system_only_table_stores_payload_with_no_prefix() {
             key.clone(),
             None,
             b"plain".to_vec(),
+            0,
             TxnId(1),
             who(),
         )

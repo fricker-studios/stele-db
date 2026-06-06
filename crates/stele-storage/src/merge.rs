@@ -180,6 +180,7 @@ mod tests {
         Version::open(
             BusinessKey::new(key.to_vec()),
             SystemTimeMicros(sys_from),
+            0,
             Provenance::new(
                 TxnId(1),
                 SystemTimeMicros(sys_from),

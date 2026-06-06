@@ -160,6 +160,7 @@ fn sample_versions() -> Vec<Version> {
         Version::open(
             BusinessKey::new(b"a".to_vec()),
             SystemTimeMicros(10),
+            0,
             Provenance::new(
                 TxnId(10),
                 SystemTimeMicros(10),
@@ -170,6 +171,7 @@ fn sample_versions() -> Vec<Version> {
         Version::open(
             BusinessKey::new(b"a".to_vec()),
             SystemTimeMicros(20),
+            0,
             Provenance::new(
                 TxnId(20),
                 SystemTimeMicros(20),
@@ -180,6 +182,7 @@ fn sample_versions() -> Vec<Version> {
         Version::open(
             BusinessKey::new(b"big".to_vec()),
             SystemTimeMicros(1),
+            0,
             Provenance::new(
                 TxnId(1),
                 SystemTimeMicros(1),

@@ -115,6 +115,7 @@ fn version(key: &[u8], sys_from: i64, payload: &[u8]) -> Version {
     Version::open(
         BusinessKey::new(key.to_vec()),
         SystemTimeMicros(sys_from),
+        0,
         Provenance::new(
             TxnId(u64::try_from(sys_from).unwrap_or(0)),
             SystemTimeMicros(sys_from),
@@ -143,6 +144,7 @@ fn dml_update_closes_a_version_that_lives_only_in_a_sealed_segment() {
             key.clone(),
             None,
             b"balance=100".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -169,6 +171,7 @@ fn dml_update_closes_a_version_that_lives_only_in_a_sealed_segment() {
             key.clone(),
             None,
             b"balance=150".to_vec(),
+            0,
             TxnId(2),
             who(),
         )
@@ -242,6 +245,7 @@ fn dml_delete_retracts_a_version_that_lives_only_in_a_sealed_segment() {
             key.clone(),
             None,
             b"row".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -297,6 +301,7 @@ fn an_empty_lookup_still_cannot_close_the_sealed_version() {
         key.clone(),
         None,
         b"v0".to_vec(),
+        0,
         TxnId(1),
         who(),
     )
@@ -314,6 +319,7 @@ fn an_empty_lookup_still_cannot_close_the_sealed_version() {
             key,
             None,
             b"v1".to_vec(),
+            0,
             TxnId(2),
             who(),
         )
@@ -343,6 +349,7 @@ fn valid_time_update_closes_a_sealed_version_and_keeps_its_interval() {
             key.clone(),
             Some(iv0),
             b"role=ic".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -362,6 +369,7 @@ fn valid_time_update_closes_a_sealed_version_and_keeps_its_interval() {
             key.clone(),
             Some(iv1),
             b"role=lead".to_vec(),
+            0,
             TxnId(2),
             who(),
         )

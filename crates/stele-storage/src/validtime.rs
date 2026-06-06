@@ -316,13 +316,14 @@ impl<C: Clock> ValidTimeWriter<C> {
         key: BusinessKey,
         valid: Option<ValidInterval>,
         payload: Vec<u8>,
+        seq: u64,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<SystemTimeMicros, ValidTimeError> {
         let framed = frame_payload(self.valid_time, valid, payload)?;
         Ok(self
             .inner
-            .insert(delta, index, sealed, key, framed, txn_id, principal)?)
+            .insert(delta, index, sealed, key, framed, seq, txn_id, principal)?)
     }
 
     /// Supersede the live version of `key`: close the prior system-time period
@@ -345,13 +346,14 @@ impl<C: Clock> ValidTimeWriter<C> {
         key: BusinessKey,
         valid: Option<ValidInterval>,
         payload: Vec<u8>,
+        seq: u64,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<SystemTimeMicros, ValidTimeError> {
         let framed = frame_payload(self.valid_time, valid, payload)?;
         Ok(self
             .inner
-            .update(delta, index, sealed, key, framed, txn_id, principal)?)
+            .update(delta, index, sealed, key, framed, seq, txn_id, principal)?)
     }
 
     /// Close the live version of `key` on the system axis without re-opening — a
@@ -403,13 +405,14 @@ impl<C: Clock> ValidTimeWriter<C> {
         key: BusinessKey,
         valid: Option<ValidInterval>,
         payload: Vec<u8>,
+        seq: u64,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<(SystemTimeMicros, Vec<Redo>), ValidTimeError> {
         let framed = frame_payload(self.valid_time, valid, payload)?;
         Ok(self
             .inner
-            .stage_insert(delta, index, sealed, key, framed, txn_id, principal)?)
+            .stage_insert(delta, index, sealed, key, framed, seq, txn_id, principal)?)
     }
 
     /// Resolve an update into the redo set it stages — the prior version closed
@@ -429,13 +432,14 @@ impl<C: Clock> ValidTimeWriter<C> {
         key: BusinessKey,
         valid: Option<ValidInterval>,
         payload: Vec<u8>,
+        seq: u64,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<(SystemTimeMicros, Vec<Redo>), ValidTimeError> {
         let framed = frame_payload(self.valid_time, valid, payload)?;
         Ok(self
             .inner
-            .stage_update(delta, index, sealed, key, framed, txn_id, principal)?)
+            .stage_update(delta, index, sealed, key, framed, seq, txn_id, principal)?)
     }
 
     /// Resolve a delete into the redo set it stages — the prior version closed,

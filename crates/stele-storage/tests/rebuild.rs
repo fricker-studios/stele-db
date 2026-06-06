@@ -169,6 +169,7 @@ fn resurrection_gap_survives_full_index_rebuild_byte_identical() {
             key.clone(),
             None,
             b"v0".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -183,6 +184,7 @@ fn resurrection_gap_survives_full_index_rebuild_byte_identical() {
             key.clone(),
             None,
             b"v1".to_vec(),
+            0,
             TxnId(2),
             who(),
         )
@@ -197,6 +199,7 @@ fn resurrection_gap_survives_full_index_rebuild_byte_identical() {
             key.clone(),
             None,
             b"v2".to_vec(),
+            0,
             TxnId(3),
             who(),
         )
@@ -216,6 +219,7 @@ fn resurrection_gap_survives_full_index_rebuild_byte_identical() {
             key.clone(),
             None,
             b"v4".to_vec(),
+            0,
             TxnId(5),
             who(),
         )
@@ -380,6 +384,7 @@ fn from_scratch_rebuild_equals_wal_replay_under_seed_sweep() {
                             key,
                             None,
                             payload.clone(),
+                            0,
                             txn,
                             who(),
                         )
@@ -402,6 +407,7 @@ fn from_scratch_rebuild_equals_wal_replay_under_seed_sweep() {
                         key,
                         None,
                         payload.clone(),
+                        0,
                         txn,
                         who(),
                     )
@@ -487,6 +493,7 @@ fn delete_provenance_is_queryable_from_the_persisted_retraction() {
             key.clone(),
             None,
             b"payload".to_vec(),
+            0,
             TxnId(11),
             who(),
         )

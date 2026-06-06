@@ -279,6 +279,7 @@ fn run_seed(seed: u64) -> Scenario {
                         key,
                         Some(interval),
                         value.clone(),
+                        0,
                         txn,
                         who(),
                     )
@@ -305,6 +306,7 @@ fn run_seed(seed: u64) -> Scenario {
                     key,
                     Some(interval),
                     value.clone(),
+                    0,
                     txn,
                     who(),
                 )
@@ -483,6 +485,7 @@ fn two_version_engine() -> (i64, i64, Option<Vec<u8>>) {
             key.clone(),
             Some(valid),
             b"A".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -497,6 +500,7 @@ fn two_version_engine() -> (i64, i64, Option<Vec<u8>>) {
             key,
             Some(valid),
             b"B".to_vec(),
+            0,
             TxnId(2),
             who(),
         )

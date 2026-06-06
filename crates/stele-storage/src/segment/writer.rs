@@ -461,6 +461,7 @@ fn extract_bytes(col: ColumnId, row: &Version, valid_time: bool) -> Result<&[u8]
         }
         ColumnId::Principal => Ok(row.provenance.principal.as_bytes()),
         ColumnId::SysFrom
+        | ColumnId::Seq
         | ColumnId::TxnId
         | ColumnId::CommittedAt
         | ColumnId::ValidFrom
@@ -484,6 +485,9 @@ fn extract_bytes(col: ColumnId, row: &Version, valid_time: bool) -> Result<&[u8]
 fn extract_i64(col: ColumnId, row: &Version) -> i64 {
     match col {
         ColumnId::SysFrom => row.sys_from.0,
+        // `seq` is a u64; store its bits in the i64 column (lossless round-trip —
+        // see `ColumnId::Seq`, same reinterpretation as `TxnId`).
+        ColumnId::Seq => row.seq as i64,
         // `txn_id` is a u64; store its bits in the i64 column (lossless
         // round-trip — see `ColumnId::TxnId`).
         ColumnId::TxnId => row.provenance.txn_id.0 as i64,

@@ -83,6 +83,7 @@ mod tests {
         Version::open(
             BusinessKey::new(key.to_vec()),
             SystemTimeMicros(sys_from),
+            0,
             Provenance::new(
                 TxnId(u64::try_from(sys_from).unwrap_or(0)),
                 SystemTimeMicros(sys_from),

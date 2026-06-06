@@ -341,6 +341,7 @@ impl<C: Clock> SysTimeWriter<C> {
         sealed: &S,
         key: BusinessKey,
         payload: Vec<u8>,
+        seq: u64,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<SystemTimeMicros, SysTimeError> {
@@ -352,7 +353,7 @@ impl<C: Clock> SysTimeWriter<C> {
             delta,
             index,
             vec![Redo::Insert(open_version(
-                key, commit, payload, txn_id, principal,
+                key, commit, seq, payload, txn_id, principal,
             ))],
         )?;
         Ok(commit)
@@ -380,6 +381,7 @@ impl<C: Clock> SysTimeWriter<C> {
         sealed: &S,
         key: BusinessKey,
         payload: Vec<u8>,
+        seq: u64,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<SystemTimeMicros, SysTimeError> {
@@ -387,14 +389,14 @@ impl<C: Clock> SysTimeWriter<C> {
         let prior =
             resolve_live(delta, sealed, index, &key, commit)?.ok_or(SysTimeError::KeyNotFound)?;
         // The superseding transaction both closes the prior period (stamping its
-        // identity as `closed_by`) and opens the new one — same `txn_id` /
+        // identity as `closed_by`) and opens the new one — same `seq` / `txn_id` /
         // `principal` for both halves.
         apply(
             delta,
             index,
             vec![
                 Redo::Close(close_of(&key, &prior, commit, txn_id, principal.clone())),
-                Redo::Insert(open_version(key, commit, payload, txn_id, principal)),
+                Redo::Insert(open_version(key, commit, seq, payload, txn_id, principal)),
             ],
         )?;
         Ok(commit)
@@ -458,7 +460,7 @@ impl<C: Clock> SysTimeWriter<C> {
     /// commit timestamp is still consumed, matching [`Self::insert`]);
     /// [`SysTimeError::TimeExhausted`] from the allocator; a [`SealedLookup`]
     /// read error.
-    #[allow(clippy::too_many_arguments)] // tier handles + sealed + key/payload + provenance triple
+    #[allow(clippy::too_many_arguments)] // tier handles + sealed + key/payload + seq + provenance triple
     pub fn stage_insert<D: Disk, I: Disk, S: SealedLookup>(
         &mut self,
         delta: &Delta<D>,
@@ -466,6 +468,7 @@ impl<C: Clock> SysTimeWriter<C> {
         sealed: &S,
         key: BusinessKey,
         payload: Vec<u8>,
+        seq: u64,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<(SystemTimeMicros, Vec<Redo>), SysTimeError> {
@@ -476,7 +479,7 @@ impl<C: Clock> SysTimeWriter<C> {
         Ok((
             commit,
             vec![Redo::Insert(open_version(
-                key, commit, payload, txn_id, principal,
+                key, commit, seq, payload, txn_id, principal,
             ))],
         ))
     }
@@ -493,7 +496,7 @@ impl<C: Clock> SysTimeWriter<C> {
     ///
     /// [`SysTimeError::KeyNotFound`] if `key` has no live version;
     /// [`SysTimeError::TimeExhausted`]; delta/index/segment read errors.
-    #[allow(clippy::too_many_arguments)] // tier handles + sealed + key/payload + provenance triple
+    #[allow(clippy::too_many_arguments)] // tier handles + sealed + key/payload + seq + provenance triple
     pub fn stage_update<D: Disk, I: Disk, S: SealedLookup>(
         &mut self,
         delta: &Delta<D>,
@@ -501,6 +504,7 @@ impl<C: Clock> SysTimeWriter<C> {
         sealed: &S,
         key: BusinessKey,
         payload: Vec<u8>,
+        seq: u64,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<(SystemTimeMicros, Vec<Redo>), SysTimeError> {
@@ -508,7 +512,7 @@ impl<C: Clock> SysTimeWriter<C> {
         let prior =
             resolve_live(delta, sealed, index, &key, commit)?.ok_or(SysTimeError::KeyNotFound)?;
         let close = close_of(&key, &prior, commit, txn_id, principal.clone());
-        let opened = open_version(key, commit, payload, txn_id, principal);
+        let opened = open_version(key, commit, seq, payload, txn_id, principal);
         Ok((commit, vec![Redo::Close(close), Redo::Insert(opened)]))
     }
 
@@ -639,11 +643,15 @@ fn close_of(
 /// Build an open version `[commit, +∞)` for `key`, stamping provenance.
 ///
 /// `committed_at` is set to `commit` — the writer stamps it exactly as it
-/// stamps `sys_from`. `txn_id` and `principal` come from the caller (the
-/// transaction manager), per [architecture §8](../../../docs/02-architecture.md#8-lineage--provenance-subsystem).
+/// stamps `sys_from`. `seq`, `txn_id`, and `principal` come from the caller (the
+/// transaction manager), per [architecture §8](../../../docs/02-architecture.md#8-lineage--provenance-subsystem):
+/// `seq` is the per-commit total-order tiebreak
+/// ([ADR-0024](../../../docs/adr/0024-time-representation.md), STL-141) drawn
+/// from the manager's `Committed` value alongside `txn_id`.
 const fn open_version(
     key: BusinessKey,
     commit: SystemTimeMicros,
+    seq: u64,
     payload: Vec<u8>,
     txn_id: TxnId,
     principal: Principal,
@@ -651,6 +659,7 @@ const fn open_version(
     Version::open(
         key,
         commit,
+        seq,
         Provenance::new(txn_id, commit, principal),
         payload,
     )

@@ -219,6 +219,7 @@ fn insert_then_update_leaves_one_closed_and_one_open_version() {
             &EmptySealed,
             key.clone(),
             b"balance=100".to_vec(),
+            0,
             TxnId(10),
             Principal::new(b"writer-a".to_vec()),
         )
@@ -232,6 +233,7 @@ fn insert_then_update_leaves_one_closed_and_one_open_version() {
             &EmptySealed,
             key.clone(),
             b"balance=150".to_vec(),
+            0,
             TxnId(20),
             Principal::new(b"writer-b".to_vec()),
         )
@@ -306,6 +308,7 @@ fn insert_on_a_live_key_is_rejected() {
             &EmptySealed,
             key.clone(),
             b"first".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -317,6 +320,7 @@ fn insert_on_a_live_key_is_rejected() {
             &EmptySealed,
             key,
             b"second".to_vec(),
+            0,
             TxnId(2),
             who(),
         )
@@ -339,6 +343,7 @@ fn update_or_delete_without_a_live_version_is_rejected() {
                 &EmptySealed,
                 key.clone(),
                 b"x".to_vec(),
+                0,
                 TxnId(1),
                 who()
             )
@@ -368,6 +373,7 @@ fn delete_closes_the_live_period_and_leaves_no_open_version() {
             &EmptySealed,
             key.clone(),
             b"v".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -423,6 +429,7 @@ fn reinsert_after_delete_opens_a_new_period_with_a_gap() {
             &EmptySealed,
             key.clone(),
             b"a".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -439,6 +446,7 @@ fn reinsert_after_delete_opens_a_new_period_with_a_gap() {
             &EmptySealed,
             key.clone(),
             b"b".to_vec(),
+            0,
             TxnId(2),
             who(),
         )
@@ -501,6 +509,7 @@ fn version_chains_are_non_overlapping_and_gap_free_under_seed_sweep() {
                         &EmptySealed,
                         key,
                         payload,
+                        0,
                         txn,
                         who(),
                     )
@@ -513,6 +522,7 @@ fn version_chains_are_non_overlapping_and_gap_free_under_seed_sweep() {
                         &EmptySealed,
                         key,
                         payload,
+                        0,
                         txn,
                         who(),
                     )

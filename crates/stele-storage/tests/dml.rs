@@ -128,6 +128,7 @@ fn insert_update_delete_flow_through_wal_then_delta() {
             key.clone(),
             None,
             b"v0".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -141,6 +142,7 @@ fn insert_update_delete_flow_through_wal_then_delta() {
             key.clone(),
             None,
             b"v1".to_vec(),
+            0,
             TxnId(2),
             who(),
         )
@@ -205,6 +207,7 @@ fn insert_on_a_live_key_is_rejected_through_the_dml_path() {
         key.clone(),
         None,
         b"a".to_vec(),
+        0,
         TxnId(1),
         who(),
     )
@@ -217,6 +220,7 @@ fn insert_on_a_live_key_is_rejected_through_the_dml_path() {
             key,
             None,
             b"b".to_vec(),
+            0,
             TxnId(2),
             who(),
         )
@@ -273,6 +277,7 @@ fn wal_replay_reconstructs_the_delta_under_seed_sweep() {
                         key,
                         Some(iv),
                         b"u".to_vec(),
+                        0,
                         txn,
                         who(),
                     )
@@ -290,6 +295,7 @@ fn wal_replay_reconstructs_the_delta_under_seed_sweep() {
                     key,
                     Some(iv),
                     b"i".to_vec(),
+                    0,
                     txn,
                     who(),
                 )
@@ -376,6 +382,7 @@ fn timeline_reconstructs_with_no_gaps_or_overlaps_under_seed_sweep() {
                             key,
                             None,
                             b"u".to_vec(),
+                            0,
                             txn,
                             who(),
                         )
@@ -398,6 +405,7 @@ fn timeline_reconstructs_with_no_gaps_or_overlaps_under_seed_sweep() {
                         key,
                         None,
                         b"i".to_vec(),
+                        0,
                         txn,
                         who(),
                     )
