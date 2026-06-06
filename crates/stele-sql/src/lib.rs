@@ -50,6 +50,13 @@
 //! a read older than the table. The snapshot it carries is the `sys_from ≤ s`
 //! bound the executor pushes into zone-map pruning ([STL-101]).
 //!
+//! The DML binder ([`bind_dml`]) completes the set: it lowers an `INSERT` /
+//! `UPDATE` / `DELETE` into a [`BoundDml`] the engine applies as a `DmlWriter`
+//! call. At v0.1 it binds the identity-demo `(key, payload)` shape — the first
+//! column is the business key, the second the opaque payload — folding each
+//! literal to a typed value and rejecting anything wider or outside the surface
+//! ([STL-149]).
+//!
 //! Planner and cost-based optimizer beyond this are still scaffold.
 
 #![allow(dead_code)]
@@ -57,6 +64,7 @@
 pub mod ast;
 pub mod ddl;
 pub mod dialect;
+pub mod dml;
 pub mod error;
 mod parser;
 pub mod select;
@@ -65,6 +73,7 @@ pub mod types;
 pub use ast::{AsOf, Statement, Temporal, TimeDimension, ValidTimePeriod};
 pub use ddl::{BindError, DdlOutcome, DdlStatement, bind_ddl};
 pub use dialect::SteleDialect;
+pub use dml::{BoundDml, DmlError, bind_dml};
 pub use error::ParseError;
 pub use parser::parse;
 pub use select::{

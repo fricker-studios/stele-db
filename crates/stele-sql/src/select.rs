@@ -40,7 +40,7 @@ use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArguments, GroupByExpr, Query, Select, SelectItem, SetExpr,
     Statement as SqlStatement, TableFactor, Value,
 };
-use stele_catalog::{Catalog, SchemaId};
+use stele_catalog::{Catalog, SchemaId, TableSchema};
 use stele_common::time::SystemTimeMicros;
 
 use crate::ast::Statement;
@@ -218,19 +218,22 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
     let projection = bind_projection(select)?;
     let snapshot = resolve_snapshot(stmt, ctx.snapshot)?;
 
-    let Some(schema) = ctx.catalog.resolve(table, snapshot) else {
-        return Err(match ctx.catalog.history_start(table) {
-            None => SelectError::UnknownTable(table.to_owned()),
-            Some(first) if snapshot < first => SelectError::BeforeHistory {
+    let schema = match resolve_table_at(ctx.catalog, table, snapshot) {
+        TableResolution::Found(schema) => schema,
+        TableResolution::Unknown => return Err(SelectError::UnknownTable(table.to_owned())),
+        TableResolution::BeforeHistory { first_commit } => {
+            return Err(SelectError::BeforeHistory {
                 table: table.to_owned(),
                 snapshot: snapshot.0,
-                first_commit: first.0,
-            },
-            Some(_) => SelectError::TableNotLive {
+                first_commit: first_commit.0,
+            });
+        }
+        TableResolution::NotLive => {
+            return Err(SelectError::TableNotLive {
                 table: table.to_owned(),
                 snapshot: snapshot.0,
-            },
-        });
+            });
+        }
     };
 
     // Every named projected column must exist in the schema live *at the
@@ -280,6 +283,49 @@ fn resolve_snapshot(
             Ok(resolve_as_of(&as_of.timestamp, now)?)
         }
         many => Err(SelectError::MultipleAsOf(many.len())),
+    }
+}
+
+/// The outcome of resolving a table name against the catalog at a snapshot.
+///
+/// Shared by the [`SELECT`](bind_select) and [`DML`](crate::bind_dml) binders so
+/// both report the *same* taxonomy for a name that does not resolve — a name the
+/// catalog never registered, a snapshot before the table's first commit, or a
+/// snapshot in a dropped / re-creation-gap era. Each binder maps these to its own
+/// error type; the discrimination logic lives here, once.
+pub(crate) enum TableResolution<'a> {
+    /// The table resolved to a live schema version at the snapshot.
+    Found(&'a TableSchema),
+    /// The catalog has never registered this name.
+    Unknown,
+    /// The snapshot precedes the table's first commit — a *before-history* read.
+    BeforeHistory {
+        /// The table's first-commit system time; the snapshot precedes it.
+        first_commit: SystemTimeMicros,
+    },
+    /// The name is in the catalog's timeline but not live at the snapshot
+    /// (dropped by then, or in the gap before a re-creation).
+    NotLive,
+}
+
+/// Resolve `table` to the schema version live at `snapshot`, distinguishing the
+/// three "no live version" cases [`resolve`](Catalog::resolve) collapses to
+/// `None` (it returns the schema or nothing; [`history_start`](Catalog::history_start)
+/// recovers *why* there is no schema).
+pub(crate) fn resolve_table_at<'a>(
+    catalog: &'a Catalog,
+    table: &str,
+    snapshot: SystemTimeMicros,
+) -> TableResolution<'a> {
+    if let Some(schema) = catalog.resolve(table, snapshot) {
+        return TableResolution::Found(schema);
+    }
+    match catalog.history_start(table) {
+        None => TableResolution::Unknown,
+        Some(first) if snapshot < first => TableResolution::BeforeHistory {
+            first_commit: first,
+        },
+        Some(_) => TableResolution::NotLive,
     }
 }
 
