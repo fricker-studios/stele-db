@@ -100,39 +100,37 @@ fn version_line() -> String {
 mod tests {
     use super::*;
 
+    /// Parse exactly like `main`, but surface clap errors as a test failure
+    /// instead of `std::process::exit` (which `parse_from` would do, taking the
+    /// whole test binary down).
+    fn parse(argv: &[&str]) -> Cmd {
+        Args::try_parse_from(argv).expect("argv should parse").cmd
+    }
+
     #[test]
     fn version_line_reports_crate_version_and_commit() {
         let line = version_line();
         assert!(line.contains(env!("CARGO_PKG_VERSION")), "{line}");
-        assert!(line.contains("commit"), "{line}");
-        // build.rs always sets the env var — never empty, even off a checkout.
+        // The rendered line carries the *actual* commit, not just the label —
+        // build.rs always sets the env var (never empty, even off a checkout).
         assert!(!env!("STELE_GIT_COMMIT").is_empty());
+        assert!(line.contains(env!("STELE_GIT_COMMIT")), "{line}");
     }
 
     #[test]
     fn documented_v0_1_surface_parses() {
+        assert!(matches!(parse(&["stele", "version"]), Cmd::Version));
+        assert!(matches!(parse(&["stele", "shell"]), Cmd::Shell));
         assert!(matches!(
-            Args::parse_from(["stele", "version"]).cmd,
-            Cmd::Version
-        ));
-        assert!(matches!(
-            Args::parse_from(["stele", "shell"]).cmd,
-            Cmd::Shell
-        ));
-        assert!(matches!(
-            Args::parse_from(["stele", "query", "SELECT 1"]).cmd,
+            parse(&["stele", "query", "SELECT 1"]),
             Cmd::Query { .. }
         ));
-        assert!(matches!(
-            Args::parse_from(["stele", "server"]).cmd,
-            Cmd::Server(_)
-        ));
+        assert!(matches!(parse(&["stele", "server"]), Cmd::Server(_)));
     }
 
     #[test]
     fn server_accepts_listen_and_dev_flags() {
-        let Cmd::Server(s) =
-            Args::parse_from(["stele", "server", "--listen", "127.0.0.1:6000", "--dev"]).cmd
+        let Cmd::Server(s) = parse(&["stele", "server", "--listen", "127.0.0.1:6000", "--dev"])
         else {
             panic!("expected server subcommand");
         };
