@@ -22,20 +22,24 @@
 //! connects, prints `stele=>`, runs `SELECT 1`, sees the `1` come back, and
 //! `\q` works cleanly.
 //!
-//! ## Not yet wired through the loop
+//! ## Statements that touch storage
 //!
 //! [STL-104] landed the **wire-format mechanism** — the outbound message
 //! encoders and the [`CommandTag`] strings — proven with the constant-`SELECT`
 //! path, and [STL-105] added the **per-type text encoder set**
 //! (`INT4`/`INT8`/`TEXT`/`BOOL`/`TIMESTAMP`/`DATE`, in the `text_format` module)
-//! that any `DataRow` value is rendered through. Routing statements that touch storage
-//! rides on the pieces that build on these:
+//! that any `DataRow` value is rendered through. Routing statements that touch
+//! storage builds on those, against the server-session engine:
 //!
 //! * **`CREATE` / `DROP TABLE`** routing (parse → `bind_ddl` → catalog) is
 //!   [STL-131], which also owns the server-session `Catalog` + commit clock.
-//! * **`INSERT` / `UPDATE` / `DELETE`** and **table `SELECT`** routing need that
-//!   same server-session engine; until it exists they return a polite
-//!   `ErrorResponse` (SQLSTATE `0A000` — `feature_not_supported`).
+//! * **table `SELECT`** and **`INSERT` / `UPDATE` / `DELETE`** routing is
+//!   [STL-147]: the loop hands each parsed statement to
+//!   [`SessionEngine::execute`], which binds and runs it, then encodes the
+//!   resulting rows ([`SelectResult`]) or affected-row count ([`DmlSummary`])
+//!   back onto the wire. v0.1 maps the table's primary-key column to the business
+//!   key and its single value column to the opaque payload; a general
+//!   multi-column row codec is a v0.2 concern.
 //!
 //! ## Not in v0.1
 //!
@@ -68,16 +72,19 @@ pub use stele_common::DEFAULT_PG_PORT;
 
 use stele_catalog::CatalogError;
 use stele_common::time::Clock;
-use stele_common::types::{LogicalType, ScalarValue};
-use stele_engine::{EngineError, SessionEngine, StatementOutcome, TableDescription};
+use stele_common::types::{DecodeError, LogicalType, ScalarValue};
+use stele_engine::{
+    DmlSummary, EngineError, SelectResult, SessionEngine, StatementOutcome, TableDescription,
+};
 use stele_storage::backend::Disk;
 
 // The wire front end leans on stele-sql for parsing; `sqlparser` is re-exported
 // from there, so matching on the AST adds no new dependency.
+use stele_sql::select::SelectError;
 use stele_sql::sqlparser::ast::{
     Expr, SelectItem, SetExpr, Statement as SqlStatement, UnaryOperator, Value,
 };
-use stele_sql::{BindError, Statement, bind_ddl};
+use stele_sql::{BindError, DmlError, Statement, bind_ddl};
 
 use pg_catalog::Introspection;
 
@@ -119,6 +126,9 @@ const SQLSTATE_UNDEFINED_TABLE: &str = "42P01";
 const SQLSTATE_DUPLICATE_COLUMN: &str = "42701";
 const SQLSTATE_INVALID_TABLE_DEFINITION: &str = "42P16";
 const SQLSTATE_INTERNAL_ERROR: &str = "XX000";
+// A literal in a `WHERE` / `VALUES` that does not match its column's type — the
+// code Postgres returns for an unparsable value (STL-147 DML routing).
+const SQLSTATE_INVALID_TEXT_REPRESENTATION: &str = "22P02";
 
 // Text format code for `RowDescription` fields (binary is 1; a v0.2 concern).
 // The per-type OID and `typlen` advertised per field now come from the value's
@@ -339,13 +349,14 @@ async fn handle_connection(
 /// `SELECT n`, `INSERT 0 n` (the leading `0` is the long-dead OID field, still
 /// emitted as `0`), `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`.
 ///
-/// [`CommandTag::Select`] is on the live path (constant `SELECT` and the
-/// `pg_catalog` shim). DDL routing writes the engine's own tag
+/// [`CommandTag::Select`] is on the live path (constant `SELECT`, the
+/// `pg_catalog` shim, and table reads). The `INSERT`/`UPDATE`/`DELETE` variants
+/// render committed DML, mapped from the engine's [`DmlSummary`] (STL-147). DDL
+/// routing instead writes the engine's own tag
 /// ([`DdlOutcome::command_tag`](stele_sql::DdlOutcome::command_tag)) to the
 /// `CommandComplete` directly, so [`CommandTag::CreateTable`] /
 /// [`CommandTag::DropTable`] stay as the one tested place that pins the
-/// convention; the `INSERT`/`UPDATE`/`DELETE` variants land on the wire with DML
-/// routing (STL-147).
+/// convention.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandTag {
     /// `SELECT n` — `n` rows returned.
@@ -405,8 +416,14 @@ struct ResultColumn {
 ///   aborts the batch (STL-131);
 /// * a constant `SELECT` (tableless, integer-literal projection) →
 ///   `RowDescription` + one `DataRow` + `CommandComplete`;
-/// * a table read or DML → `ErrorResponse` (SQLSTATE `0A000`); the batch stops
-///   there, mirroring Postgres aborting on the first error (routing is STL-147).
+/// * a table `SELECT` → `RowDescription` + a `DataRow` per row + `CommandComplete`
+///   (`SELECT n`), the rows resolved at the read snapshot (and any `AS OF`) by the
+///   session engine (STL-147);
+/// * an `INSERT` / `UPDATE` / `DELETE` → `CommandComplete` (`INSERT 0 n` /
+///   `UPDATE n` / `DELETE n`) once the write commits (STL-147);
+/// * any of those failing → `ErrorResponse` with the Postgres SQLSTATE for the
+///   failure; the batch stops there, mirroring Postgres aborting on the first
+///   error.
 async fn handle_simple_query(
     stream: &mut TcpStream,
     sql: &str,
@@ -466,23 +483,17 @@ async fn handle_simple_query(
                 }
             },
             Err(BindError::NotDdl) => {
-                // (3) A constant `SELECT` (STL-104); otherwise table reads / DML
-                // still need the routing the follow-up owns (STL-147), so they
-                // are politely deferred and the batch aborts.
+                // (3) A constant `SELECT` (STL-104) is answered without touching
+                // storage. Everything else — a table read or `INSERT`/`UPDATE`/
+                // `DELETE` — routes through the session engine (STL-147).
                 if let Some(columns) = constant_select(stmt) {
                     write_row_description(stream, &columns).await?;
                     write_data_row(stream, &columns).await?;
                     write_command_complete(stream, &CommandTag::Select(1)).await?;
-                } else {
-                    info!(query = %sql, "statement not yet routable through the simple-query loop");
-                    write_error_response(
-                        stream,
-                        "ERROR",
-                        SQLSTATE_FEATURE_NOT_SUPPORTED,
-                        "v0.1 simple query runs constant SELECT and CREATE/DROP TABLE; \
-                         table reads and DML over the wire arrive in STL-147",
-                    )
-                    .await?;
+                } else if !run_statement(stream, stmt, session).await? {
+                    // The statement errored; the reply and SQLSTATE are already on
+                    // the wire and the batch aborts (Postgres stops on the first
+                    // error), mirroring the DDL arm above.
                     return Ok(());
                 }
             }
@@ -510,10 +521,138 @@ fn run_ddl(session: &SharedSession, stmt: &Statement) -> Result<&'static str, En
     match engine.execute(stmt)? {
         StatementOutcome::Ddl { tag } => Ok(tag),
         // `bind_ddl` already classified this as DDL, so `execute` routes it to the
-        // DDL arm; a `Rows` outcome would be an internal contract break.
-        StatementOutcome::Rows(_) => Err(EngineError::Unsupported(
-            "DDL statement unexpectedly produced rows",
+        // DDL arm; any other outcome would be an internal contract break.
+        StatementOutcome::Rows(_) | StatementOutcome::Dml(_) => Err(EngineError::Unsupported(
+            "DDL statement unexpectedly produced a non-DDL outcome",
         )),
+    }
+}
+
+/// Route a table `SELECT` or an `INSERT` / `UPDATE` / `DELETE` through the session
+/// engine and write its reply. Returns `Ok(true)` on success and `Ok(false)` when
+/// the statement errored (the `ErrorResponse` is already written and the caller
+/// aborts the batch), reserving `Err` for an I/O failure on the socket.
+///
+/// All result-row cells are decoded up front, so a decode failure surfaces as a
+/// single `ErrorResponse` rather than a `RowDescription` followed by a torn row
+/// stream.
+async fn run_statement(
+    stream: &mut TcpStream,
+    stmt: &Statement,
+    session: &SharedSession,
+) -> Result<bool, WireError> {
+    match run_query(session, stmt) {
+        Ok(StatementOutcome::Rows(result)) => match decode_result_rows(&result) {
+            Ok(data_rows) => {
+                write_row_description(stream, &result_header(&result)).await?;
+                for row in &data_rows {
+                    write_data_row(stream, row).await?;
+                }
+                let n = u64::try_from(data_rows.len()).unwrap_or(u64::MAX);
+                write_command_complete(stream, &CommandTag::Select(n)).await?;
+                Ok(true)
+            }
+            Err(e) => {
+                error!(error = %e, "result cell failed to decode");
+                write_error_response(stream, "ERROR", SQLSTATE_INTERNAL_ERROR, &e.to_string())
+                    .await?;
+                Ok(false)
+            }
+        },
+        Ok(StatementOutcome::Dml(summary)) => {
+            write_command_complete(stream, &command_tag_for(summary)).await?;
+            Ok(true)
+        }
+        // DDL is handled by the caller's `bind_ddl` arm and never reaches here, but
+        // honor its tag rather than mislabel it if the routing ever shifts.
+        Ok(StatementOutcome::Ddl { tag }) => {
+            write_command_complete_tag(stream, tag).await?;
+            Ok(true)
+        }
+        Err(e) => {
+            info!(error = %e, "statement failed");
+            write_error_response(stream, "ERROR", sqlstate_for_query(&e), &e.to_string()).await?;
+            Ok(false)
+        }
+    }
+}
+
+/// Run one statement against the shared session engine, taking and releasing the
+/// mutex entirely within this synchronous call (never held across the caller's
+/// `await` writes). A poisoned mutex is recovered, as in [`run_ddl`].
+fn run_query(session: &SharedSession, stmt: &Statement) -> Result<StatementOutcome, EngineError> {
+    let mut engine = session.lock().unwrap_or_else(PoisonError::into_inner);
+    engine.execute(stmt)
+}
+
+/// The `RowDescription` field descriptors for a [`SelectResult`] — one per
+/// projected column, named and typed from the engine's projection.
+fn result_header(result: &SelectResult) -> Vec<ResultColumn> {
+    result
+        .columns
+        .iter()
+        .map(|(name, ty)| field(name, *ty))
+        .collect()
+}
+
+/// Decode every cell of a [`SelectResult`] into `DataRow`-ready [`ResultColumn`]s.
+///
+/// Each raw cell is the value's canonical encoding ([`ScalarValue::encode`]);
+/// decoding it under the column's [`LogicalType`] is the exact inverse, so a value
+/// written through the DML path round-trips. A decode failure means the stored
+/// bytes do not match the column type (corruption, or an opaque payload staged
+/// outside the wire path) and is surfaced rather than rendered wrong.
+fn decode_result_rows(result: &SelectResult) -> Result<Vec<Vec<ResultColumn>>, DecodeError> {
+    result
+        .rows
+        .iter()
+        .map(|raw| {
+            result
+                .columns
+                .iter()
+                .zip(raw)
+                .map(|((_, ty), bytes)| Ok(cell(ScalarValue::decode(*ty, bytes)?)))
+                .collect()
+        })
+        .collect()
+}
+
+/// The `CommandComplete` tag for a committed DML operation.
+const fn command_tag_for(summary: DmlSummary) -> CommandTag {
+    match summary {
+        DmlSummary::Insert(n) => CommandTag::Insert(n),
+        DmlSummary::Update(n) => CommandTag::Update(n),
+        DmlSummary::Delete(n) => CommandTag::Delete(n),
+    }
+}
+
+/// The standard Postgres SQLSTATE for a `SELECT` / DML routing failure, so a stock
+/// client classifies it the way it would against Postgres.
+///
+/// DDL-specific catalog failures reuse [`sqlstate_for`]; the cases unique to the
+/// read / write path are an unknown table (`42P01`) and a bad literal in a `WHERE`
+/// or `VALUES` (`22P02`, invalid text representation). Shapes outside the v0.1
+/// surface map to `0A000` (`feature_not_supported`).
+const fn sqlstate_for_query(err: &EngineError) -> &'static str {
+    match err {
+        EngineError::Bind(_) => SQLSTATE_SYNTAX_ERROR,
+        EngineError::Select(SelectError::UnknownTable(_) | SelectError::TableNotLive { .. })
+        | EngineError::Dml(
+            DmlError::UnknownTable(_)
+            | DmlError::TableNotLive { .. }
+            | DmlError::UnknownColumn { .. },
+        )
+        | EngineError::UnknownTable(_) => SQLSTATE_UNDEFINED_TABLE,
+        EngineError::Dml(DmlError::BadLiteral { .. } | DmlError::TypeMismatch { .. }) => {
+            SQLSTATE_INVALID_TEXT_REPRESENTATION
+        }
+        EngineError::Select(_) | EngineError::Dml(_) | EngineError::Unsupported(_) => {
+            SQLSTATE_FEATURE_NOT_SUPPORTED
+        }
+        // Catalog/storage/scan errors are unexpected on the read/write path but
+        // map cleanly rather than panicking if the contract ever shifts.
+        EngineError::Catalog(_) | EngineError::ValidTimePolicyChange { .. } => sqlstate_for(err),
+        EngineError::Storage(_) | EngineError::Scan(_) => SQLSTATE_INTERNAL_ERROR,
     }
 }
 
@@ -1719,11 +1858,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn table_read_is_politely_deferred() {
+    async fn select_from_an_unknown_table_is_an_undefined_table_error() {
         let (server, mut client) = connect_past_handshake().await;
-        // A real table read needs the table-read wire path (STL-147); STL-131
-        // routes only DDL, so this stays feature_not_supported — never a crash or
-        // a wrong answer.
+        // The table was never created, so the binder cannot resolve it — the
+        // standard Postgres undefined-table SQLSTATE, not a crash or wrong answer.
         send_query(&mut client, "SELECT balance FROM account").await;
 
         let (kind, payload) = read_message(&mut client).await;
@@ -1731,12 +1869,129 @@ mod tests {
         assert!(
             payload
                 .windows(5)
-                .any(|w| w == SQLSTATE_FEATURE_NOT_SUPPORTED.as_bytes()),
-            "an un-routable statement carries SQLSTATE 0A000"
+                .any(|w| w == SQLSTATE_UNDEFINED_TABLE.as_bytes()),
+            "a read of an unknown table carries SQLSTATE 42P01"
         );
 
         let (kind, _) = read_message(&mut client).await;
         assert_eq!(kind, MSG_READY_FOR_QUERY);
+        terminate(server, client).await;
+    }
+
+    /// The whole `(value cells of every DataRow)` of a simple-query reply, each
+    /// cell rendered to its text-format string (skips `RowDescription` /
+    /// `CommandComplete`). One inner `Vec` per row.
+    fn data_row_text(msgs: &[(u8, Vec<u8>)]) -> Vec<Vec<String>> {
+        msgs.iter()
+            .filter(|(kind, _)| *kind == MSG_DATA_ROW)
+            .map(|(_, payload)| {
+                parse_data_row(payload)
+                    .into_iter()
+                    .map(|c| String::from_utf8(c.expect("non-null cell")).unwrap())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn insert_then_table_select_round_trips_the_row() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+
+        // INSERT replies with exactly one CommandComplete tagged `INSERT 0 1`.
+        let inserted = run_simple(&mut client, "INSERT INTO account VALUES (1, 100)").await;
+        assert_eq!(
+            inserted.len(),
+            1,
+            "DML emits only CommandComplete: {inserted:?}"
+        );
+        assert_eq!(inserted[0].0, MSG_COMMAND_COMPLETE);
+        assert_eq!(command_tag(&inserted[0].1), "INSERT 0 1");
+
+        // The table read returns the (id, balance) row, decoded back to text from
+        // the canonical encoding the INSERT wrote.
+        let selected = run_simple(&mut client, "SELECT id, balance FROM account").await;
+        assert_eq!(selected[0].0, MSG_ROW_DESCRIPTION);
+        assert_eq!(
+            parse_row_description_names(&selected[0].1),
+            vec!["id", "balance"]
+        );
+        assert_eq!(data_row_text(&selected), vec![vec!["1", "100"]]);
+        assert_eq!(command_tag(&selected.last().unwrap().1), "SELECT 1");
+        terminate(server, client).await;
+    }
+
+    #[tokio::test]
+    async fn update_and_delete_tag_their_row_counts() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+        run_simple(&mut client, "INSERT INTO account VALUES (1, 100)").await;
+
+        let updated =
+            run_simple(&mut client, "UPDATE account SET balance = 250 WHERE id = 1").await;
+        assert_eq!(updated.len(), 1);
+        assert_eq!(command_tag(&updated[0].1), "UPDATE 1");
+
+        // The latest read sees the updated value.
+        let after_update = run_simple(&mut client, "SELECT id, balance FROM account").await;
+        assert_eq!(data_row_text(&after_update), vec![vec!["1", "250"]]);
+
+        let deleted = run_simple(&mut client, "DELETE FROM account WHERE id = 1").await;
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(command_tag(&deleted[0].1), "DELETE 1");
+
+        // After the delete the live read is empty (`SELECT 0`, no DataRows).
+        let after_delete = run_simple(&mut client, "SELECT id, balance FROM account").await;
+        assert!(
+            data_row_text(&after_delete).is_empty(),
+            "row gone after DELETE"
+        );
+        assert_eq!(command_tag(&after_delete.last().unwrap().1), "SELECT 0");
+        terminate(server, client).await;
+    }
+
+    #[tokio::test]
+    async fn as_of_select_reads_the_pre_update_value_over_the_wire() {
+        // The identity demo's heart over the wire, made deterministic with an
+        // integer AS OF: the test clock stamps CREATE/INSERT/UPDATE at sys_from
+        // 1/2/3, so `AS OF 2` resolves to the inserted balance, not the updated
+        // one. (`now() - interval` needs real elapsed time; the integer form pins
+        // the instant for CI.)
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await; // sys_from 1
+        run_simple(&mut client, "INSERT INTO account VALUES (1, 100)").await; // sys_from 2
+        run_simple(&mut client, "UPDATE account SET balance = 250 WHERE id = 1").await; // sys_from 3
+
+        let historical = run_simple(
+            &mut client,
+            "SELECT id, balance FROM account FOR SYSTEM_TIME AS OF 2",
+        )
+        .await;
+        assert_eq!(
+            data_row_text(&historical),
+            vec![vec!["1", "100"]],
+            "AS OF 2 returns the pre-update balance over the wire"
+        );
+        assert_eq!(command_tag(&historical.last().unwrap().1), "SELECT 1");
+        terminate(server, client).await;
+    }
+
+    #[tokio::test]
+    async fn dml_against_an_unknown_table_is_an_undefined_table_error() {
+        let (server, mut client) = connect_past_handshake().await;
+        // No table created — the binder cannot resolve `account`, so the INSERT is
+        // refused with the undefined-table SQLSTATE (42P01), never a wrong write.
+        let msgs = run_simple(&mut client, "INSERT INTO account VALUES (1, 100)").await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].0, MSG_ERROR_RESPONSE);
+        assert!(
+            msgs[0]
+                .1
+                .windows(5)
+                .any(|w| w == SQLSTATE_UNDEFINED_TABLE.as_bytes()),
+            "DML on an unknown table carries SQLSTATE 42P01: {:?}",
+            msgs[0].1
+        );
         terminate(server, client).await;
     }
 
