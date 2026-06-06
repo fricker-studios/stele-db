@@ -338,7 +338,7 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
 
     /// The version of `key` live at `snapshot` — the `AS OF` read, merging the
     /// delta tier and the sealed segments with the validity index supplying each
-    /// version's `sys_to` ([`merge::fold_chains`]). [`None`] if `key` has no
+    /// version's `sys_to` ([`merge::resolve_open`]). [`None`] if `key` has no
     /// version visible at `snapshot` (never written, or in a deletion gap).
     ///
     /// # Errors
@@ -350,18 +350,17 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         key: &BusinessKey,
         snapshot: Snapshot,
     ) -> Result<Option<Version>, EngineError> {
-        let mut candidates = self.delta.candidate_versions(key)?;
-        candidates.extend(
-            self.sealed
-                .versions()
-                .iter()
-                .filter(|v| &v.business_key == key)
-                .cloned(),
-        );
-        let chains = merge::fold_chains(candidates, &self.index)?;
-        Ok(merge::resolve_snapshot(&chains, snapshot)
-            .into_iter()
-            .find(|v| &v.business_key == key))
+        // The purpose-built single-key resolver: it folds only this key's delta +
+        // sealed candidates, overlays just its closes, and returns the version live
+        // at `snapshot` — no full-keyset chain build for a point lookup.
+        let delta_candidates = self.delta.candidate_versions(key)?;
+        Ok(merge::resolve_open(
+            &delta_candidates,
+            self.sealed.versions(),
+            &self.index,
+            key,
+            snapshot,
+        )?)
     }
 
     /// Convenience over [`Self::as_of`]: just the payload of the live version.

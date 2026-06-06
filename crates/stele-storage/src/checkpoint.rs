@@ -101,11 +101,12 @@ pub(crate) fn store<D: Disk>(disk: &D, offset: LogOffset) -> io::Result<()> {
 /// Return the last CRC-valid checkpoint on `disk`, or [`None`] if the file is
 /// absent, empty, or holds no intact record.
 ///
-/// Scans the append-only file in [`RECORD_LEN`] strides and keeps the offset of
-/// the last record that decodes; the scan stops at the first record that fails
-/// to decode (a torn trailing write) or at a short final record. [`None`] means
-/// "no durable checkpoint" — the caller replays the WAL from the beginning,
-/// which is always correct ([ADR-0023]).
+/// Scans the append-only file one [`RECORD_LEN`]-byte record at a time with
+/// `read_at` — bounded memory regardless of how long the file has grown — and
+/// keeps the offset of the last record that decodes; the scan stops at the first
+/// record that fails to decode (a torn trailing write) or at a short final
+/// record. [`None`] means "no durable checkpoint" — the caller replays the WAL
+/// from the beginning, which is always correct ([ADR-0023]).
 ///
 /// # Errors
 ///
@@ -117,30 +118,23 @@ pub(crate) fn load<D: Disk>(disk: &D) -> io::Result<Option<LogOffset>> {
         Err(e) => return Err(e),
     };
     let len = file.len();
-    if len == 0 {
-        return Ok(None);
-    }
-    let len = usize::try_from(len).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("checkpoint file length {len} exceeds usize"),
-        )
-    })?;
-    let mut bytes = vec![0u8; len];
-    let read = file.read_at(0, &mut bytes)?;
-    bytes.truncate(read);
+    let record_len = RECORD_LEN as u64;
 
     let mut last = None;
+    let mut offset = 0u64;
     let mut record = [0u8; RECORD_LEN];
-    for chunk in bytes.chunks(RECORD_LEN) {
-        if chunk.len() < RECORD_LEN {
-            break; // a short final record — the torn tail of a crashed append
+    // Only whole records are read; a trailing partial record (the torn tail of a
+    // crashed append) is left unread, exactly like the prior chunked scan.
+    while offset + record_len <= len {
+        let read = file.read_at(offset, &mut record)?;
+        if read < RECORD_LEN {
+            break; // short read at the tail — treat as a torn final record
         }
-        record.copy_from_slice(chunk);
         match decode(&record) {
-            Some(offset) => last = Some(offset),
+            Some(found) => last = Some(found),
             None => break, // a corrupt record — stop; nothing after it is trustworthy
         }
+        offset += record_len;
     }
     Ok(last)
 }
