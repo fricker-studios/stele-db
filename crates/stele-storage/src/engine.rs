@@ -115,10 +115,11 @@ pub struct Engine<C: Clock, D: Disk + Clone> {
     delta: Delta<D>,
     index: ValidityIndex<D>,
     /// Every version read out of the validated sealed segments — the write
-    /// path's [`SealedLookup`](crate::systime::SealedLookup) and the read path's
-    /// sealed tier. v0.1 keeps them resident; a per-key segment index is the
-    /// follow-up the [`crate::systime`] module anticipates.
-    sealed_versions: Vec<Version>,
+    /// path's [`SealedLookup`](crate::systime::SealedLookup) (passed by reference,
+    /// not re-cloned per op) and the read path's sealed tier. v0.1 keeps them
+    /// resident; a per-key segment index is the follow-up the [`crate::systime`]
+    /// module anticipates.
+    sealed: SealedVersions,
     /// The validated sealed segment filenames, in sorted order — observability
     /// for tests and a future compaction/manifest hook.
     segment_names: Vec<String>,
@@ -150,7 +151,7 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
             writer,
             delta,
             index,
-            sealed_versions: Vec::new(),
+            sealed: SealedVersions::new(Vec::new()),
             segment_names: Vec::new(),
             checkpoint: None,
         })
@@ -164,7 +165,10 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     /// The result is byte-for-byte the pre-crash state for everything the WAL
     /// made durable: re-running `recover` on the same disk yields the same engine
     /// (idempotent replay), and the rebuilt validity index equals the live one
-    /// exactly ([ADR-0023], [STL-102] DoD).
+    /// exactly ([ADR-0023], [STL-102] DoD). v0.1 replays the **full** WAL and
+    /// rebuilds the index from it (not from a persisted index snapshot, per
+    /// [ADR-0023]); the loaded checkpoint is the *durability fence* that gates
+    /// torn-tail tolerance, not yet a replay-skip (the STL-133 / STL-136 seam).
     ///
     /// `valid_time` mirrors the table's catalog flag; `clock` stamps post-recovery
     /// writes — position it past the recovered high-water mark before writing
@@ -190,9 +194,11 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
             sealed_retractions.extend(reader.read_retractions()?);
         }
 
-        // 2. Load the durable checkpoint fence (None ⇒ replay from the beginning,
-        //    which is always correct — the WAL is the source of truth).
+        // 2. Load the durable checkpoint fence. None ⇒ no durability claim has
+        //    been persisted, so the fence is the log origin and any torn record is
+        //    tolerable; a present fence makes corruption *before* it fatal.
         let checkpoint = checkpoint::load(&disk)?;
+        let fence = checkpoint.unwrap_or(LogOffset::ZERO);
 
         // 3. Open the non-durable tiers — both discard any stale spill left by the
         //    crashed process; the log is about to repopulate them.
@@ -213,10 +219,11 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         //    log's closes. `insert_close` is write-once but idempotent on an
         //    identical close, so a close already materialized from a segment in
         //    step 4 re-applies cleanly — segment-derived and WAL-derived closes
-        //    agree by construction. `recover_replay` tolerates the torn tail of a
-        //    mid-write crash: it applies the durable prefix and stops at the first
-        //    sheared record ([`dml::recover_replay`]).
-        dml::recover_replay(&wal, &mut delta, &mut index, Checkpoint::BEGIN)?;
+        //    agree by construction. `recover_replay` tolerates a torn record past
+        //    the durable `fence` (the unsynced tail of a mid-write crash) while
+        //    treating corruption *before* the fence as a fatal fault
+        //    ([`dml::recover_replay`]).
+        dml::recover_replay(&wal, &mut delta, &mut index, Checkpoint::BEGIN, fence)?;
 
         let writer = DmlWriter::new(wal.clone(), clock, valid_time);
         Ok(Self {
@@ -225,7 +232,7 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
             writer,
             delta,
             index,
-            sealed_versions,
+            sealed: SealedVersions::new(sealed_versions),
             segment_names,
             checkpoint,
         })
@@ -247,11 +254,10 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<DmlOutcome, EngineError> {
-        let sealed = SealedVersions::new(self.sealed_versions.clone());
         Ok(self.writer.insert(
             &mut self.delta,
             &mut self.index,
-            &sealed,
+            &self.sealed,
             key,
             valid,
             payload,
@@ -277,11 +283,10 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<DmlOutcome, EngineError> {
-        let sealed = SealedVersions::new(self.sealed_versions.clone());
         Ok(self.writer.update(
             &mut self.delta,
             &mut self.index,
-            &sealed,
+            &self.sealed,
             key,
             valid,
             payload,
@@ -303,11 +308,10 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<DmlOutcome, EngineError> {
-        let sealed = SealedVersions::new(self.sealed_versions.clone());
         Ok(self.writer.delete(
             &mut self.delta,
             &mut self.index,
-            &sealed,
+            &self.sealed,
             key,
             txn_id,
             principal,
@@ -348,7 +352,8 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     ) -> Result<Option<Version>, EngineError> {
         let mut candidates = self.delta.candidate_versions(key)?;
         candidates.extend(
-            self.sealed_versions
+            self.sealed
+                .versions()
                 .iter()
                 .filter(|v| &v.business_key == key)
                 .cloned(),

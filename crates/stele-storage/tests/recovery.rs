@@ -188,8 +188,10 @@ fn recovery_rebuilds_the_exact_validity_index() {
 
 /// A crash mid-append leaves a half-written final record. Recovery must stop at
 /// that torn record (the WAL's torn-write contract) and converge to the durable
-/// prefix — never resurrecting the partial write. Modeled by truncating the WAL
-/// just past the first commit's record, so the second commit's record is torn.
+/// prefix — never resurrecting the partial write. Modeled by checkpointing after
+/// the first commit (so its record is durable, *under* the fence) and truncating
+/// the WAL mid-way through the second commit's record (the torn tail, *past* the
+/// fence) — exactly the unsynced-tail shape `recover_replay` is meant to tolerate.
 #[test]
 fn recover_drops_a_torn_wal_tail() {
     let disk = MemDisk::new();
@@ -200,11 +202,13 @@ fn recover_drops_a_torn_wal_tail() {
         let first = engine
             .insert(k.clone(), None, b"100".to_vec(), 0, TxnId(1), who())
             .expect("insert");
+        // Checkpoint here: the first commit is now durable and the fence sits at
+        // its record's end, so the second commit lands strictly past the fence.
+        engine.checkpoint().expect("checkpoint");
         // A second commit whose WAL record we will truncate mid-write.
         engine
             .update(k.clone(), None, b"250".to_vec(), 0, TxnId(2), who())
             .expect("update");
-        engine.checkpoint().expect("checkpoint");
         (first.commit, first.wal)
     };
 
@@ -239,6 +243,43 @@ fn recover_drops_a_torn_wal_tail() {
             .is_empty(),
         "a torn supersession leaves no close in the rebuilt index",
     );
+}
+
+/// The other side of the fence: corruption *inside* the durable prefix — a record
+/// the checkpoint vouched durable — is fatal, not a tolerated tail. Both commits
+/// are checkpointed (the fence sits past both), then the first record's bytes are
+/// corrupted; recovery must refuse rather than silently truncate durable history.
+#[test]
+fn recover_rejects_corruption_inside_the_durable_prefix() {
+    let disk = MemDisk::new();
+    let k = key(b"account-1");
+
+    let w0 = {
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1_000), false).expect("open");
+        let first = engine
+            .insert(k.clone(), None, b"100".to_vec(), 0, TxnId(1), who())
+            .expect("insert");
+        engine
+            .update(k, None, b"250".to_vec(), 0, TxnId(2), who())
+            .expect("update");
+        // Checkpoint *after both* commits — the fence vouches both records durable.
+        engine.checkpoint().expect("checkpoint");
+        first.wal
+    };
+
+    // Flip a byte inside the first record (under the fence): a CRC failure the
+    // checkpoint promised could not happen — real durable-region corruption.
+    let flip_at = usize::try_from(w0.byte_offset).expect("offset fits usize") - 1;
+    let corrupt = clone_disk_mutating(&disk, WAL_SEGMENT, |mut bytes| {
+        bytes[flip_at] ^= 0xFF;
+        bytes
+    });
+
+    match Engine::recover(corrupt, StepClock::new(1_000_000), false) {
+        Ok(_) => panic!("corruption inside the durable prefix must fail recovery"),
+        Err(EngineError::Dml(_)) => {}
+        Err(other) => panic!("expected a WAL-replay error, got {other:?}"),
+    }
 }
 
 // --- 4. a corrupt sealed segment is refused --------------------------------
