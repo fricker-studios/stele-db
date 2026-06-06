@@ -10,13 +10,32 @@
 //! * Negotiate the startup phase: refuse SSL / GSS, parse `StartupMessage`,
 //!   issue `AuthenticationOk` (no auth in v0.1), report a handful of
 //!   `ParameterStatus` keys, send `BackendKeyData`, then `ReadyForQuery`.
-//! * On the first `Query` message, return a polite `ErrorResponse` (SQLSTATE
-//!   `0A000` — `feature_not_supported`) and another `ReadyForQuery`.
+//! * Run a **simple-query (`Q`) loop**: parse the SQL string with
+//!   [`stele_sql::parse`], and reply with the result protocol — a constant
+//!   `SELECT` (e.g. `SELECT 1`) returns `RowDescription` + `DataRow` +
+//!   `CommandComplete`; an empty query returns `EmptyQueryResponse`; a parse
+//!   failure returns `ErrorResponse` (SQLSTATE `42601`). A single
+//!   `ReadyForQuery` closes out the whole message.
 //! * Honor `Terminate` (`X`) by closing the connection.
 //!
-//! That is the thinnest end-to-end slice: `psql -h localhost -p 5454 -d stele`
-//! connects, prints `stele=>`, runs a `SELECT 1`, sees a not-implemented error,
-//! and `\q` works cleanly.
+//! That is the thinnest *useful* end-to-end slice: `psql -h localhost -p 5454`
+//! connects, prints `stele=>`, runs `SELECT 1`, sees the `1` come back, and
+//! `\q` works cleanly.
+//!
+//! ## Not yet wired through the loop
+//!
+//! This ticket ([STL-104]) lands the **wire-format mechanism** — the outbound
+//! message encoders and the [`CommandTag`] strings — and proves it with the
+//! constant-`SELECT` path. Routing statements that touch storage rides on the
+//! pieces that build on this one:
+//!
+//! * The **per-type text encoder set** (`INT4`/`TEXT`/`BOOL`/`TIMESTAMP`/…) is
+//!   [STL-105]; v0.1 here only formats integer literals.
+//! * **`CREATE` / `DROP TABLE`** routing (parse → `bind_ddl` → catalog) is
+//!   [STL-131], which also owns the server-session `Catalog` + commit clock.
+//! * **`INSERT` / `UPDATE` / `DELETE`** and **table `SELECT`** routing need that
+//!   same server-session engine; until it exists they return a polite
+//!   `ErrorResponse` (SQLSTATE `0A000` — `feature_not_supported`).
 //!
 //! ## Not in v0.1
 //!
@@ -43,6 +62,13 @@ use tracing::{debug, error, info, instrument, warn};
 
 pub use stele_common::DEFAULT_PG_PORT;
 
+// The wire front end leans on stele-sql for parsing; `sqlparser` is re-exported
+// from there, so matching on the AST adds no new dependency.
+use stele_sql::Statement;
+use stele_sql::sqlparser::ast::{
+    Expr, SelectItem, SetExpr, Statement as SqlStatement, UnaryOperator, Value,
+};
+
 // ---------------------------------------------------------------------------
 // Protocol constants
 // ---------------------------------------------------------------------------
@@ -64,10 +90,29 @@ const MSG_READY_FOR_QUERY: u8 = b'Z';
 const MSG_ERROR_RESPONSE: u8 = b'E';
 const MSG_QUERY: u8 = b'Q';
 const MSG_TERMINATE: u8 = b'X';
+const MSG_ROW_DESCRIPTION: u8 = b'T';
+const MSG_DATA_ROW: u8 = b'D';
+const MSG_COMMAND_COMPLETE: u8 = b'C';
+const MSG_EMPTY_QUERY_RESPONSE: u8 = b'I';
 
 // SQLSTATE codes we return.
 const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
 const SQLSTATE_PROTOCOL_VIOLATION: &str = "08P01";
+const SQLSTATE_SYNTAX_ERROR: &str = "42601";
+
+// Postgres type OIDs for the integer literals the constant-`SELECT` path emits.
+// The full v0.1 type vocabulary (TEXT/BOOL/TIMESTAMP/…) and its text encoders
+// are STL-105's concern; we only need the integer OIDs to describe `SELECT 1`.
+const OID_INT4: i32 = 23;
+const OID_INT8: i32 = 20;
+
+// Text/format size advertised in `RowDescription` for the integer OIDs: the
+// on-the-wire `typlen` (fixed-width), not the rendered text length.
+const TYPLEN_INT4: i16 = 4;
+const TYPLEN_INT8: i16 = 8;
+
+// Text format code for `RowDescription` fields (binary is 1; a v0.2 concern).
+const FORMAT_TEXT: i16 = 0;
 
 // DoS guard: cap how large a single frame we will allocate for. The Postgres
 // protocol notionally allows up to ~1 GiB messages; in practice v0.1 traffic is
@@ -173,10 +218,6 @@ async fn handle_connection(mut stream: TcpStream, peer: SocketAddr) -> Result<()
                 return Ok(());
             }
             MSG_QUERY => {
-                // The first non-trivial Query goes here. v0.1 returns a
-                // not-implemented error and stays in the loop, which is enough
-                // for `psql` to print the error and keep its session alive.
-                //
                 // A Query payload MUST be a NUL-terminated cstring. If the
                 // terminator is missing, surface that as a protocol violation
                 // rather than silently treating it as an empty query — masking
@@ -193,14 +234,12 @@ async fn handle_connection(mut stream: TcpStream, peer: SocketAddr) -> Result<()
                     write_ready_for_query(&mut stream).await?;
                     continue;
                 };
-                info!(query = %q, "received simple query (not implemented in v0.1)");
-                write_error_response(
-                    &mut stream,
-                    "ERROR",
-                    SQLSTATE_FEATURE_NOT_SUPPORTED,
-                    "the Stele engine has no executor yet — see docs/03-roadmap.md (v0.1)",
-                )
-                .await?;
+                // The whole simple-query message produces exactly one
+                // ReadyForQuery, regardless of how many statements it carried or
+                // whether one of them errored (Postgres aborts the batch on the
+                // first error). `handle_simple_query` writes the per-statement
+                // replies; the trailing ReadyForQuery is ours.
+                handle_simple_query(&mut stream, &q).await?;
                 write_ready_for_query(&mut stream).await?;
             }
             other => {
@@ -218,6 +257,190 @@ async fn handle_connection(mut stream: TcpStream, peer: SocketAddr) -> Result<()
                 write_ready_for_query(&mut stream).await?;
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Simple-query dispatch
+// ---------------------------------------------------------------------------
+
+/// The Postgres `CommandComplete` tag for a finished statement.
+///
+/// The tag string follows Postgres convention exactly, because clients parse it
+/// (e.g. `tokio-postgres` reads the trailing count to report affected rows):
+/// `SELECT n`, `INSERT 0 n` (the leading `0` is the long-dead OID field, still
+/// emitted as `0`), `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`.
+///
+/// Only [`CommandTag::Select`] is wired to a live path in this ticket; the DML
+/// and DDL variants exist so the routing tickets that build on the wire format
+/// ([STL-131] and the DML-routing follow-up) have one tested place to render
+/// their tags rather than re-deriving the convention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandTag {
+    /// `SELECT n` — `n` rows returned.
+    Select(u64),
+    /// `INSERT 0 n` — `n` rows inserted (the `0` is the legacy OID field).
+    Insert(u64),
+    /// `UPDATE n` — `n` rows updated.
+    Update(u64),
+    /// `DELETE n` — `n` rows deleted.
+    Delete(u64),
+    /// `CREATE TABLE`.
+    CreateTable,
+    /// `DROP TABLE`.
+    DropTable,
+}
+
+impl CommandTag {
+    /// Render the tag exactly as it goes into the `CommandComplete` payload.
+    #[must_use]
+    pub fn render(&self) -> String {
+        match self {
+            Self::Select(n) => format!("SELECT {n}"),
+            Self::Insert(n) => format!("INSERT 0 {n}"),
+            Self::Update(n) => format!("UPDATE {n}"),
+            Self::Delete(n) => format!("DELETE {n}"),
+            Self::CreateTable => "CREATE TABLE".to_owned(),
+            Self::DropTable => "DROP TABLE".to_owned(),
+        }
+    }
+}
+
+/// One column of a constant `SELECT` result: its reported name, type OID, and
+/// already-text-encoded value.
+struct ConstColumn {
+    name: String,
+    type_oid: i32,
+    typlen: i16,
+    text: String,
+}
+
+/// Handle one simple-query (`Q`) message: parse the SQL, then reply for each
+/// `;`-separated statement. Does **not** emit the trailing `ReadyForQuery` — the
+/// caller owns that, so the whole message produces exactly one.
+///
+/// Dispatch in v0.1:
+/// * empty / whitespace-only input → `EmptyQueryResponse`;
+/// * a parse failure → `ErrorResponse` (SQLSTATE `42601`), no further statements;
+/// * a constant `SELECT` (tableless, integer-literal projection) →
+///   `RowDescription` + one `DataRow` + `CommandComplete`;
+/// * anything that touches storage → `ErrorResponse` (SQLSTATE `0A000`), and the
+///   batch stops there, mirroring Postgres aborting on the first error.
+async fn handle_simple_query(stream: &mut TcpStream, sql: &str) -> Result<(), WireError> {
+    if sql.trim().is_empty() {
+        debug!("empty simple query");
+        return write_empty_query_response(stream)
+            .await
+            .map_err(WireError::Io);
+    }
+
+    let statements = match stele_sql::parse(sql) {
+        Ok(statements) => statements,
+        Err(e) => {
+            info!(query = %sql, error = %e, "simple query failed to parse");
+            return write_error_response(stream, "ERROR", SQLSTATE_SYNTAX_ERROR, &e.to_string())
+                .await
+                .map_err(WireError::Io);
+        }
+    };
+
+    // An all-comment / all-whitespace string parses to zero statements — that is
+    // an empty query, not a row-less success.
+    if statements.is_empty() {
+        debug!("simple query carried no statements");
+        return write_empty_query_response(stream)
+            .await
+            .map_err(WireError::Io);
+    }
+
+    for stmt in &statements {
+        if let Some(columns) = constant_select(stmt) {
+            write_row_description(stream, &columns).await?;
+            write_data_row(stream, &columns).await?;
+            write_command_complete(stream, &CommandTag::Select(1)).await?;
+        } else {
+            // Table reads, DML, and DDL all need the server-session engine that
+            // does not exist yet; route them politely and abort the batch.
+            info!(query = %sql, "statement not yet routable through the simple-query loop");
+            write_error_response(
+                stream,
+                "ERROR",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "v0.1 simple query runs constant SELECT only; table reads, DML, \
+                 and DDL over the wire arrive in STL-131 and the DML-routing follow-up",
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Recognize a constant, tableless `SELECT` whose projection is integer literals
+/// — `SELECT 1`, `SELECT 1, 2 AS k`. Returns the columns to send back, or `None`
+/// for anything that needs the binder/executor (a `FROM`, a `WHERE`, non-integer
+/// or computed expressions). Integer-only keeps this honest: it is the canonical
+/// connectivity smoke test, not a back-door scalar evaluator (STL-105 owns the
+/// real type-encoder set).
+fn constant_select(stmt: &Statement) -> Option<Vec<ConstColumn>> {
+    let SqlStatement::Query(query) = &stmt.body else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    // Tableless and unfiltered only — a `FROM` or `WHERE` belongs to the binder.
+    if !select.from.is_empty() || select.selection.is_some() {
+        return None;
+    }
+    if select.projection.is_empty() {
+        return None;
+    }
+
+    let mut columns = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+            _ => return None,
+        };
+        let parsed = integer_literal(expr)?;
+        let (type_oid, typlen) = if i32::try_from(parsed).is_ok() {
+            (OID_INT4, TYPLEN_INT4)
+        } else {
+            (OID_INT8, TYPLEN_INT8)
+        };
+        columns.push(ConstColumn {
+            // Postgres labels an unaliased expression column `?column?`.
+            name: alias.unwrap_or_else(|| "?column?".to_owned()),
+            type_oid,
+            typlen,
+            text: parsed.to_string(),
+        });
+    }
+    Some(columns)
+}
+
+/// Fold an integer-literal expression to its value, or `None` for anything that
+/// is not one. Handles a leading sign (`SELECT -1` parses as unary `-` over a
+/// `Number`, not a negative literal), since an unsigned `SELECT 1` and a signed
+/// `SELECT -1` are both basic connectivity smoke tests. Decimals and
+/// out-of-`i64`-range values fall through to the binder/executor path.
+fn integer_literal(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            Value::Number(digits, _) => digits.parse().ok(),
+            _ => None,
+        },
+        Expr::UnaryOp { op, expr } => {
+            let inner = integer_literal(expr)?;
+            match op {
+                UnaryOperator::Plus => Some(inner),
+                UnaryOperator::Minus => inner.checked_neg(),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -430,6 +653,86 @@ async fn write_error_response(
     stream.write_all(&frame).await
 }
 
+/// `EmptyQueryResponse` ('I') — the reply to a whitespace-only / comment-only
+/// query. Carries no payload; it stands in for the `CommandComplete` a real
+/// statement would have sent.
+async fn write_empty_query_response(stream: &mut TcpStream) -> io::Result<()> {
+    let buf: [u8; 5] = [MSG_EMPTY_QUERY_RESPONSE, 0, 0, 0, 4];
+    stream.write_all(&buf).await
+}
+
+/// The Postgres column-count fields in `RowDescription` / `DataRow` are Int16,
+/// so a result wider than `i16::MAX` columns cannot be described. Reject it
+/// rather than clamp the count and emit a frame whose body and header disagree.
+fn column_count(columns: &[ConstColumn]) -> Result<i16, WireError> {
+    i16::try_from(columns.len())
+        .map_err(|_| WireError::Protocol("result has more than 32767 columns"))
+}
+
+/// `RowDescription` ('T') — one field descriptor per result column.
+///
+/// Per field: name (cstring), table OID (Int32), column attr number (Int16),
+/// type OID (Int32), type size (Int16), type modifier (Int32), format code
+/// (Int16). We have no real relation behind these constant columns, so table
+/// OID and attr number are `0`, and the type modifier is `-1` (none).
+async fn write_row_description(
+    stream: &mut TcpStream,
+    columns: &[ConstColumn],
+) -> Result<(), WireError> {
+    let count = column_count(columns)?;
+    let mut payload = BytesMut::new();
+    payload.put_i16(count);
+    for col in columns {
+        payload.put_slice(col.name.as_bytes());
+        payload.put_u8(0);
+        payload.put_i32(0); // table OID — not a stored relation
+        payload.put_i16(0); // column attribute number
+        payload.put_i32(col.type_oid);
+        payload.put_i16(col.typlen);
+        payload.put_i32(-1); // type modifier
+        payload.put_i16(FORMAT_TEXT);
+    }
+    write_framed(stream, MSG_ROW_DESCRIPTION, &payload).await?;
+    Ok(())
+}
+
+/// `DataRow` ('D') — one value per column, in text format. The constant-`SELECT`
+/// path always has a value, so this never emits the `NULL` sentinel (length
+/// `-1`); the general path that does will arrive with the type-encoder set
+/// (STL-105).
+async fn write_data_row(stream: &mut TcpStream, columns: &[ConstColumn]) -> Result<(), WireError> {
+    let count = column_count(columns)?;
+    let mut payload = BytesMut::new();
+    payload.put_i16(count);
+    for col in columns {
+        let bytes = col.text.as_bytes();
+        payload.put_i32(i32::try_from(bytes.len()).unwrap_or(i32::MAX));
+        payload.put_slice(bytes);
+    }
+    write_framed(stream, MSG_DATA_ROW, &payload).await?;
+    Ok(())
+}
+
+/// `CommandComplete` ('C') — the statement's [`CommandTag`] as a cstring.
+async fn write_command_complete(stream: &mut TcpStream, tag: &CommandTag) -> io::Result<()> {
+    let rendered = tag.render();
+    let mut payload = BytesMut::with_capacity(rendered.len() + 1);
+    payload.put_slice(rendered.as_bytes());
+    payload.put_u8(0);
+    write_framed(stream, MSG_COMMAND_COMPLETE, &payload).await
+}
+
+/// Frame a payload as a typed message: 1-byte kind + Int32 length (inclusive of
+/// the length field) + payload.
+async fn write_framed(stream: &mut TcpStream, kind: u8, payload: &[u8]) -> io::Result<()> {
+    let len = i32::try_from(4 + payload.len()).unwrap_or(i32::MAX);
+    let mut frame = BytesMut::with_capacity(5 + payload.len());
+    frame.put_u8(kind);
+    frame.put_i32(len);
+    frame.put_slice(payload);
+    stream.write_all(&frame).await
+}
+
 /// Parameters that real psql / pgx / pgwire-compatible drivers read at startup.
 /// None of these encode Stele semantics; they exist to keep clients happy.
 ///
@@ -455,6 +758,127 @@ const fn default_parameter_status() -> [(&'static str, &'static str); 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Read one typed backend message: `(kind, payload)` with the 5-byte header
+    /// stripped. Panics on EOF — a test that loses the connection mid-protocol
+    /// should fail loudly.
+    async fn read_message(client: &mut TcpStream) -> (u8, Vec<u8>) {
+        let mut header = [0u8; 5];
+        client
+            .read_exact(&mut header)
+            .await
+            .expect("message header");
+        let len = usize::try_from(i32::from_be_bytes(header[1..5].try_into().unwrap())).unwrap();
+        let mut payload = vec![0u8; len - 4];
+        if !payload.is_empty() {
+            client
+                .read_exact(&mut payload)
+                .await
+                .expect("message payload");
+        }
+        (header[0], payload)
+    }
+
+    /// Send a simple-query (`Q`) message carrying `sql` (NUL-terminated).
+    async fn send_query(client: &mut TcpStream, sql: &str) {
+        let mut body = sql.as_bytes().to_vec();
+        body.push(0);
+        let mut q = BytesMut::with_capacity(5 + body.len());
+        q.put_u8(MSG_QUERY);
+        q.put_i32(i32::try_from(4 + body.len()).unwrap());
+        q.put_slice(&body);
+        client.write_all(&q).await.unwrap();
+    }
+
+    /// Stand up `handle_connection` on an ephemeral port, complete the startup
+    /// handshake from the client side, and return `(server_join, client)` poised
+    /// at `ReadyForQuery`.
+    async fn connect_past_handshake() -> (tokio::task::JoinHandle<Result<(), WireError>>, TcpStream)
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_connection(stream, peer).await
+        });
+        let mut client = TcpStream::connect(bound).await.unwrap();
+
+        let body = b"user\0stele\0database\0stele\0\0";
+        let length = 8 + body.len();
+        let mut startup = BytesMut::with_capacity(length);
+        startup.put_i32(i32::try_from(length).unwrap());
+        startup.put_i32(PROTOCOL_3_0);
+        startup.put_slice(body);
+        client.write_all(&startup).await.unwrap();
+
+        loop {
+            let (kind, _) = read_message(&mut client).await;
+            if kind == MSG_READY_FOR_QUERY {
+                break;
+            }
+        }
+        (server, client)
+    }
+
+    /// Send `Terminate`, drop the client, and join the server handler.
+    async fn terminate(
+        server: tokio::task::JoinHandle<Result<(), WireError>>,
+        mut client: TcpStream,
+    ) {
+        let term: [u8; 5] = [MSG_TERMINATE, 0, 0, 0, 4];
+        client.write_all(&term).await.unwrap();
+        drop(client);
+        server.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn command_tags_render_per_postgres_convention() {
+        assert_eq!(CommandTag::Select(0).render(), "SELECT 0");
+        assert_eq!(CommandTag::Select(42).render(), "SELECT 42");
+        assert_eq!(CommandTag::Insert(3).render(), "INSERT 0 3");
+        assert_eq!(CommandTag::Update(1).render(), "UPDATE 1");
+        assert_eq!(CommandTag::Delete(0).render(), "DELETE 0");
+        assert_eq!(CommandTag::CreateTable.render(), "CREATE TABLE");
+        assert_eq!(CommandTag::DropTable.render(), "DROP TABLE");
+    }
+
+    #[test]
+    fn constant_select_recognizes_integer_literals_only() {
+        let one = stele_sql::parse("SELECT 1").unwrap();
+        let cols = constant_select(&one[0]).expect("SELECT 1 is constant");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].name, "?column?");
+        assert_eq!(cols[0].type_oid, OID_INT4);
+        assert_eq!(cols[0].text, "1");
+
+        // Alias is honored; a wide literal escalates to INT8.
+        let aliased = stele_sql::parse("SELECT 5000000000 AS big").unwrap();
+        let cols = constant_select(&aliased[0]).expect("constant");
+        assert_eq!(cols[0].name, "big");
+        assert_eq!(cols[0].type_oid, OID_INT8);
+
+        // A leading sign is folded — `-1` parses as unary minus over a Number.
+        let neg = stele_sql::parse("SELECT -1").unwrap();
+        let cols = constant_select(&neg[0]).expect("SELECT -1 is constant");
+        assert_eq!(cols[0].type_oid, OID_INT4);
+        assert_eq!(cols[0].text, "-1");
+        let pos = stele_sql::parse("SELECT +5 AS five").unwrap();
+        assert_eq!(constant_select(&pos[0]).unwrap()[0].text, "5");
+
+        // A table read, a filter, or a non-integer expression is not constant.
+        for sql in [
+            "SELECT * FROM t",
+            "SELECT 1 WHERE 1=1",
+            "SELECT 'x'",
+            "SELECT 1.5",
+        ] {
+            let stmt = stele_sql::parse(sql).unwrap();
+            assert!(
+                constant_select(&stmt[0]).is_none(),
+                "{sql} must defer to the binder"
+            );
+        }
+    }
 
     #[test]
     fn parses_startup_params_to_terminator() {
@@ -487,7 +911,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handshake_completes_and_error_is_returned_on_query() {
+    async fn handshake_completes_and_select_one_round_trips() {
         use tokio::io::AsyncWriteExt;
         // Bind to an ephemeral port and drive a synthetic client end-to-end.
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -536,33 +960,33 @@ mod tests {
             }
         }
 
-        // Send a simple query and expect an ErrorResponse + ReadyForQuery.
-        let query = b"SELECT 1\0";
-        let qlen = i32::try_from(4 + query.len()).unwrap();
-        let mut q = BytesMut::with_capacity(5 + query.len());
-        q.put_u8(MSG_QUERY);
-        q.put_i32(qlen);
-        q.put_slice(query);
-        client.write_all(&q).await.unwrap();
+        // Send `SELECT 1` and expect the full result protocol:
+        // RowDescription, one DataRow, CommandComplete, then ReadyForQuery.
+        send_query(&mut client, "SELECT 1").await;
 
-        // First reply should be 'E'.
-        let mut eh = [0u8; 5];
-        client.read_exact(&mut eh).await.unwrap();
-        assert_eq!(eh[0], MSG_ERROR_RESPONSE);
-        let elen = usize::try_from(i32::from_be_bytes(eh[1..5].try_into().unwrap())).unwrap();
-        let mut epayload = vec![0u8; elen - 4];
-        client.read_exact(&mut epayload).await.unwrap();
+        let (kind, payload) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_ROW_DESCRIPTION, "first reply is RowDescription");
+        // Int16 field count == 1, then the field name `?column?`.
+        assert_eq!(i16::from_be_bytes(payload[0..2].try_into().unwrap()), 1);
         assert!(
-            epayload
-                .windows(5)
-                .any(|w| w == SQLSTATE_FEATURE_NOT_SUPPORTED.as_bytes()),
-            "SQLSTATE should be embedded in the error payload"
+            payload.windows(8).any(|w| w == b"?column?"),
+            "unaliased column is named ?column?"
         );
 
-        // Followed by ReadyForQuery 'Z'.
-        let mut zh = [0u8; 5];
-        client.read_exact(&mut zh).await.unwrap();
-        assert_eq!(zh[0], MSG_READY_FOR_QUERY);
+        let (kind, payload) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_DATA_ROW, "second reply is DataRow");
+        // Int16 column count == 1, Int32 value length == 1, value byte '1'.
+        assert_eq!(i16::from_be_bytes(payload[0..2].try_into().unwrap()), 1);
+        assert_eq!(i32::from_be_bytes(payload[2..6].try_into().unwrap()), 1);
+        assert_eq!(&payload[6..], b"1");
+
+        let (kind, payload) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_COMMAND_COMPLETE, "third reply is CommandComplete");
+        assert_eq!(payload, b"SELECT 1\0", "tag is `SELECT 1`");
+
+        let (kind, payload) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_READY_FOR_QUERY);
+        assert_eq!(payload, b"I");
 
         // Close cleanly with Terminate.
         let term: [u8; 5] = [MSG_TERMINATE, 0, 0, 0, 4];
@@ -751,5 +1175,82 @@ mod tests {
 
         drop(client);
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn select_with_alias_round_trips_named_column() {
+        let (server, mut client) = connect_past_handshake().await;
+        send_query(&mut client, "SELECT 7 AS answer").await;
+
+        let (kind, payload) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_ROW_DESCRIPTION);
+        assert!(payload.windows(6).any(|w| w == b"answer"));
+
+        let (kind, payload) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_DATA_ROW);
+        assert_eq!(&payload[6..], b"7");
+
+        let (kind, payload) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_COMMAND_COMPLETE);
+        assert_eq!(payload, b"SELECT 1\0");
+
+        let (kind, _) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_READY_FOR_QUERY);
+        terminate(server, client).await;
+    }
+
+    #[tokio::test]
+    async fn empty_query_yields_empty_query_response() {
+        let (server, mut client) = connect_past_handshake().await;
+        // Whitespace / a bare semicolon carry no statement.
+        send_query(&mut client, "   ").await;
+
+        let (kind, payload) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_EMPTY_QUERY_RESPONSE);
+        assert!(payload.is_empty());
+
+        let (kind, _) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_READY_FOR_QUERY, "still exactly one ReadyForQuery");
+        terminate(server, client).await;
+    }
+
+    #[tokio::test]
+    async fn syntax_error_reports_sqlstate_42601() {
+        let (server, mut client) = connect_past_handshake().await;
+        send_query(&mut client, "SELECT FROM WHERE").await;
+
+        let (kind, payload) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_ERROR_RESPONSE);
+        assert!(
+            payload
+                .windows(5)
+                .any(|w| w == SQLSTATE_SYNTAX_ERROR.as_bytes()),
+            "a parse failure carries SQLSTATE 42601"
+        );
+
+        let (kind, _) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_READY_FOR_QUERY);
+        terminate(server, client).await;
+    }
+
+    #[tokio::test]
+    async fn table_read_is_politely_deferred() {
+        let (server, mut client) = connect_past_handshake().await;
+        // A real table read needs the server-session engine (STL-131); until
+        // then it is feature_not_supported, never a crash or a wrong answer.
+        send_query(&mut client, "SELECT balance FROM account").await;
+
+        let (kind, payload) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_ERROR_RESPONSE);
+        assert!(
+            payload
+                .windows(5)
+                .any(|w| w == SQLSTATE_FEATURE_NOT_SUPPORTED.as_bytes()),
+            "an un-routable statement carries SQLSTATE 0A000"
+        );
+
+        let (kind, _) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_READY_FOR_QUERY);
+        terminate(server, client).await;
     }
 }
