@@ -24,7 +24,7 @@ flowchart TB
     test --> msrv["MSRV check"]
     test --> deny["cargo-deny + audit<br/>(licenses, advisories)"]
     push -->|"label: full-ci, or nightly schedule"| heavy["Heavy gate"]
-    heavy --> san["Sanitizers<br/>ASan · TSan · UBSan · Miri"]
+    heavy --> san["Sanitizers<br/>ASan · TSan · LSan · Miri"]
     heavy --> fuzz["Fuzz (time-boxed)"]
     heavy --> sim["Deterministic sim<br/>(long seeds)"]
     heavy --> bench["Benchmark regression gate"]
@@ -57,7 +57,7 @@ These **must** be green to merge into `main`:
 
 | Check | Tool |
 |---|---|
-| **AddressSanitizer / ThreadSanitizer / UBSan** | nightly `-Zsanitizer=...` |
+| **AddressSanitizer / ThreadSanitizer / LeakSanitizer** | nightly `-Zsanitizer=...` (UB checking is covered by Miri — `rustc` has no `-Zsanitizer=undefined`) |
 | **Miri** (UB in unsafe code) | `cargo +nightly miri test` (core crates) |
 | **Fuzzing** | `cargo fuzz` (time-boxed per target) |
 | **Deterministic simulation** | `stele-sim` long-seed runs ([06](06-testing-strategy.md)) |
@@ -159,13 +159,13 @@ jobs:
     if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-latest
     strategy:
-      matrix: { san: [address, thread, undefined] }
+      matrix: { san: [address, thread, leak] }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-        with: { components: rust-src }
+        with: { components: rust-src }       # -Zbuild-std needs the std source
       - uses: Swatinem/rust-cache@v2
-      - run: cargo nextest run --workspace
+      - run: cargo nextest run -Zbuild-std --workspace   # rebuild std under the sanitizer ABI
         env:
           RUSTFLAGS: "-Zsanitizer=${{ matrix.san }}"
           RUSTDOCFLAGS: "-Zsanitizer=${{ matrix.san }}"
