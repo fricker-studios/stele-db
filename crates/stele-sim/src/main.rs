@@ -36,8 +36,9 @@ fn main() {
         let scan_digest = stele_sim::run_snapshot_scan_seed(seed);
         let as_of_digest = stele_sim::run_as_of_resolution_seed(seed);
         let engine_rec_digest = stele_sim::run_engine_recover_seed(seed);
+        let fault_digest = stele_sim::run_fault_seed(seed);
         println!(
-            "stele-sim: seed {seed} → storage digest {digest:#018x} · valid-time digest {vt_digest:#018x} · delete digest {del_digest:#018x} · dml digest {dml_digest:#018x} · mvcc digest {mvcc_digest:#018x} · recovery-index digest {rec_digest:#018x} · snapshot-scan digest {scan_digest:#018x} · as-of-resolution digest {as_of_digest:#018x} · engine-recover digest {engine_rec_digest:#018x}"
+            "stele-sim: seed {seed} → storage digest {digest:#018x} · valid-time digest {vt_digest:#018x} · delete digest {del_digest:#018x} · dml digest {dml_digest:#018x} · mvcc digest {mvcc_digest:#018x} · recovery-index digest {rec_digest:#018x} · snapshot-scan digest {scan_digest:#018x} · as-of-resolution digest {as_of_digest:#018x} · engine-recover digest {engine_rec_digest:#018x} · fault digest {fault_digest:#018x}"
         );
     } else if args.seeds == 0 {
         println!("stele-sim: no seeds requested (pass --seeds N or --seed S)");
@@ -45,6 +46,7 @@ fn main() {
         // Sweep: each seed is independent and reproducible. Fold the per-seed
         // digests with an order-dependent FNV-style mix (not XOR, which would
         // cancel matching digests) so the sweep stays a sharp regression signal.
+        let faults_on = args.fault_injection != "off";
         let mut sweep = 0xCBF2_9CE4_8422_2325u64;
         for seed in 0..args.seeds {
             // Mix both scenarios per seed so the sweep regresses on either the
@@ -73,19 +75,21 @@ fn main() {
             // asserting an exact index rebuild and oracle-correct AS-OF (STL-102).
             sweep = (sweep ^ stele_sim::run_engine_recover_seed(seed))
                 .wrapping_mul(0x0000_0100_0000_01B3);
+            // The seeded-fault virtual disk (STL-109): a workload over a
+            // `FaultDisk` arming every fault class, folded only when fault
+            // injection is on so the flag actually changes what the sweep covers.
+            if faults_on {
+                sweep =
+                    (sweep ^ stele_sim::run_fault_seed(seed)).wrapping_mul(0x0000_0100_0000_01B3);
+            }
         }
         println!(
             "stele-sim: swept {} seed(s) over the in-memory backend → sweep digest {sweep:#018x}",
             args.seeds
         );
-        if args.fault_injection != "off" {
-            // The flag is accepted (the justfile passes it), but the seeded
-            // storage workload does not yet inject disk faults — that lands with
-            // the seeded-fault virtual disk in STL-109. Say so rather than imply
-            // toggling it changed the digest above.
+        if faults_on {
             println!(
-                "stele-sim: note: --fault-injection={} is not yet wired into the storage workload (STL-109)",
-                args.fault_injection
+                "stele-sim: fault injection on → folded the seeded-fault virtual disk per seed (STL-109)"
             );
         }
     }
