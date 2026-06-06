@@ -655,7 +655,16 @@ fn engine_chain_is_differential_equal_to_the_oracle_across_flush_boundaries() {
 
             let k = rng.range(KEY_POOL) as usize;
             let key = BusinessKey::new(vec![b'k', k as u8]);
-            let lookup = SealedVersions::new(sealed.clone());
+            // The writer only resolves the *current* key against the sealed pool,
+            // so hand it just that key's sealed versions rather than cloning the
+            // whole (growing) pool every op.
+            let lookup = SealedVersions::new(
+                sealed
+                    .iter()
+                    .filter(|v| v.business_key == key)
+                    .cloned()
+                    .collect(),
+            );
             let txn = TxnId(op);
             let principal = Principal::new(format!("p{op}").into_bytes());
             let payload = format!("s{seed}-k{k}-o{op}").into_bytes();
@@ -726,14 +735,11 @@ fn engine_chain_is_differential_equal_to_the_oracle_across_flush_boundaries() {
 ///
 /// Equality already subsumes "non-overlapping and gap-free": the model abuts on
 /// update and only gaps on delete→re-insert, so any stray gap, overlap, or
-/// mis-close diverges. The extra windowed checks are belt-and-suspenders on the
-/// engine side.
+/// mis-close diverges. The windowed sub-properties run *first* so a structural
+/// break is reported as that specific property rather than as a bulk "≠ model"
+/// panic; the element-for-element equality is the final, stricter check.
 fn assert_oracle_equal(seed: u64, k: usize, chain: &[Version], model: &[OracleVersion]) {
     let engine: Vec<OracleVersion> = chain.iter().map(project).collect();
-    assert_eq!(
-        engine, model,
-        "seed {seed} key {k}: engine chain diverged from the oracle",
-    );
     for w in engine.windows(2) {
         let (lo, hi) = (&w[0], &w[1]);
         assert!(
@@ -749,4 +755,8 @@ fn assert_oracle_equal(seed: u64, k: usize, chain: &[Version], model: &[OracleVe
             "seed {seed} key {k}: a superseded period is still open",
         );
     }
+    assert_eq!(
+        engine, model,
+        "seed {seed} key {k}: engine chain diverged from the oracle",
+    );
 }
