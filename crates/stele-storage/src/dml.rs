@@ -272,12 +272,17 @@ pub fn replay<D: Disk, I: Disk>(
 const REDO_TAG_INSERT: u8 = 0;
 /// Tag byte for a [`Redo::Close`] frame in a WAL redo record.
 const REDO_TAG_CLOSE: u8 = 1;
+/// Tag byte for a [`Redo::Retract`] frame in a WAL redo record. A retraction
+/// shares the [`Close`] wire format — the tag is what distinguishes a durable
+/// delete (persisted into segments at flush) from a re-derivable supersession
+/// close ([ADR-0023]).
+const REDO_TAG_RETRACT: u8 = 2;
 
 /// Encode a resolved redo set as a single WAL record: each entry is a one-byte
-/// tag (insert vs close) followed by the entry's self-delimiting frame, all
-/// concatenated back-to-back. The frames carry their own lengths, so no envelope
-/// is needed — the WAL record boundary delimits the set and [`decode_redo`] walks
-/// it, dispatching on the tag.
+/// tag (insert / close / retract) followed by the entry's self-delimiting frame,
+/// all concatenated back-to-back. The frames carry their own lengths, so no
+/// envelope is needed — the WAL record boundary delimits the set and
+/// [`decode_redo`] walks it, dispatching on the tag.
 fn encode_redo(redos: &[Redo]) -> Result<Vec<u8>, DmlError> {
     let mut buf = Vec::new();
     for redo in redos {
@@ -288,6 +293,10 @@ fn encode_redo(redos: &[Redo]) -> Result<Vec<u8>, DmlError> {
             }
             Redo::Close(close) => {
                 buf.push(REDO_TAG_CLOSE);
+                close.encode(&mut buf)?;
+            }
+            Redo::Retract(close) => {
+                buf.push(REDO_TAG_RETRACT);
                 close.encode(&mut buf)?;
             }
         }
@@ -316,6 +325,11 @@ fn decode_redo(bytes: &[u8]) -> Result<Vec<Redo>, DmlError> {
             REDO_TAG_CLOSE => {
                 let (close, consumed) = Close::decode(body)?;
                 redos.push(Redo::Close(close));
+                rest = &body[consumed..];
+            }
+            REDO_TAG_RETRACT => {
+                let (close, consumed) = Close::decode(body)?;
+                redos.push(Redo::Retract(close));
                 rest = &body[consumed..];
             }
             _ => {
@@ -365,6 +379,33 @@ mod tests {
         let record = encode_redo(&[close.clone(), opened.clone()]).expect("encode");
         let decoded = decode_redo(&record).expect("decode");
         assert_eq!(decoded, vec![close, opened]);
+    }
+
+    /// A delete's redo set — a single [`Redo::Retract`] — round-trips through the
+    /// tagged record codec under its own tag, so replay reconstructs a retraction
+    /// (not a plain close) and the durable-tombstone distinction survives the WAL.
+    #[test]
+    fn retract_redo_record_round_trips() {
+        use stele_common::provenance::Provenance;
+        use stele_common::time::SystemTimeMicros;
+
+        let retract = Redo::Retract(Close {
+            business_key: BusinessKey::new(b"acct".to_vec()),
+            sys_from: SystemTimeMicros(10),
+            sys_to: SystemTimeMicros(30),
+            closed_by: Provenance::new(
+                TxnId(7),
+                SystemTimeMicros(30),
+                Principal::new(b"deleter".to_vec()),
+            ),
+        });
+
+        let record = encode_redo(&[retract.clone()]).expect("encode");
+        let decoded = decode_redo(&record).expect("decode");
+        assert_eq!(decoded, vec![retract]);
+        // The tag must be the retract tag — not the close tag — so the two are
+        // genuinely distinguished on the wire.
+        assert_eq!(record.first(), Some(&REDO_TAG_RETRACT));
     }
 
     /// A truncated record is corruption, not a silently-dropped tail.

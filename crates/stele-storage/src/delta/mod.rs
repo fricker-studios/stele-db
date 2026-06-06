@@ -47,7 +47,7 @@ use stele_common::time::SystemTimeMicros;
 
 use crate::backend::Disk;
 use crate::merge;
-use crate::validity::{ValidityError, ValidityIndex};
+use crate::validity::{Close, ValidityError, ValidityIndex};
 
 pub use version::{BusinessKey, MAX_VERSION_FRAME_LEN, Snapshot, Version};
 
@@ -121,6 +121,18 @@ pub struct Delta<D: Disk> {
     /// Spill indices we have written this lifetime and have not yet flushed
     /// into a sealed segment. Kept in ascending order.
     live_spills: Vec<u64>,
+    /// Retraction tombstones (logical deletes) staged since the last flush,
+    /// keyed `(business_key, sys_from)` by the version they close. Drained into
+    /// the sealed segment at flush ([`Self::take_retractions`]) so the deletion
+    /// gap survives a from-scratch validity-index rebuild ([ADR-0023], STL-143).
+    ///
+    /// **v0.1 keeps these resident** — they are tiny and rare relative to
+    /// versions, so they never spill to disk. Like the version tier the delta
+    /// makes no durability claim: a pre-flush crash loses the buffer, and WAL
+    /// replay re-stages each retraction through [`Self::stage_retraction`]
+    /// (idempotent on `(business_key, sys_from)`). Retraction spill is a noted
+    /// follow-up once delete-heavy workloads make resident size a concern.
+    retractions: BTreeMap<(BusinessKey, SystemTimeMicros), Close>,
 }
 
 impl<D: Disk> Delta<D> {
@@ -140,6 +152,7 @@ impl<D: Disk> Delta<D> {
             mem: MemTier::new(),
             next_spill_index,
             live_spills: Vec::new(),
+            retractions: BTreeMap::new(),
         })
     }
 
@@ -264,6 +277,35 @@ impl<D: Disk> Delta<D> {
             .into_values()
             .flat_map(BTreeMap::into_values)
             .collect())
+    }
+
+    /// Stage a retraction tombstone (a logical delete — a [`Close`] with no
+    /// successor version) for persistence at the next flush.
+    ///
+    /// Idempotent on `(business_key, sys_from)`: re-staging the identical
+    /// retraction (the property WAL replay relies on) overwrites the entry with
+    /// an equal one. A retraction targeting the same version with a *different*
+    /// close is not expected — the validity index is the write-once authority and
+    /// rejects a conflicting re-close before this is ever reached — so the last
+    /// writer simply wins here without a separate conflict check.
+    ///
+    /// Unlike [`Self::insert`], staging a retraction never spills: v0.1 keeps the
+    /// tombstone buffer resident (tiny and rare relative to versions).
+    pub fn stage_retraction(&mut self, close: Close) {
+        self.retractions
+            .insert((close.business_key.clone(), close.sys_from), close);
+    }
+
+    /// Drain every staged retraction in `(business_key, sys_from)` order and clear
+    /// the buffer — the tombstone half of a flush, paired with
+    /// [`Self::flush_to_segment`]. The caller pushes these into the same sealed
+    /// segment as the drained versions ([`crate::segment::SegmentWriter::push_retraction`]),
+    /// making the segment store self-contained for a from-scratch rebuild
+    /// ([ADR-0023], STL-143).
+    pub fn take_retractions(&mut self) -> Vec<Close> {
+        std::mem::take(&mut self.retractions)
+            .into_values()
+            .collect()
     }
 
     /// Every version of `key` currently staged in the delta tier — both the

@@ -84,14 +84,38 @@ use crate::validity::{Close, ValidityError, ValidityIndex};
 /// An `INSERT` resolves to a single [`Redo::Insert`]; an `UPDATE` to a
 /// [`Redo::Close`] (the prior period's materialized end) followed by a
 /// [`Redo::Insert`] (the new open version); a `DELETE` to a single
-/// [`Redo::Close`]. The shared `apply` step dispatches each: an insert stages into the delta
-/// tier, a close materializes into the validity index.
+/// [`Redo::Retract`]. The shared `apply` step dispatches each: an insert stages
+/// into the delta tier, a close materializes into the validity index, and a
+/// retraction does both — materializes into the index *and* stages the tombstone
+/// for the next flush.
+///
+/// ## Why a delete is a `Retract`, not a `Close`
+///
+/// A [`Redo::Close`] is a **supersession**: the prior period's end abuts the new
+/// open version that the same commit appends. That adjacency — a version's
+/// `sys_to` equals the next version's `sys_from` — means a from-scratch rebuild
+/// from segments can *re-derive* the close from the version chain alone, so a
+/// supersession close needs no durable record of its own.
+///
+/// A [`Redo::Retract`] is a **delete**: a close with **no successor version**.
+/// Adjacency cannot represent it — a later re-insert would be mis-read as the
+/// successor, silently resurrecting the row across the deletion gap
+/// ([docs/16 §12](../../../docs/16-bitemporal-semantics.md#12-deletes-retractions--the-deletion-gap),
+/// [ADR-0023]). So a retraction is a **first-class durable record**: it carries
+/// the same [`Close`] payload, but the write path tags it distinctly so it is
+/// persisted into segments at flush ([`crate::segment`]) and can never be lost to
+/// a validity-index rebuild.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Redo {
     /// Stage a new open version into the delta tier.
     Insert(Version),
-    /// Materialize a prior version's end into the validity index.
+    /// Materialize a prior version's end into the validity index — a
+    /// supersession close, re-derivable from version adjacency on rebuild.
     Close(Close),
+    /// A logical delete: a close with no successor. Materializes into the
+    /// validity index **and** stages a durable tombstone for the next flush, so
+    /// the deletion gap survives a from-scratch index rebuild ([ADR-0023]).
+    Retract(Close),
 }
 
 /// A read-only lookup over the sealed segments the writer must consult to
@@ -333,7 +357,7 @@ impl<C: Clock> SysTimeWriter<C> {
         apply(
             delta,
             index,
-            vec![Redo::Close(close_of(
+            vec![Redo::Retract(close_of(
                 key, &prior, commit, txn_id, principal,
             ))],
         )?;
@@ -424,7 +448,7 @@ impl<C: Clock> SysTimeWriter<C> {
         let prior = current_open(delta, index, key, commit)?.ok_or(SysTimeError::KeyNotFound)?;
         Ok((
             commit,
-            vec![Redo::Close(close_of(
+            vec![Redo::Retract(close_of(
                 key, &prior, commit, txn_id, principal,
             ))],
         ))
@@ -461,9 +485,18 @@ impl<C: Clock> SysTimeWriter<C> {
 /// ([`crate::dml::DmlWriter`]), and a crash-recovery replay ([`crate::dml::replay`])
 /// all funnel their resolved redo sets through here, so "the same code path under
 /// sim and under real I/O" is structural, not a promise. Re-inserting the same
-/// `(business_key, sys_from)` is the delta tier's idempotent replace, and an
-/// identical re-close is the index's idempotent write-once, so replaying an
+/// `(business_key, sys_from)` is the delta tier's idempotent replace, an identical
+/// re-close is the index's idempotent write-once, and re-staging the same
+/// retraction is the delta tier's idempotent tombstone — so replaying an
 /// already-applied record is a no-op.
+///
+/// A [`Redo::Retract`] applies to **both** structures: it materializes the
+/// deleted period's end into the validity index (so reads resolve the gap
+/// immediately, exactly as a supersession close would) **and** stages the
+/// tombstone into the delta tier so the next flush persists it durably into a
+/// segment ([ADR-0023]). The index close comes first: if it rejects a conflicting
+/// re-close the delta is left untouched, so the operation neither half-applies nor
+/// leaves a tombstone for a close that never took.
 ///
 /// # Errors
 ///
@@ -478,6 +511,10 @@ pub(crate) fn apply<D: Disk, I: Disk>(
         match redo {
             Redo::Insert(version) => delta.insert(version)?,
             Redo::Close(close) => index.insert_close(close)?,
+            Redo::Retract(close) => {
+                index.insert_close(close.clone())?;
+                delta.stage_retraction(close);
+            }
         }
     }
     Ok(())

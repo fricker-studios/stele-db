@@ -17,6 +17,7 @@
 use crate::backend::{Disk, DiskFile};
 use crate::checksum::crc32c;
 use crate::delta::Version;
+use crate::validity::Close;
 use crate::validtime::{VALID_TIME_PREFIX_LEN, unframe_payload};
 
 use super::SegmentError;
@@ -34,6 +35,11 @@ use super::format::{
 pub struct SegmentWriter<F: DiskFile> {
     file: F,
     rows: Vec<Version>,
+    /// Retraction tombstones (logical deletes) to persist into this segment's
+    /// retraction section (format v7, STL-143). Buffered in memory like `rows`;
+    /// [`finish`](Self::finish) emits them as their own columnar chunks after the
+    /// version row-group. Empty for a segment with no deletes.
+    retractions: Vec<Close>,
     /// Whether this segment's table tracks valid-time. When set, [`finish`]
     /// lifts the payload's valid-time prefix into the `valid_from` / `valid_to`
     /// columns ([STL-117]) and stores only the bare user payload in the
@@ -85,6 +91,7 @@ impl<F: DiskFile> SegmentWriter<F> {
         Ok(Self {
             file,
             rows: Vec::new(),
+            retractions: Vec::new(),
             valid_time,
         })
     }
@@ -100,6 +107,17 @@ impl<F: DiskFile> SegmentWriter<F> {
         version.check_encodable()?;
         self.rows.push(version);
         Ok(())
+    }
+
+    /// Buffer one retraction tombstone for this segment's retraction section
+    /// (format v7, STL-143) — a payload-less durable record of a logical delete,
+    /// drained from the delta tier at flush
+    /// ([`crate::delta::Delta::take_retractions`]). Like [`push`](Self::push) the
+    /// row is not yet on disk; [`finish`](Self::finish) commits the retraction
+    /// chunks after the version row-group. A segment with no retractions writes no
+    /// retraction columns at all.
+    pub fn push_retraction(&mut self, close: Close) {
+        self.retractions.push(close);
     }
 
     /// Seal the segment: emit every buffered row as one row-group, then write
@@ -121,6 +139,8 @@ impl<F: DiskFile> SegmentWriter<F> {
         let mut chunks: Vec<EncodedChunk> = Vec::with_capacity(schema.len());
         let mut offset: u64 = HEADER_LEN as u64;
 
+        let version_count = u32::try_from(self.rows.len())
+            .map_err(|_| SegmentError::TooLarge("row count exceeds u32::MAX in one row-group"))?;
         for &col in schema {
             let encoded = encode_column(col, &self.rows, valid_pairs.as_deref())?;
             // Each chunk is laid out contiguously in `ColumnId::schema` order
@@ -133,9 +153,7 @@ impl<F: DiskFile> SegmentWriter<F> {
                 col,
                 offset,
                 length,
-                value_count: u32::try_from(self.rows.len()).map_err(|_| {
-                    SegmentError::TooLarge("row count exceeds u32::MAX in one row-group")
-                })?,
+                value_count: version_count,
                 payload: encoded.payload,
                 stat_min: encoded.stat_min,
                 stat_max: encoded.stat_max,
@@ -143,11 +161,38 @@ impl<F: DiskFile> SegmentWriter<F> {
             offset += length;
         }
 
-        // Emit every chunk in declaration order. Each chunk header is
-        // self-checksummed: `chunk_crc` covers `(header[0..12] || payload)`,
-        // so a flip anywhere except the CRC field itself is detected — and a
-        // flip in the CRC field is detected as a mismatch.
-        for chunk in &chunks {
+        // Retraction tombstones (format v7, STL-143) follow the version
+        // row-group as their own columnar chunks — emitted only when the segment
+        // holds at least one delete (the optional-columns pattern, like the
+        // valid-time pair). They carry their *own* value count (the number of
+        // retractions, independent of the version row count), laid out
+        // contiguously after the version chunks so offsets stay monotonic.
+        let mut retraction_chunks: Vec<EncodedChunk> = Vec::new();
+        let retraction_count = u32::try_from(self.retractions.len())
+            .map_err(|_| SegmentError::TooLarge("retraction count exceeds u32::MAX"))?;
+        if !self.retractions.is_empty() {
+            for &col in &ColumnId::RETRACTION {
+                let encoded = encode_retraction_column(col, &self.retractions)?;
+                let length = (CHUNK_HEADER_LEN + encoded.payload.len()) as u64;
+                retraction_chunks.push(EncodedChunk {
+                    col,
+                    offset,
+                    length,
+                    value_count: retraction_count,
+                    payload: encoded.payload,
+                    stat_min: encoded.stat_min,
+                    stat_max: encoded.stat_max,
+                });
+                offset += length;
+            }
+        }
+
+        // Emit every chunk in declaration order — version row-group first, then
+        // the retraction section. Each chunk header is self-checksummed:
+        // `chunk_crc` covers `(header[0..12] || payload)`, so a flip anywhere
+        // except the CRC field itself is detected — and a flip in the CRC field
+        // is detected as a mismatch.
+        for chunk in chunks.iter().chain(&retraction_chunks) {
             let mut header = Vec::with_capacity(CHUNK_HEADER_LEN);
             let payload_len = u32::try_from(chunk.payload.len()).map_err(|_| {
                 SegmentError::TooLarge("column-chunk payload exceeds u32::MAX bytes")
@@ -167,7 +212,7 @@ impl<F: DiskFile> SegmentWriter<F> {
             self.file.append(&chunk.payload)?;
         }
 
-        let footer = encode_footer(self.rows.len(), &chunks)?;
+        let footer = encode_footer(self.rows.len(), &chunks, &retraction_chunks)?;
         let footer_crc = crc32c(&footer);
         let footer_len = u32::try_from(footer.len())
             .map_err(|_| SegmentError::TooLarge("footer exceeds u32::MAX bytes"))?;
@@ -212,55 +257,20 @@ fn encode_column(
 ) -> Result<EncodedColumn, SegmentError> {
     match col.ty() {
         ColumnType::Bytes => {
-            // Plain layout: `[u32 len][bytes]` repeated. Min/max stats are a
-            // bounded *prefix* of the lex-min and lex-max byte values; the
-            // catalog will later attach a column-level comparator, but at the
-            // format layer bytewise order is the natural choice (it matches how
-            // BusinessKey already sorts via `Vec<u8>`'s Ord).
-            //
-            // Every bytes column can be an unbounded blob — `Payload` runs up
-            // to `MAX_VERSION_FRAME_LEN` (16 MiB) per row, and `BusinessKey` /
-            // `Principal` are only bounded by the same frame ceiling — so
-            // inlining a full lex-min/max would let one row push the footer past
-            // the `u32` `footer_len` limit. Instead we record a bounded prefix
-            // capped at `MAX_BYTES_STAT_PREFIX_LEN`: the min prefix is truncated
-            // *down* and the max prefix is rounded *up*, so the `[min, max]`
-            // envelope stays a superset of the real value range and
-            // `might_contain` keeps its no-false-negatives contract. This caps
-            // every bytes column's footer cost regardless of value size.
-            //
             // `valid_pairs` is `Some` exactly for a valid-time segment, where
             // the `payload` column stores only the bare user payload — the
             // 16-byte interval prefix is carried by the valid_from / valid_to
             // columns instead ([STL-119]). `extract_bytes` strips it for the
             // `Payload` column when that holds.
             let valid_time = valid_pairs.is_some();
-            let mut payload = Vec::new();
-            let mut min: Option<&[u8]> = None;
-            let mut max: Option<&[u8]> = None;
+            let mut vals: Vec<&[u8]> = Vec::with_capacity(rows.len());
             for row in rows {
-                let bytes = extract_bytes(col, row, valid_time)?;
-                let len = u32::try_from(bytes.len()).map_err(|_| {
-                    SegmentError::TooLarge("value length exceeds u32::MAX in one chunk")
-                })?;
-                payload.extend_from_slice(&len.to_le_bytes());
-                payload.extend_from_slice(bytes);
-                min = Some(min.map_or(bytes, |m| if bytes < m { bytes } else { m }));
-                max = Some(max.map_or(bytes, |m| if bytes > m { bytes } else { m }));
+                vals.push(extract_bytes(col, row, valid_time)?);
             }
-            Ok(EncodedColumn {
-                payload,
-                stat_min: min.map(bounded_min_prefix).unwrap_or_default(),
-                stat_max: max.map(bounded_max_prefix).unwrap_or_default(),
-            })
+            encode_bytes_values(vals.into_iter())
         }
         ColumnType::I64 => {
-            // Plain layout: 8 LE bytes per value. Min/max stored as 8 LE
-            // bytes of the min/max i64. An empty column emits zero-length
-            // stat fields (sentinel for "no stats").
-            let mut payload = Vec::with_capacity(rows.len() * 8);
-            let mut min: Option<i64> = None;
-            let mut max: Option<i64> = None;
+            let mut vals: Vec<i64> = Vec::with_capacity(rows.len());
             for (i, row) in rows.iter().enumerate() {
                 // The `valid_from` / `valid_to` columns read from the per-row
                 // prefix decoded once up front (`decode_valid_pairs`); every
@@ -274,16 +284,99 @@ fn encode_column(
                     }
                     _ => extract_i64(col, row),
                 };
-                payload.extend_from_slice(&v.to_le_bytes());
-                min = Some(min.map_or(v, |m| m.min(v)));
-                max = Some(max.map_or(v, |m| m.max(v)));
+                vals.push(v);
             }
-            Ok(EncodedColumn {
-                payload,
-                stat_min: min.map(|v| v.to_le_bytes().to_vec()).unwrap_or_default(),
-                stat_max: max.map(|v| v.to_le_bytes().to_vec()).unwrap_or_default(),
-            })
+            Ok(encode_i64_values(vals.into_iter()))
         }
+    }
+}
+
+/// Encode one retraction-section column (format v7, STL-143) from the buffered
+/// [`Close`] tombstones. Shares the plain bytes/i64 layout *and* the bounded
+/// zone-stat logic with the version columns via [`encode_bytes_values`] /
+/// [`encode_i64_values`], so a tombstone column prunes through the same zone map
+/// with no special-casing.
+//
+// `txn_id.0 as i64` is the same lossless bit reinterpretation as the version
+// `TxnId` column (see `ColumnId::TxnId`); the reader reverses it with `as u64`.
+#[allow(clippy::cast_possible_wrap)]
+fn encode_retraction_column(
+    col: ColumnId,
+    closes: &[Close],
+) -> Result<EncodedColumn, SegmentError> {
+    match col {
+        ColumnId::RetractKey => {
+            encode_bytes_values(closes.iter().map(|c| c.business_key.as_bytes()))
+        }
+        ColumnId::RetractClosedByPrincipal => {
+            encode_bytes_values(closes.iter().map(|c| c.closed_by.principal.as_bytes()))
+        }
+        ColumnId::RetractSysFrom => Ok(encode_i64_values(closes.iter().map(|c| c.sys_from.0))),
+        ColumnId::RetractClosedAt => Ok(encode_i64_values(closes.iter().map(|c| c.sys_to.0))),
+        ColumnId::RetractClosedByTxn => Ok(encode_i64_values(
+            closes.iter().map(|c| c.closed_by.txn_id.0 as i64),
+        )),
+        ColumnId::RetractClosedByCommittedAt => Ok(encode_i64_values(
+            closes.iter().map(|c| c.closed_by.committed_at.0),
+        )),
+        _ => unreachable!("not a retraction column"),
+    }
+}
+
+/// Encode a bytes column: plain `[u32 len][bytes]` per value, plus a bounded
+/// lex-min/max prefix stat.
+///
+/// Min/max stats are a bounded *prefix* of the lex-min and lex-max byte values;
+/// the catalog will later attach a column-level comparator, but at the format
+/// layer bytewise order is the natural choice (it matches how `BusinessKey`
+/// already sorts via `Vec<u8>`'s Ord).
+///
+/// Every bytes column can be an unbounded blob — `Payload` runs up to
+/// `MAX_VERSION_FRAME_LEN` (16 MiB) per row, and `BusinessKey` / `Principal` are
+/// only bounded by the same frame ceiling — so inlining a full lex-min/max would
+/// let one row push the footer past the `u32` `footer_len` limit. Instead we
+/// record a bounded prefix capped at `MAX_BYTES_STAT_PREFIX_LEN`: the min prefix
+/// is truncated *down* and the max prefix is rounded *up*, so the `[min, max]`
+/// envelope stays a superset of the real value range and `might_contain` keeps
+/// its no-false-negatives contract. This caps every bytes column's footer cost
+/// regardless of value size.
+fn encode_bytes_values<'a>(
+    values: impl Iterator<Item = &'a [u8]>,
+) -> Result<EncodedColumn, SegmentError> {
+    let mut payload = Vec::new();
+    let mut min: Option<&[u8]> = None;
+    let mut max: Option<&[u8]> = None;
+    for bytes in values {
+        let len = u32::try_from(bytes.len())
+            .map_err(|_| SegmentError::TooLarge("value length exceeds u32::MAX in one chunk"))?;
+        payload.extend_from_slice(&len.to_le_bytes());
+        payload.extend_from_slice(bytes);
+        min = Some(min.map_or(bytes, |m| if bytes < m { bytes } else { m }));
+        max = Some(max.map_or(bytes, |m| if bytes > m { bytes } else { m }));
+    }
+    Ok(EncodedColumn {
+        payload,
+        stat_min: min.map(bounded_min_prefix).unwrap_or_default(),
+        stat_max: max.map(bounded_max_prefix).unwrap_or_default(),
+    })
+}
+
+/// Encode an `i64` column: plain 8 LE bytes per value, plus the min/max as 8 LE
+/// bytes each. An empty column emits zero-length stat fields (the "no stats"
+/// sentinel).
+fn encode_i64_values(values: impl Iterator<Item = i64>) -> EncodedColumn {
+    let mut payload = Vec::new();
+    let mut min: Option<i64> = None;
+    let mut max: Option<i64> = None;
+    for v in values {
+        payload.extend_from_slice(&v.to_le_bytes());
+        min = Some(min.map_or(v, |m| m.min(v)));
+        max = Some(max.map_or(v, |m| m.max(v)));
+    }
+    EncodedColumn {
+        payload,
+        stat_min: min.map(|v| v.to_le_bytes().to_vec()).unwrap_or_default(),
+        stat_max: max.map(|v| v.to_le_bytes().to_vec()).unwrap_or_default(),
     }
 }
 
@@ -354,6 +447,14 @@ fn extract_bytes(col: ColumnId, row: &Version, valid_time: bool) -> Result<&[u8]
         | ColumnId::ValidTo => {
             unreachable!("not a bytes column")
         }
+        ColumnId::RetractKey
+        | ColumnId::RetractSysFrom
+        | ColumnId::RetractClosedAt
+        | ColumnId::RetractClosedByTxn
+        | ColumnId::RetractClosedByCommittedAt
+        | ColumnId::RetractClosedByPrincipal => {
+            unreachable!("retraction columns are encoded via encode_retraction_column")
+        }
     }
 }
 
@@ -375,6 +476,14 @@ fn extract_i64(col: ColumnId, row: &Version) -> i64 {
         }
         ColumnId::BusinessKey | ColumnId::Payload | ColumnId::Principal => {
             unreachable!("not an i64 column")
+        }
+        ColumnId::RetractKey
+        | ColumnId::RetractSysFrom
+        | ColumnId::RetractClosedAt
+        | ColumnId::RetractClosedByTxn
+        | ColumnId::RetractClosedByCommittedAt
+        | ColumnId::RetractClosedByPrincipal => {
+            unreachable!("retraction columns are encoded via encode_retraction_column")
         }
     }
 }
@@ -399,7 +508,11 @@ fn decode_valid_pairs(rows: &[Version]) -> Result<Vec<(i64, i64)>, SegmentError>
         .collect()
 }
 
-fn encode_footer(row_count: usize, chunks: &[EncodedChunk]) -> Result<Vec<u8>, SegmentError> {
+fn encode_footer(
+    row_count: usize,
+    chunks: &[EncodedChunk],
+    retraction_chunks: &[EncodedChunk],
+) -> Result<Vec<u8>, SegmentError> {
     let row_count = u32::try_from(row_count)
         .map_err(|_| SegmentError::TooLarge("row count exceeds u32::MAX in one row-group"))?;
     let column_count = u32::try_from(chunks.len())
@@ -411,23 +524,45 @@ fn encode_footer(row_count: usize, chunks: &[EncodedChunk]) -> Result<Vec<u8>, S
     out.extend_from_slice(&row_count.to_le_bytes());
     out.extend_from_slice(&column_count.to_le_bytes());
     for chunk in chunks {
-        out.extend_from_slice(&chunk.col.as_u16().to_le_bytes());
-        out.push(Codec::Plain as u8);
-        out.push(0u8); // reserved
-        out.extend_from_slice(&chunk.offset.to_le_bytes());
-        out.extend_from_slice(&chunk.length.to_le_bytes());
-        out.extend_from_slice(&chunk.value_count.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes()); // reserved
-        let min_len = u32::try_from(chunk.stat_min.len())
-            .map_err(|_| SegmentError::TooLarge("stat min length exceeds u32::MAX"))?;
-        out.extend_from_slice(&min_len.to_le_bytes());
-        out.extend_from_slice(&chunk.stat_min);
-        let max_len = u32::try_from(chunk.stat_max.len())
-            .map_err(|_| SegmentError::TooLarge("stat max length exceeds u32::MAX"))?;
-        out.extend_from_slice(&max_len.to_le_bytes());
-        out.extend_from_slice(&chunk.stat_max);
+        encode_chunk_meta(&mut out, chunk)?;
+    }
+    // Retraction section (format v7, STL-143): a count of tombstone rows (the
+    // shared value_count for every retraction column) followed by that many
+    // column-chunk metas. `0` columns when the segment holds no deletes — the
+    // section is always present, just empty, so a v7 reader parses it
+    // unconditionally.
+    let retraction_count = retraction_chunks.first().map_or(0, |c| c.value_count);
+    let retraction_column_count = u32::try_from(retraction_chunks.len())
+        .map_err(|_| SegmentError::TooLarge("retraction column count exceeds u32::MAX"))?;
+    out.extend_from_slice(&retraction_count.to_le_bytes());
+    out.extend_from_slice(&retraction_column_count.to_le_bytes());
+    for chunk in retraction_chunks {
+        encode_chunk_meta(&mut out, chunk)?;
     }
     Ok(out)
+}
+
+/// Append one column-chunk's footer entry: id, codec, reserved, absolute offset,
+/// length, value count, reserved, then the length-prefixed min/max zone stats.
+/// Shared by the version row-group and the retraction section so the two never
+/// drift in layout.
+fn encode_chunk_meta(out: &mut Vec<u8>, chunk: &EncodedChunk) -> Result<(), SegmentError> {
+    out.extend_from_slice(&chunk.col.as_u16().to_le_bytes());
+    out.push(Codec::Plain as u8);
+    out.push(0u8); // reserved
+    out.extend_from_slice(&chunk.offset.to_le_bytes());
+    out.extend_from_slice(&chunk.length.to_le_bytes());
+    out.extend_from_slice(&chunk.value_count.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    let min_len = u32::try_from(chunk.stat_min.len())
+        .map_err(|_| SegmentError::TooLarge("stat min length exceeds u32::MAX"))?;
+    out.extend_from_slice(&min_len.to_le_bytes());
+    out.extend_from_slice(&chunk.stat_min);
+    let max_len = u32::try_from(chunk.stat_max.len())
+        .map_err(|_| SegmentError::TooLarge("stat max length exceeds u32::MAX"))?;
+    out.extend_from_slice(&max_len.to_le_bytes());
+    out.extend_from_slice(&chunk.stat_max);
+    Ok(())
 }
 
 #[cfg(test)]
