@@ -136,6 +136,7 @@ fn version(key: &[u8], sys_from: i64, payload: &[u8]) -> Version {
     Version::open(
         BusinessKey::new(key.to_vec()),
         SystemTimeMicros(sys_from),
+        0,
         Provenance::new(
             TxnId(u64::try_from(sys_from).unwrap_or(0)),
             SystemTimeMicros(sys_from),
@@ -203,6 +204,28 @@ fn retractions_round_trip_alongside_versions() {
 
     assert_eq!(got_v.len(), 2, "versions round-trip unchanged");
     assert_eq!(got_r, retractions, "tombstones round-trip field-for-field");
+}
+
+/// The per-commit `seq` tiebreak is an always-on segment column (format v8,
+/// STL-141): a non-zero `seq` survives the columnar round-trip field-for-field,
+/// distinctly per row. `u64::MAX` exercises the lossless `u64`→`i64`-bits→`u64`
+/// reinterpretation the [`ColumnId::Seq`](stele_storage::segment) column uses,
+/// the same trick as the `txn_id` column.
+#[test]
+fn seq_round_trips_through_the_sealed_segment() {
+    let disk = MemDisk::new();
+    let mut a = version(b"k", 10, b"v0");
+    a.seq = 7;
+    let mut b = version(b"k", 20, b"v1");
+    b.seq = u64::MAX; // high bit set: round-trips through the i64 column intact
+    let (got, _) = round_trip(&disk, "seq.seg", &[a.clone(), b.clone()], &[]);
+    assert_eq!(got, vec![a, b], "versions round-trip including seq");
+    assert_eq!(got[0].seq, 7);
+    assert_eq!(
+        got[1].seq,
+        u64::MAX,
+        "full-width seq survives the i64 column"
+    );
 }
 
 /// A delete-only flush (no surviving versions in this segment) still produces a

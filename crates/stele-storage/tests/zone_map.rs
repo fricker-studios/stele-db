@@ -149,6 +149,7 @@ fn version(key: &[u8], sys_from: i64, payload: &[u8]) -> Version {
     Version::open(
         BusinessKey::new(key.to_vec()),
         SystemTimeMicros(sys_from),
+        0,
         Provenance::new(
             TxnId(u64::try_from(sys_from).unwrap_or(0)),
             SystemTimeMicros(sys_from),
@@ -453,6 +454,7 @@ fn valid_version(key: &[u8], valid_from: i64, valid_to: i64) -> Version {
     Version::open(
         BusinessKey::new(key.to_vec()),
         SystemTimeMicros(0),
+        0,
         Provenance::new(
             TxnId(1),
             SystemTimeMicros(0),

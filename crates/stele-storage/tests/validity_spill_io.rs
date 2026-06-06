@@ -159,6 +159,7 @@ fn open_version(key: &str, sys_from: i64) -> Version {
     Version::open(
         bk(key),
         SystemTimeMicros(sys_from),
+        0,
         Provenance::new(
             TxnId(1),
             SystemTimeMicros(sys_from),

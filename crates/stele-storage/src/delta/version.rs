@@ -5,6 +5,12 @@
 //!
 //! * `business_key` — the user/PK or hash key (opaque bytes).
 //! * `sys_from` — system-time at which this version became current.
+//! * `seq` — the per-commit monotonic sequence number ([ADR-0024]). It gives a
+//!   total order to writes that share the same µs `sys_from`, so same-tick
+//!   commits are deterministically ordered without mutating their timestamp. A
+//!   `u64` assigned by the transaction manager at commit ([STL-99]), carried
+//!   inline like provenance; v0.1 stamps it but the per-key chain does not yet
+//!   *order* on `(sys_from, seq)` — that is the follow-up ([STL-141] Part B).
 //! * `provenance` — the [`Provenance`] triple (`txn_id`, `committed_at`,
 //!   `principal`) captured at commit and stored inline on every version
 //!   ([architecture §12 invariant 5](../../../../docs/02-architecture.md#12-cross-cutting-architectural-invariants)).
@@ -51,8 +57,8 @@
 //! +------------------+----------------+------------------+
 //! | business_len:u32 | payload_len:u32| principal_len:u32|
 //! +------------------+----------------+------------------+
-//! | sys_from:i64 | txn_id:u64 | committed_at:i64 |
-//! +--------------+------------+------------------+
+//! | sys_from:i64 | txn_id:u64 | committed_at:i64 | seq:u64 |
+//! +--------------+------------+------------------+---------+
 //! | business_key bytes … | payload bytes … | principal bytes … |
 //! +----------------------+-----------------+-------------------+
 //! ```
@@ -69,8 +75,9 @@ use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
 use super::DeltaError;
 
 /// Fixed header size in bytes for the [`Version`] binary encoding: three `u32`
-/// lengths (12) + `sys_from`/`committed_at` `i64` (16) + `txn_id` `u64` (8).
-pub(crate) const HEADER_LEN: usize = 36;
+/// lengths (12) + `sys_from`/`committed_at` `i64` (16) + `txn_id` `u64` (8) +
+/// `seq` `u64` (8).
+pub(crate) const HEADER_LEN: usize = 44;
 
 /// Per-frame ceiling for a delta-tier `Version` (16 MiB).
 ///
@@ -121,6 +128,13 @@ pub struct Snapshot(pub SystemTimeMicros);
 pub struct Version {
     pub business_key: BusinessKey,
     pub sys_from: SystemTimeMicros,
+    /// Per-commit monotonic sequence number ([ADR-0024]) — the total-order
+    /// tiebreak for writes sharing the same µs `sys_from`. Assigned by the
+    /// transaction manager at commit ([STL-99]) and carried inline, **always
+    /// present** like provenance. Persisted on both the durable record (the
+    /// delta frame and the sealed segment), unlike the `sys_to` / `closed_by`
+    /// overlay below.
+    pub seq: u64,
     /// Resolution overlay: the system-time end of this version's period, or
     /// [`SYSTEM_TIME_OPEN`] when unresolved/open. **Never persisted** — sourced
     /// from the [validity index](crate::validity) at read time ([ADR-0023]).
@@ -143,12 +157,14 @@ impl Version {
     pub const fn open(
         business_key: BusinessKey,
         sys_from: SystemTimeMicros,
+        seq: u64,
         provenance: Provenance,
         payload: Vec<u8>,
     ) -> Self {
         Self {
             business_key,
             sys_from,
+            seq,
             sys_to: SYSTEM_TIME_OPEN,
             provenance,
             closed_by: None,
@@ -219,6 +235,7 @@ impl Version {
         out.extend_from_slice(&self.sys_from.0.to_le_bytes());
         out.extend_from_slice(&self.provenance.txn_id.0.to_le_bytes());
         out.extend_from_slice(&self.provenance.committed_at.0.to_le_bytes());
+        out.extend_from_slice(&self.seq.to_le_bytes());
         out.extend_from_slice(&self.business_key.0);
         out.extend_from_slice(&self.payload);
         out.extend_from_slice(&self.provenance.principal.0);
@@ -266,6 +283,7 @@ impl Version {
         let sys_from = rd_i64(12);
         let txn_id = rd_u64(20);
         let committed_at = rd_i64(28);
+        let seq = rd_u64(36);
         let total = HEADER_LEN
             .checked_add(business_len)
             .and_then(|v| v.checked_add(payload_len))
@@ -291,6 +309,7 @@ impl Version {
             Self::open(
                 business_key,
                 SystemTimeMicros(sys_from),
+                seq,
                 Provenance {
                     txn_id: TxnId(txn_id),
                     committed_at: SystemTimeMicros(committed_at),
@@ -308,9 +327,16 @@ mod tests {
     use super::*;
 
     fn v(key: &[u8], sys_from: i64, payload: &[u8]) -> Version {
+        // `seq` varies with `sys_from` so a non-zero, non-constant value rides
+        // through every round-trip — a codec that dropped or transposed the
+        // field would be caught, not masked by a zero default.
         Version::open(
             BusinessKey::new(key.to_vec()),
             SystemTimeMicros(sys_from),
+            u64::try_from(sys_from)
+                .unwrap_or(0)
+                .wrapping_mul(7)
+                .wrapping_add(1),
             // Provenance varies with sys_from so the round-trip exercises real
             // values in every field, not a constant the codec could mishandle.
             Provenance {
@@ -325,9 +351,11 @@ mod tests {
     #[test]
     fn encode_decode_round_trip() {
         let original = v(b"alex", 42, b"hello world");
+        assert_ne!(original.seq, 0, "fixture carries a non-zero seq");
         let bytes = original.encoded().expect("encode");
         let (parsed, consumed) = Version::decode(&bytes).expect("decode");
         assert_eq!(parsed, original);
+        assert_eq!(parsed.seq, original.seq, "seq survives the delta frame");
         assert_eq!(consumed, bytes.len());
         assert_eq!(parsed.encoded_size(), bytes.len());
     }
@@ -408,6 +436,7 @@ mod tests {
         let big = Version::open(
             BusinessKey::new(b"k".to_vec()),
             SystemTimeMicros(0),
+            1,
             Provenance {
                 txn_id: TxnId(1),
                 committed_at: SystemTimeMicros(0),

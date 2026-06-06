@@ -170,6 +170,10 @@ pub fn run_storage_seed(seed: u64) -> u64 {
                 .push(Version::open(
                     BusinessKey::new(key),
                     SystemTimeMicros(sys_from),
+                    // Derived from `sys_from`, not drawn from the seed stream, so
+                    // the seq column is exercised with varied values without
+                    // perturbing the deterministic rng sequence behind it.
+                    u64::try_from(sys_from).unwrap_or(0),
                     Provenance::new(
                         TxnId(txn_id),
                         SystemTimeMicros(sys_from),
@@ -269,6 +273,7 @@ pub fn run_validtime_seed(seed: u64) -> u64 {
                 key,
                 Some(interval),
                 payload,
+                0,
                 TxnId(txn_id),
                 Principal::new(principal),
             )
@@ -340,6 +345,7 @@ pub fn run_delete_seed(seed: u64) -> u64 {
                         &EmptySealed,
                         key,
                         payload,
+                        0,
                         txn,
                         principal,
                     )
@@ -355,6 +361,7 @@ pub fn run_delete_seed(seed: u64) -> u64 {
                     &EmptySealed,
                     key,
                     payload,
+                    0,
                     txn,
                     principal,
                 )
@@ -416,6 +423,7 @@ pub fn run_dml_seed(seed: u64) -> u64 {
                         key,
                         None,
                         payload,
+                        0,
                         txn,
                         principal,
                     )
@@ -432,6 +440,7 @@ pub fn run_dml_seed(seed: u64) -> u64 {
                     key,
                     None,
                     payload,
+                    0,
                     txn,
                     principal,
                 )
@@ -499,6 +508,7 @@ pub fn run_recovery_index_seed(seed: u64) -> u64 {
                         key,
                         None,
                         payload,
+                        0,
                         txn,
                         principal,
                     )
@@ -515,6 +525,7 @@ pub fn run_recovery_index_seed(seed: u64) -> u64 {
                     key,
                     None,
                     payload,
+                    0,
                     txn,
                     principal,
                 )
@@ -579,6 +590,7 @@ fn stage_committed_write(
         .insert(Version::open(
             key.clone(),
             commit,
+            0,
             Provenance::new(txn_id, commit, Principal::new(b"sim".to_vec())),
             format!("v@{}", commit.0).into_bytes(),
         ))

@@ -140,6 +140,7 @@ mod tests {
         Version::open(
             key(k),
             SystemTimeMicros(sys_from),
+            0,
             Provenance::new(
                 TxnId(txn),
                 SystemTimeMicros(sys_from),

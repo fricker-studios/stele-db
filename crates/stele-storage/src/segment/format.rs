@@ -86,10 +86,22 @@ pub(super) const TRAILER_MAGIC: [u8; 8] = *b"STLSEGFT";
 ///   segment cleanly at the header rather than choke on column id 8 in the
 ///   footer's new section.
 ///
-/// `seq` is intentionally *not* on the tombstone yet: a version-record `seq`
-/// (STL-141) has not landed, so there is nothing to carry. Adding it is a
-/// length-prefixed footer field that needs no `FORMAT_VERSION` bump.
-pub(super) const FORMAT_VERSION: u16 = 7;
+/// * **v8** — **adds the always-on per-commit `seq` column** ([`ColumnId::Seq`],
+///   id 14; STL-141, [ADR-0024](../../../../../docs/adr/0024-time-representation.md)).
+///   `seq` is the per-commit monotonic sequence number that totally orders writes
+///   sharing the same µs `sys_from` — carried inline on every version like
+///   provenance, so the sealed segment must persist it alongside `sys_from`. It
+///   joins the always-on version row-group ([`ColumnId::ALL`]); same
+///   backwards-incompatible reasoning as v2–v7: a v7 reader encountering column
+///   id 14 in the footer would fail with a confusing `Corrupt("unknown column
+///   id")` mid-footer, so the bump makes it reject the segment cleanly at the
+///   header instead. The v0.1 chain does not yet *order* on `(sys_from, seq)`
+///   (the column is carried, not yet load-bearing); that follow-up is STL-141
+///   Part B and needs no further format change. `seq` is still *not* on the
+///   retraction tombstone — ordering deletes by `seq` rides with Part B; adding
+///   it there is a length-prefixed footer field that needs no `FORMAT_VERSION`
+///   bump.
+pub(super) const FORMAT_VERSION: u16 = 8;
 
 /// Header size in bytes — magic (8) + version (2) + flags (2) + reserved (4).
 pub(super) const HEADER_LEN: usize = 16;
@@ -123,11 +135,12 @@ pub(super) const MAX_BYTES_STAT_PREFIX_LEN: usize = 64;
 
 /// Logical schema id stored in the footer.
 ///
-/// v0.1 has exactly one implicit schema — the six always-on `Version` columns
+/// v0.1 has exactly one implicit schema — the seven always-on `Version` columns
 /// (the three birth data/temporal fields `business_key` / `sys_from` / `payload`,
-/// and the three provenance columns of [`FORMAT_VERSION`] v2), optionally
-/// extended with the valid-time pair for a valid-time table (v3). There is no
-/// stored `sys_to` or close-provenance column (v6, [ADR-0023]). The id is
+/// the per-commit `seq` tiebreak of [`FORMAT_VERSION`] v8, and the three
+/// provenance columns of v2), optionally extended with the valid-time pair for a
+/// valid-time table (v3). There is no stored `sys_to` or close-provenance column
+/// (v6, [ADR-0023]). The id is
 /// hard-coded; once [STL-98] lands the versioned catalog this becomes a real
 /// schema reference resolved through the catalog at read time.
 pub(super) const SCHEMA_ID_IMPLICIT_VERSION: u32 = 0;
@@ -215,6 +228,12 @@ pub enum ColumnId {
     /// Retraction tombstone: the deleting principal (variable-length bytes) —
     /// `Close::closed_by.principal`. The "by whom" of delete provenance.
     RetractClosedByPrincipal = 13,
+    /// Per-commit monotonic sequence number (fixed 8 bytes, `u64` bits in the
+    /// `i64` column like [`Self::TxnId`]) — [`crate::delta::Version::seq`]. The
+    /// total-order tiebreak for versions sharing the same µs `sys_from`
+    /// ([ADR-0024], STL-141). Always-on, on every segment's version row-group
+    /// (format v8); never in the retraction section.
+    Seq = 14,
 }
 
 impl ColumnId {
@@ -227,17 +246,20 @@ impl ColumnId {
     /// The provenance columns ([`Self::TxnId`], [`Self::CommittedAt`],
     /// [`Self::Principal`]) sit after the birth data/temporal fields
     /// ([architecture §3.2](../../../../../docs/02-architecture.md#32-on-disk-segment-format)).
-    /// There is no stored `sys_to` or close-provenance column (v6, [ADR-0023]):
-    /// a segment carries only birth state.
+    /// The per-commit [`Self::Seq`] tiebreak (v8) sits next to `sys_from`, the
+    /// timestamp it disambiguates. There is no stored `sys_to` or
+    /// close-provenance column (v6, [ADR-0023]): a segment carries only birth
+    /// state.
     ///
     /// This is the **always-on** set, present on every segment. A valid-time
     /// table's segments additionally carry [`Self::ValidFrom`] /
     /// [`Self::ValidTo`]; use the crate-internal `schema` helper to get the full
     /// ordered set for a given valid-time policy rather than iterating `ALL`
     /// directly when the opt-in columns matter.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::BusinessKey,
         Self::SysFrom,
+        Self::Seq,
         Self::Payload,
         Self::TxnId,
         Self::CommittedAt,
@@ -248,9 +270,10 @@ impl ColumnId {
     /// set a *valid-time* table's segment carries, in writer/reader canonical
     /// order. Array position is just the write order, while the footer records
     /// each column's id, so the two never drift.
-    const ALL_WITH_VALID_TIME: [Self; 8] = [
+    const ALL_WITH_VALID_TIME: [Self; 9] = [
         Self::BusinessKey,
         Self::SysFrom,
+        Self::Seq,
         Self::Payload,
         Self::TxnId,
         Self::CommittedAt,
@@ -298,6 +321,7 @@ impl ColumnId {
             | Self::RetractKey
             | Self::RetractClosedByPrincipal => ColumnType::Bytes,
             Self::SysFrom
+            | Self::Seq
             | Self::TxnId
             | Self::CommittedAt
             | Self::ValidFrom
@@ -325,6 +349,7 @@ impl ColumnId {
             11 => Some(Self::RetractClosedByTxn),
             12 => Some(Self::RetractClosedByCommittedAt),
             13 => Some(Self::RetractClosedByPrincipal),
+            14 => Some(Self::Seq),
             _ => None,
         }
     }

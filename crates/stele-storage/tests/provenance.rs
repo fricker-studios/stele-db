@@ -167,6 +167,7 @@ fn every_persisted_version_carries_its_three_provenance_columns() {
                 &EmptySealed,
                 BusinessKey::new(key.clone()),
                 format!("balance={i}").into_bytes(),
+                0,
                 TxnId(i),
                 Principal::new(principal.clone()),
             )
@@ -240,6 +241,7 @@ fn provenance_columns_add_under_ten_percent_overhead() {
         rows.push(Version::open(
             BusinessKey::new(key),
             SystemTimeMicros(i64::try_from(i).unwrap() + 1),
+            0,
             Provenance::new(
                 TxnId(i / 64), // ~64 rows per transaction: a bulk-ingest batch
                 SystemTimeMicros(i64::try_from(i).unwrap() + 1),

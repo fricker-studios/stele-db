@@ -141,7 +141,9 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
         &self.wal
     }
 
-    /// `INSERT`: open a fresh `[commit, +∞)` period for `key`.
+    /// `INSERT`: open a fresh `[commit, +∞)` period for `key`. `seq` is the
+    /// per-commit total-order tiebreak ([ADR-0024], [STL-141]) stamped inline on
+    /// the new version, supplied by the transaction manager alongside `txn_id`.
     ///
     /// `sealed` is the table's sealed-segment lookup (typically a
     /// [`SealedSegments`](crate::systime::SealedSegments) built from the segment
@@ -164,17 +166,20 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
         key: BusinessKey,
         valid: Option<ValidInterval>,
         payload: Vec<u8>,
+        seq: u64,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<DmlOutcome, DmlError> {
-        let (commit, redos) = self
-            .writer
-            .stage_insert(delta, index, sealed, key, valid, payload, txn_id, principal)?;
+        let (commit, redos) = self.writer.stage_insert(
+            delta, index, sealed, key, valid, payload, seq, txn_id, principal,
+        )?;
         self.log_and_apply(delta, index, commit, redos)
     }
 
     /// `UPDATE`: close `key`'s prior period at `commit` and open a new
-    /// `[commit, +∞)` one. Never overwrites — both rows are appended.
+    /// `[commit, +∞)` one. Never overwrites — both rows are appended. `seq` is
+    /// the per-commit total-order tiebreak ([ADR-0024], [STL-141]) stamped on the
+    /// new open version.
     ///
     /// The prior period is resolved across the delta tier, the `sealed` segments,
     /// and the validity index, so an `UPDATE` closes a live version that lives
@@ -196,12 +201,13 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
         key: BusinessKey,
         valid: Option<ValidInterval>,
         payload: Vec<u8>,
+        seq: u64,
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<DmlOutcome, DmlError> {
-        let (commit, redos) = self
-            .writer
-            .stage_update(delta, index, sealed, key, valid, payload, txn_id, principal)?;
+        let (commit, redos) = self.writer.stage_update(
+            delta, index, sealed, key, valid, payload, seq, txn_id, principal,
+        )?;
         self.log_and_apply(delta, index, commit, redos)
     }
 
@@ -385,9 +391,12 @@ mod tests {
                 Principal::new(b"b".to_vec()),
             ),
         });
+        // A non-zero `seq` proves the per-commit tiebreak round-trips through the
+        // WAL redo frame (STL-141) — `decode_redo` must reconstruct it intact.
         let opened = Redo::Insert(Version::open(
             BusinessKey::new(b"k".to_vec()),
             SystemTimeMicros(20),
+            99,
             Provenance::new(
                 TxnId(2),
                 SystemTimeMicros(20),
@@ -437,6 +446,7 @@ mod tests {
         let redo = Redo::Insert(Version::open(
             BusinessKey::new(b"k".to_vec()),
             SystemTimeMicros(1),
+            0,
             Provenance::new(TxnId(1), SystemTimeMicros(1), Principal::new(b"a".to_vec())),
             b"value".to_vec(),
         ));

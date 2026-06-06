@@ -130,6 +130,7 @@ fn four_statement_identity_demo_resolves_the_pre_update_value_via_the_index() {
             &SealedVersions::default(),
             key.clone(),
             b"100".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -157,6 +158,7 @@ fn four_statement_identity_demo_resolves_the_pre_update_value_via_the_index() {
             &SealedVersions::new(sealed.clone()),
             key.clone(),
             b"250".to_vec(),
+            0,
             TxnId(2),
             who(),
         )
@@ -225,6 +227,7 @@ fn kill_mid_write_then_recover_serves_the_correct_as_of() {
             key.clone(),
             None,
             b"100".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -238,6 +241,7 @@ fn kill_mid_write_then_recover_serves_the_correct_as_of() {
             key.clone(),
             None,
             b"250".to_vec(),
+            0,
             TxnId(2),
             who(),
         )
@@ -392,6 +396,7 @@ fn recovery_rebuilds_the_index_and_serves_correct_as_of_under_seed_sweep() {
                             key,
                             None,
                             payload.clone(),
+                            0,
                             txn,
                             who(),
                         )
@@ -414,6 +419,7 @@ fn recovery_rebuilds_the_index_and_serves_correct_as_of_under_seed_sweep() {
                         key,
                         None,
                         payload.clone(),
+                        0,
                         txn,
                         who(),
                     )

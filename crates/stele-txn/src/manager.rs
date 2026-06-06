@@ -491,6 +491,7 @@ mod tests {
         Version::open(
             key.clone(),
             commit,
+            0,
             Provenance::new(txn_id, commit, Principal::new(b"tester".to_vec())),
             format!("v@{}", commit.0).into_bytes(),
         )

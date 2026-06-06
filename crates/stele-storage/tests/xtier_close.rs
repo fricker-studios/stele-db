@@ -165,6 +165,7 @@ fn update_across_a_flush_boundary_closes_the_sealed_version_via_the_index() {
             &SealedVersions::default(),
             key.clone(),
             b"balance=100".to_vec(),
+            0,
             TxnId(10),
             Principal::new(b"writer-a".to_vec()),
         )
@@ -184,6 +185,7 @@ fn update_across_a_flush_boundary_closes_the_sealed_version_via_the_index() {
             &lookup,
             key.clone(),
             b"balance=150".to_vec(),
+            0,
             TxnId(20),
             Principal::new(b"writer-b".to_vec()),
         )
@@ -275,6 +277,7 @@ fn delete_across_a_flush_boundary_closes_the_sealed_version_and_leaves_no_open()
             &SealedVersions::default(),
             key.clone(),
             b"v".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -344,6 +347,7 @@ fn insert_on_a_key_live_only_in_a_segment_is_rejected() {
             &SealedVersions::default(),
             key.clone(),
             b"a".to_vec(),
+            0,
             TxnId(1),
             who(),
         )
@@ -358,6 +362,7 @@ fn insert_on_a_key_live_only_in_a_segment_is_rejected() {
             &lookup,
             key,
             b"b".to_vec(),
+            0,
             TxnId(2),
             who(),
         )
@@ -500,13 +505,13 @@ fn chains_stay_non_overlapping_and_gap_free_across_flush_boundaries() {
                     live[k] = false;
                 } else {
                     writer
-                        .update(&mut delta, &mut index, &lookup, key, payload, txn, who())
+                        .update(&mut delta, &mut index, &lookup, key, payload, 0, txn, who())
                         .unwrap();
                     born[k].push(Born::Update);
                 }
             } else {
                 writer
-                    .insert(&mut delta, &mut index, &lookup, key, payload, txn, who())
+                    .insert(&mut delta, &mut index, &lookup, key, payload, 0, txn, who())
                     .unwrap();
                 live[k] = true;
                 born[k].push(Born::Insert);
@@ -691,6 +696,7 @@ fn engine_chain_is_differential_equal_to_the_oracle_across_flush_boundaries() {
                             &lookup,
                             key.clone(),
                             payload.clone(),
+                            0,
                             txn,
                             principal.clone(),
                         )
@@ -710,6 +716,7 @@ fn engine_chain_is_differential_equal_to_the_oracle_across_flush_boundaries() {
                         &lookup,
                         key.clone(),
                         payload.clone(),
+                        0,
                         txn,
                         principal.clone(),
                     )
