@@ -185,6 +185,53 @@ impl Close {
     }
 }
 
+/// A per-segment **upper bound** on the system-time *ends* of a set of versions,
+/// derived from the [`ValidityIndex`] ([`ValidityIndex::sys_upper_bound`]).
+///
+/// It answers the question a sealed segment's zone map cannot — the segment
+/// stores only `sys_from`, never `sys_to` (v6, [ADR-0023](super)) — namely
+/// *whether every row in a segment was already superseded at a snapshot*. That
+/// restores the upper-bound ("all rows already superseded") half of the
+/// system-time segment prune the zone map lost when `sys_to` left the record
+/// ([STL-139], the complement of `min(sys_from) > snapshot`).
+///
+/// The bound is **conservative on the open side**: a version with no
+/// materialized close is still *open* (its period end is `+∞`), so any open
+/// version anywhere in the set forces [`SysUpperBound::Unbounded`] and the set
+/// can never be pruned on this axis. Only when *every* version is closed is the
+/// bound the greatest materialized `sys_to` — the exact figure a stored
+/// `max(sys_to)` zone would once have given, now read from the derived index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SysUpperBound {
+    /// Every version in the set is closed; this is the greatest materialized
+    /// `sys_to` over them. A snapshot at or after it sees none of them. An empty
+    /// set is vacuously all-superseded and reports `Bounded(SystemTimeMicros::MIN)`,
+    /// so it prunes at every snapshot.
+    Bounded(SystemTimeMicros),
+    /// At least one version is still open (no materialized close), so the set's
+    /// period end is `+∞` — it can never be pruned on the upper bound.
+    Unbounded,
+}
+
+impl SysUpperBound {
+    /// Whether every version this bound summarizes was superseded **at or before**
+    /// `snapshot` — i.e. none can be visible at `snapshot` on the upper-bound side.
+    ///
+    /// `true` is the planner's licence to skip the segment: a closed period
+    /// `[sys_from, sys_to)` is invisible at `snapshot` once `sys_to <= snapshot`
+    /// (the end is exclusive), so a bound `max(sys_to) <= snapshot` proves no row
+    /// can be visible. [`SysUpperBound::Unbounded`] (an open version present) is
+    /// never superseded — it returns `false`, so the segment is conservatively
+    /// kept (never a false negative).
+    #[must_use]
+    pub fn superseded_at_or_before(self, snapshot: SystemTimeMicros) -> bool {
+        match self {
+            Self::Bounded(max_sys_to) => max_sys_to <= snapshot,
+            Self::Unbounded => false,
+        }
+    }
+}
+
 /// Tuning knobs for the validity index.
 #[derive(Debug, Clone, Copy)]
 pub struct ValidityConfig {
@@ -406,6 +453,43 @@ impl<D: Disk> ValidityIndex<D> {
             .map(|(sys_from, _)| *sys_from))
     }
 
+    /// The system-time **upper bound** over a set of versions named by
+    /// `(business_key, sys_from)` — the greatest materialized `sys_to`, or
+    /// [`SysUpperBound::Unbounded`] if any of them is still open.
+    ///
+    /// This is the validity index's half of the restored "all rows already
+    /// superseded" segment prune ([STL-139]): a planner hands it a sealed
+    /// segment's version identities (e.g. [`SegmentReader::version_keys`]) and,
+    /// when the result [`SysUpperBound::superseded_at_or_before`] the read
+    /// snapshot, skips the segment without materializing its bulk column chunks.
+    /// Soundness rests on the open-side conservatism — a version absent from the
+    /// index is *open*, so a single open version forces `Unbounded` and the
+    /// segment is kept (never a false negative).
+    ///
+    /// Short-circuits to `Unbounded` on the first open version. Resident entries
+    /// resolve from memory; a (rare) spilled entry costs the same per-lookup
+    /// spill scan as [`Self::close_of`], which this iterates.
+    ///
+    /// [`SegmentReader::version_keys`]: crate::segment::SegmentReader::version_keys
+    ///
+    /// # Errors
+    ///
+    /// [`ValidityError::Corrupt`] / [`ValidityError::Io`] loading a spill file.
+    pub fn sys_upper_bound<'a, I>(&self, versions: I) -> Result<SysUpperBound, ValidityError>
+    where
+        I: IntoIterator<Item = (&'a BusinessKey, SystemTimeMicros)>,
+    {
+        let mut max_sys_to = SystemTimeMicros(i64::MIN);
+        for (key, sys_from) in versions {
+            match self.close_of(key, sys_from)? {
+                Some(interval) => max_sys_to = max_sys_to.max(interval.sys_to),
+                // An open version's end is +∞: the set can never be pruned.
+                None => return Ok(SysUpperBound::Unbounded),
+            }
+        }
+        Ok(SysUpperBound::Bounded(max_sys_to))
+    }
+
     /// The full set of entries, resident + spilled, as one map. The canonical
     /// form for comparing two indexes for *exact* equality — the property the
     /// "rebuild-from-WAL reproduces the exact index" seed sweep asserts
@@ -624,5 +708,94 @@ mod tests {
         // A conflicting re-close of the *spilled* entry is still refused.
         let err = idx.insert_close(close(b"k", 0, 11, b"a")).unwrap_err();
         assert!(matches!(err, ValidityError::AlreadyClosed));
+    }
+
+    // --- sys_upper_bound (STL-139) ------------------------------------------
+
+    fn bk(key: &[u8]) -> BusinessKey {
+        BusinessKey::new(key.to_vec())
+    }
+
+    #[test]
+    fn upper_bound_of_all_closed_versions_is_the_greatest_sys_to() {
+        let mut idx = index();
+        idx.insert_close(close(b"a", 0, 100, b"x")).expect("c0");
+        idx.insert_close(close(b"a", 100, 250, b"x")).expect("c1");
+        idx.insert_close(close(b"b", 10, 200, b"x")).expect("c2");
+        let keys = [
+            (bk(b"a"), SystemTimeMicros(0)),
+            (bk(b"a"), SystemTimeMicros(100)),
+            (bk(b"b"), SystemTimeMicros(10)),
+        ];
+        let bound = idx
+            .sys_upper_bound(keys.iter().map(|(k, s)| (k, *s)))
+            .expect("bound");
+        assert_eq!(bound, SysUpperBound::Bounded(SystemTimeMicros(250)));
+    }
+
+    #[test]
+    fn a_single_open_version_forces_unbounded() {
+        let mut idx = index();
+        idx.insert_close(close(b"a", 0, 100, b"x")).expect("c0");
+        // (b, 10) has no close → it is open, so the whole set is unbounded even
+        // though `a` is closed.
+        let keys = [
+            (bk(b"a"), SystemTimeMicros(0)),
+            (bk(b"b"), SystemTimeMicros(10)),
+        ];
+        let bound = idx
+            .sys_upper_bound(keys.iter().map(|(k, s)| (k, *s)))
+            .expect("bound");
+        assert_eq!(bound, SysUpperBound::Unbounded);
+        assert!(
+            !bound.superseded_at_or_before(SystemTimeMicros(i64::MAX)),
+            "an open version is never superseded, at any snapshot",
+        );
+    }
+
+    #[test]
+    fn empty_set_is_vacuously_superseded() {
+        let idx = index();
+        let bound = idx
+            .sys_upper_bound(std::iter::empty::<(&BusinessKey, SystemTimeMicros)>())
+            .expect("bound");
+        assert_eq!(bound, SysUpperBound::Bounded(SystemTimeMicros(i64::MIN)));
+        assert!(bound.superseded_at_or_before(SystemTimeMicros(0)));
+    }
+
+    #[test]
+    fn superseded_boundary_is_inclusive() {
+        // max(sys_to) == snapshot: the period end is exclusive, so the row is
+        // already superseded *at* the snapshot and the segment prunes.
+        let mut idx = index();
+        idx.insert_close(close(b"a", 0, 100, b"x")).expect("c0");
+        let keys = [(bk(b"a"), SystemTimeMicros(0))];
+        let bound = idx
+            .sys_upper_bound(keys.iter().map(|(k, s)| (k, *s)))
+            .expect("bound");
+        assert!(bound.superseded_at_or_before(SystemTimeMicros(100)));
+        assert!(!bound.superseded_at_or_before(SystemTimeMicros(99)));
+    }
+
+    #[test]
+    fn upper_bound_resolves_spilled_closes() {
+        // Tiny threshold so the first close spills; the bound must still see it.
+        let mut idx = ValidityIndex::open(
+            MemDisk::new(),
+            ValidityConfig {
+                spill_threshold_bytes: 1,
+            },
+        )
+        .expect("open");
+        idx.insert_close(close(b"a", 0, 100, b"x")).expect("c0");
+        idx.insert_close(close(b"a", 100, 300, b"x")).expect("c1");
+        let keys = [
+            (bk(b"a"), SystemTimeMicros(0)),
+            (bk(b"a"), SystemTimeMicros(100)),
+        ];
+        let bound = idx
+            .sys_upper_bound(keys.iter().map(|(k, s)| (k, *s)))
+            .expect("bound");
+        assert_eq!(bound, SysUpperBound::Bounded(SystemTimeMicros(300)));
     }
 }

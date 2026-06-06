@@ -203,6 +203,33 @@ impl<F: DiskFile> SegmentReader<F> {
         }
     }
 
+    /// Project the segment's version identities — each row's
+    /// `(business_key, sys_from)` pair — in row order.
+    ///
+    /// The minimal read the validity-index segment prune needs: it touches only
+    /// the two narrow key columns ([`ColumnId::BusinessKey`] and
+    /// [`ColumnId::SysFrom`]), not the payload or provenance columns. A planner
+    /// feeds these to [`ValidityIndex::sys_upper_bound`](crate::validity::ValidityIndex::sys_upper_bound)
+    /// to derive the segment's system-time upper bound and skip the segment's
+    /// bulk columns entirely when every row is already superseded at the read
+    /// snapshot ([STL-139]).
+    pub fn version_keys(&self) -> Result<Vec<(BusinessKey, SystemTimeMicros)>, SegmentError> {
+        let mut business_keys = self.read_bytes_column(ColumnId::BusinessKey)?;
+        let sys_from = self.read_i64_column(ColumnId::SysFrom)?;
+        if business_keys.len() != sys_from.len() {
+            return Err(SegmentError::Corrupt(
+                "business_key / sys_from value counts disagree within row-group",
+            ));
+        }
+        // `mem::take` the owned key bytes out — the column vector is discarded at
+        // function end, so there is nothing to gain from cloning each key.
+        Ok(business_keys
+            .iter_mut()
+            .zip(sys_from)
+            .map(|(bk, sf)| (BusinessKey::new(std::mem::take(bk)), SystemTimeMicros(sf)))
+            .collect())
+    }
+
     /// Read every column and reassemble [`Version`]s in row order — the
     /// dual of [`super::writer::SegmentWriter::push`]. Useful for tests and
     /// for the compaction reader; query execution prefers the projected

@@ -32,10 +32,15 @@
 //!   none is visible yet; skip.
 //!
 //! The complementary "every row already superseded" prune (an upper bound on the
-//! period end) is the validity index's to provide — a follow-up; until then a
-//! segment whose rows have all been superseded is conservatively *kept* and the
-//! index-overlaid resolver filters it out at read time. Conservative, never a
-//! false negative.
+//! period end) is **not** the zone map's to give — the segment no longer stores
+//! `sys_to`. It is supplied by the validity index
+//! ([`ValidityIndex::sys_upper_bound`](crate::validity::ValidityIndex::sys_upper_bound),
+//! [STL-139]): the planner derives a per-segment `max(sys_to)` from the index and
+//! skips a segment all of whose rows are superseded at/before the snapshot, then
+//! composes that with the [`ZoneMap::might_contain`] decision below. A segment the
+//! zone map keeps but the index proves fully superseded is pruned there; one with
+//! any open version is kept and the index-overlaid resolver filters it out at
+//! read time. Conservative either way, never a false negative.
 //!
 //! Valid-time pruning rides the *same* generic machinery. A valid-time table's
 //! segment carries `valid_from` / `valid_to` as first-class `i64` columns,
@@ -152,7 +157,9 @@ impl ZoneMap {
     /// One-sided system-time visibility test. `false` means every row in the
     /// segment provably begins after the snapshot. The complementary "every row
     /// already superseded" prune needs the period end, which a segment no longer
-    /// stores (v6, [ADR-0023]) — that prune is the validity index's to provide.
+    /// stores (v6, [ADR-0023]) — that prune is the validity index's, via
+    /// [`ValidityIndex::sys_upper_bound`](crate::validity::ValidityIndex::sys_upper_bound)
+    /// ([STL-139]), which the planner composes with this test.
     fn snapshot_overlaps(&self, snapshot: Snapshot) -> bool {
         let s = snapshot.0;
         // If we know the minimum `sys_from` and it is already past the
