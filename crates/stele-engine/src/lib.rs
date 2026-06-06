@@ -17,11 +17,12 @@
 //!   [`NamespacedDisk`] view of the one configured backend.
 //!
 //! and exposes a single [`execute`](SessionEngine::execute) entry point the pgwire
-//! loop calls per parsed [`Statement`]: DDL and `SELECT` route by pattern-matching
-//! the bound statement. (`INSERT`/`UPDATE`/`DELETE` binding is [STL-149]; until it
-//! lands they reach the engine through the typed [`insert`](SessionEngine::insert)
-//! / [`update`](SessionEngine::update) / [`delete`](SessionEngine::delete)
-//! methods.)
+//! loop calls per parsed [`Statement`]: DDL, `SELECT`, and `INSERT`/`UPDATE`/
+//! `DELETE` all route by binding the statement ([STL-147] wired DML in through
+//! [`bind_dml`]). The typed
+//! [`insert`](SessionEngine::insert) / [`update`](SessionEngine::update) /
+//! [`delete`](SessionEngine::delete) methods remain the lower-level write path the
+//! DML router and in-process tests call.
 //!
 //! ## Runtime-agnostic
 //!
@@ -45,11 +46,12 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use stele_catalog::{Catalog, CatalogError};
 use stele_common::provenance::{Principal, TxnId};
 use stele_common::time::{Clock, SystemTimeMicros};
-use stele_common::types::LogicalType;
-use stele_exec::{Batch, ScanError, SnapshotScan};
+use stele_common::types::{LogicalType, ScalarValue};
+use stele_exec::{Batch, Column, ScanError, SnapshotScan};
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
+use stele_sql::dml::{BoundDml, DmlError};
 use stele_sql::select::SelectError;
-use stele_sql::{BindContext, BindError, Statement, bind_ddl, bind_select};
+use stele_sql::{BindContext, BindError, Statement, bind_ddl, bind_dml, bind_select};
 use stele_storage::backend::Disk;
 use stele_storage::delta::{BusinessKey, Snapshot};
 use stele_storage::dml::DmlOutcome;
@@ -180,8 +182,49 @@ pub enum StatementOutcome {
         /// The `CommandComplete` tag the wire client expects.
         tag: &'static str,
     },
-    /// A `SELECT` ran; carries the projected result batch.
-    Rows(Batch),
+    /// A `SELECT` ran; carries the projected, snapshot-resolved result.
+    Rows(SelectResult),
+    /// An `INSERT` / `UPDATE` / `DELETE` committed; carries the affected-row
+    /// count for the `CommandComplete` tag.
+    Dml(DmlSummary),
+}
+
+/// A `SELECT`'s result: the projected columns and one raw-bytes cell per column
+/// per row.
+///
+/// v0.1 projects the `(business key, payload)` pair (the identity-demo shape):
+/// the first column is the table's business key, the second its opaque payload.
+/// Each cell carries the value's canonical encoding
+/// ([`ScalarValue::encode`](stele_common::types::ScalarValue::encode)); the wire
+/// layer decodes it back to the column's [`LogicalType`] to render it
+/// ([STL-147]). The bytes are kept undecoded here so the engine stays agnostic of
+/// how a cell was written — a value staged through the typed
+/// [`insert`](SessionEngine::insert) path may carry an opaque payload that is not
+/// a `ScalarValue` encoding at all.
+///
+/// [STL-147]: https://allegromusic.atlassian.net/browse/STL-147
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectResult {
+    /// The projected columns, in output order: each a `(name, type)` pair.
+    pub columns: Vec<(String, LogicalType)>,
+    /// One entry per result row; each row holds one raw-bytes cell per column,
+    /// aligned to [`columns`](Self::columns).
+    pub rows: Vec<Vec<Vec<u8>>>,
+}
+
+/// The affected-row count of a committed `INSERT` / `UPDATE` / `DELETE`.
+///
+/// v0.1 DML writes a single row per statement, so the count is always `1` on
+/// success — but the variant is carried so the wire layer can render the right
+/// `CommandComplete` tag (`INSERT 0 n` / `UPDATE n` / `DELETE n`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmlSummary {
+    /// `INSERT` affected `n` rows.
+    Insert(u64),
+    /// `UPDATE` affected `n` rows.
+    Update(u64),
+    /// `DELETE` affected `n` rows.
+    Delete(u64),
 }
 
 /// A live table's shape at the current read snapshot, for catalog introspection.
@@ -210,6 +253,13 @@ pub enum EngineError {
     /// Binding a `SELECT` failed.
     #[error(transparent)]
     Select(#[from] SelectError),
+
+    /// Binding an `INSERT` / `UPDATE` / `DELETE` failed — an unsupported shape,
+    /// an unknown table/column, or a bad literal ([STL-149]).
+    ///
+    /// [STL-149]: https://allegromusic.atlassian.net/browse/STL-149
+    #[error(transparent)]
+    Dml(#[from] DmlError),
 
     /// Applying DDL to the catalog failed (name already live, non-monotonic
     /// time, …).
@@ -246,12 +296,9 @@ pub enum EngineError {
         table: String,
     },
 
-    /// A statement kind the session engine does not yet route. `INSERT` /
-    /// `UPDATE` / `DELETE` binding lands in [STL-149]; until then they reach the
-    /// engine through the typed write methods, not `execute`.
-    ///
-    /// [STL-149]: https://allegromusic.atlassian.net/browse/STL-149
-    #[error("statement not routable by the session engine yet: {0}")]
+    /// A statement kind the session engine does not route — it is neither DDL, a
+    /// `SELECT`, nor an `INSERT` / `UPDATE` / `DELETE`.
+    #[error("statement not routable by the session engine: {0}")]
     Unsupported(&'static str),
 }
 
@@ -280,6 +327,10 @@ pub struct SessionEngine<C: Clock + Clone, D: Disk + Clone> {
     /// tier is still resident keeps that slice on re-creation (the tier is reused,
     /// not reopened), so its history is never dropped.
     next_namespace: u64,
+    /// The next transaction id to stamp on a routed DML commit. v0.1 has no real
+    /// transaction manager yet ([STL-99]); a per-session monotonic counter gives
+    /// each `INSERT` / `UPDATE` / `DELETE` distinct provenance until one exists.
+    next_txn: u64,
 }
 
 impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
@@ -298,6 +349,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             disk,
             tables: BTreeMap::new(),
             next_namespace: 0,
+            next_txn: 1,
         }
     }
 
@@ -338,15 +390,19 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
 
     /// Execute one parsed [`Statement`] against the session.
     ///
-    /// Routes by binding: a `CREATE TABLE` / `DROP TABLE` applies to the catalog at
-    /// the commit clock's current instant (and, for `CREATE`, stands up the table's
-    /// tiers); a `SELECT` binds against the catalog at the read snapshot and runs a
-    /// [`SnapshotScan`] over the table's tiers. `INSERT` / `UPDATE` / `DELETE` are
-    /// not bound here yet ([`EngineError::Unsupported`]).
+    /// Routes by binding, in order: a `CREATE TABLE` / `DROP TABLE` applies to the
+    /// catalog at the commit clock's current instant (and, for `CREATE`, stands up
+    /// the table's tiers); a `SELECT` binds against the catalog at the read
+    /// snapshot and runs a [`SnapshotScan`] over the table's tiers; an `INSERT` /
+    /// `UPDATE` / `DELETE` binds through [`bind_dml`] and stages onto the table's
+    /// tiers ([STL-147]). Anything else is [`EngineError::Unsupported`].
+    ///
+    /// [STL-147]: https://allegromusic.atlassian.net/browse/STL-147
     ///
     /// # Errors
     ///
-    /// [`EngineError`] if binding, catalog application, or the scan fails.
+    /// [`EngineError`] if binding, catalog application, the scan, or the write
+    /// fails.
     pub fn execute(&mut self, stmt: &Statement) -> Result<StatementOutcome, EngineError> {
         // DDL first: `bind_ddl` cleanly rejects non-DDL with `NotDdl`, which we
         // treat as "try the next router".
@@ -356,20 +412,42 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             Err(e) => return Err(EngineError::Bind(e)),
         }
 
-        // SELECT next, bound against the current read snapshot.
+        // SELECT next, bound against the current read snapshot. The bind context
+        // borrows the catalog immutably; the read path is `&self`, so a hit can
+        // run before the borrow ends, but DML below needs `&mut self`, so the
+        // borrow is scoped and released first.
         let snapshot = self.clock.current();
-        let ctx = BindContext {
-            snapshot,
-            catalog: &self.catalog,
-        };
-        match bind_select(stmt, &ctx) {
-            Ok(bound) => self.run_select(&bound.table, bound.snapshot),
-            // Not a SELECT either ⇒ it is DML the session engine cannot route yet.
-            Err(SelectError::NotSelect) => Err(EngineError::Unsupported(
-                "INSERT/UPDATE/DELETE routing lands in STL-149/STL-147",
-            )),
-            Err(e) => Err(EngineError::Select(e)),
+        {
+            let ctx = BindContext {
+                snapshot,
+                catalog: &self.catalog,
+            };
+            match bind_select(stmt, &ctx) {
+                Ok(bound) => return self.run_select(&bound.table, bound.snapshot),
+                // Not a SELECT either ⇒ try the DML router below.
+                Err(SelectError::NotSelect) => {}
+                Err(e) => return Err(EngineError::Select(e)),
+            }
         }
+
+        // DML last. `bind_dml` resolves the table at the same snapshot and folds
+        // the key/payload literals; `NotDml` means this is none of the routes.
+        let bound = {
+            let ctx = BindContext {
+                snapshot,
+                catalog: &self.catalog,
+            };
+            match bind_dml(stmt, &ctx) {
+                Ok(dml) => dml,
+                Err(DmlError::NotDml) => {
+                    return Err(EngineError::Unsupported(
+                        "not a DDL, SELECT, or INSERT/UPDATE/DELETE statement",
+                    ));
+                }
+                Err(e) => return Err(EngineError::Dml(e)),
+            }
+        };
+        self.apply_dml(bound)
     }
 
     /// Apply a bound DDL statement, taking effect at the commit clock's next
@@ -435,11 +513,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     }
 
     /// Run a snapshot scan over `table`'s tiers at `snapshot`, projecting the
-    /// business key and payload.
+    /// business key and payload into a [`SelectResult`].
     ///
-    /// v0.1 projects the opaque `(business_key, payload)` pair — the identity-demo
-    /// shape — regardless of the SQL projection list; mapping arbitrary schema
-    /// columns is the row-codec work ([STL-105]/[STL-147]).
+    /// v0.1 projects the `(business_key, payload)` pair — the identity-demo shape —
+    /// regardless of the SQL projection list; mapping arbitrary schema columns is
+    /// the row-codec work ([STL-105]/[STL-147]). The two projected columns are
+    /// named and typed from the schema's first two columns (the business key, then
+    /// the payload), resolved at `snapshot` so an `AS OF` read describes itself
+    /// under the schema version live then.
     fn run_select(
         &self,
         table: &str,
@@ -449,6 +530,27 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .tables
             .get(table)
             .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
+        // Resolve the schema live at the read snapshot for the column names/types.
+        // `bind_select` already proved the table resolves here, so a `None` would
+        // be an internal contract break — surface it rather than panic.
+        let schema = self
+            .catalog
+            .resolve(table, snapshot)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
+        // Zip the schema's columns with the storage ids they map to (first column
+        // → business key, second → payload) so the projected arity always matches
+        // the header. A table with fewer than two columns projects only what it
+        // has, never a header that disagrees with the materialized cells.
+        let projection: Vec<(ColumnId, (String, LogicalType))> = schema
+            .columns()
+            .iter()
+            .zip([ColumnId::BusinessKey, ColumnId::Payload])
+            .map(|(c, id)| (id, (c.name().to_owned(), c.ty())))
+            .collect();
+        let column_ids: Vec<ColumnId> = projection.iter().map(|(id, _)| *id).collect();
+        let columns: Vec<(String, LogicalType)> =
+            projection.into_iter().map(|(_, col)| col).collect();
+
         let readers = state.engine.open_segment_readers()?;
         let out = SnapshotScan::new(
             state.engine.delta(),
@@ -456,9 +558,65 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             &readers,
             Snapshot(snapshot),
         )
-        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .project(column_ids.clone())
         .execute()?;
-        Ok(StatementOutcome::Rows(out.batch))
+
+        let rows = batch_to_rows(&out.batch, &column_ids);
+        Ok(StatementOutcome::Rows(SelectResult { columns, rows }))
+    }
+
+    /// Apply a bound DML statement to the table's tiers, stamping fresh
+    /// provenance, and report the affected-row count.
+    ///
+    /// The key and payload [`ScalarValue`]s are encoded to bytes with
+    /// [`ScalarValue::encode`] — the inverse of the decode the wire layer applies
+    /// when it reads them back, so an `INSERT`ed value round-trips through a later
+    /// `SELECT`. `seq` is `0`: the commit clock hands each write a distinct
+    /// `sys_from`, so the per-commit tiebreak never decides between two versions.
+    fn apply_dml(&mut self, dml: BoundDml) -> Result<StatementOutcome, EngineError> {
+        let txn_id = TxnId(self.next_txn);
+        self.next_txn += 1;
+        let principal = Principal::new(WIRE_PRINCIPAL.to_vec());
+        match dml {
+            BoundDml::Insert {
+                table,
+                key,
+                payload,
+                ..
+            } => {
+                self.insert(
+                    &table,
+                    business_key(&key),
+                    None,
+                    encode_value(&payload),
+                    0,
+                    txn_id,
+                    principal,
+                )?;
+                Ok(StatementOutcome::Dml(DmlSummary::Insert(1)))
+            }
+            BoundDml::Update {
+                table,
+                key,
+                payload,
+                ..
+            } => {
+                self.update(
+                    &table,
+                    business_key(&key),
+                    None,
+                    encode_value(&payload),
+                    0,
+                    txn_id,
+                    principal,
+                )?;
+                Ok(StatementOutcome::Dml(DmlSummary::Update(1)))
+            }
+            BoundDml::Delete { table, key, .. } => {
+                self.delete(&table, &business_key(&key), txn_id, principal)?;
+                Ok(StatementOutcome::Dml(DmlSummary::Delete(1)))
+            }
+        }
     }
 
     /// `INSERT` `key` into `table` through its WAL → delta path.
@@ -543,11 +701,55 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     }
 }
 
+/// The provenance principal stamped on writes routed through the session engine.
+///
+/// v0.1 has no authentication ([ADR-0003] defers SCRAM/TLS to v0.3), so every
+/// routed DML commit shares this fixed principal until a connection carries a real
+/// identity. Provenance is still captured inline at commit, per the architectural
+/// invariant — only the identity is a placeholder.
+const WIRE_PRINCIPAL: &[u8] = b"stele";
+
+/// Encode a [`ScalarValue`] to its canonical, type-erased byte form.
+fn encode_value(value: &ScalarValue) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    value.encode(&mut bytes);
+    bytes
+}
+
+/// The business key for a folded key [`ScalarValue`] — its canonical encoding, the
+/// same bytes a later `UPDATE` / `DELETE` / `SELECT` folds the literal to, so the
+/// key matches across operations.
+fn business_key(value: &ScalarValue) -> BusinessKey {
+    BusinessKey::new(encode_value(value))
+}
+
+/// Materialize a scan [`Batch`] into row-major raw-bytes cells, in `projection`
+/// order.
+///
+/// Both projected columns ([`ColumnId::BusinessKey`] and [`ColumnId::Payload`])
+/// are bytes columns; a non-bytes or absent column contributes an empty cell
+/// rather than panicking, but the v0.1 projection never produces one.
+fn batch_to_rows(batch: &Batch, projection: &[ColumnId]) -> Vec<Vec<Vec<u8>>> {
+    let lookup = |id: ColumnId| -> Option<&Vec<Vec<u8>>> {
+        batch.columns.iter().find_map(|(cid, col)| match col {
+            Column::Bytes(v) if *cid == id => Some(v),
+            _ => None,
+        })
+    };
+    let cols: Vec<Option<&Vec<Vec<u8>>>> = projection.iter().map(|id| lookup(*id)).collect();
+    (0..batch.rows)
+        .map(|r| {
+            cols.iter()
+                .map(|col| col.and_then(|c| c.get(r)).cloned().unwrap_or_default())
+                .collect()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use stele_exec::Column;
     use stele_storage::backend::MemDisk;
 
     /// A constant inner clock; [`MonotonicClock`] turns its readings into the
@@ -605,17 +807,24 @@ mod tests {
         // (3) SELECT — reads the just-inserted row back, proving the tiers the
         // CREATE stood up are the same ones the INSERT wrote and the SELECT reads:
         // state persists across statements on the one session.
-        let StatementOutcome::Rows(batch) = engine
+        let StatementOutcome::Rows(result) = engine
             .execute(&parse_one("SELECT id, balance FROM account"))
             .expect("select")
         else {
             panic!("SELECT must return rows");
         };
-        assert_eq!(batch.rows, 1, "exactly the one inserted row");
-        let payload = payload_column(&batch);
+        assert_eq!(result.rows.len(), 1, "exactly the one inserted row");
         assert_eq!(
-            payload,
-            &[b"100".to_vec()],
+            result.columns,
+            vec![
+                ("id".to_owned(), LogicalType::Int4),
+                ("balance".to_owned(), LogicalType::Int4),
+            ],
+            "the projection names the key and payload columns"
+        );
+        assert_eq!(
+            payload_column(&result),
+            vec![b"100".to_vec()],
             "the inserted balance reads back"
         );
     }
@@ -625,13 +834,56 @@ mod tests {
         let mut engine = session();
         engine.execute(&parse_one(CREATE)).expect("create");
 
-        let StatementOutcome::Rows(batch) = engine
+        let StatementOutcome::Rows(result) = engine
             .execute(&parse_one("SELECT id FROM account"))
             .expect("select")
         else {
             panic!("SELECT must return rows");
         };
-        assert_eq!(batch.rows, 0, "no rows yet, but the table resolves");
+        assert_eq!(result.rows.len(), 0, "no rows yet, but the table resolves");
+    }
+
+    #[test]
+    fn select_on_a_single_column_table_keeps_header_and_cells_aligned() {
+        // A one-column table projects only the business key, so the header and the
+        // materialized cells stay the same width — no silent truncation/mislabel
+        // from a fixed two-column projection over a narrower schema.
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE solo (id INT PRIMARY KEY) WITH SYSTEM VERSIONING",
+            ))
+            .expect("create single-column table");
+        engine
+            .insert(
+                "solo",
+                BusinessKey::new(b"1".to_vec()),
+                None,
+                Vec::new(),
+                0,
+                TxnId(1),
+                Principal::new(b"demo".to_vec()),
+            )
+            .expect("insert");
+
+        let StatementOutcome::Rows(result) = engine
+            .execute(&parse_one("SELECT id FROM solo"))
+            .expect("select")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            result.columns,
+            vec![("id".to_owned(), LogicalType::Int4)],
+            "only the key column is projected"
+        );
+        assert!(
+            result
+                .rows
+                .iter()
+                .all(|row| row.len() == result.columns.len()),
+            "every row has exactly one cell, matching the header"
+        );
     }
 
     #[test]
@@ -831,12 +1083,86 @@ mod tests {
     }
 
     #[test]
-    fn dml_through_execute_is_unsupported_for_now() {
+    fn insert_update_delete_route_through_execute() {
         let mut engine = session();
         engine.execute(&parse_one(CREATE)).expect("create");
-        let err = engine
+
+        // INSERT routes through `execute` (bind_dml → typed insert) and reports a
+        // single affected row.
+        let inserted = engine
             .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
-            .unwrap_err();
+            .expect("insert");
+        assert_eq!(inserted, StatementOutcome::Dml(DmlSummary::Insert(1)));
+
+        // The inserted value reads back, decoded from the canonical encoding the
+        // DML path wrote (int4 100 → little-endian bytes).
+        let read = |engine: &mut SessionEngine<ZeroClock, MemDisk>| {
+            let StatementOutcome::Rows(result) = engine
+                .execute(&parse_one("SELECT balance FROM account"))
+                .expect("select")
+            else {
+                panic!("rows");
+            };
+            payload_column(&result)
+        };
+        assert_eq!(
+            read(&mut engine),
+            vec![encode_value(&ScalarValue::Int4(100))]
+        );
+
+        // UPDATE then DELETE likewise route and tag their row counts.
+        let updated = engine
+            .execute(&parse_one("UPDATE account SET balance = 250 WHERE id = 1"))
+            .expect("update");
+        assert_eq!(updated, StatementOutcome::Dml(DmlSummary::Update(1)));
+        assert_eq!(
+            read(&mut engine),
+            vec![encode_value(&ScalarValue::Int4(250))]
+        );
+
+        let deleted = engine
+            .execute(&parse_one("DELETE FROM account WHERE id = 1"))
+            .expect("delete");
+        assert_eq!(deleted, StatementOutcome::Dml(DmlSummary::Delete(1)));
+        assert!(read(&mut engine).is_empty(), "the row is gone after DELETE");
+    }
+
+    #[test]
+    fn execute_as_of_reads_the_pre_update_value() {
+        // The identity demo's heart, deterministically: with the synthetic clock
+        // CREATE/INSERT/UPDATE land at sys_from 1/2/3, so an `AS OF 2` read sees
+        // the inserted value, not the updated one. The temporal correctness is
+        // bind_select's (STL-101) and SnapshotScan's (STL-100); this only proves
+        // execute routes an AS OF SELECT to them.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create"); // sys_from 1
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert"); // sys_from 2
+        engine
+            .execute(&parse_one("UPDATE account SET balance = 250 WHERE id = 1"))
+            .expect("update"); // sys_from 3
+
+        let StatementOutcome::Rows(result) = engine
+            .execute(&parse_one(
+                "SELECT balance FROM account FOR SYSTEM_TIME AS OF 2",
+            ))
+            .expect("as-of select")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            payload_column(&result),
+            vec![encode_value(&ScalarValue::Int4(100))],
+            "AS OF 2 reads the pre-update balance"
+        );
+    }
+
+    #[test]
+    fn non_routable_statement_is_unsupported() {
+        let mut engine = session();
+        // A statement that is neither DDL, SELECT, nor INSERT/UPDATE/DELETE.
+        let err = engine.execute(&parse_one("TRUNCATE account")).unwrap_err();
         assert!(matches!(err, EngineError::Unsupported(_)), "got {err:?}");
     }
 
@@ -896,15 +1222,9 @@ mod tests {
         assert_eq!(live[0].name, "ledger");
     }
 
-    fn payload_column(batch: &Batch) -> &[Vec<u8>] {
-        let (_, col) = batch
-            .columns
-            .iter()
-            .find(|(id, _)| *id == ColumnId::Payload)
-            .expect("payload column projected");
-        match col {
-            Column::Bytes(v) => v,
-            Column::I64(_) => panic!("payload is a bytes column"),
-        }
+    /// The payload cell of every row in a `(key, payload)` [`SelectResult`] — the
+    /// second projected column.
+    fn payload_column(result: &SelectResult) -> Vec<Vec<u8>> {
+        result.rows.iter().map(|row| row[1].clone()).collect()
     }
 }
