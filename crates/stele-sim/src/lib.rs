@@ -600,6 +600,9 @@ pub fn run_mvcc_seed(seed: u64) -> u64 {
                 Ok(committed) => {
                     digest = fnv1a(digest, &[1]);
                     digest = fnv1a(digest, &committed.commit_ts.0.to_le_bytes());
+                    // Fold the per-commit `seq` (ADR-0024) so the seed sweep
+                    // regresses on its deterministic, total-order assignment too.
+                    digest = fnv1a(digest, &committed.seq.to_le_bytes());
                     stage_committed_write(
                         &mut delta,
                         &mut index,
@@ -636,6 +639,9 @@ pub fn run_mvcc_seed(seed: u64) -> u64 {
             None => digest = fnv1a(digest, &[0]),
         }
     }
+    // Fold the final head of the hash-chained commit log (ADR-0026): the seed
+    // sweep now also regresses on the chain being byte-identical across runs.
+    digest = fnv1a(digest, mgr.commit_head().as_bytes());
     digest
 }
 

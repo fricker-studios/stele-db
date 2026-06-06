@@ -47,6 +47,20 @@
 //! [`TxnError::Conflict`], the clean retry signal. The first to commit wins; the
 //! loser re-runs against a fresh snapshot.
 //!
+//! ## The commit log — sequence numbers and a hash chain
+//!
+//! Every accepted commit appends one [`CommitRecord`] carrying two facts beyond
+//! the transaction id and timestamp: a per-commit monotonic `seq`
+//! ([ADR-0024](https://allegromusic.atlassian.net/browse/STL-137)) that totally
+//! orders commits independent of the µs `commit_ts` — the tiebreak for same-tick
+//! writes — and the [SHA-256](stele_common::hash) of the prior record, so the log
+//! is a hash chain anchored at [`Digest::ZERO`]
+//! ([ADR-0026](https://allegromusic.atlassian.net/browse/STL-137)). The manager
+//! holds the running head ([`commit_head`](TxnManager::commit_head)); a
+//! [`verify_chain`](crate::chain::verify_chain) pass over the WAL detects any
+//! tampered historical record. `seq` and the head advance only on a *durable*
+//! commit, so they count committed transactions, never aborted or read-only ones.
+//!
 //! ## Scope at v0.1
 //!
 //! A v0.1 transaction is **single-statement** ([STL-99] scope): begin, declare
@@ -82,6 +96,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
+use stele_common::hash::Digest;
 use stele_common::provenance::TxnId;
 use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros};
 use stele_storage::delta::{BusinessKey, Snapshot};
@@ -170,6 +185,15 @@ pub struct Committed {
     /// The assigned commit timestamp — strictly greater than the snapshot of any
     /// transaction still outstanding when this commit landed.
     pub commit_ts: SystemTimeMicros,
+    /// The per-commit monotonic sequence number ([ADR-0024]). It totally orders
+    /// commits independent of `commit_ts`, so two commits in the same µs tick are
+    /// still deterministically ordered — and is the tiebreak the version record
+    /// will carry ([STL-141]). Distinct from `txn_id`: only *committed*
+    /// transactions consume a `seq`.
+    ///
+    /// [ADR-0024]: https://allegromusic.atlassian.net/browse/STL-137
+    /// [STL-141]: https://allegromusic.atlassian.net/browse/STL-141
+    pub seq: u64,
 }
 
 /// State guarded by the manager's mutex. Kept tiny on purpose: a monotonic
@@ -182,6 +206,18 @@ struct State {
     cursor: SystemTimeMicros,
     /// The next transaction id to allocate — monotonic.
     next_txn: u64,
+    /// The next per-commit sequence number to allocate ([ADR-0024]). Bumped only
+    /// on a successful commit, so it counts commits, not begins — the total-order
+    /// tiebreak for same-µs writes.
+    ///
+    /// [ADR-0024]: https://allegromusic.atlassian.net/browse/STL-137
+    next_seq: u64,
+    /// The running head of the hash-chained commit log ([ADR-0026]): the hash of
+    /// the most recently committed record, carried as the next record's
+    /// `prev_hash`. [`Digest::ZERO`] before the first commit (genesis).
+    ///
+    /// [ADR-0026]: https://allegromusic.atlassian.net/browse/STL-137
+    commit_head: Digest,
     /// Per business key, the commit timestamp of its most recent committer. A
     /// committing transaction conflicts iff one of its keys appears here with a
     /// timestamp newer than its snapshot.
@@ -227,6 +263,9 @@ impl<C: Clock, D: Disk> TxnManager<C, D> {
                 // below the starting cursor.
                 cursor: SystemTimeMicros(0),
                 next_txn: 1,
+                // First commit is seq 1; the chain starts at the genesis link.
+                next_seq: 1,
+                commit_head: Digest::ZERO,
                 write_index: BTreeMap::new(),
             }),
         }
@@ -334,25 +373,40 @@ impl<C: Clock, D: Disk> TxnManager<C, D> {
             return Err(TxnError::TimeExhausted);
         }
 
-        // Durability first: append + fsync the commit record before any in-memory
-        // state moves, so a WAL failure leaves the manager exactly as it was and
-        // the transaction is cleanly retryable.
+        // Allocate this commit's sequence number and chain its record to the
+        // prior one: `prev_hash` is the running head, so the durable log is a
+        // hash chain anchored at genesis ([ADR-0026], [ADR-0024]).
+        let seq = st.next_seq;
         let record = CommitRecord {
             txn_id: txn.txn_id,
             commit_ts,
+            seq,
+            prev_hash: st.commit_head,
         };
+
+        // Durability first: append + fsync the commit record before any in-memory
+        // state moves, so a WAL failure leaves the manager exactly as it was and
+        // the transaction is cleanly retryable.
         self.wal.append(&record.encode())?;
         self.wal.tick()?;
 
-        // Now publish: advance the cursor and record this transaction's writes as
-        // the newest committers of their keys. The write set is moved out of the
-        // (consumed) transaction — no clone needed.
+        // Now publish: advance the cursor, the sequence counter, and the chain
+        // head, and record this transaction's writes as the newest committers of
+        // their keys. The write set is moved out of the (consumed) transaction —
+        // no clone needed. `next_seq`/`commit_head` advance only here, so they
+        // count durable commits, never aborted or read-only transactions.
         let txn_id = txn.txn_id;
         st.cursor = commit_ts;
+        st.next_seq += 1;
+        st.commit_head = record.hash();
         for key in txn.writes {
             st.write_index.insert(key, commit_ts);
         }
-        Ok(Committed { txn_id, commit_ts })
+        Ok(Committed {
+            txn_id,
+            commit_ts,
+            seq,
+        })
     }
 
     /// The current commit cursor — the highest snapshot or commit timestamp the
@@ -363,6 +417,24 @@ impl<C: Clock, D: Disk> TxnManager<C, D> {
             .lock()
             .expect("txn manager mutex poisoned")
             .cursor
+    }
+
+    /// The current head of the hash-chained commit log ([ADR-0026]) — the hash
+    /// of the most recently committed record, or [`Digest::ZERO`] if nothing has
+    /// committed yet.
+    ///
+    /// This is the anchor a tamper check verifies against: durably remember it
+    /// (a checkpoint/witness — the seed of the Merkle proofs in ~v0.5) and pass
+    /// it to [`verify_chain_to`](crate::chain::verify_chain_to) to detect even a
+    /// wholesale rewrite of the log, which the bare chain walk cannot catch.
+    ///
+    /// [ADR-0026]: https://allegromusic.atlassian.net/browse/STL-137
+    #[must_use]
+    pub fn commit_head(&self) -> Digest {
+        self.state
+            .lock()
+            .expect("txn manager mutex poisoned")
+            .commit_head
     }
 }
 
@@ -605,6 +677,119 @@ mod tests {
         let decoded = CommitRecord::decode(&records[0]).expect("decode commit record");
         assert_eq!(decoded.txn_id, committed.txn_id);
         assert_eq!(decoded.commit_ts, committed.commit_ts);
+        assert_eq!(decoded.seq, committed.seq);
+        // The first record chains from genesis; the manager's head is its hash.
+        assert_eq!(decoded.prev_hash, Digest::ZERO);
+        assert_eq!(mgr.commit_head(), decoded.hash());
+    }
+
+    /// `seq` is a per-commit counter, dense and monotonic, and — unlike the
+    /// force-bumped `commit_ts` — it does not ride on the clock. Even with a
+    /// frozen clock the seq strictly increases, giving a total order independent
+    /// of the µs timestamp ([ADR-0024]). Only *committed* transactions consume a
+    /// seq: a begin that never commits does not.
+    #[test]
+    fn seq_is_dense_monotonic_over_commits_only() {
+        let mgr = manager(StubClock::new(100));
+
+        // A begin that never commits burns a txn_id but no seq.
+        let _abandoned = mgr.begin();
+
+        let mut a = mgr.begin();
+        a.write(BusinessKey::new(b"k1".to_vec()));
+        let ca = mgr.commit(a).expect("commit a");
+
+        let mut b = mgr.begin();
+        b.write(BusinessKey::new(b"k2".to_vec()));
+        let cb = mgr.commit(b).expect("commit b");
+
+        // First two commits get seq 1 and 2 regardless of the abandoned begin.
+        assert_eq!(ca.seq, 1);
+        assert_eq!(cb.seq, 2);
+        assert!(cb.seq > ca.seq, "seq strictly increases across commits");
+    }
+
+    /// The DoD's reproducibility guarantee: replaying the same sequence of
+    /// operations yields byte-identical commit logs — identical `seq` assignment
+    /// and an identical hash-chain head — across independent runs.
+    #[test]
+    fn the_commit_log_is_deterministic_across_runs() {
+        fn run() -> (Vec<u64>, Digest, Vec<Vec<u8>>) {
+            let disk = MemDisk::new();
+            let wal = Wal::open(disk.clone(), WalConfig::default()).expect("open wal");
+            let mgr = TxnManager::new(StubClock::new(500), wal);
+            let mut seqs = Vec::new();
+            for i in 0..6 {
+                let mut t = mgr.begin();
+                t.write(BusinessKey::new(format!("key-{}", i % 3).into_bytes()));
+                // Conflicts are possible across the same key; tolerate the clean
+                // retry signal deterministically by re-begin on the next key.
+                if let Ok(c) = mgr.commit(t) {
+                    seqs.push(c.seq);
+                }
+            }
+            let frames: Vec<Vec<u8>> = Wal::open(disk, WalConfig::default())
+                .expect("reopen")
+                .replay_from(Checkpoint::BEGIN)
+                .map(|r| r.expect("record"))
+                .collect();
+            (seqs, mgr.commit_head(), frames)
+        }
+
+        let (seqs1, head1, frames1) = run();
+        let (seqs2, head2, frames2) = run();
+        assert_eq!(seqs1, seqs2, "seq assignment is deterministic");
+        assert_eq!(head1, head2, "the chain head is deterministic");
+        assert_eq!(frames1, frames2, "the commit log is byte-identical");
+    }
+
+    /// The DoD's tamper guarantee: a clean commit log verifies, and altering any
+    /// historical WAL record is caught by the chain-verify pass. Exercised over
+    /// the *real* WAL the manager wrote, not hand-built frames.
+    #[test]
+    fn clean_log_verifies_and_tampering_is_detected() {
+        use crate::chain::{ChainError, verify_chain, verify_chain_to};
+
+        let disk = MemDisk::new();
+        let wal = Wal::open(disk.clone(), WalConfig::default()).expect("open wal");
+        let mgr = TxnManager::new(StubClock::new(10), wal);
+        for i in 0..4 {
+            let mut t = mgr.begin();
+            t.write(BusinessKey::new(format!("k{i}").into_bytes()));
+            mgr.commit(t).expect("commit");
+        }
+        let head = mgr.commit_head();
+
+        // A clean log verifies, and its head matches the manager's anchor.
+        let reopen = || Wal::open(disk.clone(), WalConfig::default()).expect("reopen wal");
+        let verified = verify_chain(reopen().replay_from(Checkpoint::BEGIN)).expect("clean verify");
+        assert_eq!(verified.len, 4);
+        assert_eq!(verified.head, head);
+        verify_chain_to(reopen().replay_from(Checkpoint::BEGIN), head).expect("anchored verify");
+
+        // Tamper with record 1 in place on the backing store, then re-verify.
+        let frames: Vec<Vec<u8>> = reopen()
+            .replay_from(Checkpoint::BEGIN)
+            .map(|r| r.unwrap())
+            .collect();
+        let mut forged = CommitRecord::decode(&frames[1]).unwrap();
+        forged.commit_ts = SystemTimeMicros(forged.commit_ts.0 + 1); // rewrite history
+        let tampered: Vec<Result<Vec<u8>, _>> = frames
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                Ok(if i == 1 {
+                    forged.encode().to_vec()
+                } else {
+                    f.clone()
+                })
+            })
+            .collect();
+        let err = verify_chain(tampered).expect_err("tampered log must fail");
+        match err {
+            ChainError::BrokenLink { index, .. } => assert_eq!(index, 2),
+            other => panic!("expected a broken link, got {other:?}"),
+        }
     }
 
     /// `begin` hands out monotonically increasing transaction ids.

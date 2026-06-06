@@ -24,8 +24,10 @@
 //! The mechanism and its correctness argument live in [`manager`]; the durable
 //! commit marker in [`commit_record`].
 
+pub mod chain;
 pub mod commit_record;
 pub mod manager;
 
+pub use chain::{ChainError, ChainHead, verify_chain, verify_chain_to};
 pub use commit_record::{CommitRecord, CommitRecordError};
 pub use manager::{Committed, Transaction, TxnError, TxnManager};
