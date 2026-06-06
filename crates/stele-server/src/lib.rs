@@ -183,7 +183,8 @@ fn dev_scratch_dir() -> PathBuf {
 /// The environment variable that selects the log output format.
 const LOG_FORMAT_ENV: &str = "STELE_LOG_FORMAT";
 
-/// The verbosity filter applied when [`RUST_LOG`](EnvFilter::try_from_default_env)
+/// The verbosity filter applied when `RUST_LOG`
+/// ([`EnvFilter::try_from_default_env`](tracing_subscriber::EnvFilter::try_from_default_env))
 /// is unset: chatty for dev, quiet for an operator run.
 const fn default_filter(dev: bool) -> &'static str {
     if dev { "info,stele=debug" } else { "info" }
@@ -219,8 +220,9 @@ impl LogFormat {
 
 /// Install the global tracing subscriber.
 ///
-/// Verbosity honors `RUST_LOG` (an [`EnvFilter`] directive string such as
-/// `stele_pgwire=trace`); when it is unset the [`default_filter`] for the mode
+/// Verbosity honors `RUST_LOG` (an [`EnvFilter`](tracing_subscriber::EnvFilter)
+/// directive string such as `stele_pgwire=trace`); when it is unset the
+/// [`default_filter`] for the mode
 /// applies. Output is human-readable text unless `STELE_LOG_FORMAT=json`
 /// selects the line-delimited JSON formatter for production
 /// ([05 — logging](../../../docs/05-dev-environment.md#logging)).
