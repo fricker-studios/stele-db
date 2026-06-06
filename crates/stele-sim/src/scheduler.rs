@@ -223,6 +223,9 @@ impl Scheduler {
     #[must_use]
     pub fn run(mut self) -> Vec<Event> {
         ACTIVE.with(|cell| *cell.borrow_mut() = Some(Rc::clone(&self.state)));
+        // Clear the thread-local even if a task panics mid-poll — otherwise a
+        // later run on this thread would see a stale "active scheduler".
+        let _active = ActiveGuard;
 
         // A no-op waker: this executor decides re-polling from the ready/sleeper
         // sets a task registers before returning `Pending`, not from waker calls.
@@ -257,7 +260,20 @@ impl Scheduler {
             };
 
             let tid = match step {
-                Step::Done => break,
+                Step::Done => {
+                    // Nothing is ready and nothing is sleeping. If any task is
+                    // still live it has parked itself without registering to be
+                    // re-polled (returned `Pending` without `yield_now`/`sleep`,
+                    // or is genuinely deadlocked) — fail loudly rather than
+                    // return a silently truncated trace.
+                    let stuck = self.tasks.iter().filter(|t| t.is_some()).count();
+                    assert!(
+                        stuck == 0,
+                        "scheduler stalled with {stuck} unfinished task(s): a task returned \
+                         Pending without yielding or sleeping"
+                    );
+                    break;
+                }
                 Step::Advanced => continue,
                 Step::Poll(tid) => tid,
             };
@@ -273,8 +289,17 @@ impl Scheduler {
             }
         }
 
-        ACTIVE.with(|cell| *cell.borrow_mut() = None);
         std::mem::take(&mut self.state.borrow_mut().log)
+    }
+}
+
+/// Clears the [`ACTIVE`] thread-local when [`Scheduler::run`] returns or unwinds,
+/// so a panic in one run can't leave a stale scheduler visible to the next.
+struct ActiveGuard;
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        ACTIVE.with(|cell| *cell.borrow_mut() = None);
     }
 }
 
@@ -426,5 +451,38 @@ mod tests {
         );
         // The final record happened after a sleep(5) from t=0.
         assert_eq!(trace.last().unwrap().at, 5);
+    }
+
+    /// A future that parks forever without registering to be re-polled.
+    struct Stuck;
+    impl Future for Stuck {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            Poll::Pending
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "scheduler stalled with 1 unfinished task")]
+    fn stuck_task_fails_loudly() {
+        let mut sched = Scheduler::new(1);
+        sched.spawn(Stuck);
+        let _ = sched.run();
+    }
+
+    #[test]
+    fn panic_in_task_clears_active() {
+        // A panicking task must not leave the thread-local scheduler installed.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut sched = Scheduler::new(1);
+            sched.spawn(async {
+                record(1);
+                panic!("boom");
+            });
+            let _ = sched.run();
+        }));
+        assert!(result.is_err(), "the task panic should propagate");
+        // A fresh run on the same thread must work — proving ACTIVE was cleared.
+        assert_eq!(schedule_trace(5).len(), 24);
     }
 }
