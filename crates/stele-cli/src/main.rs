@@ -2,7 +2,8 @@
 //!
 //! v0.1 surface is intentionally tiny: `stele server` starts the daemon (so the
 //! single binary covers the "five-minute path" in [`docs/05-dev-environment.md`](../../../docs/05-dev-environment.md)),
-//! and every other subcommand is a polite "not yet" with a doc link.
+//! `stele version` reports the build, and every other subcommand is a polite
+//! "not yet" with a doc link.
 
 use clap::{Parser, Subcommand};
 
@@ -78,8 +79,62 @@ fn main() -> anyhow::Result<()> {
             )
         }
         Cmd::Version => {
-            println!("stele {} (Stele DB)", env!("CARGO_PKG_VERSION"));
+            println!("{}", version_line());
             Ok(())
         }
+    }
+}
+
+/// The line `stele version` prints: the crate version plus the git commit the
+/// binary was built from (captured in `build.rs`, or `unknown` when built
+/// outside a git checkout).
+fn version_line() -> String {
+    format!(
+        "stele {} (commit {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("STELE_GIT_COMMIT")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse exactly like `main`, but surface clap errors as a test failure
+    /// instead of `std::process::exit` (which `parse_from` would do, taking the
+    /// whole test binary down).
+    fn parse(argv: &[&str]) -> Cmd {
+        Args::try_parse_from(argv).expect("argv should parse").cmd
+    }
+
+    #[test]
+    fn version_line_reports_crate_version_and_commit() {
+        let line = version_line();
+        assert!(line.contains(env!("CARGO_PKG_VERSION")), "{line}");
+        // The rendered line carries the *actual* commit, not just the label —
+        // build.rs always sets the env var (never empty, even off a checkout).
+        assert!(!env!("STELE_GIT_COMMIT").is_empty());
+        assert!(line.contains(env!("STELE_GIT_COMMIT")), "{line}");
+    }
+
+    #[test]
+    fn documented_v0_1_surface_parses() {
+        assert!(matches!(parse(&["stele", "version"]), Cmd::Version));
+        assert!(matches!(parse(&["stele", "shell"]), Cmd::Shell));
+        assert!(matches!(
+            parse(&["stele", "query", "SELECT 1"]),
+            Cmd::Query { .. }
+        ));
+        assert!(matches!(parse(&["stele", "server"]), Cmd::Server(_)));
+    }
+
+    #[test]
+    fn server_accepts_listen_and_dev_flags() {
+        let Cmd::Server(s) = parse(&["stele", "server", "--listen", "127.0.0.1:6000", "--dev"])
+        else {
+            panic!("expected server subcommand");
+        };
+        assert_eq!(s.listen, Some("127.0.0.1:6000".parse().unwrap()));
+        assert!(s.dev);
     }
 }
