@@ -344,7 +344,11 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
         // their bulk columns read.
         let mut locator: BTreeMap<VersionId, (usize, usize)> = BTreeMap::new();
         let mut identities: Vec<Version> = Vec::new();
+        // The identity row count per survivor — the length every bulk column read
+        // from that segment must agree with, or it is corrupt (see below).
+        let mut rows_in_seg: BTreeMap<usize, usize> = BTreeMap::new();
         for (seg_idx, keys) in &survivors {
+            rows_in_seg.insert(*seg_idx, keys.len());
             for (row_idx, (bk, sys_from, seq)) in keys.iter().enumerate() {
                 locator.insert((bk.clone(), *sys_from, *seq), (*seg_idx, row_idx));
                 identities.push(identity_version(bk.clone(), *sys_from, *seq));
@@ -362,9 +366,21 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             sealed_live.iter().map(|v| locate(&locator, v).0).collect();
         let mut cols_by_seg: BTreeMap<usize, Vec<(ColumnId, ColumnData)>> = BTreeMap::new();
         for seg_idx in live_segs {
+            // Every bulk column must carry exactly as many values as the segment's
+            // identity columns ([`SegmentReader::version_keys`]); a disagreement is
+            // a corrupt segment, surfaced as an error rather than an out-of-bounds
+            // panic when the per-row patch indexes by `row_idx` (the same guard
+            // `SegmentReader::read_versions` applies across its columns).
+            let expected = rows_in_seg[&seg_idx];
             let mut cols = Vec::with_capacity(needed.len());
             for &col in &needed {
-                cols.push((col, self.segments[seg_idx].read_column(col)?));
+                let data = self.segments[seg_idx].read_column(col)?;
+                if column_len(&data) != expected {
+                    return Err(ScanError::Segment(SegmentError::Corrupt(
+                        "segment column value count disagrees with its identity row count",
+                    )));
+                }
+                cols.push((col, data));
             }
             cols_by_seg.insert(seg_idx, cols);
         }
@@ -504,10 +520,24 @@ fn locate(locator: &BTreeMap<VersionId, (usize, usize)>, v: &Version) -> (usize,
         .expect("a resolved sealed identity must locate its source row")
 }
 
+/// The number of values in a [`ColumnData`], independent of its element type —
+/// used to assert a late-materialized column agrees with the segment's identity
+/// row count before any row is indexed.
+fn column_len(data: &ColumnData) -> usize {
+    match data {
+        ColumnData::Bytes(v) => v.len(),
+        ColumnData::I64(v) => v.len(),
+    }
+}
+
 /// Overlay one late-materialized bulk column onto a resolved version at `row`.
-/// `col` is always one of [`is_bulk_column`]'s set and `data` always has the
-/// type that column's arm expects (the writer's schema), so the fallthrough is
-/// structurally unreachable.
+/// `col` is always one of [`is_bulk_column`]'s set (the only columns
+/// [`SnapshotScan::materialized_columns`] keeps) and `data` always has the type
+/// that column's arm expects — [`SegmentReader::read_column`] picks the
+/// [`ColumnData`] variant from [`ColumnId::ty`], so a mismatched pairing cannot
+/// arise. The fallthrough is therefore dead and fails fast rather than silently
+/// dropping a column, which would mask schema drift (a new bulk column added to
+/// [`is_bulk_column`] but not handled here).
 fn patch_version(v: &mut Version, col: ColumnId, data: &ColumnData, row: usize) {
     match (col, data) {
         (ColumnId::Payload, ColumnData::Bytes(b)) => v.payload.clone_from(&b[row]),
@@ -518,7 +548,10 @@ fn patch_version(v: &mut Version, col: ColumnId, data: &ColumnData, row: usize) 
         (ColumnId::CommittedAt, ColumnData::I64(x)) => {
             v.provenance.committed_at = SystemTimeMicros(x[row]);
         }
-        _ => {}
+        _ => unreachable!(
+            "patch_version received a non-bulk column or a ColumnData variant that \
+             read_column cannot produce for it: {col:?}"
+        ),
     }
 }
 
