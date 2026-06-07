@@ -242,7 +242,7 @@ flowchart LR
 | **Changelog** | `git-cliff` | Driven by **Conventional Commits**; keeps `CHANGELOG.md`. |
 | **Version bump** | `cargo release` / `release-plz` | Optional automated PRs that bump versions + changelog. |
 | **Artifacts** | `cargo build --release` per target | Static where feasible; SHA-256 checksums. |
-| **Signing** | **cosign / Sigstore** + **SLSA provenance** | Keyless signing; provenance attestation. |
+| **Signing** | **cosign / Sigstore** + **SLSA provenance** | Keyless `cosign` signs SHA256SUMS and the image digest; `actions/attest-build-provenance` emits SLSA provenance for both (see below). |
 | **SBOM** | `cargo cyclonedx` + `cyclonedx` (CycloneDX CLI) `merge` | Per-crate BOMs merged into one canonical workspace document `stele-<tag>.cdx.json`, attached to each release. |
 | **Docker** | multi-arch `buildx` → **ghcr.io** | The canonical image ([05](05-dev-environment.md)); signed with cosign. |
 | **Package registries** | crates.io (libraries), later Homebrew tap + apt/deb | pre-1.0: GitHub Releases + Docker only; registries follow as the API stabilizes. |
@@ -282,6 +282,28 @@ jobs:
 ```
 
 (Multi-arch binary builds and the Docker job run in parallel matrix jobs; condensed here.)
+
+### SLSA build provenance
+
+Beyond signing, the release attaches **SLSA build provenance** so a third party can verify *what built each artifact* (which workflow, which commit, which runner) — not just that we signed it. Both attestations come from [`actions/attest-build-provenance`](https://github.com/actions/attest-build-provenance), pinned by SHA like every other action ([ADR-0005](adr/0005-reproducible-builds-pinned-toolchain.md)):
+
+- **Binaries** — the `release` job attests `SHA256SUMS` via `subject-checksums`, producing one provenance statement per archive (no re-hashing; it reuses the digests cosign already signed).
+- **Image** — the `docker` job attests the pushed image by digest with `push-to-registry: true`. We deliberately use this over buildx `provenance: true`: buildx folds provenance into the image index, changing the manifest in ways some clients mishandle on multi-arch pulls, whereas attest-build-provenance stores a *separate* OCI artifact under the same digest, leaving `docker pull` untouched.
+
+Both jobs add `attestations: write` to their (otherwise least-privilege) permissions. Verify a release:
+
+```bash
+# A downloaded binary archive (provenance is looked up by its digest)
+gh attestation verify stele-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz --repo <owner>/stele
+
+# The image (provenance travels with the digest in ghcr.io)
+gh attestation verify oci://ghcr.io/<owner>/stele:vX.Y.Z --repo <owner>/stele
+#   or, equivalently, with cosign:
+cosign verify-attestation --type slsaprovenance \
+  --certificate-identity-regexp '^https://github.com/<owner>/stele/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/<owner>/stele@sha256:<digest>
+```
 
 ---
 

@@ -170,8 +170,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write # push to ghcr.io
-      id-token: write # keyless cosign signing
+      packages: write # push to ghcr.io + the provenance attestation
+      id-token: write # keyless cosign signing + Sigstore-signed provenance
+      attestations: write # record SLSA provenance in the GitHub attestation store
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
@@ -206,6 +207,21 @@ jobs:
         # Sign the immutable digest, not a tag — this covers every tag that
         # points at it (v{{version}}, {{major}}.{{minor}}, latest).
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
+      # SLSA build provenance for the image (docs/04-cicd.md → Signing). We
+      # attest the digest with actions/attest-build-provenance rather than
+      # buildx `provenance: true`: buildx attaches the provenance to the image
+      # index, which changes the manifest some older clients choke on for
+      # multi-arch pulls. attest-build-provenance pushes a *separate* OCI
+      # artifact referenced by the same digest, so a plain `docker pull` is
+      # untouched while `cosign verify-attestation` / `gh attestation verify`
+      # can still resolve the provenance. push-to-registry stores it next to
+      # the image in ghcr.io.
+      - name: Attest SLSA build provenance for the image
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/stele
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
   # Assemble the GitHub Release: checksums (cosign-signed), SBOM, per-target
   # binaries, and the git-cliff notes.
@@ -215,7 +231,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the GitHub Release
-      id-token: write # keyless cosign signing of the checksum file
+      id-token: write # keyless cosign signing + Sigstore-signed provenance
+      attestations: write # record SLSA provenance in the GitHub attestation store
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (no semver tags)
@@ -265,6 +282,17 @@ jobs:
           cosign sign-blob --yes SHA256SUMS \
             --output-signature SHA256SUMS.sig \
             --output-certificate SHA256SUMS.pem
+      # SLSA build provenance for the per-target archives (docs/04-cicd.md →
+      # Signing). subject-checksums reads the (digest, name) pairs straight out
+      # of SHA256SUMS, so one call attests every archive without re-hashing —
+      # the same file the cosign sign-blob above already covers. A downloaded
+      # archive then verifies by its own digest with
+      # `gh attestation verify <archive> --repo <owner>/stele` (or
+      # `cosign verify-attestation`), no path-matching needed.
+      - name: Attest SLSA build provenance for the binaries
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-checksums: dist/SHA256SUMS
       - name: Create or update the GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
