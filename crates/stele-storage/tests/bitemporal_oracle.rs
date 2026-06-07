@@ -30,9 +30,10 @@
 //!
 //! The second, independent **DuckDB** differential ([docs/06 §10]) is deliberately
 //! *not* here: it reimplements the queries at the SQL/executor layer and diffs
-//! there, which needs the executor (STL-100, still to do) and a new external
-//! dependency — out of scope for this runtime-agnostic core. It is filed as a
-//! follow-up that rides STL-100; see the PR.
+//! there, which needs the executor (STL-100) and a new external dependency — out
+//! of scope for this runtime-agnostic core. It landed as STL-144 in
+//! [`stele-exec/tests/duckdb_differential.rs`], riding the [`SnapshotScan`] read
+//! path.
 
 #![allow(
     clippy::cast_possible_truncation,

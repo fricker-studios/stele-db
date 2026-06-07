@@ -17,3 +17,9 @@ stele-storage = { workspace = true }
 stele-txn     = { workspace = true }
 stele-common  = { workspace = true }
 thiserror     = { workspace = true }
+
+[dev-dependencies]
+# The DuckDB differential oracle (STL-144): a second, independent bitemporal
+# `AS OF` implementation the executor is diffed against. Dev-only — never linked
+# into the shipped storage/txn core ([ADR-0010]).
+duckdb = { workspace = true }
