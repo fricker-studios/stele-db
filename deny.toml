@@ -48,6 +48,23 @@ exceptions = [
     { allow = ["BUSL-1.1"], name = "stele-cli" },
 ]
 
+# --- duckdb dev-dependency decision (STL-144) -------------------------------
+# The DuckDB differential bitemporal oracle ([docs/06 §10]) adds `duckdb`
+# (`bundled`) as a **dev-dependency of `stele-exec` only** — never linked into a
+# shipped crate, honoring the runtime-agnostic core boundary ([ADR-0010]).
+#
+# License: `duckdb` and `libduckdb-sys` (which vendors and compiles the DuckDB
+# C++ amalgamation) are **MIT**; the dependency drags in the `arrow` stack and
+# the usual num/zerocopy/chrono supporting crates, all **MIT** or **Apache-2.0**.
+# `libduckdb-sys` also carries a `reqwest` (download-the-prebuilt-lib) **build**-
+# dependency — compiled but unused on the `bundled` path, never linked into the
+# test binary or any shipped crate. Every license across that subtree is already
+# in the `allow` list above, so no new allowance was required — `cargo deny check
+# licenses bans sources` is green with this addition, and `[sources]` keeps the
+# whole graph on crates.io. `multiple-versions` stays a warning: the arrow tree
+# pins a few crates at versions that differ from the workspace's, which is a
+# dev-only duplication, not a shipped one.
+
 [bans]
 multiple-versions = "warn"
 wildcards         = "deny"

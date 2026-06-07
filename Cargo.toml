@@ -53,6 +53,13 @@ tokio              = { version = "1.40", features = ["rt-multi-thread", "net", "
 # Dev-only: a real Postgres client driving the pgwire front end end-to-end in an
 # integration test (STL-147 DoD). Never a runtime dependency of a shipped crate.
 tokio-postgres     = "0.7"
+# Dev-only: the second, independent bitemporal correctness oracle (STL-144). The
+# `bundled` feature vendors and compiles the DuckDB C++ amalgamation (MIT), so the
+# test needs no system library; default features are empty, so the dependency tree
+# stays the lean C-API wrapper (no arrow/polars). Pinned to 1.4.x — its MSRV
+# (1.84.1) clears our 1.85 toolchain. Wired only into `stele-exec`'s dev-deps; it
+# never links into the runtime-agnostic storage/txn core ([ADR-0010]).
+duckdb             = { version = "1.4", features = ["bundled"] }
 tracing            = "0.1"
 # `json` enables the line-delimited JSON formatter for production
 # (`STELE_LOG_FORMAT=json`, STL-107); it pulls in `serde_json` + `tracing-serde`.
