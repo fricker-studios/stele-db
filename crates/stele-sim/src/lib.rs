@@ -27,8 +27,10 @@
 
 #![allow(dead_code)]
 
+mod as_of_oracle;
 mod fault_disk;
 
+pub use as_of_oracle::run_as_of_oracle_seed;
 pub use fault_disk::{FaultDisk, FaultEvent, FaultKind, FaultProfile};
 
 use std::collections::BTreeMap;
@@ -69,10 +71,10 @@ pub use scheduler::{
 /// and determinism forbids reading the wall clock — so the harness hands the
 /// writer a counter that ticks once per [`Clock::now`]. Same seed ⇒ same
 /// sequence of `sys_from` values.
-struct StepClock(AtomicI64);
+pub(crate) struct StepClock(AtomicI64);
 
 impl StepClock {
-    const fn new(start: i64) -> Self {
+    pub(crate) const fn new(start: i64) -> Self {
         Self(AtomicI64::new(start))
     }
 }
@@ -136,7 +138,7 @@ impl Rng {
 /// FNV-1a over a byte slice, folded into a running 64-bit digest. Order-
 /// sensitive by construction, so the caller must feed bytes in a deterministic
 /// order (we sort segment names before reading).
-fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01B3;
     for &b in bytes {
         hash ^= u64::from(b);

@@ -35,11 +35,12 @@ fn main() {
         let rec_digest = stele_sim::run_recovery_index_seed(seed);
         let scan_digest = stele_sim::run_snapshot_scan_seed(seed);
         let as_of_digest = stele_sim::run_as_of_resolution_seed(seed);
+        let as_of_oracle_digest = stele_sim::run_as_of_oracle_seed(seed);
         let engine_rec_digest = stele_sim::run_engine_recover_seed(seed);
         let fault_digest = stele_sim::run_fault_seed(seed);
         let sched_digest = stele_sim::run_schedule_seed_digest(seed);
         println!(
-            "stele-sim: seed {seed} → storage digest {digest:#018x} · valid-time digest {vt_digest:#018x} · delete digest {del_digest:#018x} · dml digest {dml_digest:#018x} · mvcc digest {mvcc_digest:#018x} · recovery-index digest {rec_digest:#018x} · snapshot-scan digest {scan_digest:#018x} · as-of-resolution digest {as_of_digest:#018x} · engine-recover digest {engine_rec_digest:#018x} · fault digest {fault_digest:#018x} · schedule digest {sched_digest:#018x}"
+            "stele-sim: seed {seed} → storage digest {digest:#018x} · valid-time digest {vt_digest:#018x} · delete digest {del_digest:#018x} · dml digest {dml_digest:#018x} · mvcc digest {mvcc_digest:#018x} · recovery-index digest {rec_digest:#018x} · snapshot-scan digest {scan_digest:#018x} · as-of-resolution digest {as_of_digest:#018x} · as-of-oracle digest {as_of_oracle_digest:#018x} · engine-recover digest {engine_rec_digest:#018x} · fault digest {fault_digest:#018x} · schedule digest {sched_digest:#018x}"
         );
     } else if args.seeds == 0 {
         println!("stele-sim: no seeds requested (pass --seeds N or --seed S)");
@@ -74,6 +75,11 @@ fn main() {
             // OF` clause through the real SQL binder, then checked against the
             // same reference oracle (asserts resolution + equivalence internally).
             sweep = (sweep ^ stele_sim::run_as_of_resolution_seed(seed))
+                .wrapping_mul(0x0000_0100_0000_01B3);
+            // The canonical AS-OF oracle (STL-111): a random history applied to
+            // both the engine and a list-of-versions-per-key reference, every
+            // `AS OF` answer asserted equal at every commit boundary.
+            sweep = (sweep ^ stele_sim::run_as_of_oracle_seed(seed))
                 .wrapping_mul(0x0000_0100_0000_01B3);
             // The crash-recovery driver: kill mid-write and `Engine::recover`,
             // asserting an exact index rebuild and oracle-correct AS-OF (STL-102).
