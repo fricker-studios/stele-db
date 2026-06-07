@@ -431,7 +431,170 @@ fn segment_reads_equal_zone_map_survivors() {
         out.stats.segments_scanned, 1,
         "only the segment whose key range brackets 'm' is read",
     );
-    assert_eq!(out.stats.segments_pruned, 2);
+    // The other two are ruled out by their zone maps (disjoint key ranges), not
+    // by supersession — they hold open versions.
+    assert_eq!(out.stats.segments_pruned_zone, 2);
+    assert_eq!(out.stats.segments_pruned_superseded, 0);
+    assert_eq!(out.stats.segments_pruned(), 2);
     assert_eq!(out.batch.rows, 1);
     assert_eq!(one_bytes(&out, ColumnId::BusinessKey), b"m");
+}
+
+// --- validity-index "all superseded" prune (STL-139/146) -------------------
+
+#[test]
+fn validity_index_prunes_a_fully_superseded_segment() {
+    // Insert, flush so the version lives only in a sealed segment, then update
+    // across the flush boundary so the validity index closes the sealed version.
+    let seg_disk = MemDisk::new();
+    let wal = new_wal();
+    let mut delta = new_delta();
+    let mut index = new_index();
+    let mut dml = DmlWriter::new(wal, StepClock::new(1_000), false);
+    let key = key_of(1);
+
+    let c_insert = dml
+        .insert(
+            &mut delta,
+            &mut index,
+            &EmptySealed,
+            key.clone(),
+            None,
+            b"100".to_vec(),
+            0,
+            TxnId(1),
+            who(),
+        )
+        .expect("insert")
+        .commit;
+
+    let reader = seal(&seg_disk, "seg-0.seg", &mut delta);
+    let segments = [reader];
+
+    let sealed = SealedSegments::new(&segments);
+    let c_update = dml
+        .update(
+            &mut delta,
+            &mut index,
+            &sealed,
+            key,
+            None,
+            b"250".to_vec(),
+            0,
+            TxnId(2),
+            who(),
+        )
+        .expect("update across flush boundary")
+        .commit;
+
+    // AS OF the insert: the sealed version is live, so the zone map cannot prune
+    // it and the validity index does not (it is open at this snapshot) — it is
+    // scanned.
+    let before = SnapshotScan::new(&delta, &index, &segments, Snapshot(c_insert))
+        .project(vec![ColumnId::Payload])
+        .execute()
+        .expect("scan before update");
+    assert_eq!(one_bytes(&before, ColumnId::Payload), b"100");
+    assert_eq!(before.stats.segments_scanned, 1);
+    assert_eq!(before.stats.segments_pruned_superseded, 0);
+    assert_eq!(before.stats.segments_pruned_zone, 0);
+
+    // AS OF the update: the sealed version is now superseded (its `sys_to` equals
+    // the update commit). The zone map still cannot prune it — its key range and
+    // sys_from bracket the snapshot — but the validity index proves every row
+    // superseded, so the segment is pruned without reading its bulk columns. The
+    // live value (250) comes from the delta tier.
+    let after = SnapshotScan::new(&delta, &index, &segments, Snapshot(c_update))
+        .project(vec![ColumnId::Payload])
+        .execute()
+        .expect("scan after update");
+    assert_eq!(one_bytes(&after, ColumnId::Payload), b"250");
+    assert_eq!(after.stats.segments_total, 1);
+    assert_eq!(
+        after.stats.segments_pruned_superseded, 1,
+        "the fully-superseded segment is pruned by the validity index, not the zone map",
+    );
+    assert_eq!(after.stats.segments_pruned_zone, 0);
+    assert_eq!(after.stats.segments_scanned, 0);
+}
+
+// --- late materialization: only the live rows of a scanned segment ----------
+
+#[test]
+fn late_materialization_resolves_live_rows_within_a_scanned_segment() {
+    // Three keys land in one sealed segment; a fourth statement supersedes one of
+    // them across the flush boundary. The scan must read the segment (two of its
+    // rows are still live), materialize their projected columns, and skip the
+    // superseded row — whose live value comes from the delta tier instead.
+    let seg_disk = MemDisk::new();
+    let wal = new_wal();
+    let mut delta = new_delta();
+    let mut index = new_index();
+    let mut dml = DmlWriter::new(wal, StepClock::new(1_000), false);
+
+    for (id, payload) in [(1, "A"), (2, "B"), (3, "C")] {
+        dml.insert(
+            &mut delta,
+            &mut index,
+            &EmptySealed,
+            key_of(id),
+            None,
+            payload.as_bytes().to_vec(),
+            0,
+            TxnId(u64::try_from(id).unwrap()),
+            who(),
+        )
+        .expect("insert");
+    }
+
+    // Flush all three rows into one sealed segment.
+    let reader = seal(&seg_disk, "seg-0.seg", &mut delta);
+    let segments = [reader];
+    assert_eq!(segments[0].row_count(), 3);
+
+    // Update key 3, closing its sealed row and staging the new value in the delta.
+    let sealed = SealedSegments::new(&segments);
+    let c_update = dml
+        .update(
+            &mut delta,
+            &mut index,
+            &sealed,
+            key_of(3),
+            None,
+            b"C2".to_vec(),
+            0,
+            TxnId(9),
+            who(),
+        )
+        .expect("update key 3")
+        .commit;
+
+    let out = SnapshotScan::new(&delta, &index, &segments, Snapshot(c_update))
+        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .execute()
+        .expect("scan");
+
+    // The segment still holds live rows (keys 1 and 2), so it is scanned.
+    assert_eq!(out.stats.segments_scanned, 1);
+    assert_eq!(out.stats.segments_pruned_superseded, 0);
+
+    // Keys 1 and 2 are materialized from the segment; key 3's live value is the
+    // delta's post-update payload, not the superseded sealed one.
+    let keys: Vec<Vec<u8>> = match &out.batch.columns[0].1 {
+        Column::Bytes(rows) => rows.clone(),
+        Column::I64(_) => panic!("business key is a bytes column"),
+    };
+    let payloads: Vec<Vec<u8>> = match &out.batch.columns[1].1 {
+        Column::Bytes(rows) => rows.clone(),
+        Column::I64(_) => panic!("payload is a bytes column"),
+    };
+    let got: Vec<(Vec<u8>, Vec<u8>)> = keys.into_iter().zip(payloads).collect();
+    assert_eq!(
+        got,
+        vec![
+            (key_of(1).0, b"A".to_vec()),
+            (key_of(2).0, b"B".to_vec()),
+            (key_of(3).0, b"C2".to_vec()),
+        ],
+    );
 }

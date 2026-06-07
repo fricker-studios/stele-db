@@ -1147,17 +1147,33 @@ fn verify_scan_at(
         .execute()
         .expect("snapshot scan");
 
-    // Prune invariant: the scan reads exactly the segments the zone maps did not
-    // prune at this snapshot (STL-100 DoD bullet 2).
-    let survivors = readers
+    // Prune invariant (STL-100 DoD bullet 2, refined by STL-146). The zone-map
+    // prune is an independent function of the readers, so assert it directly. The
+    // validity-index prune (STL-139) then carves the zone survivors into the
+    // segments actually scanned and those proven fully superseded at the
+    // snapshot; assert the accounting partitions the segments exactly. Soundness
+    // of the superseded prune — that it never drops a segment holding a live row
+    // — is caught by the oracle equivalence below, which would diverge if a live
+    // row went missing.
+    let zone_survivors = readers
         .iter()
         .filter(|r| r.might_contain(&Predicate::All, snapshot))
         .count();
     assert_eq!(
-        out.stats.segments_scanned, survivors,
-        "seed {seed}: segment reads must equal zone-map survivors at {s:?}",
+        out.stats.segments_pruned_zone,
+        readers.len() - zone_survivors,
+        "seed {seed}: zone-map prune count must match the independent zone test at {s:?}",
     );
-    assert_eq!(out.stats.segments_pruned, readers.len() - survivors);
+    assert_eq!(
+        out.stats.segments_scanned + out.stats.segments_pruned_superseded,
+        zone_survivors,
+        "seed {seed}: scanned + superseded-pruned must equal the zone survivors at {s:?}",
+    );
+    assert_eq!(out.stats.segments_total, readers.len());
+    assert_eq!(
+        out.stats.segments_pruned(),
+        readers.len() - out.stats.segments_scanned,
+    );
 
     // Oracle equivalence: the merged scan equals the tier-agnostic reference.
     let got = scan_map(&out);
@@ -1191,14 +1207,16 @@ fn verify_scan_at(
 /// knowledge of tiers, so "the value of key `k` at `S`" is its latest event at or
 /// before `S`. The scan — merging the delta tier, however many sealed segments
 /// the seed flushed, and the validity index across those flush boundaries — must
-/// agree at every probe, and its segment-read count must equal the zone-map
-/// survivors (the prune invariant, DoD bullet 2). The returned digest folds every
-/// agreed `(snapshot, key, payload)` and read count. Same seed ⇒ same digest.
+/// agree at every probe, and the prune accounting must partition the segments
+/// across the zone-map prune, the validity-index "all superseded" prune
+/// (STL-139/146), and the survivors actually scanned. The returned digest folds
+/// every agreed `(snapshot, key, payload)` and scan count. Same seed ⇒ same
+/// digest.
 ///
 /// # Panics
 ///
-/// Panics if the scan disagrees with the reference oracle, or if the segment
-/// read count differs from the zone-map survivor count — correctness
+/// Panics if the scan disagrees with the reference oracle, or if the prune
+/// accounting does not partition the segments as expected — correctness
 /// regressions, not workload outcomes.
 #[must_use]
 pub fn run_snapshot_scan_seed(seed: u64) -> u64 {
