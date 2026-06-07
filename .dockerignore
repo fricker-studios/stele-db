@@ -1,0 +1,9 @@
+# Keep the Docker build context to source only — everything the build needs is
+# Cargo.toml / Cargo.lock / rust-toolchain.toml / crates/. Excluding the rest
+# keeps the context small and prevents host build artifacts from leaking in.
+target/
+.git/
+.github/
+.claude/
+brand/
+docs/
