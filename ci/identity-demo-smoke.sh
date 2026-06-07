@@ -32,6 +32,7 @@ done
 }
 
 # --- the four-statement identity demo ----------------------------------------
+"${PSQL[@]}" -c "DROP TABLE IF EXISTS account"
 "${PSQL[@]}" -c "CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING"
 "${PSQL[@]}" -c "INSERT INTO account VALUES (1, 100)"
 
