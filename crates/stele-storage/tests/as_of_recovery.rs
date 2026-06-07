@@ -129,7 +129,7 @@ fn four_statement_identity_demo_resolves_the_pre_update_value_via_the_index() {
             &mut index,
             &SealedVersions::default(),
             key.clone(),
-            b"100".to_vec(),
+            Some(b"100".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -157,7 +157,7 @@ fn four_statement_identity_demo_resolves_the_pre_update_value_via_the_index() {
             &mut index,
             &SealedVersions::new(sealed.clone()),
             key.clone(),
-            b"250".to_vec(),
+            Some(b"250".to_vec()),
             0,
             TxnId(2),
             who(),
@@ -226,7 +226,7 @@ fn kill_mid_write_then_recover_serves_the_correct_as_of() {
             &EmptySealed,
             key.clone(),
             None,
-            b"100".to_vec(),
+            Some(b"100".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -240,7 +240,7 @@ fn kill_mid_write_then_recover_serves_the_correct_as_of() {
             &EmptySealed,
             key.clone(),
             None,
-            b"250".to_vec(),
+            Some(b"250".to_vec()),
             0,
             TxnId(2),
             who(),
@@ -269,7 +269,7 @@ fn kill_mid_write_then_recover_serves_the_correct_as_of() {
             .expect("scan");
         live.into_iter()
             .find(|v| v.business_key == key)
-            .map(|v| v.payload)
+            .and_then(|v| v.payload)
     };
     assert_eq!(
         read(c0),
@@ -340,7 +340,7 @@ fn engine_as_of(
     {
         let key = v.business_key.clone();
         assert!(
-            live.insert(v.business_key, v.payload).is_none(),
+            live.insert(v.business_key, v.payload.unwrap()).is_none(),
             "@ s={s}: range_scan returned two live versions for {key:?} — \
              the at-most-one-active-version invariant is broken",
         );
@@ -395,7 +395,7 @@ fn recovery_rebuilds_the_index_and_serves_correct_as_of_under_seed_sweep() {
                             &EmptySealed,
                             key,
                             None,
-                            payload.clone(),
+                            Some(payload.clone()),
                             0,
                             txn,
                             who(),
@@ -418,7 +418,7 @@ fn recovery_rebuilds_the_index_and_serves_correct_as_of_under_seed_sweep() {
                         &EmptySealed,
                         key,
                         None,
-                        payload.clone(),
+                        Some(payload.clone()),
                         0,
                         txn,
                         who(),
@@ -512,5 +512,5 @@ fn as_of(
     merge::resolve_snapshot(&chains, Snapshot(s))
         .into_iter()
         .find(|v| &v.business_key == key)
-        .map(|v| v.payload)
+        .and_then(|v| v.payload)
 }

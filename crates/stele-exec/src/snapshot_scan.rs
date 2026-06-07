@@ -114,8 +114,11 @@ pub enum ScanError {
 /// whose length equals the batch's row count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Column {
-    /// A variable-length bytes column (business key, payload, principal).
-    Bytes(Vec<Vec<u8>>),
+    /// A variable-length bytes column (business key, payload, principal). Each
+    /// cell is `Option<Vec<u8>>` so a SQL `NULL` payload ([STL-154]) is carried
+    /// as `None`, distinct from `Some(vec![])` (an empty value). The always-present
+    /// columns (business key, principal) only ever hold `Some`.
+    Bytes(Vec<Option<Vec<u8>>>),
     /// A fixed-width `i64` column (system time, seq, provenance scalars). `u64`
     /// columns (`seq`, `txn_id`) are carried as their `i64` bit-reinterpretation,
     /// the same lossless round-trip the segment format uses ([`ColumnId::TxnId`]).
@@ -446,13 +449,15 @@ fn build_column(col: ColumnId, rows: &[Version]) -> Result<Column, ScanError> {
     Ok(match col {
         ColumnId::BusinessKey => Column::Bytes(
             rows.iter()
-                .map(|v| v.business_key.as_bytes().to_vec())
+                .map(|v| Some(v.business_key.as_bytes().to_vec()))
                 .collect(),
         ),
         ColumnId::SysFrom => Column::I64(rows.iter().map(|v| v.sys_from.0).collect()),
         // `seq` / `txn_id` are logically `u64`; carry their `i64` bit pattern,
         // the lossless round-trip the segment format defines ([`ColumnId::Seq`]).
         ColumnId::Seq => Column::I64(rows.iter().map(|v| u64_bits(v.seq)).collect()),
+        // The payload is already `Option`: a `None` is a SQL `NULL` cell, carried
+        // through verbatim ([STL-154]).
         ColumnId::Payload => Column::Bytes(rows.iter().map(|v| v.payload.clone()).collect()),
         ColumnId::TxnId => Column::I64(
             rows.iter()
@@ -464,7 +469,7 @@ fn build_column(col: ColumnId, rows: &[Version]) -> Result<Column, ScanError> {
         }
         ColumnId::Principal => Column::Bytes(
             rows.iter()
-                .map(|v| v.provenance.principal.as_bytes().to_vec())
+                .map(|v| Some(v.provenance.principal.as_bytes().to_vec()))
                 .collect(),
         ),
         other => return Err(ScanError::UnsupportedProjection(other)),
@@ -507,7 +512,9 @@ fn identity_version(business_key: BusinessKey, sys_from: SystemTimeMicros, seq: 
         sys_from,
         seq,
         Provenance::new(TxnId(0), SystemTimeMicros(0), Principal::new(Vec::new())),
-        Vec::new(),
+        // Placeholder payload — late materialization overwrites it for every row
+        // that resolves live, so the unmaterialized stand-in is left `None`.
+        None,
     )
 }
 
@@ -526,6 +533,7 @@ fn locate(locator: &BTreeMap<VersionId, (usize, usize)>, v: &Version) -> (usize,
 fn column_len(data: &ColumnData) -> usize {
     match data {
         ColumnData::Bytes(v) => v.len(),
+        ColumnData::NullableBytes(v) => v.len(),
         ColumnData::I64(v) => v.len(),
     }
 }
@@ -540,7 +548,9 @@ fn column_len(data: &ColumnData) -> usize {
 /// [`is_bulk_column`] but not handled here).
 fn patch_version(v: &mut Version, col: ColumnId, data: &ColumnData, row: usize) {
     match (col, data) {
-        (ColumnId::Payload, ColumnData::Bytes(b)) => v.payload.clone_from(&b[row]),
+        // The payload arrives as `NullableBytes` (it is the one column that can be
+        // SQL `NULL`, [STL-154]); a `None` cell patches a NULL payload straight in.
+        (ColumnId::Payload, ColumnData::NullableBytes(b)) => v.payload.clone_from(&b[row]),
         (ColumnId::Principal, ColumnData::Bytes(b)) => {
             v.provenance.principal = Principal::new(b[row].clone());
         }
@@ -596,7 +606,9 @@ fn column_value(col: ColumnId, v: &Version) -> Option<ZoneBound> {
         ColumnId::BusinessKey => ZoneBound::Bytes(v.business_key.as_bytes().to_vec()),
         ColumnId::SysFrom => ZoneBound::I64(v.sys_from.0),
         ColumnId::Seq => ZoneBound::I64(u64_bits(v.seq)),
-        ColumnId::Payload => ZoneBound::Bytes(v.payload.clone()),
+        // A SQL `NULL` payload has no comparable value, so the row filter cannot
+        // decide on it — return `None` to keep the row conservatively ([STL-154]).
+        ColumnId::Payload => return v.payload.clone().map(ZoneBound::Bytes),
         ColumnId::TxnId => ZoneBound::I64(u64_bits(v.provenance.txn_id.0)),
         ColumnId::CommittedAt => ZoneBound::I64(v.provenance.committed_at.0),
         ColumnId::Principal => ZoneBound::Bytes(v.provenance.principal.as_bytes().to_vec()),

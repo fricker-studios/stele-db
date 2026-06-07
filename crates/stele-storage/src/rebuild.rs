@@ -162,7 +162,7 @@ mod tests {
                 SystemTimeMicros(sys_from),
                 Principal::new(b"writer".to_vec()),
             ),
-            format!("v@{sys_from}+{seq}").into_bytes(),
+            Some(format!("v@{sys_from}+{seq}").into_bytes()),
         )
     }
 

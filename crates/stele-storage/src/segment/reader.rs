@@ -35,17 +35,21 @@ use crate::validtime::reframe_payload;
 
 use super::SegmentError;
 use super::format::{
-    CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FORMAT_VERSION, HEADER_LEN, HEADER_MAGIC,
-    TRAILER_LEN, TRAILER_MAGIC,
+    BYTES_NULL_SENTINEL, CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FORMAT_VERSION, HEADER_LEN,
+    HEADER_MAGIC, TRAILER_LEN, TRAILER_MAGIC,
 };
 use super::zone_map::{Predicate, ZoneBound, ZoneMap};
 
 /// Decoded contents of one projected column chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnData {
-    /// Variable-length bytes column ([`ColumnId::BusinessKey`],
-    /// [`ColumnId::Payload`], or [`ColumnId::Principal`]).
+    /// Variable-length, always-present bytes column ([`ColumnId::BusinessKey`]
+    /// or [`ColumnId::Principal`]).
     Bytes(Vec<Vec<u8>>),
+    /// A variable-length bytes column whose cells may be SQL `NULL` — only the
+    /// [`ColumnId::Payload`] column ([STL-154]). A `None` cell is a NULL,
+    /// distinct from `Some(vec![])` (an empty payload).
+    NullableBytes(Vec<Option<Vec<u8>>>),
     /// Fixed-width `i64` column ([`ColumnId::SysFrom`], [`ColumnId::TxnId`],
     /// [`ColumnId::CommittedAt`], or — on a valid-time table's segment —
     /// [`ColumnId::ValidFrom`] / [`ColumnId::ValidTo`]).
@@ -166,6 +170,18 @@ impl<F: DiskFile> SegmentReader<F> {
         // file-length check below, so the in-loop growth is itself bounded
         // by the file's actual size.
         match col.ty() {
+            // The `Payload` column may carry SQL `NULL` cells (format v10,
+            // [STL-154]); it decodes through the sentinel-aware path into a
+            // `NullableBytes`. Every other bytes column is always present.
+            ColumnType::Bytes if col == ColumnId::Payload => {
+                let mut out: Vec<Option<Vec<u8>>> = Vec::new();
+                for rg in &self.footer.row_groups {
+                    let meta = chunk_meta(rg, col)?;
+                    let payload = read_chunk_payload(&self.file, meta)?;
+                    decode_nullable_bytes_chunk(&payload, meta.value_count, &mut out)?;
+                }
+                Ok(ColumnData::NullableBytes(out))
+            }
             ColumnType::Bytes => {
                 let mut out: Vec<Vec<u8>> = Vec::new();
                 for rg in &self.footer.row_groups {
@@ -194,7 +210,22 @@ impl<F: DiskFile> SegmentReader<F> {
     fn read_bytes_column(&self, col: ColumnId) -> Result<Vec<Vec<u8>>, SegmentError> {
         match self.read_column(col)? {
             ColumnData::Bytes(v) => Ok(v),
-            ColumnData::I64(_) => Err(SegmentError::Corrupt(
+            ColumnData::NullableBytes(_) | ColumnData::I64(_) => Err(SegmentError::Corrupt(
+                "column data type mismatched expected schema",
+            )),
+        }
+    }
+
+    /// Project the nullable `payload` column, erroring if the segment typed it
+    /// otherwise. The dual of [`Self::read_bytes_column`] for the one bytes
+    /// column whose cells can be SQL `NULL` ([STL-154]).
+    fn read_nullable_bytes_column(
+        &self,
+        col: ColumnId,
+    ) -> Result<Vec<Option<Vec<u8>>>, SegmentError> {
+        match self.read_column(col)? {
+            ColumnData::NullableBytes(v) => Ok(v),
+            ColumnData::Bytes(_) | ColumnData::I64(_) => Err(SegmentError::Corrupt(
                 "column data type mismatched expected schema",
             )),
         }
@@ -205,7 +236,7 @@ impl<F: DiskFile> SegmentReader<F> {
     fn read_i64_column(&self, col: ColumnId) -> Result<Vec<i64>, SegmentError> {
         match self.read_column(col)? {
             ColumnData::I64(v) => Ok(v),
-            ColumnData::Bytes(_) => Err(SegmentError::Corrupt(
+            ColumnData::Bytes(_) | ColumnData::NullableBytes(_) => Err(SegmentError::Corrupt(
                 "column data type mismatched expected schema",
             )),
         }
@@ -259,7 +290,9 @@ impl<F: DiskFile> SegmentReader<F> {
         // `mut` so the row loop can `mem::take` each owned byte vector out
         // instead of cloning it — see the loop below.
         let mut business_keys = self.read_bytes_column(ColumnId::BusinessKey)?;
-        let mut payloads = self.read_bytes_column(ColumnId::Payload)?;
+        // The payload column may carry SQL `NULL` cells ([STL-154]); a `None`
+        // reconstructs a NULL-payload `Version`.
+        let mut payloads = self.read_nullable_bytes_column(ColumnId::Payload)?;
         let mut principals = self.read_bytes_column(ColumnId::Principal)?;
         let sys_from = self.read_i64_column(ColumnId::SysFrom)?;
         let seqs = self.read_i64_column(ColumnId::Seq)?;
@@ -309,7 +342,13 @@ impl<F: DiskFile> SegmentReader<F> {
                 ));
             }
             for i in 0..n {
-                payloads[i] = reframe_payload(valid_from[i], valid_to[i], &payloads[i]);
+                // Re-impose the interval prefix on the bare user payload. A NULL
+                // payload (`None`) is not reachable on a valid-time segment via
+                // v0.1 paths (its interval prefix is always stored), so it is left
+                // as-is rather than invented ([STL-154]).
+                if let Some(bare) = &payloads[i] {
+                    payloads[i] = Some(reframe_payload(valid_from[i], valid_to[i], bare));
+                }
             }
         }
         let mut out = Vec::with_capacity(n);
@@ -433,7 +472,9 @@ impl<F: DiskFile> SegmentReader<F> {
     fn read_retraction_bytes(&self, col: ColumnId) -> Result<Vec<Vec<u8>>, SegmentError> {
         match self.read_retraction_column(col)? {
             ColumnData::Bytes(v) => Ok(v),
-            ColumnData::I64(_) => Err(SegmentError::Corrupt(
+            // No retraction column is the nullable `payload`, so `NullableBytes`
+            // is as much a schema mismatch here as `I64`.
+            ColumnData::NullableBytes(_) | ColumnData::I64(_) => Err(SegmentError::Corrupt(
                 "retraction column data type mismatched expected schema",
             )),
         }
@@ -442,7 +483,7 @@ impl<F: DiskFile> SegmentReader<F> {
     fn read_retraction_i64(&self, col: ColumnId) -> Result<Vec<i64>, SegmentError> {
         match self.read_retraction_column(col)? {
             ColumnData::I64(v) => Ok(v),
-            ColumnData::Bytes(_) => Err(SegmentError::Corrupt(
+            ColumnData::Bytes(_) | ColumnData::NullableBytes(_) => Err(SegmentError::Corrupt(
                 "retraction column data type mismatched expected schema",
             )),
         }
@@ -814,6 +855,31 @@ fn decode_bytes_chunk(
         let len = p.u32()? as usize;
         let bytes = p.bytes(len)?;
         out.push(bytes.to_vec());
+    }
+    if !p.is_empty() {
+        return Err(SegmentError::Corrupt("trailing bytes in bytes column"));
+    }
+    Ok(())
+}
+
+/// Decode a bytes chunk whose cells may be SQL `NULL` (the `payload` column,
+/// format v10, [STL-154]). A per-value length of [`BYTES_NULL_SENTINEL`] marks a
+/// `None` cell with no body bytes; any other length is a present value. The
+/// inverse of the writer's `encode_bytes_values` over `Option<&[u8]>`.
+fn decode_nullable_bytes_chunk(
+    payload: &[u8],
+    value_count: u32,
+    out: &mut Vec<Option<Vec<u8>>>,
+) -> Result<(), SegmentError> {
+    let mut p = Parser::new(payload);
+    for _ in 0..value_count {
+        let len = p.u32()?;
+        if len == BYTES_NULL_SENTINEL {
+            out.push(None);
+        } else {
+            let bytes = p.bytes(len as usize)?;
+            out.push(Some(bytes.to_vec()));
+        }
     }
     if !p.is_empty() {
         return Err(SegmentError::Corrupt("trailing bytes in bytes column"));

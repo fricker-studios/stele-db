@@ -218,7 +218,7 @@ fn insert_then_update_leaves_one_closed_and_one_open_version() {
             &mut index,
             &EmptySealed,
             key.clone(),
-            b"balance=100".to_vec(),
+            Some(b"balance=100".to_vec()),
             0,
             TxnId(10),
             Principal::new(b"writer-a".to_vec()),
@@ -232,7 +232,7 @@ fn insert_then_update_leaves_one_closed_and_one_open_version() {
             &mut index,
             &EmptySealed,
             key.clone(),
-            b"balance=150".to_vec(),
+            Some(b"balance=150".to_vec()),
             0,
             TxnId(20),
             Principal::new(b"writer-b".to_vec()),
@@ -251,7 +251,7 @@ fn insert_then_update_leaves_one_closed_and_one_open_version() {
     // First version: opened at c0, closed at c1.
     assert_eq!(closed.sys_from, c0);
     assert_eq!(closed.sys_to, c1);
-    assert_eq!(closed.payload, b"balance=100");
+    assert_eq!(closed.payload.as_deref(), Some(&b"balance=100"[..]));
     assert_ne!(
         closed.sys_to, SYSTEM_TIME_OPEN,
         "prior period must be closed"
@@ -279,7 +279,7 @@ fn insert_then_update_leaves_one_closed_and_one_open_version() {
     // Second version: opened at c1, still current.
     assert_eq!(open.sys_from, c1);
     assert_eq!(open.sys_to, SYSTEM_TIME_OPEN, "current period stays open");
-    assert_eq!(open.payload, b"balance=150");
+    assert_eq!(open.payload.as_deref(), Some(&b"balance=150"[..]));
     // The new version carries the update's provenance, committed_at = c1.
     assert_eq!(open.provenance.txn_id, TxnId(20));
     assert_eq!(
@@ -307,7 +307,7 @@ fn insert_on_a_live_key_is_rejected() {
             &mut index,
             &EmptySealed,
             key.clone(),
-            b"first".to_vec(),
+            Some(b"first".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -319,7 +319,7 @@ fn insert_on_a_live_key_is_rejected() {
             &mut index,
             &EmptySealed,
             key,
-            b"second".to_vec(),
+            Some(b"second".to_vec()),
             0,
             TxnId(2),
             who(),
@@ -342,7 +342,7 @@ fn update_or_delete_without_a_live_version_is_rejected() {
                 &mut index,
                 &EmptySealed,
                 key.clone(),
-                b"x".to_vec(),
+                Some(b"x".to_vec()),
                 0,
                 TxnId(1),
                 who()
@@ -372,7 +372,7 @@ fn delete_closes_the_live_period_and_leaves_no_open_version() {
             &mut index,
             &EmptySealed,
             key.clone(),
-            b"v".to_vec(),
+            Some(b"v".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -428,7 +428,7 @@ fn reinsert_after_delete_opens_a_new_period_with_a_gap() {
             &mut index,
             &EmptySealed,
             key.clone(),
-            b"a".to_vec(),
+            Some(b"a".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -445,7 +445,7 @@ fn reinsert_after_delete_opens_a_new_period_with_a_gap() {
             &mut index,
             &EmptySealed,
             key.clone(),
-            b"b".to_vec(),
+            Some(b"b".to_vec()),
             0,
             TxnId(2),
             who(),
@@ -518,7 +518,7 @@ fn version_chains_are_non_overlapping_and_gap_free_under_seed_sweep() {
                         &mut index,
                         &EmptySealed,
                         key,
-                        payload,
+                        Some(payload),
                         seq,
                         txn,
                         who(),
@@ -531,7 +531,7 @@ fn version_chains_are_non_overlapping_and_gap_free_under_seed_sweep() {
                         &mut index,
                         &EmptySealed,
                         key,
-                        payload,
+                        Some(payload),
                         seq,
                         txn,
                         who(),

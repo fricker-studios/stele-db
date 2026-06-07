@@ -27,15 +27,16 @@
 //! rendering. (`INSERT` over the wire for the types it *does* support is already
 //! covered by the STL-147 CRUD round-trip.)
 //!
-//! ## NULL is deliberately out of scope here
+//! ## NULL cell over the wire (STL-154)
 //!
-//! The DoD also names a NULL cell. A genuine SQL `NULL` from a *table read* is
-//! not representable at v0.1: the payload is `Vec<u8>` end to end (storage →
-//! `Column::Bytes` → `SelectResult` → `decode_result_rows`, which always yields a
-//! present value), so nullability would need plumbing across four crates — a
-//! feature, not this test. The NULL wire sentinel (length `-1`) is already
-//! covered by the in-crate `data_row_payload` unit tests; the end-to-end NULL
-//! cell is filed as a follow-up (see the PR / STL-150 comment).
+//! The golden also covers a genuine SQL `NULL` from a table read — the last
+//! bullet of STL-105's DoD, deferred from STL-150 because nullability needed
+//! plumbing across the storage → `Column` → `SelectResult` → `decode_result_rows`
+//! stack ([STL-154] landed it: `Version.payload` and those layers are now
+//! `Option`, and a sealed segment carries NULL via format v10). The `t_null` row
+//! is staged with a `None` payload and read back over the wire; a stock client
+//! reports the length-`-1` `DataRow` sentinel as a missing cell, which the golden
+//! pins as the `\N` token — distinct from an empty string.
 
 use std::sync::{Arc, Mutex};
 
@@ -140,7 +141,7 @@ fn stage(engine: &mut SessionEngine<SystemClock, MemDisk>, case: &Case) {
             case.table,
             BusinessKey::new(key),
             None,
-            payload,
+            Some(payload),
             0,
             TxnId(1),
             Principal::new(b"stele".to_vec()),
@@ -148,12 +149,48 @@ fn stage(engine: &mut SessionEngine<SystemClock, MemDisk>, case: &Case) {
         .expect("stage row");
 }
 
+/// Stand up `t_null (id INT, v INT)` and stage a single row whose payload is a
+/// SQL `NULL` ([STL-154]) — `engine.insert` with a `None` payload, the same
+/// `None` the SQL `INSERT INTO t_null VALUES (1, NULL)` path produces. The read
+/// back over the wire is what the golden exercises: the NULL renders as the
+/// length-`-1` `DataRow` sentinel, which a stock client reports as a missing cell.
+fn stage_null(engine: &mut SessionEngine<SystemClock, MemDisk>) {
+    let stmt =
+        stele_sql::parse("CREATE TABLE t_null (id INT PRIMARY KEY, v INT) WITH SYSTEM VERSIONING")
+            .expect("parse CREATE")
+            .into_iter()
+            .next()
+            .expect("one statement");
+    engine.execute(&stmt).expect("create t_null");
+
+    let mut key = Vec::new();
+    ScalarValue::Int4(1).encode(&mut key);
+    engine
+        .insert(
+            "t_null",
+            BusinessKey::new(key),
+            None,
+            None, // SQL NULL payload
+            0,
+            TxnId(1),
+            Principal::new(b"stele".to_vec()),
+        )
+        .expect("stage NULL row");
+}
+
 /// The text of column `col` in the single data row of a `simple_query` reply.
 fn cell(messages: &[SimpleQueryMessage], col: &str) -> String {
+    cell_opt(messages, col).expect("a non-null cell")
+}
+
+/// The text of column `col`, or `None` if the cell is SQL `NULL` — a stock wire
+/// client reports the length-`-1` `DataRow` sentinel as a missing value
+/// ([STL-154]).
+fn cell_opt(messages: &[SimpleQueryMessage], col: &str) -> Option<String> {
     messages
         .iter()
         .find_map(|m| match m {
-            SimpleQueryMessage::Row(row) => Some(row.get(col).expect("a non-null cell").to_owned()),
+            SimpleQueryMessage::Row(row) => Some(row.get(col).map(ToOwned::to_owned)),
             _ => None,
         })
         .expect("a data row in the reply")
@@ -168,6 +205,8 @@ async fn psql_text_format_matches_postgres_golden() {
     for case in &cases {
         stage(&mut engine, case);
     }
+    // Plus one row whose payload is a genuine SQL NULL (STL-154).
+    stage_null(&mut engine);
     let session: SharedSession = Arc::new(Mutex::new(engine));
     let addr = common::spawn_server(session).await;
 
@@ -190,6 +229,23 @@ async fn psql_text_format_matches_postgres_golden() {
         rendered.push_str(&cell(&messages, "v"));
         rendered.push('\n');
     }
+
+    // The NULL row (STL-154): a stock client reports the cell as missing (the
+    // length-`-1` sentinel), distinct from an empty value. Render it with the
+    // `\N` token Postgres uses for NULL, so the golden distinguishes NULL from
+    // an empty string.
+    let null_messages = client
+        .simple_query("SELECT id, v FROM t_null")
+        .await
+        .expect("select the NULL row over the wire");
+    assert_eq!(
+        cell_opt(&null_messages, "v"),
+        None,
+        "a NULL payload must come back as a missing cell, not an empty string"
+    );
+    rendered.push_str("null|");
+    rendered.push_str(&cell_opt(&null_messages, "v").unwrap_or_else(|| "\\N".to_owned()));
+    rendered.push('\n');
 
     assert_eq!(
         rendered, GOLDEN,

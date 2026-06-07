@@ -121,7 +121,7 @@ fn version(key: &[u8], sys_from: i64, payload: &[u8]) -> Version {
             SystemTimeMicros(sys_from),
             who(),
         ),
-        payload.to_vec(),
+        Some(payload.to_vec()),
     )
 }
 
@@ -143,7 +143,7 @@ fn dml_update_closes_a_version_that_lives_only_in_a_sealed_segment() {
             &EmptySealed,
             key.clone(),
             None,
-            b"balance=100".to_vec(),
+            Some(b"balance=100".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -170,7 +170,7 @@ fn dml_update_closes_a_version_that_lives_only_in_a_sealed_segment() {
             &sealed,
             key.clone(),
             None,
-            b"balance=150".to_vec(),
+            Some(b"balance=150".to_vec()),
             0,
             TxnId(2),
             who(),
@@ -195,7 +195,7 @@ fn dml_update_closes_a_version_that_lives_only_in_a_sealed_segment() {
     let staged = delta.candidate_versions(&key).expect("candidates");
     assert_eq!(staged.len(), 1, "the new open version stages in the delta");
     assert_eq!(staged[0].sys_from, c1);
-    assert_eq!(staged[0].payload, b"balance=150");
+    assert_eq!(staged[0].payload.as_deref(), Some(&b"balance=150"[..]));
 
     // Read-path oracle: resolve the live version across segment + delta + index.
     let sealed_versions = readers[0].read_versions().expect("read versions");
@@ -210,7 +210,8 @@ fn dml_update_closes_a_version_that_lives_only_in_a_sealed_segment() {
     .expect("resolve")
     .expect("a version is live at c1");
     assert_eq!(
-        live_now.payload, b"balance=150",
+        live_now.payload.as_deref(),
+        Some(&b"balance=150"[..]),
         "the new version is live at c1"
     );
 
@@ -220,7 +221,8 @@ fn dml_update_closes_a_version_that_lives_only_in_a_sealed_segment() {
             .expect("resolve")
             .expect("the sealed version is live just before c1");
     assert_eq!(
-        live_prior.payload, b"balance=100",
+        live_prior.payload.as_deref(),
+        Some(&b"balance=100"[..]),
         "the sealed version was live before c1"
     );
     assert_eq!(live_prior.sys_to, c1, "and is overlaid closed at c1");
@@ -244,7 +246,7 @@ fn dml_delete_retracts_a_version_that_lives_only_in_a_sealed_segment() {
             &EmptySealed,
             key.clone(),
             None,
-            b"row".to_vec(),
+            Some(b"row".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -300,7 +302,7 @@ fn an_empty_lookup_still_cannot_close_the_sealed_version() {
         &EmptySealed,
         key.clone(),
         None,
-        b"v0".to_vec(),
+        Some(b"v0".to_vec()),
         0,
         TxnId(1),
         who(),
@@ -318,7 +320,7 @@ fn an_empty_lookup_still_cannot_close_the_sealed_version() {
             &EmptySealed,
             key,
             None,
-            b"v1".to_vec(),
+            Some(b"v1".to_vec()),
             0,
             TxnId(2),
             who(),
@@ -348,7 +350,7 @@ fn valid_time_update_closes_a_sealed_version_and_keeps_its_interval() {
             &EmptySealed,
             key.clone(),
             Some(iv0),
-            b"role=ic".to_vec(),
+            Some(b"role=ic".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -368,7 +370,7 @@ fn valid_time_update_closes_a_sealed_version_and_keeps_its_interval() {
             &sealed,
             key.clone(),
             Some(iv1),
-            b"role=lead".to_vec(),
+            Some(b"role=lead".to_vec()),
             0,
             TxnId(2),
             who(),
@@ -398,7 +400,8 @@ fn valid_time_update_closes_a_sealed_version_and_keeps_its_interval() {
     )
     .expect("resolve")
     .expect("live at c1");
-    let (valid_now, user_now) = unframe_payload(true, &live_now.payload).expect("unframe");
+    let (valid_now, user_now) =
+        unframe_payload(true, live_now.payload.as_deref().unwrap()).expect("unframe");
     assert_eq!(
         valid_now,
         Some(iv1),
@@ -413,7 +416,8 @@ fn valid_time_update_closes_a_sealed_version_and_keeps_its_interval() {
         merge::resolve_open(&delta_versions, &sealed_versions, &index, &key, just_before)
             .expect("resolve")
             .expect("live before c1");
-    let (valid_prior, user_prior) = unframe_payload(true, &live_prior.payload).expect("unframe");
+    let (valid_prior, user_prior) =
+        unframe_payload(true, live_prior.payload.as_deref().unwrap()).expect("unframe");
     assert_eq!(
         valid_prior,
         Some(iv0),
@@ -465,12 +469,12 @@ fn lookup_consults_only_segments_a_zone_map_cannot_rule_out() {
     let acct = BusinessKey::new(b"acct".to_vec());
     let got = sealed.versions_for(&acct).expect("lookup");
     assert_eq!(got.len(), 1);
-    assert_eq!(got[0].payload, b"a-high");
+    assert_eq!(got[0].payload.as_deref(), Some(&b"a-high"[..]));
 
     let zzz = BusinessKey::new(b"zzz".to_vec());
     let got = sealed.versions_for(&zzz).expect("lookup");
     assert_eq!(got.len(), 1);
-    assert_eq!(got[0].payload, b"b-high");
+    assert_eq!(got[0].payload.as_deref(), Some(&b"b-high"[..]));
 
     // A key bracketed by neither segment prunes both — no versions, no scan.
     let mmm = BusinessKey::new(b"mmm".to_vec());

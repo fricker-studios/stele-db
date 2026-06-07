@@ -155,7 +155,7 @@ fn version(key: &[u8], sys_from: i64, payload: &[u8]) -> Version {
             SystemTimeMicros(sys_from),
             Principal::new(format!("svc-{sys_from}").into_bytes()),
         ),
-        payload.to_vec(),
+        Some(payload.to_vec()),
     )
 }
 
@@ -271,8 +271,8 @@ fn time_slice_query_scans_only_matching_segment() {
 
     // Exactly the two era1 rows are live at snapshot 150.
     assert_eq!(scanned.len(), 2);
-    assert_eq!(scanned[0].payload, b"a@era1");
-    assert_eq!(scanned[1].payload, b"b@era1");
+    assert_eq!(scanned[0].payload.as_deref(), Some(&b"a@era1"[..]));
+    assert_eq!(scanned[1].payload.as_deref(), Some(&b"b@era1"[..]));
 
     // Reading every segment unconditionally must cost strictly more I/O than
     // the pruned scan — proof the prune actually saved reads, not just that
@@ -451,7 +451,8 @@ fn might_contain_never_prunes_a_real_match() {
 fn valid_version(key: &[u8], valid_from: i64, valid_to: i64) -> Version {
     let interval = ValidInterval::new(ValidTimeMicros(valid_from), ValidTimeMicros(valid_to))
         .expect("well-formed valid interval");
-    let payload = frame_payload(true, Some(interval), b"row".to_vec()).expect("frame payload");
+    let payload =
+        frame_payload(true, Some(interval), Some(b"row".to_vec())).expect("frame payload");
     Version::open(
         BusinessKey::new(key.to_vec()),
         SystemTimeMicros(0),
@@ -725,7 +726,7 @@ fn might_contain_never_prunes_a_real_match_on_truncated_payload() {
             let predicate = if rng.below(2) == 0 {
                 let value = if rng.below(2) == 0 && !rows.is_empty() {
                     let idx = rng.below(rows.len() as u64) as usize;
-                    rows[idx].0.payload.clone()
+                    rows[idx].0.payload.clone().unwrap()
                 } else {
                     let len = 40 + rng.below(50) as usize;
                     stress_bytes(&mut rng, len)
@@ -754,14 +755,14 @@ fn might_contain_never_prunes_a_real_match_on_truncated_payload() {
                     Predicate::Eq {
                         value: ZoneBound::Bytes(value),
                         ..
-                    } => v.payload == *value,
+                    } => v.payload.as_deref() == Some(value.as_slice()),
                     Predicate::Range {
                         low: ZoneBound::Bytes(low),
                         high: ZoneBound::Bytes(high),
                         ..
                     } => {
-                        v.payload.as_slice() >= low.as_slice()
-                            && v.payload.as_slice() <= high.as_slice()
+                        v.payload.as_deref().unwrap() >= low.as_slice()
+                            && v.payload.as_deref().unwrap() <= high.as_slice()
                     }
                     _ => unreachable!("only bytes Eq/Range predicates are built above"),
                 };
@@ -982,8 +983,8 @@ fn validity_index_prune_skips_an_all_superseded_segment() {
     let chains = fold_chains(raw, &index).expect("fold");
     let live = resolve_snapshot(&chains, snapshot);
     assert_eq!(live.len(), 2);
-    assert_eq!(live[0].payload, b"a@era1");
-    assert_eq!(live[1].payload, b"b@era1");
+    assert_eq!(live[0].payload.as_deref(), Some(&b"a@era1"[..]));
+    assert_eq!(live[1].payload.as_deref(), Some(&b"b@era1"[..]));
 
     // I/O proof: pruning era0 on the index avoids its bulk-column reads. The
     // index-composed keep scans only era1's chunks; the zone-only keep would also

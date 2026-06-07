@@ -176,20 +176,29 @@ impl ValidInterval {
 /// * system-only table **with** an interval → [`ValidTimeError::ValidTimeNotSupported`].
 /// * system-only table **without** an interval → payload unchanged.
 ///
+/// A `None` (SQL `NULL`) user payload ([STL-154]) passes through unchanged on a
+/// system-only table — the `None` is carried distinctly all the way to the
+/// durable record. On a valid-time table the interval prefix must still be
+/// stored, so a `NULL` user value degrades to an empty bare payload behind the
+/// prefix; this edge is unreachable from v0.1 DML (a valid-time table is never
+/// the two-column `(key, payload)` shape the binder requires), but is defined
+/// rather than left to panic.
+///
 /// # Errors
 ///
 /// The two policy-mismatch variants above.
 pub fn frame_payload(
     enabled: bool,
     valid: Option<ValidInterval>,
-    user_payload: Vec<u8>,
-) -> Result<Vec<u8>, ValidTimeError> {
+    user_payload: Option<Vec<u8>>,
+) -> Result<Option<Vec<u8>>, ValidTimeError> {
     match (enabled, valid) {
         (true, Some(interval)) => {
-            let mut out = Vec::with_capacity(VALID_TIME_PREFIX_LEN + user_payload.len());
+            let user = user_payload.unwrap_or_default();
+            let mut out = Vec::with_capacity(VALID_TIME_PREFIX_LEN + user.len());
             interval.encode_prefix(&mut out);
-            out.extend_from_slice(&user_payload);
-            Ok(out)
+            out.extend_from_slice(&user);
+            Ok(Some(out))
         }
         (true, None) => Err(ValidTimeError::ValidTimeRequired),
         (false, None) => Ok(user_payload),
@@ -315,7 +324,7 @@ impl<C: Clock> ValidTimeWriter<C> {
         sealed: &S,
         key: BusinessKey,
         valid: Option<ValidInterval>,
-        payload: Vec<u8>,
+        payload: Option<Vec<u8>>,
         seq: u64,
         txn_id: TxnId,
         principal: Principal,
@@ -345,7 +354,7 @@ impl<C: Clock> ValidTimeWriter<C> {
         sealed: &S,
         key: BusinessKey,
         valid: Option<ValidInterval>,
-        payload: Vec<u8>,
+        payload: Option<Vec<u8>>,
         seq: u64,
         txn_id: TxnId,
         principal: Principal,
@@ -404,7 +413,7 @@ impl<C: Clock> ValidTimeWriter<C> {
         sealed: &S,
         key: BusinessKey,
         valid: Option<ValidInterval>,
-        payload: Vec<u8>,
+        payload: Option<Vec<u8>>,
         seq: u64,
         txn_id: TxnId,
         principal: Principal,
@@ -431,7 +440,7 @@ impl<C: Clock> ValidTimeWriter<C> {
         sealed: &S,
         key: BusinessKey,
         valid: Option<ValidInterval>,
-        payload: Vec<u8>,
+        payload: Option<Vec<u8>>,
         seq: u64,
         txn_id: TxnId,
         principal: Principal,
@@ -504,7 +513,9 @@ mod tests {
 
     #[test]
     fn frame_then_unframe_round_trips_on_a_valid_time_table() {
-        let framed = frame_payload(true, Some(iv(7, 42)), b"salary=100".to_vec()).unwrap();
+        let framed = frame_payload(true, Some(iv(7, 42)), Some(b"salary=100".to_vec()))
+            .unwrap()
+            .expect("valid-time framing always yields a present payload");
         assert_eq!(framed.len(), VALID_TIME_PREFIX_LEN + b"salary=100".len());
 
         let (interval, user) = unframe_payload(true, &framed).unwrap();
@@ -514,23 +525,30 @@ mod tests {
 
     #[test]
     fn system_only_table_passes_payload_through_untouched() {
-        let framed = frame_payload(false, None, b"row".to_vec()).unwrap();
-        assert_eq!(framed, b"row");
-        let (interval, user) = unframe_payload(false, &framed).unwrap();
+        let framed = frame_payload(false, None, Some(b"row".to_vec())).unwrap();
+        assert_eq!(framed, Some(b"row".to_vec()));
+        let (interval, user) = unframe_payload(false, framed.as_deref().unwrap()).unwrap();
         assert_eq!(interval, None);
         assert_eq!(user, b"row");
+    }
+
+    #[test]
+    fn system_only_table_carries_a_null_payload_through() {
+        // A `None` (SQL NULL) user payload passes through unchanged on a
+        // system-only table — never collapsing into empty bytes ([STL-154]).
+        assert_eq!(frame_payload(false, None, None).unwrap(), None);
     }
 
     #[test]
     fn policy_mismatches_are_rejected_both_ways() {
         // Valid-time table, no interval supplied.
         assert!(matches!(
-            frame_payload(true, None, b"x".to_vec()),
+            frame_payload(true, None, Some(b"x".to_vec())),
             Err(ValidTimeError::ValidTimeRequired)
         ));
         // System-only table, interval supplied.
         assert!(matches!(
-            frame_payload(false, Some(iv(1, 2)), b"x".to_vec()),
+            frame_payload(false, Some(iv(1, 2)), Some(b"x".to_vec())),
             Err(ValidTimeError::ValidTimeNotSupported)
         ));
     }
@@ -549,7 +567,9 @@ mod tests {
         // A valid-time segment stores the bare payload + the interval columns;
         // `reframe_payload` rebuilds exactly the framed bytes `frame_payload`
         // produced, so a reconstructed Version round-trips byte-for-byte.
-        let framed = frame_payload(true, Some(iv(7, 42)), b"salary=100".to_vec()).unwrap();
+        let framed = frame_payload(true, Some(iv(7, 42)), Some(b"salary=100".to_vec()))
+            .unwrap()
+            .expect("valid-time framing always yields a present payload");
         let (interval, user) = unframe_payload(true, &framed).unwrap();
         let interval = interval.unwrap();
         let reframed = reframe_payload(interval.from.0, interval.to.0, user);
@@ -567,7 +587,9 @@ mod tests {
 
     #[test]
     fn empty_user_payload_is_legal_with_a_prefix() {
-        let framed = frame_payload(true, Some(iv(1, 2)), Vec::new()).unwrap();
+        let framed = frame_payload(true, Some(iv(1, 2)), Some(Vec::new()))
+            .unwrap()
+            .expect("valid-time framing always yields a present payload");
         assert_eq!(framed.len(), VALID_TIME_PREFIX_LEN);
         let (interval, user) = unframe_payload(true, &framed).unwrap();
         assert_eq!(interval, Some(iv(1, 2)));

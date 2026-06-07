@@ -165,7 +165,7 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
         sealed: &S,
         key: BusinessKey,
         valid: Option<ValidInterval>,
-        payload: Vec<u8>,
+        payload: Option<Vec<u8>>,
         seq: u64,
         txn_id: TxnId,
         principal: Principal,
@@ -200,7 +200,7 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
         sealed: &S,
         key: BusinessKey,
         valid: Option<ValidInterval>,
-        payload: Vec<u8>,
+        payload: Option<Vec<u8>>,
         seq: u64,
         txn_id: TxnId,
         principal: Principal,
@@ -471,7 +471,7 @@ mod tests {
                 SystemTimeMicros(20),
                 Principal::new(b"b".to_vec()),
             ),
-            b"new".to_vec(),
+            Some(b"new".to_vec()),
         ));
 
         let record = encode_redo(&[close.clone(), opened.clone()]).expect("encode");
@@ -518,7 +518,7 @@ mod tests {
             SystemTimeMicros(1),
             0,
             Provenance::new(TxnId(1), SystemTimeMicros(1), Principal::new(b"a".to_vec())),
-            b"value".to_vec(),
+            Some(b"value".to_vec()),
         ));
         let record = encode_redo(&[redo]).expect("encode");
         let err = decode_redo(&record[..record.len() - 1]).unwrap_err();
@@ -555,7 +555,7 @@ mod tests {
             SystemTimeMicros(1),
             0,
             Provenance::new(TxnId(1), SystemTimeMicros(1), Principal::new(b"a".to_vec())),
-            b"v".to_vec(),
+            Some(b"v".to_vec()),
         ))])
         .expect("encode");
         wal.append(&record).expect("append");

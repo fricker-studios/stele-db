@@ -35,9 +35,11 @@
 //! Multi-row `INSERT`, `INSERT … SELECT`, a `WHERE` that is not `<key> =
 //! <literal>` (including a whole-table `UPDATE`/`DELETE` with no `WHERE`),
 //! updating the key column, multi-column-payload tables, `RETURNING`, `ON
-//! CONFLICT`, `USING`/`FROM` joins, qualified names, and `NULL` or out-of-range
-//! literals. Folding a `TIMESTAMP`/`DATE` literal is also out of scope at v0.1
-//! (no civil-time codec — mirrors the [`AS OF`](crate::select) stance).
+//! CONFLICT`, `USING`/`FROM` joins, qualified names, a `NULL` business key, and
+//! out-of-range literals. A `NULL` **payload** is accepted (it folds to `None`,
+//! [STL-154]); a `NULL` key is not. Folding a `TIMESTAMP`/`DATE` literal is also
+//! out of scope at v0.1 (no civil-time codec — mirrors the
+//! [`AS OF`](crate::select) stance).
 
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, Insert, ObjectName,
@@ -65,8 +67,9 @@ pub enum BoundDml {
         schema_id: SchemaId,
         /// The business key (the first column's value).
         key: ScalarValue,
-        /// The opaque payload (the second column's value).
-        payload: ScalarValue,
+        /// The opaque payload (the second column's value), or `None` for a SQL
+        /// `NULL` payload ([STL-154]).
+        payload: Option<ScalarValue>,
     },
     /// `UPDATE`: close `key`'s prior period and open a new one with `payload`.
     Update {
@@ -76,8 +79,9 @@ pub enum BoundDml {
         schema_id: SchemaId,
         /// The business key the `WHERE` clause selected.
         key: ScalarValue,
-        /// The new opaque payload from the `SET` clause.
-        payload: ScalarValue,
+        /// The new opaque payload from the `SET` clause, or `None` for a SQL
+        /// `NULL` payload ([STL-154]).
+        payload: Option<ScalarValue>,
     },
     /// `DELETE`: close `key`'s prior period with no successor (a period close,
     /// not a row removal — history is preserved).
@@ -270,9 +274,9 @@ pub enum DmlError {
         literal: String,
     },
 
-    /// A `NULL` was bound to a key or payload. v0.1 models nullability one level
-    /// up (`Option<ScalarValue>`) and the DML write path does not carry it yet —
-    /// and a business key is never null.
+    /// A `NULL` was bound to the **business key**. A key is the identity a
+    /// version's history hangs on and is never null. (A `NULL` *payload* is
+    /// supported — it folds to `None` through `fold_payload`, [STL-154].)
     #[error("NULL is not supported for column {column:?} in table {table:?} in v0.1 DML")]
     NullValue {
         /// The table written.
@@ -360,7 +364,7 @@ fn bind_insert(insert: &Insert, ctx: &BindContext) -> Result<BoundDml, DmlError>
         table: table.clone(),
         schema_id: schema.schema_id(),
         key: fold_value(key_expr, &table, key_col)?,
-        payload: fold_value(payload_expr, &table, payload_col)?,
+        payload: fold_payload(payload_expr, &table, payload_col)?,
     })
 }
 
@@ -490,7 +494,7 @@ fn bind_update(update: &Update, ctx: &BindContext) -> Result<BoundDml, DmlError>
     }
 
     let key = key_predicate(update.selection.as_ref(), &table, key_col)?;
-    let payload = fold_value(&assignment.value, &table, payload_col)?;
+    let payload = fold_payload(&assignment.value, &table, payload_col)?;
     Ok(BoundDml::Update {
         table,
         schema_id: schema.schema_id(),
@@ -648,8 +652,27 @@ fn column_side(expr: &Expr) -> Result<Option<&str>, DmlError> {
     }
 }
 
+/// Fold a payload-column literal, accepting SQL `NULL` as `None` ([STL-154]).
+///
+/// The payload column is nullable end to end (storage carries a `None` payload
+/// distinctly), so `NULL` here is a valid write rather than a rejected one — the
+/// sibling of [`fold_value`], which still rejects `NULL` for the never-null
+/// business key. A present literal folds through [`fold_value`] unchanged.
+fn fold_payload(
+    expr: &Expr,
+    table: &str,
+    column: &ColumnDef,
+) -> Result<Option<ScalarValue>, DmlError> {
+    if is_null(expr) {
+        return Ok(None);
+    }
+    fold_value(expr, table, column).map(Some)
+}
+
 /// Fold a literal expression into a [`ScalarValue`] of `column`'s type, rejecting
-/// `NULL`, type mismatches, and out-of-range / unsupported literals.
+/// `NULL`, type mismatches, and out-of-range / unsupported literals. Used for the
+/// business key (never nullable); the payload column folds through
+/// [`fold_payload`], which accepts `NULL`.
 fn fold_value(expr: &Expr, table: &str, column: &ColumnDef) -> Result<ScalarValue, DmlError> {
     if is_null(expr) {
         return Err(DmlError::NullValue {
@@ -837,7 +860,7 @@ mod tests {
                 table: "account".to_owned(),
                 schema_id: SchemaId(1),
                 key: ScalarValue::Int4(1),
-                payload: ScalarValue::Int4(100),
+                payload: Some(ScalarValue::Int4(100)),
             })
         );
     }
@@ -851,7 +874,7 @@ mod tests {
                 table: "account".to_owned(),
                 schema_id: SchemaId(1),
                 key: ScalarValue::Int4(1),
-                payload: ScalarValue::Int4(250),
+                payload: Some(ScalarValue::Int4(250)),
             })
         );
     }
@@ -882,7 +905,7 @@ mod tests {
                 table: "account".to_owned(),
                 schema_id: SchemaId(1),
                 key: ScalarValue::Int4(1),
-                payload: ScalarValue::Int4(100),
+                payload: Some(ScalarValue::Int4(100)),
             })
         );
     }
@@ -909,7 +932,7 @@ mod tests {
         else {
             panic!("expected an INSERT");
         };
-        assert_eq!(payload, ScalarValue::Int4(-42));
+        assert_eq!(payload, Some(ScalarValue::Int4(-42)));
     }
 
     #[test]
@@ -997,13 +1020,53 @@ mod tests {
     }
 
     #[test]
-    fn null_is_rejected() {
+    fn null_payload_is_accepted() {
+        // A NULL payload folds to `None` — a valid write, not a rejection
+        // ([STL-154]). The key stays its concrete value.
         let catalog = account_catalog();
         assert_eq!(
             bind("INSERT INTO account VALUES (1, NULL)", &catalog),
+            Ok(BoundDml::Insert {
+                table: "account".to_owned(),
+                schema_id: SchemaId(1),
+                key: ScalarValue::Int4(1),
+                payload: None,
+            })
+        );
+    }
+
+    #[test]
+    fn null_payload_in_update_is_accepted() {
+        let catalog = account_catalog();
+        assert_eq!(
+            bind("UPDATE account SET balance = NULL WHERE id = 1", &catalog),
+            Ok(BoundDml::Update {
+                table: "account".to_owned(),
+                schema_id: SchemaId(1),
+                key: ScalarValue::Int4(1),
+                payload: None,
+            })
+        );
+    }
+
+    #[test]
+    fn null_key_is_rejected() {
+        // The business key is never nullable — a NULL key is still refused
+        // ([STL-154] lifts the rejection for the payload only).
+        let catalog = account_catalog();
+        assert_eq!(
+            bind("INSERT INTO account VALUES (NULL, 100)", &catalog),
             Err(DmlError::NullValue {
                 table: "account".to_owned(),
-                column: "balance".to_owned(),
+                column: "id".to_owned(),
+            })
+        );
+        // A NULL key in a WHERE predicate is refused too.
+        assert_eq!(
+            bind("DELETE FROM account WHERE id = NULL", &catalog),
+            Err(DmlError::NullValue {
+                table: "account".to_owned(),
+                column: "id".to_owned(),
             })
         );
     }
@@ -1152,7 +1215,7 @@ mod tests {
                 table: "flags".to_owned(),
                 schema_id: SchemaId(1),
                 key: ScalarValue::Text("alpha".to_owned()),
-                payload: ScalarValue::Bool(true),
+                payload: Some(ScalarValue::Bool(true)),
             })
         );
     }

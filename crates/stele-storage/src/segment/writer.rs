@@ -22,8 +22,9 @@ use crate::validtime::{VALID_TIME_PREFIX_LEN, unframe_payload};
 
 use super::SegmentError;
 use super::format::{
-    CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FORMAT_VERSION, HEADER_LEN, HEADER_MAGIC,
-    MAX_BYTES_STAT_PREFIX_LEN, SCHEMA_ID_IMPLICIT_VERSION, TRAILER_LEN, TRAILER_MAGIC,
+    BYTES_NULL_SENTINEL, CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FORMAT_VERSION, HEADER_LEN,
+    HEADER_MAGIC, MAX_BYTES_STAT_PREFIX_LEN, SCHEMA_ID_IMPLICIT_VERSION, TRAILER_LEN,
+    TRAILER_MAGIC,
 };
 
 /// Streaming writer over a single sealed-segment file.
@@ -279,7 +280,10 @@ fn encode_column(
             // columns instead ([STL-119]). `extract_bytes` strips it for the
             // `Payload` column when that holds.
             let valid_time = valid_pairs.is_some();
-            let mut vals: Vec<&[u8]> = Vec::with_capacity(rows.len());
+            // A `None` here is a SQL `NULL` cell (only the `Payload` column ever
+            // yields one); `encode_bytes_values` writes the reserved sentinel for
+            // it ([STL-154]).
+            let mut vals: Vec<Option<&[u8]>> = Vec::with_capacity(rows.len());
             for row in rows {
                 vals.push(extract_bytes(col, row, valid_time)?);
             }
@@ -322,12 +326,16 @@ fn encode_retraction_column(
     closes: &[Close],
 ) -> Result<EncodedColumn, SegmentError> {
     match col {
+        // Retraction tombstone bytes columns are never NULL — wrap each value as
+        // present so it shares the `Option`-aware bytes encoder ([STL-154]).
         ColumnId::RetractKey => {
-            encode_bytes_values(closes.iter().map(|c| c.business_key.as_bytes()))
+            encode_bytes_values(closes.iter().map(|c| Some(c.business_key.as_bytes())))
         }
-        ColumnId::RetractClosedByPrincipal => {
-            encode_bytes_values(closes.iter().map(|c| c.closed_by.principal.as_bytes()))
-        }
+        ColumnId::RetractClosedByPrincipal => encode_bytes_values(
+            closes
+                .iter()
+                .map(|c| Some(c.closed_by.principal.as_bytes())),
+        ),
         ColumnId::RetractSysFrom => Ok(encode_i64_values(closes.iter().map(|c| c.sys_from.0))),
         // `seq` is a u64; store its bits in the i64 column (lossless round-trip —
         // see `ColumnId::RetractSeq`, same reinterpretation as `TxnId`).
@@ -361,14 +369,27 @@ fn encode_retraction_column(
 /// its no-false-negatives contract. This caps every bytes column's footer cost
 /// regardless of value size.
 fn encode_bytes_values<'a>(
-    values: impl Iterator<Item = &'a [u8]>,
+    values: impl Iterator<Item = Option<&'a [u8]>>,
 ) -> Result<EncodedColumn, SegmentError> {
     let mut payload = Vec::new();
     let mut min: Option<&[u8]> = None;
     let mut max: Option<&[u8]> = None;
-    for bytes in values {
+    for value in values {
+        let Some(bytes) = value else {
+            // SQL `NULL`: the reserved sentinel length, no value bytes, and no
+            // contribution to the zone-map min/max ([STL-154]).
+            payload.extend_from_slice(&BYTES_NULL_SENTINEL.to_le_bytes());
+            continue;
+        };
         let len = u32::try_from(bytes.len())
             .map_err(|_| SegmentError::TooLarge("value length exceeds u32::MAX in one chunk"))?;
+        // A present value can never reach the sentinel length — the frame ceiling
+        // (`MAX_VERSION_FRAME_LEN`, 16 MiB) caps it far below `u32::MAX` — so a
+        // present cell and a NULL cell are always distinguishable on read.
+        debug_assert_ne!(
+            len, BYTES_NULL_SENTINEL,
+            "present value reached NULL sentinel length"
+        );
         payload.extend_from_slice(&len.to_le_bytes());
         payload.extend_from_slice(bytes);
         min = Some(min.map_or(bytes, |m| if bytes < m { bytes } else { m }));
@@ -439,9 +460,15 @@ fn bounded_max_prefix(value: &[u8]) -> Vec<u8> {
     Vec::new()
 }
 
-fn extract_bytes(col: ColumnId, row: &Version, valid_time: bool) -> Result<&[u8], SegmentError> {
+// `None` is a SQL `NULL` cell — only the `Payload` column can produce one; every
+// other bytes column is always present, returned as `Some` ([STL-154]).
+fn extract_bytes(
+    col: ColumnId,
+    row: &Version,
+    valid_time: bool,
+) -> Result<Option<&[u8]>, SegmentError> {
     match col {
-        ColumnId::BusinessKey => Ok(row.business_key.as_bytes()),
+        ColumnId::BusinessKey => Ok(Some(row.business_key.as_bytes())),
         // On a valid-time segment the interval lives in the valid_from /
         // valid_to columns, so the payload column stores only the bare user
         // payload — strip the 16-byte prefix rather than persist it twice
@@ -450,19 +477,22 @@ fn extract_bytes(col: ColumnId, row: &Version, valid_time: bool) -> Result<&[u8]
         // prefix length — slice it off directly rather than re-parse and
         // re-validate the interval per row on the flush hot path. The `get`
         // still guards a truncated payload as `Corrupt`. A system-only segment
-        // stores the payload verbatim.
-        ColumnId::Payload => {
-            if valid_time {
-                row.payload
+        // stores the payload verbatim. A `None` payload (SQL `NULL`) is carried
+        // through as `None`; it never reaches the valid-time branch because a
+        // valid-time row's payload always carries the interval prefix.
+        ColumnId::Payload => match &row.payload {
+            None => Ok(None),
+            Some(bytes) if valid_time => {
+                bytes
                     .get(VALID_TIME_PREFIX_LEN..)
+                    .map(Some)
                     .ok_or(SegmentError::Corrupt(
                         "valid-time payload shorter than its interval prefix",
                     ))
-            } else {
-                Ok(&row.payload)
             }
-        }
-        ColumnId::Principal => Ok(row.provenance.principal.as_bytes()),
+            Some(bytes) => Ok(Some(bytes)),
+        },
+        ColumnId::Principal => Ok(Some(row.provenance.principal.as_bytes())),
         ColumnId::SysFrom
         | ColumnId::Seq
         | ColumnId::TxnId
@@ -526,7 +556,12 @@ fn extract_i64(col: ColumnId, row: &Version) -> i64 {
 fn decode_valid_pairs(rows: &[Version]) -> Result<Vec<(i64, i64)>, SegmentError> {
     rows.iter()
         .map(|row| {
-            let (interval, _user) = unframe_payload(true, &row.payload).map_err(|_| {
+            // A valid-time row's payload always carries the interval prefix, so a
+            // `None` (SQL `NULL`) payload here is a malformed row ([STL-154]).
+            let stored = row.payload.as_deref().ok_or(SegmentError::Corrupt(
+                "valid-time row has a NULL payload, which cannot carry a valid-time interval",
+            ))?;
+            let (interval, _user) = unframe_payload(true, stored).map_err(|_| {
                 SegmentError::Corrupt(
                     "valid-time payload could not be decoded into valid_from/valid_to columns",
                 )

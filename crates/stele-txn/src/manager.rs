@@ -493,7 +493,7 @@ mod tests {
             commit,
             0,
             Provenance::new(txn_id, commit, Principal::new(b"tester".to_vec())),
-            format!("v@{}", commit.0).into_bytes(),
+            Some(format!("v@{}", commit.0).into_bytes()),
         )
     }
 
@@ -510,7 +510,9 @@ mod tests {
             .expect("range scan")
             .into_iter()
             .next()
-            .map(|v| v.payload)
+            // These tests never write a SQL NULL payload, so a present version
+            // always carries one — flatten the now-`Option` payload ([STL-154]).
+            .and_then(|v| v.payload)
     }
 
     /// The DoD's headline guarantee: a reader at snapshot `s` keeps seeing the

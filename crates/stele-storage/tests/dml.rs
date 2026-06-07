@@ -127,7 +127,7 @@ fn insert_update_delete_flow_through_wal_then_delta() {
             &EmptySealed,
             key.clone(),
             None,
-            b"v0".to_vec(),
+            Some(b"v0".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -141,7 +141,7 @@ fn insert_update_delete_flow_through_wal_then_delta() {
             &EmptySealed,
             key.clone(),
             None,
-            b"v1".to_vec(),
+            Some(b"v1".to_vec()),
             0,
             TxnId(2),
             who(),
@@ -182,8 +182,8 @@ fn insert_update_delete_flow_through_wal_then_delta() {
     assert_eq!(versions.len(), 2);
     assert_eq!((versions[0].sys_from, versions[0].sys_to), (c0, c1));
     assert_eq!((versions[1].sys_from, versions[1].sys_to), (c1, c2));
-    assert_eq!(versions[0].payload, b"v0");
-    assert_eq!(versions[1].payload, b"v1");
+    assert_eq!(versions[0].payload.as_deref(), Some(&b"v0"[..]));
+    assert_eq!(versions[1].payload.as_deref(), Some(&b"v1"[..]));
     assert!(
         versions.iter().all(|v| v.closed_by.is_some()),
         "both periods are closed and carry their closer's provenance"
@@ -206,7 +206,7 @@ fn insert_on_a_live_key_is_rejected_through_the_dml_path() {
         &EmptySealed,
         key.clone(),
         None,
-        b"a".to_vec(),
+        Some(b"a".to_vec()),
         0,
         TxnId(1),
         who(),
@@ -219,7 +219,7 @@ fn insert_on_a_live_key_is_rejected_through_the_dml_path() {
             &EmptySealed,
             key,
             None,
-            b"b".to_vec(),
+            Some(b"b".to_vec()),
             0,
             TxnId(2),
             who(),
@@ -276,7 +276,7 @@ fn wal_replay_reconstructs_the_delta_under_seed_sweep() {
                         &EmptySealed,
                         key,
                         Some(iv),
-                        b"u".to_vec(),
+                        Some(b"u".to_vec()),
                         0,
                         txn,
                         who(),
@@ -294,7 +294,7 @@ fn wal_replay_reconstructs_the_delta_under_seed_sweep() {
                     &EmptySealed,
                     key,
                     Some(iv),
-                    b"i".to_vec(),
+                    Some(b"i".to_vec()),
                     0,
                     txn,
                     who(),
@@ -322,7 +322,8 @@ fn wal_replay_reconstructs_the_delta_under_seed_sweep() {
         // And the framed valid-time prefix survived the WAL round-trip.
         for chain in replayed_chains.values() {
             for v in chain {
-                let (interval, _user) = unframe_payload(true, &v.payload).expect("unframe");
+                let (interval, _user) =
+                    unframe_payload(true, v.payload.as_deref().unwrap()).expect("unframe");
                 assert!(interval.is_some(), "seed {seed}: valid interval preserved");
             }
         }
@@ -381,7 +382,7 @@ fn timeline_reconstructs_with_no_gaps_or_overlaps_under_seed_sweep() {
                             &EmptySealed,
                             key,
                             None,
-                            b"u".to_vec(),
+                            Some(b"u".to_vec()),
                             0,
                             txn,
                             who(),
@@ -404,7 +405,7 @@ fn timeline_reconstructs_with_no_gaps_or_overlaps_under_seed_sweep() {
                         &EmptySealed,
                         key,
                         None,
-                        b"i".to_vec(),
+                        Some(b"i".to_vec()),
                         0,
                         txn,
                         who(),

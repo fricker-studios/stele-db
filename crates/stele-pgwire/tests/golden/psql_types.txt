@@ -4,3 +4,4 @@ text|hello, 世界
 bool|t
 timestamp|2023-11-14 22:13:20
 date|2023-11-14
+null|\N

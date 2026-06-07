@@ -200,7 +200,7 @@ mod tests {
                 SystemTimeMicros(sys_from),
                 Principal::new(b"birth".to_vec()),
             ),
-            b"body".to_vec(),
+            Some(b"body".to_vec()),
         )
     }
 
@@ -233,7 +233,11 @@ mod tests {
         let chain = &chains[&BusinessKey::new(b"k".to_vec())];
         let v = &chain[&(SystemTimeMicros(10), 0)];
         assert_eq!(v.sys_to, SystemTimeMicros(20), "index closes the interval");
-        assert_eq!(v.payload, b"body", "body is preserved");
+        assert_eq!(
+            v.payload.as_deref(),
+            Some(&b"body"[..]),
+            "body is preserved"
+        );
         assert_eq!(v.provenance.principal, Principal::new(b"birth".to_vec()));
         assert_eq!(
             v.closed_by.as_ref().unwrap().principal,
@@ -323,7 +327,7 @@ mod tests {
                 SystemTimeMicros(sys_from),
                 Principal::new(b"birth".to_vec()),
             ),
-            b"body".to_vec(),
+            Some(b"body".to_vec()),
         )
     }
 

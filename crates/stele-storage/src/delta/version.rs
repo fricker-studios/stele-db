@@ -18,8 +18,11 @@
 //!   carried as first-class fields here (and as first-class columns in a sealed
 //!   segment) rather than inside `payload` — so it survives WAL replay and
 //!   compresses on its own column statistics ([STL-93]).
-//! * `payload` — the column values, encoded by a layer above. The delta tier
-//!   treats this as opaque bytes.
+//! * `payload` — the column values, encoded by a layer above, or `None` for a
+//!   SQL `NULL` cell ([STL-154]). The delta tier treats a present payload as
+//!   opaque bytes and a `None` as a distinct, value-less cell — the two are kept
+//!   apart on the durable record so a `NULL` survives WAL replay rather than
+//!   collapsing to empty bytes.
 //!
 //! ## `sys_to` / `closed_by` are a **resolution overlay**, never persisted
 //!
@@ -63,6 +66,12 @@
 //! +----------------------+-----------------+-------------------+
 //! ```
 //!
+//! A SQL `NULL` payload ([STL-154]) is encoded by setting `payload_len` to the
+//! reserved sentinel [`PAYLOAD_NULL_SENTINEL`] (`u32::MAX`) with **no** payload
+//! bytes in the body. A real payload can never reach that length — the frame is
+//! capped at [`MAX_VERSION_FRAME_LEN`] (16 MiB) — so the sentinel is
+//! unambiguous and needs no separate null flag.
+//!
 //! There is no `sys_to` or close-provenance group in the frame — those are the
 //! validity-index overlay described above, not part of the durable record.
 //!
@@ -86,6 +95,14 @@ pub(crate) const HEADER_LEN: usize = 44;
 /// enforces `MAX_PAYLOAD_LEN = 16 MiB`, so a delta-tier frame can never
 /// legitimately exceed that.
 pub const MAX_VERSION_FRAME_LEN: usize = 16 * 1024 * 1024;
+
+/// The `payload_len` value reserved to mean "this version's payload is SQL
+/// `NULL`" ([STL-154]). A present payload is bounded by [`MAX_VERSION_FRAME_LEN`]
+/// (16 MiB), so it can never legitimately reach `u32::MAX`; reusing that
+/// otherwise-impossible length as a sentinel lets a `None` payload round-trip
+/// through the frame with no separate null flag and no format-version bump (the
+/// frame is unversioned, and the value was previously unreachable).
+pub(crate) const PAYLOAD_NULL_SENTINEL: u32 = u32::MAX;
 
 /// Opaque business-key bytes — the user/PK or hash key for a logical row.
 ///
@@ -146,7 +163,11 @@ pub struct Version {
     /// sourced from the [validity index](crate::validity) at read time
     /// ([ADR-0023], [STL-118]).
     pub closed_by: Option<Provenance>,
-    pub payload: Vec<u8>,
+    /// The column values encoded by a layer above, or `None` for a SQL `NULL`
+    /// cell ([STL-154]). Persisted distinctly on the durable record (see the
+    /// `PAYLOAD_NULL_SENTINEL` frame encoding) so a `NULL` is never confused
+    /// with an empty payload.
+    pub payload: Option<Vec<u8>>,
 }
 
 impl Version {
@@ -159,7 +180,7 @@ impl Version {
         sys_from: SystemTimeMicros,
         seq: u64,
         provenance: Provenance,
-        payload: Vec<u8>,
+        payload: Option<Vec<u8>>,
     ) -> Self {
         Self {
             business_key,
@@ -179,7 +200,7 @@ impl Version {
     pub fn encoded_size(&self) -> usize {
         HEADER_LEN
             + self.business_key.0.len()
-            + self.payload.len()
+            + self.payload.as_ref().map_or(0, Vec::len)
             + self.provenance.principal.0.len()
     }
 
@@ -195,7 +216,10 @@ impl Version {
     /// [`MAX_VERSION_FRAME_LEN`].
     pub fn check_encodable(&self) -> Result<(), DeltaError> {
         if u32::try_from(self.business_key.0.len()).is_err()
-            || u32::try_from(self.payload.len()).is_err()
+            || self
+                .payload
+                .as_ref()
+                .is_some_and(|p| u32::try_from(p.len()).is_err())
             || u32::try_from(self.provenance.principal.0.len()).is_err()
         {
             return Err(DeltaError::TooLarge(self.encoded_size()));
@@ -224,8 +248,15 @@ impl Version {
         // preflight still gets the typed error instead of a panic.
         let business_len = u32::try_from(self.business_key.0.len())
             .map_err(|_| DeltaError::TooLarge(self.encoded_size()))?;
-        let payload_len = u32::try_from(self.payload.len())
-            .map_err(|_| DeltaError::TooLarge(self.encoded_size()))?;
+        // A `None` payload writes the reserved sentinel and no body bytes; a
+        // present payload writes its real length (bounded well below the
+        // sentinel by `check_encodable`).
+        let payload_len = match &self.payload {
+            None => PAYLOAD_NULL_SENTINEL,
+            Some(p) => {
+                u32::try_from(p.len()).map_err(|_| DeltaError::TooLarge(self.encoded_size()))?
+            }
+        };
         let principal_len = u32::try_from(self.provenance.principal.0.len())
             .map_err(|_| DeltaError::TooLarge(self.encoded_size()))?;
         out.reserve(self.encoded_size());
@@ -237,7 +268,9 @@ impl Version {
         out.extend_from_slice(&self.provenance.committed_at.0.to_le_bytes());
         out.extend_from_slice(&self.seq.to_le_bytes());
         out.extend_from_slice(&self.business_key.0);
-        out.extend_from_slice(&self.payload);
+        if let Some(p) = &self.payload {
+            out.extend_from_slice(p);
+        }
         out.extend_from_slice(&self.provenance.principal.0);
         Ok(())
     }
@@ -278,7 +311,15 @@ impl Version {
         let rd_i64 = |o: usize| i64::from_le_bytes(bytes[o..o + 8].try_into().expect("8 bytes"));
         let rd_u64 = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().expect("8 bytes"));
         let business_len = rd_u32(0) as usize;
-        let payload_len = rd_u32(4) as usize;
+        // The reserved sentinel marks a SQL `NULL` payload: no body bytes, and
+        // the field contributes nothing to the frame length.
+        let payload_raw = rd_u32(4);
+        let payload_is_null = payload_raw == PAYLOAD_NULL_SENTINEL;
+        let payload_len = if payload_is_null {
+            0
+        } else {
+            payload_raw as usize
+        };
         let principal_len = rd_u32(8) as usize;
         let sys_from = rd_i64(12);
         let txn_id = rd_u64(20);
@@ -303,7 +344,11 @@ impl Version {
         let payload_end = bk_end + payload_len;
         let principal_end = payload_end + principal_len;
         let business_key = BusinessKey(bytes[HEADER_LEN..bk_end].to_vec());
-        let payload = bytes[bk_end..payload_end].to_vec();
+        let payload = if payload_is_null {
+            None
+        } else {
+            Some(bytes[bk_end..payload_end].to_vec())
+        };
         let principal = Principal(bytes[payload_end..principal_end].to_vec());
         Ok((
             Self::open(
@@ -344,8 +389,31 @@ mod tests {
                 committed_at: SystemTimeMicros(sys_from),
                 principal: Principal::new(b"tester".to_vec()),
             },
-            payload.to_vec(),
+            Some(payload.to_vec()),
         )
+    }
+
+    #[test]
+    fn null_payload_round_trips_and_is_distinct_from_empty() {
+        // A `None` (SQL NULL) payload survives the frame and decodes back to
+        // `None` — never collapsing into the empty-bytes `Some(vec![])`.
+        let mut null = v(b"k", 9, b"");
+        null.payload = None;
+        let bytes = null.encoded().expect("encode");
+        let (parsed, consumed) = Version::decode(&bytes).expect("decode");
+        assert_eq!(parsed, null);
+        assert_eq!(parsed.payload, None, "NULL stays NULL");
+        assert_eq!(consumed, bytes.len());
+
+        // The same row with an *empty* payload encodes to different bytes and
+        // decodes to `Some(vec![])`, proving the two are not conflated.
+        let empty = v(b"k", 9, b"");
+        assert_eq!(empty.payload, Some(Vec::new()));
+        assert_ne!(
+            empty.encoded().expect("encode"),
+            bytes,
+            "empty payload and NULL payload must not share a frame"
+        );
     }
 
     #[test]
@@ -442,7 +510,7 @@ mod tests {
                 committed_at: SystemTimeMicros(0),
                 principal: Principal::new(b"tester".to_vec()),
             },
-            vec![0u8; MAX_VERSION_FRAME_LEN + 1],
+            Some(vec![0u8; MAX_VERSION_FRAME_LEN + 1]),
         );
         let err = big.check_encodable().unwrap_err();
         assert!(matches!(err, DeltaError::TooLarge(_)));

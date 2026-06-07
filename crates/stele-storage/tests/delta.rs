@@ -135,7 +135,7 @@ fn version(key: &[u8], sys_from: i64, payload: &[u8]) -> Version {
             SystemTimeMicros(sys_from),
             Principal::new(format!("svc-{sys_from}").into_bytes()),
         ),
-        payload.to_vec(),
+        Some(payload.to_vec()),
     )
 }
 
@@ -211,19 +211,19 @@ fn snapshot_returns_latest_live_version_per_key() {
     let s5 = at(5);
     assert_eq!(s5.len(), 1);
     assert_eq!(s5[0].business_key.as_bytes(), b"a");
-    assert_eq!(s5[0].payload, b"v0");
+    assert_eq!(s5[0].payload.as_deref(), Some(&b"v0"[..]));
 
     // At s=15, both keys are live: "a" on v1, "b" on its only version.
     let s15 = at(15);
     assert_eq!(s15.len(), 2);
     assert_eq!(s15[0].business_key.as_bytes(), b"a");
-    assert_eq!(s15[0].payload, b"v1");
+    assert_eq!(s15[0].payload.as_deref(), Some(&b"v1"[..]));
     assert_eq!(s15[1].business_key.as_bytes(), b"b");
-    assert_eq!(s15[1].payload, b"only");
+    assert_eq!(s15[1].payload.as_deref(), Some(&b"only"[..]));
 
     // At s=25, "a" should be on v2.
     let s25 = at(25);
-    assert_eq!(s25[0].payload, b"v2");
+    assert_eq!(s25[0].payload.as_deref(), Some(&b"v2"[..]));
 }
 
 /// `[sys_from, sys_to)` is half-open: a version closed at exactly `s` is not
@@ -283,8 +283,9 @@ fn spill_round_trips_versions_to_disk_and_back() {
         .range_scan(.., Snapshot(SystemTimeMicros(i64::MAX - 1)), &index)
         .unwrap();
     // Same multiset of payloads.
-    let mut got_payloads: Vec<Vec<u8>> = live.iter().map(|v| v.payload.clone()).collect();
-    let mut want_payloads: Vec<Vec<u8>> = written.iter().map(|v| v.payload.clone()).collect();
+    let mut got_payloads: Vec<Option<Vec<u8>>> = live.iter().map(|v| v.payload.clone()).collect();
+    let mut want_payloads: Vec<Option<Vec<u8>>> =
+        written.iter().map(|v| v.payload.clone()).collect();
     got_payloads.sort();
     want_payloads.sort();
     assert_eq!(got_payloads, want_payloads, "spilled reads must round-trip");

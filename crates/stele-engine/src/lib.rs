@@ -207,9 +207,11 @@ pub enum StatementOutcome {
 pub struct SelectResult {
     /// The projected columns, in output order: each a `(name, type)` pair.
     pub columns: Vec<(String, LogicalType)>,
-    /// One entry per result row; each row holds one raw-bytes cell per column,
-    /// aligned to [`columns`](Self::columns).
-    pub rows: Vec<Vec<Vec<u8>>>,
+    /// One entry per result row; each row holds one cell per column, aligned to
+    /// [`columns`](Self::columns). A cell is `Some(bytes)` for a present value
+    /// (the value's canonical encoding) or `None` for a SQL `NULL` ([STL-154]),
+    /// which the wire layer renders as the length-`-1` `DataRow` sentinel.
+    pub rows: Vec<Vec<Option<Vec<u8>>>>,
 }
 
 /// The affected-row count of a committed `INSERT` / `UPDATE` / `DELETE`.
@@ -588,7 +590,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     &table,
                     business_key(&key),
                     None,
-                    encode_value(&payload),
+                    encode_payload(payload.as_ref()),
                     0,
                     txn_id,
                     principal,
@@ -605,7 +607,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     &table,
                     business_key(&key),
                     None,
-                    encode_value(&payload),
+                    encode_payload(payload.as_ref()),
                     0,
                     txn_id,
                     principal,
@@ -636,7 +638,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         table: &str,
         key: BusinessKey,
         valid: Option<ValidInterval>,
-        payload: Vec<u8>,
+        payload: Option<Vec<u8>>,
         seq: u64,
         txn_id: TxnId,
         principal: Principal,
@@ -658,7 +660,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         table: &str,
         key: BusinessKey,
         valid: Option<ValidInterval>,
-        payload: Vec<u8>,
+        payload: Option<Vec<u8>>,
         seq: u64,
         txn_id: TxnId,
         principal: Principal,
@@ -716,6 +718,14 @@ fn encode_value(value: &ScalarValue) -> Vec<u8> {
     bytes
 }
 
+/// Encode an optional payload value into the storage payload form: `Some(bytes)`
+/// for a present value, `None` for a SQL `NULL` cell ([STL-154]). A `None`
+/// payload is carried through to the durable record as a distinct NULL, never an
+/// empty encoding.
+fn encode_payload(value: Option<&ScalarValue>) -> Option<Vec<u8>> {
+    value.map(encode_value)
+}
+
 /// The business key for a folded key [`ScalarValue`] — its canonical encoding, the
 /// same bytes a later `UPDATE` / `DELETE` / `SELECT` folds the literal to, so the
 /// key matches across operations.
@@ -727,20 +737,23 @@ fn business_key(value: &ScalarValue) -> BusinessKey {
 /// order.
 ///
 /// Both projected columns ([`ColumnId::BusinessKey`] and [`ColumnId::Payload`])
-/// are bytes columns; a non-bytes or absent column contributes an empty cell
-/// rather than panicking, but the v0.1 projection never produces one.
-fn batch_to_rows(batch: &Batch, projection: &[ColumnId]) -> Vec<Vec<Vec<u8>>> {
-    let lookup = |id: ColumnId| -> Option<&Vec<Vec<u8>>> {
+/// are bytes columns; a non-bytes or absent column contributes a NULL (`None`)
+/// cell rather than panicking, but the v0.1 projection never produces one. A
+/// present cell carries the value's bytes; a `None` cell is a SQL `NULL`
+/// ([STL-154]) — the payload column is the one that can produce it.
+fn batch_to_rows(batch: &Batch, projection: &[ColumnId]) -> Vec<Vec<Option<Vec<u8>>>> {
+    let lookup = |id: ColumnId| -> Option<&Vec<Option<Vec<u8>>>> {
         batch.columns.iter().find_map(|(cid, col)| match col {
             Column::Bytes(v) if *cid == id => Some(v),
             _ => None,
         })
     };
-    let cols: Vec<Option<&Vec<Vec<u8>>>> = projection.iter().map(|id| lookup(*id)).collect();
+    let cols: Vec<Option<&Vec<Option<Vec<u8>>>>> =
+        projection.iter().map(|id| lookup(*id)).collect();
     (0..batch.rows)
         .map(|r| {
             cols.iter()
-                .map(|col| col.and_then(|c| c.get(r)).cloned().unwrap_or_default())
+                .map(|col| col.and_then(|c| c.get(r)).cloned().flatten())
                 .collect()
         })
         .collect()
@@ -797,7 +810,7 @@ mod tests {
                 "account",
                 BusinessKey::new(b"1".to_vec()),
                 None,
-                b"100".to_vec(),
+                Some(b"100".to_vec()),
                 0,
                 TxnId(1),
                 Principal::new(b"demo".to_vec()),
@@ -859,7 +872,7 @@ mod tests {
                 "solo",
                 BusinessKey::new(b"1".to_vec()),
                 None,
-                Vec::new(),
+                Some(Vec::new()),
                 0,
                 TxnId(1),
                 Principal::new(b"demo".to_vec()),
@@ -896,7 +909,7 @@ mod tests {
                 "account",
                 BusinessKey::new(b"1".to_vec()),
                 None,
-                b"100".to_vec(),
+                Some(b"100".to_vec()),
                 0,
                 TxnId(1),
                 who.clone(),
@@ -907,7 +920,7 @@ mod tests {
                 "account",
                 BusinessKey::new(b"1".to_vec()),
                 None,
-                b"250".to_vec(),
+                Some(b"250".to_vec()),
                 0,
                 TxnId(2),
                 who,
@@ -940,7 +953,7 @@ mod tests {
                 "account",
                 BusinessKey::new(b"1".to_vec()),
                 None,
-                b"aaa".to_vec(),
+                Some(b"aaa".to_vec()),
                 0,
                 TxnId(1),
                 who.clone(),
@@ -951,7 +964,7 @@ mod tests {
                 "ledger",
                 BusinessKey::new(b"1".to_vec()),
                 None,
-                b"bbb".to_vec(),
+                Some(b"bbb".to_vec()),
                 0,
                 TxnId(2),
                 who,
@@ -1005,7 +1018,7 @@ mod tests {
                 "account",
                 BusinessKey::new(b"1".to_vec()),
                 None,
-                b"100".to_vec(),
+                Some(b"100".to_vec()),
                 0,
                 TxnId(1),
                 Principal::new(b"demo".to_vec()),
@@ -1046,7 +1059,7 @@ mod tests {
                 "account",
                 BusinessKey::new(b"1".to_vec()),
                 None,
-                b"100".to_vec(),
+                Some(b"100".to_vec()),
                 0,
                 TxnId(1),
                 Principal::new(b"demo".to_vec()),
@@ -1125,6 +1138,68 @@ mod tests {
             .expect("delete");
         assert_eq!(deleted, StatementOutcome::Dml(DmlSummary::Delete(1)));
         assert!(read(&mut engine).is_empty(), "the row is gone after DELETE");
+    }
+
+    #[test]
+    fn insert_null_payload_reads_back_as_null() {
+        // A SQL NULL payload routes through `execute` (bind_dml → typed insert)
+        // and reads back as a `None` cell — distinct from an empty payload, and
+        // carried as a distinct NULL all the way through storage ([STL-154]).
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        let inserted = engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, NULL)"))
+            .expect("insert null");
+        assert_eq!(inserted, StatementOutcome::Dml(DmlSummary::Insert(1)));
+
+        let StatementOutcome::Rows(result) = engine
+            .execute(&parse_one("SELECT id, balance FROM account"))
+            .expect("select")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(result.rows.len(), 1, "the row exists");
+        assert_eq!(result.rows[0][0], Some(encode_value(&ScalarValue::Int4(1))));
+        assert_eq!(
+            result.rows[0][1], None,
+            "the payload reads back as SQL NULL"
+        );
+    }
+
+    #[test]
+    fn update_to_null_then_back_is_visible() {
+        // An UPDATE can set the payload to NULL and a later UPDATE can set it
+        // back to a value — both are visible to a subsequent read ([STL-154]).
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+        engine
+            .execute(&parse_one("UPDATE account SET balance = NULL WHERE id = 1"))
+            .expect("update to null");
+
+        let payload_cell = |engine: &mut SessionEngine<ZeroClock, MemDisk>| {
+            let StatementOutcome::Rows(result) = engine
+                .execute(&parse_one("SELECT balance FROM account"))
+                .expect("select")
+            else {
+                panic!("rows");
+            };
+            // The engine always projects `(key, payload)`, so the payload (balance)
+            // is the second cell regardless of the SELECT list.
+            result.rows[0][1].clone()
+        };
+        assert_eq!(payload_cell(&mut engine), None, "balance is now NULL");
+
+        engine
+            .execute(&parse_one("UPDATE account SET balance = 250 WHERE id = 1"))
+            .expect("update back to a value");
+        assert_eq!(
+            payload_cell(&mut engine),
+            Some(encode_value(&ScalarValue::Int4(250))),
+            "balance reads back as 250 again"
+        );
     }
 
     #[test]
@@ -1225,6 +1300,10 @@ mod tests {
     /// The payload cell of every row in a `(key, payload)` [`SelectResult`] — the
     /// second projected column.
     fn payload_column(result: &SelectResult) -> Vec<Vec<u8>> {
-        result.rows.iter().map(|row| row[1].clone()).collect()
+        result
+            .rows
+            .iter()
+            .map(|row| row[1].clone().expect("non-null payload in this test"))
+            .collect()
     }
 }
