@@ -802,9 +802,12 @@ fn verify_recovered_prefix<C: Clock, D: Disk + Clone>(
     for &s in &probes {
         for key in keys {
             recovered_fp.push(
+                // `.flatten()`: no NULL payloads here, so a present row's payload
+                // is always `Some` ([STL-154]).
                 engine
                     .as_of_payload(key, Snapshot(s))
-                    .expect("recovered as_of"),
+                    .expect("recovered as_of")
+                    .flatten(),
             );
         }
     }
@@ -940,10 +943,10 @@ pub fn run_engine_recover_faults_seed(seed: u64) -> u64 {
                 if want_delete {
                     engine.delete(&key, txn, principal)
                 } else {
-                    engine.update(key.clone(), None, payload.clone(), 0, txn, principal)
+                    engine.update(key.clone(), None, Some(payload.clone()), 0, txn, principal)
                 }
             } else {
-                engine.insert(key.clone(), None, payload.clone(), 0, txn, principal)
+                engine.insert(key.clone(), None, Some(payload.clone()), 0, txn, principal)
             };
             match outcome {
                 Ok(o) => {
