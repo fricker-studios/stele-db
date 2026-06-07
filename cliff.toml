@@ -40,9 +40,11 @@ footer = ""
 conventional_commits = true
 filter_unconventional = true
 split_commits = false
-# Subsystem groupings, highest-signal first. Anything that doesn't match a
-# rule is dropped (filter_commits below keeps the changelog focused on
-# user-facing change).
+# Subsystem groupings, highest-signal first. The trailing catch-all parser
+# (`.*` with skip = true) drops anything that didn't match an earlier rule, so
+# the changelog stays focused on user-facing change. (filter_commits = false
+# below only governs commits with no matching parser at all — moot here, since
+# the catch-all matches everything.)
 commit_parsers = [
   { message = "^feat", group = "<!-- 0 -->Features" },
   { message = "^fix", group = "<!-- 1 -->Bug Fixes" },

@@ -47,6 +47,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0 # need the tag object itself to check it's annotated
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (no semver tags)
         with:
           toolchain: "1.85.0"
@@ -54,8 +56,16 @@ jobs:
       - uses: taiki-e/install-action@cde8c9e634f4a17bc06b61413ac0ef75450eac46 # v2.81.4
         with:
           tool: nextest
-      - name: Tag matches workspace version
+      - name: Tag is annotated and matches the workspace version
         run: |
+          # Releases are cut only from annotated tags (docs/04-cicd.md), which
+          # carry a tagger + message and are what `git tag -s` signs. A
+          # lightweight tag points straight at a commit, so `cat-file -t` is
+          # `commit` rather than `tag` — reject it before anything publishes.
+          if [ "$(git cat-file -t "${GITHUB_REF_NAME}")" != "tag" ]; then
+            echo "::error::${GITHUB_REF_NAME} is a lightweight tag; cut releases from an annotated, signed tag (git tag -s ${GITHUB_REF_NAME})"
+            exit 1
+          fi
           # First `version =` in Cargo.toml is [workspace.package].version,
           # which every crate inherits. The tag must be exactly v<that>.
           crate_ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
@@ -64,7 +74,7 @@ jobs:
             echo "::error::tag ${GITHUB_REF_NAME} != workspace version ${expected} (bump Cargo.toml or fix the tag)"
             exit 1
           fi
-          echo "tag ${GITHUB_REF_NAME} matches workspace version ✓"
+          echo "tag ${GITHUB_REF_NAME} is annotated and matches workspace version ✓"
       - run: cargo nextest run --workspace --all-features --locked
       - run: cargo test --doc --workspace --all-features --locked
 
@@ -244,17 +254,27 @@ jobs:
           cosign sign-blob --yes SHA256SUMS \
             --output-signature SHA256SUMS.sig \
             --output-certificate SHA256SUMS.pem
-      - name: Create GitHub Release
+      - name: Create or update the GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # Pre-1.0 tags ship as prereleases (the API is still stabilizing).
+        # Idempotent: a rerun after a transient failure updates the existing
+        # release and re-uploads assets (--clobber) instead of erroring.
         run: |
-          prerelease=""
+          prerelease="false"
           case "${GITHUB_REF_NAME}" in
-            v0.*) prerelease="--prerelease" ;;
+            v0.*) prerelease="true" ;;
           esac
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "${GITHUB_REF_NAME}" \
-            --notes-file RELEASE_NOTES.md \
-            ${prerelease} \
-            dist/*
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file RELEASE_NOTES.md \
+              --prerelease="${prerelease}"
+            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file RELEASE_NOTES.md \
+              --prerelease="${prerelease}" \
+              dist/*
+          fi
