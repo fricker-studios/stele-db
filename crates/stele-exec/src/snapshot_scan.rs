@@ -14,30 +14,40 @@
 //! ## Shape of the read
 //!
 //! ```text
-//! prune segments (zone maps) → read survivors + delta → resolve per key at S
-//!   → filter by pushed-down predicate → project columns → Arrow-shaped batch
+//! prune segments (zone maps, then validity index) → resolve per key at S from
+//!   the identity columns → late-materialize the projected columns of the live
+//!   rows + delta → filter by pushed-down predicate → project → Arrow batch
 //! ```
 //!
-//! 1. **Prune.** Each sealed segment is tested against the predicate and the
-//!    snapshot with [`SegmentReader::might_contain`] — a zone-map-only check that
-//!    touches no column chunk. A segment the zone maps prove cannot hold a
-//!    visible match is skipped before any read I/O. The number of segments
-//!    actually read therefore equals the number the zone maps did not prune —
-//!    the invariant [`ScanStats`] exposes (STL-100 DoD).
-//! 2. **Merge.** The delta tier resolves its own staged versions at `S`
-//!    ([`Delta::range_scan`]); the surviving segments' raw versions are folded
+//! 1. **Prune.** Each sealed segment runs two complementary skip tests before
+//!    any bulk column is read (STL-146). First, [`SegmentReader::might_contain`]
+//!    — a zone-map-only check ("begins after `S`", plus value bounds) that
+//!    touches no column chunk. A segment that survives the zone map then has only
+//!    its narrow `(business_key, sys_from, seq)` identity columns read, which
+//!    [`ValidityIndex::sys_upper_bound`] (STL-139) can use to prove every version
+//!    is already superseded at `S` ("ends before `S`") — skipping the bulk
+//!    chunks. [`ScanStats`] partitions the segments across the two prunes and the
+//!    survivors.
+//! 2. **Resolve.** The delta tier resolves its own staged versions at `S`
+//!    ([`Delta::range_scan`]); the surviving segments' *identities* are folded
 //!    with the validity index and resolved the same way
-//!    ([`merge::fold_chains`] + [`merge::resolve_snapshot`]). The two per-tier
-//!    results are unioned and deduplicated per key, latest visible version
-//!    winning. The tiers' per-key system intervals are disjoint by construction
-//!    — a superseded version's `sys_to` equals its successor's `sys_from`, and a
-//!    flush drains the delta — so at most one tier holds the version live at `S`;
-//!    the dedup is a belt-and-suspenders guard, never a real tie-break in v0.1.
-//! 3. **Filter.** The pushed-down [`Predicate`] is re-applied at the row level:
+//!    ([`merge::fold_chains`] + [`merge::resolve_snapshot`]) so the operator
+//!    learns which rows are live at `S` before reading their payload or
+//!    provenance. The two per-tier results are unioned and deduplicated per key,
+//!    latest visible version winning. The tiers' per-key system intervals are
+//!    disjoint by construction — a superseded version's `sys_to` equals its
+//!    successor's `sys_from`, and a flush drains the delta — so at most one tier
+//!    holds the version live at `S`; the dedup is a belt-and-suspenders guard,
+//!    never a real tie-break in v0.1.
+//! 3. **Materialize.** Only the projected (and predicate-referenced) bulk columns
+//!    of the segments that resolved a live row are read, via
+//!    [`SegmentReader::read_column`] — late materialization. A surviving segment
+//!    with no live row at `S` is never read beyond its identity columns.
+//! 4. **Filter.** The pushed-down [`Predicate`] is re-applied at the row level:
 //!    zone maps prune *segments* conservatively but a surviving segment can still
 //!    carry non-matching rows (e.g. other keys), so the row filter is what makes
 //!    `WHERE id = 1` return a single row.
-//! 4. **Project.** Only the requested [`ColumnId`]s are materialized into the
+//! 5. **Project.** Only the requested [`ColumnId`]s are materialized into the
 //!    output batch.
 //!
 //! ## Determinism
@@ -49,22 +59,32 @@
 //!
 //! ## Not yet (follow-ups)
 //!
-//! Projection is realized as *output* trimming plus segment-level zone-map
-//! pruning; per-column late materialization *within* a surviving segment (read
-//! only the projected column chunks for the rows that survive resolution) is a
-//! noted optimization, not wired at v0.1. The complementary "every row already
-//! superseded" segment prune via [`ValidityIndex::sys_upper_bound`] (STL-139)
-//! composes on top of the zone-map prune and is likewise deferred so the
-//! read-count invariant stays a clean function of the zone maps alone.
+//! Late materialization is per *column*: [`SegmentReader::read_column`] reads a
+//! whole column across every row-group, so a survivor with a single live row
+//! still reads that column's full chunks and the operator then indexes the row.
+//! True per-*row* skipping — reading only the row-groups (chunks) that hold a
+//! live row — is a further refinement that needs chunk-level row addressing the
+//! reader does not yet expose, and is left to the v0.2 vectorized-execution work
+//! (STL-77).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
+use stele_common::provenance::{Principal, Provenance, TxnId};
+use stele_common::time::SystemTimeMicros;
 use stele_storage::backend::{Disk, DiskFile};
 use stele_storage::delta::{BusinessKey, Delta, DeltaError, Snapshot, Version};
 use stele_storage::merge;
-use stele_storage::segment::{ColumnId, Predicate, SegmentError, SegmentReader, ZoneBound};
+use stele_storage::segment::{
+    ColumnData, ColumnId, Predicate, SegmentError, SegmentReader, ZoneBound,
+};
 use stele_storage::validity::{ValidityError, ValidityIndex};
+
+/// A sealed row's identity — its `(business_key, sys_from, seq)` triple, the key
+/// the validity index and the per-key version chains are keyed by (STL-145).
+/// Read narrowly from a segment ([`SegmentReader::version_keys`]) to resolve
+/// which rows are live at the snapshot before any bulk column is materialized.
+type VersionId = (BusinessKey, SystemTimeMicros, u64);
 
 /// Errors surfaced while executing a [`SnapshotScan`].
 #[derive(Debug, thiserror::Error)]
@@ -135,18 +155,49 @@ pub struct Batch {
 
 /// Per-scan statistics — chiefly the segment-pruning accounting.
 ///
-/// The STL-100 DoD asserts on it: `segments_scanned` is exactly the number of
-/// segments the zone maps did not prune, and the only segments the operator
-/// read.
+/// A segment reaches the scan in one of three states, and the counts partition
+/// the segment set exactly: `segments_total == segments_pruned_zone +
+/// segments_pruned_superseded + segments_scanned`.
+///
+/// Two complementary prunes run before any bulk column is read (STL-146):
+///
+/// * **Zone-map prune** ([`segments_pruned_zone`](Self::segments_pruned_zone)) —
+///   the zone maps prove the segment holds no row visible at the snapshot that
+///   satisfies the predicate ("begins after the snapshot", plus value bounds).
+///   No column chunk is touched.
+/// * **Validity-index prune**
+///   ([`segments_pruned_superseded`](Self::segments_pruned_superseded)) — the
+///   segment survives the zone map, but reading only its narrow identity columns
+///   ([`SegmentReader::version_keys`]) lets [`ValidityIndex::sys_upper_bound`]
+///   prove *every* version is already superseded at the snapshot ("ends before
+///   the snapshot", STL-139). The bulk column chunks are never read.
+///
+/// What remains is [`segments_scanned`](Self::segments_scanned): the segments
+/// whose projected columns are materialized for the rows that survive resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanStats {
     /// Total sealed segments offered to the scan.
     pub segments_total: usize,
     /// Segments the zone maps proved could hold no visible match — skipped with
-    /// no read I/O.
-    pub segments_pruned: usize,
-    /// Segments actually read (`segments_total - segments_pruned`).
+    /// no read I/O at all.
+    pub segments_pruned_zone: usize,
+    /// Segments that survived the zone map but whose every version the validity
+    /// index proved superseded at the snapshot — skipped after reading only the
+    /// narrow identity columns, never the bulk chunks (STL-139).
+    pub segments_pruned_superseded: usize,
+    /// Segments that survived both prunes — their projected columns are read for
+    /// any row live at the snapshot.
     pub segments_scanned: usize,
+}
+
+impl ScanStats {
+    /// Segments skipped by either prune (`segments_pruned_zone +
+    /// segments_pruned_superseded`) — the count that never had its bulk columns
+    /// materialized.
+    #[must_use]
+    pub const fn segments_pruned(&self) -> usize {
+        self.segments_pruned_zone + self.segments_pruned_superseded
+    }
 }
 
 /// The result of executing a [`SnapshotScan`]: the projected [`Batch`] and the
@@ -247,22 +298,98 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             .delta
             .range_scan(key_range, self.snapshot, self.index)?;
 
-        // Prune sealed segments by zone map, then fold + resolve the survivors.
-        let mut scanned = 0usize;
-        let mut sealed_candidates: Vec<Version> = Vec::new();
-        for reader in self.segments {
-            if reader.might_contain(&self.predicate, self.snapshot) {
-                scanned += 1;
-                sealed_candidates.extend(reader.read_versions()?);
+        // The bulk (non-identity) columns a survivor must materialize for this
+        // scan — the union of the projected and predicate-referenced columns.
+        let needed = self.materialized_columns();
+
+        // Prune each sealed segment in two complementary stages, then keep the
+        // identity columns of the survivors for resolution + late materialization.
+        let mut pruned_zone = 0usize;
+        let mut pruned_superseded = 0usize;
+        let mut survivors: Vec<(usize, Vec<VersionId>)> = Vec::new();
+        for (seg_idx, reader) in self.segments.iter().enumerate() {
+            // Stage 1 — zone map: rules a segment out touching no column chunk.
+            if !reader.might_contain(&self.predicate, self.snapshot) {
+                pruned_zone += 1;
+                continue;
             }
+            // Stage 2 — validity index: read only the narrow `(business_key,
+            // sys_from, seq)` identity columns and ask whether every version is
+            // already superseded at the snapshot (STL-139). Complementary to the
+            // zone map's "begins after the snapshot" test, this is "ends before
+            // the snapshot"; either prune skips the bulk column chunks.
+            let keys = reader.version_keys()?;
+            if self
+                .index
+                .sys_upper_bound(keys.iter().cloned())?
+                .superseded_at_or_before(self.snapshot.0)
+            {
+                pruned_superseded += 1;
+                continue;
+            }
+            survivors.push((seg_idx, keys));
         }
         let stats = ScanStats {
             segments_total: self.segments.len(),
-            segments_pruned: self.segments.len() - scanned,
-            segments_scanned: scanned,
+            segments_pruned_zone: pruned_zone,
+            segments_pruned_superseded: pruned_superseded,
+            segments_scanned: survivors.len(),
         };
-        let sealed_chains = merge::fold_chains(sealed_candidates, self.index)?;
-        let sealed_live = merge::resolve_snapshot(&sealed_chains, self.snapshot);
+
+        // Resolve which survivor rows are live at the snapshot from the identity
+        // columns alone: `fold_chains` overlays the validity index's closes and
+        // `resolve_snapshot` picks, per key, the one version whose system
+        // interval contains the snapshot. A side map locates each row's source
+        // `(segment, row)` so only the survivors that resolve live ever have
+        // their bulk columns read.
+        let mut locator: BTreeMap<VersionId, (usize, usize)> = BTreeMap::new();
+        let mut identities: Vec<Version> = Vec::new();
+        // The identity row count per survivor — the length every bulk column read
+        // from that segment must agree with, or it is corrupt (see below).
+        let mut rows_in_seg: BTreeMap<usize, usize> = BTreeMap::new();
+        for (seg_idx, keys) in &survivors {
+            rows_in_seg.insert(*seg_idx, keys.len());
+            for (row_idx, (bk, sys_from, seq)) in keys.iter().enumerate() {
+                locator.insert((bk.clone(), *sys_from, *seq), (*seg_idx, row_idx));
+                identities.push(identity_version(bk.clone(), *sys_from, *seq));
+            }
+        }
+        let sealed_chains = merge::fold_chains(identities, self.index)?;
+        let mut sealed_live = merge::resolve_snapshot(&sealed_chains, self.snapshot);
+
+        // Late materialization: read each needed bulk column once per survivor
+        // that actually holds a live row, then patch it into the resolved
+        // version. `read_column` touches only that column's chunks, so the scan
+        // pays for the projected columns of the live rows — never the full row
+        // of every survivor, never a survivor with no live row.
+        let live_segs: BTreeSet<usize> =
+            sealed_live.iter().map(|v| locate(&locator, v).0).collect();
+        let mut cols_by_seg: BTreeMap<usize, Vec<(ColumnId, ColumnData)>> = BTreeMap::new();
+        for seg_idx in live_segs {
+            // Every bulk column must carry exactly as many values as the segment's
+            // identity columns ([`SegmentReader::version_keys`]); a disagreement is
+            // a corrupt segment, surfaced as an error rather than an out-of-bounds
+            // panic when the per-row patch indexes by `row_idx` (the same guard
+            // `SegmentReader::read_versions` applies across its columns).
+            let expected = rows_in_seg[&seg_idx];
+            let mut cols = Vec::with_capacity(needed.len());
+            for &col in &needed {
+                let data = self.segments[seg_idx].read_column(col)?;
+                if column_len(&data) != expected {
+                    return Err(ScanError::Segment(SegmentError::Corrupt(
+                        "segment column value count disagrees with its identity row count",
+                    )));
+                }
+                cols.push((col, data));
+            }
+            cols_by_seg.insert(seg_idx, cols);
+        }
+        for v in &mut sealed_live {
+            let (seg_idx, row_idx) = locate(&locator, v);
+            for (col, data) in &cols_by_seg[&seg_idx] {
+                patch_version(v, *col, data, row_idx);
+            }
+        }
 
         // Union the two per-tier results, deduplicated per key. The intervals
         // are disjoint across tiers (see the module docs), so a key resolves to
@@ -278,6 +405,26 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             }
         }
         Ok((by_key.into_values().collect(), stats))
+    }
+
+    /// The bulk (non-identity) columns this scan reads from a surviving segment:
+    /// the projected and predicate-referenced columns, restricted to those a
+    /// segment materializes *outside* the identity triple. The identity columns
+    /// (`business_key`, `sys_from`, `seq`) come for free from
+    /// [`SegmentReader::version_keys`] during resolution, so they are never
+    /// re-read; a column the operator does not materialize at v0.1 (the
+    /// valid-time / retraction columns) is excluded here and surfaces its error
+    /// at [`build_column`] / is conservatively kept by the row filter.
+    fn materialized_columns(&self) -> Vec<ColumnId> {
+        let mut referenced = self.projection.clone();
+        collect_predicate_columns(&self.predicate, &mut referenced);
+        let mut needed = Vec::new();
+        for col in referenced {
+            if is_bulk_column(col) && !needed.contains(&col) {
+                needed.push(col);
+            }
+        }
+        needed
     }
 
     /// Materialize the projected columns into an Arrow-shaped [`Batch`].
@@ -329,6 +476,98 @@ fn build_column(col: ColumnId, rows: &[Version]) -> Result<Column, ScanError> {
 /// cast (and its clippy lint) while preserving every bit.
 const fn u64_bits(value: u64) -> i64 {
     i64::from_le_bytes(value.to_le_bytes())
+}
+
+/// The inverse of [`u64_bits`]: recover a `u64` from the `i64` bit pattern a
+/// segment stores for the `seq` / `txn_id` columns.
+const fn bits_u64(value: i64) -> u64 {
+    u64::from_le_bytes(value.to_le_bytes())
+}
+
+/// The bulk (non-identity) columns a segment materializes that the row filter
+/// and projection can read — everything outside the `(business_key, sys_from,
+/// seq)` identity triple that [`patch_version`] knows how to overlay. The
+/// valid-time and retraction columns are deliberately absent: the operator does
+/// not materialize them at v0.1.
+const fn is_bulk_column(col: ColumnId) -> bool {
+    matches!(
+        col,
+        ColumnId::Payload | ColumnId::TxnId | ColumnId::CommittedAt | ColumnId::Principal
+    )
+}
+
+/// A payload-less, provenance-less stand-in carrying only a sealed row's
+/// `(business_key, sys_from, seq)` identity — all [`merge::fold_chains`] /
+/// [`merge::resolve_snapshot`] need to decide which row is live at the snapshot
+/// before any bulk column is read. The bulk fields are patched in by late
+/// materialization ([`patch_version`]) for the rows that survive resolution.
+fn identity_version(business_key: BusinessKey, sys_from: SystemTimeMicros, seq: u64) -> Version {
+    Version::open(
+        business_key,
+        sys_from,
+        seq,
+        Provenance::new(TxnId(0), SystemTimeMicros(0), Principal::new(Vec::new())),
+        Vec::new(),
+    )
+}
+
+/// Locate a resolved sealed version's source `(segment, row)`. `resolve_snapshot`
+/// only ever returns identities that went in via [`identity_version`], so the
+/// lookup cannot miss — a miss is a resolution-layer invariant break.
+fn locate(locator: &BTreeMap<VersionId, (usize, usize)>, v: &Version) -> (usize, usize) {
+    *locator
+        .get(&(v.business_key.clone(), v.sys_from, v.seq))
+        .expect("a resolved sealed identity must locate its source row")
+}
+
+/// The number of values in a [`ColumnData`], independent of its element type —
+/// used to assert a late-materialized column agrees with the segment's identity
+/// row count before any row is indexed.
+fn column_len(data: &ColumnData) -> usize {
+    match data {
+        ColumnData::Bytes(v) => v.len(),
+        ColumnData::I64(v) => v.len(),
+    }
+}
+
+/// Overlay one late-materialized bulk column onto a resolved version at `row`.
+/// `col` is always one of [`is_bulk_column`]'s set (the only columns
+/// [`SnapshotScan::materialized_columns`] keeps) and `data` always has the type
+/// that column's arm expects — [`SegmentReader::read_column`] picks the
+/// [`ColumnData`] variant from [`ColumnId::ty`], so a mismatched pairing cannot
+/// arise. The fallthrough is therefore dead and fails fast rather than silently
+/// dropping a column, which would mask schema drift (a new bulk column added to
+/// [`is_bulk_column`] but not handled here).
+fn patch_version(v: &mut Version, col: ColumnId, data: &ColumnData, row: usize) {
+    match (col, data) {
+        (ColumnId::Payload, ColumnData::Bytes(b)) => v.payload.clone_from(&b[row]),
+        (ColumnId::Principal, ColumnData::Bytes(b)) => {
+            v.provenance.principal = Principal::new(b[row].clone());
+        }
+        (ColumnId::TxnId, ColumnData::I64(x)) => v.provenance.txn_id = TxnId(bits_u64(x[row])),
+        (ColumnId::CommittedAt, ColumnData::I64(x)) => {
+            v.provenance.committed_at = SystemTimeMicros(x[row]);
+        }
+        _ => unreachable!(
+            "patch_version received a non-bulk column or a ColumnData variant that \
+             read_column cannot produce for it: {col:?}"
+        ),
+    }
+}
+
+/// Collect every column a predicate references, in tree order (duplicates kept;
+/// [`SnapshotScan::materialized_columns`] dedups). The mirror of
+/// [`predicate_matches`] over the predicate tree.
+fn collect_predicate_columns(predicate: &Predicate, out: &mut Vec<ColumnId>) {
+    match predicate {
+        Predicate::All => {}
+        Predicate::Eq { column, .. } | Predicate::Range { column, .. } => out.push(*column),
+        Predicate::And(parts) => {
+            for part in parts {
+                collect_predicate_columns(part, out);
+            }
+        }
+    }
 }
 
 /// Evaluate a pushed-down predicate against one resolved version (the row-level
