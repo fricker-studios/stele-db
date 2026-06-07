@@ -167,7 +167,7 @@ fn update_across_a_flush_boundary_closes_the_sealed_version_via_the_index() {
             &mut index,
             &SealedVersions::default(),
             key.clone(),
-            b"balance=100".to_vec(),
+            Some(b"balance=100".to_vec()),
             0,
             TxnId(10),
             Principal::new(b"writer-a".to_vec()),
@@ -187,7 +187,7 @@ fn update_across_a_flush_boundary_closes_the_sealed_version_via_the_index() {
             &mut index,
             &lookup,
             key.clone(),
-            b"balance=150".to_vec(),
+            Some(b"balance=150".to_vec()),
             0,
             TxnId(20),
             Principal::new(b"writer-b".to_vec()),
@@ -225,7 +225,8 @@ fn update_across_a_flush_boundary_closes_the_sealed_version_via_the_index() {
         "the sealed version is closed at the update"
     );
     assert_eq!(
-        closed.payload, b"balance=100",
+        closed.payload.as_deref(),
+        Some(&b"balance=100"[..]),
         "body preserved from segment"
     );
     assert_eq!(
@@ -246,7 +247,7 @@ fn update_across_a_flush_boundary_closes_the_sealed_version_via_the_index() {
 
     assert_eq!(open.sys_from, c1);
     assert_eq!(open.sys_to, SYSTEM_TIME_OPEN, "the new version stays open");
-    assert_eq!(open.payload, b"balance=150");
+    assert_eq!(open.payload.as_deref(), Some(&b"balance=150"[..]));
     assert_eq!(open.closed_by, None);
 
     // Snapshot resolution sees one live version on each side of the close.
@@ -279,7 +280,7 @@ fn delete_across_a_flush_boundary_closes_the_sealed_version_and_leaves_no_open()
             &mut index,
             &SealedVersions::default(),
             key.clone(),
-            b"v".to_vec(),
+            Some(b"v".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -349,7 +350,7 @@ fn insert_on_a_key_live_only_in_a_segment_is_rejected() {
             &mut index,
             &SealedVersions::default(),
             key.clone(),
-            b"a".to_vec(),
+            Some(b"a".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -364,7 +365,7 @@ fn insert_on_a_key_live_only_in_a_segment_is_rejected() {
             &mut index,
             &lookup,
             key,
-            b"b".to_vec(),
+            Some(b"b".to_vec()),
             0,
             TxnId(2),
             who(),
@@ -522,7 +523,7 @@ fn chains_stay_non_overlapping_and_gap_free_across_flush_boundaries() {
                             &mut index,
                             &lookup,
                             key,
-                            payload,
+                            Some(payload),
                             seq,
                             txn,
                             who(),
@@ -537,7 +538,7 @@ fn chains_stay_non_overlapping_and_gap_free_across_flush_boundaries() {
                         &mut index,
                         &lookup,
                         key,
-                        payload,
+                        Some(payload),
                         seq,
                         txn,
                         who(),
@@ -645,7 +646,7 @@ fn project(v: &Version) -> OracleVersion {
         sys_from: v.sys_from,
         seq: v.seq,
         sys_to: v.sys_to,
-        payload: v.payload.clone(),
+        payload: v.payload.clone().unwrap(),
         provenance: v.provenance.clone(),
         closed_by: v.closed_by.clone(),
     }
@@ -732,7 +733,7 @@ fn engine_chain_is_differential_equal_to_the_oracle_across_flush_boundaries() {
                             &mut index,
                             &lookup,
                             key.clone(),
-                            payload.clone(),
+                            Some(payload.clone()),
                             op,
                             txn,
                             principal.clone(),
@@ -752,7 +753,7 @@ fn engine_chain_is_differential_equal_to_the_oracle_across_flush_boundaries() {
                         &mut index,
                         &lookup,
                         key.clone(),
-                        payload.clone(),
+                        Some(payload.clone()),
                         op,
                         txn,
                         principal.clone(),

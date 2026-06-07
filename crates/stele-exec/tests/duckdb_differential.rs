@@ -337,7 +337,7 @@ fn bytes_column(out: &stele_exec::ScanOutput, col: ColumnId) -> Vec<Vec<u8>> {
         .find(|(c, _)| *c == col)
         .expect("projected column present");
     match column {
-        Column::Bytes(rows) => rows.clone(),
+        Column::Bytes(rows) => rows.iter().map(|c| c.clone().unwrap()).collect(),
         Column::I64(_) => panic!("column {col:?} is i64, expected bytes"),
     }
 }
@@ -402,7 +402,7 @@ fn run_seed(seed: u64, duck: &DuckModel) -> Seed {
                         &sealed,
                         key,
                         Some(interval),
-                        value.clone(),
+                        Some(value.clone()),
                         op,
                         txn,
                         who(),
@@ -423,7 +423,7 @@ fn run_seed(seed: u64, duck: &DuckModel) -> Seed {
                     &sealed,
                     key,
                     Some(interval),
-                    value.clone(),
+                    Some(value.clone()),
                     op,
                     txn,
                     who(),
@@ -542,7 +542,7 @@ fn duckdb_oracle_detects_a_deliberate_stale_close() {
             &sealed,
             key_of(0),
             Some(valid),
-            b"A".to_vec(),
+            Some(b"A".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -557,7 +557,7 @@ fn duckdb_oracle_detects_a_deliberate_stale_close() {
             &sealed,
             key_of(0),
             Some(valid),
-            b"B".to_vec(),
+            Some(b"B".to_vec()),
             1,
             TxnId(2),
             who(),

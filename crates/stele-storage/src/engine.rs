@@ -249,7 +249,7 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         &mut self,
         key: BusinessKey,
         valid: Option<ValidInterval>,
-        payload: Vec<u8>,
+        payload: Option<Vec<u8>>,
         seq: u64,
         txn_id: TxnId,
         principal: Principal,
@@ -278,7 +278,7 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         &mut self,
         key: BusinessKey,
         valid: Option<ValidInterval>,
-        payload: Vec<u8>,
+        payload: Option<Vec<u8>>,
         seq: u64,
         txn_id: TxnId,
         principal: Principal,
@@ -365,6 +365,11 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
 
     /// Convenience over [`Self::as_of`]: just the payload of the live version.
     ///
+    /// The outer `Option` is row presence (`None` ⇒ no live version at the
+    /// snapshot); the inner `Option` is the payload, which is itself `None` for a
+    /// SQL `NULL` cell ([STL-154]) — kept distinct from `Some(vec![])` (an empty
+    /// payload).
+    ///
     /// # Errors
     ///
     /// As [`Self::as_of`].
@@ -372,7 +377,7 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         &self,
         key: &BusinessKey,
         snapshot: Snapshot,
-    ) -> Result<Option<Vec<u8>>, EngineError> {
+    ) -> Result<Option<Option<Vec<u8>>>, EngineError> {
         Ok(self.as_of(key, snapshot)?.map(|v| v.payload))
     }
 

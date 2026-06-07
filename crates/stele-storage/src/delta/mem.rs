@@ -91,7 +91,7 @@ mod tests {
                 SystemTimeMicros(sys_from),
                 Principal::new(b"tester".to_vec()),
             ),
-            payload.to_vec(),
+            Some(payload.to_vec()),
         )
     }
 

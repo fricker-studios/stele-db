@@ -102,11 +102,11 @@ fn insert_update_kill_recover_serves_the_correct_as_of() {
     let (c0, c1) = {
         let mut engine = Engine::open(disk.clone(), StepClock::new(1_000), false).expect("open");
         let c0 = engine
-            .insert(k.clone(), None, b"100".to_vec(), 0, TxnId(1), who())
+            .insert(k.clone(), None, Some(b"100".to_vec()), 0, TxnId(1), who())
             .expect("insert")
             .commit;
         let c1 = engine
-            .update(k.clone(), None, b"250".to_vec(), 0, TxnId(2), who())
+            .update(k.clone(), None, Some(b"250".to_vec()), 0, TxnId(2), who())
             .expect("update")
             .commit;
         engine.checkpoint().expect("checkpoint"); // fsync + record the durable fence
@@ -117,19 +117,19 @@ fn insert_update_kill_recover_serves_the_correct_as_of() {
     let recovered = Engine::recover(disk, StepClock::new(1_000_000), false).expect("recover");
     assert_eq!(
         recovered.as_of_payload(&k, Snapshot(c0)).expect("as_of"),
-        Some(b"100".to_vec()),
+        Some(Some(b"100".to_vec())),
         "recovered AS OF past → 100",
     );
     assert_eq!(
         recovered
             .as_of_payload(&k, Snapshot(SystemTimeMicros(c1.0 - 1)))
             .expect("as_of"),
-        Some(b"100".to_vec()),
+        Some(Some(b"100".to_vec())),
         "half-open: 100 right up to (but excluding) the close",
     );
     assert_eq!(
         recovered.as_of_payload(&k, Snapshot(c1)).expect("as_of"),
-        Some(b"250".to_vec()),
+        Some(Some(b"250".to_vec())),
         "recovered AS OF now → 250",
     );
     // The checkpoint persisted the durable fence and recovery loaded it.
@@ -153,17 +153,17 @@ fn recovery_rebuilds_the_exact_validity_index() {
     let before = {
         let mut engine = Engine::open(disk.clone(), StepClock::new(1), false).expect("open");
         engine
-            .insert(a.clone(), None, b"a0".to_vec(), 0, TxnId(1), who())
+            .insert(a.clone(), None, Some(b"a0".to_vec()), 0, TxnId(1), who())
             .expect("insert a");
         engine
-            .insert(b.clone(), None, b"b0".to_vec(), 0, TxnId(2), who())
+            .insert(b.clone(), None, Some(b"b0".to_vec()), 0, TxnId(2), who())
             .expect("insert b");
         engine
-            .update(a.clone(), None, b"a1".to_vec(), 0, TxnId(3), who())
+            .update(a.clone(), None, Some(b"a1".to_vec()), 0, TxnId(3), who())
             .expect("update a");
         engine.delete(&b, TxnId(4), who()).expect("delete b");
         engine
-            .update(a, None, b"a2".to_vec(), 0, TxnId(5), who())
+            .update(a, None, Some(b"a2".to_vec()), 0, TxnId(5), who())
             .expect("update a again");
         engine.checkpoint().expect("checkpoint");
         engine.materialize_index().expect("materialize")
@@ -200,14 +200,14 @@ fn recover_drops_a_torn_wal_tail() {
     let (c0, w0) = {
         let mut engine = Engine::open(disk.clone(), StepClock::new(1_000), false).expect("open");
         let first = engine
-            .insert(k.clone(), None, b"100".to_vec(), 0, TxnId(1), who())
+            .insert(k.clone(), None, Some(b"100".to_vec()), 0, TxnId(1), who())
             .expect("insert");
         // Checkpoint here: the first commit is now durable and the fence sits at
         // its record's end, so the second commit lands strictly past the fence.
         engine.checkpoint().expect("checkpoint");
         // A second commit whose WAL record we will truncate mid-write.
         engine
-            .update(k.clone(), None, b"250".to_vec(), 0, TxnId(2), who())
+            .update(k.clone(), None, Some(b"250".to_vec()), 0, TxnId(2), who())
             .expect("update");
         (first.commit, first.wal)
     };
@@ -225,14 +225,14 @@ fn recover_drops_a_torn_wal_tail() {
     // the value is `100` at the first commit *and* still `100` "now".
     assert_eq!(
         recovered.as_of_payload(&k, Snapshot(c0)).expect("as_of"),
-        Some(b"100".to_vec()),
+        Some(Some(b"100".to_vec())),
         "the durable first commit survived",
     );
     assert_eq!(
         recovered
             .as_of_payload(&k, Snapshot(SystemTimeMicros(c0.0 + 1_000)))
             .expect("as_of"),
-        Some(b"100".to_vec()),
+        Some(Some(b"100".to_vec())),
         "the torn update was dropped — the insert stays live, no resurrection of the partial write",
     );
     // No close was materialized: the supersession never durably happened.
@@ -257,10 +257,10 @@ fn recover_rejects_corruption_inside_the_durable_prefix() {
     let w0 = {
         let mut engine = Engine::open(disk.clone(), StepClock::new(1_000), false).expect("open");
         let first = engine
-            .insert(k.clone(), None, b"100".to_vec(), 0, TxnId(1), who())
+            .insert(k.clone(), None, Some(b"100".to_vec()), 0, TxnId(1), who())
             .expect("insert");
         engine
-            .update(k, None, b"250".to_vec(), 0, TxnId(2), who())
+            .update(k, None, Some(b"250".to_vec()), 0, TxnId(2), who())
             .expect("update");
         // Checkpoint *after both* commits — the fence vouches both records durable.
         engine.checkpoint().expect("checkpoint");
@@ -299,7 +299,7 @@ fn recover_rejects_a_corrupt_sealed_segment() {
         SystemTimeMicros(10),
         0,
         stele_common::provenance::Provenance::new(TxnId(1), SystemTimeMicros(10), who()),
-        b"v".to_vec(),
+        Some(b"v".to_vec()),
     ))
     .expect("push");
     w.finish().expect("finish");
@@ -334,11 +334,11 @@ fn checkpoint_advances_the_persisted_durable_fence() {
     {
         let mut engine = Engine::open(disk.clone(), StepClock::new(1), false).expect("open");
         engine
-            .insert(k.clone(), None, b"v0".to_vec(), 0, TxnId(1), who())
+            .insert(k.clone(), None, Some(b"v0".to_vec()), 0, TxnId(1), who())
             .expect("insert");
         fence1 = engine.checkpoint().expect("checkpoint 1");
         engine
-            .update(k, None, b"v1".to_vec(), 0, TxnId(2), who())
+            .update(k, None, Some(b"v1".to_vec()), 0, TxnId(2), who())
             .expect("update");
         fence2 = engine.checkpoint().expect("checkpoint 2");
     }

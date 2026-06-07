@@ -182,7 +182,12 @@ impl Answer {
         Self {
             sys_from: v.sys_from,
             sys_to: v.sys_to,
-            payload: v.payload.clone(),
+            // This oracle never writes a SQL NULL payload ([STL-154]); a `None`
+            // here would be a write-path bug, so surface it loudly.
+            payload: v
+                .payload
+                .clone()
+                .expect("oracle scenarios never write a NULL payload"),
         }
     }
 }
@@ -288,7 +293,7 @@ fn build_history(
         } else if live[k] {
             let payload = format!("v{op}").into_bytes();
             let commit = engine
-                .update(key.clone(), None, payload.clone(), 0, txn, who)
+                .update(key.clone(), None, Some(payload.clone()), 0, txn, who)
                 .expect("update")
                 .commit;
             // An update closes the prior period and opens the new one at the same
@@ -303,7 +308,7 @@ fn build_history(
         } else {
             let payload = format!("v{op}").into_bytes();
             let commit = engine
-                .insert(key.clone(), None, payload.clone(), 0, txn, who)
+                .insert(key.clone(), None, Some(payload.clone()), 0, txn, who)
                 .expect("insert")
                 .commit;
             model.open(key.clone(), commit, payload.clone());
@@ -455,11 +460,18 @@ mod tests {
         let key = BusinessKey::new(b"k-0000".to_vec());
 
         let t1 = engine
-            .insert(key.clone(), None, b"100".to_vec(), 0, TxnId(1), who.clone())
+            .insert(
+                key.clone(),
+                None,
+                Some(b"100".to_vec()),
+                0,
+                TxnId(1),
+                who.clone(),
+            )
             .expect("insert")
             .commit;
         let t2 = engine
-            .update(key.clone(), None, b"250".to_vec(), 0, TxnId(2), who)
+            .update(key.clone(), None, Some(b"250".to_vec()), 0, TxnId(2), who)
             .expect("update")
             .commit;
         assert!(t2 > t1, "the update must commit after the insert");

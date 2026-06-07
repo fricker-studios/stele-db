@@ -166,7 +166,7 @@ fn every_persisted_version_carries_its_three_provenance_columns() {
                 &mut index,
                 &EmptySealed,
                 BusinessKey::new(key.clone()),
-                format!("balance={i}").into_bytes(),
+                Some(format!("balance={i}").into_bytes()),
                 0,
                 TxnId(i),
                 Principal::new(principal.clone()),
@@ -247,7 +247,7 @@ fn provenance_columns_add_under_ten_percent_overhead() {
                 SystemTimeMicros(i64::try_from(i).unwrap() + 1),
                 principal.clone(),
             ),
-            payload,
+            Some(payload),
         ));
     }
 

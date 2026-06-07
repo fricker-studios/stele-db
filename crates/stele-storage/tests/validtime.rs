@@ -204,7 +204,7 @@ fn insert_into_a_valid_time_table_populates_both_axes_and_reads_filter_on_either
             &EmptySealed,
             key.clone(),
             Some(interval(100, 200)),
-            b"role=ic".to_vec(),
+            Some(b"role=ic".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -224,7 +224,7 @@ fn insert_into_a_valid_time_table_populates_both_axes_and_reads_filter_on_either
     );
 
     // --- Filter on the VALID axis: recover the interval and test membership. ---
-    let (valid, user) = unframe_payload(true, &stored.payload).unwrap();
+    let (valid, user) = unframe_payload(true, stored.payload.as_deref().unwrap()).unwrap();
     let valid = valid.expect("valid-time table carries an interval");
     assert_eq!(valid, interval(100, 200));
     assert_eq!(user, b"role=ic", "user payload survives the framing");
@@ -251,7 +251,7 @@ fn update_opens_a_new_valid_period_and_the_superseded_one_keeps_its_interval() {
             &EmptySealed,
             key.clone(),
             Some(interval(100, 200)),
-            b"role=ic".to_vec(),
+            Some(b"role=ic".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -266,7 +266,7 @@ fn update_opens_a_new_valid_period_and_the_superseded_one_keeps_its_interval() {
             &EmptySealed,
             key.clone(),
             Some(interval(200, i64::MAX)),
-            b"role=lead".to_vec(),
+            Some(b"role=lead".to_vec()),
             0,
             TxnId(2),
             who(),
@@ -284,11 +284,13 @@ fn update_opens_a_new_valid_period_and_the_superseded_one_keeps_its_interval() {
 
     // Valid axis: the superseded version keeps its original interval; corrections
     // append rather than mutate.
-    let (closed_valid, closed_user) = unframe_payload(true, &versions[0].payload).unwrap();
+    let (closed_valid, closed_user) =
+        unframe_payload(true, versions[0].payload.as_deref().unwrap()).unwrap();
     assert_eq!(closed_valid, Some(interval(100, 200)));
     assert_eq!(closed_user, b"role=ic");
 
-    let (open_valid, open_user) = unframe_payload(true, &versions[1].payload).unwrap();
+    let (open_valid, open_user) =
+        unframe_payload(true, versions[1].payload.as_deref().unwrap()).unwrap();
     assert_eq!(
         open_valid,
         Some(ValidInterval::new(vt(200), VALID_TIME_OPEN).unwrap())
@@ -311,7 +313,7 @@ fn delete_closes_the_system_period_and_preserves_the_valid_interval() {
             &EmptySealed,
             key.clone(),
             Some(interval(100, 200)),
-            b"role=ic".to_vec(),
+            Some(b"role=ic".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -342,7 +344,7 @@ fn delete_closes_the_system_period_and_preserves_the_valid_interval() {
         "delete closes the system period"
     );
     // The valid interval the row was written with is untouched by the delete.
-    let (valid, _) = unframe_payload(true, &versions[0].payload).unwrap();
+    let (valid, _) = unframe_payload(true, versions[0].payload.as_deref().unwrap()).unwrap();
     assert_eq!(valid, Some(interval(100, 200)));
     // The delete's identity is recorded as close-provenance on the system axis,
     // forwarded verbatim through the valid-time writer (STL-118).
@@ -373,7 +375,7 @@ fn valid_time_table_requires_an_interval_on_every_write() {
             &EmptySealed,
             key,
             None,
-            b"x".to_vec(),
+            Some(b"x".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -396,7 +398,7 @@ fn system_only_table_rejects_a_supplied_interval() {
             &EmptySealed,
             key,
             Some(interval(1, 2)),
-            b"x".to_vec(),
+            Some(b"x".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -420,7 +422,7 @@ fn system_only_table_stores_payload_with_no_prefix() {
             &EmptySealed,
             key.clone(),
             None,
-            b"plain".to_vec(),
+            Some(b"plain".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -432,8 +434,8 @@ fn system_only_table_stores_payload_with_no_prefix() {
         .unwrap();
     assert_eq!(live.len(), 1);
     // Stored verbatim — no 16-byte interval prefix on a system-only table.
-    assert_eq!(live[0].payload, b"plain");
-    let (valid, user) = unframe_payload(false, &live[0].payload).unwrap();
+    assert_eq!(live[0].payload.as_deref(), Some(&b"plain"[..]));
+    let (valid, user) = unframe_payload(false, live[0].payload.as_deref().unwrap()).unwrap();
     assert_eq!(valid, None);
     assert_eq!(user, b"plain");
 }

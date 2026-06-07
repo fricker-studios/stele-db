@@ -166,7 +166,7 @@ fn sample_versions() -> Vec<Version> {
                 SystemTimeMicros(10),
                 Principal::new(b"svc".to_vec()),
             ),
-            b"a-v0".to_vec(),
+            Some(b"a-v0".to_vec()),
         ),
         Version::open(
             BusinessKey::new(b"a".to_vec()),
@@ -177,7 +177,7 @@ fn sample_versions() -> Vec<Version> {
                 SystemTimeMicros(20),
                 Principal::new(b"svc".to_vec()),
             ),
-            b"a-v1".to_vec(),
+            Some(b"a-v1".to_vec()),
         ),
         Version::open(
             BusinessKey::new(b"big".to_vec()),
@@ -188,7 +188,7 @@ fn sample_versions() -> Vec<Version> {
                 SystemTimeMicros(1),
                 Principal::new(b"svc".to_vec()),
             ),
-            blob,
+            Some(blob),
         ),
     ]
 }

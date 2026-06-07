@@ -159,6 +159,16 @@ pub(crate) fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Fold an optional payload into the running digest with a presence tag, so a SQL
+/// `NULL` (`None`) and a present value never collide ([STL-154]): a leading `1`
+/// then the bytes for a present value, a lone `0` for `None`.
+fn fold_optional_payload(digest: u64, payload: Option<&[u8]>) -> u64 {
+    payload.map_or_else(
+        || fnv1a(digest, &[0]),
+        |bytes| fnv1a(fnv1a(digest, &[1]), bytes),
+    )
+}
+
 /// Fold a version's optional close-provenance into the running digest ([STL-118]).
 /// A leading presence byte distinguishes an open version (`0`) from a closed one
 /// (`1`, followed by the closing transaction's `txn_id` / `committed_at` /
@@ -222,7 +232,7 @@ pub fn run_storage_seed(seed: u64) -> u64 {
                         SystemTimeMicros(sys_from),
                         Principal::new(principal),
                     ),
-                    payload,
+                    Some(payload),
                 ))
                 .expect("push version");
         }
@@ -261,7 +271,9 @@ fn fold_version(mut digest: u64, v: &Version) -> u64 {
     digest = fnv1a(digest, &v.provenance.committed_at.0.to_le_bytes());
     digest = fnv1a(digest, v.provenance.principal.as_bytes());
     digest = fold_closed_by(digest, v.closed_by.as_ref());
-    digest = fnv1a(digest, &v.payload);
+    // Fold with a presence tag so a SQL NULL payload (`None`) and an empty
+    // payload (`Some(vec![])`) stay distinct in the determinism digest ([STL-154]).
+    digest = fold_optional_payload(digest, v.payload.as_deref());
     digest
 }
 
@@ -320,7 +332,7 @@ pub fn run_validtime_seed(seed: u64) -> u64 {
                 &EmptySealed,
                 key,
                 Some(interval),
-                payload,
+                Some(payload),
                 0,
                 TxnId(txn_id),
                 Principal::new(principal),
@@ -331,7 +343,11 @@ pub fn run_validtime_seed(seed: u64) -> u64 {
     // `flush_to_segment` drains in `(business_key, sys_from)` order — deterministic.
     let mut digest = FNV_OFFSET;
     for v in delta.flush_to_segment().expect("flush") {
-        let (valid, user) = unframe_payload(true, &v.payload).expect("unframe");
+        let (valid, user) = unframe_payload(
+            true,
+            v.payload.as_deref().expect("valid-time row has a payload"),
+        )
+        .expect("unframe");
         let valid = valid.expect("valid-time table carries an interval");
         digest = fnv1a(digest, v.business_key.as_bytes());
         digest = fnv1a(digest, &v.sys_from.0.to_le_bytes());
@@ -393,7 +409,7 @@ pub fn run_delete_seed(seed: u64) -> u64 {
                         &mut index,
                         &EmptySealed,
                         key,
-                        payload,
+                        Some(payload),
                         0,
                         txn,
                         principal,
@@ -409,7 +425,7 @@ pub fn run_delete_seed(seed: u64) -> u64 {
                     &mut index,
                     &EmptySealed,
                     key,
-                    payload,
+                    Some(payload),
                     0,
                     txn,
                     principal,
@@ -471,7 +487,7 @@ pub fn run_dml_seed(seed: u64) -> u64 {
                         &EmptySealed,
                         key,
                         None,
-                        payload,
+                        Some(payload),
                         0,
                         txn,
                         principal,
@@ -488,7 +504,7 @@ pub fn run_dml_seed(seed: u64) -> u64 {
                     &EmptySealed,
                     key,
                     None,
-                    payload,
+                    Some(payload),
                     0,
                     txn,
                     principal,
@@ -556,7 +572,7 @@ pub fn run_recovery_index_seed(seed: u64) -> u64 {
                         &EmptySealed,
                         key,
                         None,
-                        payload,
+                        Some(payload),
                         0,
                         txn,
                         principal,
@@ -573,7 +589,7 @@ pub fn run_recovery_index_seed(seed: u64) -> u64 {
                     &EmptySealed,
                     key,
                     None,
-                    payload,
+                    Some(payload),
                     0,
                     txn,
                     principal,
@@ -669,7 +685,7 @@ pub fn run_engine_recover_seed(seed: u64) -> u64 {
                     let payload_len = rng.below_usize(16);
                     let payload = rng.bytes(payload_len);
                     let c = engine
-                        .update(key.clone(), None, payload.clone(), 0, txn, principal)
+                        .update(key.clone(), None, Some(payload.clone()), 0, txn, principal)
                         .expect("update")
                         .commit;
                     oracle.entry(key).or_default().insert(c, Some(payload));
@@ -679,7 +695,7 @@ pub fn run_engine_recover_seed(seed: u64) -> u64 {
                 let payload_len = rng.below_usize(16);
                 let payload = rng.bytes(payload_len);
                 let c = engine
-                    .insert(key.clone(), None, payload.clone(), 0, txn, principal)
+                    .insert(key.clone(), None, Some(payload.clone()), 0, txn, principal)
                     .expect("insert")
                     .commit;
                 oracle.entry(key).or_default().insert(c, Some(payload));
@@ -726,19 +742,17 @@ pub fn run_engine_recover_seed(seed: u64) -> u64 {
                 .get(key)
                 .and_then(|timeline| timeline.range(..=s).next_back())
                 .and_then(|(_, payload)| payload.clone());
-            let got = recovered.as_of_payload(key, Snapshot(s)).expect("as_of");
+            // `.flatten()` drops the NULL-ness Option: this scenario writes none (STL-154).
+            let got = recovered
+                .as_of_payload(key, Snapshot(s))
+                .expect("as_of")
+                .flatten();
             assert_eq!(
                 got, want,
                 "seed {seed} @ s={s:?} key {key:?}: recovered AS OF must match the oracle",
             );
             digest = fnv1a(digest, key.as_bytes());
-            match got {
-                Some(payload) => {
-                    digest = fnv1a(digest, &[1]);
-                    digest = fnv1a(digest, &payload);
-                }
-                None => digest = fnv1a(digest, &[0]),
-            }
+            digest = fold_optional_payload(digest, got.as_deref());
         }
     }
     // Fold the (identical) rebuilt index for the determinism sweep.
@@ -790,9 +804,12 @@ fn verify_recovered_prefix<C: Clock, D: Disk + Clone>(
     for &s in &probes {
         for key in keys {
             recovered_fp.push(
+                // `.flatten()`: no NULL payloads here, so a present row's payload
+                // is always `Some` ([STL-154]).
                 engine
                     .as_of_payload(key, Snapshot(s))
-                    .expect("recovered as_of"),
+                    .expect("recovered as_of")
+                    .flatten(),
             );
         }
     }
@@ -928,10 +945,10 @@ pub fn run_engine_recover_faults_seed(seed: u64) -> u64 {
                 if want_delete {
                     engine.delete(&key, txn, principal)
                 } else {
-                    engine.update(key.clone(), None, payload.clone(), 0, txn, principal)
+                    engine.update(key.clone(), None, Some(payload.clone()), 0, txn, principal)
                 }
             } else {
-                engine.insert(key.clone(), None, payload.clone(), 0, txn, principal)
+                engine.insert(key.clone(), None, Some(payload.clone()), 0, txn, principal)
             };
             match outcome {
                 Ok(o) => {
@@ -1040,7 +1057,7 @@ fn stage_committed_write(
             commit,
             0,
             Provenance::new(txn_id, commit, Principal::new(b"sim".to_vec())),
-            format!("v@{}", commit.0).into_bytes(),
+            Some(format!("v@{}", commit.0).into_bytes()),
         ))
         .expect("open new version");
 }
@@ -1131,7 +1148,9 @@ pub fn run_mvcc_seed(seed: u64) -> u64 {
             Some(v) => {
                 digest = fnv1a(digest, &[1]);
                 digest = fnv1a(digest, &v.sys_from.0.to_le_bytes());
-                digest = fnv1a(digest, &v.payload);
+                // Presence-tagged so a NULL payload never hashes like an empty one
+                // ([STL-154]).
+                digest = fold_optional_payload(digest, v.payload.as_deref());
             }
             None => digest = fnv1a(digest, &[0]),
         }
@@ -1298,7 +1317,18 @@ fn scan_map(out: &stele_exec::ScanOutput) -> BTreeMap<Vec<u8>, Vec<u8>> {
     else {
         panic!("scan must project BusinessKey and Payload as bytes columns");
     };
-    keys.iter().cloned().zip(payloads.iter().cloned()).collect()
+    // This scenario never writes a SQL NULL, so every projected cell is present;
+    // a `None` would be a write-path bug, surfaced loudly here ([STL-154]).
+    keys.iter()
+        .cloned()
+        .zip(payloads.iter().cloned())
+        .map(|(k, p)| {
+            (
+                k.expect("business key is never NULL"),
+                p.expect("this scenario writes no NULL payload"),
+            )
+        })
+        .collect()
 }
 
 /// The reference oracle: per key, the committed timeline of payload-or-delete,
@@ -1342,7 +1372,7 @@ fn apply_scan_op(
                 &sealed,
                 key.clone(),
                 None,
-                payload.clone(),
+                Some(payload.clone()),
                 0,
                 txn,
                 who,
@@ -1357,7 +1387,7 @@ fn apply_scan_op(
                 &sealed,
                 key.clone(),
                 None,
-                payload.clone(),
+                Some(payload.clone()),
                 0,
                 txn,
                 who,
@@ -1622,7 +1652,7 @@ pub fn four_statement_identity_demo() -> Vec<u8> {
             &EmptySealed,
             key.clone(),
             None,
-            b"100".to_vec(),
+            Some(b"100".to_vec()),
             0,
             TxnId(1),
             who.clone(),
@@ -1638,7 +1668,7 @@ pub fn four_statement_identity_demo() -> Vec<u8> {
             &EmptySealed,
             key,
             None,
-            b"250".to_vec(),
+            Some(b"250".to_vec()),
             0,
             TxnId(2),
             who,
@@ -1681,8 +1711,9 @@ pub fn four_statement_identity_demo() -> Vec<u8> {
     let Some((_, Column::Bytes(payloads))) = out.batch.columns.into_iter().next() else {
         panic!("scan must project the payload as a bytes column");
     };
-    let [payload] = <[Vec<u8>; 1]>::try_from(payloads).expect("exactly one row for id = 1");
-    payload
+    let [payload] = <[Option<Vec<u8>>; 1]>::try_from(payloads).expect("exactly one row for id = 1");
+    // This scenario writes no SQL NULL payload, so the one cell is always present.
+    payload.expect("this scenario writes no NULL payload")
 }
 
 /// Read a seeded insert/update/delete history back **through the SQL binder**.

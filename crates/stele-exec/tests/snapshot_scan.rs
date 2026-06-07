@@ -82,7 +82,7 @@ fn seal_one(disk: &MemDisk, name: &str, key: &[u8], sys_from: i64) -> SegmentRea
         SystemTimeMicros(sys_from),
         0,
         Provenance::new(TxnId(1), SystemTimeMicros(sys_from), who()),
-        b"payload".to_vec(),
+        Some(b"payload".to_vec()),
     ))
     .expect("push");
     w.finish().expect("finish");
@@ -113,7 +113,7 @@ fn one_bytes(out: &stele_exec::ScanOutput, col: ColumnId) -> Vec<u8> {
     match column {
         Column::Bytes(rows) => {
             assert_eq!(rows.len(), 1, "expected exactly one row");
-            rows[0].clone()
+            rows[0].clone().expect("present payload")
         }
         Column::I64(_) => panic!("column {col:?} is i64, expected bytes"),
     }
@@ -137,7 +137,7 @@ fn identity_demo_reads_the_pre_update_value_as_of() {
             &EmptySealed,
             key.clone(),
             None,
-            b"100".to_vec(),
+            Some(b"100".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -151,7 +151,7 @@ fn identity_demo_reads_the_pre_update_value_as_of() {
             &EmptySealed,
             key,
             None,
-            b"250".to_vec(),
+            Some(b"250".to_vec()),
             0,
             TxnId(2),
             who(),
@@ -205,7 +205,7 @@ fn cross_tier_merge_resolves_segment_then_delta() {
             &EmptySealed,
             key.clone(),
             None,
-            b"100".to_vec(),
+            Some(b"100".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -227,7 +227,7 @@ fn cross_tier_merge_resolves_segment_then_delta() {
             &sealed,
             key,
             None,
-            b"250".to_vec(),
+            Some(b"250".to_vec()),
             0,
             TxnId(2),
             who(),
@@ -270,7 +270,7 @@ fn projection_selects_and_orders_columns() {
             &EmptySealed,
             key.clone(),
             None,
-            b"payload".to_vec(),
+            Some(b"payload".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -315,7 +315,7 @@ fn projecting_an_unsupported_column_errors() {
             &EmptySealed,
             key_of(1),
             None,
-            b"x".to_vec(),
+            Some(b"x".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -352,7 +352,7 @@ fn predicate_filters_to_one_key() {
                 &EmptySealed,
                 key_of(id),
                 None,
-                format!("row-{id}").into_bytes(),
+                Some(format!("row-{id}").into_bytes()),
                 0,
                 TxnId(u64::try_from(id).unwrap()),
                 who(),
@@ -395,7 +395,7 @@ fn predicate_filters_to_one_key() {
         .execute()
         .expect("scan 2..=4");
     let keys: Vec<Vec<u8>> = match &mid.batch.columns[0].1 {
-        Column::Bytes(rows) => rows.clone(),
+        Column::Bytes(rows) => rows.iter().map(|c| c.clone().unwrap()).collect(),
         Column::I64(_) => panic!("business key is a bytes column"),
     };
     assert_eq!(keys, vec![key_of(2).0, key_of(3).0, key_of(4).0]);
@@ -460,7 +460,7 @@ fn validity_index_prunes_a_fully_superseded_segment() {
             &EmptySealed,
             key.clone(),
             None,
-            b"100".to_vec(),
+            Some(b"100".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -479,7 +479,7 @@ fn validity_index_prunes_a_fully_superseded_segment() {
             &sealed,
             key,
             None,
-            b"250".to_vec(),
+            Some(b"250".to_vec()),
             0,
             TxnId(2),
             who(),
@@ -539,7 +539,7 @@ fn late_materialization_resolves_live_rows_within_a_scanned_segment() {
             &EmptySealed,
             key_of(id),
             None,
-            payload.as_bytes().to_vec(),
+            Some(payload.as_bytes().to_vec()),
             0,
             TxnId(u64::try_from(id).unwrap()),
             who(),
@@ -561,7 +561,7 @@ fn late_materialization_resolves_live_rows_within_a_scanned_segment() {
             &sealed,
             key_of(3),
             None,
-            b"C2".to_vec(),
+            Some(b"C2".to_vec()),
             0,
             TxnId(9),
             who(),
@@ -581,11 +581,11 @@ fn late_materialization_resolves_live_rows_within_a_scanned_segment() {
     // Keys 1 and 2 are materialized from the segment; key 3's live value is the
     // delta's post-update payload, not the superseded sealed one.
     let keys: Vec<Vec<u8>> = match &out.batch.columns[0].1 {
-        Column::Bytes(rows) => rows.clone(),
+        Column::Bytes(rows) => rows.iter().map(|c| c.clone().unwrap()).collect(),
         Column::I64(_) => panic!("business key is a bytes column"),
     };
     let payloads: Vec<Vec<u8>> = match &out.batch.columns[1].1 {
-        Column::Bytes(rows) => rows.clone(),
+        Column::Bytes(rows) => rows.iter().map(|c| c.clone().unwrap()).collect(),
         Column::I64(_) => panic!("payload is a bytes column"),
     };
     let got: Vec<(Vec<u8>, Vec<u8>)> = keys.into_iter().zip(payloads).collect();

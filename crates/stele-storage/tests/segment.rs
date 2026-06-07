@@ -142,7 +142,7 @@ fn version(key: &[u8], sys_from: i64, payload: &[u8]) -> Version {
             SystemTimeMicros(sys_from),
             Principal::new(format!("svc-{sys_from}").into_bytes()),
         ),
-        payload.to_vec(),
+        Some(payload.to_vec()),
     )
 }
 
@@ -226,6 +226,49 @@ fn seq_round_trips_through_the_sealed_segment() {
         got[1].seq,
         u64::MAX,
         "full-width seq survives the i64 column"
+    );
+}
+
+/// A SQL `NULL` payload survives seal → read (format v10, STL-154): the `None`
+/// is persisted via the bytes-column sentinel and reconstructs as a `None`
+/// payload, kept distinct from an empty payload in the same segment.
+#[test]
+fn null_payload_round_trips_through_the_sealed_segment() {
+    let disk = MemDisk::new();
+    let mut null = version(b"a", 10, b"");
+    null.payload = None;
+    let present = version(b"b", 20, b"v");
+    let empty = version(b"c", 30, b""); // Some(vec![]) — must NOT collapse to NULL
+
+    let (got, _) = round_trip(
+        &disk,
+        "null.seg",
+        &[null.clone(), present.clone(), empty.clone()],
+        &[],
+    );
+    assert_eq!(
+        got,
+        vec![null, present, empty],
+        "payloads round-trip exactly"
+    );
+    assert_eq!(got[0].payload, None, "NULL stays NULL across the seal");
+    assert_eq!(got[1].payload, Some(b"v".to_vec()));
+    assert_eq!(
+        got[2].payload,
+        Some(Vec::new()),
+        "empty payload is not confused with NULL"
+    );
+
+    // The projected payload column reports the NULL as a `None` cell.
+    let reader = SegmentReader::open(&disk, "null.seg").expect("open");
+    let ColumnData::NullableBytes(payloads) = reader.read_column(ColumnId::Payload).expect("read")
+    else {
+        panic!("payload column reads back as nullable bytes");
+    };
+    assert_eq!(
+        payloads,
+        vec![None, Some(b"v".to_vec()), Some(Vec::new())],
+        "the payload column carries the NULL through projection"
     );
 }
 
@@ -331,7 +374,8 @@ fn round_trip_preserves_every_column_value() {
         .map(|v| v.business_key.as_bytes().to_vec())
         .collect();
     let expected_sys_from: Vec<i64> = written.iter().map(|v| v.sys_from.0).collect();
-    let expected_payload: Vec<Vec<u8>> = written.iter().map(|v| v.payload.clone()).collect();
+    let expected_payload: Vec<Option<Vec<u8>>> =
+        written.iter().map(|v| v.payload.clone()).collect();
 
     assert_eq!(
         r.read_column(ColumnId::BusinessKey).unwrap(),
@@ -345,7 +389,7 @@ fn round_trip_preserves_every_column_value() {
     // validity index, not the segment.
     assert_eq!(
         r.read_column(ColumnId::Payload).unwrap(),
-        ColumnData::Bytes(expected_payload),
+        ColumnData::NullableBytes(expected_payload),
     );
 
     // Provenance columns are first-class — projectable exactly like the data

@@ -246,7 +246,8 @@ fn engine_live(
         .expect("scan")
     {
         let key = v.business_key.0[1];
-        let (interval, user) = unframe_payload(true, &v.payload).expect("unframe");
+        let (interval, user) =
+            unframe_payload(true, v.payload.as_deref().unwrap()).expect("unframe");
         let interval = interval.expect("valid-time table carries an interval");
         assert!(
             live.insert(key, (interval, user.to_vec())).is_none(),
@@ -330,7 +331,7 @@ fn run_seed_with<C: Clock>(seed: u64, clock: C) -> Scenario {
                         &EmptySealed,
                         key,
                         Some(interval),
-                        value.clone(),
+                        Some(value.clone()),
                         op,
                         txn,
                         who(),
@@ -358,7 +359,7 @@ fn run_seed_with<C: Clock>(seed: u64, clock: C) -> Scenario {
                     &EmptySealed,
                     key,
                     Some(interval),
-                    value.clone(),
+                    Some(value.clone()),
                     op,
                     txn,
                     who(),
@@ -532,7 +533,7 @@ fn two_commits_at_one_tick_are_ordered_by_seq() {
             &EmptySealed,
             key.clone(),
             Some(valid),
-            b"A".to_vec(),
+            Some(b"A".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -547,7 +548,7 @@ fn two_commits_at_one_tick_are_ordered_by_seq() {
             &EmptySealed,
             key,
             Some(valid),
-            b"B".to_vec(),
+            Some(b"B".to_vec()),
             1,
             TxnId(2),
             who(),
@@ -672,7 +673,7 @@ fn two_version_engine() -> (i64, i64, Option<Vec<u8>>) {
             &EmptySealed,
             key.clone(),
             Some(valid),
-            b"A".to_vec(),
+            Some(b"A".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -687,7 +688,7 @@ fn two_version_engine() -> (i64, i64, Option<Vec<u8>>) {
             &EmptySealed,
             key,
             Some(valid),
-            b"B".to_vec(),
+            Some(b"B".to_vec()),
             0,
             TxnId(2),
             who(),

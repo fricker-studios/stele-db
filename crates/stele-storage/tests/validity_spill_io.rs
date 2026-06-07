@@ -166,7 +166,7 @@ fn open_version(key: &str, sys_from: i64) -> Version {
             SystemTimeMicros(sys_from),
             Principal::new(b"birth".to_vec()),
         ),
-        b"body".to_vec(),
+        Some(b"body".to_vec()),
     )
 }
 

@@ -649,11 +649,13 @@ fn result_header(result: &SelectResult) -> Vec<ResultColumn> {
 
 /// Decode every cell of a [`SelectResult`] into `DataRow`-ready [`ResultColumn`]s.
 ///
-/// Each raw cell is the value's canonical encoding ([`ScalarValue::encode`]);
+/// A present cell carries the value's canonical encoding ([`ScalarValue::encode`]);
 /// decoding it under the column's [`LogicalType`] is the exact inverse, so a value
-/// written through the DML path round-trips. A decode failure means the stored
-/// bytes do not match the column type (corruption, or an opaque payload staged
-/// outside the wire path) and is surfaced rather than rendered wrong.
+/// written through the DML path round-trips. A `None` cell is a SQL `NULL`
+/// ([STL-154]): it carries no bytes and renders as the length-`-1` `DataRow`
+/// sentinel (via [`null_cell`]). A decode failure on a present cell means the
+/// stored bytes do not match the column type (corruption, or an opaque payload
+/// staged outside the wire path) and is surfaced rather than rendered wrong.
 fn decode_result_rows(result: &SelectResult) -> Result<Vec<Vec<ResultColumn>>, DecodeError> {
     result
         .rows
@@ -663,7 +665,10 @@ fn decode_result_rows(result: &SelectResult) -> Result<Vec<Vec<ResultColumn>>, D
                 .columns
                 .iter()
                 .zip(raw)
-                .map(|((_, ty), bytes)| Ok(cell(ScalarValue::decode(*ty, bytes)?)))
+                .map(|((_, ty), cell_bytes)| match cell_bytes {
+                    None => Ok(null_cell(*ty)),
+                    Some(bytes) => Ok(cell(ScalarValue::decode(*ty, bytes)?)),
+                })
                 .collect()
         })
         .collect()
@@ -792,6 +797,17 @@ const fn cell(value: ScalarValue) -> ResultColumn {
         name: String::new(),
         ty: value.logical_type(),
         value: Some(value),
+    }
+}
+
+/// A `DataRow` cell for a SQL `NULL` of the given column type ([STL-154]): no
+/// value, so [`data_row_payload`] emits the length-`-1` sentinel. The type is
+/// carried for parity with [`cell`] even though a NULL cell renders no bytes.
+const fn null_cell(ty: LogicalType) -> ResultColumn {
+    ResultColumn {
+        name: String::new(),
+        ty,
+        value: None,
     }
 }
 

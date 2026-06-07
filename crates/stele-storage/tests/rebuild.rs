@@ -140,7 +140,7 @@ fn as_of(
     merge::resolve_snapshot(&chains, Snapshot(s))
         .into_iter()
         .find(|v| &v.business_key == key)
-        .map(|v| v.payload)
+        .and_then(|v| v.payload)
 }
 
 // --- 1. the resurrection oracle ---------------------------------------------
@@ -168,7 +168,7 @@ fn resurrection_gap_survives_full_index_rebuild_byte_identical() {
             &EmptySealed,
             key.clone(),
             None,
-            b"v0".to_vec(),
+            Some(b"v0".to_vec()),
             0,
             TxnId(1),
             who(),
@@ -183,7 +183,7 @@ fn resurrection_gap_survives_full_index_rebuild_byte_identical() {
             &EmptySealed,
             key.clone(),
             None,
-            b"v1".to_vec(),
+            Some(b"v1".to_vec()),
             0,
             TxnId(2),
             who(),
@@ -198,7 +198,7 @@ fn resurrection_gap_survives_full_index_rebuild_byte_identical() {
             &EmptySealed,
             key.clone(),
             None,
-            b"v2".to_vec(),
+            Some(b"v2".to_vec()),
             0,
             TxnId(3),
             who(),
@@ -218,7 +218,7 @@ fn resurrection_gap_survives_full_index_rebuild_byte_identical() {
             &EmptySealed,
             key.clone(),
             None,
-            b"v4".to_vec(),
+            Some(b"v4".to_vec()),
             0,
             TxnId(5),
             who(),
@@ -383,7 +383,7 @@ fn from_scratch_rebuild_equals_wal_replay_under_seed_sweep() {
                             &EmptySealed,
                             key,
                             None,
-                            payload.clone(),
+                            Some(payload.clone()),
                             0,
                             txn,
                             who(),
@@ -406,7 +406,7 @@ fn from_scratch_rebuild_equals_wal_replay_under_seed_sweep() {
                         &EmptySealed,
                         key,
                         None,
-                        payload.clone(),
+                        Some(payload.clone()),
                         0,
                         txn,
                         who(),
@@ -459,7 +459,8 @@ fn from_scratch_rebuild_equals_wal_replay_under_seed_sweep() {
             let chains = merge::fold_chains(seg_versions.iter().cloned(), &rebuilt).expect("fold");
             for v in merge::resolve_snapshot(&chains, Snapshot(SystemTimeMicros(s))) {
                 assert!(
-                    got.insert(v.business_key.clone(), v.payload).is_none(),
+                    got.insert(v.business_key.clone(), v.payload.unwrap())
+                        .is_none(),
                     "seed {seed} @ s={s}: two live versions for one key — tiling invariant broken",
                 );
             }
@@ -492,7 +493,7 @@ fn delete_provenance_is_queryable_from_the_persisted_retraction() {
             &EmptySealed,
             key.clone(),
             None,
-            b"payload".to_vec(),
+            Some(b"payload".to_vec()),
             0,
             TxnId(11),
             who(),

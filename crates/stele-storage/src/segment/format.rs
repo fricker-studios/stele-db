@@ -114,7 +114,27 @@ pub(super) const TRAILER_MAGIC: [u8; 8] = *b"STLSEGFT";
 ///   from a corrupt one. The version bump restores the clean header-level reject
 ///   ([`SegmentError::UnsupportedVersion`](super::SegmentError::UnsupportedVersion))
 ///   in both directions. The version row-group is byte-identical to v8.
-pub(super) const FORMAT_VERSION: u16 = 9;
+///
+/// * **v10** — **lets the `payload` column carry SQL `NULL`** ([STL-154]). A
+///   value-less (`None`) payload is encoded in the bytes column with its
+///   per-value length set to the reserved sentinel [`BYTES_NULL_SENTINEL`]
+///   (`u32::MAX`) and no value bytes, mirroring the delta frame's
+///   `PAYLOAD_NULL_SENTINEL`. A real value can never
+///   reach that length (`MAX_VERSION_FRAME_LEN` caps it at 16 MiB), so the
+///   sentinel is unambiguous and only ever appears in the `payload` column. It
+///   bumps the generation because a v9 reader would mis-decode the sentinel
+///   length as a 4 GiB value (`Corrupt`) rather than reject cleanly at the
+///   header; the bump restores the clean header-level reject in both directions.
+///   Every other column and the row-group framing are byte-identical to v9.
+pub(super) const FORMAT_VERSION: u16 = 10;
+
+/// The per-value length reserved in a bytes column to mean "this cell is SQL
+/// `NULL`" ([STL-154], [`FORMAT_VERSION`] v10). Only the `payload` column ever
+/// writes it; a present value's length is bounded by `MAX_VERSION_FRAME_LEN`
+/// (16 MiB), so `u32::MAX` is otherwise unreachable. The mirror of the delta
+/// frame's `PAYLOAD_NULL_SENTINEL`, kept as a distinct constant because the two
+/// encodings are independent on-disk formats.
+pub(super) const BYTES_NULL_SENTINEL: u32 = u32::MAX;
 
 /// Header size in bytes — magic (8) + version (2) + flags (2) + reserved (4).
 pub(super) const HEADER_LEN: usize = 16;
