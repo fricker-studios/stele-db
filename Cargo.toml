@@ -55,10 +55,12 @@ tokio              = { version = "1.40", features = ["rt-multi-thread", "net", "
 tokio-postgres     = "0.7"
 # Dev-only: the second, independent bitemporal correctness oracle (STL-144). The
 # `bundled` feature vendors and compiles the DuckDB C++ amalgamation (MIT), so the
-# test needs no system library; default features are empty, so the dependency tree
-# stays the lean C-API wrapper (no arrow/polars). Pinned to 1.4.x — its MSRV
-# (1.84.1) clears our 1.85 toolchain. Wired only into `stele-exec`'s dev-deps; it
-# never links into the runtime-agnostic storage/txn core ([ADR-0010]).
+# test needs no system library. Default features are empty (no polars/extensions),
+# but `duckdb` depends on `arrow` non-optionally — there is no feature to opt out —
+# so the dev-tree pulls the arrow stack regardless (all MIT/Apache-2.0; cargo-deny
+# green, see deny.toml). Pinned to 1.4.x — its MSRV (1.84.1) clears our 1.85
+# toolchain. Wired only into `stele-exec`'s dev-deps; it never links into the
+# runtime-agnostic storage/txn core ([ADR-0010]).
 duckdb             = { version = "1.4", features = ["bundled"] }
 tracing            = "0.1"
 # `json` enables the line-delimited JSON formatter for production
