@@ -243,7 +243,7 @@ flowchart LR
 | **Version bump** | `cargo release` / `release-plz` | Optional automated PRs that bump versions + changelog. |
 | **Artifacts** | `cargo build --release` per target | Static where feasible; SHA-256 checksums. |
 | **Signing** | **cosign / Sigstore** + **SLSA provenance** | Keyless signing; provenance attestation. |
-| **SBOM** | `cargo cyclonedx` | Attached to each release. |
+| **SBOM** | `cargo cyclonedx` + `cyclonedx` (CycloneDX CLI) `merge` | Per-crate BOMs merged into one canonical workspace document `stele-<tag>.cdx.json`, attached to each release. |
 | **Docker** | multi-arch `buildx` → **ghcr.io** | The canonical image ([05](05-dev-environment.md)); signed with cosign. |
 | **Package registries** | crates.io (libraries), later Homebrew tap + apt/deb | pre-1.0: GitHub Releases + Docker only; registries follow as the API stabilizes. |
 
