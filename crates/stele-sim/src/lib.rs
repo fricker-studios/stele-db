@@ -1688,14 +1688,18 @@ pub fn sweep(seeds: u64, fault_injection: bool) -> SweepReport {
 /// `--fault-injection` flag.
 #[must_use]
 pub fn replay(seed: u64) -> Vec<(&'static str, u64)> {
-    registry()
+    let digests = registry()
         .iter()
         .map(|scenario| {
             set_current(scenario.name(), seed);
             let digest = scenario.run(seed);
             (scenario.name(), digest)
         })
-        .collect()
+        .collect();
+    // Clear the marker so a later, unrelated panic can't print a stale
+    // `scenario + seed` banner from this finished replay.
+    clear_current();
+    digests
 }
 
 #[cfg(test)]
@@ -1968,19 +1972,28 @@ mod tests {
     }
 
     #[test]
-    fn fault_injection_flag_changes_coverage() {
-        // The `--fault-injection` flag must genuinely change what runs: exactly
-        // the one fault-gated scenario, and a different fold as a result.
+    fn fault_injection_gates_exactly_the_fault_disk_scenario() {
+        // The `--fault-injection` flag must genuinely change what runs. Assert it
+        // structurally: exactly one scenario is fault-gated and it is fault-disk,
+        // and turning the flag on adds exactly that one scenario to the sweep.
+        // (A digest-inequality check would be subtly flaky — different folds can
+        // collide in principle — so we assert coverage, not the digest value.)
+        let gated: Vec<&str> = registry()
+            .iter()
+            .filter(|s| s.requires_fault_injection())
+            .map(|s| s.name())
+            .collect();
+        assert_eq!(
+            gated,
+            ["fault-disk"],
+            "exactly the fault-disk scenario is fault-gated"
+        );
         let on = sweep(4, true);
         let off = sweep(4, false);
         assert_eq!(
             on.scenarios,
             off.scenarios + 1,
             "fault injection adds exactly the fault-disk scenario"
-        );
-        assert_ne!(
-            on.digest, off.digest,
-            "folding the fault scenario must change the sweep digest"
         );
     }
 

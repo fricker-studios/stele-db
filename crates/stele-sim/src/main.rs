@@ -8,7 +8,15 @@
 //!
 //! [`install_failure_reporter`]: stele_sim::install_failure_reporter
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// A strict on/off toggle — clap rejects anything but `on` or `off`, so a typo
+/// like `--fault-injection Off` fails fast instead of silently enabling faults.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Toggle {
+    On,
+    Off,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -25,8 +33,8 @@ struct Args {
     seed: Option<u64>,
 
     /// Toggle fault injection (gates the seeded-fault virtual-disk scenario).
-    #[arg(long, default_value = "off")]
-    fault_injection: String,
+    #[arg(long, value_enum, default_value = "off")]
+    fault_injection: Toggle,
 }
 
 fn main() {
@@ -46,7 +54,7 @@ fn main() {
     } else if args.seeds == 0 {
         println!("stele-sim: no seeds requested (pass --seeds N or --seed S)");
     } else {
-        let faults_on = args.fault_injection != "off";
+        let faults_on = args.fault_injection == Toggle::On;
         // Sweep: only returns once every active scenario passes every seed. A
         // failure prints the banner via the panic hook and exits non-zero.
         let report = stele_sim::sweep(args.seeds, faults_on);
