@@ -149,11 +149,19 @@ impl Future for Sleep {
             self.scheduled = true;
             let dur = self.dur;
             with_state(|st| {
-                let wake_at = st.clock.now_micros().saturating_add(dur);
-                st.sleepers.push(Sleeper {
-                    wake_at,
-                    task: st.current,
-                });
+                let now = st.clock.now_micros();
+                let wake_at = now.saturating_add(dur);
+                if wake_at <= now {
+                    // A non-positive sleep can't park: sleepers only wake once
+                    // the ready set drains, so it could starve behind tasks that
+                    // keep yielding. Treat it as an immediate re-queue instead.
+                    st.ready.push(st.current);
+                } else {
+                    st.sleepers.push(Sleeper {
+                        wake_at,
+                        task: st.current,
+                    });
+                }
             });
             Poll::Pending
         }
@@ -352,18 +360,28 @@ pub fn run_schedule_seed(seed: u64) -> Vec<u8> {
     encode_events(&schedule_trace(seed))
 }
 
-/// FNV-1a digest of the demo schedule's byte trace — a single `u64` to fold into
-/// the sim sweep alongside the storage-scenario digests.
+/// FNV-1a digest of an encoded schedule trace — a single `u64` to fold into the
+/// sim sweep alongside the storage-scenario digests.
+///
+/// Callers that also need the raw trace (e.g. to count distinct schedules) should
+/// run the demo once and pass its bytes here, rather than calling
+/// [`run_schedule_seed_digest`] separately.
 #[must_use]
-pub fn run_schedule_seed_digest(seed: u64) -> u64 {
+pub fn trace_digest(trace: &[u8]) -> u64 {
     const OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01B3;
     let mut hash = OFFSET;
-    for b in run_schedule_seed(seed) {
+    for &b in trace {
         hash ^= u64::from(b);
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+/// FNV-1a digest of the demo schedule for `seed`.
+#[must_use]
+pub fn run_schedule_seed_digest(seed: u64) -> u64 {
+    trace_digest(&run_schedule_seed(seed))
 }
 
 #[cfg(test)]
@@ -451,6 +469,28 @@ mod tests {
         );
         // The final record happened after a sleep(5) from t=0.
         assert_eq!(trace.last().unwrap().at, 5);
+    }
+
+    #[test]
+    fn zero_sleep_does_not_starve() {
+        // One task sleeps(0) while another keeps yielding. If sleep(0) parked in
+        // `sleepers` it could starve (sleepers only wake when `ready` drains);
+        // it must instead re-queue as ready and complete.
+        let mut sched = Scheduler::new(2);
+        sched.spawn(async {
+            sleep(0).await;
+            record(100);
+        });
+        sched.spawn(async {
+            for _ in 0..3 {
+                yield_now().await;
+            }
+        });
+        let trace = sched.run();
+        assert!(
+            trace.iter().any(|e| e.tag == 100),
+            "the sleep(0) task never ran"
+        );
     }
 
     /// A future that parks forever without registering to be re-polled.

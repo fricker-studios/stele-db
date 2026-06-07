@@ -87,11 +87,12 @@ fn main() {
                     (sweep ^ stele_sim::run_fault_seed(seed)).wrapping_mul(0x0000_0100_0000_01B3);
             }
             // The cooperative scheduler (STL-108): a seed-determined interleaving
-            // of cooperating tasks over the virtual clock + ChaCha20 RNG. The raw
-            // trace feeds the distinct-schedule count below.
-            sweep = (sweep ^ stele_sim::run_schedule_seed_digest(seed))
-                .wrapping_mul(0x0000_0100_0000_01B3);
-            schedules.insert(stele_sim::run_schedule_seed(seed));
+            // of cooperating tasks over the virtual clock + ChaCha20 RNG. Run the
+            // demo once per seed — digest the trace and reuse the same bytes for
+            // the distinct-schedule count below.
+            let trace = stele_sim::run_schedule_seed(seed);
+            sweep = (sweep ^ stele_sim::trace_digest(&trace)).wrapping_mul(0x0000_0100_0000_01B3);
+            schedules.insert(trace);
         }
         println!(
             "stele-sim: swept {} seed(s) over the in-memory backend → sweep digest {sweep:#018x}",

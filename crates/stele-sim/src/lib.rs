@@ -60,7 +60,7 @@ pub use chacha::SeededRng;
 pub use clock::VirtualClock;
 pub use scheduler::{
     Event, Scheduler, TaskId, encode_events, record, run_schedule_seed, run_schedule_seed_digest,
-    schedule_trace, sleep, yield_now,
+    schedule_trace, sleep, trace_digest, yield_now,
 };
 
 /// A deterministic, strictly-increasing clock for seeded scenarios.

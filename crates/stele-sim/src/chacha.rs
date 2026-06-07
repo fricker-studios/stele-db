@@ -145,10 +145,24 @@ impl SeededRng {
         (hi << 32) | lo
     }
 
-    /// Uniform-ish `usize` in `0..bound`. `bound` must be non-zero (a zero
-    /// `bound` panics on the modulo, exactly like the older [`crate::Rng`]).
+    /// Uniform `usize` in `0..bound`. `bound` must be non-zero (a zero `bound`
+    /// panics on the modulo).
+    ///
+    /// Uses rejection sampling, so the result is unbiased even when `bound` does
+    /// not divide 2⁶⁴ — the scheduler relies on this for a genuinely uniform
+    /// choice among ready tasks.
     pub fn below_usize(&mut self, bound: usize) -> usize {
-        usize::try_from(self.next_u64() % bound as u64).expect("value < bound fits usize")
+        let bound = bound as u64;
+        // Reject the unfair tail: the top `2^64 % bound` values would over-
+        // represent the low residues. `0 - bound` wraps to `2^64 - bound`, whose
+        // remainder mod `bound` is exactly `2^64 % bound`.
+        let reject_below = 0u64.wrapping_sub(bound) % bound;
+        loop {
+            let v = self.next_u64();
+            if v >= reject_below {
+                return usize::try_from(v % bound).expect("value < bound fits usize");
+            }
+        }
     }
 }
 
