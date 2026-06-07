@@ -271,7 +271,9 @@ fn fold_version(mut digest: u64, v: &Version) -> u64 {
     digest = fnv1a(digest, &v.provenance.committed_at.0.to_le_bytes());
     digest = fnv1a(digest, v.provenance.principal.as_bytes());
     digest = fold_closed_by(digest, v.closed_by.as_ref());
-    digest = fnv1a(digest, v.payload.as_deref().unwrap_or_default());
+    // Fold with a presence tag so a SQL NULL payload (`None`) and an empty
+    // payload (`Some(vec![])`) stay distinct in the determinism digest ([STL-154]).
+    digest = fold_optional_payload(digest, v.payload.as_deref());
     digest
 }
 
@@ -1146,7 +1148,9 @@ pub fn run_mvcc_seed(seed: u64) -> u64 {
             Some(v) => {
                 digest = fnv1a(digest, &[1]);
                 digest = fnv1a(digest, &v.sys_from.0.to_le_bytes());
-                digest = fnv1a(digest, v.payload.as_deref().unwrap_or_default());
+                // Presence-tagged so a NULL payload never hashes like an empty one
+                // ([STL-154]).
+                digest = fold_optional_payload(digest, v.payload.as_deref());
             }
             None => digest = fnv1a(digest, &[0]),
         }
