@@ -9,39 +9,15 @@
 //! wired through.) Proving a third-party client — not just the in-crate synthetic
 //! one — drives the front end is the point of this test.
 
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
-use stele_pgwire::{Server, SharedSession};
+use stele_pgwire::SharedSession;
 use stele_storage::backend::MemDisk;
-use tokio::net::{TcpListener, TcpStream};
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
-/// Stand up a `Server` on an ephemeral port over a fresh in-memory session and
-/// return its address. The server task runs for the test's lifetime (the test
-/// drops the runtime at the end, which aborts it).
-async fn spawn_server() -> SocketAddr {
-    // Reserve a free port via a throwaway bind, then hand it to the real server.
-    let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = reserved.local_addr().unwrap();
-    drop(reserved);
-
-    let session: SharedSession =
-        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
-    tokio::spawn(Server::new(addr, session).run());
-
-    // `Server::run` binds asynchronously; wait until it accepts before returning.
-    for _ in 0..200 {
-        if TcpStream::connect(addr).await.is_ok() {
-            return addr;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("server did not come up on {addr} within the retry budget");
-}
+mod common;
 
 /// The single balance cell of a one-row `SELECT … id, balance …` reply, or
 /// `None` when the reply carried no rows.
@@ -56,15 +32,11 @@ fn single_balance(messages: &[SimpleQueryMessage]) -> Option<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tokio_postgres_drives_a_crud_round_trip() {
-    let addr = spawn_server().await;
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
 
-    // `sslmode=disable` skips the SSL negotiation entirely (the server would
-    // refuse it anyway); no auth in v0.1, so any user/dbname is accepted.
-    let conn_str = format!(
-        "host=127.0.0.1 port={} user=stele dbname=stele sslmode=disable",
-        addr.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+    let (client, connection) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
         .await
         .expect("connect to the stele pgwire server");
     // The connection object owns the actual socket I/O; drive it on its own task.

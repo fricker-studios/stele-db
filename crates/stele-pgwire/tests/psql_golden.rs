@@ -37,19 +37,18 @@
 //! covered by the in-crate `data_row_payload` unit tests; the end-to-end NULL
 //! cell is filed as a follow-up (see the PR / STL-150 comment).
 
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use stele_common::provenance::{Principal, TxnId};
 use stele_common::time::SystemClock;
 use stele_common::types::ScalarValue;
 use stele_engine::SessionEngine;
-use stele_pgwire::{Server, SharedSession};
+use stele_pgwire::SharedSession;
 use stele_storage::backend::MemDisk;
 use stele_storage::delta::BusinessKey;
-use tokio::net::{TcpListener, TcpStream};
 use tokio_postgres::{NoTls, SimpleQueryMessage};
+
+mod common;
 
 /// The committed Postgres baseline: one `label|rendered` line per scalar type,
 /// where `rendered` is the exact text-format output Postgres prints for the
@@ -149,28 +148,6 @@ fn stage(engine: &mut SessionEngine<SystemClock, MemDisk>, case: &Case) {
         .expect("stage row");
 }
 
-/// Start a [`Server`] over `session` on an ephemeral port and return its address,
-/// once it accepts connections.
-///
-/// Uses the reserve-a-port-then-drop idiom the STL-147 test established; the race
-/// it carries (another process can grab the port before the server re-binds) is
-/// tracked by STL-152, which will let the server report its own bound address.
-async fn spawn_server(session: SharedSession) -> SocketAddr {
-    let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = reserved.local_addr().unwrap();
-    drop(reserved);
-
-    tokio::spawn(Server::new(addr, session).run());
-
-    for _ in 0..200 {
-        if TcpStream::connect(addr).await.is_ok() {
-            return addr;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("server did not come up on {addr} within the retry budget");
-}
-
 /// The text of column `col` in the single data row of a `simple_query` reply.
 fn cell(messages: &[SimpleQueryMessage], col: &str) -> String {
     messages
@@ -192,15 +169,9 @@ async fn psql_text_format_matches_postgres_golden() {
         stage(&mut engine, case);
     }
     let session: SharedSession = Arc::new(Mutex::new(engine));
-    let addr = spawn_server(session).await;
+    let addr = common::spawn_server(session).await;
 
-    // `sslmode=disable` skips negotiation (the server refuses SSL anyway); v0.1
-    // has no auth, so any user/dbname is accepted.
-    let conn_str = format!(
-        "host=127.0.0.1 port={} user=stele dbname=stele sslmode=disable",
-        addr.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+    let (client, connection) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
         .await
         .expect("connect to the stele pgwire server");
     let driver = tokio::spawn(connection);
