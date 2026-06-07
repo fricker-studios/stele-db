@@ -212,18 +212,69 @@ impl Server {
         }
     }
 
+    /// Bind the listen socket now, returning a [`BoundServer`] whose
+    /// [`local_addr`](BoundServer::local_addr) reports the address actually
+    /// bound before the accept loop runs.
+    ///
+    /// Binding up front is what lets a caller pass port `0` (an ephemeral port)
+    /// and then learn the real port with **no race**: the listener is already
+    /// holding the socket when the address is read, so nothing can grab the port
+    /// in between (the old "reserve a `:0` listener, drop it, re-bind on its
+    /// address" dance had exactly that window). The returned listener already
+    /// accepts connections into its backlog, so a client may connect before
+    /// [`serve`](BoundServer::serve) is even awaited — no connect-retry needed.
+    pub async fn bind(self) -> io::Result<BoundServer> {
+        let listener = TcpListener::bind(self.listen_addr).await?;
+        let local_addr = listener.local_addr()?;
+        Ok(BoundServer {
+            listener,
+            local_addr,
+            session: self.session,
+        })
+    }
+
     /// Bind the listen socket and serve connections until cancelled by the caller.
+    ///
+    /// A convenience over [`bind`](Server::bind) + [`serve`](BoundServer::serve)
+    /// for callers that don't need the bound address. The caller owns shutdown —
+    /// wire this into `tokio::select!` against a signal future for graceful drain.
+    pub async fn run(self) -> io::Result<()> {
+        self.bind().await?.serve().await
+    }
+}
+
+/// A [`Server`] that has already bound its listen socket.
+///
+/// Its [`local_addr`] is readable before [`serve`] starts the accept loop, so a
+/// caller that bound an ephemeral (`:0`) port learns the real address with no
+/// reserve-drop race.
+///
+/// [`local_addr`]: BoundServer::local_addr
+/// [`serve`]: BoundServer::serve
+pub struct BoundServer {
+    listener: TcpListener,
+    local_addr: SocketAddr,
+    session: SharedSession,
+}
+
+impl BoundServer {
+    /// The address the listen socket is actually bound to — the resolved port
+    /// when the caller asked for an ephemeral `:0`.
+    #[must_use]
+    pub const fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Accept and dispatch connections until cancelled by the caller.
     ///
     /// The caller owns shutdown — wire this into `tokio::select!` against a
     /// signal future for graceful drain.
-    #[instrument(skip_all, fields(addr = %self.listen_addr))]
-    pub async fn run(self) -> io::Result<()> {
-        let listener = TcpListener::bind(self.listen_addr).await?;
-        let bound = listener.local_addr()?;
-        info!(addr = %bound, "stele-pgwire: listening");
+    #[instrument(skip_all, fields(addr = %self.local_addr))]
+    pub async fn serve(self) -> io::Result<()> {
+        info!(addr = %self.local_addr, "stele-pgwire: listening");
 
         loop {
-            let (stream, peer) = match listener.accept().await {
+            let (stream, peer) = match self.listener.accept().await {
                 Ok(pair) => pair,
                 Err(e) => {
                     // Transient accept errors should not kill the listener.
@@ -1778,33 +1829,19 @@ mod tests {
     async fn server_boots_and_refuses_ssl_with_n() {
         use tokio::io::AsyncWriteExt;
         // DoD bullet 2, encoded as a regression test: booting the public listener
-        // and probing it with an SSLRequest yields the 'N' refusal byte. Reserve a
-        // free port via a throwaway bind, then hand it to the real `Server::run`.
-        let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = reserved.local_addr().unwrap();
-        drop(reserved);
+        // and probing it with an SSLRequest yields the 'N' refusal byte. `bind`
+        // up front (STL-152) reports the real ephemeral port with no reserve-drop
+        // window, and the socket already accepts into its backlog, so the connect
+        // needs no retry loop.
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let bound = Server::new(addr, test_session())
+            .bind()
+            .await
+            .expect("bind ephemeral port");
+        let addr = bound.local_addr();
+        let handle = tokio::spawn(bound.serve());
 
-        let handle = tokio::spawn(Server::new(addr, test_session()).run());
-
-        // `Server::run` binds asynchronously; connect-retry until it is listening
-        // (up to ~2s, generous for a loaded CI runner). Bail out loudly if the
-        // server task itself exits early — e.g. a bind failure — instead of
-        // spinning the whole budget against a socket that will never come up and
-        // then panicking with a misleading "timed out" message.
-        let mut maybe_client = None;
-        for _ in 0..200 {
-            assert!(
-                !handle.is_finished(),
-                "server task exited before accepting a connection (bind error on {addr}?)"
-            );
-            if let Ok(c) = TcpStream::connect(addr).await {
-                maybe_client = Some(c);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let mut client =
-            maybe_client.expect("server should bind and accept within the 2s retry budget");
+        let mut client = TcpStream::connect(addr).await.expect("connect to server");
 
         let mut ssl = BytesMut::with_capacity(8);
         ssl.put_i32(8);

@@ -17,7 +17,10 @@
 //!
 //! The seeded-fault virtual disk ([STL-109]) lives in the `fault_disk` module:
 //! [`run_fault_seed`] drives a [`FaultDisk`] through a seeded workload and folds
-//! its fault-event log into a digest.
+//! its fault-event log into a digest. [`run_engine_recover_faults_seed`] then
+//! drives the full kill-and-recover path *through* that fault disk ([STL-153]),
+//! asserting recovery either converges to a consistent committed prefix or cleanly
+//! detects corruption — never silently diverges.
 //!
 //! The deterministic substrate — a [`VirtualClock`] that advances on demand, the
 //! ChaCha20-backed [`SeededRng`], and the cooperative [`Scheduler`] that drives
@@ -757,6 +760,259 @@ pub fn run_engine_recover_seed(seed: u64) -> u64 {
         digest = fnv1a(digest, &seq.to_le_bytes());
         digest = fnv1a(digest, &interval.sys_to.0.to_le_bytes());
         digest = fold_closed_by(digest, Some(&interval.closed_by));
+    }
+    digest
+}
+
+/// Map a draw from `rng` to a probability in `[lo, hi]` permille (thousandths) —
+/// a small, seed-derived spread so different seeds stress different fault mixes
+/// while every probability stays integer-derived and reproducible.
+#[allow(clippy::cast_precision_loss)] // permille < 1000 is exact in f64
+fn prob_permille(rng: &mut Rng, lo: u64, hi: u64) -> f64 {
+    let pm = lo + rng.below(hi - lo + 1);
+    pm as f64 / 1000.0
+}
+
+/// Assert a fault-recovered `engine`'s observable state is a consistent committed
+/// prefix of the reference `oracle`, returning the matching cutoff length and the
+/// recovered probe fingerprint (for the digest). The cutoff `k` ranges over
+/// `0..=committed.len()`; `k = committed.len()` is the full timeline. See
+/// [`run_engine_recover_faults_seed`].
+///
+/// # Panics
+///
+/// Panics if no committed prefix reproduces the recovered state — a silent
+/// divergence, the failure the fault-recovery sweep exists to catch.
+fn verify_recovered_prefix<C: Clock, D: Disk + Clone>(
+    seed: u64,
+    engine: &Engine<C, D>,
+    oracle: &BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Option<Vec<u8>>>>,
+    committed: &[SystemTimeMicros],
+    keys: &[BusinessKey],
+) -> (usize, Vec<Option<Vec<u8>>>) {
+    // Probe just before the first commit and at every commit boundary.
+    let mut probes: Vec<SystemTimeMicros> = Vec::new();
+    if let Some(first) = committed.first() {
+        probes.push(SystemTimeMicros(first.0 - 1));
+    }
+    probes.extend(committed.iter().copied());
+
+    // The recovered observable state, key by key at every probe.
+    let mut recovered_fp: Vec<Option<Vec<u8>>> = Vec::new();
+    for &s in &probes {
+        for key in keys {
+            recovered_fp.push(
+                engine
+                    .as_of_payload(key, Snapshot(s))
+                    .expect("recovered as_of"),
+            );
+        }
+    }
+
+    // The reference oracle truncated at a cutoff instant, read at each probe. A
+    // `None` cutoff is the pre-history empty state (`k = 0`).
+    let expected = |cutoff: Option<SystemTimeMicros>| -> Vec<Option<Vec<u8>>> {
+        let mut fp = Vec::new();
+        for &s in &probes {
+            for key in keys {
+                fp.push(cutoff.and_then(|c| {
+                    oracle
+                        .get(key)
+                        .and_then(|tl| tl.range(..=s.min(c)).next_back())
+                        .and_then(|(_, payload)| payload.clone())
+                }));
+            }
+        }
+        fp
+    };
+
+    // Recovery applies a clean run of WAL records and stops at the first corrupt
+    // one, so it can only land on a record boundary — the recovered state must
+    // equal the oracle truncated at some committed prefix.
+    let k = (0..=committed.len())
+        .find(|&k| {
+            let cutoff = (k != 0).then(|| committed[k - 1]);
+            expected(cutoff) == recovered_fp
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "seed {seed}: recovered state is not a consistent committed prefix \
+                 of the oracle — recovery silently diverged"
+            )
+        });
+    (k, recovered_fp)
+}
+
+/// Kill and `recover` a seeded [`Engine`] workload **through a [`FaultDisk`]** ([STL-153]).
+///
+/// Recovery must either converge to a consistent committed prefix or cleanly detect
+/// corruption — never silently diverge.
+///
+/// This is [`run_engine_recover_seed`] hardened against injected disk faults — the
+/// second DoD bullet [STL-109] deferred to the recovery layer. The engine's single
+/// shared disk is a [`FaultDisk`] with a **seed-derived [`FaultProfile`]**, armed in
+/// two phases so each fault class lands where its survival contract is defined:
+///
+/// * **Workload phase** — torn-write, full-disk, and slow-fsync faults are armed.
+///   The write-ahead order ([`stele_storage::dml`]) means a torn or failed WAL
+///   append aborts the operation *before* the delta or validity index is touched,
+///   so the reference oracle records only the operations that returned `Ok`; the
+///   first failure is the crash. At this scale the tiers never spill, so the WAL
+///   append is the only write-fault surface and any torn bytes land at the log tail.
+/// * **Recovery phase** — bit-flip and short-read faults are armed instead, so every
+///   read [`Engine::recover`] makes (the checkpoint scan and the WAL replay) is
+///   subject to the silent corruption the WAL's CRC32C framing must catch.
+///
+/// Recovery's outcome is then asserted *sound*, two ways:
+///
+/// * `Err(_)` — a checksum caught corruption the durable fence vouched for and
+///   recovery refused rather than serving it (the DoD's "detected as corruption"); or
+/// * `Ok(engine)` — the recovered state is a genuine **committed prefix**: there is a
+///   cutoff `k` for which every recovered `AS OF` read equals the reference oracle
+///   truncated at the `k`-th commit. A corrupt or short read past the durable fence
+///   is dropped as a torn tail, yielding an *earlier* consistent point; a clean
+///   recovery yields the full timeline (`k = n`), matching the oracle at **every**
+///   commit boundary exactly as the fault-free sweep does. A recovered value that
+///   belongs to no prefix fails the membership check — the "never silently diverge"
+///   guarantee.
+///
+/// The digest folds the recovered answers, the prefix cutoff, and the disk's
+/// seed-keyed fault-event log, so the sweep regresses on the whole fault sequence.
+/// Same seed ⇒ same digest.
+///
+/// # Panics
+///
+/// Panics if recovery returns `Ok` with a state that is not a consistent committed
+/// prefix of the reference oracle — a silent divergence, the exact failure this
+/// scenario exists to catch.
+#[must_use]
+pub fn run_engine_recover_faults_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+
+    // Seed-derived fault probabilities: a small spread so different seeds stress
+    // different mixes, all reproducible from `seed`. Drawn from a stream distinct
+    // from the workload's so the op sequence is independent of the profile.
+    let mut prof_rng = Rng::new(seed ^ 0xFA17_D15C_0BAD_F00D);
+    let p_torn = prob_permille(&mut prof_rng, 20, 60);
+    let p_full = prob_permille(&mut prof_rng, 10, 30);
+    let p_slow = prob_permille(&mut prof_rng, 200, 500);
+    let p_bit = prob_permille(&mut prof_rng, 80, 200);
+    let p_short = prob_permille(&mut prof_rng, 80, 200);
+
+    let mut rng = Rng::new(seed);
+
+    // The reference oracle: per key, the committed payload-or-delete timeline keyed
+    // by commit `sys_from` — an independent model, recording only operations the
+    // engine confirmed (returned `Ok`). `committed` is every commit instant in order.
+    let mut oracle: BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Option<Vec<u8>>>> =
+        BTreeMap::new();
+    let mut committed: Vec<SystemTimeMicros> = Vec::new();
+
+    let key_count = 1 + rng.below_usize(6);
+    let keys: Vec<BusinessKey> = (0..key_count)
+        .map(|i| BusinessKey::new(format!("k-{i:04}").into_bytes()))
+        .collect();
+
+    // Open on a clean disk, *then* arm the write-path faults — a fault during open
+    // would only produce a degenerate empty world, not exercise recovery. The disk
+    // handle and the engine's internal clones share one fault state (and one seeded
+    // stream), so enabling a class here perturbs the engine's writes.
+    let disk = FaultDisk::new(seed, FaultProfile::none());
+    {
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1), false).expect("open engine");
+        disk.enable(FaultKind::TornWrite, p_torn);
+        disk.enable(FaultKind::FullDisk, p_full);
+        disk.enable(FaultKind::SlowSync, p_slow);
+
+        let mut live = vec![false; key_count];
+        let ops = 8 + rng.below(24);
+        'workload: for op in 0..ops {
+            let k = rng.below_usize(key_count);
+            let key = keys[k].clone();
+            let txn = TxnId(op);
+            let principal = Principal::new(b"sim".to_vec());
+            // A per-op-unique payload, so each operation changes its key's visible
+            // value at its own commit boundary — making the per-prefix oracle
+            // fingerprints distinct and the cutoff membership check unambiguous.
+            let payload = format!("op{op}").into_bytes();
+            let want_delete = live[k] && rng.below(2) == 0;
+            let outcome = if live[k] {
+                if want_delete {
+                    engine.delete(&key, txn, principal)
+                } else {
+                    engine.update(key.clone(), None, payload.clone(), 0, txn, principal)
+                }
+            } else {
+                engine.insert(key.clone(), None, payload.clone(), 0, txn, principal)
+            };
+            match outcome {
+                Ok(o) => {
+                    let effect = if want_delete { None } else { Some(payload) };
+                    oracle.entry(key).or_default().insert(o.commit, effect);
+                    committed.push(o.commit);
+                    live[k] = !want_delete;
+                }
+                // A torn or full-disk WAL append: the op aborted before touching the
+                // delta or index (write-ahead order), so it never committed. The
+                // torn bytes (if any) are the log tail. This is the crash point.
+                Err(_) => break 'workload,
+            }
+            // A periodic durable checkpoint; a fault writing it is also a crash.
+            if rng.below(3) == 0 && engine.checkpoint().is_err() {
+                break 'workload;
+            }
+        }
+        // Best-effort graceful-shutdown checkpoint, then drop the engine — the crash.
+        let _ = engine.checkpoint();
+    }
+
+    // Re-arm: silence the write-path faults, arm read corruption for recovery so
+    // every checkpoint/WAL read recovery makes is subject to a flip or short read.
+    disk.disable(FaultKind::TornWrite);
+    disk.disable(FaultKind::FullDisk);
+    disk.disable(FaultKind::SlowSync);
+    disk.enable(FaultKind::BitFlip, p_bit);
+    disk.enable(FaultKind::ShortRead, p_short);
+
+    let recovered = Engine::recover(disk.clone(), StepClock::new(1_000_000), false);
+
+    // Stop perturbing reads — the harness now inspects the recovered engine.
+    disk.disable(FaultKind::BitFlip);
+    disk.disable(FaultKind::ShortRead);
+
+    let mut digest = FNV_OFFSET;
+    match recovered {
+        // Corruption the durable fence vouched for was caught by a checksum and
+        // surfaced rather than served — a sound outcome.
+        Err(_) => digest = fnv1a(digest, &[0xE2]),
+        Ok(engine) => {
+            // The recovered state must be a consistent committed prefix of the
+            // oracle (else the harness panics — a silent divergence).
+            let (k, recovered_fp) =
+                verify_recovered_prefix(seed, &engine, &oracle, &committed, &keys);
+            digest = fnv1a(digest, &[0x0C]);
+            digest = fnv1a(
+                digest,
+                &u64::try_from(k).expect("prefix len fits u64").to_le_bytes(),
+            );
+            for entry in &recovered_fp {
+                match entry {
+                    Some(payload) => {
+                        digest = fnv1a(digest, &[1]);
+                        digest = fnv1a(digest, payload);
+                    }
+                    None => digest = fnv1a(digest, &[0]),
+                }
+            }
+        }
+    }
+
+    // Fold the seed-keyed fault-event log so the digest regresses on the exact
+    // injected fault sequence, not only the recovered state.
+    for ev in disk.events() {
+        digest = fnv1a(digest, &ev.seq.to_le_bytes());
+        digest = fnv1a(digest, &[fault_op_tag(ev.op), fault_kind_tag(ev.kind)]);
+        digest = fnv1a(digest, &ev.detail.to_le_bytes());
     }
     digest
 }
@@ -1608,8 +1864,8 @@ impl Scenario for FnScenario {
 /// The v0.1 set covers the system-time and valid-time write paths, the
 /// WAL→delta(+index) recovery paths, the MVCC commit/conflict path, the merged
 /// AS-OF read path with its binder and the canonical AS-OF oracle, the engine
-/// kill-and-recover driver, the cooperative scheduler's interleaving demo, and
-/// the seeded-fault virtual disk.
+/// kill-and-recover driver and its fault-injected variant, the cooperative
+/// scheduler's interleaving demo, and the seeded-fault virtual disk.
 #[must_use]
 pub fn registry() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -1623,6 +1879,7 @@ pub fn registry() -> Vec<Box<dyn Scenario>> {
         FnScenario::boxed("as-of-resolution", run_as_of_resolution_seed),
         FnScenario::boxed("as-of-oracle", run_as_of_oracle_seed),
         FnScenario::boxed("engine-recover", run_engine_recover_seed),
+        FnScenario::fault("engine-recover-faults", run_engine_recover_faults_seed),
         FnScenario::boxed("schedule", run_schedule_seed_digest),
         FnScenario::fault("fault-disk", run_fault_seed),
     ]
@@ -1898,6 +2155,30 @@ mod tests {
     }
 
     #[test]
+    fn engine_recover_faults_seed_is_reproducible() {
+        // Each seed also asserts (internally) that recovery through the FaultDisk
+        // either lands on a consistent committed prefix of the reference oracle or
+        // cleanly errors — never silently diverges (STL-153 DoD).
+        for seed in 0..64 {
+            assert_eq!(
+                run_engine_recover_faults_seed(seed),
+                run_engine_recover_faults_seed(seed),
+                "seed {seed} must replay to an identical fault-recovery digest"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_recover_faults_distinct_seeds_diverge() {
+        let digests: std::collections::HashSet<u64> =
+            (0..64).map(run_engine_recover_faults_seed).collect();
+        assert!(
+            digests.len() > 1,
+            "the fault-injected kill-and-recover workload must depend on the seed"
+        );
+    }
+
+    #[test]
     fn mvcc_seed_is_reproducible() {
         for seed in 0..64 {
             assert_eq!(
@@ -2014,28 +2295,29 @@ mod tests {
     }
 
     #[test]
-    fn fault_injection_gates_exactly_the_fault_disk_scenario() {
+    fn fault_injection_gates_exactly_the_fault_scenarios() {
         // The `--fault-injection` flag must genuinely change what runs. Assert it
-        // structurally: exactly one scenario is fault-gated and it is fault-disk,
-        // and turning the flag on adds exactly that one scenario to the sweep.
+        // structurally: the fault-gated set is exactly the seeded-fault disk and the
+        // fault-injected recovery sweep, and turning the flag on adds exactly those.
         // (A digest-inequality check would be subtly flaky — different folds can
         // collide in principle — so we assert coverage, not the digest value.)
-        let gated: Vec<&str> = registry()
+        let mut gated: Vec<&str> = registry()
             .iter()
             .filter(|s| s.requires_fault_injection())
             .map(|s| s.name())
             .collect();
+        gated.sort_unstable();
         assert_eq!(
             gated,
-            ["fault-disk"],
-            "exactly the fault-disk scenario is fault-gated"
+            ["engine-recover-faults", "fault-disk"],
+            "exactly the fault-injected scenarios are fault-gated"
         );
         let on = sweep(4, true);
         let off = sweep(4, false);
         assert_eq!(
             on.scenarios,
-            off.scenarios + 1,
-            "fault injection adds exactly the fault-disk scenario"
+            off.scenarios + gated.len(),
+            "fault injection adds exactly the fault-gated scenarios"
         );
     }
 
@@ -2054,6 +2336,10 @@ mod tests {
         assert_eq!(replayed["snapshot-scan"], run_snapshot_scan_seed(seed));
         assert_eq!(replayed["as-of-oracle"], run_as_of_oracle_seed(seed));
         assert_eq!(replayed["engine-recover"], run_engine_recover_seed(seed));
+        assert_eq!(
+            replayed["engine-recover-faults"],
+            run_engine_recover_faults_seed(seed)
+        );
         assert_eq!(replayed["schedule"], run_schedule_seed_digest(seed));
         assert_eq!(replayed["fault-disk"], run_fault_seed(seed));
     }
