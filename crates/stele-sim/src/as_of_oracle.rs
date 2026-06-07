@@ -205,7 +205,9 @@ fn render_opt(answer: Option<&Answer>) -> String {
 
 /// A first point of disagreement between the engine and the reference, carrying
 /// everything needed to reproduce and read it: the diverging snapshot, the key,
-/// both answers, and the full applied history.
+/// both answers, and the **minimal** reproducing history — only the operations on
+/// the diverging key up to and including the probe snapshot, since the `AS OF`
+/// answer at that snapshot depends on nothing else.
 #[derive(Debug)]
 struct Divergence {
     snapshot: SystemTimeMicros,
@@ -269,8 +271,9 @@ fn build_history(
         let key = keys[k].clone();
         let txn = TxnId(op);
         let who = Principal::new(b"sim".to_vec());
-        // Drawn only when the key is live, keeping the rng stream — and so every
-        // seed's op sequence — independent of the insert path.
+        // The delete roll is drawn only when the key is live (short-circuit on
+        // `live[k]`); an insert consumes none. Liveness is itself seed-determined,
+        // so the whole op sequence stays deterministic and reproducible per seed.
         let is_delete = live[k] && rng.below(4) == 0;
 
         let kind = if live[k] && is_delete {
@@ -353,12 +356,19 @@ fn differential_check(
             let reference_ans = model.as_of(key, s, bug).map(Answer::from_ref);
 
             if engine_ans != reference_ans {
+                // Minimal reproducer: only this key's operations at or before the
+                // probe — the sole inputs to its `AS OF` answer at `s`.
+                let repro: Vec<HistoryOp> = history
+                    .iter()
+                    .filter(|op| op.key == *key && op.commit.0 <= s.0)
+                    .cloned()
+                    .collect();
                 return Err(Box::new(Divergence {
                     snapshot: s,
                     key: key.clone(),
                     engine: engine_ans,
                     reference: reference_ans,
-                    history: history.to_vec(),
+                    history: repro,
                 }));
             }
 
