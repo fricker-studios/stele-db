@@ -2217,11 +2217,20 @@ dependencies = [
 name = "stele-exec"
 version = "0.1.0"
 dependencies = [
- "duckdb",
  "stele-common",
  "stele-storage",
  "stele-txn",
  "thiserror",
+]
+
+[[package]]
+name = "stele-exec-oracle"
+version = "0.1.0"
+dependencies = [
+ "duckdb",
+ "stele-common",
+ "stele-exec",
+ "stele-storage",
 ]
 
 [[package]]

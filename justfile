@@ -12,9 +12,11 @@ build:
     cargo build --workspace --all-targets
 
 # Unit + integration + doctests. Uses nextest if installed, falls back to `cargo test`.
+# `stele-exec-oracle` is excluded (it compiles the bundled DuckDB amalgamation —
+# minutes); run it with `just oracle`. Mirrors the per-PR CI test job (STL-158).
 test:
-    cargo nextest run --workspace --all-features 2>/dev/null || cargo test --workspace --all-features
-    cargo test --doc --workspace --all-features
+    cargo nextest run --workspace --exclude stele-exec-oracle --all-features 2>/dev/null || cargo test --workspace --exclude stele-exec-oracle --all-features
+    cargo test --doc --workspace --exclude stele-exec-oracle --all-features
 
 # Auto-format the tree.
 fmt:
@@ -28,7 +30,7 @@ fmt:
 # job still runs it, so a typo can only land red there, never silently merge.
 lint:
     cargo fmt --all --check
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    cargo clippy --workspace --exclude stele-exec-oracle --all-targets --all-features -- -D warnings
     # Strict when installed (real failures propagate); a note when not.
     # Install to match CI with: cargo install --locked --version 1.39.0 typos-cli
     if command -v typos >/dev/null 2>&1; then typos; else echo "note: typos-cli not installed — skipping (best-effort; CI's quick job runs it)"; fi
@@ -42,6 +44,12 @@ doc:
 # checks runnable with just the pinned toolchain). The MSRV build and
 # cargo-deny run as their own CI jobs; use `just deny` for the latter.
 check: lint test doc
+
+# The DuckDB differential oracle (STL-144) — excluded from `just check` because
+# it compiles the bundled DuckDB C++ amalgamation (minutes). This is the only
+# command that builds `stele-exec-oracle`; CI runs it in the nightly gate (STL-158).
+oracle:
+    cargo nextest run -p stele-exec-oracle --all-features 2>/dev/null || cargo test -p stele-exec-oracle
 
 # Deterministic simulation seeds with fault injection.
 sim seeds="100":

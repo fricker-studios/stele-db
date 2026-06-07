@@ -50,7 +50,10 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # `stele-exec-oracle` is excluded: linting its tests would compile the
+      # bundled DuckDB amalgamation (minutes). It is built only in the nightly
+      # `duckdb-oracle` job (STL-158).
+      - run: cargo clippy --workspace --exclude stele-exec-oracle --all-targets --all-features -- -D warnings
       # `crate-ci/typos@master` downloads via `wget`, which isn't on this
       # self-hosted runner. Install from crates.io instead — the Rust toolchain
       # is already in place, so no extra system dependency is needed.
@@ -79,8 +82,12 @@ jobs:
       - uses: taiki-e/install-action@cde8c9e634f4a17bc06b61413ac0ef75450eac46 # v2.81.4
         with:
           tool: nextest
-      - run: cargo nextest run --workspace --all-features
-      - run: cargo test --doc --workspace --all-features
+      # `stele-exec-oracle` (the DuckDB differential oracle) is excluded from the
+      # per-PR test run — its bundled-amalgamation compile runs only in the
+      # nightly `duckdb-oracle` job (STL-158). Per-PR temporal coverage still
+      # comes from the in-process oracles (STL-111, STL-138).
+      - run: cargo nextest run --workspace --exclude stele-exec-oracle --all-features
+      - run: cargo test --doc --workspace --exclude stele-exec-oracle --all-features
 
   msrv:
     name: msrv (1.85.0)
