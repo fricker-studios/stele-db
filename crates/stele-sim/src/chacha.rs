@@ -95,19 +95,26 @@ impl SeededRng {
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             z ^ (z >> 31)
         };
-        // Eleven little-endian `u32` words: eight for the key, three for the
-        // nonce. (Six `u64` draws give twelve words; the last is unused.)
-        let mut words = [0u32; 12];
-        for pair in words.chunks_exact_mut(2) {
-            let b = splitmix().to_le_bytes();
-            pair[0] = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-            pair[1] = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
-        }
+        // Split one splitmix64 output into two little-endian `u32` words.
+        let split = |v: u64| {
+            let b = v.to_le_bytes();
+            [
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            ]
+        };
+        // Key (256-bit) and nonce (96-bit) are both built straight from
+        // splitmix64 output — every word traces to the seed, with no constant
+        // array in the dataflow (so neither is a fixed value).
         let mut key = [0u32; 8];
-        key.copy_from_slice(&words[0..8]);
+        for pair in key.chunks_exact_mut(2) {
+            pair.copy_from_slice(&split(splitmix()));
+        }
+        let [n0, n1] = split(splitmix());
+        let [n2, _] = split(splitmix());
         Self {
             key,
-            nonce: [words[8], words[9], words[10]],
+            nonce: [n0, n1, n2],
             counter: 0,
             buf: [0; 16],
             pos: 16,
