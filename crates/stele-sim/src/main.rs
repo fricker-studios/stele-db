@@ -1,7 +1,12 @@
-//! `stele-sim` driver — replays seeds against the deterministic harness.
+//! `stele-sim` driver — drives the [`stele_sim`] scenario registry (STL-110).
 //!
-//! Walking-skeleton CLI: argument parsing and a "no scenarios yet" message.
-//! Real seed replay lands as the storage/txn core does.
+//! `--seeds N` sweeps every registered scenario across N distinct seeds;
+//! `--seed K` replays one seed across all of them. A scenario that violates an
+//! invariant panics with the seed in its message; [`install_failure_reporter`]
+//! prints a prominent `scenario + seed` banner so a contributor can reproduce
+//! it locally with `just sim-seed K`.
+//!
+//! [`install_failure_reporter`]: stele_sim::install_failure_reporter
 
 use clap::Parser;
 
@@ -11,99 +16,50 @@ use clap::Parser;
     about = "Stele deterministic simulation harness ([docs/06-testing-strategy.md])."
 )]
 struct Args {
-    /// Number of distinct seeds to run when sweeping.
+    /// Number of distinct seeds to sweep across all registered scenarios.
     #[arg(long, default_value_t = 0)]
     seeds: u64,
 
-    /// Replay one specific seed (overrides --seeds).
+    /// Replay one specific seed across all scenarios (overrides --seeds).
     #[arg(long)]
     seed: Option<u64>,
 
-    /// Toggle fault injection (disk, network, clock skew).
+    /// Toggle fault injection (gates the seeded-fault virtual-disk scenario).
     #[arg(long, default_value = "off")]
     fault_injection: String,
 }
 
 fn main() {
     let args = Args::parse();
+
+    // Any scenario panic becomes a prominent, reproducible `scenario + seed`
+    // banner. Installed for both paths so replay failures are named too.
+    stele_sim::install_failure_reporter();
+
     if let Some(seed) = args.seed {
-        let digest = stele_sim::run_storage_seed(seed);
-        let vt_digest = stele_sim::run_validtime_seed(seed);
-        let del_digest = stele_sim::run_delete_seed(seed);
-        let dml_digest = stele_sim::run_dml_seed(seed);
-        let mvcc_digest = stele_sim::run_mvcc_seed(seed);
-        let rec_digest = stele_sim::run_recovery_index_seed(seed);
-        let scan_digest = stele_sim::run_snapshot_scan_seed(seed);
-        let as_of_digest = stele_sim::run_as_of_resolution_seed(seed);
-        let as_of_oracle_digest = stele_sim::run_as_of_oracle_seed(seed);
-        let engine_rec_digest = stele_sim::run_engine_recover_seed(seed);
-        let fault_digest = stele_sim::run_fault_seed(seed);
-        let sched_digest = stele_sim::run_schedule_seed_digest(seed);
-        println!(
-            "stele-sim: seed {seed} → storage digest {digest:#018x} · valid-time digest {vt_digest:#018x} · delete digest {del_digest:#018x} · dml digest {dml_digest:#018x} · mvcc digest {mvcc_digest:#018x} · recovery-index digest {rec_digest:#018x} · snapshot-scan digest {scan_digest:#018x} · as-of-resolution digest {as_of_digest:#018x} · as-of-oracle digest {as_of_oracle_digest:#018x} · engine-recover digest {engine_rec_digest:#018x} · fault digest {fault_digest:#018x} · schedule digest {sched_digest:#018x}"
-        );
+        // Reproduction path: run every scenario for this one seed and print each
+        // digest. A failing scenario surfaces its full assertion (with the seed).
+        println!("stele-sim: replaying seed {seed} across all scenarios");
+        for (name, digest) in stele_sim::replay(seed) {
+            println!("  {name:<18} digest {digest:#018x}");
+        }
     } else if args.seeds == 0 {
         println!("stele-sim: no seeds requested (pass --seeds N or --seed S)");
     } else {
-        // Sweep: each seed is independent and reproducible. Fold the per-seed
-        // digests with an order-dependent FNV-style mix (not XOR, which would
-        // cancel matching digests) so the sweep stays a sharp regression signal.
         let faults_on = args.fault_injection != "off";
-        let mut sweep = 0xCBF2_9CE4_8422_2325u64;
-        // The schedule trace per seed, collected to report how many *distinct*
-        // interleavings the seeds explored — the scheduler's DoD statistic.
-        let mut schedules = std::collections::HashSet::new();
-        for seed in 0..args.seeds {
-            // Mix both scenarios per seed so the sweep regresses on either the
-            // sealed-segment path or the valid-time ingestion path.
-            sweep = (sweep ^ stele_sim::run_storage_seed(seed)).wrapping_mul(0x0000_0100_0000_01B3);
-            sweep =
-                (sweep ^ stele_sim::run_validtime_seed(seed)).wrapping_mul(0x0000_0100_0000_01B3);
-            sweep = (sweep ^ stele_sim::run_delete_seed(seed)).wrapping_mul(0x0000_0100_0000_01B3);
-            // The full DML write path: WAL redo records replayed back into a delta.
-            sweep = (sweep ^ stele_sim::run_dml_seed(seed)).wrapping_mul(0x0000_0100_0000_01B3);
-            // The MVCC path: snapshot acquisition, commit ordering, conflict resolution.
-            sweep = (sweep ^ stele_sim::run_mvcc_seed(seed)).wrapping_mul(0x0000_0100_0000_01B3);
-            // Rebuild-from-WAL reproduces the exact validity index (asserts internally).
-            sweep = (sweep ^ stele_sim::run_recovery_index_seed(seed))
-                .wrapping_mul(0x0000_0100_0000_01B3);
-            // The executor read path: merged AS-OF snapshot scan checked against
-            // the in-memory reference oracle, with the zone-map prune invariant.
-            sweep = (sweep ^ stele_sim::run_snapshot_scan_seed(seed))
-                .wrapping_mul(0x0000_0100_0000_01B3);
-            // The AS-OF binder: each probe resolved from a `FOR SYSTEM_TIME AS
-            // OF` clause through the real SQL binder, then checked against the
-            // same reference oracle (asserts resolution + equivalence internally).
-            sweep = (sweep ^ stele_sim::run_as_of_resolution_seed(seed))
-                .wrapping_mul(0x0000_0100_0000_01B3);
-            // The canonical AS-OF oracle (STL-111): a random history applied to
-            // both the engine and a list-of-versions-per-key reference, every
-            // `AS OF` answer asserted equal at every commit boundary.
-            sweep = (sweep ^ stele_sim::run_as_of_oracle_seed(seed))
-                .wrapping_mul(0x0000_0100_0000_01B3);
-            // The crash-recovery driver: kill mid-write and `Engine::recover`,
-            // asserting an exact index rebuild and oracle-correct AS-OF (STL-102).
-            sweep = (sweep ^ stele_sim::run_engine_recover_seed(seed))
-                .wrapping_mul(0x0000_0100_0000_01B3);
-            // The seeded-fault virtual disk (STL-109): a workload over a
-            // `FaultDisk` arming every fault class, folded only when fault
-            // injection is on so the flag actually changes what the sweep covers.
-            if faults_on {
-                sweep =
-                    (sweep ^ stele_sim::run_fault_seed(seed)).wrapping_mul(0x0000_0100_0000_01B3);
-            }
-            // The cooperative scheduler (STL-108): a seed-determined interleaving
-            // of cooperating tasks over the virtual clock + ChaCha20 RNG. Run the
-            // demo once per seed — digest the trace and reuse the same bytes for
-            // the distinct-schedule count below.
-            let trace = stele_sim::run_schedule_seed(seed);
-            sweep = (sweep ^ stele_sim::trace_digest(&trace)).wrapping_mul(0x0000_0100_0000_01B3);
-            schedules.insert(trace);
-        }
+        // Sweep: only returns once every active scenario passes every seed. A
+        // failure prints the banner via the panic hook and exits non-zero.
+        let report = stele_sim::sweep(args.seeds, faults_on);
         println!(
-            "stele-sim: swept {} seed(s) over the in-memory backend → sweep digest {sweep:#018x}",
-            args.seeds
+            "stele-sim: swept {} seed(s) across {} scenario(s) → sweep digest {:#018x}",
+            report.seeds, report.scenarios, report.digest
         );
+        // The scheduler's DoD statistic (STL-108): how many *distinct*
+        // interleavings the seeds explored. The schedule scenario already runs
+        // inside the sweep for its digest; replay the demo trace here purely to
+        // count distinct schedules for the human-facing report.
+        let schedules: std::collections::HashSet<Vec<u8>> =
+            (0..args.seeds).map(stele_sim::run_schedule_seed).collect();
         println!(
             "stele-sim: scheduler explored {} distinct interleaving(s) across {} seed(s)",
             schedules.len(),
@@ -111,7 +67,7 @@ fn main() {
         );
         if faults_on {
             println!(
-                "stele-sim: fault injection on → folded the seeded-fault virtual disk per seed (STL-109)"
+                "stele-sim: fault injection on → seeded-fault virtual-disk scenario included (STL-109)"
             );
         }
     }
