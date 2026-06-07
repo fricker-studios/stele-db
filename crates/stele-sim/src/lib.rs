@@ -24,6 +24,14 @@
 //! futures in a seed-determined order ([STL-108]) — now lives alongside the
 //! storage scenarios; [`run_schedule_seed`] is its determinism demo (same seed ⇒
 //! byte-identical trace). The simulated network lands in an adjacent ticket.
+//!
+//! The [`Scenario`] trait and [`registry`] turn those per-seed digest functions
+//! into a registry the CLI drives ([STL-110]): [`sweep`] runs every registered
+//! scenario across N distinct seeds; [`replay`] re-runs one seed across all of
+//! them. On an invariant violation a scenario panics with the seed in its
+//! message, and [`install_failure_reporter`] turns that into a prominent
+//! `scenario + seed` banner — so a failure is a *number* a contributor replays
+//! with `just sim-seed <N>`.
 
 #![allow(dead_code)]
 
@@ -35,6 +43,7 @@ pub use fault_disk::{FaultDisk, FaultEvent, FaultKind, FaultProfile};
 
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use stele_catalog::{Catalog, ColumnDef, TableTemporal};
@@ -1477,6 +1486,222 @@ pub fn run_as_of_resolution_seed(seed: u64) -> u64 {
     digest
 }
 
+// ---------------------------------------------------------------------------
+// Scenario registry — the surface the CLI drives (STL-110).
+// ---------------------------------------------------------------------------
+
+/// One registered simulation scenario.
+///
+/// Every scenario follows the same lifecycle for a given seed: **setup** a fresh
+/// world seeded from the seed alone (tiers, disk, or engine — no wall-clock and
+/// no ambient RNG), **run** a seed-driven workload, and **assert its invariants**
+/// against an independent reference oracle, returning a digest of the result.
+/// Determinism is the invariant every scenario shares — the same seed must
+/// always produce the same digest — so a failure is a *number* a contributor
+/// replays with `just sim-seed <N>`
+/// ([docs/06 §5](../../../docs/06-testing-strategy.md#5-deterministic-simulation-testing-dst--the-centerpiece)).
+///
+/// Scenarios assert by panicking — the seed is in every assertion message — and
+/// [`install_failure_reporter`] turns that panic into a prominent `scenario +
+/// seed` banner before the process exits non-zero.
+pub trait Scenario {
+    /// Stable, kebab-case identifier — printed next to the seed on failure.
+    fn name(&self) -> &'static str;
+
+    /// Run the scenario for `seed` and return its digest. Panics on an invariant
+    /// violation; same seed ⇒ same digest.
+    fn run(&self, seed: u64) -> u64;
+
+    /// Whether this scenario is swept only when fault injection is enabled
+    /// (`--fault-injection on`). Defaults to `false`; the fault-disk scenario
+    /// overrides it so the flag actually changes what the sweep covers.
+    fn requires_fault_injection(&self) -> bool {
+        false
+    }
+}
+
+/// A [`Scenario`] backed by a free `fn(u64) -> u64` digest function — the shape
+/// every v0.1 scenario already has.
+struct FnScenario {
+    name: &'static str,
+    run: fn(u64) -> u64,
+    fault: bool,
+}
+
+impl FnScenario {
+    fn boxed(name: &'static str, run: fn(u64) -> u64) -> Box<dyn Scenario> {
+        Box::new(Self {
+            name,
+            run,
+            fault: false,
+        })
+    }
+
+    /// A scenario that only runs under `--fault-injection on`.
+    fn fault(name: &'static str, run: fn(u64) -> u64) -> Box<dyn Scenario> {
+        Box::new(Self {
+            name,
+            run,
+            fault: true,
+        })
+    }
+}
+
+impl Scenario for FnScenario {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn run(&self, seed: u64) -> u64 {
+        (self.run)(seed)
+    }
+
+    fn requires_fault_injection(&self) -> bool {
+        self.fault
+    }
+}
+
+/// Every scenario the harness drives, in a stable order.
+///
+/// The v0.1 set covers the system-time and valid-time write paths, the
+/// WAL→delta(+index) recovery paths, the MVCC commit/conflict path, the merged
+/// AS-OF read path with its binder and the canonical AS-OF oracle, the engine
+/// kill-and-recover driver, the cooperative scheduler's interleaving demo, and
+/// the seeded-fault virtual disk.
+#[must_use]
+pub fn registry() -> Vec<Box<dyn Scenario>> {
+    vec![
+        FnScenario::boxed("storage", run_storage_seed),
+        FnScenario::boxed("valid-time", run_validtime_seed),
+        FnScenario::boxed("delete-provenance", run_delete_seed),
+        FnScenario::boxed("dml-wal-replay", run_dml_seed),
+        FnScenario::boxed("mvcc", run_mvcc_seed),
+        FnScenario::boxed("recovery-index", run_recovery_index_seed),
+        FnScenario::boxed("snapshot-scan", run_snapshot_scan_seed),
+        FnScenario::boxed("as-of-resolution", run_as_of_resolution_seed),
+        FnScenario::boxed("as-of-oracle", run_as_of_oracle_seed),
+        FnScenario::boxed("engine-recover", run_engine_recover_seed),
+        FnScenario::boxed("schedule", run_schedule_seed_digest),
+        FnScenario::fault("fault-disk", run_fault_seed),
+    ]
+}
+
+/// The scenario + seed currently executing, read by the panic hook to name a
+/// failure. `None` when the harness is idle.
+static CURRENT: Mutex<Option<(&'static str, u64)>> = Mutex::new(None);
+
+fn set_current(scenario: &'static str, seed: u64) {
+    if let Ok(mut guard) = CURRENT.lock() {
+        *guard = Some((scenario, seed));
+    }
+}
+
+fn clear_current() {
+    if let Ok(mut guard) = CURRENT.lock() {
+        *guard = None;
+    }
+}
+
+/// Install a panic hook that names a failing scenario and seed.
+///
+/// On any scenario panic it prints a prominent `scenario + seed` banner and the
+/// command to replay it, then chains to the previous hook so the original
+/// assertion message and location still show.
+///
+/// Call once from the binary's `main` before [`sweep`] or [`replay`]. With
+/// `panic = "abort"` in the release profile (the profile `just sim` builds) the
+/// process aborts right after the banner; in a debug/unwind build the panic
+/// propagates out instead. Either way the exit is non-zero and the seed is
+/// reproducible — the "failure is a number" contract of the harness.
+pub fn install_failure_reporter() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some((scenario, seed)) = CURRENT.lock().ok().and_then(|guard| *guard) {
+            eprintln!(
+                "\nstele-sim: FAIL — scenario `{scenario}` violated an invariant on seed {seed}"
+            );
+            eprintln!(
+                "stele-sim: reproduce with `just sim-seed {seed}`  (cargo run -p stele-sim -- --seed {seed})"
+            );
+        }
+        previous(info);
+    }));
+}
+
+/// A clean sweep — every active scenario passed every seed.
+#[derive(Debug, Clone, Copy)]
+pub struct SweepReport {
+    /// Scenarios that actually ran (fault-disk only when faults are on).
+    pub scenarios: usize,
+    /// Seeds swept.
+    pub seeds: u64,
+    /// Order-sensitive fold of every per-`(seed, scenario)` digest — one
+    /// regression signal for the whole sweep.
+    pub digest: u64,
+}
+
+/// Sweep `seeds` distinct seeds across every registered scenario, returning a
+/// [`SweepReport`] once all pass.
+///
+/// A scenario that violates an invariant panics; with [`install_failure_reporter`]
+/// in place that prints the failing scenario + seed before the process exits
+/// non-zero, so this only returns on success. `fault_injection` gates the
+/// scenarios that opt in via [`Scenario::requires_fault_injection`] — with it
+/// off, the fault-disk scenario is skipped, so the `--fault-injection` flag
+/// genuinely changes coverage.
+#[must_use]
+pub fn sweep(seeds: u64, fault_injection: bool) -> SweepReport {
+    const OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01B3;
+    let registry = registry();
+    let active: Vec<&dyn Scenario> = registry
+        .iter()
+        .map(Box::as_ref)
+        .filter(|s| fault_injection || !s.requires_fault_injection())
+        .collect();
+
+    let mut digest = OFFSET;
+    for seed in 0..seeds {
+        for scenario in &active {
+            set_current(scenario.name(), seed);
+            // Mix each per-seed digest with an order-dependent FNV step (not XOR,
+            // which would cancel matching digests) so the sweep stays a sharp
+            // regression signal across scenarios and seeds.
+            digest = (digest ^ scenario.run(seed)).wrapping_mul(PRIME);
+        }
+    }
+    clear_current();
+    SweepReport {
+        scenarios: active.len(),
+        seeds,
+        digest,
+    }
+}
+
+/// Replay one seed across **every** scenario (fault-disk included), returning each
+/// scenario's name and digest.
+///
+/// The reproduction path behind `just sim-seed K`: a scenario that fails panics
+/// with its full assertion (the seed is in the message), which
+/// [`install_failure_reporter`] names by scenario. Faults are always included so
+/// a fault-disk failure reproduces even though `just sim-seed` passes no
+/// `--fault-injection` flag.
+#[must_use]
+pub fn replay(seed: u64) -> Vec<(&'static str, u64)> {
+    let digests = registry()
+        .iter()
+        .map(|scenario| {
+            set_current(scenario.name(), seed);
+            let digest = scenario.run(seed);
+            (scenario.name(), digest)
+        })
+        .collect();
+    // Clear the marker so a later, unrelated panic can't print a stale
+    // `scenario + seed` banner from this finished replay.
+    clear_current();
+    digests
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1706,5 +1931,88 @@ mod tests {
             digests.len() > 1,
             "the AS-OF-resolution read workload must actually depend on the seed"
         );
+    }
+
+    #[test]
+    fn registry_names_are_unique_and_kebab() {
+        let registry = registry();
+        let total = registry.len();
+        assert!(total > 1, "the registry must hold the v0.1 scenario set");
+        let mut names: Vec<&str> = registry.iter().map(|s| s.name()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "scenario names must be unique");
+        for name in names {
+            assert!(
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                "scenario name `{name}` must be lowercase kebab-case",
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_is_deterministic_and_covers_every_scenario() {
+        // Same seeds ⇒ same fold: the determinism the whole harness rests on,
+        // now asserted at the registry-sweep level (STL-110 DoD).
+        let first = sweep(16, true);
+        let second = sweep(16, true);
+        assert_eq!(
+            first.digest, second.digest,
+            "the sweep digest must replay identically"
+        );
+        assert_eq!(first.seeds, 16);
+        assert_eq!(
+            first.scenarios,
+            registry().len(),
+            "faults on ⇒ every registered scenario runs"
+        );
+    }
+
+    #[test]
+    fn fault_injection_gates_exactly_the_fault_disk_scenario() {
+        // The `--fault-injection` flag must genuinely change what runs. Assert it
+        // structurally: exactly one scenario is fault-gated and it is fault-disk,
+        // and turning the flag on adds exactly that one scenario to the sweep.
+        // (A digest-inequality check would be subtly flaky — different folds can
+        // collide in principle — so we assert coverage, not the digest value.)
+        let gated: Vec<&str> = registry()
+            .iter()
+            .filter(|s| s.requires_fault_injection())
+            .map(|s| s.name())
+            .collect();
+        assert_eq!(
+            gated,
+            ["fault-disk"],
+            "exactly the fault-disk scenario is fault-gated"
+        );
+        let on = sweep(4, true);
+        let off = sweep(4, false);
+        assert_eq!(
+            on.scenarios,
+            off.scenarios + 1,
+            "fault injection adds exactly the fault-disk scenario"
+        );
+    }
+
+    #[test]
+    fn replay_wires_each_scenario_to_its_digest_function() {
+        // `--seed K` must reproduce exactly what the sweep saw — each registered
+        // scenario yields the same digest a direct call to its function does.
+        let seed = 42;
+        let replayed: std::collections::BTreeMap<&str, u64> = replay(seed).into_iter().collect();
+        assert_eq!(
+            replayed.len(),
+            registry().len(),
+            "replay covers every scenario"
+        );
+        assert_eq!(replayed["storage"], run_storage_seed(seed));
+        assert_eq!(replayed["snapshot-scan"], run_snapshot_scan_seed(seed));
+        assert_eq!(replayed["as-of-oracle"], run_as_of_oracle_seed(seed));
+        assert_eq!(replayed["engine-recover"], run_engine_recover_seed(seed));
+        assert_eq!(replayed["schedule"], run_schedule_seed_digest(seed));
+        assert_eq!(replayed["fault-disk"], run_fault_seed(seed));
     }
 }
