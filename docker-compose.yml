@@ -1,0 +1,18 @@
+# Minimal local stack for the five-minute path (docs/05-dev-environment.md).
+#
+# v0.1 is a single service running in dev mode (no config, scratch storage). The
+# MinIO S3-compatible cold store joins this file in v0.3, when storage tiering
+# lands. The published image is ghcr.io/<org>/stele; until a release exists we
+# build it locally from docker/Dockerfile.
+#
+#   docker compose up --build      # build + run the engine on :5454
+#   psql -h localhost -p 5454 -d stele   # then run the identity demo
+services:
+  stele:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: stele:dev
+    command: ["--dev"]
+    ports:
+      - "5454:5454"

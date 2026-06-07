@@ -70,3 +70,11 @@ cli *args:
 # Build the canonical Docker image.
 docker-build:
     docker build -f docker/Dockerfile -t stele:dev .
+
+# Five-minute-path smoke test (STL-112): build the image, run the engine, drive
+# the four-statement identity demo over pg-wire, assert the AS OF query returns
+# 100. Mirrors the CI `five-minute path` job. Needs Docker + psql.
+docker-smoke: docker-build
+    docker rm -f stele-smoke >/dev/null 2>&1 || true
+    docker run -d --name stele-smoke -p 5454:5454 stele:dev --dev
+    ci/identity-demo-smoke.sh localhost 5454; status=$?; docker rm -f stele-smoke >/dev/null 2>&1 || true; exit $status

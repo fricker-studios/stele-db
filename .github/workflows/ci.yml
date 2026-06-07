@@ -115,3 +115,28 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+
+  five-minute-path:
+    name: five-minute path (docker identity demo)
+    needs: quick
+    # GitHub-hosted: the Docker daemon and the postgresql-client (`psql`) the
+    # smoke test needs are both preinstalled. The self-hosted ARC runners are
+    # unprivileged k8s pods with no Docker daemon, so the image build/run lives
+    # here (same place codeql.yml runs). Only the SHA-pinned actions/checkout is
+    # used; everything else is the runner's stock `docker` CLI (ADR-0005 keeps
+    # the third-party action surface small).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Build the canonical image
+        run: docker build -f docker/Dockerfile -t stele:ci .
+      - name: Start the engine
+        run: docker run -d --name stele -p 5454:5454 stele:ci --dev
+      - name: Run the identity demo and assert the AS OF query time-travels
+        run: ci/identity-demo-smoke.sh localhost 5454
+      - name: Engine logs
+        if: always()
+        run: docker logs stele || true
+      - name: Stop the engine
+        if: always()
+        run: docker rm -f stele || true
