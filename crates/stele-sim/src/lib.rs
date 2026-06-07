@@ -15,10 +15,15 @@
 //! always produces the same digest — the determinism property the whole
 //! testing strategy rests on.
 //!
-//! The seeded-fault virtual disk ([STL-109]) lands in the `fault_disk` module:
+//! The seeded-fault virtual disk ([STL-109]) lives in the `fault_disk` module:
 //! [`run_fault_seed`] drives a [`FaultDisk`] through a seeded workload and folds
-//! its fault-event log into a digest. The virtual clock/network land in
-//! adjacent tickets.
+//! its fault-event log into a digest.
+//!
+//! The deterministic substrate — a [`VirtualClock`] that advances on demand, the
+//! ChaCha20-backed [`SeededRng`], and the cooperative [`Scheduler`] that drives
+//! futures in a seed-determined order ([STL-108]) — now lives alongside the
+//! storage scenarios; [`run_schedule_seed`] is its determinism demo (same seed ⇒
+//! byte-identical trace). The simulated network lands in an adjacent ticket.
 
 #![allow(dead_code)]
 
@@ -47,6 +52,17 @@ use stele_storage::validtime::{ValidInterval, ValidTimeWriter, unframe_payload};
 use stele_storage::wal::{Checkpoint, Wal, WalConfig};
 use stele_txn::TxnManager;
 
+mod chacha;
+mod clock;
+mod scheduler;
+
+pub use chacha::SeededRng;
+pub use clock::VirtualClock;
+pub use scheduler::{
+    Event, Scheduler, TaskId, encode_events, record, run_schedule_seed, run_schedule_seed_digest,
+    schedule_trace, sleep, trace_digest, yield_now,
+};
+
 /// A deterministic, strictly-increasing clock for seeded scenarios.
 ///
 /// The system-time axis needs commit timestamps that advance ([`stele_storage::systime`]),
@@ -70,8 +86,10 @@ impl Clock for StepClock {
 /// Tiny `xorshift64*` PRNG — deterministic and dependency-free.
 ///
 /// Seeded from a `u64` so a failing seed is a number we can replay. This is the
-/// only source of "randomness" in a simulation run, which is exactly what makes
-/// runs reproducible.
+/// source of "randomness" the storage scenarios use, which is exactly what makes
+/// runs reproducible. The scheduler substrate ([STL-108]) uses the
+/// stronger ChaCha20-backed [`SeededRng`] instead; migrating these scenarios onto
+/// it is a deferred cleanup.
 #[derive(Debug, Clone)]
 pub struct Rng(u64);
 
