@@ -6,45 +6,24 @@
 //! suite with `mod common;`.
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use stele_pgwire::{Server, SharedSession};
-use tokio::net::TcpListener;
-use tokio_postgres::NoTls;
 
-/// Start a [`Server`] over `session` on an ephemeral port and return its address,
-/// once it accepts a full connection.
+/// Start a [`Server`] over `session` on an ephemeral port and return its address.
 ///
-/// Reserves a free port with a throwaway bind, drops it, and hands the address to
-/// the real server. The race this carries (another process can grab the port
-/// before the server re-binds) is tracked by STL-152, which will let the server
-/// report its own bound address — at which point this dance goes away for both
-/// callers at once.
-///
-/// Readiness is probed by completing a **real Postgres startup handshake**
-/// (`tokio_postgres::connect`), not a bare `TcpStream::connect`: a raw TCP connect
-/// that is immediately dropped leaves the server's handler staring at EOF mid
-/// startup framing (a spurious warning during test setup). The probe connection
-/// is closed cleanly before returning.
+/// Binds the listen socket up front (STL-152) and reports the real bound address
+/// before spawning the accept loop, so there is **no** reserve-drop window and no
+/// connect-retry: the listener already accepts into its backlog, so the caller can
+/// connect immediately on the returned address.
 pub async fn spawn_server(session: SharedSession) -> SocketAddr {
-    let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = reserved.local_addr().unwrap();
-    drop(reserved);
-
-    tokio::spawn(Server::new(addr, session).run());
-
-    for _ in 0..200 {
-        if let Ok((client, connection)) = tokio_postgres::connect(&conn_str(addr), NoTls).await {
-            // Drive the connection just long enough to close it cleanly (a plain
-            // Terminate), so the readiness probe leaves no half-open socket.
-            let driver = tokio::spawn(connection);
-            drop(client);
-            let _ = driver.await;
-            return addr;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("server did not come up on {addr} within the retry budget");
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let bound = Server::new(addr, session)
+        .bind()
+        .await
+        .expect("bind ephemeral port");
+    let addr = bound.local_addr();
+    tokio::spawn(bound.serve());
+    addr
 }
 
 /// The libpq connection string for a Stele pgwire server at `addr`.
