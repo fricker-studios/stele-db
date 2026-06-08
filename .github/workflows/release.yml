@@ -210,6 +210,13 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        # Pin the cosign *binary* version, not just the SHA-pinned installer
+        # action (ADR-0005). Left unpinned it floats to latest — cosign v3
+        # changed `sign-blob` (bundle-by-default) and broke the v2-style
+        # `--output-signature`/`--output-certificate` invocation below. v2.6.3
+        # is the latest v2; keep both cosign steps on it (STL-190).
+        with:
+          cosign-release: "v2.6.3"
       - name: Sign the image by digest
         env:
           IMAGE: ghcr.io/${{ github.repository_owner }}/stele
@@ -286,6 +293,11 @@ jobs:
         # .sig/.pem) stay out. The SBOM is integrity-covered like every asset.
         run: sha256sum *.tar.gz *.cdx.json > SHA256SUMS
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        # Pin cosign to v2.6.3 — see the docker job above. v3's `sign-blob`
+        # bundle-by-default broke this `--output-signature`/`--output-certificate`
+        # invocation ("create bundle file: open : no such file or directory").
+        with:
+          cosign-release: "v2.6.3"
       - name: Sign the checksum file (keyless)
         working-directory: dist
         run: |
