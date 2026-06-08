@@ -1,0 +1,25 @@
+[package]
+name        = "stele-exec-oracle"
+description = "Test-only: DuckDB differential oracle for the executor's bitemporal AS OF. Not shipped."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# The DuckDB differential oracle (STL-144) lives here, isolated from stele-exec
+# so the `bundled` DuckDB C++ amalgamation never compiles on the per-PR CI path
+# (STL-158): this crate is excluded from the per-PR `--workspace` runs and from
+# `default-members`, and runs only in the nightly gate via `-p stele-exec-oracle`.
+# Dev-only — never linked into the shipped storage/txn/exec core (ADR-0010).
+duckdb        = { workspace = true }
+stele-common  = { workspace = true }
+stele-storage = { workspace = true }
+stele-exec    = { workspace = true }

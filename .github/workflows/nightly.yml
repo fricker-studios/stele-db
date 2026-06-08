@@ -59,7 +59,11 @@ jobs:
           # Without it, cargo links the precompiled rustup std (built with the
           # sanitizer unset) and rustc rejects the ABI mismatch. Needs the
           # rust-src component + an explicit --target, both already set above.
-          cargo +nightly build -Zbuild-std --workspace --all-features
+          #
+          # `stele-exec-oracle` is excluded — its DuckDB C++ amalgamation has no
+          # business being recompiled under -Zbuild-std/sanitizer; the Rust core
+          # is what we sanitize, and the oracle runs in its own job below (STL-158).
+          cargo +nightly build -Zbuild-std --workspace --exclude stele-exec-oracle --all-features
 
   miri:
     if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'full-ci')
@@ -108,3 +112,25 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - run: |
           echo "Bench gate stub — wire criterion baselines in STL follow-up."
+
+  # The DuckDB differential oracle (STL-144), isolated here so the bundled DuckDB
+  # C++ amalgamation never gates a PR (STL-158). This is the one job that compiles
+  # `stele-exec-oracle`; the per-PR `ci.yml` jobs exclude it. Linux-only — the
+  # oracle checks platform-independent bitemporal `AS OF` resolution, so there is
+  # no value in paying the amalgamation compile on a second target. rust-cache
+  # keeps the built libduckdb between runs (a real run is a no-op when the lock +
+  # toolchain are unchanged).
+  duckdb-oracle:
+    if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    name: duckdb differential oracle
+    runs-on: arc-runner-fricker-amd64
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (no semver tags)
+        with:
+          toolchain: "1.85.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - uses: taiki-e/install-action@cde8c9e634f4a17bc06b61413ac0ef75450eac46 # v2.81.4
+        with:
+          tool: nextest
+      - run: cargo nextest run -p stele-exec-oracle --all-features

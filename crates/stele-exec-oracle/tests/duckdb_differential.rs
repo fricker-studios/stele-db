@@ -18,10 +18,13 @@
 //!   exists above the runtime-agnostic core. The workload flushes the delta into
 //!   sealed segments mid-history, so most probes resolve a version that has
 //!   crossed the flush boundary (the cross-tier merge), not a delta-only read.
-//! * DuckDB is an external C++ dependency. Keeping it a **dev-dependency of
-//!   `stele-exec` only** honors [ADR-0010]: the deterministic storage/txn core
-//!   never links it. The `bundled` feature vendors the DuckDB amalgamation, so no
-//!   system library is required in CI.
+//! * DuckDB is an external C++ dependency. It is confined to this dedicated
+//!   **`stele-exec-oracle`** crate (a dev-dependency here, never in `stele-exec`
+//!   or any shipped crate), honoring [ADR-0010]: the deterministic storage/txn
+//!   core never links it. The `bundled` feature vendors the DuckDB amalgamation,
+//!   so no system library is required in CI. The crate is held off the per-PR
+//!   `--workspace` runs and built only in the nightly gate (STL-158), so the
+//!   multi-minute amalgamation compile never gates a PR.
 //!
 //! ## The two implementations being diffed
 //!

@@ -8,6 +8,26 @@ members = [
     "crates/stele-txn",
     "crates/stele-sql",
     "crates/stele-exec",
+    "crates/stele-exec-oracle",
+    "crates/stele-engine",
+    "crates/stele-pgwire",
+    "crates/stele-lineage",
+    "crates/stele-server",
+    "crates/stele-cli",
+]
+# `stele-exec-oracle` is a test-only crate whose dev-dep DuckDB compiles the
+# bundled C++ amalgamation (minutes). It is deliberately left out of
+# `default-members` so a bare `cargo build`/`cargo test` skips it; the per-PR CI
+# jobs exclude it explicitly (`--exclude stele-exec-oracle`) and it runs only in
+# the nightly gate (`-p stele-exec-oracle`) — STL-158.
+default-members = [
+    "crates/stele-common",
+    "crates/stele-storage",
+    "crates/stele-sim",
+    "crates/stele-catalog",
+    "crates/stele-txn",
+    "crates/stele-sql",
+    "crates/stele-exec",
     "crates/stele-engine",
     "crates/stele-pgwire",
     "crates/stele-lineage",
@@ -59,8 +79,10 @@ tokio-postgres     = "0.7"
 # but `duckdb` depends on `arrow` non-optionally — there is no feature to opt out —
 # so the dev-tree pulls the arrow stack regardless (all MIT/Apache-2.0; cargo-deny
 # green, see deny.toml). Pinned to 1.4.x — its MSRV (1.84.1) clears our 1.85
-# toolchain. Wired only into `stele-exec`'s dev-deps; it never links into the
-# runtime-agnostic storage/txn core ([ADR-0010]).
+# toolchain. Wired only into the test-only `stele-exec-oracle` crate's dev-deps; it
+# never links into any shipped crate or the runtime-agnostic storage/txn core
+# ([ADR-0010]). That crate is held off the per-PR CI path so this multi-minute
+# amalgamation compile runs only in the nightly gate (STL-158).
 duckdb             = { version = "1.4", features = ["bundled"] }
 tracing            = "0.1"
 # `json` enables the line-delimited JSON formatter for production
