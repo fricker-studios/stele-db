@@ -115,7 +115,13 @@ jobs:
           - { os: macos-latest, target: aarch64-apple-darwin, ext: "" }
           # Tier 2
           - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, ext: "", linker: gcc-aarch64-linux-gnu }
-          - { os: macos-13, target: x86_64-apple-darwin, ext: "" }
+          # `macos-15-intel`, not the retired `macos-13`: GitHub removed the
+          # macOS 13 (Intel) image under its N-1 OS policy (~Dec 2025), so a
+          # `macos-13` job hangs `queued` forever with no runner. macos-15-intel
+          # is the last Intel-based hosted image (until ~Fall 2027); after that
+          # GitHub drops hosted Intel macOS entirely and this target retires
+          # (STL-161).
+          - { os: macos-15-intel, target: x86_64-apple-darwin, ext: "" }
           # Tier 3 (x86_64-pc-windows-msvc) is deferred: the storage backend's
           # positioned read uses the Unix-only `pread` (std::os::unix FileExt),
           # so the engine does not yet compile on Windows, and Windows has no CI
