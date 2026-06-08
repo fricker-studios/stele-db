@@ -36,7 +36,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85.0"
 license = "BUSL-1.1"
@@ -46,17 +46,17 @@ authors = ["Stele DB contributors"]
 
 [workspace.dependencies]
 # Internal crates — referenced by path so workspace builds are hermetic.
-stele-common   = { path = "crates/stele-common",   version = "0.1.0" }
-stele-storage  = { path = "crates/stele-storage",  version = "0.1.0" }
-stele-sim      = { path = "crates/stele-sim",      version = "0.1.0" }
-stele-catalog  = { path = "crates/stele-catalog",  version = "0.1.0" }
-stele-txn      = { path = "crates/stele-txn",      version = "0.1.0" }
-stele-sql      = { path = "crates/stele-sql",      version = "0.1.0" }
-stele-exec     = { path = "crates/stele-exec",     version = "0.1.0" }
-stele-engine   = { path = "crates/stele-engine",   version = "0.1.0" }
-stele-pgwire   = { path = "crates/stele-pgwire",   version = "0.1.0" }
-stele-lineage  = { path = "crates/stele-lineage",  version = "0.1.0" }
-stele-server   = { path = "crates/stele-server",   version = "0.1.0" }
+stele-common   = { path = "crates/stele-common",   version = "0.2.0" }
+stele-storage  = { path = "crates/stele-storage",  version = "0.2.0" }
+stele-sim      = { path = "crates/stele-sim",      version = "0.2.0" }
+stele-catalog  = { path = "crates/stele-catalog",  version = "0.2.0" }
+stele-txn      = { path = "crates/stele-txn",      version = "0.2.0" }
+stele-sql      = { path = "crates/stele-sql",      version = "0.2.0" }
+stele-exec     = { path = "crates/stele-exec",     version = "0.2.0" }
+stele-engine   = { path = "crates/stele-engine",   version = "0.2.0" }
+stele-pgwire   = { path = "crates/stele-pgwire",   version = "0.2.0" }
+stele-lineage  = { path = "crates/stele-lineage",  version = "0.2.0" }
+stele-server   = { path = "crates/stele-server",   version = "0.2.0" }
 
 # Pinned third-party deps. Keep this list short on purpose — each addition is a
 # supply-chain surface and a `cargo-deny` decision.
