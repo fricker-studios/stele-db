@@ -116,8 +116,12 @@ jobs:
           # Tier 2
           - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, ext: "", linker: gcc-aarch64-linux-gnu }
           - { os: macos-13, target: x86_64-apple-darwin, ext: "" }
-          # Tier 3 (release-only, which this is)
-          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: ".exe" }
+          # Tier 3 (x86_64-pc-windows-msvc) is deferred: the storage backend's
+          # positioned read uses the Unix-only `pread` (std::os::unix FileExt),
+          # so the engine does not yet compile on Windows, and Windows has no CI
+          # coverage. Restored once the portable seek_read path + a Windows CI
+          # leg land (STL-160). Keeping a broken release-only target here would
+          # block every GitHub Release (this matrix feeds `release`).
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3

@@ -58,7 +58,7 @@ Every image is **signed with cosign** and ships an attached **SBOM** and **SLSA 
 
 Standalone binaries for users who don't want containers.
 
-- **Target matrix** mirrors the [CI tiers](04-cicd.md#cross-platform-matrix): tier-1 `x86_64-linux`, `aarch64-macos`; tier-2 `aarch64-linux`, `x86_64-macos`; tier-3 `x86_64-windows`.
+- **Target matrix** mirrors the [CI tiers](04-cicd.md#cross-platform-matrix): tier-1 `x86_64-linux`, `aarch64-macos`; tier-2 `aarch64-linux`, `x86_64-macos`. Tier-3 `x86_64-windows` is **deferred** — the engine does not yet compile on Windows (Unix-only `pread` in the storage backend); it returns to the matrix with STL-160.
 - **Naming:** `stele-<version>-<target>.<ext>` (e.g. `stele-1.4.2-aarch64-apple-darwin.tar.gz`), each with a `.sha256` and a cosign `.sig`.
 - **Linking:** statically linked where the target allows (musl on Linux) so there are no runtime dependencies.
 - **Contents:** each archive bundles both `stele-server` and the `stele` CLI, plus shell completions and man pages.
