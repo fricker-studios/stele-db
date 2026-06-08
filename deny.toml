@@ -41,6 +41,7 @@ exceptions = [
     { allow = ["BUSL-1.1"], name = "stele-txn" },
     { allow = ["BUSL-1.1"], name = "stele-sql" },
     { allow = ["BUSL-1.1"], name = "stele-exec" },
+    { allow = ["BUSL-1.1"], name = "stele-exec-oracle" },
     { allow = ["BUSL-1.1"], name = "stele-engine" },
     { allow = ["BUSL-1.1"], name = "stele-pgwire" },
     { allow = ["BUSL-1.1"], name = "stele-lineage" },
@@ -48,10 +49,12 @@ exceptions = [
     { allow = ["BUSL-1.1"], name = "stele-cli" },
 ]
 
-# --- duckdb dev-dependency decision (STL-144) -------------------------------
+# --- duckdb dev-dependency decision (STL-144, isolated in STL-158) -----------
 # The DuckDB differential bitemporal oracle ([docs/06 §10]) adds `duckdb`
-# (`bundled`) as a **dev-dependency of `stele-exec` only** — never linked into a
-# shipped crate, honoring the runtime-agnostic core boundary ([ADR-0010]).
+# (`bundled`) as a **dev-dependency of the test-only `stele-exec-oracle` crate
+# only** — never in `stele-exec` or any shipped crate's tree, honoring the
+# runtime-agnostic core boundary ([ADR-0010]). That crate is held off the per-PR
+# CI path so the amalgamation compiles only in the nightly gate (STL-158).
 #
 # License: `duckdb` and `libduckdb-sys` (which vendors and compiles the DuckDB
 # C++ amalgamation) are **MIT**; the dependency drags in the `arrow` stack and
