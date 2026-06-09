@@ -18,6 +18,15 @@ path = "src/main.rs"
 
 [dependencies]
 stele-server = { workspace = true }
+stele-common = { workspace = true }
 anyhow       = { workspace = true }
 clap         = { workspace = true }
 tokio        = { workspace = true }
+
+[dev-dependencies]
+# The scripted-shell integration test boots an in-process engine + pgwire
+# server on an ephemeral port, then drives the real `stele` binary against it.
+stele-engine  = { workspace = true }
+stele-pgwire  = { workspace = true }
+stele-storage = { workspace = true }
+tokio         = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -2190,7 +2190,11 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
+ "stele-common",
+ "stele-engine",
+ "stele-pgwire",
  "stele-server",
+ "stele-storage",
  "tokio",
 ]
 

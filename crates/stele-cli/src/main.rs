@@ -1,11 +1,15 @@
 //! The `stele` CLI binary.
 //!
-//! v0.1 surface is intentionally tiny: `stele server` starts the daemon (so the
-//! single binary covers the "five-minute path" in [`docs/05-dev-environment.md`](../../../docs/05-dev-environment.md)),
+//! `stele server` starts the daemon (so the single binary covers the
+//! "five-minute path" in [`docs/05-dev-environment.md`](../../../docs/05-dev-environment.md)),
+//! `stele shell` opens the interactive query shell over pg-wire (STL-185),
 //! `stele version` reports the build, and every other subcommand is a polite
 //! "not yet" with a doc link.
 
 use clap::{Parser, Subcommand};
+
+mod client;
+mod shell;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -22,12 +26,28 @@ struct Args {
 enum Cmd {
     /// Start the engine daemon (alias for `stele-server`).
     Server(ServerArgs),
-    /// Interactive SQL shell. Not implemented in v0.1.
-    Shell,
+    /// Interactive SQL shell over pg-wire.
+    Shell(ShellArgs),
     /// One-shot query. Not implemented in v0.1.
     Query { sql: String },
     /// Print version + build metadata.
     Version,
+}
+
+#[derive(clap::Args, Debug)]
+struct ShellArgs {
+    /// Engine host to connect to.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+    /// Engine pg-wire port.
+    #[arg(long, default_value_t = stele_common::DEFAULT_PG_PORT)]
+    port: u16,
+    /// User name sent in the startup message (the dev server runs trust auth).
+    #[arg(long, default_value = "stele")]
+    user: String,
+    /// Database name sent in the startup message.
+    #[arg(long, default_value = "stele")]
+    dbname: String,
 }
 
 #[derive(clap::Args, Debug)]
@@ -73,9 +93,15 @@ fn main() -> anyhow::Result<()> {
                 .block_on(stele_server::run(cfg))?;
             Ok(())
         }
-        Cmd::Shell | Cmd::Query { .. } => {
+        Cmd::Shell(s) => shell::run(&shell::Opts {
+            host: s.host,
+            port: s.port,
+            user: s.user,
+            dbname: s.dbname,
+        }),
+        Cmd::Query { .. } => {
             anyhow::bail!(
-                "not implemented in v0.1 — see docs/03-roadmap.md. Use `psql -h localhost -p 5454 -d stele` for now."
+                "not implemented yet — see docs/03-roadmap.md. Use `stele shell` or `psql -h localhost -p 5454 -d stele` for now."
             )
         }
         Cmd::Version => {
@@ -118,14 +144,39 @@ mod tests {
     }
 
     #[test]
-    fn documented_v0_1_surface_parses() {
+    fn documented_surface_parses() {
         assert!(matches!(parse(&["stele", "version"]), Cmd::Version));
-        assert!(matches!(parse(&["stele", "shell"]), Cmd::Shell));
+        assert!(matches!(parse(&["stele", "shell"]), Cmd::Shell(_)));
         assert!(matches!(
             parse(&["stele", "query", "SELECT 1"]),
             Cmd::Query { .. }
         ));
         assert!(matches!(parse(&["stele", "server"]), Cmd::Server(_)));
+    }
+
+    #[test]
+    fn shell_defaults_target_the_local_dev_server() {
+        let Cmd::Shell(s) = parse(&["stele", "shell"]) else {
+            panic!("expected shell subcommand");
+        };
+        assert_eq!(s.host, "127.0.0.1");
+        assert_eq!(s.port, stele_common::DEFAULT_PG_PORT);
+        assert_eq!(s.user, "stele");
+        assert_eq!(s.dbname, "stele");
+    }
+
+    #[test]
+    fn shell_accepts_explicit_connection_flags() {
+        let Cmd::Shell(s) = parse(&[
+            "stele", "shell", "--host", "10.0.0.7", "--port", "6000", "--user", "ops", "--dbname",
+            "audit",
+        ]) else {
+            panic!("expected shell subcommand");
+        };
+        assert_eq!(s.host, "10.0.0.7");
+        assert_eq!(s.port, 6000);
+        assert_eq!(s.user, "ops");
+        assert_eq!(s.dbname, "audit");
     }
 
     #[test]
