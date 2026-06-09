@@ -19,6 +19,8 @@
 //! | `bool`      | `t` / `f`                                            |
 //! | `timestamp` | ISO-8601 `YYYY-MM-DD HH:MM:SS[.ffffff]` (UTC)        |
 //! | `date`      | ISO-8601 `YYYY-MM-DD`                                |
+//! | `uuid`      | canonical lowercase `8-4-4-4-12` hex                 |
+//! | `bytea`     | `\x` + lowercase hex (Postgres `bytea_output = hex`) |
 //!
 //! Timestamps and dates are stored as raw offsets from the Unix epoch
 //! (microseconds and days respectively — see [`stele_common::types`]); the
@@ -48,7 +50,8 @@ pub(crate) const fn pg_typlen(ty: LogicalType) -> i16 {
         LogicalType::Int4 | LogicalType::Date => 4,
         LogicalType::Int8 | LogicalType::Timestamp => 8,
         LogicalType::Bool => 1,
-        LogicalType::Text => -1,
+        LogicalType::Uuid => 16,
+        LogicalType::Text | LogicalType::Bytea => -1,
     }
 }
 
@@ -64,7 +67,42 @@ pub(crate) fn encode_text(value: &ScalarValue) -> String {
         ScalarValue::Bool(b) => if *b { "t" } else { "f" }.to_owned(),
         ScalarValue::Timestamp(micros) => format_timestamp(*micros),
         ScalarValue::Date(days) => format_date(*days),
+        ScalarValue::Uuid(bytes) => format_uuid(bytes),
+        ScalarValue::Bytea(bytes) => format_bytea(bytes),
     }
+}
+
+/// Lowercase hex digit for the low nibble of `b`'s high/low half — the shared
+/// primitive behind the `uuid` and `bytea` renderings.
+fn push_hex(out: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(HEX[usize::from(byte >> 4)] as char);
+    out.push(HEX[usize::from(byte & 0x0F)] as char);
+}
+
+/// Render a 16-byte UUID as Postgres's canonical lowercase `8-4-4-4-12` form,
+/// e.g. `550e8400-e29b-41d4-a716-446655440000`. Hyphens fall after bytes 4, 6,
+/// 8, and 10.
+fn format_uuid(bytes: &[u8; 16]) -> String {
+    let mut out = String::with_capacity(36);
+    for (i, &b) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        push_hex(&mut out, b);
+    }
+    out
+}
+
+/// Render a byte string in Postgres's default `bytea` hex output: a `\x` prefix
+/// followed by two lowercase hex digits per byte (empty input renders as `\x`).
+fn format_bytea(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(2 + bytes.len() * 2);
+    out.push_str("\\x");
+    for &b in bytes {
+        push_hex(&mut out, b);
+    }
+    out
 }
 
 /// Convert days since the Unix epoch (1970-01-01) into a proleptic-Gregorian
@@ -151,6 +189,47 @@ mod tests {
         assert_eq!(pg_typlen(LogicalType::Date), 4);
         assert_eq!(pg_typlen(LogicalType::Timestamp), 8);
         assert_eq!(pg_typlen(LogicalType::Text), -1, "text is variable-length");
+        assert_eq!(pg_typlen(LogicalType::Uuid), 16);
+        assert_eq!(
+            pg_typlen(LogicalType::Bytea),
+            -1,
+            "bytea is variable-length"
+        );
+    }
+
+    #[test]
+    fn uuid_renders_canonical_lowercase_hyphenated() {
+        let bytes = [
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ];
+        assert_eq!(
+            encode_text(&ScalarValue::Uuid(bytes)),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        // Upper-half bytes render with their leading zero preserved.
+        assert_eq!(
+            encode_text(&ScalarValue::Uuid([0; 16])),
+            "00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(
+            encode_text(&ScalarValue::Uuid([0xFF; 16])),
+            "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        );
+    }
+
+    #[test]
+    fn bytea_renders_hex_with_backslash_x_prefix() {
+        // Postgres's default `bytea_output = hex`.
+        assert_eq!(encode_text(&ScalarValue::Bytea(vec![])), "\\x");
+        assert_eq!(
+            encode_text(&ScalarValue::Bytea(vec![0xDE, 0xAD, 0xBE, 0xEF])),
+            "\\xdeadbeef"
+        );
+        assert_eq!(
+            encode_text(&ScalarValue::Bytea(vec![0x00, 0x01, 0x0F, 0xA0])),
+            "\\x00010fa0"
+        );
     }
 
     #[test]

@@ -248,13 +248,19 @@ pub(crate) fn param_to_value(oid: u32, bytes: Option<&[u8]>) -> Result<Value, Pa
         Some(LogicalType::Bool) => {
             Value::Boolean(parse_bool(text).ok_or_else(|| ParamError::BadBool(text.to_owned()))?)
         }
-        Some(LogicalType::Text) => Value::SingleQuotedString(text.to_owned()),
-        // No civil-time literal codec yet (mirrors AS OF / DML): substitute as a
-        // string so the binder surfaces its documented "unsupported" error rather
-        // than this layer guessing a calendar encoding.
-        Some(LogicalType::Timestamp | LogicalType::Date) => {
-            Value::SingleQuotedString(text.to_owned())
-        }
+        // Every text-bearing type is passed through as a single-quoted string
+        // literal for the binder to fold against the column type: `text` and the
+        // textual `uuid` / `bytea` forms (`550e…`, `\xDEAD…`, STL-181) fold to a
+        // value; `timestamp` / `date` have no civil-time literal codec yet
+        // (mirrors AS OF / DML) and surface the binder's documented "unsupported"
+        // error rather than this layer guessing a calendar encoding.
+        Some(
+            LogicalType::Text
+            | LogicalType::Uuid
+            | LogicalType::Bytea
+            | LogicalType::Timestamp
+            | LogicalType::Date,
+        ) => Value::SingleQuotedString(text.to_owned()),
         // Unspecified (OID 0) or a type outside the set: infer from the text. An
         // integer-looking value folds to a numeric literal so `WHERE id = $1`
         // works without a declared type; everything else is a string. The binder

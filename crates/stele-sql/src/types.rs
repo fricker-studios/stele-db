@@ -9,12 +9,14 @@
 //! set of spellings the SQL surface accepts lives next to the parser that
 //! produces them, upstream of the catalog (STL-98).
 //!
-//! v0.1 vocabulary: `INT`/`INTEGER` → `Int4`, `BIGINT` → `Int8`, `TEXT` →
-//! `Text`, `BOOL`/`BOOLEAN` → `Bool`, `TIMESTAMP` (no time zone) → `Timestamp`,
-//! `DATE` → `Date`. Anything else — including `VARCHAR`, `CHAR`, and
-//! `TIMESTAMP WITH TIME ZONE` — is rejected as
-//! [`ParseError::UnsupportedType`]; those are deliberate later additions, not
-//! silent re-labellings (see [`LogicalType::Timestamp`]).
+//! Vocabulary: `INT`/`INTEGER` → `Int4`, `BIGINT` → `Int8`, `TEXT` → `Text`,
+//! `BOOL`/`BOOLEAN` → `Bool`, `TIMESTAMP` (no time zone) → `Timestamp`,
+//! `DATE` → `Date`, `UUID` → `Uuid`, `BYTEA` → `Bytea` ([STL-181]). Anything
+//! else — including `VARCHAR`, `CHAR`, and `TIMESTAMP WITH TIME ZONE` — is
+//! rejected as [`ParseError::UnsupportedType`]; those are deliberate later
+//! additions, not silent re-labellings (see [`LogicalType::Timestamp`]).
+//!
+//! [STL-181]: https://allegromusic.atlassian.net/browse/STL-181
 
 use sqlparser::ast::{DataType, TimezoneInfo};
 use stele_common::types::LogicalType;
@@ -48,6 +50,38 @@ pub fn logical_type(data_type: &DataType) -> Result<LogicalType, ParseError> {
             Ok(LogicalType::Timestamp)
         }
         DataType::Date => Ok(LogicalType::Date),
+        DataType::Uuid => Ok(LogicalType::Uuid),
+        DataType::Bytea => Ok(LogicalType::Bytea),
         other => Err(ParseError::UnsupportedType(other.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_the_full_vocabulary() {
+        assert_eq!(
+            logical_type(&DataType::Int(None)).unwrap(),
+            LogicalType::Int4
+        );
+        assert_eq!(
+            logical_type(&DataType::BigInt(None)).unwrap(),
+            LogicalType::Int8
+        );
+        assert_eq!(logical_type(&DataType::Text).unwrap(), LogicalType::Text);
+        assert_eq!(logical_type(&DataType::Boolean).unwrap(), LogicalType::Bool);
+        assert_eq!(logical_type(&DataType::Date).unwrap(), LogicalType::Date);
+        // STL-181 additions.
+        assert_eq!(logical_type(&DataType::Uuid).unwrap(), LogicalType::Uuid);
+        assert_eq!(logical_type(&DataType::Bytea).unwrap(), LogicalType::Bytea);
+    }
+
+    #[test]
+    fn rejects_types_outside_the_vocabulary() {
+        // Still rejected after the additions — these are deliberate non-mappings.
+        assert!(logical_type(&DataType::Varchar(None)).is_err());
+        assert!(logical_type(&DataType::Blob(None)).is_err());
     }
 }
