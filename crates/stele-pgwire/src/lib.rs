@@ -41,12 +41,24 @@
 //!   key and its single value column to the opaque payload; a general
 //!   multi-column row codec is a v0.2 concern.
 //!
-//! ## Not in v0.1
+//! ## Extended Query (v0.2)
 //!
-//! * Extended Query (Parse / Bind / Execute) — slated for **v0.2**
-//!   ([docs/03-roadmap.md](../../../docs/03-roadmap.md)).
+//! [STL-182] adds the **extended-query** state machine — `Parse` / `Bind` /
+//! `Describe` / `Execute` / `Sync` / `Close` — and a per-connection
+//! prepared-statement + portal cache, so a driver can prepare a parameterized
+//! statement once and execute it with bound values. The protocol decoding and
+//! the `$1 … $n` → literal substitution live in the `extended` module; this one
+//! owns the async handlers, the per-connection caches, and the result streaming.
+//! Only **text-format** parameters and results are handled here; binary encoders
+//! ride in with [STL-77] \[G23\].
+//!
+//! ## Not yet
+//!
 //! * `COPY` — v0.3.
 //! * SCRAM-SHA-256 auth + TLS — v0.3.
+//!
+//! [STL-182]: https://allegromusic.atlassian.net/browse/STL-182
+//! [STL-77]: https://allegromusic.atlassian.net/browse/STL-77
 //!
 //! ## Architectural constraint
 //!
@@ -56,9 +68,11 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+mod extended;
 mod pg_catalog;
 mod text_format;
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -115,6 +129,26 @@ const MSG_DATA_ROW: u8 = b'D';
 const MSG_COMMAND_COMPLETE: u8 = b'C';
 const MSG_EMPTY_QUERY_RESPONSE: u8 = b'I';
 
+// Extended-query message types (STL-182). The message-type byte is
+// direction-specific, so several reuse a letter the backend emits for something
+// else on the *outbound* stream (inbound `D` is Describe vs outbound DataRow,
+// inbound `E` is Execute vs outbound ErrorResponse, inbound `C` is Close vs
+// outbound CommandComplete, inbound `S` is Sync vs outbound ParameterStatus).
+const MSG_PARSE: u8 = b'P';
+const MSG_BIND: u8 = b'B';
+const MSG_DESCRIBE: u8 = b'D';
+const MSG_EXECUTE: u8 = b'E';
+const MSG_SYNC: u8 = b'S';
+const MSG_CLOSE: u8 = b'C';
+const MSG_FLUSH: u8 = b'H';
+// …and the replies unique to the extended protocol.
+const MSG_PARSE_COMPLETE: u8 = b'1';
+const MSG_BIND_COMPLETE: u8 = b'2';
+const MSG_CLOSE_COMPLETE: u8 = b'3';
+const MSG_PARAMETER_DESCRIPTION: u8 = b't';
+const MSG_NO_DATA: u8 = b'n';
+const MSG_PORTAL_SUSPENDED: u8 = b's';
+
 // SQLSTATE codes we return.
 const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
 const SQLSTATE_PROTOCOL_VIOLATION: &str = "08P01";
@@ -134,6 +168,11 @@ const SQLSTATE_INVALID_TEXT_REPRESENTATION: &str = "22P02";
 // A statement issued while the transaction is already aborted — Postgres ignores
 // commands until the block ends (`COMMIT`/`ROLLBACK`), STL-174.
 const SQLSTATE_IN_FAILED_TRANSACTION: &str = "25P02";
+// Extended-query lifecycle errors (STL-182): preparing a name that already
+// exists, and naming a prepared statement / portal that does not.
+const SQLSTATE_DUPLICATE_PSTATEMENT: &str = "42P05";
+const SQLSTATE_INVALID_PSTATEMENT_NAME: &str = "26000";
+const SQLSTATE_INVALID_CURSOR_NAME: &str = "34000";
 
 // Text format code for `RowDescription` fields (binary is 1; a v0.2 concern).
 // The per-type OID and `typlen` advertised per field now come from the value's
@@ -442,17 +481,55 @@ async fn handle_connection(
     let mut txn = ConnTxn::Idle;
 
     // --- 3. Message loop --------------------------------------------------
+    // The extended-query caches (prepared statements + portals) and the
+    // "skip until Sync" error latch live for the whole connection.
+    let mut state = ConnState::default();
     loop {
         let Some(msg) = read_typed_message(&mut stream).await? else {
             debug!("peer closed connection");
             return Ok(());
         };
+
+        // After an error inside an extended-query batch, Postgres discards every
+        // message until the next Sync, which re-opens the connection with a fresh
+        // ReadyForQuery. Terminate still ends the connection immediately.
+        if state.skip_until_sync && msg.kind != MSG_SYNC && msg.kind != MSG_TERMINATE {
+            debug!(message_type = %char::from(msg.kind), "skipping until Sync");
+            continue;
+        }
+
         match msg.kind {
             MSG_TERMINATE => {
                 debug!("received Terminate");
                 return Ok(());
             }
+            MSG_SYNC => {
+                // Sync closes an extended-query batch: clear the error latch and
+                // report ready, carrying the current transaction-status byte
+                // (STL-174). A bare Sync outside any batch is a harmless no-op that
+                // still owes a ReadyForQuery.
+                state.skip_until_sync = false;
+                write_ready_for_query(&mut stream, txn.status_byte()).await?;
+            }
+            MSG_PARSE => handle_parse(&mut stream, &mut state, &msg.payload).await?,
+            MSG_BIND => handle_bind(&mut stream, &mut state, &msg.payload).await?,
+            MSG_DESCRIBE => {
+                handle_describe(&mut stream, &mut state, &msg.payload, &session, &mut txn).await?;
+            }
+            MSG_EXECUTE => {
+                handle_execute(&mut stream, &mut state, &msg.payload, &session, &mut txn).await?;
+            }
+            MSG_CLOSE => handle_close(&mut stream, &mut state, &msg.payload).await?,
+            MSG_FLUSH => {
+                // We write replies straight to the socket with no backend buffer,
+                // so Flush only needs to push them past the OS send buffer.
+                stream.flush().await?;
+            }
             MSG_QUERY => {
+                // A simple Query runs outside the extended protocol and destroys
+                // the unnamed prepared statement and portal (Postgres §53.2.3).
+                state.prepared.remove("");
+                state.portals.remove("");
                 // A Query payload MUST be a NUL-terminated cstring. If the
                 // terminator is missing, surface that as a protocol violation
                 // rather than silently treating it as an empty query — masking
@@ -479,18 +556,13 @@ async fn handle_connection(
                 write_ready_for_query(&mut stream, txn.status_byte()).await?;
             }
             other => {
-                // Sync ('S'), Flush ('H'), and friends arrive once Extended Query
-                // lands (v0.2). Until then, anything unexpected is a protocol
-                // violation we surface politely rather than disconnecting silently.
-                warn!(message_type = %char::from(other), "unsupported message type in v0.1");
-                write_error_response(
-                    &mut stream,
-                    "ERROR",
-                    SQLSTATE_FEATURE_NOT_SUPPORTED,
-                    "message type not implemented in v0.1",
-                )
-                .await?;
-                write_ready_for_query(&mut stream, txn.status_byte()).await?;
+                // Simple + extended query and the lifecycle messages are all
+                // handled above. What is left (`COPY` data/done, function call)
+                // is outside the current surface; an unknown type mid-stream is a
+                // framing hazard, so we fail the connection rather than guess at
+                // where the next message starts.
+                warn!(message_type = %char::from(other), "unsupported message type");
+                return Err(WireError::Protocol("unsupported message type"));
             }
         }
     }
@@ -554,6 +626,7 @@ impl CommandTag {
 /// The type is carried rather than the OID so a column always renders its value
 /// ([`text_format::encode_text`]) and describes itself ([`LogicalType::pg_oid`],
 /// [`text_format::pg_typlen`]) from one source of truth.
+#[derive(Clone)]
 struct ResultColumn {
     name: String,
     ty: LogicalType,
@@ -1158,6 +1231,459 @@ fn integer_literal(expr: &Expr) -> Option<i64> {
 }
 
 // ---------------------------------------------------------------------------
+// Extended-query state machine (STL-182)
+// ---------------------------------------------------------------------------
+
+/// A parsed-but-unbound prepared statement in the per-connection cache.
+struct Prepared {
+    /// The single parsed statement, or `None` for an empty query string —
+    /// Postgres lets you prepare an empty statement; its Execute later replies
+    /// `EmptyQueryResponse`.
+    stmt: Option<Statement>,
+    /// Declared parameter type OIDs in `$1 … $n` order (`0` = unspecified).
+    param_oids: Vec<u32>,
+}
+
+/// A bound portal: a prepared statement with its parameters substituted, plus
+/// the lazily-cached result of running it.
+struct PortalEntry {
+    /// The bound statement, or `None` for an empty-query portal.
+    stmt: Option<Statement>,
+    /// Populated on the first Describe / Execute. Caching means a Describe that
+    /// runs the read and a later Execute that drains it agree on one result, and
+    /// a row-capped Execute can resume from where the previous one stopped.
+    executed: Option<Executed>,
+}
+
+/// The outcome of running a portal's statement, cached for streaming.
+enum Executed {
+    /// A row-returning statement: the `RowDescription` header, every decoded
+    /// row, and how many have been streamed so far (for resumable Execute).
+    Rows {
+        header: Vec<ResultColumn>,
+        rows: Vec<Vec<ResultColumn>>,
+        sent: usize,
+    },
+    /// A statement that completes with only a `CommandComplete` tag (DML / DDL).
+    Completed { tag: String },
+}
+
+/// Per-connection extended-query state: the prepared-statement and portal caches
+/// plus the "discard until Sync" error latch.
+#[derive(Default)]
+struct ConnState {
+    prepared: HashMap<String, Prepared>,
+    portals: HashMap<String, PortalEntry>,
+    /// Set when an extended-query message errors; the loop then drops every
+    /// message until the next Sync, per the Postgres protocol.
+    skip_until_sync: bool,
+}
+
+/// A failed execution, carried with the Postgres SQLSTATE to report.
+struct ExecError {
+    sqlstate: &'static str,
+    message: String,
+}
+
+/// Whether a statement produces a result-set (and therefore a `RowDescription`)
+/// rather than just a `CommandComplete` — the `pg_catalog` shim, a constant
+/// `SELECT`, and any `Query` return rows; DDL and DML do not.
+fn returns_rows(stmt: &Statement) -> bool {
+    pg_catalog::classify(stmt).is_some()
+        || constant_select(stmt).is_some()
+        || matches!(stmt.body, SqlStatement::Query(_))
+}
+
+/// Parse a prepared-statement query string into its single [`Statement`], or
+/// `None` for an empty / comment-only string. An error string is returned for a
+/// parse failure or a multi-statement string (a prepared statement holds exactly
+/// one command).
+fn parse_single(query: &str) -> Result<Option<Statement>, String> {
+    if query.trim().is_empty() {
+        return Ok(None);
+    }
+    match stele_sql::parse(query) {
+        Ok(mut stmts) => match stmts.len() {
+            0 => Ok(None),
+            1 => Ok(Some(stmts.remove(0))),
+            _ => Err("cannot insert multiple commands into a prepared statement".to_owned()),
+        },
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Run a portal's statement once and cache the outcome, mirroring the
+/// simple-query dispatch (`pg_catalog` → DDL → constant `SELECT` → engine). A
+/// row-returning read is side-effect-free, so running it at Describe time and
+/// reusing it at Execute is safe.
+///
+/// `txn` is threaded into [`run_query`] so an extended-query `INSERT`/`UPDATE`/
+/// `DELETE` buffers into an open `BEGIN` block exactly like a simple-query one
+/// (STL-174); a `SELECT` runs immediately against committed state regardless.
+fn execute_stmt(
+    session: &SharedSession,
+    stmt: &Statement,
+    txn: &mut ConnTxn,
+) -> Result<Executed, ExecError> {
+    if let Some(intro) = pg_catalog::classify(stmt) {
+        let (header, rows) = introspection_reply(&intro, session);
+        return Ok(Executed::Rows {
+            header,
+            rows,
+            sent: 0,
+        });
+    }
+    match bind_ddl(stmt) {
+        Ok(_) => {
+            let tag = run_ddl(session, stmt).map_err(|e| ExecError {
+                sqlstate: sqlstate_for(&e),
+                message: e.to_string(),
+            })?;
+            Ok(Executed::Completed {
+                tag: tag.to_owned(),
+            })
+        }
+        Err(BindError::NotDdl) => {
+            if let Some(columns) = constant_select(stmt) {
+                let header = columns.iter().map(|c| field(&c.name, c.ty)).collect();
+                return Ok(Executed::Rows {
+                    header,
+                    rows: vec![columns],
+                    sent: 0,
+                });
+            }
+            match run_query(session, stmt, txn) {
+                Ok(StatementOutcome::Rows(result)) => {
+                    let rows = decode_result_rows(&result).map_err(|e| ExecError {
+                        sqlstate: SQLSTATE_INTERNAL_ERROR,
+                        message: e.to_string(),
+                    })?;
+                    Ok(Executed::Rows {
+                        header: result_header(&result),
+                        rows,
+                        sent: 0,
+                    })
+                }
+                Ok(StatementOutcome::Dml(summary)) => Ok(Executed::Completed {
+                    tag: command_tag_for(summary).render(),
+                }),
+                Ok(StatementOutcome::Ddl { tag }) => Ok(Executed::Completed {
+                    tag: tag.to_owned(),
+                }),
+                Err(e) => Err(ExecError {
+                    sqlstate: sqlstate_for_query(&e),
+                    message: e.to_string(),
+                }),
+            }
+        }
+        Err(e) => Err(ExecError {
+            sqlstate: SQLSTATE_SYNTAX_ERROR,
+            message: e.to_string(),
+        }),
+    }
+}
+
+/// Ensure a portal's statement has been run, caching the outcome on the portal.
+/// A no-op if it ran already (Describe then Execute share the one result).
+fn ensure_executed(
+    state: &mut ConnState,
+    portal: &str,
+    session: &SharedSession,
+    stmt: &Statement,
+    txn: &mut ConnTxn,
+) -> Result<(), ExecError> {
+    if state
+        .portals
+        .get(portal)
+        .is_some_and(|p| p.executed.is_some())
+    {
+        return Ok(());
+    }
+    let executed = execute_stmt(session, stmt, txn)?;
+    if let Some(entry) = state.portals.get_mut(portal) {
+        entry.executed = Some(executed);
+    }
+    Ok(())
+}
+
+/// Write an `ErrorResponse` and latch the connection into skip-until-Sync — the
+/// extended-query failure path (no trailing `ReadyForQuery`; the client's Sync
+/// re-opens the batch).
+async fn fail_extended(
+    stream: &mut TcpStream,
+    state: &mut ConnState,
+    sqlstate: &str,
+    message: &str,
+) -> Result<(), WireError> {
+    write_error_response(stream, "ERROR", sqlstate, message).await?;
+    state.skip_until_sync = true;
+    Ok(())
+}
+
+/// `Parse` ('P'): parse the query, store it under its name, reply `ParseComplete`.
+async fn handle_parse(
+    stream: &mut TcpStream,
+    state: &mut ConnState,
+    payload: &[u8],
+) -> Result<(), WireError> {
+    let Some(msg) = extended::parse_parse(payload) else {
+        return Err(WireError::Protocol("malformed Parse message"));
+    };
+    // Re-preparing a *named* statement without closing it first is an error;
+    // the unnamed statement ("") is silently replaced.
+    if !msg.name.is_empty() && state.prepared.contains_key(&msg.name) {
+        let m = format!("prepared statement \"{}\" already exists", msg.name);
+        return fail_extended(stream, state, SQLSTATE_DUPLICATE_PSTATEMENT, &m).await;
+    }
+    let stmt = match parse_single(&msg.query) {
+        Ok(stmt) => stmt,
+        Err(e) => return fail_extended(stream, state, SQLSTATE_SYNTAX_ERROR, &e).await,
+    };
+    state.prepared.insert(
+        msg.name,
+        Prepared {
+            stmt,
+            param_oids: msg.param_oids,
+        },
+    );
+    write_parse_complete(stream).await?;
+    Ok(())
+}
+
+/// `Bind` ('B'): substitute the parameters into the named statement, creating a
+/// portal, reply `BindComplete`. Binary parameter / result formats are refused
+/// (text-only until the binary encoders land in \[G23\]).
+async fn handle_bind(
+    stream: &mut TcpStream,
+    state: &mut ConnState,
+    payload: &[u8],
+) -> Result<(), WireError> {
+    let Some(msg) = extended::parse_bind(payload) else {
+        return Err(WireError::Protocol("malformed Bind message"));
+    };
+    // Clone the statement + OIDs so the prepared-cache borrow is released before
+    // we mutate the portal cache.
+    let Some(prepared) = state.prepared.get(&msg.statement) else {
+        let m = format!("prepared statement \"{}\" does not exist", msg.statement);
+        return fail_extended(stream, state, SQLSTATE_INVALID_PSTATEMENT_NAME, &m).await;
+    };
+    let (pstmt, param_oids) = (prepared.stmt.clone(), prepared.param_oids.clone());
+    if msg.param_formats.iter().any(|&f| f != FORMAT_TEXT) {
+        let m = "binary-format parameters are not yet supported";
+        return fail_extended(stream, state, SQLSTATE_FEATURE_NOT_SUPPORTED, m).await;
+    }
+    if msg.result_formats.iter().any(|&f| f != FORMAT_TEXT) {
+        let m = "binary-format results are not yet supported";
+        return fail_extended(stream, state, SQLSTATE_FEATURE_NOT_SUPPORTED, m).await;
+    }
+
+    let mut values = Vec::with_capacity(msg.params.len());
+    for (i, raw) in msg.params.iter().enumerate() {
+        let oid = param_oids.get(i).copied().unwrap_or(0);
+        match extended::param_to_value(oid, raw.as_deref()) {
+            Ok(value) => values.push(value),
+            Err(e) => {
+                return fail_extended(
+                    stream,
+                    state,
+                    SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                    &e.to_string(),
+                )
+                .await;
+            }
+        }
+    }
+
+    let bound = match pstmt {
+        None => None,
+        Some(stmt) => match extended::substitute(&stmt, &values) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                return fail_extended(stream, state, SQLSTATE_PROTOCOL_VIOLATION, &e.to_string())
+                    .await;
+            }
+        },
+    };
+    state.portals.insert(
+        msg.portal,
+        PortalEntry {
+            stmt: bound,
+            executed: None,
+        },
+    );
+    write_bind_complete(stream).await?;
+    Ok(())
+}
+
+/// `Describe` ('D'): report the shape of a prepared statement (its parameter
+/// types, then `NoData`) or a portal (its `RowDescription`, or `NoData` for a
+/// write / empty portal).
+async fn handle_describe(
+    stream: &mut TcpStream,
+    state: &mut ConnState,
+    payload: &[u8],
+    session: &SharedSession,
+    txn: &mut ConnTxn,
+) -> Result<(), WireError> {
+    let Some(target) = extended::parse_target(payload) else {
+        return Err(WireError::Protocol("malformed Describe message"));
+    };
+    match target {
+        extended::Target::Statement(name) => {
+            let Some(prepared) = state.prepared.get(&name) else {
+                let m = format!("prepared statement \"{name}\" does not exist");
+                return fail_extended(stream, state, SQLSTATE_INVALID_PSTATEMENT_NAME, &m).await;
+            };
+            let oids = prepared.param_oids.clone();
+            write_parameter_description(stream, &oids).await?;
+            // The row shape of an unbound statement needs its parameters resolved;
+            // we report NoData and surface the real RowDescription from a
+            // Describe-portal after Bind. (Statement-level row description is a
+            // follow-up — see STL-183 fan-out.)
+            write_no_data(stream).await?;
+            Ok(())
+        }
+        extended::Target::Portal(name) => {
+            handle_describe_portal(stream, state, &name, session, txn).await
+        }
+    }
+}
+
+/// The portal arm of [`handle_describe`]: run a row-returning portal (caching the
+/// result) and reply `RowDescription`; reply `NoData` for a write or empty portal.
+async fn handle_describe_portal(
+    stream: &mut TcpStream,
+    state: &mut ConnState,
+    name: &str,
+    session: &SharedSession,
+    txn: &mut ConnTxn,
+) -> Result<(), WireError> {
+    let Some(portal) = state.portals.get(name) else {
+        let m = format!("portal \"{name}\" does not exist");
+        return fail_extended(stream, state, SQLSTATE_INVALID_CURSOR_NAME, &m).await;
+    };
+    let Some(stmt) = portal.stmt.clone() else {
+        return write_no_data(stream).await.map_err(WireError::Io);
+    };
+    if !returns_rows(&stmt) {
+        return write_no_data(stream).await.map_err(WireError::Io);
+    }
+    if let Err(e) = ensure_executed(state, name, session, &stmt, txn) {
+        return fail_extended(stream, state, e.sqlstate, &e.message).await;
+    }
+    let header = match state.portals.get(name).and_then(|p| p.executed.as_ref()) {
+        Some(Executed::Rows { header, .. }) => header.clone(),
+        _ => Vec::new(),
+    };
+    write_row_description(stream, &header).await?;
+    Ok(())
+}
+
+/// `Execute` ('E'): run the portal (if not already), then stream up to `max_rows`
+/// `DataRow`s. Exhausting the portal ends with `CommandComplete`; stopping early
+/// at the row cap ends with `PortalSuspended`, leaving the rest for the next
+/// Execute.
+///
+/// Per the extended-query protocol, Execute does **not** emit a `RowDescription`
+/// — that is the reply to `Describe`. A client learns the result columns by
+/// issuing `Describe` on the statement or portal first (every mainstream driver
+/// does); re-sending the row description on Execute would be a duplicate the
+/// Describe-then-Execute flow does not expect.
+async fn handle_execute(
+    stream: &mut TcpStream,
+    state: &mut ConnState,
+    payload: &[u8],
+    session: &SharedSession,
+    txn: &mut ConnTxn,
+) -> Result<(), WireError> {
+    let Some(msg) = extended::parse_execute(payload) else {
+        return Err(WireError::Protocol("malformed Execute message"));
+    };
+    // Inside an aborted transaction block, every statement is refused until
+    // COMMIT/ROLLBACK ends it — same rule the simple-query path enforces (STL-174).
+    if matches!(txn, ConnTxn::Failed) {
+        return fail_extended(
+            stream,
+            state,
+            SQLSTATE_IN_FAILED_TRANSACTION,
+            "current transaction is aborted, commands ignored until end of transaction block",
+        )
+        .await;
+    }
+    let Some(portal) = state.portals.get(&msg.portal) else {
+        let m = format!("portal \"{}\" does not exist", msg.portal);
+        return fail_extended(stream, state, SQLSTATE_INVALID_CURSOR_NAME, &m).await;
+    };
+    let Some(stmt) = portal.stmt.clone() else {
+        // An empty-query portal replies EmptyQueryResponse, with no command tag.
+        return write_empty_query_response(stream)
+            .await
+            .map_err(WireError::Io);
+    };
+    if let Err(e) = ensure_executed(state, &msg.portal, session, &stmt, txn) {
+        return fail_extended(stream, state, e.sqlstate, &e.message).await;
+    }
+
+    let entry = state.portals.get_mut(&msg.portal).expect("portal present");
+    match entry.executed.as_mut().expect("executed cached") {
+        Executed::Rows { rows, sent, .. } => {
+            let remaining = rows.len() - *sent;
+            // `max_rows <= 0` means "every remaining row"; a positive cap is
+            // clamped to what is left.
+            let take = if msg.max_rows <= 0 {
+                remaining
+            } else {
+                usize::try_from(msg.max_rows)
+                    .unwrap_or(remaining)
+                    .min(remaining)
+            };
+            let start = *sent;
+            let end = start + take;
+            for row in &rows[start..end] {
+                write_data_row(stream, row).await?;
+            }
+            *sent = end;
+            if *sent < rows.len() {
+                write_portal_suspended(stream).await?;
+            } else {
+                let n = u64::try_from(take).unwrap_or(u64::MAX);
+                write_command_complete(stream, &CommandTag::Select(n)).await?;
+            }
+            Ok(())
+        }
+        Executed::Completed { tag } => {
+            write_command_complete_tag(stream, tag).await?;
+            Ok(())
+        }
+    }
+}
+
+/// `Close` ('C'): drop a prepared statement or portal (idempotent — closing an
+/// absent name is not an error), reply `CloseComplete`.
+async fn handle_close(
+    stream: &mut TcpStream,
+    state: &mut ConnState,
+    payload: &[u8],
+) -> Result<(), WireError> {
+    let Some(target) = extended::parse_target(payload) else {
+        return Err(WireError::Protocol("malformed Close message"));
+    };
+    match target {
+        // Closing a statement should also close portals derived from it; we do
+        // not track that linkage, so a named portal outlives its statement until
+        // its own Close (a documented follow-up).
+        extended::Target::Statement(name) => {
+            state.prepared.remove(&name);
+        }
+        extended::Target::Portal(name) => {
+            state.portals.remove(&name);
+        }
+    }
+    write_close_complete(stream).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Startup-phase parsing
 // ---------------------------------------------------------------------------
 
@@ -1467,6 +1993,58 @@ async fn write_command_complete_tag(stream: &mut TcpStream, tag: &str) -> io::Re
     payload.put_slice(tag.as_bytes());
     payload.put_u8(0);
     write_framed(stream, MSG_COMMAND_COMPLETE, &payload).await
+}
+
+/// A payload-less typed message: 1-byte kind + Int32 length `4`. The extended
+/// protocol's acknowledgements (`ParseComplete`, `BindComplete`, `CloseComplete`,
+/// `NoData`, `PortalSuspended`) are all this shape.
+async fn write_empty_framed(stream: &mut TcpStream, kind: u8) -> io::Result<()> {
+    let buf: [u8; 5] = [kind, 0, 0, 0, 4];
+    stream.write_all(&buf).await
+}
+
+/// `ParseComplete` ('1').
+async fn write_parse_complete(stream: &mut TcpStream) -> io::Result<()> {
+    write_empty_framed(stream, MSG_PARSE_COMPLETE).await
+}
+
+/// `BindComplete` ('2').
+async fn write_bind_complete(stream: &mut TcpStream) -> io::Result<()> {
+    write_empty_framed(stream, MSG_BIND_COMPLETE).await
+}
+
+/// `CloseComplete` ('3').
+async fn write_close_complete(stream: &mut TcpStream) -> io::Result<()> {
+    write_empty_framed(stream, MSG_CLOSE_COMPLETE).await
+}
+
+/// `NoData` ('n') — the reply to Describe on a statement / portal that returns
+/// no result columns.
+async fn write_no_data(stream: &mut TcpStream) -> io::Result<()> {
+    write_empty_framed(stream, MSG_NO_DATA).await
+}
+
+/// `PortalSuspended` ('s') — a row-capped Execute stopped with rows still to
+/// come; the next Execute on the same portal resumes.
+async fn write_portal_suspended(stream: &mut TcpStream) -> io::Result<()> {
+    write_empty_framed(stream, MSG_PORTAL_SUSPENDED).await
+}
+
+/// `ParameterDescription` ('t') — the parameter type OIDs of a prepared
+/// statement, in `$1 … $n` order (`0` = the server is left to infer the type).
+async fn write_parameter_description(
+    stream: &mut TcpStream,
+    oids: &[u32],
+) -> Result<(), WireError> {
+    let count =
+        i16::try_from(oids.len()).map_err(|_| WireError::Protocol("more than 32767 parameters"))?;
+    let mut payload = BytesMut::with_capacity(2 + oids.len() * 4);
+    payload.put_i16(count);
+    for &oid in oids {
+        payload.put_u32(oid);
+    }
+    write_framed(stream, MSG_PARAMETER_DESCRIPTION, &payload).await?;
+    Ok(())
 }
 
 /// Frame a payload as a typed message: 1-byte kind + Int32 length (inclusive of
@@ -2582,6 +3160,477 @@ mod tests {
         assert_eq!(select[1].0, MSG_DATA_ROW);
         assert_eq!(&select[1].1[6..], b"1");
         assert_eq!(command_tag(&select[2].1), "SELECT 1");
+        terminate(server, client).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Extended-query protocol (STL-182)
+    // -----------------------------------------------------------------------
+
+    // Well-known Postgres OIDs the tests declare for typed parameters.
+    const OID_INT4: u32 = 23;
+
+    /// Append a NUL-terminated cstring.
+    fn put_cstr(buf: &mut BytesMut, s: &str) {
+        buf.put_slice(s.as_bytes());
+        buf.put_u8(0);
+    }
+
+    /// Frame and send one extended-query message (`kind` + length + body).
+    async fn send_msg(client: &mut TcpStream, kind: u8, body: &[u8]) {
+        let mut m = BytesMut::with_capacity(5 + body.len());
+        m.put_u8(kind);
+        m.put_i32(i32::try_from(4 + body.len()).unwrap());
+        m.put_slice(body);
+        client.write_all(&m).await.unwrap();
+    }
+
+    /// `Parse`: name the statement, the SQL, and the parameter type OIDs.
+    async fn send_parse(client: &mut TcpStream, name: &str, query: &str, oids: &[u32]) {
+        let mut b = BytesMut::new();
+        put_cstr(&mut b, name);
+        put_cstr(&mut b, query);
+        b.put_i16(i16::try_from(oids.len()).unwrap());
+        for &o in oids {
+            b.put_u32(o);
+        }
+        send_msg(client, MSG_PARSE, &b).await;
+    }
+
+    /// `Bind`: all parameters + results in text format (zero format codes). A
+    /// `None` parameter is a SQL `NULL`.
+    async fn send_bind(client: &mut TcpStream, portal: &str, stmt: &str, params: &[Option<&str>]) {
+        let mut b = BytesMut::new();
+        put_cstr(&mut b, portal);
+        put_cstr(&mut b, stmt);
+        b.put_i16(0); // zero param format codes → all text
+        b.put_i16(i16::try_from(params.len()).unwrap());
+        for p in params {
+            match p {
+                None => b.put_i32(-1),
+                Some(s) => {
+                    b.put_i32(i32::try_from(s.len()).unwrap());
+                    b.put_slice(s.as_bytes());
+                }
+            }
+        }
+        b.put_i16(0); // zero result format codes → all text
+        send_msg(client, MSG_BIND, &b).await;
+    }
+
+    /// `Describe` a statement (`b'S'`) or portal (`b'P'`).
+    async fn send_describe(client: &mut TcpStream, target: u8, name: &str) {
+        let mut b = BytesMut::new();
+        b.put_u8(target);
+        put_cstr(&mut b, name);
+        send_msg(client, MSG_DESCRIBE, &b).await;
+    }
+
+    /// `Execute` a portal, capping the row count (`0` = no cap).
+    async fn send_execute(client: &mut TcpStream, portal: &str, max_rows: i32) {
+        let mut b = BytesMut::new();
+        put_cstr(&mut b, portal);
+        b.put_i32(max_rows);
+        send_msg(client, MSG_EXECUTE, &b).await;
+    }
+
+    /// `Close` a statement (`b'S'`) or portal (`b'P'`).
+    async fn send_close(client: &mut TcpStream, target: u8, name: &str) {
+        let mut b = BytesMut::new();
+        b.put_u8(target);
+        put_cstr(&mut b, name);
+        send_msg(client, MSG_CLOSE, &b).await;
+    }
+
+    /// `Sync`.
+    async fn send_sync(client: &mut TcpStream) {
+        send_msg(client, MSG_SYNC, &[]).await;
+    }
+
+    /// Read backend messages up to (not including) the next `ReadyForQuery` — the
+    /// whole reply to an extended batch closed by `Sync`.
+    async fn drain_to_ready(client: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
+        let mut msgs = Vec::new();
+        loop {
+            let (kind, payload) = read_message(client).await;
+            if kind == MSG_READY_FOR_QUERY {
+                break;
+            }
+            msgs.push((kind, payload));
+        }
+        msgs
+    }
+
+    /// The DoD, end-to-end: a parameterized `INSERT` Parses once and Executes
+    /// twice with different bound parameters, and the rows land. Proving "Parse
+    /// once, Bind/Execute many" — the heart of the extended protocol.
+    #[tokio::test]
+    async fn parameterized_insert_parses_once_executes_twice() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+
+        // Parse the statement a single time, then Bind + Execute the first row.
+        send_parse(
+            &mut client,
+            "ins",
+            "INSERT INTO account VALUES ($1, $2)",
+            &[OID_INT4, OID_INT4],
+        )
+        .await;
+        send_bind(&mut client, "", "ins", &[Some("1"), Some("100")]).await;
+        send_execute(&mut client, "", 0).await;
+        send_sync(&mut client).await;
+
+        let first = drain_to_ready(&mut client).await;
+        assert_eq!(first[0].0, MSG_PARSE_COMPLETE, "ParseComplete");
+        assert_eq!(first[1].0, MSG_BIND_COMPLETE, "BindComplete");
+        assert_eq!(first[2].0, MSG_COMMAND_COMPLETE);
+        assert_eq!(command_tag(&first[2].1), "INSERT 0 1");
+
+        // Re-Bind the *same* prepared statement — no second Parse — with new
+        // parameters and Execute again.
+        send_bind(&mut client, "", "ins", &[Some("2"), Some("200")]).await;
+        send_execute(&mut client, "", 0).await;
+        send_sync(&mut client).await;
+
+        let second = drain_to_ready(&mut client).await;
+        assert_eq!(
+            second.len(),
+            2,
+            "only BindComplete + CommandComplete: {second:?}"
+        );
+        assert_eq!(second[0].0, MSG_BIND_COMPLETE);
+        assert_eq!(command_tag(&second[1].1), "INSERT 0 1");
+
+        // Both rows are present.
+        let rows = run_simple(&mut client, "SELECT id, balance FROM account").await;
+        let mut got = data_row_text(&rows);
+        got.sort();
+        assert_eq!(got, vec![vec!["1", "100"], vec!["2", "200"]]);
+        terminate(server, client).await;
+    }
+
+    /// A parameterized `UPDATE`'s `SET` value and `WHERE` key both bind from
+    /// parameters, and the write commits.
+    #[tokio::test]
+    async fn parameterized_update_binds_set_and_where() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+        run_simple(&mut client, "INSERT INTO account VALUES (1, 100)").await;
+
+        send_parse(
+            &mut client,
+            "",
+            "UPDATE account SET balance = $1 WHERE id = $2",
+            &[OID_INT4, OID_INT4],
+        )
+        .await;
+        send_bind(&mut client, "", "", &[Some("250"), Some("1")]).await;
+        send_execute(&mut client, "", 0).await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        assert_eq!(command_tag(&msgs.last().unwrap().1), "UPDATE 1");
+
+        let rows = run_simple(&mut client, "SELECT id, balance FROM account").await;
+        assert_eq!(data_row_text(&rows), vec![vec!["1", "250"]]);
+        terminate(server, client).await;
+    }
+
+    /// Describe on a portal returns the result `RowDescription`; Execute then
+    /// streams the rows and a `CommandComplete`.
+    #[tokio::test]
+    async fn describe_portal_then_execute_streams_rows() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+        run_simple(&mut client, "INSERT INTO account VALUES (1, 100)").await;
+
+        send_parse(&mut client, "sel", "SELECT id, balance FROM account", &[]).await;
+        send_bind(&mut client, "", "sel", &[]).await;
+        send_describe(&mut client, b'P', "").await;
+        send_execute(&mut client, "", 0).await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        // ParseComplete, BindComplete, RowDescription, DataRow, CommandComplete.
+        assert_eq!(msgs[0].0, MSG_PARSE_COMPLETE);
+        assert_eq!(msgs[1].0, MSG_BIND_COMPLETE);
+        assert_eq!(msgs[2].0, MSG_ROW_DESCRIPTION);
+        assert_eq!(
+            parse_row_description_names(&msgs[2].1),
+            vec!["id", "balance"]
+        );
+        assert_eq!(msgs[3].0, MSG_DATA_ROW);
+        assert_eq!(
+            parse_data_row(&msgs[3].1),
+            vec![Some(b"1".to_vec()), Some(b"100".to_vec())]
+        );
+        assert_eq!(command_tag(&msgs[4].1), "SELECT 1");
+        terminate(server, client).await;
+    }
+
+    /// Describe on a *statement* reports its parameter types (`ParameterDescription`)
+    /// followed by `NoData` (statement-level row description is deferred).
+    #[tokio::test]
+    async fn describe_statement_reports_parameter_types() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+
+        send_parse(
+            &mut client,
+            "s",
+            "SELECT id FROM account WHERE id = $1",
+            &[OID_INT4],
+        )
+        .await;
+        send_describe(&mut client, b'S', "s").await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        assert_eq!(msgs[0].0, MSG_PARSE_COMPLETE);
+        assert_eq!(msgs[1].0, MSG_PARAMETER_DESCRIPTION);
+        // Int16 count == 1, then the single Int32 OID 23 (int4).
+        assert_eq!(i16::from_be_bytes(msgs[1].1[0..2].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_be_bytes(msgs[1].1[2..6].try_into().unwrap()),
+            OID_INT4
+        );
+        assert_eq!(msgs[2].0, MSG_NO_DATA);
+        terminate(server, client).await;
+    }
+
+    /// A row cap suspends the portal: the first Execute returns one row +
+    /// `PortalSuspended`, the next resumes and finishes with `CommandComplete`.
+    #[tokio::test]
+    async fn execute_row_cap_suspends_then_resumes_portal() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+        run_simple(&mut client, "INSERT INTO account VALUES (1, 100)").await;
+        run_simple(&mut client, "INSERT INTO account VALUES (2, 200)").await;
+
+        send_parse(&mut client, "", "SELECT id, balance FROM account", &[]).await;
+        send_bind(&mut client, "", "", &[]).await;
+        send_execute(&mut client, "", 1).await; // cap at one row
+        send_sync(&mut client).await;
+
+        let first = drain_to_ready(&mut client).await;
+        // ParseComplete, BindComplete, one DataRow, PortalSuspended.
+        assert_eq!(first[0].0, MSG_PARSE_COMPLETE);
+        assert_eq!(first[1].0, MSG_BIND_COMPLETE);
+        let rows = first.iter().filter(|(k, _)| *k == MSG_DATA_ROW).count();
+        assert_eq!(rows, 1, "only one row before the suspend: {first:?}");
+        assert_eq!(first.last().unwrap().0, MSG_PORTAL_SUSPENDED);
+
+        // Resume: the remaining row, then CommandComplete.
+        send_execute(&mut client, "", 0).await;
+        send_sync(&mut client).await;
+        let second = drain_to_ready(&mut client).await;
+        let rows = second.iter().filter(|(k, _)| *k == MSG_DATA_ROW).count();
+        assert_eq!(rows, 1, "the second row resumes: {second:?}");
+        assert_eq!(second.last().unwrap().0, MSG_COMMAND_COMPLETE);
+        assert_eq!(command_tag(&second.last().unwrap().1), "SELECT 1");
+        terminate(server, client).await;
+    }
+
+    /// Closing a portal destroys it: a later Execute of that portal is an
+    /// invalid-cursor error, and the connection recovers at the next Sync.
+    #[tokio::test]
+    async fn close_portal_then_execute_is_invalid_cursor() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+
+        send_parse(&mut client, "", "SELECT id, balance FROM account", &[]).await;
+        send_bind(&mut client, "p", "", &[]).await;
+        send_close(&mut client, b'P', "p").await;
+        send_execute(&mut client, "p", 0).await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        assert_eq!(msgs[0].0, MSG_PARSE_COMPLETE);
+        assert_eq!(msgs[1].0, MSG_BIND_COMPLETE);
+        assert_eq!(msgs[2].0, MSG_CLOSE_COMPLETE);
+        // The Execute of the closed portal errors with SQLSTATE 34000.
+        assert_eq!(msgs[3].0, MSG_ERROR_RESPONSE);
+        assert!(
+            msgs[3]
+                .1
+                .windows(5)
+                .any(|w| w == SQLSTATE_INVALID_CURSOR_NAME.as_bytes()),
+            "closed-portal Execute carries SQLSTATE 34000: {:?}",
+            msgs[3].1
+        );
+        terminate(server, client).await;
+    }
+
+    /// An extended-query error discards every following message until Sync: a
+    /// Bind to a missing statement errors, the Execute after it is swallowed, and
+    /// only Sync produces the recovering `ReadyForQuery`.
+    #[tokio::test]
+    async fn error_in_batch_skips_messages_until_sync() {
+        let (server, mut client) = connect_past_handshake().await;
+
+        // Bind references a prepared statement that was never Parsed.
+        send_bind(&mut client, "", "ghost", &[]).await;
+        // This Execute must be discarded (the portal was never created anyway).
+        send_execute(&mut client, "", 0).await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        // Exactly one reply before ReadyForQuery: the ErrorResponse. The Execute
+        // produced nothing.
+        assert_eq!(msgs.len(), 1, "only the error, Execute swallowed: {msgs:?}");
+        assert_eq!(msgs[0].0, MSG_ERROR_RESPONSE);
+        assert!(
+            msgs[0]
+                .1
+                .windows(5)
+                .any(|w| w == SQLSTATE_INVALID_PSTATEMENT_NAME.as_bytes()),
+            "Bind to a missing statement carries SQLSTATE 26000: {:?}",
+            msgs[0].1
+        );
+
+        // The connection is healthy again: a fresh extended round-trips.
+        send_parse(&mut client, "", "SELECT 1", &[]).await;
+        send_bind(&mut client, "", "", &[]).await;
+        send_execute(&mut client, "", 0).await;
+        send_sync(&mut client).await;
+        let ok = drain_to_ready(&mut client).await;
+        assert_eq!(ok[0].0, MSG_PARSE_COMPLETE);
+        assert_eq!(command_tag(&ok.last().unwrap().1), "SELECT 1");
+        terminate(server, client).await;
+    }
+
+    /// A NULL parameter (length `-1`) binds as SQL `NULL`: an `INSERT` of a NULL
+    /// payload round-trips back as the NULL cell over the wire.
+    #[tokio::test]
+    async fn null_parameter_binds_as_sql_null() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+
+        send_parse(
+            &mut client,
+            "",
+            "INSERT INTO account VALUES ($1, $2)",
+            &[OID_INT4, OID_INT4],
+        )
+        .await;
+        send_bind(&mut client, "", "", &[Some("1"), None]).await;
+        send_execute(&mut client, "", 0).await;
+        send_sync(&mut client).await;
+        let msgs = drain_to_ready(&mut client).await;
+        assert_eq!(command_tag(&msgs.last().unwrap().1), "INSERT 0 1");
+
+        let rows = run_simple(&mut client, "SELECT id, balance FROM account").await;
+        let data = rows
+            .iter()
+            .find(|(k, _)| *k == MSG_DATA_ROW)
+            .map(|(_, p)| parse_data_row(p))
+            .expect("one data row");
+        assert_eq!(
+            data,
+            vec![Some(b"1".to_vec()), None],
+            "balance bound to NULL"
+        );
+        terminate(server, client).await;
+    }
+
+    /// `Flush` is answered (it forces buffered output out) and does not disturb
+    /// the in-flight extended batch.
+    #[tokio::test]
+    async fn flush_does_not_break_the_batch() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+
+        send_parse(&mut client, "", "SELECT 1", &[]).await;
+        send_msg(&mut client, MSG_FLUSH, &[]).await;
+        // ParseComplete is available immediately after the Flush.
+        let (kind, _) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_PARSE_COMPLETE);
+
+        send_bind(&mut client, "", "", &[]).await;
+        send_execute(&mut client, "", 0).await;
+        send_sync(&mut client).await;
+        let msgs = drain_to_ready(&mut client).await;
+        assert_eq!(command_tag(&msgs.last().unwrap().1), "SELECT 1");
+        terminate(server, client).await;
+    }
+
+    /// Read backend messages up to AND including the next `ReadyForQuery`,
+    /// returning its transaction-status byte (`I`/`T`/`E`).
+    async fn drain_capturing_status(client: &mut TcpStream) -> u8 {
+        loop {
+            let (kind, payload) = read_message(client).await;
+            if kind == MSG_READY_FOR_QUERY {
+                return payload[0];
+            }
+        }
+    }
+
+    /// An extended-query `INSERT` issued inside a simple-query `BEGIN` block
+    /// buffers into the transaction (STL-174 integration): `Sync` reports `T`
+    /// mid-block, `COMMIT` applies the write, and `ROLLBACK` discards it.
+    #[tokio::test]
+    async fn extended_dml_participates_in_a_begin_block() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+
+        // Open a block, then INSERT through the extended path.
+        run_simple(&mut client, "BEGIN").await;
+        send_parse(
+            &mut client,
+            "",
+            "INSERT INTO account VALUES ($1, $2)",
+            &[OID_INT4, OID_INT4],
+        )
+        .await;
+        send_bind(&mut client, "", "", &[Some("1"), Some("100")]).await;
+        send_execute(&mut client, "", 0).await;
+        send_sync(&mut client).await;
+        // The buffered INSERT still tags its would-be count, and the status byte
+        // shows we are inside a transaction (`T`).
+        let status = drain_capturing_status(&mut client).await;
+        assert_eq!(status, b'T', "Sync inside BEGIN reports in-transaction");
+
+        // Not yet visible (still buffered).
+        let mid = run_simple(&mut client, "SELECT id, balance FROM account").await;
+        assert!(
+            data_row_text(&mid).is_empty(),
+            "write buffered until COMMIT"
+        );
+
+        // COMMIT applies it.
+        run_simple(&mut client, "COMMIT").await;
+        let after = run_simple(&mut client, "SELECT id, balance FROM account").await;
+        assert_eq!(data_row_text(&after), vec![vec!["1", "100"]]);
+        terminate(server, client).await;
+    }
+
+    /// The rollback half: an extended `INSERT` buffered in a `BEGIN` block is
+    /// discarded by `ROLLBACK`.
+    #[tokio::test]
+    async fn extended_dml_rolled_back_in_a_begin_block_is_discarded() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+
+        run_simple(&mut client, "BEGIN").await;
+        send_parse(
+            &mut client,
+            "",
+            "INSERT INTO account VALUES ($1, $2)",
+            &[OID_INT4, OID_INT4],
+        )
+        .await;
+        send_bind(&mut client, "", "", &[Some("9"), Some("900")]).await;
+        send_execute(&mut client, "", 0).await;
+        send_sync(&mut client).await;
+        drain_to_ready(&mut client).await;
+
+        run_simple(&mut client, "ROLLBACK").await;
+        let after = run_simple(&mut client, "SELECT id, balance FROM account").await;
+        assert!(
+            data_row_text(&after).is_empty(),
+            "ROLLBACK discarded the write"
+        );
         terminate(server, client).await;
     }
 }
