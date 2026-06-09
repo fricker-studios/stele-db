@@ -32,8 +32,9 @@ pub(crate) enum FoldError {
         /// The literal text that could not be represented.
         literal: String,
     },
-    /// The column's type has no literal codec at v0.2 (`TIMESTAMP` / `DATE` —
-    /// no civil-time literal parsing yet; mirrors the `AS OF` stance).
+    /// The column's type has no literal codec (the zone-less `TIMESTAMP` / `DATE`
+    /// — no civil-time literal parsing yet; mirrors the `AS OF` stance).
+    /// `TIMESTAMPTZ` does have one ([`stele_common::datetime`]).
     UnsupportedType(LogicalType),
 }
 
@@ -77,10 +78,21 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
                 found: describe(expr),
             }),
         },
-        // No civil-time or period literal codec at v0.2 (mirrors AS OF); a
-        // TIMESTAMP/DATE/PERIOD column cannot be written or compared against a
-        // literal yet. (Period predicates build their intervals from PERIOD(a,b)
-        // endpoints, not from a folded period scalar — see stele-exec.)
+        // A `timestamptz` literal carries a zone offset that is normalized to the
+        // engine's UTC microsecond scale ([`stele_common::datetime`], STL-189).
+        LogicalType::TimestampTz => match literal(expr) {
+            Some(Value::SingleQuotedString(s)) => stele_common::datetime::parse_timestamptz(s)
+                .map(ScalarValue::TimestampTz)
+                .map_err(|_| FoldError::BadLiteral { literal: s.clone() }),
+            _ => Err(FoldError::TypeMismatch {
+                found: describe(expr),
+            }),
+        },
+        // No literal codec for the zone-less `TIMESTAMP`/`DATE` or `PERIOD` types
+        // yet (mirrors AS OF); such a column cannot be written or compared against
+        // a literal. `timestamptz` above is the one civil-time type with a codec.
+        // (Period predicates build their intervals from PERIOD(a,b) endpoints, not
+        // from a folded period scalar — see stele-exec.)
         ty @ (LogicalType::Timestamp | LogicalType::Date | LogicalType::Period) => {
             Err(FoldError::UnsupportedType(ty))
         }

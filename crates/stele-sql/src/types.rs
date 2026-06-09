@@ -9,10 +9,10 @@
 //! set of spellings the SQL surface accepts lives next to the parser that
 //! produces them, upstream of the catalog (STL-98).
 //!
-//! v0.1 vocabulary: `INT`/`INTEGER` → `Int4`, `BIGINT` → `Int8`, `TEXT` →
-//! `Text`, `BOOL`/`BOOLEAN` → `Bool`, `TIMESTAMP` (no time zone) → `Timestamp`,
-//! `DATE` → `Date`. Anything else — including `VARCHAR`, `CHAR`, and
-//! `TIMESTAMP WITH TIME ZONE` — is rejected as
+//! Vocabulary: `INT`/`INTEGER` → `Int4`, `BIGINT` → `Int8`, `TEXT` → `Text`,
+//! `BOOL`/`BOOLEAN` → `Bool`, `TIMESTAMP` (no time zone) → `Timestamp`,
+//! `TIMESTAMP WITH TIME ZONE` / `TIMESTAMPTZ` → `TimestampTz`, `DATE` → `Date`.
+//! Anything else — `VARCHAR`, `CHAR`, … — is rejected as
 //! [`ParseError::UnsupportedType`]; those are deliberate later additions, not
 //! silent re-labellings (see [`LogicalType::Timestamp`]).
 
@@ -43,9 +43,14 @@ pub fn logical_type(data_type: &DataType) -> Result<LogicalType, ParseError> {
         DataType::BigInt(_) | DataType::Int8(_) => Ok(LogicalType::Int8),
         DataType::Text => Ok(LogicalType::Text),
         DataType::Bool | DataType::Boolean => Ok(LogicalType::Bool),
-        // Bare `TIMESTAMP` only — `timestamptz` (OID 1184) is a later addition.
+        // Bare `TIMESTAMP` (no zone) stores a UTC instant with no offset on the
+        // wire; `TIMESTAMP WITH TIME ZONE` / `TIMESTAMPTZ` normalizes the offset to
+        // UTC and renders one back ([`LogicalType::TimestampTz`], STL-189).
         DataType::Timestamp(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
             Ok(LogicalType::Timestamp)
+        }
+        DataType::Timestamp(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => {
+            Ok(LogicalType::TimestampTz)
         }
         DataType::Date => Ok(LogicalType::Date),
         other => Err(ParseError::UnsupportedType(other.to_string())),

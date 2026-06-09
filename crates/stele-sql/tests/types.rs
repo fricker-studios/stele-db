@@ -19,6 +19,8 @@ fn v0_1_vocabulary_lowers() {
         ("BOOLEAN", LogicalType::Bool),
         ("TIMESTAMP", LogicalType::Timestamp),
         ("TIMESTAMP WITHOUT TIME ZONE", LogicalType::Timestamp),
+        ("TIMESTAMP WITH TIME ZONE", LogicalType::TimestampTz),
+        ("TIMESTAMPTZ", LogicalType::TimestampTz),
         ("DATE", LogicalType::Date),
     ];
     for (sql_ty, expected) in cases {
@@ -33,7 +35,7 @@ fn v0_1_vocabulary_lowers() {
 
 #[test]
 fn out_of_vocabulary_types_are_rejected() {
-    for sql_ty in ["VARCHAR(10)", "CHAR(3)", "REAL", "TIMESTAMP WITH TIME ZONE"] {
+    for sql_ty in ["VARCHAR(10)", "CHAR(3)", "REAL"] {
         let dt = column_type(sql_ty);
         assert!(
             matches!(logical_type(&dt), Err(ParseError::UnsupportedType(_))),

@@ -25,6 +25,7 @@
 //! | `int4` / `int8`         | [`Value::Number`]                |
 //! | `text`                  | [`Value::SingleQuotedString`]    |
 //! | `bool`                  | [`Value::Boolean`]               |
+//! | `timestamptz`           | string (binder parses the zone offset to UTC) |
 //! | `timestamp` / `date`    | string (binder rejects — no DML codec yet) |
 //! | unspecified (`0`) / other | inferred: integer → number, else string |
 //!
@@ -249,11 +250,18 @@ pub(crate) fn param_to_value(oid: u32, bytes: Option<&[u8]>) -> Result<Value, Pa
             Value::Boolean(parse_bool(text).ok_or_else(|| ParamError::BadBool(text.to_owned()))?)
         }
         Some(LogicalType::Text) => Value::SingleQuotedString(text.to_owned()),
-        // No civil-time or period literal codec yet (mirrors AS OF / DML):
-        // substitute as a string so the binder surfaces its documented
-        // "unsupported" error rather than this layer guessing a calendar/range
-        // encoding. (Binary-format PERIOD params ride in with STL-183.)
-        Some(LogicalType::Timestamp | LogicalType::Date | LogicalType::Period) => {
+        // `timestamptz` is substituted as a string and parsed by the binder's
+        // civil-time codec (zone offset → UTC). The zone-less `timestamp` / `date`
+        // and `period` have no DML codec yet, so they are also passed as a string
+        // and the binder surfaces its documented "unsupported" error — this layer
+        // never guesses a calendar/range encoding. (Binary-format params ride in
+        // with STL-183.)
+        Some(
+            LogicalType::TimestampTz
+            | LogicalType::Timestamp
+            | LogicalType::Date
+            | LogicalType::Period,
+        ) => {
             Value::SingleQuotedString(text.to_owned())
         }
         // Unspecified (OID 0) or a type outside the set: infer from the text. An

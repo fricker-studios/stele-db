@@ -15,10 +15,11 @@
 //! | type        | rendering                                            |
 //! |-------------|------------------------------------------------------|
 //! | `int4`/`int8` | decimal, e.g. `42`, `-1`                           |
-//! | `text`      | the bytes verbatim                                   |
-//! | `bool`      | `t` / `f`                                            |
-//! | `timestamp` | ISO-8601 `YYYY-MM-DD HH:MM:SS[.ffffff]` (UTC)        |
-//! | `date`      | ISO-8601 `YYYY-MM-DD`                                |
+//! | `text`        | the bytes verbatim                                 |
+//! | `bool`        | `t` / `f`                                          |
+//! | `timestamp`   | ISO-8601 `YYYY-MM-DD HH:MM:SS[.ffffff]` (UTC)      |
+//! | `timestamptz` | the same, with a `+00` UTC offset suffix           |
+//! | `date`        | ISO-8601 `YYYY-MM-DD`                              |
 //!
 //! Timestamps and dates are stored as raw offsets from the Unix epoch
 //! (microseconds and days respectively — see [`stele_common::types`]); the
@@ -47,7 +48,7 @@ const MICROS_PER_DAY: i64 = 86_400 * MICROS_PER_SEC;
 pub(crate) const fn pg_typlen(ty: LogicalType) -> i16 {
     match ty {
         LogicalType::Int4 | LogicalType::Date => 4,
-        LogicalType::Int8 | LogicalType::Timestamp => 8,
+        LogicalType::Int8 | LogicalType::Timestamp | LogicalType::TimestampTz => 8,
         LogicalType::Bool => 1,
         // `text` and `tsrange` are both variable-length (`typlen = -1`).
         LogicalType::Text | LogicalType::Period => -1,
@@ -65,6 +66,9 @@ pub(crate) fn encode_text(value: &ScalarValue) -> String {
         // `true` / `false`, in both text output and `\d`-style displays.
         ScalarValue::Bool(b) => if *b { "t" } else { "f" }.to_owned(),
         ScalarValue::Timestamp(micros) => format_timestamp(*micros),
+        // `timestamptz` shares the civil-time rendering but appends the UTC zone
+        // offset: the engine is UTC-internal, so the offset is always `+00`.
+        ScalarValue::TimestampTz(micros) => format_timestamptz(*micros),
         ScalarValue::Date(days) => format_date(*days),
         ScalarValue::Period(iv) => format_period(iv),
     }
@@ -158,6 +162,17 @@ fn format_timestamp(micros: i64) -> String {
     out
 }
 
+/// Render a `timestamptz` (microseconds since the Unix epoch, UTC) the same way
+/// as a `timestamp`, then append the zone offset. Stele stores every instant
+/// UTC-internal and carries no session time zone, so the offset is always `+00`
+/// — matching what Postgres prints for a `timestamptz` read back with `TimeZone`
+/// set to `UTC` (STL-189).
+fn format_timestamptz(micros: i64) -> String {
+    let mut out = format_timestamp(micros);
+    out.push_str("+00");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +184,7 @@ mod tests {
         assert_eq!(pg_typlen(LogicalType::Bool), 1);
         assert_eq!(pg_typlen(LogicalType::Date), 4);
         assert_eq!(pg_typlen(LogicalType::Timestamp), 8);
+        assert_eq!(pg_typlen(LogicalType::TimestampTz), 8);
         assert_eq!(pg_typlen(LogicalType::Text), -1, "text is variable-length");
         assert_eq!(
             pg_typlen(LogicalType::Period),
@@ -268,6 +284,25 @@ mod tests {
         assert_eq!(
             encode_text(&ScalarValue::Timestamp(base + 1)),
             "2023-11-14 22:13:20.000001"
+        );
+    }
+
+    #[test]
+    fn timestamptz_renders_with_a_utc_offset_suffix() {
+        // Same instant as the bare timestamp, plus the `+00` UTC offset Stele
+        // always emits (it is UTC-internal, with no session zone to localize to).
+        assert_eq!(
+            encode_text(&ScalarValue::TimestampTz(0)),
+            "1970-01-01 00:00:00+00"
+        );
+        assert_eq!(
+            encode_text(&ScalarValue::TimestampTz(1_700_000_000_000_000)),
+            "2023-11-14 22:13:20+00"
+        );
+        // Fractional seconds still trim, with the offset after them.
+        assert_eq!(
+            encode_text(&ScalarValue::TimestampTz(1_700_000_000_120_000)),
+            "2023-11-14 22:13:20.12+00"
         );
     }
 
