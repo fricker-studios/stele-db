@@ -249,10 +249,11 @@ pub(crate) fn param_to_value(oid: u32, bytes: Option<&[u8]>) -> Result<Value, Pa
             Value::Boolean(parse_bool(text).ok_or_else(|| ParamError::BadBool(text.to_owned()))?)
         }
         Some(LogicalType::Text) => Value::SingleQuotedString(text.to_owned()),
-        // No civil-time literal codec yet (mirrors AS OF / DML): substitute as a
-        // string so the binder surfaces its documented "unsupported" error rather
-        // than this layer guessing a calendar encoding.
-        Some(LogicalType::Timestamp | LogicalType::Date) => {
+        // No civil-time or period literal codec yet (mirrors AS OF / DML):
+        // substitute as a string so the binder surfaces its documented
+        // "unsupported" error rather than this layer guessing a calendar/range
+        // encoding. (Binary-format PERIOD params ride in with STL-183.)
+        Some(LogicalType::Timestamp | LogicalType::Date | LogicalType::Period) => {
             Value::SingleQuotedString(text.to_owned())
         }
         // Unspecified (OID 0) or a type outside the set: infer from the text. An
