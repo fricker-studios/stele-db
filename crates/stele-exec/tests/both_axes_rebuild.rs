@@ -614,8 +614,8 @@ fn run_seed(seed: u64) -> SeedRun {
 fn rebuilt_index_differential_matches_a_naive_reference() {
     let mut total_probes: u64 = 0;
     let mut total_flushes: usize = 0;
+    let mut total_retractions: usize = 0;
     let mut rows_seen: u64 = 0;
-    let mut saw_gap = false;
     // The differential must, at least once, diverge from the inclusive-`vto`
     // reference — otherwise the half-open valid boundary is never actually probed.
     let mut teeth = false;
@@ -623,6 +623,15 @@ fn rebuilt_index_differential_matches_a_naive_reference() {
     for seed in 0..SEEDS {
         let run = run_seed(seed);
         total_flushes += run.flushes;
+        // Count persisted tombstones: the rebuild oracle only proves something
+        // about deletes if the seeded workload actually deleted and the tombstone
+        // landed in the segment store (a vacuous "saw an empty probe" check would
+        // pass on the always-empty `s = START-1` / `v = -1` grid corners).
+        total_retractions += run
+            .segments
+            .iter()
+            .map(|seg| seg.read_retractions().expect("read retractions").len())
+            .sum::<usize>();
         // Everything is sealed; the delta is empty. Build the index from the
         // segment store alone — the property under test.
         let rebuilt = rebuild_from(&run.segments);
@@ -644,9 +653,6 @@ fn rebuilt_index_differential_matches_a_naive_reference() {
                 if got != run.model.cell(s, v, true) {
                     teeth = true;
                 }
-                if got.is_empty() {
-                    saw_gap = true;
-                }
                 rows_seen += got.len() as u64;
                 total_probes += 1;
             }
@@ -662,8 +668,9 @@ fn rebuilt_index_differential_matches_a_naive_reference() {
         "every probe was empty — the workload resolved nothing"
     );
     assert!(
-        saw_gap,
-        "no probe was ever ABSENT — deletion/valid gaps were never exercised"
+        total_retractions > 0,
+        "no seed persisted a retraction tombstone — DELETE-driven deletion gaps were never \
+         exercised, so the rebuild oracle proved nothing about deletes"
     );
     assert!(
         teeth,
