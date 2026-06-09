@@ -27,13 +27,18 @@ pub(crate) enum FoldError {
         found: &'static str,
     },
     /// The literal is the right shape for the type but cannot be represented
-    /// (out of range, or not an integer). Carries the offending literal text.
+    /// (out of range, not an integer, or a malformed civil-time literal). Carries
+    /// the offending literal text and, where the codec produced one, a short
+    /// reason (e.g. `"month out of range"`).
     BadLiteral {
         /// The literal text that could not be represented.
         literal: String,
+        /// A short, stable explanation from the type's codec, when it has one.
+        reason: Option<&'static str>,
     },
-    /// The column's type has no literal codec at v0.2 (`TIMESTAMP` / `DATE` —
-    /// no civil-time literal parsing yet; mirrors the `AS OF` stance).
+    /// The column's type has no literal codec (the zone-less `TIMESTAMP` / `DATE`
+    /// — no civil-time literal parsing yet; mirrors the `AS OF` stance).
+    /// `TIMESTAMPTZ` does have one ([`stele_common::datetime`]).
     UnsupportedType(LogicalType),
 }
 
@@ -54,7 +59,10 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
             digits
                 .parse::<i32>()
                 .map(ScalarValue::Int4)
-                .map_err(|_| FoldError::BadLiteral { literal: digits })
+                .map_err(|_| FoldError::BadLiteral {
+                    literal: digits,
+                    reason: None,
+                })
         }
         LogicalType::Int8 => {
             let digits = signed_number(expr).ok_or(FoldError::TypeMismatch {
@@ -63,7 +71,10 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
             digits
                 .parse::<i64>()
                 .map(ScalarValue::Int8)
-                .map_err(|_| FoldError::BadLiteral { literal: digits })
+                .map_err(|_| FoldError::BadLiteral {
+                    literal: digits,
+                    reason: None,
+                })
         }
         LogicalType::Text => match literal(expr) {
             Some(Value::SingleQuotedString(s)) => Ok(ScalarValue::Text(s.clone())),
@@ -85,7 +96,10 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
             })?;
             parse_uuid(s)
                 .map(ScalarValue::Uuid)
-                .ok_or_else(|| FoldError::BadLiteral { literal: s.clone() })
+                .ok_or_else(|| FoldError::BadLiteral {
+                    literal: s.clone(),
+                    reason: None,
+                })
         }
         LogicalType::Bytea => {
             let s = string_literal(expr).ok_or_else(|| FoldError::TypeMismatch {
@@ -93,12 +107,29 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
             })?;
             parse_bytea(s)
                 .map(ScalarValue::Bytea)
-                .ok_or_else(|| FoldError::BadLiteral { literal: s.clone() })
+                .ok_or_else(|| FoldError::BadLiteral {
+                    literal: s.clone(),
+                    reason: None,
+                })
         }
-        // No civil-time or period literal codec at v0.2 (mirrors AS OF); a
-        // TIMESTAMP/DATE/PERIOD column cannot be written or compared against a
-        // literal yet. (Period predicates build their intervals from PERIOD(a,b)
-        // endpoints, not from a folded period scalar — see stele-exec.)
+        // A `timestamptz` literal carries a zone offset that is normalized to the
+        // engine's UTC microsecond scale ([`stele_common::datetime`], STL-189).
+        LogicalType::TimestampTz => match literal(expr) {
+            Some(Value::SingleQuotedString(s)) => stele_common::datetime::parse_timestamptz(s)
+                .map(ScalarValue::TimestampTz)
+                .map_err(|e| FoldError::BadLiteral {
+                    literal: e.literal,
+                    reason: Some(e.reason),
+                }),
+            _ => Err(FoldError::TypeMismatch {
+                found: describe(expr),
+            }),
+        },
+        // No literal codec for the zone-less `TIMESTAMP`/`DATE` or `PERIOD` types
+        // yet (mirrors AS OF); such a column cannot be written or compared against
+        // a literal. `timestamptz` above is the one civil-time type with a codec.
+        // (Period predicates build their intervals from PERIOD(a,b) endpoints, not
+        // from a folded period scalar — see stele-exec.)
         ty @ (LogicalType::Timestamp | LogicalType::Date | LogicalType::Period) => {
             Err(FoldError::UnsupportedType(ty))
         }

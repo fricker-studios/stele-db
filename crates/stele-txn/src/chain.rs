@@ -20,6 +20,8 @@
 //! [ADR-0026]: ../../../docs/adr/0026-verifiable-audit-log.md
 
 use stele_common::hash::Digest;
+use stele_common::provenance::TxnId;
+use stele_common::time::SystemTimeMicros;
 use stele_storage::wal::WalError;
 
 use crate::commit_record::{CommitRecord, CommitRecordError};
@@ -33,6 +35,40 @@ pub struct ChainHead {
     pub head: Digest,
     /// The number of commit records verified.
     pub len: u64,
+}
+
+/// A verified chain plus the tail state a recovering
+/// [`TxnManager`](crate::TxnManager) needs to resume issuing commits without
+/// colliding with the durable history ([`TxnManager::recover`]).
+///
+/// Returned by [`verify_chain_recover`]: it is a [`ChainHead`] (the same
+/// fail-closed verification) augmented with the three monotonic facts the
+/// manager's in-memory cursor is rebuilt from. Every field is genesis-valued for
+/// an empty log, so recovering an empty log yields the same state a fresh
+/// [`TxnManager::new`](crate::TxnManager::new) starts at.
+///
+/// [`TxnManager::recover`]: crate::TxnManager::recover
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveredChain {
+    /// The verified head — the hash of the last record, [`Digest::ZERO`] for an
+    /// empty log. Becomes the recovered manager's `commit_head` (the next
+    /// commit's `prev_hash`).
+    pub head: Digest,
+    /// The number of commit records verified.
+    pub len: u64,
+    /// The greatest commit timestamp in the log — the last record's, since the
+    /// log is written in strictly increasing `commit_ts` order. The recovered
+    /// commit cursor; [`SystemTimeMicros(0)`](SystemTimeMicros) for an empty log.
+    pub commit_ts: SystemTimeMicros,
+    /// The greatest sequence number in the log — the last record's, since `seq`
+    /// is dense and monotonic over commits. The next commit takes `seq + 1`; `0`
+    /// for an empty log (so recovery resumes at `seq` 1).
+    pub seq: u64,
+    /// The greatest transaction id over the **whole** log — *not* necessarily the
+    /// last record's, because transaction ids are assigned at `begin` but appended
+    /// in commit order, so a later-begun transaction can commit earlier. The next
+    /// transaction takes `max_txn_id + 1`; [`TxnId(0)`](TxnId) for an empty log.
+    pub max_txn_id: TxnId,
 }
 
 /// Why a commit-log chain failed to verify.
@@ -111,8 +147,41 @@ pub fn verify_chain<I>(records: I) -> Result<ChainHead, ChainError>
 where
     I: IntoIterator<Item = Result<Vec<u8>, WalError>>,
 {
+    let recovered = verify_chain_recover(records)?;
+    Ok(ChainHead {
+        head: recovered.head,
+        len: recovered.len,
+    })
+}
+
+/// Verify a hash-chained commit log and recover its tail state.
+///
+/// Verifies exactly as [`verify_chain`] does, additionally recovering the tail
+/// state a [`TxnManager`](crate::TxnManager) needs to resume — the recovery entry
+/// point [`TxnManager::recover`] sits on.
+///
+/// The verification is identical to [`verify_chain`] (which delegates here): the
+/// same genesis walk, the same fail-closed errors, so a single tampered
+/// historical record is caught as a [`ChainError::BrokenLink`] before any state
+/// is rebuilt. The extra work is purely accumulation — the last record's
+/// `commit_ts`/`seq` and the greatest `txn_id` seen — so it costs nothing beyond
+/// the walk the log already requires.
+///
+/// [`TxnManager::recover`]: crate::TxnManager::recover
+///
+/// # Errors
+///
+/// Identical to [`verify_chain`]: [`ChainError::Replay`], [`ChainError::Decode`],
+/// or [`ChainError::BrokenLink`] at the first offending record.
+pub fn verify_chain_recover<I>(records: I) -> Result<RecoveredChain, ChainError>
+where
+    I: IntoIterator<Item = Result<Vec<u8>, WalError>>,
+{
     let mut prev = Digest::ZERO;
     let mut len = 0u64;
+    let mut commit_ts = SystemTimeMicros(0);
+    let mut seq = 0u64;
+    let mut max_txn_id = TxnId(0);
     for (index, item) in records.into_iter().enumerate() {
         let index = index as u64;
         let bytes = item.map_err(|source| ChainError::Replay { index, source })?;
@@ -127,8 +196,22 @@ where
         }
         prev = record.hash();
         len += 1;
+        // The log is in commit order, so the last record carries the greatest
+        // `commit_ts`/`seq`; `txn_id` is assigned at begin, not commit, so the
+        // greatest can sit anywhere — track it across every record.
+        commit_ts = record.commit_ts;
+        seq = record.seq;
+        if record.txn_id.0 > max_txn_id.0 {
+            max_txn_id = record.txn_id;
+        }
     }
-    Ok(ChainHead { head: prev, len })
+    Ok(RecoveredChain {
+        head: prev,
+        len,
+        commit_ts,
+        seq,
+        max_txn_id,
+    })
 }
 
 /// Verify a commit log and additionally check its head matches `expected_head` —

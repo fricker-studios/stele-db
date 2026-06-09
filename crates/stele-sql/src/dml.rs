@@ -264,9 +264,11 @@ pub enum DmlError {
     },
 
     /// A literal is the right shape for its column's type but cannot be
-    /// represented (out of range, or not an integer).
+    /// represented (out of range, not an integer, or a malformed civil-time
+    /// literal).
     #[error(
-        "literal {literal:?} is not a valid {ty} value for column {column:?} in table {table:?}"
+        "literal {literal:?} is not a valid {ty} value for column {column:?} in table {table:?}{}",
+        reason.map(|r| format!(" ({r})")).unwrap_or_default()
     )]
     BadLiteral {
         /// The table written.
@@ -277,6 +279,10 @@ pub enum DmlError {
         ty: LogicalType,
         /// The offending literal text.
         literal: String,
+        /// A short, stable reason from the type's codec, when it has one (e.g.
+        /// `"day out of range for month"` for a `timestamptz`); `None` for the
+        /// integer types, whose failure is self-evident from the literal.
+        reason: Option<&'static str>,
     },
 
     /// A `NULL` was bound to the **business key**. A key is the identity a
@@ -727,11 +733,12 @@ fn fold_err_to_dml(err: FoldError, table: &str, column: &ColumnDef) -> DmlError 
             expected: column.ty(),
             found: found.to_owned(),
         },
-        FoldError::BadLiteral { literal } => DmlError::BadLiteral {
+        FoldError::BadLiteral { literal, reason } => DmlError::BadLiteral {
             table: table.to_owned(),
             column: column.name().to_owned(),
             ty: column.ty(),
             literal,
+            reason,
         },
         FoldError::UnsupportedType(ty) => {
             DmlError::Unsupported(format!("a {ty} literal for column {:?}", column.name()))
@@ -976,6 +983,7 @@ mod tests {
                 column: "balance".to_owned(),
                 ty: LogicalType::Int4,
                 literal: "5000000000".to_owned(),
+                reason: None,
             })
         );
     }

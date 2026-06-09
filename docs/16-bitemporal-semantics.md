@@ -84,6 +84,10 @@ Stele **does not auto-coalesce on write** ([Part E default](../README.md)): adja
 
 Valid-time is often a **business date**, not an instant ("effective March 2024"). The spec defines: business dates resolve to half-open µs ranges in UTC at documented boundaries; DST gaps/overlaps, leap seconds, Feb 29, end-of-month, and fiscal calendars (e.g. 4-4-5) are handled at this resolution layer, not in the physical type ([ADR-0024](adr/0024-time-representation.md)). Cross-zone reporting stores UTC + originating zone.
 
+**`TIMESTAMPTZ` is stored UTC-internal** ([STL-189], [ADR-0024](adr/0024-time-representation.md)). A `timestamptz` literal's zone offset is normalized away to the engine's single µs/UTC scale on input — `2024-01-15 12:00:00+05` and `2024-01-15 02:00:00-05` store the *same* instant — and the value renders back with a `+00` offset (the engine carries no session time zone to localize into). Two literals naming one instant in different zones are therefore indistinguishable once stored, on both axes; the half-open boundary tests in [§2](#2-intervals) hold identically whether the instant arrived as a bare `timestamp` or a zoned `timestamptz`. Leap seconds (`:60`) are not representable — the physical type is leap-second-free UTC microseconds. Preserving an originating zone alongside the instant is the separate cross-zone-reporting concern above, not part of the scalar type.
+
+[STL-189]: https://allegromusic.atlassian.net/browse/STL-189
+
 ## 11. What the engine enforces vs. punts (stated honestly)
 
 | Concern | Engine | Notes |

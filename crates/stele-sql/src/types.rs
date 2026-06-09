@@ -11,12 +11,14 @@
 //!
 //! Vocabulary: `INT`/`INTEGER` → `Int4`, `BIGINT` → `Int8`, `TEXT` → `Text`,
 //! `BOOL`/`BOOLEAN` → `Bool`, `TIMESTAMP` (no time zone) → `Timestamp`,
+//! `TIMESTAMP WITH TIME ZONE` / `TIMESTAMPTZ` → `TimestampTz` ([STL-189]),
 //! `DATE` → `Date`, `UUID` → `Uuid`, `BYTEA` → `Bytea` ([STL-181]). Anything
-//! else — including `VARCHAR`, `CHAR`, and `TIMESTAMP WITH TIME ZONE` — is
-//! rejected as [`ParseError::UnsupportedType`]; those are deliberate later
-//! additions, not silent re-labellings (see [`LogicalType::Timestamp`]).
+//! else — `VARCHAR`, `CHAR`, … — is rejected as
+//! [`ParseError::UnsupportedType`]; those are deliberate later additions, not
+//! silent re-labellings (see [`LogicalType::Timestamp`]).
 //!
 //! [STL-181]: https://allegromusic.atlassian.net/browse/STL-181
+//! [STL-189]: https://allegromusic.atlassian.net/browse/STL-189
 
 use sqlparser::ast::{DataType, TimezoneInfo};
 use stele_common::types::LogicalType;
@@ -45,9 +47,14 @@ pub fn logical_type(data_type: &DataType) -> Result<LogicalType, ParseError> {
         DataType::BigInt(_) | DataType::Int8(_) => Ok(LogicalType::Int8),
         DataType::Text => Ok(LogicalType::Text),
         DataType::Bool | DataType::Boolean => Ok(LogicalType::Bool),
-        // Bare `TIMESTAMP` only — `timestamptz` (OID 1184) is a later addition.
+        // Bare `TIMESTAMP` (no zone) stores a UTC instant with no offset on the
+        // wire; `TIMESTAMP WITH TIME ZONE` / `TIMESTAMPTZ` normalizes the offset to
+        // UTC and renders one back ([`LogicalType::TimestampTz`], STL-189).
         DataType::Timestamp(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
             Ok(LogicalType::Timestamp)
+        }
+        DataType::Timestamp(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => {
+            Ok(LogicalType::TimestampTz)
         }
         DataType::Date => Ok(LogicalType::Date),
         DataType::Uuid => Ok(LogicalType::Uuid),

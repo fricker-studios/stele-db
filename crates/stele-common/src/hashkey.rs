@@ -48,9 +48,10 @@
 //! | TEXT | `0x04` | UTF-8 bytes, verbatim |
 //! | TIMESTAMP | `0x05` | 8-byte big-endian `i64` microseconds since the Unix epoch (UTC) |
 //! | DATE | `0x06` | 4-byte big-endian `i32` days since the Unix epoch |
-//! | PERIOD | `0x07` | 16 bytes: `from` then `to`, each an 8-byte big-endian `i64` (timestamp micros); an open-ended period carries `to = i64::MAX` |
-//! | UUID | `0x08` | the 16 raw UUID bytes, network order |
-//! | BYTEA | `0x09` | the raw bytes, verbatim |
+//! | TIMESTAMPTZ | `0x07` | 8-byte big-endian `i64` microseconds since the Unix epoch (UTC) |
+//! | PERIOD | `0x08` | 16 bytes: two big-endian `i64` µs bounds, `from` then `to` (open upper = `i64::MAX`) |
+//! | UUID | `0x09` | the 16 raw UUID bytes, network order |
+//! | BYTEA | `0x0A` | the raw bytes, verbatim |
 //!
 //! ### Why these choices
 //!
@@ -88,9 +89,10 @@ const TAG_INT8: u8 = 0x03;
 const TAG_TEXT: u8 = 0x04;
 const TAG_TIMESTAMP: u8 = 0x05;
 const TAG_DATE: u8 = 0x06;
-const TAG_PERIOD: u8 = 0x07;
-const TAG_UUID: u8 = 0x08;
-const TAG_BYTEA: u8 = 0x09;
+const TAG_TIMESTAMPTZ: u8 = 0x07;
+const TAG_PERIOD: u8 = 0x08;
+const TAG_UUID: u8 = 0x09;
+const TAG_BYTEA: u8 = 0x0A;
 
 /// Compute the v1 portable hash-key digest of `args`, in order.
 ///
@@ -144,9 +146,12 @@ fn encode_arg(arg: Option<&ScalarValue>, msg: &mut Vec<u8>) {
         Some(ScalarValue::Text(s)) => push_frame(msg, TAG_TEXT, s.as_bytes()),
         Some(ScalarValue::Timestamp(v)) => push_frame(msg, TAG_TIMESTAMP, &v.to_be_bytes()),
         Some(ScalarValue::Date(v)) => push_frame(msg, TAG_DATE, &v.to_be_bytes()),
+        // `timestamptz` is UTC-internal, so its body is the same big-endian µs
+        // instant as `timestamp`; the distinct tag keeps the two from aliasing.
+        Some(ScalarValue::TimestampTz(v)) => push_frame(msg, TAG_TIMESTAMPTZ, &v.to_be_bytes()),
+        // A `period` frames its half-open `[from, to)` bounds as two big-endian
+        // i64 µs values, lower then upper (an open upper bound is `i64::MAX`).
         Some(ScalarValue::Period(iv)) => {
-            // `from` then `to`, each big-endian — the portable convention. (This
-            // is independent of the little-endian storage form in `period`.)
             let mut body = [0u8; 16];
             body[..8].copy_from_slice(&iv.from.to_be_bytes());
             body[8..].copy_from_slice(&iv.to.to_be_bytes());
@@ -235,11 +240,16 @@ pub fn vectors() -> Vec<Vector> {
             hex: "61c9586983296ab2e403396f6ce20b01e2adc2514633fc63bb9d5a1e0ce85a20",
         },
         Vector {
-            label: "period [0, 1)",
+            label: "timestamptz 1700000000000000",
+            args: vec![Some(ScalarValue::TimestampTz(1_700_000_000_000_000))],
+            hex: "8720f97303210b1ae946845bfaad4a52d062189d52e098b5b4b3278708b2db31",
+        },
+        Vector {
+            label: "period [10, 20)",
             args: vec![Some(ScalarValue::Period(
-                crate::period::Interval::new(0, 1).expect("valid interval"),
+                crate::period::Interval::new(10, 20).expect("well-formed interval"),
             ))],
-            hex: "847ee2b94fa3f57ff6814f7938cf3a6c003a65970bf150964ab71c967860f8e4",
+            hex: "35ccfb9906f082824c65f8e0ef866f4439cb8e4217a9ff5d3890d95fdff0379c",
         },
         Vector {
             label: "uuid 550e8400-e29b-41d4-a716-446655440000",
@@ -247,17 +257,17 @@ pub fn vectors() -> Vec<Vector> {
                 0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
                 0x00, 0x00,
             ]))],
-            hex: "2496c47c1925593995f507777a874ee0db1cf3f1433e86c667fe1291629cd8aa",
+            hex: "8c149c5fb901c43282f7b67163b24a1f1de2bb3c72df46707a37b4bc4f0ae811",
         },
         Vector {
             label: "bytea \\xdeadbeef",
             args: vec![Some(ScalarValue::Bytea(vec![0xDE, 0xAD, 0xBE, 0xEF]))],
-            hex: "4aba35e1ea0c25f2e3aca2c3fc847462598f0f4f335f9f817045cbbf7eccf31c",
+            hex: "81ed9d4be87550352ed909232a1b669bde775b2ae106ae2d892dc475bd043fc5",
         },
         Vector {
             label: "empty bytea",
             args: vec![Some(ScalarValue::Bytea(vec![]))],
-            hex: "6964f673369779b4ed3617ca6b6b611f0c7b64dbe7037d956ae14f4fc7373cd0",
+            hex: "79649e69f651affd02e15ab04eaae96fb60f72387989148d4fee9769cc1fa278",
         },
     ]
 }

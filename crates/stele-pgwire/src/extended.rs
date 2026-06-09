@@ -25,6 +25,7 @@
 //! | `int4` / `int8`         | [`Value::Number`]                |
 //! | `text`                  | [`Value::SingleQuotedString`]    |
 //! | `bool`                  | [`Value::Boolean`]               |
+//! | `timestamptz`           | string (binder parses the zone offset to UTC) |
 //! | `timestamp` / `date`    | string (binder rejects — no DML codec yet) |
 //! | unspecified (`0`) / other | inferred: integer → number, else string |
 //!
@@ -248,17 +249,18 @@ pub(crate) fn param_to_value(oid: u32, bytes: Option<&[u8]>) -> Result<Value, Pa
         Some(LogicalType::Bool) => {
             Value::Boolean(parse_bool(text).ok_or_else(|| ParamError::BadBool(text.to_owned()))?)
         }
-        // Every text-bearing type is passed through as a single-quoted string
-        // literal for the binder to fold against the column type: `text` and the
-        // textual `uuid` / `bytea` forms (`550e…`, `\xDEAD…`, STL-181) fold to a
-        // value; `timestamp` / `date` / `period` have no civil-time or range
-        // literal codec yet (mirrors AS OF / DML) and surface the binder's
-        // documented "unsupported" error rather than this layer guessing a
+        // Every text-bearing type is substituted as a single-quoted string for the
+        // binder to fold against the column type. `text` is verbatim; the textual
+        // `uuid` / `bytea` forms (`550e…`, `\xDEAD…`, STL-181) and `timestamptz`
+        // (zone offset → UTC) fold to a value, while the zone-less `timestamp` /
+        // `date` / `period` have no DML codec yet and surface the binder's
+        // documented "unsupported" error. Either way this layer never guesses a
         // calendar/range encoding. (Binary-format params ride in with STL-183.)
         Some(
             LogicalType::Text
             | LogicalType::Uuid
             | LogicalType::Bytea
+            | LogicalType::TimestampTz
             | LogicalType::Timestamp
             | LogicalType::Date
             | LogicalType::Period,
