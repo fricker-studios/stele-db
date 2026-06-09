@@ -249,21 +249,19 @@ pub(crate) fn param_to_value(oid: u32, bytes: Option<&[u8]>) -> Result<Value, Pa
         Some(LogicalType::Bool) => {
             Value::Boolean(parse_bool(text).ok_or_else(|| ParamError::BadBool(text.to_owned()))?)
         }
-        Some(LogicalType::Text) => Value::SingleQuotedString(text.to_owned()),
-        // `timestamptz` is substituted as a string and parsed by the binder's
-        // civil-time codec (zone offset → UTC). The zone-less `timestamp` / `date`
-        // and `period` have no DML codec yet, so they are also passed as a string
-        // and the binder surfaces its documented "unsupported" error — this layer
-        // never guesses a calendar/range encoding. (Binary-format params ride in
-        // with STL-183.)
+        // `text` is the string verbatim. The civil-time and range types are also
+        // substituted as a string: `timestamptz` is then parsed by the binder's
+        // codec (zone offset → UTC), while the zone-less `timestamp` / `date` /
+        // `period` have no DML codec yet and surface the binder's documented
+        // "unsupported" error. Either way this layer never guesses a calendar/range
+        // encoding. (Binary-format params ride in with STL-183.)
         Some(
-            LogicalType::TimestampTz
+            LogicalType::Text
+            | LogicalType::TimestampTz
             | LogicalType::Timestamp
             | LogicalType::Date
             | LogicalType::Period,
-        ) => {
-            Value::SingleQuotedString(text.to_owned())
-        }
+        ) => Value::SingleQuotedString(text.to_owned()),
         // Unspecified (OID 0) or a type outside the set: infer from the text. An
         // integer-looking value folds to a numeric literal so `WHERE id = $1`
         // works without a declared type; everything else is a string. The binder
