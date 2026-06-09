@@ -27,9 +27,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use stele_common::provenance::{Principal, TxnId};
 use stele_common::time::{Clock, SystemTimeMicros};
 use stele_storage::backend::{Disk, DiskFile, MemDisk};
-use stele_storage::delta::{BusinessKey, Snapshot, Version};
+use stele_storage::delta::{BusinessKey, Snapshot};
 use stele_storage::engine::{Engine, EngineError};
-use stele_storage::segment::SegmentWriter;
 
 // --- harness ---------------------------------------------------------------
 
@@ -282,29 +281,33 @@ fn recover_rejects_corruption_inside_the_durable_prefix() {
     }
 }
 
-// --- 4. a corrupt sealed segment is refused --------------------------------
+// --- 4. a corrupt committed segment is refused -----------------------------
 
-/// A sealed segment whose bytes were corrupted must fail recovery's checksum
-/// validation — recovery refuses rather than serving history that failed its
-/// checksum. A clean copy of the same segment recovers fine, proving the failure
-/// is the corruption and not the setup.
+/// A *committed* sealed segment (one the checkpoint manifest vouches) whose bytes
+/// were corrupted must fail recovery's checksum validation — recovery refuses
+/// rather than serving history that failed its checksum. A clean copy of the same
+/// segment recovers fine, proving the failure is the corruption and not the setup.
 #[test]
-fn recover_rejects_a_corrupt_sealed_segment() {
+fn recover_rejects_a_corrupt_committed_segment() {
     let disk = MemDisk::new();
+    let k = key(b"k");
 
-    // Write one valid sealed segment under the engine's discovery namespace.
-    let mut w = SegmentWriter::create(&disk, SEGMENT).expect("create segment");
-    w.push(Version::open(
-        key(b"k"),
-        SystemTimeMicros(10),
-        0,
-        stele_common::provenance::Provenance::new(TxnId(1), SystemTimeMicros(10), who()),
-        Some(b"v".to_vec()),
-    ))
-    .expect("push");
-    w.finish().expect("finish");
+    // A committed flush: the insert is sealed into seg-0 and vouched by the
+    // checkpoint manifest, so recovery validates that segment by checksum.
+    {
+        let mut engine = Engine::open(disk.clone(), StepClock::new(10), false).expect("open");
+        engine
+            .insert(k, None, Some(b"v".to_vec()), 0, TxnId(1), who())
+            .expect("insert");
+        engine.flush().expect("flush");
+        assert_eq!(
+            engine.segment_names().len(),
+            1,
+            "the flush sealed one segment"
+        );
+    }
 
-    // A clean recover validates the segment and succeeds.
+    // A clean recover validates the committed segment and succeeds.
     Engine::recover(disk.clone(), StepClock::new(1), false).expect("clean recover");
 
     // Flip a byte in the middle of the segment payload; recovery must reject it.
@@ -314,13 +317,242 @@ fn recover_rejects_a_corrupt_sealed_segment() {
         bytes
     });
     match Engine::recover(corrupt, StepClock::new(1), false) {
-        Ok(_) => panic!("a corrupt sealed segment must fail recovery, not pass"),
+        Ok(_) => panic!("a corrupt committed segment must fail recovery, not pass"),
         Err(EngineError::Segment(_)) => {}
         Err(other) => panic!("expected a segment checksum error, got {other:?}"),
     }
 }
 
-// --- 5. the checkpoint records the last fully-flushed WAL offset ------------
+// --- 5. flush bounds replay to the WAL tail (STL-177) -----------------------
+
+/// After a [`Engine::flush`], recovery replays **only the tail**: the flushed
+/// prefix is rebuilt from the sealed segment, not the WAL, so corruption in the
+/// pre-floor WAL is irrelevant. Proven directly — flush the whole history, flip a
+/// byte deep inside the (now-redundant) WAL prefix, and recovery still succeeds
+/// with the correct `AS OF`, where a full-log replay would have hit the corruption
+/// and failed.
+#[test]
+fn flush_bounds_recovery_to_the_wal_tail() {
+    let disk = MemDisk::new();
+    let k = key(b"account-1");
+
+    let (c0, c1) = {
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1_000), false).expect("open");
+        let c0 = engine
+            .insert(k.clone(), None, Some(b"100".to_vec()), 0, TxnId(1), who())
+            .expect("insert")
+            .commit;
+        let c1 = engine
+            .update(k.clone(), None, Some(b"250".to_vec()), 0, TxnId(2), who())
+            .expect("update")
+            .commit;
+        // Flush seals both versions into seg-0 and advances the floor to the log
+        // end — there is no tail left to replay.
+        let floor = engine.flush().expect("flush");
+        assert!(
+            floor > stele_storage::wal::LogOffset::ZERO,
+            "floor advanced"
+        );
+        assert_eq!(engine.segment_names().len(), 1, "one sealed segment");
+        (c0, c1)
+    };
+
+    // Corrupt the WAL *prefix* — a record the flush already folded into the
+    // segment. A full-log replay would choke on it; a tail-bounded replay never
+    // reads it.
+    let corrupt = clone_disk_mutating(&disk, WAL_SEGMENT, |mut bytes| {
+        bytes[8] ^= 0xFF; // a byte well inside the first (flushed) record
+        bytes
+    });
+
+    let recovered = Engine::recover(corrupt, StepClock::new(1_000_000), false)
+        .expect("recovery ignores the corrupt, already-flushed WAL prefix");
+    assert_eq!(
+        recovered.segment_names().len(),
+        1,
+        "the committed segment is read back",
+    );
+    assert!(
+        recovered.replay_floor() > stele_storage::wal::LogOffset::ZERO,
+        "recovery resumes from the advanced floor, not the log origin",
+    );
+    assert_eq!(
+        recovered.as_of_payload(&k, Snapshot(c0)).expect("as_of"),
+        Some(Some(b"100".to_vec())),
+        "pre-update value served from the sealed segment + rebuilt index",
+    );
+    assert_eq!(
+        recovered.as_of_payload(&k, Snapshot(c1)).expect("as_of"),
+        Some(Some(b"250".to_vec())),
+        "post-update value served from the sealed segment + rebuilt index",
+    );
+}
+
+/// A flush mid-history, then more writes, then a kill with no final flush:
+/// recovery composes the **segment prefix** (rebuilt from seg-0) with the **WAL
+/// tail** (replayed from the floor). Every `AS OF` boundary resolves correctly and
+/// the validity index is rebuilt exactly.
+#[test]
+fn flush_then_tail_writes_recover_correctly() {
+    let disk = MemDisk::new();
+    let k = key(b"account-1");
+
+    let (c0, c1, c2, before) = {
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1_000), false).expect("open");
+        let c0 = engine
+            .insert(k.clone(), None, Some(b"100".to_vec()), 0, TxnId(1), who())
+            .expect("insert")
+            .commit;
+        let c1 = engine
+            .update(k.clone(), None, Some(b"250".to_vec()), 0, TxnId(2), who())
+            .expect("update")
+            .commit;
+        // Flush the prefix into seg-0; the floor now sits past these two records.
+        engine.flush().expect("flush");
+        // Tail writes after the flush — these live only in the WAL until recovery.
+        let c2 = engine
+            .update(k.clone(), None, Some(b"400".to_vec()), 0, TxnId(3), who())
+            .expect("tail update")
+            .commit;
+        let before = engine.materialize_index().expect("materialize");
+        (c0, c1, c2, before)
+        // dropped — no final flush, so the tail is recovered via WAL replay
+    };
+
+    let recovered = Engine::recover(disk, StepClock::new(1_000_000), false).expect("recover");
+    assert_eq!(
+        recovered.as_of_payload(&k, Snapshot(c0)).expect("as_of"),
+        Some(Some(b"100".to_vec())),
+        "segment-prefix value",
+    );
+    assert_eq!(
+        recovered.as_of_payload(&k, Snapshot(c1)).expect("as_of"),
+        Some(Some(b"250".to_vec())),
+        "segment-prefix value after the in-segment supersession",
+    );
+    assert_eq!(
+        recovered.as_of_payload(&k, Snapshot(c2)).expect("as_of"),
+        Some(Some(b"400".to_vec())),
+        "tail value replayed from the WAL on top of the segment prefix",
+    );
+    assert_eq!(
+        before,
+        recovered.materialize_index().expect("materialize"),
+        "the index rebuilt from segment + tail equals the pre-crash one",
+    );
+}
+
+/// The crash-during-flush invariant at the storage layer: a segment written by a
+/// flush whose checkpoint record never became durable is an **orphan** recovery
+/// ignores, falling back to the WAL. Modeled by flushing cleanly, then removing
+/// the checkpoint file (the manifest never committed) **and** corrupting the
+/// segment (a torn write) — recovery must still succeed by replaying the WAL,
+/// proving the orphan was never trusted.
+#[test]
+fn recover_ignores_an_uncommitted_orphan_segment() {
+    let disk = MemDisk::new();
+    let k = key(b"account-1");
+
+    let (c0, c1) = {
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1_000), false).expect("open");
+        let c0 = engine
+            .insert(k.clone(), None, Some(b"100".to_vec()), 0, TxnId(1), who())
+            .expect("insert")
+            .commit;
+        let c1 = engine
+            .update(k.clone(), None, Some(b"250".to_vec()), 0, TxnId(2), who())
+            .expect("update")
+            .commit;
+        engine.flush().expect("flush"); // writes seg-0 + the committing manifest
+        (c0, c1)
+    };
+
+    // Drop the checkpoint file (the manifest that committed seg-0) and corrupt the
+    // orphaned segment — exactly the on-disk shape of a crash after the segment
+    // fsync but before the checkpoint record was durable.
+    let orphaned = {
+        let out = MemDisk::new();
+        for name in disk.list().expect("list") {
+            if name == "stele.checkpoint" {
+                continue; // the manifest never became durable
+            }
+            let file = disk.open(&name).expect("open");
+            let mut bytes = vec![0u8; usize::try_from(file.len()).expect("len")];
+            let read = file.read_at(0, &mut bytes).expect("read");
+            bytes.truncate(read);
+            if name == SEGMENT {
+                let mid = bytes.len() / 2;
+                bytes[mid] ^= 0xFF; // the orphan is also torn
+            }
+            let mut dst = out.create(&name).expect("create");
+            dst.append(&bytes).expect("append");
+            dst.sync().expect("sync");
+        }
+        out
+    };
+
+    // No manifest ⇒ seg-0 is an uncommitted orphan: recovery ignores it (never
+    // validating its corrupt bytes) and rebuilds purely from the WAL.
+    let recovered = Engine::recover(orphaned, StepClock::new(1_000_000), false)
+        .expect("recovery falls back to the WAL for an uncommitted orphan segment");
+    assert!(
+        recovered.segment_names().is_empty(),
+        "the orphan segment is not adopted",
+    );
+    assert_eq!(
+        recovered.as_of_payload(&k, Snapshot(c0)).expect("as_of"),
+        Some(Some(b"100".to_vec())),
+        "pre-update value rebuilt from the WAL",
+    );
+    assert_eq!(
+        recovered.as_of_payload(&k, Snapshot(c1)).expect("as_of"),
+        Some(Some(b"250".to_vec())),
+        "post-update value rebuilt from the WAL",
+    );
+}
+
+/// A second flush appends a second committed segment and advances the floor
+/// again — recovery reads both and replays nothing.
+#[test]
+fn two_flushes_commit_two_segments_and_bound_replay() {
+    let disk = MemDisk::new();
+    let a = key(b"a");
+    let b = key(b"b");
+
+    let (ca, cb) = {
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1), false).expect("open");
+        let ca = engine
+            .insert(a.clone(), None, Some(b"a0".to_vec()), 0, TxnId(1), who())
+            .expect("insert a")
+            .commit;
+        engine.flush().expect("flush 1");
+        let cb = engine
+            .insert(b.clone(), None, Some(b"b0".to_vec()), 0, TxnId(2), who())
+            .expect("insert b")
+            .commit;
+        let floor2 = engine.flush().expect("flush 2");
+        assert_eq!(engine.segment_names().len(), 2, "two committed segments");
+        assert_eq!(engine.replay_floor(), floor2, "floor at the second flush");
+        (ca, cb)
+    };
+
+    let recovered = Engine::recover(disk, StepClock::new(1_000_000), false).expect("recover");
+    assert_eq!(
+        recovered.segment_names().len(),
+        2,
+        "both segments read back"
+    );
+    assert_eq!(
+        recovered.as_of_payload(&a, Snapshot(ca)).expect("as_of"),
+        Some(Some(b"a0".to_vec())),
+    );
+    assert_eq!(
+        recovered.as_of_payload(&b, Snapshot(cb)).expect("as_of"),
+        Some(Some(b"b0".to_vec())),
+    );
+}
+
+// --- 6. the checkpoint records the last fully-flushed WAL offset ------------
 
 /// [`Engine::checkpoint`] advances the persisted durable fence: after a second
 /// checkpoint past more writes, recovery loads the newer offset.

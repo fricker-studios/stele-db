@@ -766,6 +766,134 @@ pub fn run_engine_recover_seed(seed: u64) -> u64 {
     digest
 }
 
+/// Kill and `recover` a seeded [`Engine`] workload that periodically **flushes**
+/// the delta tier into sealed segments ([STL-177]).
+///
+/// This is [`run_engine_recover_seed`] with the periodic durability point upgraded
+/// from a fence-only [`Engine::checkpoint`] to a [`Engine::flush`]: each flush
+/// seals the staged versions/retractions into a segment and advances the replay
+/// floor, so recovery rebuilds the flushed prefix **from the segment store** and
+/// replays only the WAL tail. There is *no* shutdown flush — the post-last-flush
+/// writes live only in the WAL at crash time, so the sweep exercises both halves
+/// of recovery: the from-segment rebuild and the bounded tail replay, composed.
+///
+/// The invariants asserted are the same as the fence-only sweep and pin the
+/// STL-177 correctness claim across random histories: the recovered validity index
+/// must equal the pre-crash one **exactly** (segment rebuild + tail replay = the
+/// live closes), and every `AS OF` boundary must match the tier-agnostic reference
+/// oracle. Same seed ⇒ same digest.
+#[must_use]
+pub fn run_engine_flush_recover_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut rng = Rng::new(seed);
+    let disk = MemDisk::new();
+
+    // Tier-agnostic reference oracle: per key, the committed payload-or-delete
+    // timeline keyed by commit `sys_from`.
+    let mut oracle: BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Option<Vec<u8>>>> =
+        BTreeMap::new();
+    let mut commits: Vec<SystemTimeMicros> = Vec::new();
+
+    let key_count = 1 + rng.below_usize(6);
+    let keys: Vec<BusinessKey> = (0..key_count)
+        .map(|i| BusinessKey::new(format!("k-{i:04}").into_bytes()))
+        .collect();
+
+    let before_index = {
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1), false).expect("open engine");
+        let mut live = vec![false; key_count];
+        let ops = 8 + rng.below(24);
+        for op in 0..ops {
+            let k = rng.below_usize(key_count);
+            let key = keys[k].clone();
+            let txn = TxnId(op);
+            let principal_len = rng.below_usize(8);
+            let principal = Principal::new(rng.bytes(principal_len));
+            let commit = if live[k] {
+                if rng.below(2) == 0 {
+                    let c = engine.delete(&key, txn, principal).expect("delete").commit;
+                    oracle.entry(key).or_default().insert(c, None);
+                    live[k] = false;
+                    c
+                } else {
+                    let payload_len = rng.below_usize(16);
+                    let payload = rng.bytes(payload_len);
+                    let c = engine
+                        .update(key.clone(), None, Some(payload.clone()), 0, txn, principal)
+                        .expect("update")
+                        .commit;
+                    oracle.entry(key).or_default().insert(c, Some(payload));
+                    c
+                }
+            } else {
+                let payload_len = rng.below_usize(16);
+                let payload = rng.bytes(payload_len);
+                let c = engine
+                    .insert(key.clone(), None, Some(payload.clone()), 0, txn, principal)
+                    .expect("insert")
+                    .commit;
+                oracle.entry(key).or_default().insert(c, Some(payload));
+                live[k] = true;
+                c
+            };
+            commits.push(commit);
+            // A periodic flush at seed-chosen points — seals the delta into a
+            // segment and advances the recovery floor.
+            if rng.below(3) == 0 {
+                engine.flush().expect("periodic flush");
+            }
+        }
+        // No shutdown flush: drop the engine with a WAL tail past the last flush,
+        // so recovery must compose the segment prefix with the replayed tail.
+        engine
+            .materialize_index()
+            .expect("materialize pre-crash index")
+    };
+
+    let recovered = Engine::recover(disk, StepClock::new(1_000_000), false).expect("recover");
+    let after_index = recovered
+        .materialize_index()
+        .expect("materialize rebuilt index");
+    assert_eq!(
+        before_index, after_index,
+        "seed {seed}: flush-recovery must rebuild the exact validity index",
+    );
+
+    let mut probes: Vec<SystemTimeMicros> = Vec::new();
+    if let Some(first) = commits.first() {
+        probes.push(SystemTimeMicros(first.0 - 1));
+    }
+    probes.extend(commits.iter().copied());
+
+    let mut digest = FNV_OFFSET;
+    for s in probes {
+        for key in &keys {
+            let want = oracle
+                .get(key)
+                .and_then(|timeline| timeline.range(..=s).next_back())
+                .and_then(|(_, payload)| payload.clone());
+            let got = recovered
+                .as_of_payload(key, Snapshot(s))
+                .expect("as_of")
+                .flatten();
+            assert_eq!(
+                got, want,
+                "seed {seed} @ s={s:?} key {key:?}: flush-recovered AS OF must match the oracle",
+            );
+            digest = fnv1a(digest, key.as_bytes());
+            digest = fold_optional_payload(digest, got.as_deref());
+        }
+    }
+    for ((key, sys_from, seq), interval) in &after_index {
+        digest = fnv1a(digest, key.as_bytes());
+        digest = fnv1a(digest, &sys_from.0.to_le_bytes());
+        digest = fnv1a(digest, &seq.to_le_bytes());
+        digest = fnv1a(digest, &interval.sys_to.0.to_le_bytes());
+        digest = fold_closed_by(digest, Some(&interval.closed_by));
+    }
+    digest
+}
+
 /// Map a draw from `rng` to a probability in `[lo, hi]` permille (thousandths) —
 /// a small, seed-derived spread so different seeds stress different fault mixes
 /// while every probability stays integer-derived and reproducible.
@@ -1014,6 +1142,136 @@ pub fn run_engine_recover_faults_seed(seed: u64) -> u64 {
 
     // Fold the seed-keyed fault-event log so the digest regresses on the exact
     // injected fault sequence, not only the recovered state.
+    for ev in disk.events() {
+        digest = fnv1a(digest, &ev.seq.to_le_bytes());
+        digest = fnv1a(digest, &[fault_op_tag(ev.op), fault_kind_tag(ev.kind)]);
+        digest = fnv1a(digest, &ev.detail.to_le_bytes());
+    }
+    digest
+}
+
+/// Kill and `recover` a seeded [`Engine`] workload that periodically **flushes**,
+/// **through a [`FaultDisk`]** — the crash-during-flush half of [STL-177]'s DoD.
+///
+/// This is [`run_engine_recover_faults_seed`] with the periodic durability point
+/// upgraded to a [`Engine::flush`], so the injected faults now land on the flush's
+/// extra write surfaces too: the sealed-segment append/`fsync` and the checkpoint
+/// (manifest) record. A torn or full-disk fault mid-flush leaves a **segment whose
+/// committing checkpoint record never became durable** — an orphan. Recovery must
+/// ignore that orphan and fall back to the WAL, converging to a consistent
+/// committed prefix (or cleanly detecting corruption), never silently diverging:
+/// exactly "crash during a checkpoint recovers to a consistent state".
+///
+/// The two-phase fault arming, the committed-prefix membership check
+/// (`verify_recovered_prefix`), and the fault-event digest fold are identical to
+/// the fence-only sweep. Same seed ⇒ same digest.
+///
+/// # Panics
+///
+/// Panics if recovery returns `Ok` with a state that is not a consistent committed
+/// prefix of the reference oracle — a silent divergence.
+#[must_use]
+pub fn run_engine_flush_recover_faults_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+
+    let mut prof_rng = Rng::new(seed ^ 0xFA17_D15C_0BAD_F00D);
+    let p_torn = prob_permille(&mut prof_rng, 20, 60);
+    let p_full = prob_permille(&mut prof_rng, 10, 30);
+    let p_slow = prob_permille(&mut prof_rng, 200, 500);
+    let p_bit = prob_permille(&mut prof_rng, 80, 200);
+    let p_short = prob_permille(&mut prof_rng, 80, 200);
+
+    let mut rng = Rng::new(seed);
+
+    let mut oracle: BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Option<Vec<u8>>>> =
+        BTreeMap::new();
+    let mut committed: Vec<SystemTimeMicros> = Vec::new();
+
+    let key_count = 1 + rng.below_usize(6);
+    let keys: Vec<BusinessKey> = (0..key_count)
+        .map(|i| BusinessKey::new(format!("k-{i:04}").into_bytes()))
+        .collect();
+
+    let disk = FaultDisk::new(seed, FaultProfile::none());
+    {
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1), false).expect("open engine");
+        disk.enable(FaultKind::TornWrite, p_torn);
+        disk.enable(FaultKind::FullDisk, p_full);
+        disk.enable(FaultKind::SlowSync, p_slow);
+
+        let mut live = vec![false; key_count];
+        let ops = 8 + rng.below(24);
+        'workload: for op in 0..ops {
+            let k = rng.below_usize(key_count);
+            let key = keys[k].clone();
+            let txn = TxnId(op);
+            let principal = Principal::new(b"sim".to_vec());
+            let payload = format!("op{op}").into_bytes();
+            let want_delete = live[k] && rng.below(2) == 0;
+            let outcome = if live[k] {
+                if want_delete {
+                    engine.delete(&key, txn, principal)
+                } else {
+                    engine.update(key.clone(), None, Some(payload.clone()), 0, txn, principal)
+                }
+            } else {
+                engine.insert(key.clone(), None, Some(payload.clone()), 0, txn, principal)
+            };
+            match outcome {
+                Ok(o) => {
+                    let effect = if want_delete { None } else { Some(payload) };
+                    oracle.entry(key).or_default().insert(o.commit, effect);
+                    committed.push(o.commit);
+                    live[k] = !want_delete;
+                }
+                Err(_) => break 'workload,
+            }
+            // A periodic flush; a fault sealing the segment or writing its manifest
+            // record is a crash mid-flush — the orphan-segment case recovery must
+            // survive. The delta is left intact on a flush error, so the WAL stays
+            // authoritative.
+            if rng.below(3) == 0 && engine.flush().is_err() {
+                break 'workload;
+            }
+        }
+        // Best-effort graceful-shutdown flush, then drop the engine — the crash.
+        let _ = engine.flush();
+    }
+
+    disk.disable(FaultKind::TornWrite);
+    disk.disable(FaultKind::FullDisk);
+    disk.disable(FaultKind::SlowSync);
+    disk.enable(FaultKind::BitFlip, p_bit);
+    disk.enable(FaultKind::ShortRead, p_short);
+
+    let recovered = Engine::recover(disk.clone(), StepClock::new(1_000_000), false);
+
+    disk.disable(FaultKind::BitFlip);
+    disk.disable(FaultKind::ShortRead);
+
+    let mut digest = FNV_OFFSET;
+    match recovered {
+        Err(_) => digest = fnv1a(digest, &[0xE2]),
+        Ok(engine) => {
+            let (k, recovered_fp) =
+                verify_recovered_prefix(seed, &engine, &oracle, &committed, &keys);
+            digest = fnv1a(digest, &[0x0C]);
+            digest = fnv1a(
+                digest,
+                &u64::try_from(k).expect("prefix len fits u64").to_le_bytes(),
+            );
+            for entry in &recovered_fp {
+                match entry {
+                    Some(payload) => {
+                        digest = fnv1a(digest, &[1]);
+                        digest = fnv1a(digest, payload);
+                    }
+                    None => digest = fnv1a(digest, &[0]),
+                }
+            }
+        }
+    }
+
     for ev in disk.events() {
         digest = fnv1a(digest, &ev.seq.to_le_bytes());
         digest = fnv1a(digest, &[fault_op_tag(ev.op), fault_kind_tag(ev.kind)]);
@@ -1887,6 +2145,11 @@ pub fn registry() -> Vec<Box<dyn Scenario>> {
         FnScenario::boxed("as-of-oracle", run_as_of_oracle_seed),
         FnScenario::boxed("engine-recover", run_engine_recover_seed),
         FnScenario::fault("engine-recover-faults", run_engine_recover_faults_seed),
+        FnScenario::boxed("engine-flush-recover", run_engine_flush_recover_seed),
+        FnScenario::fault(
+            "engine-flush-recover-faults",
+            run_engine_flush_recover_faults_seed,
+        ),
         FnScenario::boxed("schedule", run_schedule_seed_digest),
         FnScenario::fault("fault-disk", run_fault_seed),
     ]
@@ -2305,7 +2568,7 @@ mod tests {
     fn fault_injection_gates_exactly_the_fault_scenarios() {
         // The `--fault-injection` flag must genuinely change what runs. Assert it
         // structurally: the fault-gated set is exactly the seeded-fault disk and the
-        // fault-injected recovery sweep, and turning the flag on adds exactly those.
+        // fault-injected recovery sweeps, and turning the flag on adds exactly those.
         // (A digest-inequality check would be subtly flaky — different folds can
         // collide in principle — so we assert coverage, not the digest value.)
         let mut gated: Vec<&str> = registry()
@@ -2316,7 +2579,11 @@ mod tests {
         gated.sort_unstable();
         assert_eq!(
             gated,
-            ["engine-recover-faults", "fault-disk"],
+            [
+                "engine-flush-recover-faults",
+                "engine-recover-faults",
+                "fault-disk"
+            ],
             "exactly the fault-injected scenarios are fault-gated"
         );
         let on = sweep(4, true);

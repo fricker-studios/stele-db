@@ -184,6 +184,14 @@ impl SealedVersions {
     pub fn versions(&self) -> &[Version] {
         &self.versions
     }
+
+    /// Append `versions` to the resident set in place — the rows a flush just
+    /// sealed into a new segment ([`Engine::flush`](crate::engine::Engine::flush)).
+    /// Appends without cloning the existing prefix, so a flush stays `O(flushed
+    /// batch)` rather than `O(total sealed history)`.
+    pub fn extend(&mut self, versions: impl IntoIterator<Item = Version>) {
+        self.versions.extend(versions);
+    }
 }
 
 impl SealedLookup for SealedVersions {
