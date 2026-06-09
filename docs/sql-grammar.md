@@ -213,10 +213,16 @@ parser and the catalog (STL-98) / executor / pgwire encoder. The v0.1 set:
 | `TEXT`                                 | `Text`        | 25           |
 | `BOOL`, `BOOLEAN`                      | `Bool`        | 16           |
 | `TIMESTAMP` (no time zone)             | `Timestamp`   | 1114         |
+| `TIMESTAMP WITH TIME ZONE`, `TIMESTAMPTZ` | `TimestampTz` | 1184      |
 | `DATE`                                 | `Date`        | 1082         |
 
-Anything else — `VARCHAR`, `CHAR`, `REAL`, `TIMESTAMP WITH TIME ZONE`, … — is
-rejected (`ParseError::UnsupportedType`) rather than silently coerced; these are
+`TimestampTz` is stored UTC-internal: a literal's zone offset is normalized to
+UTC on input and rendered back with a `+00` offset (STL-189; the codec lives in
+[`stele_common::datetime`]). A `timestamptz` literal *can* be written in DML; the
+zone-less `TIMESTAMP` / `DATE` have no literal codec yet (mirrors `AS OF`).
+
+Anything else — `VARCHAR`, `CHAR`, `REAL`, … — is rejected
+(`ParseError::UnsupportedType`) rather than silently coerced; these are
 deliberate later additions.
 
 ## AST shape

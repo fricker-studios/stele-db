@@ -48,6 +48,8 @@
 //! | TEXT | `0x04` | UTF-8 bytes, verbatim |
 //! | TIMESTAMP | `0x05` | 8-byte big-endian `i64` microseconds since the Unix epoch (UTC) |
 //! | DATE | `0x06` | 4-byte big-endian `i32` days since the Unix epoch |
+//! | TIMESTAMPTZ | `0x07` | 8-byte big-endian `i64` microseconds since the Unix epoch (UTC) |
+//! | PERIOD | `0x08` | 16 bytes: two big-endian `i64` µs bounds, `from` then `to` (open upper = `i64::MAX`) |
 //!
 //! ### Why these choices
 //!
@@ -85,6 +87,8 @@ const TAG_INT8: u8 = 0x03;
 const TAG_TEXT: u8 = 0x04;
 const TAG_TIMESTAMP: u8 = 0x05;
 const TAG_DATE: u8 = 0x06;
+const TAG_TIMESTAMPTZ: u8 = 0x07;
+const TAG_PERIOD: u8 = 0x08;
 
 /// Compute the v1 portable hash-key digest of `args`, in order.
 ///
@@ -138,6 +142,17 @@ fn encode_arg(arg: Option<&ScalarValue>, msg: &mut Vec<u8>) {
         Some(ScalarValue::Text(s)) => push_frame(msg, TAG_TEXT, s.as_bytes()),
         Some(ScalarValue::Timestamp(v)) => push_frame(msg, TAG_TIMESTAMP, &v.to_be_bytes()),
         Some(ScalarValue::Date(v)) => push_frame(msg, TAG_DATE, &v.to_be_bytes()),
+        // `timestamptz` is UTC-internal, so its body is the same big-endian µs
+        // instant as `timestamp`; the distinct tag keeps the two from aliasing.
+        Some(ScalarValue::TimestampTz(v)) => push_frame(msg, TAG_TIMESTAMPTZ, &v.to_be_bytes()),
+        // A `period` frames its half-open `[from, to)` bounds as two big-endian
+        // i64 µs values, lower then upper (an open upper bound is `i64::MAX`).
+        Some(ScalarValue::Period(iv)) => {
+            let mut body = [0u8; 16];
+            body[..8].copy_from_slice(&iv.from.to_be_bytes());
+            body[8..].copy_from_slice(&iv.to.to_be_bytes());
+            push_frame(msg, TAG_PERIOD, &body);
+        }
     }
 }
 
@@ -217,6 +232,18 @@ pub fn vectors() -> Vec<Vector> {
             label: "composite ('acme', 42, NULL)",
             args: vec![text("acme"), Some(ScalarValue::Int4(42)), None],
             hex: "61c9586983296ab2e403396f6ce20b01e2adc2514633fc63bb9d5a1e0ce85a20",
+        },
+        Vector {
+            label: "timestamptz 1700000000000000",
+            args: vec![Some(ScalarValue::TimestampTz(1_700_000_000_000_000))],
+            hex: "8720f97303210b1ae946845bfaad4a52d062189d52e098b5b4b3278708b2db31",
+        },
+        Vector {
+            label: "period [10, 20)",
+            args: vec![Some(ScalarValue::Period(
+                crate::period::Interval::new(10, 20).expect("well-formed interval"),
+            ))],
+            hex: "35ccfb9906f082824c65f8e0ef866f4439cb8e4217a9ff5d3890d95fdff0379c",
         },
     ]
 }

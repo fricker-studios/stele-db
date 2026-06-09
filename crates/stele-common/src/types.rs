@@ -49,15 +49,17 @@ const OID_INT4: PgOid = 23;
 const OID_TEXT: PgOid = 25;
 const OID_DATE: PgOid = 1082;
 const OID_TIMESTAMP: PgOid = 1114;
+const OID_TIMESTAMPTZ: PgOid = 1184;
 const OID_TSRANGE: PgOid = 3908;
 
 /// The closed set of logical column types Stele understands.
 ///
 /// Started as the six scalar/temporal types the identity-proof demos need and
-/// that every Postgres driver can already decode ([STL-96] scope); [`Self::Period`]
-/// joined them in v0.2 ([STL-180]). Further numeric breadth (`NUMERIC`,
-/// `FLOAT8`, `UUID`, …) and `timestamptz` come later — each is a new variant
-/// plus its OID, with no churn to the existing ones.
+/// that every Postgres driver can already decode ([STL-96] scope); the
+/// time-zone-aware [`Self::TimestampTz`] ([STL-189]) and [`Self::Period`]
+/// ([STL-180]) joined them in v0.2. Further numeric breadth (`NUMERIC`,
+/// `FLOAT8`, `UUID`, …) comes later — each is a new variant plus its OID, with
+/// no churn to the existing ones.
 ///
 /// ```
 /// use stele_common::types::LogicalType;
@@ -85,11 +87,23 @@ pub enum LogicalType {
     /// the same epoch and precision the bitemporal core uses on disk
     /// ([`crate::time::SystemTimeMicros`]). We map it to the Postgres `timestamp`
     /// OID (1114, *without* time zone) to match the bare SQL type name; Stele
-    /// interprets every such value as UTC, and the time-zone-aware `timestamptz`
-    /// (OID 1184) is a deliberate later addition rather than a silent
-    /// re-labelling ([assumption A9](../../../docs/assumptions.md) — document the
-    /// choice where SQL:2011 and Postgres conventions diverge).
+    /// interprets every such value as UTC, and the time-zone-aware
+    /// [`Self::TimestampTz`] (OID 1184) is the explicit zone-carrying counterpart
+    /// ([assumption A9](../../../docs/assumptions.md) — document the choice where
+    /// SQL:2011 and Postgres conventions diverge).
     Timestamp,
+    /// Time-zone-aware microsecond instant, **stored UTC-internal** — SQL
+    /// `TIMESTAMP WITH TIME ZONE` / `TIMESTAMPTZ`, Postgres `timestamptz`
+    /// (OID 1184).
+    ///
+    /// The stored value is the same microseconds-since-the-Unix-epoch UTC instant
+    /// as [`Self::Timestamp`] ([`ScalarValue::TimestampTz`]); the difference is at
+    /// the edges of the system. On input a literal's zone offset is normalized
+    /// away to UTC, and on output the instant renders with a `+00` offset — so two
+    /// literals naming the same instant in different zones store identically
+    /// ([STL-189], [ADR-0024](../../../docs/adr/0024-time-representation.md);
+    /// parsing in [`crate::datetime`]).
+    TimestampTz,
     /// Calendar date with no time component — SQL `DATE`, Postgres `date`. The
     /// value is days since the Unix epoch ([`ScalarValue::Date`]).
     Date,
@@ -110,12 +124,13 @@ impl LogicalType {
     /// Every logical type, in a stable order. The single source of truth tests
     /// and exhaustive consumers iterate so a new variant can't be silently
     /// missed.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Int4,
         Self::Int8,
         Self::Text,
         Self::Bool,
         Self::Timestamp,
+        Self::TimestampTz,
         Self::Date,
         Self::Period,
     ];
@@ -131,6 +146,7 @@ impl LogicalType {
             Self::Text => OID_TEXT,
             Self::Bool => OID_BOOL,
             Self::Timestamp => OID_TIMESTAMP,
+            Self::TimestampTz => OID_TIMESTAMPTZ,
             Self::Date => OID_DATE,
             Self::Period => OID_TSRANGE,
         }
@@ -146,6 +162,7 @@ impl LogicalType {
             OID_TEXT => Some(Self::Text),
             OID_BOOL => Some(Self::Bool),
             OID_TIMESTAMP => Some(Self::Timestamp),
+            OID_TIMESTAMPTZ => Some(Self::TimestampTz),
             OID_DATE => Some(Self::Date),
             OID_TSRANGE => Some(Self::Period),
             _ => None,
@@ -163,6 +180,7 @@ impl LogicalType {
             Self::Text => "text",
             Self::Bool => "bool",
             Self::Timestamp => "timestamp",
+            Self::TimestampTz => "timestamptz",
             Self::Date => "date",
             Self::Period => "tsrange",
         }
@@ -176,8 +194,9 @@ impl LogicalType {
     /// * [`ColumnCodec::Dictionary`] for [`Self::Text`] — string columns are usually
     ///   low-cardinality (statuses, enums, country codes), where a dictionary
     ///   collapses repeats hard.
-    /// * [`ColumnCodec::Delta`] for [`Self::Timestamp`] and [`Self::Date`] — temporal
-    ///   columns trend monotonic, so successive deltas are tiny.
+    /// * [`ColumnCodec::Delta`] for [`Self::Timestamp`], [`Self::TimestampTz`] and
+    ///   [`Self::Date`] — temporal columns trend monotonic, so successive deltas
+    ///   are tiny.
     /// * [`ColumnCodec::Plain`] for the fixed-width numerics and `bool`, which a
     ///   general codec rarely beats at v0.1 scale.
     ///
@@ -188,7 +207,7 @@ impl LogicalType {
     pub const fn default_codec(self) -> ColumnCodec {
         match self {
             Self::Text => ColumnCodec::Dictionary,
-            Self::Timestamp | Self::Date => ColumnCodec::Delta,
+            Self::Timestamp | Self::TimestampTz | Self::Date => ColumnCodec::Delta,
             Self::Int4 | Self::Int8 | Self::Bool | Self::Period => ColumnCodec::Plain,
         }
     }
@@ -249,6 +268,11 @@ pub enum ScalarValue {
     /// A UTC instant in microseconds since the Unix epoch
     /// ([`LogicalType::Timestamp`]).
     Timestamp(i64),
+    /// A time-zone-aware UTC instant in microseconds since the Unix epoch
+    /// ([`LogicalType::TimestampTz`]). Stored identically to [`Self::Timestamp`]
+    /// — the zone offset was normalized away on input; only the wire rendering
+    /// (a `+00` suffix) and the advertised OID differ.
+    TimestampTz(i64),
     /// A date in days since the Unix epoch ([`LogicalType::Date`]).
     Date(i32),
     /// A half-open `[from, to)` period of timestamp microseconds
@@ -296,6 +320,7 @@ impl ScalarValue {
             Self::Text(_) => LogicalType::Text,
             Self::Bool(_) => LogicalType::Bool,
             Self::Timestamp(_) => LogicalType::Timestamp,
+            Self::TimestampTz(_) => LogicalType::TimestampTz,
             Self::Date(_) => LogicalType::Date,
             Self::Period(_) => LogicalType::Period,
         }
@@ -322,7 +347,7 @@ impl ScalarValue {
     /// bytes are read back. Layout, all little-endian:
     ///
     /// * `Int4` / `Date` — 4 bytes.
-    /// * `Int8` / `Timestamp` — 8 bytes.
+    /// * `Int8` / `Timestamp` / `TimestampTz` — 8 bytes.
     /// * `Bool` — 1 byte (`0` / `1`).
     /// * `Text` — the raw UTF-8 bytes; the surrounding column framing carries
     ///   the length.
@@ -338,7 +363,9 @@ impl ScalarValue {
             // a body each — the column's type, not the bytes, tells them apart on
             // the way back in [`Self::decode`].
             Self::Int4(v) | Self::Date(v) => out.extend_from_slice(&v.to_le_bytes()),
-            Self::Int8(v) | Self::Timestamp(v) => out.extend_from_slice(&v.to_le_bytes()),
+            Self::Int8(v) | Self::Timestamp(v) | Self::TimestampTz(v) => {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
             Self::Text(s) => out.extend_from_slice(s.as_bytes()),
             Self::Bool(b) => out.push(u8::from(*b)),
             Self::Period(iv) => {
@@ -361,6 +388,9 @@ impl ScalarValue {
             LogicalType::Int4 => Ok(Self::Int4(i32::from_le_bytes(fixed(ty, bytes)?))),
             LogicalType::Int8 => Ok(Self::Int8(i64::from_le_bytes(fixed(ty, bytes)?))),
             LogicalType::Timestamp => Ok(Self::Timestamp(i64::from_le_bytes(fixed(ty, bytes)?))),
+            LogicalType::TimestampTz => {
+                Ok(Self::TimestampTz(i64::from_le_bytes(fixed(ty, bytes)?)))
+            }
             LogicalType::Date => Ok(Self::Date(i32::from_le_bytes(fixed(ty, bytes)?))),
             LogicalType::Bool => {
                 let [b] = fixed::<1>(ty, bytes)?;
@@ -399,6 +429,7 @@ mod tests {
         assert_eq!(LogicalType::Text.pg_oid(), 25);
         assert_eq!(LogicalType::Bool.pg_oid(), 16);
         assert_eq!(LogicalType::Timestamp.pg_oid(), 1114);
+        assert_eq!(LogicalType::TimestampTz.pg_oid(), 1184);
         assert_eq!(LogicalType::Date.pg_oid(), 1082);
         // PERIOD borrows Postgres `tsrange` so a stock driver can decode it.
         assert_eq!(LogicalType::Period.pg_oid(), 3908);
@@ -453,6 +484,7 @@ mod tests {
     fn type_names_are_the_postgres_names() {
         assert_eq!(LogicalType::Int4.pg_type_name(), "int4");
         assert_eq!(LogicalType::Timestamp.to_string(), "timestamp");
+        assert_eq!(LogicalType::TimestampTz.to_string(), "timestamptz");
         assert_eq!(LogicalType::Date.to_string(), "date");
     }
 
@@ -460,6 +492,7 @@ mod tests {
     fn default_codec_follows_the_documented_policy() {
         assert_eq!(LogicalType::Text.default_codec(), ColumnCodec::Dictionary);
         assert_eq!(LogicalType::Timestamp.default_codec(), ColumnCodec::Delta);
+        assert_eq!(LogicalType::TimestampTz.default_codec(), ColumnCodec::Delta);
         assert_eq!(LogicalType::Date.default_codec(), ColumnCodec::Delta);
         assert_eq!(LogicalType::Int4.default_codec(), ColumnCodec::Plain);
         assert_eq!(LogicalType::Int8.default_codec(), ColumnCodec::Plain);
@@ -475,6 +508,7 @@ mod tests {
             (ScalarValue::Text("x".into()), LogicalType::Text),
             (ScalarValue::Bool(true), LogicalType::Bool),
             (ScalarValue::Timestamp(1), LogicalType::Timestamp),
+            (ScalarValue::TimestampTz(1), LogicalType::TimestampTz),
             (ScalarValue::Date(1), LogicalType::Date),
             (
                 ScalarValue::Period(Interval::new(1, 2).unwrap()),
@@ -505,6 +539,9 @@ mod tests {
             ScalarValue::Timestamp(i64::MIN),
             ScalarValue::Timestamp(0),
             ScalarValue::Timestamp(1_700_000_000_000_000),
+            ScalarValue::TimestampTz(i64::MIN),
+            ScalarValue::TimestampTz(0),
+            ScalarValue::TimestampTz(1_700_000_000_000_000),
             ScalarValue::Date(i32::MIN),
             ScalarValue::Date(0),
             ScalarValue::Date(20_000),

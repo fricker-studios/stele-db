@@ -10,6 +10,7 @@
 //! enforced here by keeping this crate `no_std`-friendly in spirit (we still link
 //! `std`, but avoid `tokio`, file I/O, and global state).
 
+pub mod datetime;
 pub mod hash;
 pub mod hashkey;
 pub mod period;

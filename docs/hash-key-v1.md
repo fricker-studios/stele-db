@@ -59,6 +59,8 @@ lowercase hex** string (`TEXT`).
 | `TEXT`      | `0x04` | UTF-8 bytes, verbatim                                        |
 | `TIMESTAMP` | `0x05` | 8-byte big-endian `i64`, microseconds since the Unix epoch (UTC) |
 | `DATE`      | `0x06` | 4-byte big-endian `i32`, days since the Unix epoch          |
+| `TIMESTAMPTZ` | `0x07` | 8-byte big-endian `i64`, microseconds since the Unix epoch (UTC) |
+| `PERIOD`    | `0x08` | 16 bytes: two big-endian `i64` µs bounds, `from` then `to` (open upper = `i64::MAX`) |
 
 Tags are frozen: a tag's meaning never changes, and a new type takes the next
 free value rather than reusing one.
@@ -87,11 +89,13 @@ free value rather than reusing one.
   a Unicode version into a frozen format and pull in a Unicode-tables dependency.
   Callers that need normalized equality normalize **before** hashing. Revisited if
   a `v2` is cut.
-- **SQL literal coverage.** Over the wire, `hash(...)` currently accepts the
-  literal shapes the v0.2 parser folds without a target type — string (`TEXT`),
-  integer (`INT4`/`INT8`), boolean (`BOOL`), and `NULL`. `TIMESTAMP` / `DATE` have
-  no civil-time literal codec yet (mirroring `AS OF`), but the spec defines their
-  encoding so a client building keys directly is fully specified. The digest is
+- **SQL literal coverage.** Over the wire, `hash(...)` argument folding is
+  type-inference-free, so it produces the literal shapes the v0.2 parser folds
+  without a target type — string (`TEXT`), integer (`INT4`/`INT8`), boolean
+  (`BOOL`), and `NULL`. The civil-time and range types (`TIMESTAMP`, `DATE`,
+  `TIMESTAMPTZ`, `PERIOD`) are not auto-selected from a bare literal in a
+  `hash(...)` call, but the spec defines their encoding so a client building keys
+  directly is fully specified. The digest is
   returned as `TEXT` hex; a dedicated hash-digest scalar type is
   [STL-181](https://allegromusic.atlassian.net/browse/STL-181) (F21).
 
@@ -124,5 +128,7 @@ same data the code checks in; the two must not drift.
 | `42` (`INT8`)                   | `29a3cc3ace5b15675d46dc9e13804f0ab65feaf17dc14090b3d9ccdfba6c7061` |
 | `true` (`BOOL`)                 | `4c7d2e3d4dd051d20ab6da771cf4b167e4014b08d8b2d5b4e6b92da26b890ba9` |
 | `'acme'`, `42` (`INT4`), `NULL` | `61c9586983296ab2e403396f6ce20b01e2adc2514633fc63bb9d5a1e0ce85a20` |
+| `1700000000000000` (`TIMESTAMPTZ`) | `8720f97303210b1ae946845bfaad4a52d062189d52e098b5b4b3278708b2db31` |
+| `[10, 20)` (`PERIOD`)           | `35ccfb9906f082824c65f8e0ef866f4439cb8e4217a9ff5d3890d95fdff0379c` |
 
 [FIPS 180-4]: https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf

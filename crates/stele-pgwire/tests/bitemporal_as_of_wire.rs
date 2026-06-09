@@ -182,3 +182,124 @@ async fn tokio_postgres_reads_a_both_axes_as_of_cell() {
         .expect("connection driver task joined")
         .expect("the connection closed without a protocol error");
 }
+
+/// Half-open `[from, to)` boundary semantics on **both** axes, probed at the
+/// exact interval edges over the wire (STL-189). The visibility function is
+/// `from ≤ point < to` ([docs/16 §2](../../../docs/16-bitemporal-semantics.md#2-intervals));
+/// the off-by-one trap is a point landing *on* a boundary, so this pins behavior
+/// at `from`, `to`, and the µs either side of each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_postgres_both_axes_as_of_is_half_open_at_the_edges() {
+    // Same staging shape as the cell test:
+    //   INSERT id=1, balance=100, valid [10, 20)  → commit c1
+    //   UPDATE id=1, balance=250, valid [20, 30)  → commit c2  (supersedes v1)
+    let mut engine = SessionEngine::open(MemDisk::new(), SystemClock);
+    let create = stele_sql::parse(
+        "CREATE TABLE account (id INT PRIMARY KEY, balance INT, vf TIMESTAMP, vt TIMESTAMP) \
+         WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+    )
+    .expect("parse CREATE")
+    .into_iter()
+    .next()
+    .expect("one statement");
+    engine.execute(&create).expect("create valid-time table");
+
+    let who = || Principal::new(b"stele".to_vec());
+    let key = || BusinessKey::new(enc(&ScalarValue::Int4(1)));
+    let c1 = engine
+        .insert(
+            "account",
+            key(),
+            Some(iv(10, 20)),
+            payload(100, 10, 20),
+            0,
+            TxnId(1),
+            who(),
+        )
+        .expect("stage insert")
+        .commit;
+    let c2 = engine
+        .update(
+            "account",
+            key(),
+            Some(iv(20, 30)),
+            payload(250, 20, 30),
+            0,
+            TxnId(2),
+            who(),
+        )
+        .expect("stage update")
+        .commit;
+    assert!(
+        c1.0 < c2.0,
+        "the update must commit strictly after the insert"
+    );
+
+    let session: SharedSession = Arc::new(Mutex::new(engine));
+    let addr = common::spawn_server(session).await;
+    let (client, connection) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect to the stele pgwire server");
+    let driver = tokio::spawn(connection);
+
+    let read = |sys: i64, valid: i64| {
+        let client = &client;
+        async move {
+            let sql = format!(
+                "SELECT balance FROM account \
+                 FOR SYSTEM_TIME AS OF {sys} FOR VALID_TIME AS OF {valid}"
+            );
+            balance(
+                &client
+                    .simple_query(&sql)
+                    .await
+                    .expect("as-of select over the wire"),
+            )
+        }
+    };
+
+    // --- Valid axis, system pinned inside v1's live range (S = c1) ---
+    // v1's window is `[10, 20)`: 10 is included, 20 is not.
+    assert_eq!(read(c1.0, 9).await, None, "valid 9 < from 10: excluded");
+    assert_eq!(
+        read(c1.0, 10).await.as_deref(),
+        Some("100"),
+        "valid 10 == from: included"
+    );
+    assert_eq!(
+        read(c1.0, 19).await.as_deref(),
+        Some("100"),
+        "valid 19 < to 20: included"
+    );
+    assert_eq!(
+        read(c1.0, 20).await,
+        None,
+        "valid 20 == to: excluded (half-open)"
+    );
+
+    // --- System axis, valid pinned at 15 (only v1's `[10,20)` covers it) ---
+    // v1 is system-live over `[c1, c2)`: live at c1 and at c2-1, superseded at c2.
+    assert_eq!(
+        read(c1.0, 15).await.as_deref(),
+        Some("100"),
+        "sys c1 == v1.sys_from: included"
+    );
+    assert_eq!(
+        read(c2.0 - 1, 15).await.as_deref(),
+        Some("100"),
+        "sys c2-1 < v2.sys_from: still v1 (upper bound is exclusive)"
+    );
+    // At exactly c2 the supersession takes effect: v1 is closed and v2 is live,
+    // but v2's window `[20,30)` excludes 15 — so the cell is ABSENT, not 250.
+    assert_eq!(
+        read(c2.0, 15).await,
+        None,
+        "sys c2 == v2.sys_from: v1 closed (inclusive lower bound on the successor)"
+    );
+
+    drop(client);
+    driver
+        .await
+        .expect("connection driver task joined")
+        .expect("the connection closed without a protocol error");
+}
