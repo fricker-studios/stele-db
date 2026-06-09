@@ -50,10 +50,11 @@ use sqlparser::ast::{
     Statement as SqlStatement, TableFactor, Value,
 };
 use stele_catalog::{Catalog, SchemaId, TableSchema};
+use stele_common::period::{Interval, IntervalError, PeriodPredicate};
 use stele_common::time::SystemTimeMicros;
 use stele_common::types::{LogicalType, ScalarValue};
 
-use crate::ast::{Statement, TimeDimension};
+use crate::ast::{PeriodExpr, PeriodPredicateClause, Statement, TimeDimension};
 use crate::fold::{self, FoldError};
 
 /// The context a [`bind_select`] needs: the transaction snapshot and the
@@ -123,6 +124,29 @@ pub struct BoundSelect {
     /// The lowered `WHERE` predicate, or `None` for an unfiltered read. v0.2
     /// lowers `<column> = <literal>` only ([STL-151]).
     pub filter: Option<BoundPredicate>,
+    /// A bound `WHERE PERIOD(a, b) <pred> PERIOD(c, d)` period predicate, or
+    /// `None` when the `WHERE` is not one ([STL-165]). Both operands fold to
+    /// constant intervals, so the predicate is a constant truth value the
+    /// executor applies once: a `false` predicate excludes every row. (Per-row
+    /// periods built from value columns are the deferred follow-up.) Mutually
+    /// exclusive with [`filter`](Self::filter) — a `WHERE` is one shape or the
+    /// other.
+    pub period_filter: Option<BoundPeriodPredicate>,
+}
+
+/// A bound `PERIOD(a, b) <predicate> PERIOD(c, d)` clause: two constant-folded
+/// half-open intervals and the predicate relating them ([STL-165]).
+///
+/// Ready for `stele_exec::evaluate` — binding folded each `PERIOD(...)` operand
+/// to a concrete `[from, to)` interval, so evaluation is a pure constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundPeriodPredicate {
+    /// The left period operand.
+    pub left: Interval,
+    /// The predicate relating the two operands.
+    pub predicate: PeriodPredicate,
+    /// The right period operand.
+    pub right: Interval,
 }
 
 /// Why binding a `SELECT` failed.
@@ -190,6 +214,17 @@ pub enum SelectError {
     /// The `AS OF` expression could not be folded to a concrete instant.
     #[error("AS OF: {0}")]
     AsOf(#[from] AsOfError),
+
+    /// A `PERIOD(from, to)` operand of a period predicate could not be folded to
+    /// a concrete instant ([STL-165]). The endpoints fold the same way as `AS OF`
+    /// expressions (`now()`, `now() ± interval`, integer microseconds).
+    #[error("period predicate operand: {0}")]
+    PeriodOperand(AsOfError),
+
+    /// A `PERIOD(from, to)` operand folded to an empty or reversed interval
+    /// (`from >= to`) ([STL-165]). Half-open `[from, to)` requires `from < to`.
+    #[error("period predicate: {0}")]
+    PeriodInterval(IntervalError),
 
     /// The catalog has never registered this table name.
     #[error("unknown table {0:?}")]
@@ -309,6 +344,17 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
 
     let filter = bind_filter(select, schema, table)?;
 
+    // A period predicate is lifted off the token stream (the executor-glue
+    // `WHERE` is gone by the time `bind_filter` runs), so the two filter shapes
+    // are naturally mutually exclusive. Its `PERIOD(...)` endpoints fold against
+    // the transaction `now` (`ctx.snapshot`), like `AS OF` operands.
+    let period_filter = stmt
+        .temporal
+        .period_predicate
+        .as_ref()
+        .map(|clause| bind_period_predicate(clause, ctx.snapshot))
+        .transpose()?;
+
     Ok(BoundSelect {
         table: table.to_owned(),
         schema_id: schema.schema_id(),
@@ -316,7 +362,35 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
         valid_snapshot,
         projection,
         filter,
+        period_filter,
     })
+}
+
+/// Bind a parsed [`PeriodPredicateClause`] to a [`BoundPeriodPredicate`] of two
+/// constant-folded intervals ([STL-165]).
+///
+/// Each `PERIOD(from, to)` endpoint folds the same way an `AS OF` instant does
+/// ([`resolve_as_of`]); the resulting `[from, to)` must be a well-formed
+/// half-open interval (`from < to`).
+fn bind_period_predicate(
+    clause: &PeriodPredicateClause,
+    now: SystemTimeMicros,
+) -> Result<BoundPeriodPredicate, SelectError> {
+    Ok(BoundPeriodPredicate {
+        left: bind_period_operand(&clause.left, now)?,
+        predicate: clause.predicate,
+        right: bind_period_operand(&clause.right, now)?,
+    })
+}
+
+/// Fold one `PERIOD(from, to)` operand to a half-open [`Interval`].
+fn bind_period_operand(
+    operand: &PeriodExpr,
+    now: SystemTimeMicros,
+) -> Result<Interval, SelectError> {
+    let from = resolve_as_of(&operand.from, now).map_err(SelectError::PeriodOperand)?;
+    let to = resolve_as_of(&operand.to, now).map_err(SelectError::PeriodOperand)?;
+    Interval::new(from.0, to.0).map_err(SelectError::PeriodInterval)
 }
 
 /// Lower a `WHERE` clause to a [`BoundPredicate`], or `None` when there is none.
@@ -1307,5 +1381,116 @@ mod tests {
                 "expected UnsupportedPredicate for: {sql}"
             );
         }
+    }
+
+    // ---- period predicates (STL-165) ----
+
+    #[test]
+    fn no_period_predicate_leaves_the_field_unset() {
+        let catalog = catalog_with_account(1_000);
+        assert_eq!(
+            bind("SELECT balance FROM account", &catalog)
+                .unwrap()
+                .period_filter,
+            None
+        );
+    }
+
+    #[test]
+    fn each_predicate_binds_to_its_kind_and_intervals() {
+        let catalog = catalog_with_account(1_000);
+        let cases = [
+            ("CONTAINS", PeriodPredicate::Contains),
+            ("OVERLAPS", PeriodPredicate::Overlaps),
+            ("EQUALS", PeriodPredicate::Equals),
+            ("PRECEDES", PeriodPredicate::Precedes),
+            ("SUCCEEDS", PeriodPredicate::Succeeds),
+            ("MEETS", PeriodPredicate::ImmediatelyPrecedes),
+            ("IMMEDIATELY PRECEDES", PeriodPredicate::ImmediatelyPrecedes),
+            ("IMMEDIATELY SUCCEEDS", PeriodPredicate::ImmediatelySucceeds),
+        ];
+        for (kw, predicate) in cases {
+            let sql =
+                format!("SELECT balance FROM account WHERE PERIOD(10, 20) {kw} PERIOD(30, 40)");
+            assert_eq!(
+                bind(&sql, &catalog).unwrap().period_filter,
+                Some(BoundPeriodPredicate {
+                    left: Interval::new(10, 20).unwrap(),
+                    predicate,
+                    right: Interval::new(30, 40).unwrap(),
+                }),
+                "binding `{kw}`"
+            );
+        }
+    }
+
+    #[test]
+    fn period_operands_fold_like_as_of_instants() {
+        // `now()` and `now() ± interval` fold the same way an AS OF operand does.
+        let catalog = catalog_with_account(1_000);
+        let bound = bind(
+            "SELECT balance FROM account \
+             WHERE PERIOD(now() - interval '1 second', now()) OVERLAPS PERIOD(0, 1)",
+            &catalog,
+        )
+        .unwrap()
+        .period_filter
+        .unwrap();
+        assert_eq!(bound.left, Interval::new(NOW.0 - 1_000_000, NOW.0).unwrap());
+    }
+
+    #[test]
+    fn a_period_predicate_leaves_the_equality_filter_unset() {
+        // The two `WHERE` shapes are mutually exclusive: lifting the period
+        // predicate strips the clause, so the equality binder sees no selection.
+        let catalog = catalog_with_account(1_000);
+        let bound = bind(
+            "SELECT balance FROM account WHERE PERIOD(10, 20) CONTAINS PERIOD(12, 15)",
+            &catalog,
+        )
+        .unwrap();
+        assert_eq!(bound.filter, None);
+        assert!(bound.period_filter.is_some());
+    }
+
+    #[test]
+    fn a_reversed_period_operand_is_rejected() {
+        let catalog = catalog_with_account(1_000);
+        assert!(matches!(
+            bind(
+                "SELECT id FROM account WHERE PERIOD(20, 10) CONTAINS PERIOD(12, 15)",
+                &catalog,
+            ),
+            Err(SelectError::PeriodInterval(IntervalError::EmptyOrReversed(
+                20, 10
+            )))
+        ));
+    }
+
+    #[test]
+    fn an_empty_period_operand_is_rejected() {
+        let catalog = catalog_with_account(1_000);
+        assert!(matches!(
+            bind(
+                "SELECT id FROM account WHERE PERIOD(10, 10) OVERLAPS PERIOD(12, 15)",
+                &catalog,
+            ),
+            Err(SelectError::PeriodInterval(IntervalError::EmptyOrReversed(
+                10, 10
+            )))
+        ));
+    }
+
+    #[test]
+    fn an_unfoldable_period_operand_is_a_period_operand_error() {
+        // A bare column reference is not a constant instant — rejected, not guessed.
+        let catalog = catalog_with_account(1_000);
+        assert!(matches!(
+            bind(
+                "SELECT id FROM account WHERE PERIOD(balance, 20) CONTAINS PERIOD(12, 15)",
+                &catalog,
+            ),
+            Err(SelectError::PeriodOperand(_))
+        ));
     }
 }

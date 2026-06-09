@@ -2,9 +2,11 @@
 
 > **Status:** v0.1 parser bootstrap (STL-97) + DDL binding (STL-95) + the
 > `SELECT … FOR SYSTEM_TIME AS OF` query binder (STL-101), extended to the
-> **valid axis** — `FOR VALID_TIME AS OF` now binds too (STL-162). The parser,
-> the `CREATE TABLE` / `DROP TABLE` binder, and both-axes AS-OF snapshot
-> resolution are live; the executor's joint `(sys, valid)` resolution and wiring
+> **valid axis** — `FOR VALID_TIME AS OF` now binds too (STL-162) — plus the
+> SQL:2011 **period predicates** (`CONTAINS` / `OVERLAPS` / `PRECEDES` /
+> `SUCCEEDS` / `EQUALS` / `MEETS`, STL-165). The parser, the `CREATE TABLE` /
+> `DROP TABLE` binder, both-axes AS-OF snapshot resolution, and constant period
+> predicates are live; the executor's joint `(sys, valid)` resolution and wiring
 > the bound plan through the pgwire query loop land in later tickets.
 > **Read with:** [02 — Architecture §6](02-architecture.md#6-query-layer).
 
@@ -70,6 +72,53 @@ A table may carry **one qualifier per axis**, in either order, so a bitemporal
 point names both. A `VALID_TIME AS OF` against a table with no valid-time period
 is rejected at bind time (`SelectError::ValidTimeUnsupported`) — there is no valid
 axis to travel.
+
+### `PERIOD(from, to) <predicate> PERIOD(from, to)` — period predicates
+
+```sql
+SELECT * FROM booking
+  WHERE PERIOD(1700000000000000, 1700000003600000000) OVERLAPS PERIOD(now() - interval '1 hour', now());
+```
+
+The SQL:2011 **period predicates** ask range questions over two half-open
+`[from, to)` periods ([STL-165]). Each is a boolean relation between a left and a
+right `PERIOD(from, to)` operand:
+
+| Predicate                | True (for left `a`, right `b`) iff |
+|--------------------------|------------------------------------|
+| `a CONTAINS b`           | `a.from ≤ b.from` and `b.to ≤ a.to` |
+| `a OVERLAPS b`           | `a.from < b.to` and `b.from < a.to` (share a point) |
+| `a EQUALS b`             | identical bounds                   |
+| `a PRECEDES b`           | `a.to ≤ b.from`                    |
+| `a SUCCEEDS b`           | `b.to ≤ a.from`                    |
+| `a IMMEDIATELY PRECEDES b` (a.k.a. `a MEETS b`) | `a.to == b.from` |
+| `a IMMEDIATELY SUCCEEDS b` | `a.from == b.to`                 |
+
+Because periods are **half-open**, a touching boundary lands on the right side of
+the line: `PERIOD(10, 20) PRECEDES PERIOD(20, 30)` is **true** (they meet, sharing
+no point), while `PERIOD(10, 20) OVERLAPS PERIOD(20, 30)` is **false**. The end of
+a period may be `+∞` (an open period). The exhaustive boundary truth table is
+pinned in `stele-exec`'s tests.
+
+Like `FOR … AS OF`, the predicate is lifted off the token stream (`sqlparser-rs`
+has no grammar for these keywords) and bound separately. **v0.2 status**, each a
+deliberate boundary, not a silent gap:
+
+- A period predicate is recognized only as the **entire** `WHERE` clause (it
+  begins with `PERIOD`). Combining it with other conditions
+  (`… OVERLAPS … AND id = 1`) is rejected, not silently half-applied.
+- Each `PERIOD(from, to)` endpoint folds to a **constant instant** the same way an
+  `AS OF` operand does (`now()`, `now() ± interval '…'`, an integer microsecond
+  literal). The whole predicate is therefore a constant truth value the executor
+  applies once: a false predicate returns no rows. Building a period from a row's
+  value columns (a per-row filter) is the deferred follow-up — it needs the
+  vectorized Filter operator and a civil-time literal codec.
+- An endpoint that folds to an empty or reversed `[from, to)` (`from ≥ to`) is a
+  bind error — half-open periods require `from < to`.
+
+Captured as `Temporal::period_predicate: Option<PeriodPredicateClause>`; bound to
+a `BoundPeriodPredicate` of two `Interval`s and a `PeriodPredicate`, evaluated by
+[`stele_exec::evaluate`].
 
 ### `CREATE TABLE … WITH SYSTEM VERSIONING` — opt into system-time history
 
@@ -178,9 +227,13 @@ Statement
 └── temporal: Temporal
     ├── system_versioning: bool         // WITH SYSTEM VERSIONING
     ├── valid_time: Option<ValidTimePeriod>   // VALID TIME (from, to)
-    └── as_of: Vec<AsOf>                 // FOR <axis> AS OF <expr>
-        ├── dimension: TimeDimension { System | Valid }
-        └── timestamp: sqlparser::ast::Expr
+    ├── as_of: Vec<AsOf>                 // FOR <axis> AS OF <expr>
+    │   ├── dimension: TimeDimension { System | Valid }
+    │   └── timestamp: sqlparser::ast::Expr
+    └── period_predicate: Option<PeriodPredicateClause>   // PERIOD(..) <pred> PERIOD(..)
+        ├── left:  PeriodExpr { from, to: sqlparser::ast::Expr }
+        ├── predicate: PeriodPredicate { Contains | Overlaps | Equals | … }
+        └── right: PeriodExpr { from, to: sqlparser::ast::Expr }
 ```
 
 A statement with no temporal grammar carries `Temporal::default()` (all empty);
@@ -193,7 +246,10 @@ These are recognized as future work, not silently accepted. Some are already
 
 - `FOR VALID_TIME AS OF` executor resolution (binds and carries the instant; the
   joint `(sys, valid)` version pick is STL-163 — above).
-- Period predicates (`WHERE … CONTAINS PERIOD …`, `OVERLAPS`).
+- **Per-row** period predicates — a `PERIOD(...)` built from a row's valid/system
+  value columns rather than constant instants. The constant forms parse, bind,
+  and evaluate today ([above](#periodfrom-to-predicate-periodfrom-to--period-predicates));
+  the per-row filter rides with the vectorized Filter operator + civil-time codec.
 - `AS OF` on DML and on system-versioned `DROP`/`ALTER`.
 - A hand-written parser — revisited only if `sqlparser-rs` becomes a constraint
   ([Architecture §6](02-architecture.md#6-query-layer)).

@@ -18,7 +18,12 @@
 //! aggregate / join / filter operators (STL-77 C10–C13) build on this trait.
 
 mod operator;
+mod period;
 mod snapshot_scan;
 
 pub use operator::{DEFAULT_BATCH_SIZE, Operator, Project, ScanSource};
+pub use period::evaluate;
 pub use snapshot_scan::{Batch, Column, ScanError, ScanOutput, ScanStats, SnapshotScan};
+// Re-exported so consumers (the binder's bound predicate, the oracle) name the
+// same period vocabulary the evaluator works in ([STL-165]).
+pub use stele_common::period::{Interval, IntervalError, PeriodPredicate};

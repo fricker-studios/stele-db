@@ -11,6 +11,7 @@
 //! `std`, but avoid `tokio`, file I/O, and global state).
 
 pub mod hash;
+pub mod period;
 pub mod provenance;
 pub mod row_codec;
 pub mod time;
