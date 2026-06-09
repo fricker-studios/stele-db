@@ -11,6 +11,7 @@
 //! these types capture and the v0.1 implementation status of each piece.
 
 use sqlparser::ast::{Expr, Ident, Statement as SqlStatement};
+use stele_common::period::PeriodPredicate;
 
 /// One parsed top-level SQL statement.
 #[derive(Debug, Clone)]
@@ -49,6 +50,35 @@ pub struct Temporal {
     /// `FOR { SYSTEM_TIME | VALID_TIME } AS OF <expr>` qualifiers, one per
     /// table reference that carried one, in left-to-right source order.
     pub as_of: Vec<AsOf>,
+    /// A `WHERE PERIOD(a, b) <pred> PERIOD(c, d)` period predicate lifted off the
+    /// token stream, when the whole `WHERE` is one ([STL-165]). `sqlparser` has
+    /// no grammar for the period predicates, so — like `AS OF` — they are lifted
+    /// here and bound separately; `body`'s `WHERE` is left clean.
+    pub period_predicate: Option<PeriodPredicateClause>,
+}
+
+/// A parsed `PERIOD(from, to) <predicate> PERIOD(from, to)` clause — the
+/// SQL:2011 period predicate forms, captured before binding ([STL-165]).
+///
+/// Each side's `from` / `to` is an arbitrary scalar expression (the binder folds
+/// each to a concrete microsecond instant, the same way `AS OF` operands fold).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeriodPredicateClause {
+    /// The left period operand.
+    pub left: PeriodExpr,
+    /// Which period predicate relates the two operands.
+    pub predicate: PeriodPredicate,
+    /// The right period operand.
+    pub right: PeriodExpr,
+}
+
+/// A `PERIOD(from, to)` operand: the two endpoint expressions of one period.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeriodExpr {
+    /// The inclusive-start expression.
+    pub from: Expr,
+    /// The exclusive-end expression.
+    pub to: Expr,
 }
 
 /// The `(from, to)` column pair declared by `VALID TIME (from, to)`.

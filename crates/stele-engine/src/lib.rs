@@ -48,7 +48,7 @@ use stele_common::provenance::{Principal, TxnId};
 use stele_common::row_codec::{self, RowCodecError};
 use stele_common::time::{Clock, SystemTimeMicros};
 use stele_common::types::{LogicalType, ScalarValue};
-use stele_exec::{Batch, Column, ScanError, SnapshotScan};
+use stele_exec::{Batch, Column, ScanError, SnapshotScan, evaluate};
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::dml::{BoundDml, DmlError};
 use stele_sql::select::{BoundSelect, Projection, SelectError};
@@ -614,6 +614,25 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .map(|c| (c.name().to_owned(), c.ty()))
             .collect();
         let value_count = schema_columns.len().saturating_sub(1);
+
+        // A constant period predicate ([STL-165]) is a whole-`WHERE` filter that
+        // folds to a single truth value: when it is false no row qualifies, so the
+        // scan is skipped and an empty result with the correct header is returned
+        // (never a silently-unfiltered read). A true predicate constrains no
+        // individual row, so the scan below proceeds unfiltered.
+        if let Some(p) = &bound.period_filter {
+            if !evaluate(p.predicate, p.left, p.right) {
+                let projection = projection_indices(&bound.projection, &schema_columns);
+                let columns = projection
+                    .iter()
+                    .map(|&i| schema_columns[i].clone())
+                    .collect();
+                return Ok(StatementOutcome::Rows(SelectResult {
+                    columns,
+                    rows: Vec::new(),
+                }));
+            }
+        }
 
         // Push a key-equality predicate down to the scan for zone-map pruning; a
         // filter on a value column lives inside the opaque payload, which a zone
@@ -1846,6 +1865,51 @@ mod tests {
                 .rows
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_constant_period_predicate_is_honored_end_to_end() {
+        // STL-165: a `WHERE PERIOD(..) <pred> PERIOD(..)` folds to a constant
+        // truth value the engine applies. A true predicate returns every row; a
+        // false one returns none — never a silently-unfiltered read.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_WIDE)).expect("create");
+        for sql in [
+            "INSERT INTO t VALUES (1, 10, 'one')",
+            "INSERT INTO t VALUES (2, 20, 'two')",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+
+        // [10,40) CONTAINS [20,30) → true: every row survives, header preserved.
+        let r = select(
+            &mut engine,
+            "SELECT id FROM t WHERE PERIOD(10, 40) CONTAINS PERIOD(20, 30)",
+        );
+        assert_eq!(r.columns, vec![("id".to_owned(), LogicalType::Int4)]);
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![cell(Some(ScalarValue::Int4(1)))],
+                vec![cell(Some(ScalarValue::Int4(2)))],
+            ]
+        );
+
+        // [10,20) OVERLAPS [20,30) → false (half-open, they only touch): no rows,
+        // but the column header is still the projected one.
+        let r = select(
+            &mut engine,
+            "SELECT id FROM t WHERE PERIOD(10, 20) OVERLAPS PERIOD(20, 30)",
+        );
+        assert_eq!(r.columns, vec![("id".to_owned(), LogicalType::Int4)]);
+        assert!(r.rows.is_empty());
+
+        // The touching pair *does* satisfy PRECEDES (and MEETS): all rows return.
+        let r = select(
+            &mut engine,
+            "SELECT id FROM t WHERE PERIOD(10, 20) PRECEDES PERIOD(20, 30)",
+        );
+        assert_eq!(r.rows.len(), 2);
     }
 
     #[test]

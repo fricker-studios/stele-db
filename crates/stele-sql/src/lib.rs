@@ -74,15 +74,17 @@ mod parser;
 pub mod select;
 pub mod types;
 
-pub use ast::{AsOf, Statement, Temporal, TimeDimension, ValidTimePeriod};
+pub use ast::{
+    AsOf, PeriodExpr, PeriodPredicateClause, Statement, Temporal, TimeDimension, ValidTimePeriod,
+};
 pub use ddl::{BindError, DdlOutcome, DdlStatement, bind_ddl};
 pub use dialect::SteleDialect;
 pub use dml::{BoundDml, DmlError, bind_dml};
 pub use error::ParseError;
 pub use parser::parse;
 pub use select::{
-    AsOfError, BindContext, BoundPredicate, BoundSelect, Projection, SelectError, bind_select,
-    resolve_as_of,
+    AsOfError, BindContext, BoundPeriodPredicate, BoundPredicate, BoundSelect, Projection,
+    SelectError, bind_select, resolve_as_of,
 };
 pub use types::logical_type;
 
