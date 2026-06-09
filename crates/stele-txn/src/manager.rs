@@ -137,6 +137,34 @@ pub enum TxnError {
     Wal(#[from] WalError),
 }
 
+/// Why [`TxnManager::recover`] refused to restart from a commit log — the
+/// fail-closed outcomes of the recovery path.
+#[derive(Debug, thiserror::Error)]
+pub enum RecoverError {
+    /// The commit-log hash chain failed to verify: a tampered historical record
+    /// ([`ChainError::BrokenLink`]), a malformed durable frame
+    /// ([`ChainError::Decode`]), or an unreadable record
+    /// ([`ChainError::Replay`] — including a torn-write tail, since the commit
+    /// log has no durable fence yet to vouch a tail benign; see
+    /// [`recover`](TxnManager::recover)). The tamper-evidence signal.
+    #[error(transparent)]
+    Chain(#[from] ChainError),
+
+    /// A recovered monotonic counter already sits at [`u64::MAX`], so resuming
+    /// would overflow it and reuse an id or sequence number. Unreachable from an
+    /// honest log — no real history reaches 2⁶⁴ commits — so it signals a corrupt
+    /// or maliciously-crafted (but internally chain-consistent) log; recovery
+    /// fails closed rather than wrap into reuse. `counter` names which one.
+    #[error(
+        "commit-log recovery: the {counter} counter is exhausted (reached u64::MAX); \
+         cannot resume without reuse"
+    )]
+    CounterExhausted {
+        /// Which counter is exhausted — `"seq"` or `"txn_id"`.
+        counter: &'static str,
+    },
+}
+
 /// A handle on an in-flight transaction: its identity, its read snapshot, and
 /// the set of keys it intends to write.
 ///
@@ -278,11 +306,11 @@ impl<C: Clock, D: Disk> TxnManager<C, D> {
     ///
     /// This is the tamper-evidence guarantee made load-bearing on the restart
     /// path: recovery replays the durable commit log from genesis through
-    /// [`verify_chain_recover`] and **fails
-    /// closed** — any broken link, malformed frame, or unreadable record aborts
-    /// the boot with a [`ChainError`] rather than serving a log a privileged
-    /// writer may have silently rewritten. A clean log is rebuilt into a manager
-    /// that resumes exactly where the crashed one left off:
+    /// [`verify_chain_recover`] and **fails closed** — any broken link, malformed
+    /// frame, or unreadable record aborts the boot with a [`RecoverError`] rather
+    /// than serving a log a privileged writer may have silently rewritten. A clean
+    /// log is rebuilt into a manager that resumes exactly where the crashed one
+    /// left off:
     ///
     /// * the commit cursor at the greatest committed timestamp, so every new
     ///   commit is strictly later than all recovered history;
@@ -299,33 +327,62 @@ impl<C: Clock, D: Disk> TxnManager<C, D> {
     /// crash that left an in-flight transaction simply loses it, the correct
     /// snapshot-isolation outcome.)
     ///
+    /// ## Scope of the verification (two deliberate deferrals)
+    ///
     /// Recovery here is the bare genesis walk, which catches any tampered
-    /// *historical* record. Anchoring it against a durably-remembered head — to
-    /// also catch a wholesale rewrite, via
-    /// [`verify_chain_to`](crate::chain::verify_chain_to) — waits on the
-    /// checkpoint/witness mechanism (the seed of the ~v0.5 Merkle proofs); see
-    /// [`commit_head`](Self::commit_head).
+    /// *historical* record. Two stronger guarantees both wait on a **durable
+    /// checkpoint for the commit-log WAL** — a persisted `{witness head, fence
+    /// offset}` — which does not exist yet:
+    ///
+    /// * **Wholesale-rewrite detection.** A log re-chained from genesis (every
+    ///   link recomputed) passes the bare walk; catching it needs
+    ///   [`verify_chain_to`](crate::chain::verify_chain_to) against a
+    ///   durably-remembered head (the witness — seed of the ~v0.5 Merkle proofs;
+    ///   see [`commit_head`](Self::commit_head)).
+    /// * **Graceful torn-tail recovery.** A crash mid-`append` can leave a torn
+    ///   final record the WAL reports as corruption ([`ChainError::Replay`]).
+    ///   This recovery **fails closed on it** rather than dropping it, because
+    ///   without a persisted fence a torn tail is indistinguishable from a
+    ///   maliciously truncated/corrupted log — and silently accepting the prefix
+    ///   would be a tamper-evidence hole, not robustness. Distinguishing the two
+    ///   is what the storage tier's fenced
+    ///   [`recover_replay`](stele_storage::dml) does with its durable
+    ///   `LogOffset`; the commit log gains the same fence with the witness work.
+    ///
+    /// Both are folded into the durable-witness follow-up (STL-196).
     ///
     /// [ADR-0026]: ../../../docs/adr/0026-verifiable-audit-log.md
     ///
     /// # Errors
     ///
-    /// [`ChainError`] if the commit log fails to verify — the fail-closed signal:
-    /// [`ChainError::BrokenLink`] for a tampered historical record,
-    /// [`ChainError::Decode`] for a malformed frame, or [`ChainError::Replay`]
-    /// for an unreadable one.
-    pub fn recover(clock: C, wal: Wal<D>) -> Result<Self, ChainError> {
+    /// * [`RecoverError::Chain`] if the commit log fails to verify — the
+    ///   fail-closed signal: a tampered historical record, a malformed frame, or
+    ///   an unreadable/torn record.
+    /// * [`RecoverError::CounterExhausted`] if a recovered `seq` / `txn_id` is
+    ///   already at [`u64::MAX`], so resuming would overflow into reuse — only
+    ///   reachable from a corrupt or forged log.
+    pub fn recover(clock: C, wal: Wal<D>) -> Result<Self, RecoverError> {
         let recovered = verify_chain_recover(wal.replay_from(Checkpoint::BEGIN))?;
+        // One past the greatest recovered id/seq — both 0 for an empty log, so an
+        // empty recovery matches a fresh `new` (next_txn / next_seq = 1).
+        // `checked_add` fails closed instead of overflowing a `u64::MAX` counter
+        // (unreachable on an honest log; a forged one must not wrap into reuse).
+        let next_txn = recovered
+            .max_txn_id
+            .0
+            .checked_add(1)
+            .ok_or(RecoverError::CounterExhausted { counter: "txn_id" })?;
+        let next_seq = recovered
+            .seq
+            .checked_add(1)
+            .ok_or(RecoverError::CounterExhausted { counter: "seq" })?;
         Ok(Self {
             clock,
             wal,
             state: Mutex::new(State {
                 cursor: recovered.commit_ts,
-                // One past the greatest recovered id/seq — both 0 for an empty
-                // log, so an empty recovery matches a fresh `new` (next_txn /
-                // next_seq = 1).
-                next_txn: recovered.max_txn_id.0 + 1,
-                next_seq: recovered.seq + 1,
+                next_txn,
+                next_seq,
                 commit_head: recovered.head,
                 write_index: BTreeMap::new(),
             }),
@@ -988,9 +1045,55 @@ mod tests {
         match err {
             // Record 2 back-links to record 1, whose hash changed — the break
             // surfaces at index 2.
-            ChainError::BrokenLink { index, .. } => assert_eq!(index, 2),
+            RecoverError::Chain(ChainError::BrokenLink { index, .. }) => assert_eq!(index, 2),
             other => panic!("expected a broken link, got {other:?}"),
         }
+    }
+
+    /// Recovery fails closed instead of overflowing a monotonic counter: a log
+    /// whose last record already carries a `u64::MAX` `seq` / `txn_id` (only a
+    /// corrupt or forged log can) must refuse rather than wrap `next_seq` /
+    /// `next_txn` into reuse. The single record chains from genesis, so the chain
+    /// itself verifies — the exhaustion guard is what rejects it.
+    #[test]
+    fn recover_fails_closed_when_a_counter_is_exhausted() {
+        // Lay a single internally-consistent record with an exhausted counter onto
+        // a fresh WAL (valid CRC), reopen, and recover.
+        let recover_with = |rec: CommitRecord| {
+            let disk = MemDisk::new();
+            let wal = Wal::open(disk.clone(), WalConfig::default()).expect("open wal");
+            wal.append(&rec.encode()).expect("append");
+            wal.tick().expect("tick");
+            drop(wal);
+            let reopened = Wal::open(disk, WalConfig::default()).expect("reopen");
+            TxnManager::recover(StubClock::new(10), reopened)
+        };
+
+        // seq at the ceiling (txn_id small) ⇒ the seq counter is the exhausted one.
+        let err = recover_with(CommitRecord {
+            txn_id: TxnId(1),
+            commit_ts: SystemTimeMicros(10),
+            seq: u64::MAX,
+            prev_hash: Digest::ZERO,
+        })
+        .expect_err("seq exhaustion must fail closed");
+        assert!(
+            matches!(err, RecoverError::CounterExhausted { counter: "seq" }),
+            "got {err:?}"
+        );
+
+        // txn_id at the ceiling (seq small) ⇒ the txn_id counter is exhausted.
+        let err = recover_with(CommitRecord {
+            txn_id: TxnId(u64::MAX),
+            commit_ts: SystemTimeMicros(10),
+            seq: 1,
+            prev_hash: Digest::ZERO,
+        })
+        .expect_err("txn_id exhaustion must fail closed");
+        assert!(
+            matches!(err, RecoverError::CounterExhausted { counter: "txn_id" }),
+            "got {err:?}"
+        );
     }
 
     /// `begin` hands out monotonically increasing transaction ids.
