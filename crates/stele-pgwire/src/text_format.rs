@@ -22,6 +22,7 @@
 //! | `date`      | ISO-8601 `YYYY-MM-DD`                                |
 //! | `uuid`      | canonical lowercase `8-4-4-4-12` hex                 |
 //! | `bytea`     | `\x` + lowercase hex (Postgres `bytea_output = hex`) |
+//! | `period`    | `tsrange` text, e.g. `["…","…")` (half-open)         |
 //!
 //! Timestamps and dates are stored as raw offsets from the Unix epoch
 //! (microseconds and days respectively — see [`stele_common::types`]); the
@@ -34,6 +35,7 @@
 //! the length-`-1` sentinel ([STL-105] Definition of Done) and never calls in
 //! here.
 
+use stele_common::period::Interval;
 use stele_common::types::{LogicalType, ScalarValue};
 
 /// Microseconds in one second.
@@ -52,7 +54,8 @@ pub(crate) const fn pg_typlen(ty: LogicalType) -> i16 {
         LogicalType::Int8 | LogicalType::Timestamp => 8,
         LogicalType::Bool => 1,
         LogicalType::Uuid => 16,
-        LogicalType::Text | LogicalType::Bytea => -1,
+        // `text`, `bytea`, and `tsrange` are all variable-length (`typlen = -1`).
+        LogicalType::Text | LogicalType::Bytea | LogicalType::Period => -1,
     }
 }
 
@@ -70,6 +73,23 @@ pub(crate) fn encode_text(value: &ScalarValue) -> String {
         ScalarValue::Date(days) => format_date(*days),
         ScalarValue::Uuid(bytes) => format_uuid(bytes),
         ScalarValue::Bytea(bytes) => format_bytea(bytes),
+        ScalarValue::Period(iv) => format_period(iv),
+    }
+}
+
+/// Render a `period` in Postgres `tsrange` text format: a `[`, the lower bound,
+/// the upper bound, and a `)` — lower inclusive, upper exclusive, matching the
+/// half-open `[from, to)` value. Each finite bound is the `timestamp` rendering
+/// in double quotes (Postgres quotes range elements that contain spaces); an
+/// open-ended period (`to == i64::MAX`) leaves the upper slot empty, exactly as
+/// `psql` prints `["…",)`.
+fn format_period(iv: &Interval) -> String {
+    let lower = format_timestamp(iv.from);
+    if iv.to == i64::MAX {
+        format!("[\"{lower}\",)")
+    } else {
+        let upper = format_timestamp(iv.to);
+        format!("[\"{lower}\",\"{upper}\")")
     }
 }
 
@@ -196,6 +216,11 @@ mod tests {
             -1,
             "bytea is variable-length"
         );
+        assert_eq!(
+            pg_typlen(LogicalType::Period),
+            -1,
+            "tsrange is variable-length"
+        );
     }
 
     #[test]
@@ -230,6 +255,22 @@ mod tests {
         assert_eq!(
             encode_text(&ScalarValue::Bytea(vec![0x00, 0x01, 0x0F, 0xA0])),
             "\\x00010fa0"
+        );
+    }
+
+    #[test]
+    fn period_renders_as_postgres_tsrange_text() {
+        // 2023-11-14 22:13:20 UTC and one hour later — half-open `[lower,upper)`.
+        let from = 1_700_000_000_000_000;
+        let to = from + 3_600_000_000;
+        assert_eq!(
+            encode_text(&ScalarValue::Period(Interval::new(from, to).unwrap())),
+            "[\"2023-11-14 22:13:20\",\"2023-11-14 23:13:20\")"
+        );
+        // An open-ended period leaves the upper slot empty, as psql prints it.
+        assert_eq!(
+            encode_text(&ScalarValue::Period(Interval::new(from, i64::MAX).unwrap())),
+            "[\"2023-11-14 22:13:20\",)"
         );
     }
 

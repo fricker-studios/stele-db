@@ -85,6 +85,7 @@ use tracing::{debug, error, info, instrument, warn};
 pub use stele_common::DEFAULT_PG_PORT;
 
 use stele_catalog::CatalogError;
+use stele_common::hashkey::hash_key;
 use stele_common::time::Clock;
 use stele_common::types::{DecodeError, LogicalType, ScalarValue};
 use stele_engine::{
@@ -97,7 +98,8 @@ use stele_storage::backend::Disk;
 // from there, so matching on the AST adds no new dependency.
 use stele_sql::select::SelectError;
 use stele_sql::sqlparser::ast::{
-    Expr, SelectItem, SetExpr, Statement as SqlStatement, UnaryOperator, Value,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr,
+    Statement as SqlStatement, UnaryOperator, Value,
 };
 use stele_sql::{BindError, DmlError, Statement, bind_ddl};
 
@@ -1169,12 +1171,16 @@ const fn sqlstate_for(err: &EngineError) -> &'static str {
 }
 
 /// Recognize a constant, tableless `SELECT` whose projection is integer literals
-/// — `SELECT 1`, `SELECT 1, 2 AS k`. Returns the columns to send back, or `None`
-/// for anything that needs the binder/executor (a `FROM`, a `WHERE`, non-integer
-/// or computed expressions). Integer-only keeps this honest: it is the canonical
-/// connectivity smoke test, not a back-door scalar evaluator. The full v0.1
-/// scalar set has text encoders ([`text_format`]); they reach the wire through
-/// the table-read path the routing tickets add, not through this literal probe.
+/// — `SELECT 1`, `SELECT 1, 2 AS k` — plus the builtin `hash(...)` over literal
+/// arguments ([STL-179]). Returns the columns to send back, or `None` for
+/// anything that needs the binder/executor (a `FROM`, a `WHERE`, a column
+/// reference, a non-integer expression, or a function other than `hash`).
+///
+/// This stays a *constant* evaluator, not a back-door scalar engine: every
+/// recognized form folds to a value with no table access. The full scalar set's
+/// text encoders ([`text_format`]) reach the wire through the table-read path the
+/// routing tickets add; only deliberately-specified constants — integer literals
+/// and the portable `hash` key ([`hash_key`]) — are answered here.
 fn constant_select(stmt: &Statement) -> Option<Vec<ResultColumn>> {
     let SqlStatement::Query(query) = &stmt.body else {
         return None;
@@ -1197,19 +1203,105 @@ fn constant_select(stmt: &Statement) -> Option<Vec<ResultColumn>> {
             SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
             _ => return None,
         };
-        let parsed = integer_literal(expr)?;
-        // A literal that fits `i32` is `int4`, matching Postgres's typing of a
-        // small integer constant; anything wider escalates to `int8`.
-        let value =
-            i32::try_from(parsed).map_or_else(|_| ScalarValue::Int8(parsed), ScalarValue::Int4);
+        // Each item folds to its value and a default column name; an explicit
+        // `AS` alias overrides the default. A single unrecognized item makes the
+        // whole statement defer to the binder/executor.
+        let (value, default_name) = constant_value(expr)?;
         columns.push(ResultColumn {
-            // Postgres labels an unaliased expression column `?column?`.
-            name: alias.unwrap_or_else(|| "?column?".to_owned()),
+            name: alias.unwrap_or_else(|| default_name.to_owned()),
             ty: value.logical_type(),
             value: Some(value),
         });
     }
     Some(columns)
+}
+
+/// Fold one tableless projection expression to its constant value and the column
+/// name Postgres would give it. `None` for anything not a recognized constant.
+fn constant_value(expr: &Expr) -> Option<(ScalarValue, &'static str)> {
+    // The portable hash key — `hash(<literals>)` — before the integer probe, so a
+    // `hash(...)` call is never misread as a non-literal.
+    if let Some(digest) = hash_call(expr) {
+        return Some((ScalarValue::Text(digest), "hash"));
+    }
+    let parsed = integer_literal(expr)?;
+    // A literal that fits `i32` is `int4`, matching Postgres's typing of a small
+    // integer constant; anything wider escalates to `int8`. Postgres labels an
+    // unaliased expression column `?column?`.
+    let value = i32::try_from(parsed).map_or_else(|_| ScalarValue::Int8(parsed), ScalarValue::Int4);
+    Some((value, "?column?"))
+}
+
+/// Recognize the builtin `hash(arg, ...)` over literal arguments and return its
+/// lowercase-hex digest ([`hash_key`], spec [`docs/hash-key-v1.md`]). `None` for
+/// any other call, or a `hash(...)` whose arguments are not all literals (e.g. a
+/// column reference) — that defers to the binder, which rejects it (per-row
+/// `hash` over a column is [STL-181]/the projection work, not this surface).
+///
+/// [`docs/hash-key-v1.md`]: ../../../docs/hash-key-v1.md
+fn hash_call(expr: &Expr) -> Option<String> {
+    let Expr::Function(func) = expr else {
+        return None;
+    };
+    // Unqualified, case-insensitive `hash`.
+    let [part] = func.name.0.as_slice() else {
+        return None;
+    };
+    if !part
+        .as_ident()
+        .is_some_and(|id| id.value.eq_ignore_ascii_case("hash"))
+    {
+        return None;
+    }
+    // Positional literal arguments only; `hash()` with no arguments is the
+    // well-defined empty key.
+    let raw = match &func.args {
+        FunctionArguments::None => &[][..],
+        FunctionArguments::List(list) => list.args.as_slice(),
+        FunctionArguments::Subquery(_) => return None,
+    };
+    let mut args = Vec::with_capacity(raw.len());
+    for arg in raw {
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg else {
+            return None;
+        };
+        // A non-literal argument (e.g. a column) makes the whole call defer.
+        args.push(match hash_arg_literal(e)? {
+            ArgLit::Null => None,
+            ArgLit::Value(v) => Some(v),
+        });
+    }
+    Some(hash_key(&args).to_hex())
+}
+
+/// A recognized `hash(...)` argument literal: SQL `NULL`, or a typed value.
+enum ArgLit {
+    /// The SQL `NULL` literal — hashed as the distinct NULL frame.
+    Null,
+    /// A typed value literal.
+    Value(ScalarValue),
+}
+
+/// Fold a `hash(...)` argument literal to an [`ArgLit`], or `None` for a
+/// non-literal. The literal *shape* picks the type: a string is `text`, a boolean
+/// is `bool`, an integer is `int4`/`int8`. (Civil-time literals have no codec at
+/// v0.2, mirroring `AS OF` and the SQL binder's literal fold; the spec covers
+/// those types for clients that build keys directly.)
+fn hash_arg_literal(expr: &Expr) -> Option<ArgLit> {
+    if let Expr::Value(value) = expr {
+        match &value.value {
+            Value::Null => return Some(ArgLit::Null),
+            Value::SingleQuotedString(s) => {
+                return Some(ArgLit::Value(ScalarValue::Text(s.clone())));
+            }
+            Value::Boolean(b) => return Some(ArgLit::Value(ScalarValue::Bool(*b))),
+            _ => {}
+        }
+    }
+    // Integers (with an optional leading sign) reuse the smoke-test folder.
+    let n = integer_literal(expr)?;
+    let value = i32::try_from(n).map_or_else(|_| ScalarValue::Int8(n), ScalarValue::Int4);
+    Some(ArgLit::Value(value))
 }
 
 /// Fold an integer-literal expression to its value, or `None` for anything that
@@ -2371,6 +2463,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn constant_select_evaluates_the_hash_builtin() {
+        // `hash(...)` over literals folds to a TEXT column named `hash`, carrying
+        // the spec digest's lowercase hex — and matches the published vector.
+        let want = stele_common::hashkey::vectors()
+            .into_iter()
+            .find(|v| v.label == "text 'acme'")
+            .unwrap()
+            .hex;
+        let stmt = stele_sql::parse("SELECT hash('acme')").unwrap();
+        let cols = constant_select(&stmt[0]).expect("hash() is constant");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].name, "hash");
+        assert_eq!(cols[0].ty, LogicalType::Text);
+        assert_eq!(cols[0].value, Some(ScalarValue::Text(want.to_owned())));
+
+        // Mixed literal types, an alias, and a NULL argument all fold; the result
+        // is the composite vector's digest.
+        let composite = stele_common::hashkey::vectors()
+            .into_iter()
+            .find(|v| v.label == "composite ('acme', 42, NULL)")
+            .unwrap()
+            .hex;
+        let stmt = stele_sql::parse("SELECT hash('acme', 42, NULL) AS bk").unwrap();
+        let cols = constant_select(&stmt[0]).expect("hash() is constant");
+        assert_eq!(cols[0].name, "bk");
+        assert_eq!(cols[0].value, Some(ScalarValue::Text(composite.to_owned())));
+
+        // Case-insensitive, and the no-argument empty key is well-defined.
+        assert!(constant_select(&stele_sql::parse("SELECT HASH()").unwrap()[0]).is_some());
+
+        // A `hash` over a column reference is not constant — it defers to the
+        // binder (which has no per-row hash projection yet), as does any other
+        // function call.
+        for sql in [
+            "SELECT hash(id)",
+            "SELECT lower('x')",
+            "SELECT hash(1) FROM t",
+        ] {
+            let stmt = stele_sql::parse(sql).unwrap();
+            assert!(
+                constant_select(&stmt[0]).is_none(),
+                "{sql} must defer to the binder"
+            );
+        }
+    }
+
     /// Parse a `DataRow` payload into its per-column cells: `None` is the NULL
     /// sentinel (length `-1`), `Some(bytes)` is a present text-format value.
     fn parse_data_row(payload: &[u8]) -> Vec<Option<Vec<u8>>> {
@@ -2823,6 +2962,37 @@ mod tests {
         let (kind, payload) = read_message(&mut client).await;
         assert_eq!(kind, MSG_DATA_ROW);
         assert_eq!(&payload[6..], b"7");
+
+        let (kind, payload) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_COMMAND_COMPLETE);
+        assert_eq!(payload, b"SELECT 1\0");
+
+        let (kind, _) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_READY_FOR_QUERY);
+        terminate(server, client).await;
+    }
+
+    #[tokio::test]
+    async fn hash_builtin_round_trips_the_spec_digest() {
+        // End-to-end: `SELECT hash('acme')` flows through the simple-query path
+        // (the same route as `SELECT 1`) and the digest text reaches the wire,
+        // matching the published v1 vector — the SQL-callable half of the DoD.
+        let want = stele_common::hashkey::vectors()
+            .into_iter()
+            .find(|v| v.label == "text 'acme'")
+            .unwrap()
+            .hex;
+        let (server, mut client) = connect_past_handshake().await;
+        send_query(&mut client, "SELECT hash('acme')").await;
+
+        let (kind, payload) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_ROW_DESCRIPTION);
+        assert!(payload.windows(4).any(|w| w == b"hash"));
+
+        let (kind, payload) = read_message(&mut client).await;
+        assert_eq!(kind, MSG_DATA_ROW);
+        // Skip the 2-byte column count and the 4-byte length prefix.
+        assert_eq!(&payload[6..], want.as_bytes());
 
         let (kind, payload) = read_message(&mut client).await;
         assert_eq!(kind, MSG_COMMAND_COMPLETE);

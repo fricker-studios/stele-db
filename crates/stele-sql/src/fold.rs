@@ -95,9 +95,13 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
                 .map(ScalarValue::Bytea)
                 .ok_or_else(|| FoldError::BadLiteral { literal: s.clone() })
         }
-        // No civil-time literal codec at v0.2 (mirrors AS OF); a TIMESTAMP/DATE
-        // column cannot be written or compared against a literal yet.
-        ty @ (LogicalType::Timestamp | LogicalType::Date) => Err(FoldError::UnsupportedType(ty)),
+        // No civil-time or period literal codec at v0.2 (mirrors AS OF); a
+        // TIMESTAMP/DATE/PERIOD column cannot be written or compared against a
+        // literal yet. (Period predicates build their intervals from PERIOD(a,b)
+        // endpoints, not from a folded period scalar — see stele-exec.)
+        ty @ (LogicalType::Timestamp | LogicalType::Date | LogicalType::Period) => {
+            Err(FoldError::UnsupportedType(ty))
+        }
     }
 }
 
