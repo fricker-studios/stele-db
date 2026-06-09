@@ -23,8 +23,8 @@ use crate::validtime::{VALID_TIME_PREFIX_LEN, unframe_payload};
 use super::SegmentError;
 use super::format::{
     BYTES_NULL_SENTINEL, CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FORMAT_VERSION, HEADER_LEN,
-    HEADER_MAGIC, MAX_BYTES_STAT_PREFIX_LEN, SCHEMA_ID_IMPLICIT_VERSION, TRAILER_LEN,
-    TRAILER_MAGIC,
+    HEADER_MAGIC, MAX_BYTES_STAT_PREFIX_LEN, SCHEMA_ID_IMPLICIT_VERSION, STAT_MAX_UNBOUNDED,
+    STAT_MIN_UNBOUNDED, TRAILER_LEN, TRAILER_MAGIC,
 };
 
 /// Streaming writer over a single sealed-segment file.
@@ -251,10 +251,50 @@ impl<F: DiskFile> SegmentWriter<F> {
     }
 }
 
+/// One end (min or max) of a column's encoded zone-map stat, before it is laid
+/// into the footer column entry.
+///
+/// The footer encodes a stat field as a length-prefixed byte run; [`Self::Absent`]
+/// and [`Self::Unbounded`] both write zero bytes and are told apart by the
+/// per-entry stat-presence flag ([STL-120]): an absent stat leaves the flag bit
+/// clear (the classic "no stats" sentinel), an unbounded stat sets it.
+enum StatBound {
+    /// No statistic for this end — the column had no (non-NULL) values. Encodes
+    /// as a zero-length field with the flag bit clear.
+    Absent,
+    /// A concrete bound: the length-prefixed bytes (lex prefix for a bytes
+    /// column) or the 8 LE bytes of an `i64` bound.
+    Value(Vec<u8>),
+    /// A present but *open* end — −∞ for a min, +∞ for a max ([STL-120]). Arises
+    /// only for a bounded-prefix bytes column whose prefix degenerates (empty
+    /// lex-min, or an all-`0xFF` max with no shorter upper bound). Encodes as a
+    /// zero-length field with the flag bit set.
+    Unbounded,
+}
+
+impl StatBound {
+    /// The flag bit this end contributes to the column entry's stat-flags byte:
+    /// `unbounded_bit` when open, otherwise none.
+    const fn flag(&self, unbounded_bit: u8) -> u8 {
+        match self {
+            Self::Unbounded => unbounded_bit,
+            Self::Absent | Self::Value(_) => 0,
+        }
+    }
+
+    /// The length-prefixed stat bytes — empty for an absent or unbounded end.
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Value(v) => v,
+            Self::Absent | Self::Unbounded => &[],
+        }
+    }
+}
+
 struct EncodedColumn {
     payload: Vec<u8>,
-    stat_min: Vec<u8>,
-    stat_max: Vec<u8>,
+    stat_min: StatBound,
+    stat_max: StatBound,
 }
 
 struct EncodedChunk {
@@ -263,8 +303,8 @@ struct EncodedChunk {
     length: u64,
     value_count: u32,
     payload: Vec<u8>,
-    stat_min: Vec<u8>,
-    stat_max: Vec<u8>,
+    stat_min: StatBound,
+    stat_max: StatBound,
 }
 
 fn encode_column(
@@ -397,9 +437,30 @@ fn encode_bytes_values<'a>(
     }
     Ok(EncodedColumn {
         payload,
-        stat_min: min.map(bounded_min_prefix).unwrap_or_default(),
-        stat_max: max.map(bounded_max_prefix).unwrap_or_default(),
+        // A column with no (non-NULL) values has no bound (`Absent`). For a
+        // present value, an empty bounded prefix is the degenerate edge of the
+        // scheme — an empty lex-min, or an all-`0xFF` max — which we record as a
+        // present *open* end (`Unbounded`, −∞ / +∞) so the column keeps its zone
+        // and prunes on the other side, instead of the bare zero-length sentinel
+        // that used to collapse the whole zone ([STL-120]).
+        stat_min: min.map_or(StatBound::Absent, |m| {
+            bound_or_unbounded(bounded_min_prefix(m))
+        }),
+        stat_max: max.map_or(StatBound::Absent, |m| {
+            bound_or_unbounded(bounded_max_prefix(m))
+        }),
     })
+}
+
+/// A non-empty bounded prefix is a concrete [`StatBound::Value`]; an *empty* one
+/// is the degenerate edge of the bounded-prefix scheme, recorded as a present
+/// open end ([`StatBound::Unbounded`], −∞ for a min / +∞ for a max, [STL-120]).
+fn bound_or_unbounded(prefix: Vec<u8>) -> StatBound {
+    if prefix.is_empty() {
+        StatBound::Unbounded
+    } else {
+        StatBound::Value(prefix)
+    }
 }
 
 /// Encode an `i64` column: plain 8 LE bytes per value, plus the min/max as 8 LE
@@ -419,19 +480,25 @@ fn encode_i64_values(values: impl Iterator<Item = i64>) -> EncodedColumn {
     }
     EncodedColumn {
         payload,
-        stat_min: min.map(|v| v.to_le_bytes().to_vec()).unwrap_or_default(),
-        stat_max: max.map(|v| v.to_le_bytes().to_vec()).unwrap_or_default(),
+        // An i64 bound is always exactly representable, so it is never open —
+        // only `Absent` (empty column) or a concrete `Value` ([STL-120]).
+        stat_min: min.map_or(StatBound::Absent, |v| {
+            StatBound::Value(v.to_le_bytes().to_vec())
+        }),
+        stat_max: max.map_or(StatBound::Absent, |v| {
+            StatBound::Value(v.to_le_bytes().to_vec())
+        }),
     }
 }
 
 /// Truncate a lex-min byte value *down* to a bounded prefix for the footer
 /// stat. A byte prefix is lex-`<=` the value it came from, so the prefix is a
 /// sound lower bound for every value in the column — pruning against it can
-/// never drop a real match. An empty result (the min value is itself empty)
-/// encodes as the footer's zero-length "no stats" sentinel; because the reader
-/// records a zone entry only when *both* bounds are present (`ZoneMap::from_bounds`),
-/// that drops the column's zone for the segment entirely — no pruning on either
-/// side. Conservative, never wrong.
+/// never drop a real match. An empty result means the min value is itself the
+/// empty byte string; the caller ([`bound_or_unbounded`]) records that as a
+/// present *open* (−∞) end so the column keeps pruning on its max side
+/// ([STL-120]) — everything is `>= b""`, so an exact `b""` lower bound would
+/// prune nothing anyway. Conservative, never wrong.
 fn bounded_min_prefix(value: &[u8]) -> Vec<u8> {
     value[..value.len().min(MAX_BYTES_STAT_PREFIX_LEN)].to_vec()
 }
@@ -441,10 +508,10 @@ fn bounded_min_prefix(value: &[u8]) -> Vec<u8> {
 /// bound; otherwise keep the first `MAX_BYTES_STAT_PREFIX_LEN` bytes and
 /// increment them — drop any trailing `0xFF` bytes and bump the last byte below
 /// `0xFF` — so the result is `>=` every value sharing that prefix. A prefix that
-/// is *all* `0xFF` has no shorter upper bound representable, so it encodes as the
-/// zero-length "no stats" sentinel; as with an empty min, the column then records
-/// no zone entry for the segment (an entry needs both bounds), so it never prunes
-/// at all — still conservative, never a false negative.
+/// is *all* `0xFF` has no shorter upper bound representable, so it returns empty;
+/// the caller ([`bound_or_unbounded`]) records that as a present *open* (+∞) end
+/// so the column keeps pruning on its min side ([STL-120]) — +∞ never prunes on
+/// the max side, still conservative, never a false negative.
 fn bounded_max_prefix(value: &[u8]) -> Vec<u8> {
     if value.len() <= MAX_BYTES_STAT_PREFIX_LEN {
         return value.to_vec();
@@ -613,19 +680,27 @@ fn encode_footer(
 fn encode_chunk_meta(out: &mut Vec<u8>, chunk: &EncodedChunk) -> Result<(), SegmentError> {
     out.extend_from_slice(&chunk.col.as_u16().to_le_bytes());
     out.push(Codec::Plain as u8);
-    out.push(0u8); // reserved
+    // Stat-presence flags ([STL-120]): formerly an always-zero reserved byte.
+    // Marks a present-but-open min/max (−∞ / +∞) so the reader tells it apart
+    // from the zero-length "no stats" sentinel. Zero for every i64 column and
+    // any bytes column with concrete bounds, so existing layouts are unchanged.
+    let stat_flags =
+        chunk.stat_min.flag(STAT_MIN_UNBOUNDED) | chunk.stat_max.flag(STAT_MAX_UNBOUNDED);
+    out.push(stat_flags);
     out.extend_from_slice(&chunk.offset.to_le_bytes());
     out.extend_from_slice(&chunk.length.to_le_bytes());
     out.extend_from_slice(&chunk.value_count.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // reserved
-    let min_len = u32::try_from(chunk.stat_min.len())
+    let min_bytes = chunk.stat_min.bytes();
+    let min_len = u32::try_from(min_bytes.len())
         .map_err(|_| SegmentError::TooLarge("stat min length exceeds u32::MAX"))?;
     out.extend_from_slice(&min_len.to_le_bytes());
-    out.extend_from_slice(&chunk.stat_min);
-    let max_len = u32::try_from(chunk.stat_max.len())
+    out.extend_from_slice(min_bytes);
+    let max_bytes = chunk.stat_max.bytes();
+    let max_len = u32::try_from(max_bytes.len())
         .map_err(|_| SegmentError::TooLarge("stat max length exceeds u32::MAX"))?;
     out.extend_from_slice(&max_len.to_le_bytes());
-    out.extend_from_slice(&chunk.stat_max);
+    out.extend_from_slice(max_bytes);
     Ok(())
 }
 

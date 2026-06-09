@@ -102,7 +102,7 @@ use std::io;
 pub use format::ColumnId;
 pub use reader::{ColumnData, SegmentReader};
 pub use writer::SegmentWriter;
-pub use zone_map::{ColumnZone, Predicate, ZoneBound, ZoneMap};
+pub use zone_map::{ColumnZone, Predicate, ZoneBound, ZoneEnd, ZoneMap};
 
 /// Errors surfaced from the sealed-segment writer and reader.
 #[derive(Debug, thiserror::Error)]

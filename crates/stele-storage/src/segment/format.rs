@@ -136,6 +136,44 @@ pub(super) const FORMAT_VERSION: u16 = 10;
 /// encodings are independent on-disk formats.
 pub(super) const BYTES_NULL_SENTINEL: u32 = u32::MAX;
 
+/// Per-column-entry **stat presence flags** ([STL-120]), carried in the byte
+/// that sits after the codec in each footer column entry (formerly an always-zero
+/// reserved byte — see [`super::writer`]).
+///
+/// A zone-map stat field is length-prefixed and a *zero-length* field is the
+/// "no stats" sentinel (the reader decodes it as `None`). That sentinel
+/// is ambiguous for a bounded-prefix bytes column at the edge of the scheme: the
+/// lex-min can be the empty byte string and the lex-max prefix can saturate at
+/// all-`0xFF`, both of which the writer used to emit as the bare zero-length
+/// sentinel — collapsing the column's *whole* zone (an entry needs both bounds),
+/// so it stopped pruning even on the representable side. These flags let an
+/// **empty-but-present / open** bound be encoded distinctly from an absent one:
+/// the bit is set, the stat field is still zero-length (the bound carries no
+/// value), and the reader materializes an *unbounded* end
+/// ([`ZoneEnd::Unbounded`](super::zone_map::ZoneEnd::Unbounded)) rather than
+/// dropping the zone.
+///
+/// * [`STAT_MIN_UNBOUNDED`] — the min bound is open below (−∞). Set for the
+///   empty lex-min case: every value is `>= b""`, so an exact `b""` lower bound
+///   prunes nothing anyway, and recording it as −∞ keeps the *max* side pruning.
+/// * [`STAT_MAX_UNBOUNDED`] — the max bound is open above (+∞). Set for the
+///   all-`0xFF` max-prefix case, which has no shorter representable upper bound;
+///   +∞ never prunes on the max side but keeps the *min* side pruning.
+///
+/// **No [`FORMAT_VERSION`] bump.** Unlike every prior format change (a new column
+/// id an older reader chokes on, or the v10 NULL sentinel it mis-decodes), this
+/// is *gracefully* backward-compatible: an older reader ignores this byte and
+/// still reads the zero-length stat field as "no stats", so it simply forgoes
+/// the recovered pruning — never a wrong or corrupt result. A new reader reading
+/// an old segment sees the bit clear (the byte was always zero) and behaves
+/// exactly as before. The byte was explicitly reserved for additive use like
+/// this, so repurposing it stays within the §3.2 self-describing-format contract
+/// without invalidating existing segments.
+pub(super) const STAT_MIN_UNBOUNDED: u8 = 0b0000_0001;
+
+/// See [`STAT_MIN_UNBOUNDED`]: the max bound is open above (+∞).
+pub(super) const STAT_MAX_UNBOUNDED: u8 = 0b0000_0010;
+
 /// Header size in bytes — magic (8) + version (2) + flags (2) + reserved (4).
 pub(super) const HEADER_LEN: usize = 16;
 
