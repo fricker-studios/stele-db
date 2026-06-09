@@ -108,6 +108,12 @@ pub enum ScanError {
     /// valid-time pair and the retraction tombstone columns are not yet.
     #[error("column {0:?} is not projectable by SnapshotScan at v0.1")]
     UnsupportedProjection(ColumnId),
+
+    /// A [`Project`](crate::Project) operator asked for a column its child
+    /// operator did not emit in the batch — a plan-construction error: the
+    /// project list named a column the source was not configured to produce.
+    #[error("column {0:?} is not present in the input batch")]
+    MissingColumn(ColumnId),
 }
 
 /// One column of a [`Batch`] — Arrow-shaped: a single typed, contiguous array
@@ -139,6 +145,26 @@ impl Column {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// A contiguous `len`-value window starting at `offset`. Used by the
+    /// batch-at-a-time pull pipeline ([`crate::Operator`]) to cut a fully
+    /// resolved column into fixed-size batches.
+    ///
+    /// This currently deep-copies the window: `Column` owns its cells rather than
+    /// a shared buffer, so an Arrow-style zero-copy slice awaits the shared-buffer
+    /// `Column` representation (a tracked v0.2 follow-up; see PR #77 / STL-170).
+    ///
+    /// # Panics
+    ///
+    /// If `offset + len` exceeds the column's length — the caller
+    /// ([`crate::ScanSource`]) only ever slices within the resolved row count.
+    #[must_use]
+    pub fn slice(&self, offset: usize, len: usize) -> Self {
+        match self {
+            Self::Bytes(v) => Self::Bytes(v[offset..offset + len].to_vec()),
+            Self::I64(v) => Self::I64(v[offset..offset + len].to_vec()),
+        }
     }
 }
 
@@ -269,6 +295,16 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
     pub fn filter(mut self, predicate: Predicate) -> Self {
         self.predicate = predicate;
         self
+    }
+
+    /// Turn this scan into a [`ScanSource`](crate::ScanSource) — a source
+    /// [`Operator`](crate::Operator) that emits the resolved rows in batches of
+    /// at most `batch_rows` rows. The concatenation of every emitted batch is
+    /// byte-for-byte the [`execute`](Self::execute) result; the source merely
+    /// chunks it for the pull pipeline. A `batch_rows` of `0` is clamped to `1`.
+    #[must_use]
+    pub fn into_source(self, batch_rows: usize) -> crate::ScanSource<'a, D, I, F> {
+        crate::ScanSource::new(self, batch_rows)
     }
 
     /// Execute the scan: prune, merge, resolve at the snapshot, filter, project.
