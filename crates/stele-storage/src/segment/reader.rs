@@ -705,16 +705,25 @@ fn parse_chunk_meta(
 /// Decode one footer stat field into a typed [`ZoneEnd`]. When `unbounded` is
 /// set the end is open (−∞ for a min, +∞ for a max, [STL-120]) and the field
 /// must carry no bytes — an unbounded end has no value, so a non-empty field
-/// alongside the flag is corruption. Otherwise the zero-length sentinel maps to
-/// `None` ("no stats"); a non-empty field is interpreted according to the
-/// column's [`ColumnType`], and an `i64` stat whose length is not exactly 8
-/// bytes is rejected as corruption rather than silently truncated.
+/// alongside the flag is corruption — *and* only a bytes column can legitimately
+/// produce an open end ([STL-120]): an `i64` bound is always exactly
+/// representable, so the writer never flags one, and the flag on an `i64` column
+/// is rejected as corruption (it would otherwise also bypass the 8-byte length
+/// check). Otherwise the zero-length sentinel maps to `None` ("no stats"); a
+/// non-empty field is interpreted according to the column's [`ColumnType`], and
+/// an `i64` stat whose length is not exactly 8 bytes is rejected as corruption
+/// rather than silently truncated.
 fn decode_stat(
     col: ColumnId,
     bytes: &[u8],
     unbounded: bool,
 ) -> Result<Option<ZoneEnd>, SegmentError> {
     if unbounded {
+        if col.ty() != ColumnType::Bytes {
+            return Err(SegmentError::Corrupt(
+                "unbounded stat flag set on a non-bytes column",
+            ));
+        }
         if !bytes.is_empty() {
             return Err(SegmentError::Corrupt(
                 "unbounded stat flag set but the stat field carries bytes",
@@ -1138,6 +1147,18 @@ mod tests {
         assert_eq!(
             decode_stat(ColumnId::Payload, &[], true).unwrap(),
             Some(ZoneEnd::Unbounded),
+        );
+    }
+
+    #[test]
+    fn unbounded_flag_on_i64_column_is_rejected() {
+        // Only a bounded-prefix bytes column can produce an open end; an i64
+        // bound is always exactly representable. The flag on an i64 column is a
+        // corrupt footer (and would otherwise bypass the 8-byte length check).
+        let err = decode_stat(ColumnId::SysFrom, &[], true).unwrap_err();
+        assert!(
+            matches!(err, SegmentError::Corrupt(msg) if msg.contains("non-bytes")),
+            "unbounded flag on an i64 column must be rejected, got {err:?}"
         );
     }
 
