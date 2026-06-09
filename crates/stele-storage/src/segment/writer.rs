@@ -455,6 +455,17 @@ fn encode_bytes_values<'a>(
 /// A non-empty bounded prefix is a concrete [`StatBound::Value`]; an *empty* one
 /// is the degenerate edge of the bounded-prefix scheme, recorded as a present
 /// open end ([`StatBound::Unbounded`], −∞ for a min / +∞ for a max, [STL-120]).
+///
+/// One narrow case is *conservatively* over-open on the max side: when the lex-max
+/// value is itself the empty byte string — i.e. every (non-NULL) value in the
+/// column is `b""` — `bounded_max_prefix` returns empty, so the max is recorded as
+/// +∞ even though a concrete upper bound (`b""`) exists. This forfeits the
+/// max-side prune for an all-empty column, but is never a false negative, and it
+/// matches the pre-STL-120 behaviour (both bounds hit the sentinel ⇒ no zone) — so
+/// this is no regression, just an un-recovered prune. Distinguishing it would need
+/// a third "concrete empty bound" encoding (length-0 is already the absent/open
+/// sentinel); out of scope for STL-120, whose DoD targets the empty-min and
+/// saturating-`0xFF`-max edges only.
 fn bound_or_unbounded(prefix: Vec<u8>) -> StatBound {
     if prefix.is_empty() {
         StatBound::Unbounded
