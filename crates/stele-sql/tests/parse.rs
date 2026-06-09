@@ -99,15 +99,14 @@ fn select_captures_system_time_as_of() {
     let as_of = &stmts[0].temporal.as_of;
     assert_eq!(as_of.len(), 1);
     assert_eq!(as_of[0].dimension, TimeDimension::System);
-    assert!(as_of[0].dimension.is_implemented());
 
-    // The AS OF also rides natively on the underlying AST.
-    assert!(table_has_version(&stmts[0].body));
+    // The qualifier is lifted off the token stream into `temporal`; the body
+    // `sqlparser` parses is clean standard SQL with no native version.
+    assert!(!table_has_version(&stmts[0].body));
 }
 
 #[test]
-fn select_accepts_valid_time_as_of_but_marks_unimplemented() {
-    // Per STL-97: accept FOR VALID_TIME, tag it not-yet-implemented for the binder.
+fn select_captures_valid_time_as_of() {
     let stmts = parse(
         "SELECT balance FROM account \
          FOR VALID_TIME AS OF TIMESTAMP '2020-01-01 00:00:00' WHERE id = 1",
@@ -116,10 +115,27 @@ fn select_accepts_valid_time_as_of_but_marks_unimplemented() {
     let as_of = &stmts[0].temporal.as_of;
     assert_eq!(as_of.len(), 1);
     assert_eq!(as_of[0].dimension, TimeDimension::Valid);
-    assert!(
-        !as_of[0].dimension.is_implemented(),
-        "valid-time AS OF is parsed but not yet implemented"
-    );
+    assert!(!table_has_version(&stmts[0].body));
+}
+
+#[test]
+fn select_captures_both_axes_as_of_in_source_order() {
+    // sqlparser allows only one `FOR … AS OF` per table; both qualifiers are
+    // lifted at the token level, preserving source order and per-axis tagging.
+    let stmts = parse(
+        "SELECT id FROM booking \
+         FOR VALID_TIME AS OF 1600000000000000 \
+         FOR SYSTEM_TIME AS OF 1700000000000000 WHERE id = 1",
+    )
+    .unwrap();
+    let dims: Vec<TimeDimension> = stmts[0]
+        .temporal
+        .as_of
+        .iter()
+        .map(|a| a.dimension)
+        .collect();
+    assert_eq!(dims, vec![TimeDimension::Valid, TimeDimension::System]);
+    assert!(!table_has_version(&stmts[0].body));
 }
 
 #[test]
@@ -182,6 +198,24 @@ fn rejects_malformed_valid_time_clause() {
     // VALID TIME present but missing the second column.
     let err = parse("CREATE TABLE t (id INT) VALID TIME (vf)").unwrap_err();
     assert!(matches!(err, stele_sql::ParseError::Temporal(_)));
+}
+
+#[test]
+fn rejects_as_of_on_non_select_statements() {
+    // `FOR … AS OF` is lifted off the token stream for every statement, so a
+    // stray qualifier on a write or DDL must be rejected — otherwise it would be
+    // silently stripped and the statement run against the present.
+    for sql in [
+        "DELETE FROM account FOR SYSTEM_TIME AS OF 1 WHERE id = 1",
+        "UPDATE account SET balance = 1 FOR SYSTEM_TIME AS OF 1 WHERE id = 1",
+        "INSERT INTO account FOR VALID_TIME AS OF 1 VALUES (1, 2)",
+        "CREATE TABLE t (id INT) FOR SYSTEM_TIME AS OF 1",
+    ] {
+        assert!(
+            matches!(parse(sql), Err(stele_sql::ParseError::Temporal(_))),
+            "expected a temporal-grammar rejection for: {sql}"
+        );
+    }
 }
 
 /// True if the (single) statement is a query whose first table factor carries a

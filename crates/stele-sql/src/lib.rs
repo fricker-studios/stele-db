@@ -15,8 +15,8 @@
 //! with typed temporal annotations:
 //!
 //! - `SELECT … FOR SYSTEM_TIME AS OF <expr>` — time-travel along system time.
-//! - `SELECT … FOR VALID_TIME AS OF <expr>` — parsed and tagged, but
-//!   [not yet implemented](ast::TimeDimension::is_implemented) downstream.
+//! - `SELECT … FOR VALID_TIME AS OF <expr>` — time-travel along valid time; may
+//!   be combined with the system axis for a bitemporal point.
 //! - `CREATE TABLE … WITH SYSTEM VERSIONING` — opt into system-time history.
 //! - `CREATE TABLE … VALID TIME (from, to)` — opt into a valid-time period.
 //!
@@ -41,14 +41,17 @@
 //! assert!(stmts[0].is_temporal());
 //! ```
 //!
-//! The query binder ([`bind_select`]) folds a `SELECT … FOR SYSTEM_TIME AS OF
-//! <expr>` into a [`BoundSelect`]: it resolves the `AS OF` to a concrete
-//! system-time snapshot (`now()`, `now() ± interval '…'`, or an explicit
-//! instant), defaults to the transaction snapshot when no `AS OF` is given, and
-//! resolves the table against the versioned catalog at that snapshot — surfacing
-//! the documented [before-history](select::SelectError::BeforeHistory) error for
-//! a read older than the table. The snapshot it carries is the `sys_from ≤ s`
-//! bound the executor pushes into zone-map pruning ([STL-101]).
+//! The query binder ([`bind_select`]) folds a `SELECT … FOR { SYSTEM_TIME |
+//! VALID_TIME } AS OF <expr>` into a [`BoundSelect`]: it resolves each `AS OF` to
+//! a concrete instant (`now()`, `now() ± interval '…'`, or an explicit value),
+//! defaulting the system axis to the transaction snapshot when no system `AS OF`
+//! is given, and resolves the table against the versioned catalog at the
+//! system-time snapshot — surfacing the documented
+//! [before-history](select::SelectError::BeforeHistory) error for a read older
+//! than the table. The system snapshot it carries is the `sys_from ≤ s` bound the
+//! executor pushes into zone-map pruning ([STL-101]); the optional valid-time
+//! instant rides alongside for the executor's joint `(sys, valid)` resolution
+//! ([STL-162]).
 //!
 //! The DML binder ([`bind_dml`]) completes the set: it lowers an `INSERT` /
 //! `UPDATE` / `DELETE` into a [`BoundDml`] the engine applies as a `DmlWriter`

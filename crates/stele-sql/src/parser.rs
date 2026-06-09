@@ -3,23 +3,24 @@
 //!
 //! ## Why preprocess at the token level
 //!
-//! `sqlparser-rs` parses `FOR SYSTEM_TIME AS OF` natively once the dialect opts
-//! in ([`SteleDialect`]), but it has no grammar for Stele's other temporal
-//! clauses (`WITH SYSTEM VERSIONING`, `VALID TIME (..)`) and no concept of the
-//! `VALID_TIME` axis. Rather than fork the parser this early
-//! ([`docs/02-architecture.md` §6] says start from `sqlparser` and revisit a
-//! hand-written parser only if needed), we run a small pass over the token
-//! stream: we lift the non-standard clauses out into [`Temporal`], rewrite
-//! `VALID_TIME` to `SYSTEM_TIME` so the qualifier parses, and let `sqlparser`
-//! handle the standard remainder. The lifted axis is recovered afterward from
-//! the recorded dimensions.
+//! `sqlparser-rs` has no grammar for Stele's temporal clauses (`WITH SYSTEM
+//! VERSIONING`, `VALID TIME (..)`), no concept of the `VALID_TIME` axis, and —
+//! crucially — only one `FOR … AS OF` qualifier per table, so it cannot parse a
+//! bitemporal `… FOR SYSTEM_TIME AS OF s FOR VALID_TIME AS OF v`. Rather than
+//! fork the parser this early ([`docs/02-architecture.md` §6] says start from
+//! `sqlparser` and revisit a hand-written parser only if needed), we run a small
+//! pass over the token stream: we lift the non-standard clauses out into
+//! [`Temporal`] — including **every** `FOR { SYSTEM_TIME | VALID_TIME } AS OF
+//! <expr>` qualifier, parsing each `<expr>` with `sqlparser`'s own expression
+//! parser — and hand the clean standard-SQL remainder to `sqlparser`. The lifted
+//! qualifiers are the single source of truth for the binder; `sqlparser` never
+//! sees a versioned table (the dialect leaves `supports_table_versioning` off),
+//! so a qualifier we somehow failed to lift fails loudly rather than parsing as a
+//! lone system-time version that silently drops the second axis.
 //!
 //! [`docs/02-architecture.md` §6]: ../../../docs/02-architecture.md#6-query-layer
 
-use sqlparser::ast::{
-    Expr, Ident, Query, SetExpr, Statement as SqlStatement, TableFactor, TableVersion,
-    TableWithJoins,
-};
+use sqlparser::ast::{Expr, Ident, Statement as SqlStatement};
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Token, Tokenizer};
 
@@ -86,10 +87,10 @@ fn split_statements(tokens: Vec<Token>) -> Vec<Vec<Token>> {
 /// Extract temporal grammar from one statement's tokens, parse the remainder,
 /// and stitch the two back together.
 fn parse_one(mut tokens: Vec<Token>) -> Result<Statement, ParseError> {
-    let (system_versioning, valid_time) = extract_create_table_clauses(&mut tokens)?;
-    let dimensions = lift_as_of_dimensions(&mut tokens);
-
     let dialect = SteleDialect::default();
+    let (system_versioning, valid_time) = extract_create_table_clauses(&mut tokens)?;
+    let as_of = lift_as_of(&mut tokens, &dialect)?;
+
     let mut parser = Parser::new(&dialect).with_tokens(tokens);
     let body = parser.parse_statement()?;
 
@@ -103,7 +104,17 @@ fn parse_one(mut tokens: Vec<Token>) -> Result<Statement, ParseError> {
         ))));
     }
 
-    let as_of = build_as_of(&body, &dimensions);
+    // `FOR … AS OF` is a read-time qualifier — it only makes sense on a SELECT.
+    // Because we lift it off the token stream, a stray qualifier on a write or
+    // DDL would otherwise be silently stripped and the statement run against the
+    // present. Reject it here so the misuse fails loudly. (AS OF on DML is
+    // deferred grammar — see docs/sql-grammar.md.)
+    if !as_of.is_empty() && !matches!(body, SqlStatement::Query(_)) {
+        return Err(ParseError::Temporal(
+            "FOR ... AS OF applies only to a SELECT query".to_string(),
+        ));
+    }
+
     Ok(Statement {
         body,
         temporal: Temporal {
@@ -249,12 +260,25 @@ fn parse_valid_time_clause(
     Ok((ValidTimePeriod { from, to }, start + 5))
 }
 
-/// Record, in source order, the axis of each `FOR { SYSTEM_TIME | VALID_TIME }
-/// AS OF` qualifier, rewriting `VALID_TIME` to `SYSTEM_TIME` so `sqlparser`
-/// parses the qualifier. The axis is recovered later via [`build_as_of`].
-fn lift_as_of_dimensions(tokens: &mut [Token]) -> Vec<TimeDimension> {
-    let mut dimensions = Vec::new();
-    for i in 0..tokens.len() {
+/// Lift every `FOR { SYSTEM_TIME | VALID_TIME } AS OF <expr>` qualifier out of
+/// the token stream, in source order, leaving a clean standard-SQL remainder.
+///
+/// `sqlparser` allows at most one `FOR … AS OF` per table and has no `VALID_TIME`
+/// axis, so a bitemporal `… FOR SYSTEM_TIME AS OF s FOR VALID_TIME AS OF v` can
+/// never parse natively. Instead each qualifier's `<expr>` is parsed here with
+/// `sqlparser`'s own expression parser — the boundary of the expression is found
+/// by parsing and asking how many tokens were consumed — and the whole qualifier
+/// (the `FOR … AS OF` prefix plus the expression's tokens) is removed.
+///
+/// # Errors
+///
+/// [`ParseError`] if a qualifier has no expression after `AS OF`, or if that
+/// expression does not parse.
+fn lift_as_of(tokens: &mut Vec<Token>, dialect: &SteleDialect) -> Result<Vec<AsOf>, ParseError> {
+    let mut as_of = Vec::new();
+    let mut keep = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
         let is_qualifier = word_is(&tokens[i], "FOR")
             && tokens
                 .get(i + 1)
@@ -262,77 +286,41 @@ fn lift_as_of_dimensions(tokens: &mut [Token]) -> Vec<TimeDimension> {
             && tokens.get(i + 2).is_some_and(|t| word_is(t, "AS"))
             && tokens.get(i + 3).is_some_and(|t| word_is(t, "OF"));
         if !is_qualifier {
+            keep.push(tokens[i].clone());
+            i += 1;
             continue;
         }
-        if word_is(&tokens[i + 1], "VALID_TIME") {
-            dimensions.push(TimeDimension::Valid);
-            tokens[i + 1] = Token::make_word("SYSTEM_TIME", None);
+        let dimension = if word_is(&tokens[i + 1], "VALID_TIME") {
+            TimeDimension::Valid
         } else {
-            dimensions.push(TimeDimension::System);
-        }
-    }
-    dimensions
-}
-
-/// Pair each `FOR SYSTEM_TIME AS OF` expression `sqlparser` parsed (in source
-/// order) with the axis [`lift_as_of_dimensions`] recorded for it.
-fn build_as_of(body: &SqlStatement, dimensions: &[TimeDimension]) -> Vec<AsOf> {
-    let mut exprs = Vec::new();
-    if let SqlStatement::Query(query) = body {
-        collect_set_expr(&query.body, &mut exprs);
-    }
-    exprs
-        .into_iter()
-        .enumerate()
-        .map(|(idx, timestamp)| AsOf {
-            // Default to System if the counts ever diverge, so we never reject a
-            // query sqlparser accepted; in practice the lengths match.
-            dimension: dimensions
-                .get(idx)
-                .copied()
-                .unwrap_or(TimeDimension::System),
+            TimeDimension::System
+        };
+        let (timestamp, consumed) = parse_as_of_expr(&tokens[i + 4..], dialect)?;
+        as_of.push(AsOf {
+            dimension,
             timestamp,
-        })
-        .collect()
-}
-
-fn collect_set_expr(set_expr: &SetExpr, out: &mut Vec<Expr>) {
-    match set_expr {
-        SetExpr::Select(select) => {
-            for twj in &select.from {
-                collect_table_with_joins(twj, out);
-            }
-        }
-        SetExpr::Query(query) => collect_set_expr(&query.body, out),
-        SetExpr::SetOperation { left, right, .. } => {
-            collect_set_expr(left, out);
-            collect_set_expr(right, out);
-        }
-        _ => {}
+        });
+        i += 4 + consumed;
     }
+    *tokens = keep;
+    Ok(as_of)
 }
 
-fn collect_table_with_joins(twj: &TableWithJoins, out: &mut Vec<Expr>) {
-    collect_table_factor(&twj.relation, out);
-    for join in &twj.joins {
-        collect_table_factor(&join.relation, out);
+/// Parse the single expression at the head of `tokens` (the operand just after
+/// an `AS OF`), returning it and the number of tokens it consumed. The remainder
+/// (the next clause — `WHERE`, another `FOR …`, end of statement) is left for the
+/// caller.
+fn parse_as_of_expr(tokens: &[Token], dialect: &SteleDialect) -> Result<(Expr, usize), ParseError> {
+    if tokens.is_empty() {
+        return Err(ParseError::Temporal(
+            "expected an expression after `AS OF`".to_string(),
+        ));
     }
-}
-
-fn collect_table_factor(factor: &TableFactor, out: &mut Vec<Expr>) {
-    match factor {
-        TableFactor::Table {
-            version: Some(TableVersion::ForSystemTimeAsOf(expr)),
-            ..
-        } => out.push(expr.clone()),
-        TableFactor::Derived { subquery, .. } => collect_query(subquery, out),
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => collect_table_with_joins(table_with_joins, out),
-        _ => {}
-    }
-}
-
-fn collect_query(query: &Query, out: &mut Vec<Expr>) {
-    collect_set_expr(&query.body, out);
+    let mut parser = Parser::new(dialect).with_tokens(tokens.to_vec());
+    let expr = parser.parse_expr()?;
+    // `parse_expr` stops without consuming the terminating token; the parser's
+    // current index is the count of tokens it consumed. (Always ≥ 1 on success,
+    // so `get_current_index() + 1` is exact.)
+    let consumed = parser.get_current_index() + 1;
+    Ok((expr, consumed))
 }
