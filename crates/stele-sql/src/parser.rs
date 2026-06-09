@@ -20,7 +20,7 @@
 //!
 //! [`docs/02-architecture.md` §6]: ../../../docs/02-architecture.md#6-query-layer
 
-use sqlparser::ast::{Expr, Ident};
+use sqlparser::ast::{Expr, Ident, Statement as SqlStatement};
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Token, Tokenizer};
 
@@ -102,6 +102,17 @@ fn parse_one(mut tokens: Vec<Token>) -> Result<Statement, ParseError> {
         return Err(ParseError::Syntax(ParserError::ParserError(format!(
             "unexpected trailing token after statement: {trailing}"
         ))));
+    }
+
+    // `FOR … AS OF` is a read-time qualifier — it only makes sense on a SELECT.
+    // Because we lift it off the token stream, a stray qualifier on a write or
+    // DDL would otherwise be silently stripped and the statement run against the
+    // present. Reject it here so the misuse fails loudly. (AS OF on DML is
+    // deferred grammar — see docs/sql-grammar.md.)
+    if !as_of.is_empty() && !matches!(body, SqlStatement::Query(_)) {
+        return Err(ParseError::Temporal(
+            "FOR ... AS OF applies only to a SELECT query".to_string(),
+        ));
     }
 
     Ok(Statement {

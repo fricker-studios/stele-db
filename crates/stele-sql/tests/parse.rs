@@ -200,6 +200,24 @@ fn rejects_malformed_valid_time_clause() {
     assert!(matches!(err, stele_sql::ParseError::Temporal(_)));
 }
 
+#[test]
+fn rejects_as_of_on_non_select_statements() {
+    // `FOR … AS OF` is lifted off the token stream for every statement, so a
+    // stray qualifier on a write or DDL must be rejected — otherwise it would be
+    // silently stripped and the statement run against the present.
+    for sql in [
+        "DELETE FROM account FOR SYSTEM_TIME AS OF 1 WHERE id = 1",
+        "UPDATE account SET balance = 1 FOR SYSTEM_TIME AS OF 1 WHERE id = 1",
+        "INSERT INTO account FOR VALID_TIME AS OF 1 VALUES (1, 2)",
+        "CREATE TABLE t (id INT) FOR SYSTEM_TIME AS OF 1",
+    ] {
+        assert!(
+            matches!(parse(sql), Err(stele_sql::ParseError::Temporal(_))),
+            "expected a temporal-grammar rejection for: {sql}"
+        );
+    }
+}
+
 /// True if the (single) statement is a query whose first table factor carries a
 /// version qualifier — i.e. `sqlparser` parsed the `AS OF` natively.
 fn table_has_version(stmt: &SqlStatement) -> bool {
