@@ -1,8 +1,10 @@
 //! Stele's logical type system: the scalar + temporal set the engine speaks,
 //! with the metadata that lets values round-trip cleanly through the Postgres
-//! wire protocol. It began as the minimal v0.1 set the early demos need
-//! ([STL-96]) and grows additively — the v0.2 `UUID` / `BYTEA` types
-//! ([STL-181]) are the current additions.
+//! wire protocol.
+//!
+//! It began as the minimal v0.1 set the early demos need ([STL-96]) and grows
+//! additively — the v0.2 `UUID` / `BYTEA` types ([STL-181]) are the current
+//! additions.
 //!
 //! Three things live here, and only here:
 //!
