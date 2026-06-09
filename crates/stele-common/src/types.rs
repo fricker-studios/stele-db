@@ -1,11 +1,16 @@
-//! The v0.1 logical type system: the minimal scalar + temporal set the early
-//! demos need, with the metadata that lets values round-trip cleanly through
-//! the Postgres wire protocol ([STL-96]).
+//! Stele's logical type system: the scalar + temporal set the engine speaks,
+//! with the metadata that lets values round-trip cleanly through the Postgres
+//! wire protocol.
+//!
+//! It began as the minimal v0.1 set the early demos need ([STL-96]) and grows
+//! additively — the v0.2 `UUID` / `BYTEA` types ([STL-181]) are the current
+//! additions.
 //!
 //! Three things live here, and only here:
 //!
-//! 1. [`LogicalType`] — the closed set of v0.1 column types (`INT4`, `INT8`,
-//!    `TEXT`, `BOOL`, `TIMESTAMP`, `DATE`), each carrying its **Postgres OID**
+//! 1. [`LogicalType`] — the closed set of logical column types (the v0.1 scalar
+//!    set — `INT4`, `INT8`, `TEXT`, `BOOL`, `TIMESTAMP`, `DATE` — plus the v0.2
+//!    additions `UUID` and `BYTEA`), each carrying its **Postgres OID**
 //!    ([`LogicalType::pg_oid`]) so a stock driver can interpret the column, and
 //!    its **default codec choice** ([`LogicalType::default_codec`]) so the
 //!    writer knows how to physically encode it.
@@ -44,22 +49,25 @@ pub type PgOid = u32;
 // every Postgres driver hard-codes them, so they are safe to treat as
 // constants rather than resolve at runtime.
 const OID_BOOL: PgOid = 16;
+const OID_BYTEA: PgOid = 17;
 const OID_INT8: PgOid = 20;
 const OID_INT4: PgOid = 23;
 const OID_TEXT: PgOid = 25;
 const OID_DATE: PgOid = 1082;
 const OID_TIMESTAMP: PgOid = 1114;
 const OID_TIMESTAMPTZ: PgOid = 1184;
+const OID_UUID: PgOid = 2950;
 const OID_TSRANGE: PgOid = 3908;
 
 /// The closed set of logical column types Stele understands.
 ///
-/// Started as the six scalar/temporal types the identity-proof demos need and
-/// that every Postgres driver can already decode ([STL-96] scope); the
-/// time-zone-aware [`Self::TimestampTz`] ([STL-189]) and [`Self::Period`]
-/// ([STL-180]) joined them in v0.2. Further numeric breadth (`NUMERIC`,
-/// `FLOAT8`, `UUID`, …) comes later — each is a new variant plus its OID, with
-/// no churn to the existing ones.
+/// Started deliberately minimal — the six scalar/temporal types the
+/// identity-proof demos need and that every Postgres driver can already decode
+/// ([STL-96] scope). The set grows additively: each new type is a new variant
+/// plus its OID, with no churn to the existing ones — v0.2 added the
+/// time-zone-aware [`Self::TimestampTz`] ([STL-189]), [`Self::Period`]
+/// ([STL-180]), and `UUID` / `BYTEA` ([STL-181]). Further numeric breadth
+/// (`NUMERIC`, `FLOAT8`) comes later.
 ///
 /// ```
 /// use stele_common::types::LogicalType;
@@ -118,13 +126,24 @@ pub enum LogicalType {
     /// bound may be `+∞` for an open-ended period. Generic user range types over
     /// other element types are a deliberate later addition, each its own OID.
     Period,
+    /// A 128-bit universally-unique identifier — SQL `UUID`, Postgres `uuid`
+    /// (OID 2950). The value is the 16 raw bytes in network order
+    /// ([`ScalarValue::Uuid`]); the text form is the canonical lowercase
+    /// hyphenated rendering. Backs provenance identifiers ([STL-181]).
+    Uuid,
+    /// A variable-length byte string — SQL `BYTEA`, Postgres `bytea` (OID 17).
+    /// The value is the raw bytes verbatim ([`ScalarValue::Bytea`]); the text
+    /// form is Postgres's `\x`-prefixed lowercase-hex output. This is the
+    /// hash-digest / opaque-blob type that backs business-key hash digests
+    /// ([STL-181]).
+    Bytea,
 }
 
 impl LogicalType {
     /// Every logical type, in a stable order. The single source of truth tests
     /// and exhaustive consumers iterate so a new variant can't be silently
     /// missed.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::Int4,
         Self::Int8,
         Self::Text,
@@ -133,6 +152,8 @@ impl LogicalType {
         Self::TimestampTz,
         Self::Date,
         Self::Period,
+        Self::Uuid,
+        Self::Bytea,
     ];
 
     /// The Postgres type OID a wire client uses to interpret this type
@@ -149,11 +170,13 @@ impl LogicalType {
             Self::TimestampTz => OID_TIMESTAMPTZ,
             Self::Date => OID_DATE,
             Self::Period => OID_TSRANGE,
+            Self::Uuid => OID_UUID,
+            Self::Bytea => OID_BYTEA,
         }
     }
 
     /// The logical type a Postgres OID denotes, or `None` if it is outside the
-    /// v0.1 set. Inverse of [`Self::pg_oid`].
+    /// set Stele understands. Inverse of [`Self::pg_oid`].
     #[must_use]
     pub const fn from_pg_oid(oid: PgOid) -> Option<Self> {
         match oid {
@@ -165,6 +188,8 @@ impl LogicalType {
             OID_TIMESTAMPTZ => Some(Self::TimestampTz),
             OID_DATE => Some(Self::Date),
             OID_TSRANGE => Some(Self::Period),
+            OID_UUID => Some(Self::Uuid),
+            OID_BYTEA => Some(Self::Bytea),
             _ => None,
         }
     }
@@ -183,6 +208,8 @@ impl LogicalType {
             Self::TimestampTz => "timestamptz",
             Self::Date => "date",
             Self::Period => "tsrange",
+            Self::Uuid => "uuid",
+            Self::Bytea => "bytea",
         }
     }
 
@@ -198,7 +225,9 @@ impl LogicalType {
     ///   [`Self::Date`] — temporal columns trend monotonic, so successive deltas
     ///   are tiny.
     /// * [`ColumnCodec::Plain`] for the fixed-width numerics and `bool`, which a
-    ///   general codec rarely beats at v0.1 scale.
+    ///   general codec rarely beats at v0.1 scale, and for the high-entropy
+    ///   `uuid` / `bytea` (hash digests, opaque blobs), which neither a dictionary
+    ///   nor a delta can compress.
     ///
     /// The choice is advisory: storage may fall back to [`ColumnCodec::Plain`] for any
     /// column until the richer codecs land in the segment writer, since the
@@ -208,7 +237,9 @@ impl LogicalType {
         match self {
             Self::Text => ColumnCodec::Dictionary,
             Self::Timestamp | Self::TimestampTz | Self::Date => ColumnCodec::Delta,
-            Self::Int4 | Self::Int8 | Self::Bool | Self::Period => ColumnCodec::Plain,
+            Self::Int4 | Self::Int8 | Self::Bool | Self::Period | Self::Uuid | Self::Bytea => {
+                ColumnCodec::Plain
+            }
         }
     }
 }
@@ -281,6 +312,10 @@ pub enum ScalarValue {
     /// open-ended period. This is the value the SQL:2011 period predicates
     /// ([`crate::period::PeriodPredicate`]) range over.
     Period(Interval),
+    /// A 128-bit UUID, the 16 raw bytes in network order ([`LogicalType::Uuid`]).
+    Uuid([u8; 16]),
+    /// A variable-length byte string ([`LogicalType::Bytea`]).
+    Bytea(Vec<u8>),
 }
 
 /// Why decoding a [`ScalarValue`] from bytes failed.
@@ -323,6 +358,8 @@ impl ScalarValue {
             Self::TimestampTz(_) => LogicalType::TimestampTz,
             Self::Date(_) => LogicalType::Date,
             Self::Period(_) => LogicalType::Period,
+            Self::Uuid(_) => LogicalType::Uuid,
+            Self::Bytea(_) => LogicalType::Bytea,
         }
     }
 
@@ -349,7 +386,8 @@ impl ScalarValue {
     /// * `Int4` / `Date` — 4 bytes.
     /// * `Int8` / `Timestamp` / `TimestampTz` — 8 bytes.
     /// * `Bool` — 1 byte (`0` / `1`).
-    /// * `Text` — the raw UTF-8 bytes; the surrounding column framing carries
+    /// * `Uuid` — the 16 raw bytes, network order.
+    /// * `Text` / `Bytea` — the raw bytes; the surrounding column framing carries
     ///   the length.
     /// * `Period` — 16 bytes: the `from` bound then the `to` bound, each an
     ///   `i64`. (This canonical storage form is distinct from the Postgres
@@ -372,6 +410,8 @@ impl ScalarValue {
                 out.extend_from_slice(&iv.from.to_le_bytes());
                 out.extend_from_slice(&iv.to.to_le_bytes());
             }
+            Self::Uuid(bytes) => out.extend_from_slice(bytes),
+            Self::Bytea(bytes) => out.extend_from_slice(bytes),
         }
     }
 
@@ -405,6 +445,8 @@ impl ScalarValue {
                 let to = i64::from_le_bytes(raw[8..].try_into().unwrap());
                 Ok(Self::Period(Interval::new(from, to)?))
             }
+            LogicalType::Uuid => Ok(Self::Uuid(fixed::<16>(ty, bytes)?)),
+            LogicalType::Bytea => Ok(Self::Bytea(bytes.to_vec())),
         }
     }
 }
@@ -431,9 +473,30 @@ mod tests {
         assert_eq!(LogicalType::Timestamp.pg_oid(), 1114);
         assert_eq!(LogicalType::TimestampTz.pg_oid(), 1184);
         assert_eq!(LogicalType::Date.pg_oid(), 1082);
+        assert_eq!(LogicalType::Uuid.pg_oid(), 2950);
+        assert_eq!(LogicalType::Bytea.pg_oid(), 17);
         // PERIOD borrows Postgres `tsrange` so a stock driver can decode it.
         assert_eq!(LogicalType::Period.pg_oid(), 3908);
         assert_eq!(LogicalType::Period.pg_type_name(), "tsrange");
+    }
+
+    #[test]
+    fn type_set_grew_additively_without_disturbing_the_original_six() {
+        // v0.2 added TIMESTAMPTZ (STL-189), PERIOD (STL-180), and UUID/BYTEA
+        // (STL-181); the original six keep their identity (OID + name), so a wire
+        // client that knew only the original set is unaffected.
+        assert_eq!(LogicalType::ALL.len(), 10);
+        for (ty, oid, name) in [
+            (LogicalType::Int4, 23, "int4"),
+            (LogicalType::Int8, 20, "int8"),
+            (LogicalType::Text, 25, "text"),
+            (LogicalType::Bool, 16, "bool"),
+            (LogicalType::Timestamp, 1114, "timestamp"),
+            (LogicalType::Date, 1082, "date"),
+        ] {
+            assert_eq!(ty.pg_oid(), oid, "{ty} OID drifted");
+            assert_eq!(ty.pg_type_name(), name, "{ty} name drifted");
+        }
     }
 
     #[test]
@@ -514,6 +577,8 @@ mod tests {
                 ScalarValue::Period(Interval::new(1, 2).unwrap()),
                 LogicalType::Period,
             ),
+            (ScalarValue::Uuid([0; 16]), LogicalType::Uuid),
+            (ScalarValue::Bytea(vec![1, 2, 3]), LogicalType::Bytea),
         ];
         for (value, ty) in samples {
             assert_eq!(value.logical_type(), ty);
@@ -548,6 +613,15 @@ mod tests {
             ScalarValue::Period(Interval::new(0, 1).unwrap()),
             ScalarValue::Period(Interval::new(i64::MIN, i64::MAX).unwrap()),
             ScalarValue::Period(Interval::new(1_700_000_000_000_000, i64::MAX).unwrap()),
+            ScalarValue::Uuid([0; 16]),
+            ScalarValue::Uuid([0xFF; 16]),
+            ScalarValue::Uuid([
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00,
+            ]),
+            ScalarValue::Bytea(Vec::new()),
+            ScalarValue::Bytea(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            ScalarValue::Bytea(vec![0; 32]),
         ];
         for value in cases {
             let mut buf = Vec::new();
@@ -577,6 +651,27 @@ mod tests {
                 got: 0
             })
         );
+        // A uuid is exactly 16 bytes; a 15-byte buffer is corrupt.
+        assert_eq!(
+            ScalarValue::decode(LogicalType::Uuid, &[0; 15]),
+            Err(DecodeError::Width {
+                ty: LogicalType::Uuid,
+                expected: 16,
+                got: 15
+            })
+        );
+    }
+
+    #[test]
+    fn bytea_accepts_any_byte_length_including_empty() {
+        // bytea is variable-length like text but with no UTF-8 constraint, so
+        // arbitrary bytes (including 0xFF, never valid UTF-8) decode cleanly.
+        for bytes in [Vec::new(), vec![0xFF], vec![0, 1, 2, 0xFF, 0xFE]] {
+            assert_eq!(
+                ScalarValue::decode(LogicalType::Bytea, &bytes),
+                Ok(ScalarValue::Bytea(bytes.clone()))
+            );
+        }
     }
 
     #[test]

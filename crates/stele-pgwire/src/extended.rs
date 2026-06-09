@@ -249,14 +249,17 @@ pub(crate) fn param_to_value(oid: u32, bytes: Option<&[u8]>) -> Result<Value, Pa
         Some(LogicalType::Bool) => {
             Value::Boolean(parse_bool(text).ok_or_else(|| ParamError::BadBool(text.to_owned()))?)
         }
-        // `text` is the string verbatim. The civil-time and range types are also
-        // substituted as a string: `timestamptz` is then parsed by the binder's
-        // codec (zone offset → UTC), while the zone-less `timestamp` / `date` /
-        // `period` have no DML codec yet and surface the binder's documented
-        // "unsupported" error. Either way this layer never guesses a calendar/range
-        // encoding. (Binary-format params ride in with STL-183.)
+        // Every text-bearing type is substituted as a single-quoted string for the
+        // binder to fold against the column type. `text` is verbatim; the textual
+        // `uuid` / `bytea` forms (`550e…`, `\xDEAD…`, STL-181) and `timestamptz`
+        // (zone offset → UTC) fold to a value, while the zone-less `timestamp` /
+        // `date` / `period` have no DML codec yet and surface the binder's
+        // documented "unsupported" error. Either way this layer never guesses a
+        // calendar/range encoding. (Binary-format params ride in with STL-183.)
         Some(
             LogicalType::Text
+            | LogicalType::Uuid
+            | LogicalType::Bytea
             | LogicalType::TimestampTz
             | LogicalType::Timestamp
             | LogicalType::Date

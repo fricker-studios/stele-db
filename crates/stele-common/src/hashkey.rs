@@ -50,6 +50,8 @@
 //! | DATE | `0x06` | 4-byte big-endian `i32` days since the Unix epoch |
 //! | TIMESTAMPTZ | `0x07` | 8-byte big-endian `i64` microseconds since the Unix epoch (UTC) |
 //! | PERIOD | `0x08` | 16 bytes: two big-endian `i64` µs bounds, `from` then `to` (open upper = `i64::MAX`) |
+//! | UUID | `0x09` | the 16 raw UUID bytes, network order |
+//! | BYTEA | `0x0A` | the raw bytes, verbatim |
 //!
 //! ### Why these choices
 //!
@@ -89,6 +91,8 @@ const TAG_TIMESTAMP: u8 = 0x05;
 const TAG_DATE: u8 = 0x06;
 const TAG_TIMESTAMPTZ: u8 = 0x07;
 const TAG_PERIOD: u8 = 0x08;
+const TAG_UUID: u8 = 0x09;
+const TAG_BYTEA: u8 = 0x0A;
 
 /// Compute the v1 portable hash-key digest of `args`, in order.
 ///
@@ -153,6 +157,8 @@ fn encode_arg(arg: Option<&ScalarValue>, msg: &mut Vec<u8>) {
             body[8..].copy_from_slice(&iv.to.to_be_bytes());
             push_frame(msg, TAG_PERIOD, &body);
         }
+        Some(ScalarValue::Uuid(bytes)) => push_frame(msg, TAG_UUID, bytes),
+        Some(ScalarValue::Bytea(bytes)) => push_frame(msg, TAG_BYTEA, bytes),
     }
 }
 
@@ -244,6 +250,24 @@ pub fn vectors() -> Vec<Vector> {
                 crate::period::Interval::new(10, 20).expect("well-formed interval"),
             ))],
             hex: "35ccfb9906f082824c65f8e0ef866f4439cb8e4217a9ff5d3890d95fdff0379c",
+        },
+        Vector {
+            label: "uuid 550e8400-e29b-41d4-a716-446655440000",
+            args: vec![Some(ScalarValue::Uuid([
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00,
+            ]))],
+            hex: "8c149c5fb901c43282f7b67163b24a1f1de2bb3c72df46707a37b4bc4f0ae811",
+        },
+        Vector {
+            label: "bytea \\xdeadbeef",
+            args: vec![Some(ScalarValue::Bytea(vec![0xDE, 0xAD, 0xBE, 0xEF]))],
+            hex: "81ed9d4be87550352ed909232a1b669bde775b2ae106ae2d892dc475bd043fc5",
+        },
+        Vector {
+            label: "empty bytea",
+            args: vec![Some(ScalarValue::Bytea(vec![]))],
+            hex: "79649e69f651affd02e15ab04eaae96fb60f72387989148d4fee9769cc1fa278",
         },
     ]
 }

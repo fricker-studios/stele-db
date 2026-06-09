@@ -61,9 +61,13 @@ lowercase hex** string (`TEXT`).
 | `DATE`      | `0x06` | 4-byte big-endian `i32`, days since the Unix epoch          |
 | `TIMESTAMPTZ` | `0x07` | 8-byte big-endian `i64`, microseconds since the Unix epoch (UTC) |
 | `PERIOD`    | `0x08` | 16 bytes: two big-endian `i64` µs bounds, `from` then `to` (open upper = `i64::MAX`) |
+| `UUID`      | `0x09` | the 16 raw UUID bytes, network order                        |
+| `BYTEA`     | `0x0A` | the raw bytes, verbatim                                      |
 
 Tags are frozen: a tag's meaning never changes, and a new type takes the next
-free value rather than reusing one.
+free value rather than reusing one. `TIMESTAMPTZ` / `PERIOD` (STL-189 / STL-180)
+and `UUID` / `BYTEA` (STL-181) were appended additively as those types joined the
+logical type set; the original `0x00`–`0x06` encodings are unchanged.
 
 ### Design rationale
 
@@ -92,11 +96,11 @@ free value rather than reusing one.
 - **SQL literal coverage.** Over the wire, `hash(...)` argument folding is
   type-inference-free, so it produces the literal shapes the v0.2 parser folds
   without a target type — string (`TEXT`), integer (`INT4`/`INT8`), boolean
-  (`BOOL`), and `NULL`. The civil-time and range types (`TIMESTAMP`, `DATE`,
-  `TIMESTAMPTZ`, `PERIOD`) are not auto-selected from a bare literal in a
-  `hash(...)` call, but the spec defines their encoding so a client building keys
-  directly is fully specified. The digest is
-  returned as `TEXT` hex; a dedicated hash-digest scalar type is
+  (`BOOL`), and `NULL`. The civil-time, range, and binary types (`TIMESTAMP`,
+  `DATE`, `TIMESTAMPTZ`, `PERIOD`, `UUID`, `BYTEA`) are not auto-selected from a
+  bare literal in a `hash(...)` call, but the spec defines every type's encoding
+  so a client building keys directly is fully specified. The digest is returned
+  as `TEXT` hex; the dedicated `UUID` / `BYTEA` scalar types landed in
   [STL-181](https://allegromusic.atlassian.net/browse/STL-181) (F21).
 
 ## SQL surface
@@ -130,5 +134,8 @@ same data the code checks in; the two must not drift.
 | `'acme'`, `42` (`INT4`), `NULL` | `61c9586983296ab2e403396f6ce20b01e2adc2514633fc63bb9d5a1e0ce85a20` |
 | `1700000000000000` (`TIMESTAMPTZ`) | `8720f97303210b1ae946845bfaad4a52d062189d52e098b5b4b3278708b2db31` |
 | `[10, 20)` (`PERIOD`)           | `35ccfb9906f082824c65f8e0ef866f4439cb8e4217a9ff5d3890d95fdff0379c` |
+| `550e8400-…-446655440000` (`UUID`) | `8c149c5fb901c43282f7b67163b24a1f1de2bb3c72df46707a37b4bc4f0ae811` |
+| `\xdeadbeef` (`BYTEA`)          | `81ed9d4be87550352ed909232a1b669bde775b2ae106ae2d892dc475bd043fc5` |
+| `\x` (empty `BYTEA`)            | `79649e69f651affd02e15ab04eaae96fb60f72387989148d4fee9769cc1fa278` |
 
 [FIPS 180-4]: https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf

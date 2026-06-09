@@ -2595,6 +2595,19 @@ mod tests {
                 ty: LogicalType::Date,
                 value: Some(ScalarValue::Date(19_675)),
             },
+            ResultColumn {
+                name: "u".into(),
+                ty: LogicalType::Uuid,
+                value: Some(ScalarValue::Uuid([
+                    0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55,
+                    0x44, 0x00, 0x00,
+                ])),
+            },
+            ResultColumn {
+                name: "by".into(),
+                ty: LogicalType::Bytea,
+                value: Some(ScalarValue::Bytea(vec![0xDE, 0xAD, 0xBE, 0xEF])),
+            },
         ];
         let cells = parse_data_row(&data_row_payload(&columns).expect("payload"));
         let rendered: Vec<String> = cells
@@ -2610,6 +2623,8 @@ mod tests {
                 "f",
                 "2023-11-14 22:13:20",
                 "2023-11-14",
+                "550e8400-e29b-41d4-a716-446655440000",
+                "\\xdeadbeef",
             ]
         );
     }

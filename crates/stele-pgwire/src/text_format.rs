@@ -1,7 +1,8 @@
-//! Postgres **text-format** value encoding for the v0.1 scalar set
-//! ([STL-105]).
+//! Postgres **text-format** value encoding for Stele's scalar set
+//! (originally the v0.1 types, [STL-105]; extended with `uuid` / `bytea` in
+//! [STL-181]).
 //!
-//! [`stele_common::types`] fixes the v0.1 logical types and their OIDs but
+//! [`stele_common::types`] fixes the logical types and their OIDs but
 //! deliberately stops short of wire serialization — turning a [`ScalarValue`]
 //! into the bytes a `DataRow` carries is the wire front end's job, and this is
 //! where it lives. The simple-query loop sends every value in **text format**
@@ -20,6 +21,9 @@
 //! | `timestamp`   | ISO-8601 `YYYY-MM-DD HH:MM:SS[.ffffff]` (UTC)      |
 //! | `timestamptz` | the same, with a `+00` UTC offset suffix           |
 //! | `date`        | ISO-8601 `YYYY-MM-DD`                              |
+//! | `uuid`        | canonical lowercase `8-4-4-4-12` hex               |
+//! | `bytea`       | `\x` + lowercase hex (Postgres `bytea_output = hex`) |
+//! | `period`      | `tsrange` text, e.g. `["…","…")` (half-open)       |
 //!
 //! Timestamps and dates are stored as raw offsets from the Unix epoch
 //! (microseconds and days respectively — see [`stele_common::types`]); the
@@ -40,18 +44,19 @@ const MICROS_PER_SEC: i64 = 1_000_000;
 /// Microseconds in one calendar day (no leap seconds — UTC instants).
 const MICROS_PER_DAY: i64 = 86_400 * MICROS_PER_SEC;
 
-/// Postgres `pg_type.typlen` for a v0.1 logical type: the fixed on-the-wire
-/// width of the binary form, or `-1` for the variable-length `text`. This is the
-/// `typlen` advertised in a `RowDescription` field — it describes the type, not
-/// the rendered text length (text format is always length-prefixed in the
-/// `DataRow` regardless).
+/// Postgres `pg_type.typlen` for a logical type: the fixed on-the-wire width of
+/// the binary form, or `-1` for the variable-length types (`text`, `bytea`).
+/// This is the `typlen` advertised in a `RowDescription` field — it describes the
+/// type, not the rendered text length (text format is always length-prefixed in
+/// the `DataRow` regardless).
 pub(crate) const fn pg_typlen(ty: LogicalType) -> i16 {
     match ty {
         LogicalType::Int4 | LogicalType::Date => 4,
         LogicalType::Int8 | LogicalType::Timestamp | LogicalType::TimestampTz => 8,
         LogicalType::Bool => 1,
-        // `text` and `tsrange` are both variable-length (`typlen = -1`).
-        LogicalType::Text | LogicalType::Period => -1,
+        LogicalType::Uuid => 16,
+        // `text`, `bytea`, and `tsrange` are all variable-length (`typlen = -1`).
+        LogicalType::Text | LogicalType::Bytea | LogicalType::Period => -1,
     }
 }
 
@@ -70,6 +75,8 @@ pub(crate) fn encode_text(value: &ScalarValue) -> String {
         // offset: the engine is UTC-internal, so the offset is always `+00`.
         ScalarValue::TimestampTz(micros) => format_timestamptz(*micros),
         ScalarValue::Date(days) => format_date(*days),
+        ScalarValue::Uuid(bytes) => format_uuid(bytes),
+        ScalarValue::Bytea(bytes) => format_bytea(bytes),
         ScalarValue::Period(iv) => format_period(iv),
     }
 }
@@ -88,6 +95,39 @@ fn format_period(iv: &Interval) -> String {
         let upper = format_timestamp(iv.to);
         format!("[\"{lower}\",\"{upper}\")")
     }
+}
+
+/// Append `byte` as two lowercase hex digits (high nibble then low) — the shared
+/// primitive behind the `uuid` and `bytea` renderings.
+fn push_hex(out: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(HEX[usize::from(byte >> 4)] as char);
+    out.push(HEX[usize::from(byte & 0x0F)] as char);
+}
+
+/// Render a 16-byte UUID as Postgres's canonical lowercase `8-4-4-4-12` form,
+/// e.g. `550e8400-e29b-41d4-a716-446655440000`. Hyphens fall after bytes 4, 6,
+/// 8, and 10.
+fn format_uuid(bytes: &[u8; 16]) -> String {
+    let mut out = String::with_capacity(36);
+    for (i, &b) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        push_hex(&mut out, b);
+    }
+    out
+}
+
+/// Render a byte string in Postgres's default `bytea` hex output: a `\x` prefix
+/// followed by two lowercase hex digits per byte (empty input renders as `\x`).
+fn format_bytea(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(2 + bytes.len() * 2);
+    out.push_str("\\x");
+    for &b in bytes {
+        push_hex(&mut out, b);
+    }
+    out
 }
 
 /// Convert days since the Unix epoch (1970-01-01) into a proleptic-Gregorian
@@ -191,10 +231,51 @@ mod tests {
         assert_eq!(pg_typlen(LogicalType::Timestamp), 8);
         assert_eq!(pg_typlen(LogicalType::TimestampTz), 8);
         assert_eq!(pg_typlen(LogicalType::Text), -1, "text is variable-length");
+        assert_eq!(pg_typlen(LogicalType::Uuid), 16);
+        assert_eq!(
+            pg_typlen(LogicalType::Bytea),
+            -1,
+            "bytea is variable-length"
+        );
         assert_eq!(
             pg_typlen(LogicalType::Period),
             -1,
             "tsrange is variable-length"
+        );
+    }
+
+    #[test]
+    fn uuid_renders_canonical_lowercase_hyphenated() {
+        let bytes = [
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ];
+        assert_eq!(
+            encode_text(&ScalarValue::Uuid(bytes)),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        // Upper-half bytes render with their leading zero preserved.
+        assert_eq!(
+            encode_text(&ScalarValue::Uuid([0; 16])),
+            "00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(
+            encode_text(&ScalarValue::Uuid([0xFF; 16])),
+            "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        );
+    }
+
+    #[test]
+    fn bytea_renders_hex_with_backslash_x_prefix() {
+        // Postgres's default `bytea_output = hex`.
+        assert_eq!(encode_text(&ScalarValue::Bytea(vec![])), "\\x");
+        assert_eq!(
+            encode_text(&ScalarValue::Bytea(vec![0xDE, 0xAD, 0xBE, 0xEF])),
+            "\\xdeadbeef"
+        );
+        assert_eq!(
+            encode_text(&ScalarValue::Bytea(vec![0x00, 0x01, 0x0F, 0xA0])),
+            "\\x00010fa0"
         );
     }
 
