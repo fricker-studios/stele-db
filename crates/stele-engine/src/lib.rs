@@ -229,6 +229,45 @@ pub enum DmlSummary {
     Delete(u64),
 }
 
+/// A multi-statement transaction's buffered, not-yet-applied writes ([STL-174]).
+///
+/// Created by [`SessionEngine::begin`], fed bound DML one statement at a time by
+/// [`SessionEngine::stage_dml`], and applied as a unit by
+/// [`SessionEngine::commit`] — or simply **dropped** to roll back. The defining
+/// property is that staged writes are *buffered*, never applied, until commit:
+/// nothing a transaction writes is visible — to it, or to any other connection —
+/// before `COMMIT`, and `ROLLBACK` discards the buffer with no effect ever
+/// reaching storage.
+///
+/// What this deliberately does *not* yet do (each its own follow-up):
+/// * **Read-your-own-writes.** A `SELECT` inside the transaction still reads the
+///   committed snapshot and does not see the buffer — a consistent
+///   transaction-local snapshot is snapshot-isolation work ([STL-175]).
+/// * **Crash-atomic group commit.** [`commit`](SessionEngine::commit) replays the
+///   buffer through the per-write WAL path, so a crash *mid-commit* can leave a
+///   prefix durable; a single transaction-boundary WAL record (the `stele-txn`
+///   `commit_record` deferral note) is the follow-up that closes that window.
+///   Absent a crash, commit is all-or-nothing and shares one transaction id
+///   across every write.
+///
+/// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
+/// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+#[derive(Debug, Default)]
+pub struct SessionTransaction {
+    /// The bound writes staged so far, in statement order. Applied front-to-back
+    /// at commit so a later `UPDATE` of a key staged after its `INSERT` lands in
+    /// the order the client issued them.
+    writes: Vec<BoundDml>,
+}
+
+impl SessionTransaction {
+    /// A fresh transaction with an empty write buffer.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { writes: Vec::new() }
+    }
+}
+
 /// A live table's shape at the current read snapshot, for catalog introspection.
 ///
 /// The pgwire front end's `pg_catalog` shim (the `psql \d` path, [STL-131]) reads
@@ -579,6 +618,27 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let txn_id = TxnId(self.next_txn);
         self.next_txn += 1;
         let principal = Principal::new(WIRE_PRINCIPAL.to_vec());
+        let summary = self.apply_bound_dml(dml, txn_id, &principal)?;
+        Ok(StatementOutcome::Dml(summary))
+    }
+
+    /// Apply one already-bound DML operation under the given provenance, reporting
+    /// the affected-row count. The shared core of the auto-commit path
+    /// ([`apply_dml`](Self::apply_dml)) and the multi-statement commit path
+    /// ([`commit`](Self::commit)) — the latter passes one `txn_id` for every write
+    /// in the transaction, so they share provenance.
+    ///
+    /// The key and payload [`ScalarValue`]s are encoded to bytes with
+    /// [`ScalarValue::encode`] — the inverse of the decode the wire layer applies
+    /// when it reads them back, so an `INSERT`ed value round-trips through a later
+    /// `SELECT`. `seq` is `0`: the commit clock hands each write a distinct
+    /// `sys_from`, so the per-commit tiebreak never decides between two versions.
+    fn apply_bound_dml(
+        &mut self,
+        dml: BoundDml,
+        txn_id: TxnId,
+        principal: &Principal,
+    ) -> Result<DmlSummary, EngineError> {
         match dml {
             BoundDml::Insert {
                 table,
@@ -593,9 +653,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     encode_payload(payload.as_ref()),
                     0,
                     txn_id,
-                    principal,
+                    principal.clone(),
                 )?;
-                Ok(StatementOutcome::Dml(DmlSummary::Insert(1)))
+                Ok(DmlSummary::Insert(1))
             }
             BoundDml::Update {
                 table,
@@ -610,15 +670,96 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     encode_payload(payload.as_ref()),
                     0,
                     txn_id,
-                    principal,
+                    principal.clone(),
                 )?;
-                Ok(StatementOutcome::Dml(DmlSummary::Update(1)))
+                Ok(DmlSummary::Update(1))
             }
             BoundDml::Delete { table, key, .. } => {
-                self.delete(&table, &business_key(&key), txn_id, principal)?;
-                Ok(StatementOutcome::Dml(DmlSummary::Delete(1)))
+                self.delete(&table, &business_key(&key), txn_id, principal.clone())?;
+                Ok(DmlSummary::Delete(1))
             }
         }
+    }
+
+    /// Begin a multi-statement transaction — an empty write buffer the caller
+    /// feeds with [`stage_dml`](Self::stage_dml) and applies with
+    /// [`commit`](Self::commit) ([STL-174]).
+    ///
+    /// The transaction is held *per connection* (the pgwire front end owns one per
+    /// session), not on the shared engine, so two connections' open transactions
+    /// stay independent. Nothing is allocated against the engine here — a
+    /// transaction id is taken only at [`commit`](Self::commit), so a `BEGIN`
+    /// followed by `ROLLBACK` (or a read-only transaction) consumes none.
+    ///
+    /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
+    #[must_use]
+    pub const fn begin(&self) -> SessionTransaction {
+        SessionTransaction::new()
+    }
+
+    /// Bind a DML statement and **buffer** it into `txn` without applying it,
+    /// returning the affected-row summary the wire client expects for its
+    /// `CommandComplete`. Returns `Ok(None)` if `stmt` is not an
+    /// `INSERT`/`UPDATE`/`DELETE` — a `SELECT` or DDL inside a transaction is the
+    /// caller's to route through [`execute`](Self::execute), which runs it at once
+    /// against the committed state (the buffer stays write-only, [STL-174]).
+    ///
+    /// Binding here folds the statement's literals and resolves its table against
+    /// the catalog at the current snapshot, exactly as the auto-commit path does;
+    /// only the *application* is deferred to [`commit`](Self::commit).
+    ///
+    /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Dml`] if the statement is malformed DML (unknown table or
+    /// column, a bad literal); the statement is rejected and nothing is buffered.
+    pub fn stage_dml(
+        &self,
+        stmt: &Statement,
+        txn: &mut SessionTransaction,
+    ) -> Result<Option<DmlSummary>, EngineError> {
+        let ctx = BindContext {
+            snapshot: self.clock.current(),
+            catalog: &self.catalog,
+        };
+        match bind_dml(stmt, &ctx) {
+            Ok(dml) => {
+                let summary = dml_summary(&dml);
+                txn.writes.push(dml);
+                Ok(Some(summary))
+            }
+            Err(DmlError::NotDml) => Ok(None),
+            Err(e) => Err(EngineError::Dml(e)),
+        }
+    }
+
+    /// Apply a transaction's buffered writes as a unit, stamping every one with a
+    /// single shared transaction id, and report success ([STL-174]). Dropping the
+    /// [`SessionTransaction`] instead of calling this rolls the transaction back —
+    /// the buffer is discarded and no effect reaches storage.
+    ///
+    /// One `txn_id` is allocated for the whole transaction, so every row it writes
+    /// carries the same provenance — the property that makes the writes one
+    /// logical commit. The writes are applied in staged order through the same
+    /// typed path the auto-commit route uses.
+    ///
+    /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] if applying any buffered write fails (e.g. its table was
+    /// dropped between staging and commit). A write that has already been applied
+    /// when a later one fails is **not** rolled back — crash/-failure-atomic group
+    /// commit is the deferred follow-up noted on [`SessionTransaction`].
+    pub fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError> {
+        let txn_id = TxnId(self.next_txn);
+        self.next_txn += 1;
+        let principal = Principal::new(WIRE_PRINCIPAL.to_vec());
+        for dml in txn.writes {
+            self.apply_bound_dml(dml, txn_id, &principal)?;
+        }
+        Ok(())
     }
 
     /// `INSERT` `key` into `table` through its WAL → delta path.
@@ -710,6 +851,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
 /// identity. Provenance is still captured inline at commit, per the architectural
 /// invariant — only the identity is a placeholder.
 const WIRE_PRINCIPAL: &[u8] = b"stele";
+
+/// The affected-row summary a bound DML operation reports — always one row per
+/// statement at v0.1, tagged by kind so the wire layer renders the right
+/// `CommandComplete` ([`stage_dml`](SessionEngine::stage_dml) reports it before
+/// the write is applied).
+const fn dml_summary(dml: &BoundDml) -> DmlSummary {
+    match dml {
+        BoundDml::Insert { .. } => DmlSummary::Insert(1),
+        BoundDml::Update { .. } => DmlSummary::Update(1),
+        BoundDml::Delete { .. } => DmlSummary::Delete(1),
+    }
+}
 
 /// Encode a [`ScalarValue`] to its canonical, type-erased byte form.
 fn encode_value(value: &ScalarValue) -> Vec<u8> {
@@ -1231,6 +1384,125 @@ mod tests {
             vec![encode_value(&ScalarValue::Int4(100))],
             "AS OF 2 reads the pre-update balance"
         );
+    }
+
+    #[test]
+    fn transaction_commit_applies_all_buffered_writes_atomically() {
+        // BEGIN; INSERT; INSERT; COMMIT — both rows are buffered (invisible until
+        // commit) and then applied together ([STL-174]).
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        let mut txn = engine.begin();
+        let one = engine
+            .stage_dml(&parse_one("INSERT INTO account VALUES (1, 100)"), &mut txn)
+            .expect("stage insert 1");
+        let two = engine
+            .stage_dml(&parse_one("INSERT INTO account VALUES (2, 200)"), &mut txn)
+            .expect("stage insert 2");
+        assert_eq!(one, Some(DmlSummary::Insert(1)));
+        assert_eq!(two, Some(DmlSummary::Insert(1)));
+
+        // Nothing is visible while the writes sit in the buffer.
+        let StatementOutcome::Rows(before) = engine
+            .execute(&parse_one("SELECT id FROM account"))
+            .expect("select before commit")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(before.rows.len(), 0, "buffered writes are invisible");
+
+        engine.commit(txn).expect("commit");
+
+        let StatementOutcome::Rows(after) = engine
+            .execute(&parse_one("SELECT id FROM account"))
+            .expect("select after commit")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(after.rows.len(), 2, "both buffered writes land at commit");
+    }
+
+    #[test]
+    fn dropping_a_transaction_rolls_it_back() {
+        // A buffered write that is never committed — the transaction is simply
+        // dropped — leaves no trace, the ROLLBACK semantics ([STL-174]).
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        let mut txn = engine.begin();
+        engine
+            .stage_dml(&parse_one("INSERT INTO account VALUES (1, 100)"), &mut txn)
+            .expect("stage insert");
+        drop(txn); // ROLLBACK: discard the buffer
+
+        let StatementOutcome::Rows(result) = engine
+            .execute(&parse_one("SELECT id FROM account"))
+            .expect("select")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(result.rows.len(), 0, "rolled-back write never applied");
+    }
+
+    #[test]
+    fn committed_transaction_is_readable_and_updatable_afterwards() {
+        // After COMMIT the rows behave like any other committed state: a later
+        // UPDATE (auto-commit) sees and supersedes them.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        let mut txn = engine.begin();
+        engine
+            .stage_dml(&parse_one("INSERT INTO account VALUES (1, 100)"), &mut txn)
+            .expect("stage");
+        engine.commit(txn).expect("commit");
+
+        engine
+            .execute(&parse_one("UPDATE account SET balance = 250 WHERE id = 1"))
+            .expect("update after commit");
+        let StatementOutcome::Rows(result) = engine
+            .execute(&parse_one("SELECT balance FROM account"))
+            .expect("select")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            payload_column(&result),
+            vec![encode_value(&ScalarValue::Int4(250))]
+        );
+    }
+
+    #[test]
+    fn stage_dml_passes_non_dml_through() {
+        // A non-DML statement returns `None` so the caller routes it through
+        // `execute` instead of buffering it.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        let mut txn = engine.begin();
+        let select = engine
+            .stage_dml(&parse_one("SELECT id FROM account"), &mut txn)
+            .expect("stage select");
+        assert_eq!(select, None, "a SELECT is not buffered");
+        let create = engine
+            .stage_dml(
+                &parse_one("CREATE TABLE t (id INT PRIMARY KEY) WITH SYSTEM VERSIONING"),
+                &mut txn,
+            )
+            .expect("stage ddl");
+        assert_eq!(create, None, "DDL is not buffered");
+    }
+
+    #[test]
+    fn stage_dml_surfaces_a_malformed_write() {
+        // Staging binds the statement, so a write against an unknown table is
+        // rejected at stage time, not silently buffered.
+        let engine = session();
+        let mut txn = engine.begin();
+        let err = engine
+            .stage_dml(&parse_one("INSERT INTO nope VALUES (1, 100)"), &mut txn)
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Dml(_)), "got {err:?}");
     }
 
     #[test]

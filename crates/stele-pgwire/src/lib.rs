@@ -74,7 +74,8 @@ use stele_catalog::CatalogError;
 use stele_common::time::Clock;
 use stele_common::types::{DecodeError, LogicalType, ScalarValue};
 use stele_engine::{
-    DmlSummary, EngineError, SelectResult, SessionEngine, StatementOutcome, TableDescription,
+    DmlSummary, EngineError, SelectResult, SessionEngine, SessionTransaction, StatementOutcome,
+    TableDescription,
 };
 use stele_storage::backend::Disk;
 
@@ -130,6 +131,9 @@ const SQLSTATE_INTERNAL_ERROR: &str = "XX000";
 // A literal in a `WHERE` / `VALUES` that does not match its column's type — the
 // code Postgres returns for an unparsable value (STL-147 DML routing).
 const SQLSTATE_INVALID_TEXT_REPRESENTATION: &str = "22P02";
+// A statement issued while the transaction is already aborted — Postgres ignores
+// commands until the block ends (`COMMIT`/`ROLLBACK`), STL-174.
+const SQLSTATE_IN_FAILED_TRANSACTION: &str = "25P02";
 
 // Text format code for `RowDescription` fields (binary is 1; a v0.2 concern).
 // The per-type OID and `typlen` advertised per field now come from the value's
@@ -170,6 +174,23 @@ pub trait SessionHandle: Send {
     /// The live tables and their columns at the current snapshot, for the
     /// `pg_catalog` `\d` shim — see [`SessionEngine::describe_live_tables`].
     fn describe_live_tables(&self) -> Vec<TableDescription>;
+
+    /// Bind and buffer a DML statement into the connection's open transaction,
+    /// returning its affected-row summary or `Ok(None)` if it is not DML — see
+    /// [`SessionEngine::stage_dml`] ([STL-174]).
+    ///
+    /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
+    fn stage_dml(
+        &self,
+        stmt: &Statement,
+        txn: &mut SessionTransaction,
+    ) -> Result<Option<DmlSummary>, EngineError>;
+
+    /// Apply a transaction's buffered writes as a unit — see
+    /// [`SessionEngine::commit`] ([STL-174]).
+    ///
+    /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
+    fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError>;
 }
 
 impl<C, D> SessionHandle for SessionEngine<C, D>
@@ -183,6 +204,18 @@ where
 
     fn describe_live_tables(&self) -> Vec<TableDescription> {
         Self::describe_live_tables(self)
+    }
+
+    fn stage_dml(
+        &self,
+        stmt: &Statement,
+        txn: &mut SessionTransaction,
+    ) -> Result<Option<DmlSummary>, EngineError> {
+        Self::stage_dml(self, stmt, txn)
+    }
+
+    fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError> {
+        Self::commit(self, txn)
     }
 }
 
@@ -316,6 +349,73 @@ pub enum WireError {
 // Connection handler
 // ---------------------------------------------------------------------------
 
+/// The per-connection transaction state — the `ReadyForQuery` status indicator
+/// made real ([STL-174]).
+///
+/// A connection is either auto-committing each statement ([`Idle`](Self::Idle)),
+/// inside an explicit `BEGIN` block buffering writes ([`Active`](Self::Active)),
+/// or inside one that hit an error and is now aborted ([`Failed`](Self::Failed),
+/// rejecting everything until `COMMIT`/`ROLLBACK` ends the block). The state lives
+/// on the connection task's stack, not the shared engine, so each connection's
+/// transaction is independent. The variant maps directly to the Postgres
+/// `ReadyForQuery` byte — `I` / `T` / `E` — that closes out every message.
+enum ConnTxn {
+    /// No transaction open; each statement auto-commits. `ReadyForQuery` = `I`.
+    Idle,
+    /// Inside `BEGIN`, buffering writes until `COMMIT`. `ReadyForQuery` = `T`.
+    Active(SessionTransaction),
+    /// Inside a transaction that errored; statements are refused until the block
+    /// ends. `ReadyForQuery` = `E`.
+    Failed,
+}
+
+impl ConnTxn {
+    /// The `ReadyForQuery` transaction-status byte for this state.
+    const fn status_byte(&self) -> u8 {
+        match self {
+            Self::Idle => b'I',
+            Self::Active(_) => b'T',
+            Self::Failed => b'E',
+        }
+    }
+
+    /// Move an open (non-failed) transaction into the aborted state, discarding
+    /// its buffered writes; a no-op when idle (an auto-commit statement error does
+    /// not open a transaction). Called when a statement errors so the trailing
+    /// `ReadyForQuery` reports `E`.
+    fn mark_failed(&mut self) {
+        if matches!(self, Self::Active(_)) {
+            *self = Self::Failed;
+        }
+    }
+}
+
+/// The transaction-control statements the front end handles itself rather than
+/// routing to the engine ([STL-174]). `ROLLBACK TO <savepoint>` is intentionally
+/// not one of these (savepoints are [STL-176]) — it falls through to the engine,
+/// which rejects it as unsupported.
+enum TxnControl {
+    /// `BEGIN` / `START TRANSACTION`.
+    Begin,
+    /// `COMMIT` / `END`.
+    Commit,
+    /// `ROLLBACK` / `ABORT` (without a savepoint target).
+    Rollback,
+}
+
+/// Classify a statement as transaction control, or `None` for anything the engine
+/// routes. A `ROLLBACK TO <savepoint>` is deliberately *not* matched here.
+const fn txn_control(stmt: &Statement) -> Option<TxnControl> {
+    match &stmt.body {
+        SqlStatement::StartTransaction { .. } => Some(TxnControl::Begin),
+        SqlStatement::Commit { .. } => Some(TxnControl::Commit),
+        SqlStatement::Rollback {
+            savepoint: None, ..
+        } => Some(TxnControl::Rollback),
+        _ => None,
+    }
+}
+
 #[instrument(skip(stream, session), fields(%peer))]
 async fn handle_connection(
     mut stream: TcpStream,
@@ -334,7 +434,12 @@ async fn handle_connection(
     // BackendKeyData lets clients later issue CancelRequest. We don't honor
     // cancellation in v0.1, but the message itself is part of a clean handshake.
     write_backend_key_data(&mut stream, 0, 0).await?;
-    write_ready_for_query(&mut stream).await?;
+    write_ready_for_query(&mut stream, ConnTxn::Idle.status_byte()).await?;
+
+    // The connection's transaction state — auto-commit (`Idle`) until a `BEGIN`
+    // opens an explicit block. Persists across messages for the life of the
+    // connection (STL-174).
+    let mut txn = ConnTxn::Idle;
 
     // --- 3. Message loop --------------------------------------------------
     loop {
@@ -361,16 +466,17 @@ async fn handle_connection(
                         "Query message missing NUL terminator",
                     )
                     .await?;
-                    write_ready_for_query(&mut stream).await?;
+                    write_ready_for_query(&mut stream, txn.status_byte()).await?;
                     continue;
                 };
                 // The whole simple-query message produces exactly one
                 // ReadyForQuery, regardless of how many statements it carried or
                 // whether one of them errored (Postgres aborts the batch on the
                 // first error). `handle_simple_query` writes the per-statement
-                // replies; the trailing ReadyForQuery is ours.
-                handle_simple_query(&mut stream, &q, &session).await?;
-                write_ready_for_query(&mut stream).await?;
+                // replies and advances the transaction state; the trailing
+                // ReadyForQuery — carrying the resulting status byte — is ours.
+                handle_simple_query(&mut stream, &q, &session, &mut txn).await?;
+                write_ready_for_query(&mut stream, txn.status_byte()).await?;
             }
             other => {
                 // Sync ('S'), Flush ('H'), and friends arrive once Extended Query
@@ -384,7 +490,7 @@ async fn handle_connection(
                     "message type not implemented in v0.1",
                 )
                 .await?;
-                write_ready_for_query(&mut stream).await?;
+                write_ready_for_query(&mut stream, txn.status_byte()).await?;
             }
         }
     }
@@ -472,14 +578,23 @@ struct ResultColumn {
 ///   (`SELECT n`), the rows resolved at the read snapshot (and any `AS OF`) by the
 ///   session engine (STL-147);
 /// * an `INSERT` / `UPDATE` / `DELETE` → `CommandComplete` (`INSERT 0 n` /
-///   `UPDATE n` / `DELETE n`) once the write commits (STL-147);
-/// * any of those failing → `ErrorResponse` with the Postgres SQLSTATE for the
-///   failure; the batch stops there, mirroring Postgres aborting on the first
-///   error.
+///   `UPDATE n` / `DELETE n`) once the write commits — or, inside a `BEGIN`
+///   block, once it is *buffered* (STL-147, STL-174);
+/// * `BEGIN` / `COMMIT` / `ROLLBACK` → handled by the front end against the
+///   connection's `txn` state, not the engine's routing (STL-174);
+/// * any non-control statement failing → `ErrorResponse` with the Postgres
+///   SQLSTATE for the failure; the batch stops there, mirroring Postgres aborting
+///   on the first error, and an open transaction moves to the aborted state.
+///
+/// Transactional DDL is **not** modelled: a `CREATE`/`DROP TABLE` inside a `BEGIN`
+/// block auto-commits at once and is not undone by a later `ROLLBACK` (only DML is
+/// buffered). Drivers' transaction blocks are DML in practice; rolling back DDL is
+/// a later concern.
 async fn handle_simple_query(
     stream: &mut TcpStream,
     sql: &str,
     session: &SharedSession,
+    txn: &mut ConnTxn,
 ) -> Result<(), WireError> {
     if sql.trim().is_empty() {
         debug!("empty simple query");
@@ -492,6 +607,9 @@ async fn handle_simple_query(
         Ok(statements) => statements,
         Err(e) => {
             info!(query = %sql, error = %e, "simple query failed to parse");
+            // A parse failure inside an open transaction aborts it, like any other
+            // statement error.
+            txn.mark_failed();
             return write_error_response(stream, "ERROR", SQLSTATE_SYNTAX_ERROR, &e.to_string())
                 .await
                 .map_err(WireError::Io);
@@ -508,6 +626,46 @@ async fn handle_simple_query(
     }
 
     for stmt in &statements {
+        // (0) Transaction control — `BEGIN` / `COMMIT` / `ROLLBACK` manage the
+        // connection's `txn` state and never reach the engine's routing. Checked
+        // first so `COMMIT`/`ROLLBACK` can still end a transaction that is in the
+        // aborted state.
+        if let Some(ctl) = txn_control(stmt) {
+            let proceed = match ctl {
+                TxnControl::Begin => {
+                    run_begin(stream, txn).await?;
+                    true
+                }
+                // A failed COMMIT writes an ErrorResponse and returns `false`, so
+                // the batch aborts here like any other statement error — nothing
+                // more may follow an error on the wire.
+                TxnControl::Commit => run_commit(stream, session, txn).await?,
+                TxnControl::Rollback => {
+                    run_rollback(stream, txn).await?;
+                    true
+                }
+            };
+            if !proceed {
+                return Ok(());
+            }
+            continue;
+        }
+
+        // (0b) Inside an aborted transaction every other statement is refused
+        // until the block ends — Postgres's `in_failed_sql_transaction`. The batch
+        // stops here, leaving the transaction aborted for the trailing
+        // ReadyForQuery to report (`E`).
+        if matches!(txn, ConnTxn::Failed) {
+            write_error_response(
+                stream,
+                "ERROR",
+                SQLSTATE_IN_FAILED_TRANSACTION,
+                "current transaction is aborted, commands ignored until end of transaction block",
+            )
+            .await?;
+            return Ok(());
+        }
+
         // (1) `pg_catalog` introspection (`psql \d`) — answered from the live
         // catalog through the minimal shim, ahead of every other route since
         // these are `SELECT`s that would otherwise fall to the deferral arm.
@@ -531,21 +689,25 @@ async fn handle_simple_query(
                 Err(e) => {
                     info!(query = %sql, error = %e, "DDL failed");
                     write_error_response(stream, "ERROR", sqlstate_for(&e), &e.to_string()).await?;
+                    txn.mark_failed();
                     return Ok(());
                 }
             },
             Err(BindError::NotDdl) => {
                 // (3) A constant `SELECT` (STL-104) is answered without touching
                 // storage. Everything else — a table read or `INSERT`/`UPDATE`/
-                // `DELETE` — routes through the session engine (STL-147).
+                // `DELETE` — routes through the session engine (STL-147), buffered
+                // into `txn` instead of committed when a transaction is open.
                 if let Some(columns) = constant_select(stmt) {
                     write_row_description(stream, &columns).await?;
                     write_data_row(stream, &columns).await?;
                     write_command_complete(stream, &CommandTag::Select(1)).await?;
-                } else if !run_statement(stream, stmt, session).await? {
+                } else if !run_statement(stream, stmt, session, txn).await? {
                     // The statement errored; the reply and SQLSTATE are already on
                     // the wire and the batch aborts (Postgres stops on the first
-                    // error), mirroring the DDL arm above.
+                    // error), mirroring the DDL arm above. An open transaction is
+                    // now aborted.
+                    txn.mark_failed();
                     return Ok(());
                 }
             }
@@ -554,11 +716,89 @@ async fn handle_simple_query(
                 info!(query = %sql, error = %e, "DDL bind failed");
                 write_error_response(stream, "ERROR", SQLSTATE_SYNTAX_ERROR, &e.to_string())
                     .await?;
+                txn.mark_failed();
                 return Ok(());
             }
         }
     }
     Ok(())
+}
+
+/// `BEGIN` / `START TRANSACTION` — open an explicit transaction block ([STL-174]).
+///
+/// From idle this enters [`ConnTxn::Active`] with an empty write buffer. A `BEGIN`
+/// already inside a transaction (active or aborted) leaves the state untouched —
+/// Postgres warns but stays in the block — and still reports `BEGIN`.
+async fn run_begin(stream: &mut TcpStream, txn: &mut ConnTxn) -> Result<(), WireError> {
+    if matches!(txn, ConnTxn::Idle) {
+        *txn = ConnTxn::Active(SessionTransaction::new());
+    }
+    write_command_complete_tag(stream, "BEGIN")
+        .await
+        .map_err(WireError::Io)
+}
+
+/// `COMMIT` / `END` — apply the transaction's buffered writes as a unit
+/// ([STL-174]).
+///
+/// From [`ConnTxn::Active`] the buffer is applied through
+/// [`SessionHandle::commit`] (one shared transaction id) and the state returns to
+/// idle. A `COMMIT` of an aborted transaction rolls it back and reports `ROLLBACK`,
+/// matching Postgres; a `COMMIT` with no open transaction is a warning-only no-op
+/// that still reports `COMMIT`.
+///
+/// Returns whether the batch may continue: `Ok(true)` on success, `Ok(false)` when
+/// the commit replay failed — an `ErrorResponse` was written, so the caller must
+/// stop processing this message (nothing may follow an error on the wire).
+async fn run_commit(
+    stream: &mut TcpStream,
+    session: &SharedSession,
+    txn: &mut ConnTxn,
+) -> Result<bool, WireError> {
+    match std::mem::replace(txn, ConnTxn::Idle) {
+        ConnTxn::Active(buffered) => match commit_txn(session, buffered) {
+            Ok(()) => write_command_complete_tag(stream, "COMMIT").await?,
+            Err(e) => {
+                // The commit replay failed partway. The transaction is over (state
+                // already reset to idle), but — unlike a clean ROLLBACK — any writes
+                // applied before the failure are NOT undone: `SessionEngine::commit`
+                // replays through the per-write WAL path with no rollback (the
+                // crash-atomic group-commit follow-up). Surface the error and abort
+                // the batch; the trailing ReadyForQuery reports idle.
+                info!(error = %e, "COMMIT failed");
+                write_error_response(stream, "ERROR", sqlstate_for_query(&e), &e.to_string())
+                    .await?;
+                return Ok(false);
+            }
+        },
+        // Postgres rolls a failed transaction back on COMMIT and reports ROLLBACK.
+        ConnTxn::Failed => write_command_complete_tag(stream, "ROLLBACK").await?,
+        // No open transaction — a warning-only no-op that still reports COMMIT.
+        ConnTxn::Idle => write_command_complete_tag(stream, "COMMIT").await?,
+    }
+    Ok(true)
+}
+
+/// `ROLLBACK` / `ABORT` — discard the transaction's buffered writes ([STL-174]).
+///
+/// Returns to idle from any state, dropping an [`ConnTxn::Active`] buffer (nothing
+/// it staged ever reaches storage) or clearing a [`ConnTxn::Failed`] block. A
+/// `ROLLBACK` with no open transaction still reports `ROLLBACK`.
+async fn run_rollback(stream: &mut TcpStream, txn: &mut ConnTxn) -> Result<(), WireError> {
+    *txn = ConnTxn::Idle;
+    write_command_complete_tag(stream, "ROLLBACK")
+        .await
+        .map_err(WireError::Io)
+}
+
+/// Apply a transaction's buffered writes under the session lock, taking and
+/// releasing the mutex entirely within this synchronous call (never held across
+/// the caller's `await` writes). A poisoned mutex is recovered, as in [`run_ddl`].
+fn commit_txn(session: &SharedSession, txn: SessionTransaction) -> Result<(), EngineError> {
+    session
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .commit(txn)
 }
 
 /// Route a bound-DDL statement through the shared session engine and return its
@@ -592,8 +832,9 @@ async fn run_statement(
     stream: &mut TcpStream,
     stmt: &Statement,
     session: &SharedSession,
+    txn: &mut ConnTxn,
 ) -> Result<bool, WireError> {
-    match run_query(session, stmt) {
+    match run_query(session, stmt, txn) {
         Ok(StatementOutcome::Rows(result)) => match decode_result_rows(&result) {
             Ok(data_rows) => {
                 write_row_description(stream, &result_header(&result)).await?;
@@ -632,8 +873,23 @@ async fn run_statement(
 /// Run one statement against the shared session engine, taking and releasing the
 /// mutex entirely within this synchronous call (never held across the caller's
 /// `await` writes). A poisoned mutex is recovered, as in [`run_ddl`].
-fn run_query(session: &SharedSession, stmt: &Statement) -> Result<StatementOutcome, EngineError> {
+///
+/// When a transaction is open ([`ConnTxn::Active`]) an `INSERT`/`UPDATE`/`DELETE`
+/// is **buffered** into it rather than committed — its `CommandComplete` reports
+/// the would-be affected count and the write applies later at `COMMIT` ([STL-174]).
+/// A `SELECT` (or anything not DML) still runs immediately against the committed
+/// state; the buffer is write-only until commit.
+fn run_query(
+    session: &SharedSession,
+    stmt: &Statement,
+    txn: &mut ConnTxn,
+) -> Result<StatementOutcome, EngineError> {
     let mut engine = session.lock().unwrap_or_else(PoisonError::into_inner);
+    if let ConnTxn::Active(buffered) = txn {
+        if let Some(summary) = engine.stage_dml(stmt, buffered)? {
+            return Ok(StatementOutcome::Dml(summary));
+        }
+    }
     engine.execute(stmt)
 }
 
@@ -1072,12 +1328,13 @@ async fn write_backend_key_data(stream: &mut TcpStream, pid: i32, secret: i32) -
     stream.write_all(&buf).await
 }
 
-async fn write_ready_for_query(stream: &mut TcpStream) -> io::Result<()> {
-    // 'Z' + len(5) + 'I' (idle, not in a transaction)
+async fn write_ready_for_query(stream: &mut TcpStream, status: u8) -> io::Result<()> {
+    // 'Z' + len(5) + status byte: 'I' (idle), 'T' (in a transaction block), or
+    // 'E' (in a failed transaction block) — STL-174.
     let mut buf = BytesMut::with_capacity(6);
     buf.put_u8(MSG_READY_FOR_QUERY);
     buf.put_i32(5);
-    buf.put_u8(b'I');
+    buf.put_u8(status);
     stream.write_all(&buf).await
 }
 
@@ -1305,16 +1562,21 @@ mod tests {
     /// Send a simple query and collect every backend message up to (but not
     /// including) the trailing `ReadyForQuery` — the whole reply to one `Q`.
     async fn run_simple(client: &mut TcpStream, sql: &str) -> Vec<(u8, Vec<u8>)> {
+        run_simple_with_status(client, sql).await.0
+    }
+
+    /// As [`run_simple`], but also return the trailing `ReadyForQuery`
+    /// transaction-status byte (`I` / `T` / `E`) — STL-174.
+    async fn run_simple_with_status(client: &mut TcpStream, sql: &str) -> (Vec<(u8, Vec<u8>)>, u8) {
         send_query(client, sql).await;
         let mut msgs = Vec::new();
         loop {
             let (kind, payload) = read_message(client).await;
             if kind == MSG_READY_FOR_QUERY {
-                break;
+                return (msgs, payload[0]);
             }
             msgs.push((kind, payload));
         }
-        msgs
     }
 
     /// The field names of a `RowDescription` payload, skipping each field's
@@ -1376,6 +1638,101 @@ mod tests {
         client.write_all(&term).await.unwrap();
         drop(client);
         server.await.unwrap().unwrap();
+    }
+
+    /// The `CommandComplete` tag carried in a query reply, if any.
+    fn reply_tag(msgs: &[(u8, Vec<u8>)]) -> Option<String> {
+        msgs.iter()
+            .find(|(kind, _)| *kind == MSG_COMMAND_COMPLETE)
+            .map(|(_, payload)| command_tag(payload))
+    }
+
+    #[tokio::test]
+    async fn ready_for_query_reports_transaction_status_across_a_commit() {
+        // The trailing ReadyForQuery byte tracks the transaction block: `I` idle,
+        // `T` inside BEGIN…COMMIT, back to `I` after COMMIT (STL-174).
+        let (server, mut client) = connect_past_handshake().await;
+
+        let (_, status) = run_simple_with_status(
+            &mut client,
+            "CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+        )
+        .await;
+        assert_eq!(status, b'I', "idle after a bare DDL statement");
+
+        let (begin, status) = run_simple_with_status(&mut client, "BEGIN").await;
+        assert_eq!(reply_tag(&begin).as_deref(), Some("BEGIN"));
+        assert_eq!(status, b'T', "inside the transaction block after BEGIN");
+
+        let (_, status) =
+            run_simple_with_status(&mut client, "INSERT INTO account VALUES (1, 100)").await;
+        assert_eq!(status, b'T', "still in the block after a buffered INSERT");
+
+        let (commit, status) = run_simple_with_status(&mut client, "COMMIT").await;
+        assert_eq!(reply_tag(&commit).as_deref(), Some("COMMIT"));
+        assert_eq!(status, b'I', "idle again after COMMIT");
+
+        // The committed row is visible afterwards.
+        let rows = run_simple(&mut client, "SELECT id FROM account").await;
+        let data_rows = rows.iter().filter(|(k, _)| *k == MSG_DATA_ROW).count();
+        assert_eq!(data_rows, 1, "the committed INSERT is readable");
+
+        terminate(server, client).await;
+    }
+
+    #[tokio::test]
+    async fn an_error_in_a_transaction_aborts_it_until_rollback() {
+        // A statement error inside BEGIN aborts the block: ReadyForQuery flips to
+        // `E`, further statements are refused with 25P02, and ROLLBACK clears it
+        // back to `I` (STL-174).
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(
+            &mut client,
+            "CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+        )
+        .await;
+
+        let (_, status) = run_simple_with_status(&mut client, "BEGIN").await;
+        assert_eq!(status, b'T');
+
+        // A write against an unknown table errors and aborts the transaction.
+        let (errored, status) =
+            run_simple_with_status(&mut client, "INSERT INTO nope VALUES (1, 1)").await;
+        assert!(
+            errored.iter().any(|(k, _)| *k == MSG_ERROR_RESPONSE),
+            "the bad write reports an error"
+        );
+        assert_eq!(status, b'E', "the transaction is now aborted");
+
+        // Any further statement is refused until the block ends.
+        let (refused, status) = run_simple_with_status(&mut client, "SELECT 1").await;
+        let sqlstate = refused
+            .iter()
+            .find(|(k, _)| *k == MSG_ERROR_RESPONSE)
+            .map(|(_, payload)| {
+                // ErrorResponse fields: each a code byte + cstring; find 'C'.
+                let mut cursor = &payload[..];
+                let mut code = String::new();
+                while !cursor.is_empty() && cursor[0] != 0 {
+                    let field = cursor[0];
+                    let end = cursor[1..].iter().position(|&b| b == 0).unwrap() + 1;
+                    if field == b'C' {
+                        code = String::from_utf8(cursor[1..end].to_vec()).unwrap();
+                    }
+                    cursor = &cursor[end + 1..];
+                }
+                code
+            })
+            .expect("error response");
+        assert_eq!(sqlstate, SQLSTATE_IN_FAILED_TRANSACTION);
+        assert_eq!(status, b'E', "still aborted");
+
+        // ROLLBACK ends the block and returns to idle.
+        let (rolled_back, status) = run_simple_with_status(&mut client, "ROLLBACK").await;
+        assert_eq!(reply_tag(&rolled_back).as_deref(), Some("ROLLBACK"));
+        assert_eq!(status, b'I', "idle again after ROLLBACK");
+
+        terminate(server, client).await;
     }
 
     #[test]
