@@ -64,7 +64,7 @@ use stele_storage::systime::{EmptySealed, SealedSegments, SysTimeWriter};
 use stele_storage::validity::{Close, ValidityConfig, ValidityIndex};
 use stele_storage::validtime::{ValidInterval, ValidTimeWriter, unframe_payload};
 use stele_storage::wal::{Checkpoint, Wal, WalConfig};
-use stele_txn::TxnManager;
+use stele_txn::{ChainError, TxnManager, verify_chain};
 
 mod chacha;
 mod clock;
@@ -1419,6 +1419,96 @@ pub fn run_mvcc_seed(seed: u64) -> u64 {
     digest
 }
 
+/// Recover a hash-chained commit log under the sim and prove tamper-evidence.
+///
+/// Drives a seeded run of commits through the real [`TxnManager`], **recovers**
+/// the commit log, and proves tamper-evidence is load-bearing on the restart path
+/// ([STL-178], [ADR-0026], architecture invariant 10).
+///
+/// Each seed commits a run of transactions, then "crashes" (drops the manager,
+/// keeping only the durable WAL) and reopens it through
+/// [`TxnManager::recover`](stele_txn::TxnManager::recover). The clean log must
+/// recover to the **same** chain head the crashed manager held, and the recovered
+/// manager must continue the chain — the next commit's `seq` follows on and the
+/// whole reopened log re-verifies. Then a seed-chosen historical frame is forged
+/// (re-encoded, so it is well-formed) and [`verify_chain`]
+/// must catch the broken link at the *following* record — recovery fails closed
+/// rather than serving a silently-rewritten log. The digest folds the commit
+/// sequence, the recovered head, and the detected tamper position, so the seed
+/// sweep regresses on chain determinism *and* tamper detection together. Same
+/// seed ⇒ same digest.
+///
+/// [STL-178]: https://allegromusic.atlassian.net/browse/STL-178
+/// [ADR-0026]: ../../../docs/adr/0026-verifiable-audit-log.md
+#[must_use]
+pub fn run_chain_recovery_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut rng = Rng::new(seed);
+    let disk = MemDisk::new();
+    let wal = Wal::open(disk.clone(), WalConfig::default()).expect("open wal");
+    let mgr = TxnManager::new(StepClock::new(1), wal);
+
+    // A seeded run of commits builds a real hash-chained commit log.
+    let commits = 3 + rng.below(13);
+    let mut digest = FNV_OFFSET;
+    for i in 0..commits {
+        let mut t = mgr.begin();
+        t.write(BusinessKey::new(format!("k-{i:04}").into_bytes()));
+        let c = mgr.commit(t).expect("commit");
+        digest = fnv1a(digest, &c.seq.to_le_bytes());
+    }
+    let clean_head = mgr.commit_head();
+    drop(mgr); // crash: drop the in-memory state, keep the durable WAL.
+
+    // Recovery re-verifies the chain from genesis and rebuilds the head; a clean
+    // log recovers to exactly the pre-crash head (fails closed otherwise).
+    let reopened = Wal::open(disk.clone(), WalConfig::default()).expect("reopen wal");
+    let recovered = TxnManager::recover(StepClock::new(1), reopened).expect("clean recovery");
+    assert_eq!(
+        recovered.commit_head(),
+        clean_head,
+        "seed {seed}: recovered head must match the pre-crash head"
+    );
+    digest = fnv1a(digest, recovered.commit_head().as_bytes());
+
+    // The recovered manager continues the chain: the next commit resumes one past
+    // the recovered log and links onto the recovered head.
+    let mut extra = recovered.begin();
+    extra.write(BusinessKey::new(b"post-recovery".to_vec()));
+    let ec = recovered.commit(extra).expect("post-recovery commit");
+    assert_eq!(
+        ec.seq,
+        commits + 1,
+        "seed {seed}: seq must resume one past the recovered log"
+    );
+    digest = fnv1a(digest, &ec.seq.to_le_bytes());
+
+    // Tamper-evidence: forge a seed-chosen historical frame and confirm the chain
+    // catches it. The whole log (recovered records + the new one) is read back;
+    // a non-tail frame is chosen so a successor exists to break the link.
+    let frames: Vec<Vec<u8>> = Wal::open(disk, WalConfig::default())
+        .expect("reopen for tamper")
+        .replay_from(Checkpoint::BEGIN)
+        .map(|r| r.expect("frame"))
+        .collect();
+    let victim = rng.below_usize(frames.len() - 1);
+    let mut forged = frames;
+    forged[victim][8] ^= 0x01; // flip a byte of record `victim`'s commit_ts.
+    let err = verify_chain(forged.into_iter().map(Ok)).expect_err("tamper must be detected");
+    match err {
+        ChainError::BrokenLink { index, .. } => {
+            assert_eq!(
+                usize::try_from(index).expect("record index fits in usize"),
+                victim + 1,
+                "seed {seed}: the break surfaces at the tampered record's successor"
+            );
+            digest = fnv1a(digest, &index.to_le_bytes());
+        }
+        other => panic!("seed {seed}: expected a broken link, got {other:?}"),
+    }
+    digest
+}
+
 /// Play a seeded workload against a [`FaultDisk`] and fold every operation
 /// outcome and the disk's seed-keyed fault-event log into a digest ([STL-109]).
 ///
@@ -2127,7 +2217,8 @@ impl Scenario for FnScenario {
 /// Every scenario the harness drives, in a stable order.
 ///
 /// The v0.1 set covers the system-time and valid-time write paths, the
-/// WAL→delta(+index) recovery paths, the MVCC commit/conflict path, the merged
+/// WAL→delta(+index) recovery paths, the MVCC commit/conflict path, the
+/// commit-log hash-chain recovery + tamper-evidence path, the merged
 /// AS-OF read path with its binder and the canonical AS-OF oracle, the engine
 /// kill-and-recover driver and its fault-injected variant, the cooperative
 /// scheduler's interleaving demo, and the seeded-fault virtual disk.
@@ -2139,6 +2230,7 @@ pub fn registry() -> Vec<Box<dyn Scenario>> {
         FnScenario::boxed("delete-provenance", run_delete_seed),
         FnScenario::boxed("dml-wal-replay", run_dml_seed),
         FnScenario::boxed("mvcc", run_mvcc_seed),
+        FnScenario::boxed("chain-recovery", run_chain_recovery_seed),
         FnScenario::boxed("recovery-index", run_recovery_index_seed),
         FnScenario::boxed("snapshot-scan", run_snapshot_scan_seed),
         FnScenario::boxed("as-of-resolution", run_as_of_resolution_seed),
@@ -2465,6 +2557,29 @@ mod tests {
         assert!(
             digests.len() > 1,
             "the MVCC commit/conflict workload must actually depend on the seed"
+        );
+    }
+
+    #[test]
+    fn chain_recovery_seed_is_reproducible() {
+        // Each seed also asserts (internally) that a clean log recovers to the
+        // pre-crash head and that a forged historical frame fails closed.
+        for seed in 0..64 {
+            assert_eq!(
+                run_chain_recovery_seed(seed),
+                run_chain_recovery_seed(seed),
+                "seed {seed} must replay to an identical chain-recovery digest"
+            );
+        }
+    }
+
+    #[test]
+    fn chain_recovery_distinct_seeds_diverge() {
+        let digests: std::collections::HashSet<u64> =
+            (0..64).map(run_chain_recovery_seed).collect();
+        assert!(
+            digests.len() > 1,
+            "the commit-log recovery workload must actually depend on the seed"
         );
     }
 
