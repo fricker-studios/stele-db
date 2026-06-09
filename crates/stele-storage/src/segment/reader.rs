@@ -23,6 +23,7 @@
 //! for one chunk's I/O and one CRC.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::SystemTimeMicros;
@@ -132,6 +133,22 @@ impl<F: DiskFile> SegmentReader<F> {
             .sum()
     }
 
+    /// The number of rows in each row-group, in on-disk (row) order.
+    ///
+    /// Footer-derived, so it costs no column-chunk I/O. This is the addressing
+    /// a caller needs to map a segment-global row index back to its owning
+    /// row-group — the prefix sums of these counts are each row-group's
+    /// starting row — and then scope a column read to just those row-groups
+    /// via [`Self::read_column_in_row_groups`] ([STL-155]).
+    #[must_use]
+    pub fn row_group_row_counts(&self) -> Vec<u32> {
+        self.footer
+            .row_groups
+            .iter()
+            .map(|rg| rg.row_count)
+            .collect()
+    }
+
     /// The segment's resident [`ZoneMap`], decoded once at open from the
     /// footer's per-column min/max stats.
     ///
@@ -162,6 +179,41 @@ impl<F: DiskFile> SegmentReader<F> {
     /// touched, and each chunk's CRC32C is verified before any of its bytes
     /// are decoded.
     pub fn read_column(&self, col: ColumnId) -> Result<ColumnData, SegmentError> {
+        self.read_column_from(col, self.footer.row_groups.iter())
+    }
+
+    /// Read one column across only the selected row-groups, in row-group
+    /// (and therefore row) order — the chunk-level late-materialization path
+    /// ([STL-155]). Only the named row-groups' chunks for `col` are touched;
+    /// each chunk's CRC32C is still verified before any of its bytes are
+    /// decoded. The returned values are the concatenation of the selected
+    /// row-groups' values, so a caller addressing individual rows must
+    /// translate segment-global row indices through the selection (see
+    /// [`Self::row_group_row_counts`]).
+    ///
+    /// # Panics
+    ///
+    /// If a selected index is not below the footer's row-group count — the
+    /// caller derives its selection from this reader's own
+    /// [`row_group_row_counts`](Self::row_group_row_counts), so an
+    /// out-of-range index is a caller bug, not data corruption (the same
+    /// contract as `Column::slice` in the executor).
+    pub fn read_column_in_row_groups(
+        &self,
+        col: ColumnId,
+        row_groups: &BTreeSet<usize>,
+    ) -> Result<ColumnData, SegmentError> {
+        self.read_column_from(col, row_groups.iter().map(|&g| &self.footer.row_groups[g]))
+    }
+
+    /// Shared body of [`Self::read_column`] / [`Self::read_column_in_row_groups`]:
+    /// decode `col`'s chunk from each yielded row-group, appending values in
+    /// iteration order.
+    fn read_column_from<'g>(
+        &self,
+        col: ColumnId,
+        row_groups: impl Iterator<Item = &'g RowGroup>,
+    ) -> Result<ColumnData, SegmentError> {
         // No `with_capacity` from `self.row_count()` — that figure is
         // footer-derived and the natural-growth `Vec` is the safer baseline
         // against a corrupt footer that advertises billions of rows. Each
@@ -175,7 +227,7 @@ impl<F: DiskFile> SegmentReader<F> {
             // `NullableBytes`. Every other bytes column is always present.
             ColumnType::Bytes if col == ColumnId::Payload => {
                 let mut out: Vec<Option<Vec<u8>>> = Vec::new();
-                for rg in &self.footer.row_groups {
+                for rg in row_groups {
                     let meta = chunk_meta(rg, col)?;
                     let payload = read_chunk_payload(&self.file, meta)?;
                     decode_nullable_bytes_chunk(&payload, meta.value_count, &mut out)?;
@@ -184,7 +236,7 @@ impl<F: DiskFile> SegmentReader<F> {
             }
             ColumnType::Bytes => {
                 let mut out: Vec<Vec<u8>> = Vec::new();
-                for rg in &self.footer.row_groups {
+                for rg in row_groups {
                     let meta = chunk_meta(rg, col)?;
                     let payload = read_chunk_payload(&self.file, meta)?;
                     decode_bytes_chunk(&payload, meta.value_count, &mut out)?;
@@ -193,7 +245,7 @@ impl<F: DiskFile> SegmentReader<F> {
             }
             ColumnType::I64 => {
                 let mut out: Vec<i64> = Vec::new();
-                for rg in &self.footer.row_groups {
+                for rg in row_groups {
                     let meta = chunk_meta(rg, col)?;
                     let payload = read_chunk_payload(&self.file, meta)?;
                     decode_i64_chunk(&payload, meta.value_count, &mut out)?;

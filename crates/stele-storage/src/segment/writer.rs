@@ -29,10 +29,14 @@ use super::format::{
 
 /// Streaming writer over a single sealed-segment file.
 ///
-/// v0.1 emits exactly one row-group per segment, so all pushed rows are held
-/// in memory until [`finish`](Self::finish) drains them into chunks. The
-/// on-disk footer already enumerates row-groups, so a future writer can flush
-/// in row-group-sized batches without bumping the format version.
+/// All pushed rows are held in memory until [`finish`](Self::finish) drains
+/// them into chunks. By default the writer emits exactly one row-group per
+/// segment (the v0.1 shape); [`with_max_row_group_rows`](Self::with_max_row_group_rows)
+/// bounds each row-group so a wide segment splits into several, which is what
+/// lets the read path skip the chunks of row-groups holding no live row
+/// ([`SegmentReader::read_column_in_row_groups`](super::SegmentReader::read_column_in_row_groups),
+/// [STL-155]). The on-disk footer has enumerated row-groups since v1, so the
+/// split needs no format-version bump.
 pub struct SegmentWriter<F: DiskFile> {
     file: F,
     rows: Vec<Version>,
@@ -47,6 +51,10 @@ pub struct SegmentWriter<F: DiskFile> {
     /// `payload` column ([STL-119]); when clear, those columns are absent and
     /// the payload is stored verbatim.
     valid_time: bool,
+    /// Upper bound on rows per row-group ([STL-155]). `None` — the default —
+    /// keeps the v0.1 shape: every pushed row lands in one row-group, so the
+    /// emitted bytes are identical to what earlier writers produced.
+    max_row_group_rows: Option<usize>,
 }
 
 impl<F: DiskFile> SegmentWriter<F> {
@@ -94,7 +102,22 @@ impl<F: DiskFile> SegmentWriter<F> {
             rows: Vec::new(),
             retractions: Vec::new(),
             valid_time,
+            max_row_group_rows: None,
         })
+    }
+
+    /// Bound each row-group to at most `rows` rows, so
+    /// [`finish`](Self::finish) splits the buffered rows into several
+    /// row-groups instead of the single default one ([STL-155]). A bounded
+    /// segment lets the read path skip whole row-groups that hold no live row
+    /// ([`SegmentReader::read_column_in_row_groups`](super::SegmentReader::read_column_in_row_groups));
+    /// the footer has enumerated row-groups since v1, so the split is not a
+    /// format change. A `rows` of `0` is clamped to `1` (the same clamp
+    /// `SnapshotScan::into_source` applies to its batch size).
+    #[must_use]
+    pub fn with_max_row_group_rows(mut self, rows: usize) -> Self {
+        self.max_row_group_rows = Some(rows.max(1));
+        self
     }
 
     /// Buffer one row for inclusion in the current (and, in v0.1, only)
@@ -137,9 +160,11 @@ impl<F: DiskFile> SegmentWriter<F> {
         Ok(())
     }
 
-    /// Seal the segment: emit every buffered row as one row-group, then write
-    /// the footer and trailer and `sync`. After return the file is immutable
-    /// in the format's sense — no writer API can reach it.
+    /// Seal the segment: emit every buffered row as row-groups (one by
+    /// default; several when [`with_max_row_group_rows`](Self::with_max_row_group_rows)
+    /// bounded them), then write the footer and trailer and `sync`. After
+    /// return the file is immutable in the format's sense — no writer API can
+    /// reach it.
     pub fn finish(mut self) -> Result<(), SegmentError> {
         // Per-column buffers. Row order is preserved: column i's k-th value
         // came from `self.rows[k]`. A valid-time table's schema carries the
@@ -147,35 +172,60 @@ impl<F: DiskFile> SegmentWriter<F> {
         let schema = ColumnId::schema(self.valid_time);
         // Decode each row's valid-time prefix exactly once up front (not once
         // per valid-time column), so emitting both valid_from and valid_to
-        // re-uses the same parse ([STL-117]).
+        // re-uses the same parse ([STL-117]). Decoded across all rows, then
+        // sliced per row-group below, so the split does not re-parse either.
         let valid_pairs: Option<Vec<(i64, i64)>> = if self.valid_time {
             Some(decode_valid_pairs(&self.rows)?)
         } else {
             None
         };
-        let mut chunks: Vec<EncodedChunk> = Vec::with_capacity(schema.len());
+        // Partition the buffered rows into row-groups ([STL-155]). The unbounded
+        // default produces the single row-group every earlier writer emitted; an
+        // empty segment keeps its one empty row-group rather than zero, so the
+        // empty-segment footer shape is unchanged too.
+        let group_rows = self.max_row_group_rows.unwrap_or(usize::MAX);
+        let groups: Vec<&[Version]> = if self.rows.is_empty() {
+            vec![&[][..]]
+        } else {
+            self.rows.chunks(group_rows).collect()
+        };
+        let mut row_groups: Vec<RowGroupChunks> = Vec::with_capacity(groups.len());
         let mut offset: u64 = HEADER_LEN as u64;
-
-        let version_count = u32::try_from(self.rows.len())
-            .map_err(|_| SegmentError::TooLarge("row count exceeds u32::MAX in one row-group"))?;
-        for &col in schema {
-            let encoded = encode_column(col, &self.rows, valid_pairs.as_deref())?;
-            // Each chunk is laid out contiguously in `ColumnId::schema` order
-            // (`business_key`, `sys_from`, `payload`, the three provenance
-            // columns, then the valid-time pair when present) — there is no
-            // stored `sys_to` (v6, [ADR-0023]). The footer records the absolute
-            // offset, so the reader projects exactly the columns it wants.
-            let length = (CHUNK_HEADER_LEN + encoded.payload.len()) as u64;
-            chunks.push(EncodedChunk {
-                col,
-                offset,
-                length,
-                value_count: version_count,
-                payload: encoded.payload,
-                stat_min: encoded.stat_min,
-                stat_max: encoded.stat_max,
+        let mut row_base = 0usize;
+        for group in groups {
+            let version_count = u32::try_from(group.len()).map_err(|_| {
+                SegmentError::TooLarge("row count exceeds u32::MAX in one row-group")
+            })?;
+            let group_pairs = valid_pairs
+                .as_deref()
+                .map(|pairs| &pairs[row_base..row_base + group.len()]);
+            let mut chunks: Vec<EncodedChunk> = Vec::with_capacity(schema.len());
+            for &col in schema {
+                let encoded = encode_column(col, group, group_pairs)?;
+                // Within a row-group each chunk is laid out contiguously in
+                // `ColumnId::schema` order (`business_key`, `sys_from`,
+                // `payload`, the three provenance columns, then the valid-time
+                // pair when present) — there is no stored `sys_to` (v6,
+                // [ADR-0023]); row-groups follow one another in row order. The
+                // footer records the absolute offset, so the reader projects
+                // exactly the columns (and row-groups) it wants.
+                let length = (CHUNK_HEADER_LEN + encoded.payload.len()) as u64;
+                chunks.push(EncodedChunk {
+                    col,
+                    offset,
+                    length,
+                    value_count: version_count,
+                    payload: encoded.payload,
+                    stat_min: encoded.stat_min,
+                    stat_max: encoded.stat_max,
+                });
+                offset += length;
+            }
+            row_groups.push(RowGroupChunks {
+                row_count: version_count,
+                chunks,
             });
-            offset += length;
+            row_base += group.len();
         }
 
         // Retraction tombstones (format v7, STL-143) follow the version
@@ -204,12 +254,16 @@ impl<F: DiskFile> SegmentWriter<F> {
             }
         }
 
-        // Emit every chunk in declaration order — version row-group first, then
-        // the retraction section. Each chunk header is self-checksummed:
-        // `chunk_crc` covers `(header[0..12] || payload)`, so a flip anywhere
-        // except the CRC field itself is detected — and a flip in the CRC field
-        // is detected as a mismatch.
-        for chunk in chunks.iter().chain(&retraction_chunks) {
+        // Emit every chunk in declaration order — version row-groups first (in
+        // row order), then the retraction section. Each chunk header is
+        // self-checksummed: `chunk_crc` covers `(header[0..12] || payload)`, so
+        // a flip anywhere except the CRC field itself is detected — and a flip
+        // in the CRC field is detected as a mismatch.
+        for chunk in row_groups
+            .iter()
+            .flat_map(|rg| rg.chunks.iter())
+            .chain(&retraction_chunks)
+        {
             let mut header = Vec::with_capacity(CHUNK_HEADER_LEN);
             let payload_len = u32::try_from(chunk.payload.len()).map_err(|_| {
                 SegmentError::TooLarge("column-chunk payload exceeds u32::MAX bytes")
@@ -229,7 +283,7 @@ impl<F: DiskFile> SegmentWriter<F> {
             self.file.append(&chunk.payload)?;
         }
 
-        let footer = encode_footer(self.rows.len(), &chunks, &retraction_chunks)?;
+        let footer = encode_footer(&row_groups, &retraction_chunks)?;
         let footer_crc = crc32c(&footer);
         let footer_len = u32::try_from(footer.len())
             .map_err(|_| SegmentError::TooLarge("footer exceeds u32::MAX bytes"))?;
@@ -305,6 +359,13 @@ struct EncodedChunk {
     payload: Vec<u8>,
     stat_min: StatBound,
     stat_max: StatBound,
+}
+
+/// One encoded row-group: its row count and its per-column chunks, in
+/// `ColumnId::schema` order ([STL-155]).
+struct RowGroupChunks {
+    row_count: u32,
+    chunks: Vec<EncodedChunk>,
 }
 
 fn encode_column(
@@ -640,22 +701,26 @@ fn decode_valid_pairs(rows: &[Version]) -> Result<Vec<(i64, i64)>, SegmentError>
 }
 
 fn encode_footer(
-    row_count: usize,
-    chunks: &[EncodedChunk],
+    row_groups: &[RowGroupChunks],
     retraction_chunks: &[EncodedChunk],
 ) -> Result<Vec<u8>, SegmentError> {
-    let row_count = u32::try_from(row_count)
-        .map_err(|_| SegmentError::TooLarge("row count exceeds u32::MAX in one row-group"))?;
-    let column_count = u32::try_from(chunks.len())
-        .map_err(|_| SegmentError::TooLarge("column count exceeds u32::MAX"))?;
+    let row_group_count = u32::try_from(row_groups.len())
+        .map_err(|_| SegmentError::TooLarge("row-group count exceeds u32::MAX"))?;
     let mut out = Vec::new();
     out.extend_from_slice(&SCHEMA_ID_IMPLICIT_VERSION.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // flags
-    out.extend_from_slice(&1u32.to_le_bytes()); // row_group_count — v0.1 emits exactly one
-    out.extend_from_slice(&row_count.to_le_bytes());
-    out.extend_from_slice(&column_count.to_le_bytes());
-    for chunk in chunks {
-        encode_chunk_meta(&mut out, chunk)?;
+    // One by default; several when the writer was bounded ([STL-155]). The
+    // footer has carried this count since v1, so a multi-row-group segment is
+    // not a format change.
+    out.extend_from_slice(&row_group_count.to_le_bytes());
+    for rg in row_groups {
+        let column_count = u32::try_from(rg.chunks.len())
+            .map_err(|_| SegmentError::TooLarge("column count exceeds u32::MAX"))?;
+        out.extend_from_slice(&rg.row_count.to_le_bytes());
+        out.extend_from_slice(&column_count.to_le_bytes());
+        for chunk in &rg.chunks {
+            encode_chunk_meta(&mut out, chunk)?;
+        }
     }
     // Retraction section (format v7, STL-143): a count of tombstone rows (the
     // shared value_count for every retraction column) followed by that many
