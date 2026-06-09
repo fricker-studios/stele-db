@@ -202,6 +202,23 @@ fn project_selects_and_reorders_columns() {
 }
 
 #[test]
+fn project_can_emit_a_column_more_than_once() {
+    let (delta, index, snap) = table_with_rows(2);
+    // A degenerate projection that names BusinessKey twice: the first selection
+    // moves the column out, the repeat clones the already-emitted copy.
+    let source = SnapshotScan::new(&delta, &index, &NO_SEGMENTS, snap).into_source(8);
+    let batches = drain(Project::new(
+        source,
+        vec![ColumnId::BusinessKey, ColumnId::BusinessKey],
+    ));
+    assert_eq!(batches.len(), 1);
+    let cols: Vec<ColumnId> = batches[0].columns.iter().map(|(c, _)| *c).collect();
+    assert_eq!(cols, [ColumnId::BusinessKey, ColumnId::BusinessKey]);
+    // Both copies carry identical data.
+    assert_eq!(batches[0].columns[0].1, batches[0].columns[1].1);
+}
+
+#[test]
 fn project_for_a_column_the_child_did_not_emit_errors() {
     let (delta, index, snap) = table_with_rows(2);
     // Source projects only BusinessKey; Project then asks for Payload, which the

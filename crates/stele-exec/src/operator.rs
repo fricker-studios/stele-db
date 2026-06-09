@@ -48,7 +48,7 @@
 use stele_storage::backend::{Disk, DiskFile};
 use stele_storage::segment::ColumnId;
 
-use crate::snapshot_scan::{Batch, ScanError, ScanStats, SnapshotScan};
+use crate::snapshot_scan::{Batch, Column, ScanError, ScanStats, SnapshotScan};
 
 /// Default rows per emitted [`Batch`] when a caller picks no other size.
 ///
@@ -177,19 +177,30 @@ impl<C: Operator> Operator for Project<C> {
         let Some(batch) = self.child.next()? else {
             return Ok(None);
         };
-        let mut columns = Vec::with_capacity(self.columns.len());
+        let rows = batch.rows;
+        // Move the child's columns into takeable slots so a projection that
+        // selects + reorders distinct columns (the common case) *moves* each one
+        // out of the owned batch — no per-batch deep clone. A column projected
+        // more than once (degenerate) clones from the copy already emitted this
+        // batch; a column the child never emitted is a plan error.
+        let mut slots: Vec<(ColumnId, Option<Column>)> = batch
+            .columns
+            .into_iter()
+            .map(|(id, c)| (id, Some(c)))
+            .collect();
+        let mut columns: Vec<(ColumnId, Column)> = Vec::with_capacity(self.columns.len());
         for &want in &self.columns {
-            let col = batch
-                .columns
-                .iter()
-                .find(|(id, _)| *id == want)
-                .map(|(_, c)| c.clone())
-                .ok_or(ScanError::MissingColumn(want))?;
+            let col = match slots.iter_mut().find(|(id, _)| *id == want) {
+                Some((_, slot @ Some(_))) => slot.take().expect("matched Some"),
+                Some((_, None)) => columns
+                    .iter()
+                    .find(|(id, _)| *id == want)
+                    .map(|(_, c)| c.clone())
+                    .expect("a taken column was already emitted this batch"),
+                None => return Err(ScanError::MissingColumn(want)),
+            };
             columns.push((want, col));
         }
-        Ok(Some(Batch {
-            columns,
-            rows: batch.rows,
-        }))
+        Ok(Some(Batch { columns, rows }))
     }
 }
