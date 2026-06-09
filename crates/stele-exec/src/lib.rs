@@ -11,7 +11,14 @@
 //! v0.1 lands the read-path glue: [`SnapshotScan`], which merges the delta tier
 //! and the sealed segments into one snapshot-resolved, projected batch
 //! ([STL-100]).
+//!
+//! v0.2 adds the [`Operator`] framework: a Volcano-style, batch-at-a-time pull
+//! pipeline over Arrow-shaped batches, with [`SnapshotScan`] re-expressed as a
+//! source operator ([`ScanSource`]) and a [`Project`] shaping operator. The
+//! aggregate / join / filter operators (STL-77 C10–C13) build on this trait.
 
+mod operator;
 mod snapshot_scan;
 
+pub use operator::{DEFAULT_BATCH_SIZE, Operator, Project, ScanSource};
 pub use snapshot_scan::{Batch, Column, ScanError, ScanOutput, ScanStats, SnapshotScan};
