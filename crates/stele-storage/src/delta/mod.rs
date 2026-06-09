@@ -242,6 +242,33 @@ impl<D: Disk> Delta<D> {
         Ok(merge::resolve_snapshot(&chains, snapshot))
     }
 
+    /// Merge every in-memory row plus every spill into a single sequence sorted by
+    /// `(business_key, sys_from, seq)`, **without** draining the tier or touching
+    /// any spill file. Shared by [`flush_to_segment`](Self::flush_to_segment) (which
+    /// then clears) and [`staged_versions`](Self::staged_versions) (which does not).
+    fn merge_staged(&self) -> Result<Vec<Version>, DeltaError> {
+        let mut merged: BTreeMap<BusinessKey, BTreeMap<(SystemTimeMicros, u64), Version>> =
+            BTreeMap::new();
+        for v in self.mem.iter() {
+            merged
+                .entry(v.business_key.clone())
+                .or_default()
+                .insert((v.sys_from, v.seq), v.clone());
+        }
+        for &idx in &self.live_spills {
+            for v in spill::read_spill(&self.disk, idx)? {
+                merged
+                    .entry(v.business_key.clone())
+                    .or_default()
+                    .insert((v.sys_from, v.seq), v);
+            }
+        }
+        Ok(merged
+            .into_values()
+            .flat_map(BTreeMap::into_values)
+            .collect())
+    }
+
     /// Promote every in-memory row plus every spill into a single sorted
     /// sequence and clear the delta. Removes the consumed spill files.
     ///
@@ -253,32 +280,60 @@ impl<D: Disk> Delta<D> {
     ///
     /// Surfaces I/O or corruption errors loading spill files.
     pub fn flush_to_segment(&mut self) -> Result<Vec<Version>, DeltaError> {
-        let mut merged: BTreeMap<BusinessKey, BTreeMap<(SystemTimeMicros, u64), Version>> =
-            BTreeMap::new();
-        for v in self.mem.drain_sorted() {
-            merged
-                .entry(v.business_key.clone())
-                .or_default()
-                .insert((v.sys_from, v.seq), v);
-        }
-        for &idx in &self.live_spills {
-            for v in spill::read_spill(&self.disk, idx)? {
-                merged
-                    .entry(v.business_key.clone())
-                    .or_default()
-                    .insert((v.sys_from, v.seq), v);
-            }
-        }
-        // Remove spills only after a successful merge — if a read failed
-        // halfway through, the caller still has the option of re-reading on
-        // the next attempt.
+        // Merge first; remove spills only after a successful merge — if a read
+        // failed halfway through, the caller can re-read on the next attempt.
+        let out = self.merge_staged()?;
         for idx in std::mem::take(&mut self.live_spills) {
             spill::remove_spill(&self.disk, idx)?;
         }
-        Ok(merged
-            .into_values()
-            .flat_map(BTreeMap::into_values)
-            .collect())
+        self.mem = MemTier::new();
+        Ok(out)
+    }
+
+    /// Every staged version — in-memory rows plus every spill, sorted by
+    /// `(business_key, sys_from, seq)` — **without** draining the tier.
+    ///
+    /// This is the read half of a crash-safe flush ([`Engine::flush`](crate::engine::Engine::flush),
+    /// [STL-177]): the engine snapshots the staged versions here, seals them into a
+    /// segment, and only *then* commits the flush and calls
+    /// [`discard_flushed`](Self::discard_flushed). If the seal or the commit fails,
+    /// the tier is untouched and the WAL stays authoritative — nothing is lost.
+    /// Paired with [`staged_retractions`](Self::staged_retractions) for the
+    /// tombstone half.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces I/O or corruption errors loading spill files.
+    pub fn staged_versions(&self) -> Result<Vec<Version>, DeltaError> {
+        self.merge_staged()
+    }
+
+    /// Every staged retraction tombstone, in `(business_key, sys_from, seq)` order,
+    /// **without** draining the buffer — the tombstone half of the non-draining
+    /// flush snapshot (see [`staged_versions`](Self::staged_versions)). Unlike
+    /// [`take_retractions`](Self::take_retractions) the buffer is left intact until
+    /// the flush commits via [`discard_flushed`](Self::discard_flushed).
+    #[must_use]
+    pub fn staged_retractions(&self) -> Vec<Close> {
+        self.retractions.values().cloned().collect()
+    }
+
+    /// Drop the tier's staged contents after a flush has *committed* them to a
+    /// sealed segment: clear the in-memory rows, remove every spill file, and clear
+    /// the retraction buffer. The caller ([`Engine::flush`](crate::engine::Engine::flush))
+    /// invokes this only once the segment and its checkpoint record are durable, so
+    /// a crash before that point leaves everything in place for WAL replay.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces I/O errors removing spill files.
+    pub fn discard_flushed(&mut self) -> Result<(), DeltaError> {
+        for idx in std::mem::take(&mut self.live_spills) {
+            spill::remove_spill(&self.disk, idx)?;
+        }
+        self.mem = MemTier::new();
+        self.retractions.clear();
+        Ok(())
     }
 
     /// Stage a retraction tombstone (a logical delete — a [`Close`] with no

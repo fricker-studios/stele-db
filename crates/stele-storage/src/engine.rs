@@ -6,10 +6,11 @@
 //! that walks the boot flow of [architecture §3.6](../../../docs/02-architecture.md#36-crash-recovery):
 //!
 //! ```text
-//!   boot ─▶ verify sealed segments (checksums)
-//!        ─▶ load the last checkpoint (durable WAL fence)
-//!        ─▶ replay the WAL forward (idempotent redo)
-//!        ─▶ rebuild the delta tier + validity index
+//!   boot ─▶ load the recovery point (replay floor + durable fence + committed segments)
+//!        ─▶ verify the committed sealed segments (checksums); drop orphans
+//!        ─▶ rebuild the validity index from the segment store
+//!        ─▶ replay the WAL tail from the floor (idempotent redo)
+//!        ─▶ rebuild the delta tier + overlay the tail's closes
 //!        ─▶ ready (consistent)
 //! ```
 //!
@@ -32,19 +33,26 @@
 //! **exactly** the pre-crash one, the property the million-seed sim sweep pins
 //! ([STL-102] DoD).
 //!
-//! ## The checkpoint, and what it is *not* in v0.1
+//! ## Two checkpoints: the durable fence, and the flush
 //!
-//! [`Engine::checkpoint`] fsyncs the WAL and records the **last fully-flushed WAL
-//! offset** to a small checkpoint file — periodically and on
-//! graceful shutdown. Per [ADR-0023] the index is rebuilt *from the WAL*, not from
-//! a persisted index snapshot, so v0.1 recovery replays the full log and the
-//! checkpoint serves as the **durable boundary**: records up to it are committed
-//! and must survive a crash; the unsynced tail past it is what a mid-write
-//! `kill -9` may tear, and is dropped at the first corrupt record by the WAL's
-//! torn-write contract ([`crate::wal`]). Turning the checkpoint into a
-//! replay-*skip* (so routine recovery is `checkpoint + tail` over a persisted
-//! validity-index checkpoint) is the realignment tracked in STL-133 / STL-136;
-//! this engine leaves the seam exactly where they pick it up.
+//! [`Engine::checkpoint`] is the lightweight one: it fsyncs the WAL and records
+//! the **last fully-flushed WAL offset** as the durable boundary — records up to
+//! it are committed and must survive a crash; the unsynced tail past it is what a
+//! mid-write `kill -9` may tear, dropped at the first corrupt record by the WAL's
+//! torn-write contract ([`crate::wal`]). It does not bound replay: recovery still
+//! replays from the log origin.
+//!
+//! [`Engine::flush`] is the **bounding** one ([STL-177]): it seals the in-memory
+//! delta tier into a fresh sealed segment, then advances the **replay floor** —
+//! the offset recovery resumes from — past the records that segment now covers.
+//! Everything before the floor is durable in committed segments and rebuilt from
+//! the segment store ([ADR-0023], no persisted index snapshot), so routine
+//! recovery is `segment rebuild + tail replay` rather than a full-log scan. The
+//! checkpoint file is the manifest that makes a crash *during* a flush safe: a
+//! segment is committed only once its checkpoint record (carrying the advanced
+//! floor and the bumped committed-segment count) is durable, so a
+//! segment written by a torn flush is an **orphan** recovery ignores, falling
+//! back to the WAL — the atomic-commit seam STL-133 / STL-136 anticipated.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -53,12 +61,12 @@ use stele_common::provenance::{Principal, TxnId};
 use stele_common::time::{Clock, SystemTimeMicros};
 
 use crate::backend::Disk;
-use crate::checkpoint;
+use crate::checkpoint::{self, RecoveryPoint};
 use crate::delta::{BusinessKey, Delta, DeltaConfig, DeltaError, Snapshot, Version};
 use crate::dml::{self, DmlError, DmlOutcome, DmlWriter};
 use crate::merge;
 use crate::rebuild::rebuild_index_from_segments;
-use crate::segment::{SegmentError, SegmentReader};
+use crate::segment::{SegmentError, SegmentReader, SegmentWriter};
 use crate::systime::SealedVersions;
 use crate::validity::{ClosedInterval, ValidityConfig, ValidityError, ValidityIndex};
 use crate::validtime::ValidInterval;
@@ -109,7 +117,12 @@ pub enum EngineError {
 /// reconstructs the non-durable tiers from the log first.
 pub struct Engine<C: Clock, D: Disk + Clone> {
     disk: D,
-    /// A clone of the writer's WAL handle, for [`Self::checkpoint`].
+    /// Whether this table opts into valid-time — mirrors the catalog flag passed
+    /// to [`Self::open`]/[`Self::recover`]. Selects the
+    /// [`SegmentWriter`](crate::segment::SegmentWriter) flavor a [`Self::flush`]
+    /// seals with, and the delta/segment payload framing ([STL-117]).
+    valid_time: bool,
+    /// A clone of the writer's WAL handle, for [`Self::checkpoint`] / [`Self::flush`].
     wal: Wal<D>,
     writer: DmlWriter<C, D>,
     delta: Delta<D>,
@@ -120,12 +133,22 @@ pub struct Engine<C: Clock, D: Disk + Clone> {
     /// resident; a per-key segment index is the follow-up the [`crate::systime`]
     /// module anticipates.
     sealed: SealedVersions,
-    /// The validated sealed segment filenames, in sorted order — observability
-    /// for tests and a future compaction/manifest hook.
+    /// The validated, **committed** sealed segment filenames, in sorted order —
+    /// observability for tests and the manifest hook a [`Self::flush`] appends to.
+    /// Excludes orphan segments left by a torn flush (recovery drops those).
     segment_names: Vec<String>,
+    /// The next sealed-segment index a [`Self::flush`] will allocate — equal to
+    /// the committed segment count, i.e. `segment_names.len()`
+    /// at the last commit. Segment files at this index or above are uncommitted
+    /// orphans.
+    next_segment_index: u64,
+    /// The WAL offset recovery resumes replay from — advanced by [`Self::flush`]
+    /// past every record the flushed segments now cover. [`LogOffset::ZERO`] until
+    /// the first flush, so a checkpoint-only engine replays the whole log.
+    replay_floor: LogOffset,
     /// The durable WAL fence loaded at recovery / last stored by
-    /// [`Self::checkpoint`]. [`None`] means no checkpoint has been taken — replay
-    /// covers the whole log.
+    /// [`Self::checkpoint`] or [`Self::flush`]. [`None`] means no checkpoint has
+    /// been taken — replay covers the whole log and no segment is trusted.
     checkpoint: Option<LogOffset>,
 }
 
@@ -147,12 +170,15 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         let writer = DmlWriter::new(wal.clone(), clock, valid_time);
         Ok(Self {
             disk,
+            valid_time,
             wal,
             writer,
             delta,
             index,
             sealed: SealedVersions::new(Vec::new()),
             segment_names: Vec::new(),
+            next_segment_index: 0,
+            replay_floor: LogOffset::ZERO,
             checkpoint: None,
         })
     }
@@ -180,12 +206,36 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     /// [`EngineError::Wal`] / [`EngineError::Dml`] if the log cannot be replayed;
     /// [`EngineError`] for any other tier-open or I/O failure.
     pub fn recover(disk: D, clock: C, valid_time: bool) -> Result<Self, EngineError> {
-        // 1. Validate every sealed segment by checksum. `SegmentReader::open`
-        //    checks the header + footer CRC; reading the versions and retractions
-        //    forces every per-column-chunk CRC, so a torn page is caught here and
-        //    recovery refuses rather than serving corrupt history.
-        let mut segment_names = list_segment_names(&disk)?;
-        segment_names.sort();
+        // 1. Load the durable recovery point: where replay resumes (`floor`), the
+        //    torn-tail boundary (`fence`), and how many sealed segments committed
+        //    flushes vouched (`segment_count`). No record ⇒ no flush ever
+        //    committed: replay the whole log from the origin and trust no segment.
+        let recovery = checkpoint::load(&disk)?;
+        let (floor, fence, segment_count) = recovery
+            .map_or((LogOffset::ZERO, LogOffset::ZERO, 0), |p: RecoveryPoint| {
+                (p.replay_floor, p.durable_fence, p.segment_count)
+            });
+
+        // 2. Drop orphan segments — any `seg-*` at or above the committed count was
+        //    written by a flush whose checkpoint record never became durable. The
+        //    records they hold are still in the WAL (the flush advances the floor
+        //    only *after* its checkpoint record is durable), so the orphan is
+        //    re-flushed from replay. Removing it keeps the next flush's `create`
+        //    from colliding; best-effort, since a leftover only forces an
+        //    overwrite next time ([STL-177] crash-during-flush safety).
+        for name in &list_segment_names(&disk)? {
+            let committed = segment_index_of(name).is_some_and(|idx| idx < segment_count);
+            if !committed {
+                let _ = disk.remove(name);
+            }
+        }
+
+        // 3. Validate and read the committed segments (`seg-0 … seg-{count-1}`) by
+        //    checksum. `SegmentReader::open` checks the header + footer CRC; reading
+        //    the versions and retractions forces every per-column-chunk CRC, so a
+        //    torn page in a *committed* segment is caught here and recovery refuses
+        //    rather than serving corrupt history.
+        let segment_names: Vec<String> = (0..segment_count).map(segment_name).collect();
         let mut sealed_versions = Vec::new();
         let mut sealed_retractions = Vec::new();
         for name in &segment_names {
@@ -194,19 +244,13 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
             sealed_retractions.extend(reader.read_retractions()?);
         }
 
-        // 2. Load the durable checkpoint fence. None ⇒ no durability claim has
-        //    been persisted, so the fence is the log origin and any torn record is
-        //    tolerable; a present fence makes corruption *before* it fatal.
-        let checkpoint = checkpoint::load(&disk)?;
-        let fence = checkpoint.unwrap_or(LogOffset::ZERO);
-
-        // 3. Open the non-durable tiers — both discard any stale spill left by the
+        // 4. Open the non-durable tiers — both discard any stale spill left by the
         //    crashed process; the log is about to repopulate them.
         let wal = Wal::open(disk.clone(), WalConfig::default())?;
         let mut delta = Delta::open(disk.clone(), DeltaConfig::default())?;
         let mut index = ValidityIndex::open(disk.clone(), ValidityConfig::default())?;
 
-        // 4. Rebuild the validity index from the sealed segment store alone —
+        // 5. Rebuild the validity index from the committed segment store alone —
         //    supersession closes from version adjacency, deletion closes from the
         //    persisted retraction tombstones ([ADR-0023], STL-143).
         rebuild_index_from_segments(
@@ -215,26 +259,30 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
             &mut index,
         )?;
 
-        // 5. Replay the WAL forward, rebuilding the delta tier and overlaying the
-        //    log's closes. `insert_close` is write-once but idempotent on an
-        //    identical close, so a close already materialized from a segment in
-        //    step 4 re-applies cleanly — segment-derived and WAL-derived closes
-        //    agree by construction. `recover_replay` tolerates a torn record past
-        //    the durable `fence` (the unsynced tail of a mid-write crash) while
-        //    treating corruption *before* the fence as a fatal fault
-        //    ([`dml::recover_replay`]).
-        dml::recover_replay(&wal, &mut delta, &mut index, Checkpoint::BEGIN, fence)?;
+        // 6. Replay the WAL **tail** — from `floor` forward, not the log origin.
+        //    Everything before the floor is durable in the committed segments
+        //    rebuilt in step 5; replaying it again would only re-derive the same
+        //    versions (deduped by `(sys_from, seq)`) and the same write-once
+        //    closes, so bounding the replay is a pure speedup, not a semantic
+        //    change. `recover_replay` tolerates a torn record past the durable
+        //    `fence` (the unsynced tail of a mid-write crash) while treating
+        //    corruption *before* the fence — a committed-but-unflushed record — as
+        //    a fatal fault ([`dml::recover_replay`], [STL-177]).
+        dml::recover_replay(&wal, &mut delta, &mut index, Checkpoint(floor), fence)?;
 
         let writer = DmlWriter::new(wal.clone(), clock, valid_time);
         Ok(Self {
             disk,
+            valid_time,
             wal,
             writer,
             delta,
             index,
             sealed: SealedVersions::new(sealed_versions),
             segment_names,
-            checkpoint,
+            next_segment_index: segment_count,
+            replay_floor: floor,
+            checkpoint: recovery.map(|p| p.durable_fence),
         })
     }
 
@@ -319,7 +367,9 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     }
 
     /// Take a **checkpoint**: group-commit fsync the WAL, then record the new
-    /// durable end as the last fully-flushed offset in the checkpoint file.
+    /// durable end as the last fully-flushed offset in the checkpoint file. Leaves
+    /// the replay floor and committed-segment count untouched — this is the
+    /// lightweight durability fence, not a flush ([`Self::flush`]).
     ///
     /// Call this periodically and on graceful shutdown ([STL-102] scope). Returns
     /// the recorded fence.
@@ -331,7 +381,105 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     pub fn checkpoint(&mut self) -> Result<LogOffset, EngineError> {
         self.wal.tick()?;
         let fence = self.wal.durable_end();
-        checkpoint::store(&self.disk, fence)?;
+        checkpoint::store(
+            &self.disk,
+            RecoveryPoint {
+                replay_floor: self.replay_floor,
+                durable_fence: fence,
+                segment_count: self.next_segment_index,
+            },
+        )?;
+        self.checkpoint = Some(fence);
+        Ok(fence)
+    }
+
+    /// **Flush** the delta tier into a fresh sealed segment and advance the replay
+    /// floor past the records it now covers, so the next recovery replays only the
+    /// WAL tail ([STL-177], [feature-plan B.5]). Returns the new replay floor.
+    ///
+    /// The sequence is ordered for crash safety:
+    ///
+    /// 1. `fsync` the WAL — everything up to `fence` is now durable.
+    /// 2. **Snapshot** the delta's staged versions and retractions *without*
+    ///    draining ([`Delta::staged_versions`]) — a later failure leaves the tier
+    ///    intact and the WAL authoritative.
+    /// 3. Seal them into `seg-{next}` and `fsync` it (an orphan at that index from
+    ///    a prior torn flush is removed first, so `create` never collides).
+    /// 4. Append the checkpoint record — `{floor = fence, fence, segment_count+1}`.
+    ///    **This is the atomic commit point**: until it is durable the new segment
+    ///    is an orphan recovery ignores, replaying the WAL instead.
+    /// 5. Only now drop the flushed rows from the delta and fold them into the
+    ///    resident sealed set, advancing the floor and committed count.
+    ///
+    /// A flush with an empty delta records the (unchanged) floor as a degenerate
+    /// checkpoint and writes no segment.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Wal`] on the fsync, [`EngineError::Delta`] reading staged
+    /// rows, [`EngineError::Segment`] sealing the segment, or [`EngineError::Io`]
+    /// writing the checkpoint record. On any error the delta tier is unchanged.
+    pub fn flush(&mut self) -> Result<LogOffset, EngineError> {
+        // 1. Make the WAL durable; `fence` is the post-fsync end of the log.
+        self.wal.tick()?;
+        let fence = self.wal.durable_end();
+
+        // 2. Snapshot the delta without draining it.
+        let versions = self.delta.staged_versions()?;
+        let retractions = self.delta.staged_retractions();
+        if versions.is_empty() && retractions.is_empty() {
+            // Nothing staged ⇒ no unflushed records since the last flush, so the
+            // floor is already current. Record the fence (a degenerate flush) and
+            // leave the floor / count untouched.
+            checkpoint::store(
+                &self.disk,
+                RecoveryPoint {
+                    replay_floor: self.replay_floor,
+                    durable_fence: fence,
+                    segment_count: self.next_segment_index,
+                },
+            )?;
+            self.checkpoint = Some(fence);
+            return Ok(self.replay_floor);
+        }
+
+        // 3. Seal the snapshot into the next segment. Clear any orphan first.
+        let idx = self.next_segment_index;
+        let name = segment_name(idx);
+        let _ = self.disk.remove(&name);
+        let mut writer = if self.valid_time {
+            SegmentWriter::create_valid_time(&self.disk, &name)?
+        } else {
+            SegmentWriter::create(&self.disk, &name)?
+        };
+        for v in &versions {
+            writer.push(v.clone())?;
+        }
+        for c in retractions {
+            writer.push_retraction(c)?;
+        }
+        writer.finish()?; // fsyncs — the segment is now durable
+
+        // 4. Commit: the checkpoint record vouches the segment and advances the
+        //    floor past every record it covers.
+        checkpoint::store(
+            &self.disk,
+            RecoveryPoint {
+                replay_floor: fence,
+                durable_fence: fence,
+                segment_count: idx + 1,
+            },
+        )?;
+
+        // 5. Adopt the now-durable segment: drop the delta's flushed rows and fold
+        //    the versions into the resident sealed set the write/read paths use.
+        self.delta.discard_flushed()?;
+        let mut sealed = self.sealed.versions().to_vec();
+        sealed.extend(versions);
+        self.sealed = SealedVersions::new(sealed);
+        self.segment_names.push(name);
+        self.next_segment_index = idx + 1;
+        self.replay_floor = fence;
         self.checkpoint = Some(fence);
         Ok(fence)
     }
@@ -395,11 +543,20 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     }
 
     /// The durable WAL fence loaded at recovery / last recorded by
-    /// [`Self::checkpoint`] — the committed/unsynced boundary. [`None`] if no
-    /// checkpoint has been taken.
+    /// [`Self::checkpoint`] or [`Self::flush`] — the committed/unsynced boundary.
+    /// [`None`] if no checkpoint has been taken.
     #[must_use]
     pub const fn durable_fence(&self) -> Option<LogOffset> {
         self.checkpoint
+    }
+
+    /// The WAL offset recovery would resume replay from — advanced by
+    /// [`Self::flush`] past the records the sealed segments now cover.
+    /// [`LogOffset::ZERO`] until the first flush. Observability for the
+    /// bounded-replay tests ([STL-177]).
+    #[must_use]
+    pub const fn replay_floor(&self) -> LogOffset {
+        self.replay_floor
     }
 
     /// The validated sealed segment filenames, sorted — observability for tests.
@@ -447,6 +604,16 @@ pub(crate) fn segment_name(index: u64) -> String {
     format!("{SEGMENT_FILENAME_PREFIX}{index:020}{SEGMENT_FILENAME_SUFFIX}")
 }
 
+/// Parse the segment index out of a `seg-{index:020}.seg` filename, or [`None`]
+/// if `name` is not a sealed-segment filename — the inverse of [`segment_name`],
+/// used to tell a committed segment from an orphan by index.
+fn segment_index_of(name: &str) -> Option<u64> {
+    name.strip_prefix(SEGMENT_FILENAME_PREFIX)?
+        .strip_suffix(SEGMENT_FILENAME_SUFFIX)?
+        .parse()
+        .ok()
+}
+
 /// List every sealed-segment filename on `disk` (unsorted — the caller sorts).
 fn list_segment_names<D: Disk>(disk: &D) -> io::Result<Vec<String>> {
     Ok(disk
@@ -478,5 +645,18 @@ mod tests {
         let mut names = list_segment_names(&disk).expect("list");
         names.sort();
         assert_eq!(names, vec![segment_name(0), segment_name(1)]);
+    }
+
+    #[test]
+    fn segment_index_of_inverts_segment_name() {
+        // The orphan/committed partition depends on parsing the index back out of
+        // a segment filename — the exact inverse of `segment_name`.
+        for n in [0u64, 1, 42, u64::from(u32::MAX)] {
+            assert_eq!(segment_index_of(&segment_name(n)), Some(n));
+        }
+        // Foreign names from the other disk namespaces are not segments.
+        assert_eq!(segment_index_of("wal-00000000000000000000.log"), None);
+        assert_eq!(segment_index_of(checkpoint::CHECKPOINT_FILENAME), None);
+        assert_eq!(segment_index_of("seg-not-a-number.seg"), None);
     }
 }
