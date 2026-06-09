@@ -147,10 +147,13 @@ impl Column {
         self.len() == 0
     }
 
-    /// A contiguous `len`-value window starting at `offset` (an Arrow-style
-    /// zero-copy-shaped slice, though this clones). Used by the batch-at-a-time
-    /// pull pipeline ([`crate::Operator`]) to cut a fully resolved column into
-    /// fixed-size batches.
+    /// A contiguous `len`-value window starting at `offset`. Used by the
+    /// batch-at-a-time pull pipeline ([`crate::Operator`]) to cut a fully
+    /// resolved column into fixed-size batches.
+    ///
+    /// This currently deep-copies the window: `Column` owns its cells rather than
+    /// a shared buffer, so an Arrow-style zero-copy slice awaits the shared-buffer
+    /// `Column` representation (a tracked v0.2 follow-up; see PR #77 / STL-170).
     ///
     /// # Panics
     ///
