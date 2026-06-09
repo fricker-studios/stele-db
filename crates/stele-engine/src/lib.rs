@@ -45,18 +45,19 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use stele_catalog::{Catalog, CatalogError};
 use stele_common::provenance::{Principal, TxnId};
+use stele_common::row_codec::{self, RowCodecError};
 use stele_common::time::{Clock, SystemTimeMicros};
 use stele_common::types::{LogicalType, ScalarValue};
 use stele_exec::{Batch, Column, ScanError, SnapshotScan};
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::dml::{BoundDml, DmlError};
-use stele_sql::select::SelectError;
+use stele_sql::select::{BoundSelect, Projection, SelectError};
 use stele_sql::{BindContext, BindError, Statement, bind_ddl, bind_dml, bind_select};
 use stele_storage::backend::Disk;
 use stele_storage::delta::{BusinessKey, Snapshot};
 use stele_storage::dml::DmlOutcome;
 use stele_storage::engine::{Engine, EngineError as StorageError};
-use stele_storage::segment::ColumnId;
+use stele_storage::segment::{ColumnId, Predicate, ZoneBound};
 use stele_storage::validtime::ValidInterval;
 
 /// A monotonic, globally-shared commit clock.
@@ -316,6 +317,12 @@ pub enum EngineError {
     #[error(transparent)]
     Scan(#[from] ScanError),
 
+    /// A stored payload could not be sliced back into the row's value columns —
+    /// the bytes do not match the schema's column count (corruption, or a width
+    /// disagreement). See the [row codec](stele_common::row_codec).
+    #[error(transparent)]
+    RowCodec(#[from] RowCodecError),
+
     /// A statement named a table that is not **live** in this session — it was
     /// never created, or has been dropped. (A dropped table's tier is retained for
     /// history, but the catalog no longer resolves the name at the current
@@ -464,7 +471,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 catalog: &self.catalog,
             };
             match bind_select(stmt, &ctx) {
-                Ok(bound) => return self.run_select(&bound.table, bound.snapshot),
+                Ok(bound) => return self.run_select(&bound),
                 // Not a SELECT either ⇒ try the DML router below.
                 Err(SelectError::NotSelect) => {}
                 Err(e) => return Err(EngineError::Select(e)),
@@ -553,44 +560,52 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         Ok(TableState { engine, valid_time })
     }
 
-    /// Run a snapshot scan over `table`'s tiers at `snapshot`, projecting the
-    /// business key and payload into a [`SelectResult`].
+    /// Run a snapshot scan for a bound `SELECT`, honoring its projection list and
+    /// `WHERE` filter ([STL-151]).
     ///
-    /// v0.1 projects the `(business_key, payload)` pair — the identity-demo shape —
-    /// regardless of the SQL projection list; mapping arbitrary schema columns is
-    /// the row-codec work ([STL-105]/[STL-147]). The two projected columns are
-    /// named and typed from the schema's first two columns (the business key, then
-    /// the payload), resolved at `snapshot` so an `AS OF` read describes itself
-    /// under the schema version live then.
-    fn run_select(
-        &self,
-        table: &str,
-        snapshot: SystemTimeMicros,
-    ) -> Result<StatementOutcome, EngineError> {
+    /// The scan materializes the `(business_key, payload)` pair; the payload is
+    /// sliced back into the row's value columns by the
+    /// [row codec](stele_common::row_codec), reconstructing the full row in schema
+    /// order (the business key, then the value columns). The row is then
+    /// **filtered** by the bound predicate and **projected** to exactly the
+    /// requested columns. A key-equality predicate is additionally pushed down to
+    /// the scan so its zone maps can prune; every predicate is re-applied here so
+    /// the answer is correct regardless of what the prune could prove.
+    ///
+    /// The schema is resolved at the read snapshot, so an `AS OF` read names and
+    /// types its columns under the schema version live then.
+    fn run_select(&self, bound: &BoundSelect) -> Result<StatementOutcome, EngineError> {
+        let table = bound.table.as_str();
+        let snapshot = bound.snapshot;
         let state = self
             .tables
             .get(table)
             .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
-        // Resolve the schema live at the read snapshot for the column names/types.
         // `bind_select` already proved the table resolves here, so a `None` would
         // be an internal contract break — surface it rather than panic.
         let schema = self
             .catalog
             .resolve(table, snapshot)
             .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
-        // Zip the schema's columns with the storage ids they map to (first column
-        // → business key, second → payload) so the projected arity always matches
-        // the header. A table with fewer than two columns projects only what it
-        // has, never a header that disagrees with the materialized cells.
-        let projection: Vec<(ColumnId, (String, LogicalType))> = schema
+        // Column 0 is the business key; the rest are value columns packed into the
+        // payload. `value_count` drives the codec's slicing.
+        let schema_columns: Vec<(String, LogicalType)> = schema
             .columns()
             .iter()
-            .zip([ColumnId::BusinessKey, ColumnId::Payload])
-            .map(|(c, id)| (id, (c.name().to_owned(), c.ty())))
+            .map(|c| (c.name().to_owned(), c.ty()))
             .collect();
-        let column_ids: Vec<ColumnId> = projection.iter().map(|(id, _)| *id).collect();
-        let columns: Vec<(String, LogicalType)> =
-            projection.into_iter().map(|(_, col)| col).collect();
+        let value_count = schema_columns.len().saturating_sub(1);
+
+        // Push a key-equality predicate down to the scan for zone-map pruning; a
+        // filter on a value column lives inside the opaque payload, which a zone
+        // map cannot reason about, so it is applied only after decode.
+        let predicate = match &bound.filter {
+            Some(p) if p.column_index == 0 => Predicate::Eq {
+                column: ColumnId::BusinessKey,
+                value: ZoneBound::Bytes(encode_value(&p.value)),
+            },
+            _ => Predicate::All,
+        };
 
         let readers = state.engine.open_segment_readers()?;
         let out = SnapshotScan::new(
@@ -599,21 +614,46 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             &readers,
             Snapshot(snapshot),
         )
-        .project(column_ids.clone())
+        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .filter(predicate)
         .execute()?;
 
-        let rows = batch_to_rows(&out.batch, &column_ids);
+        // Reconstruct each full row [key, value cells…], then filter + project.
+        let projection = projection_indices(&bound.projection, &schema_columns);
+        let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(out.batch.rows);
+        for r in 0..out.batch.rows {
+            let key = column_cell(&out.batch, ColumnId::BusinessKey, r);
+            let payload = column_cell(&out.batch, ColumnId::Payload, r);
+            let mut full_row = Vec::with_capacity(schema_columns.len());
+            full_row.push(key);
+            full_row.extend(row_codec::decode_payload(value_count, payload.as_deref())?);
+
+            // Re-apply the predicate on the reconstructed row (belt-and-suspenders
+            // for the key case, the only filter for a value column). `WHERE col =
+            // <lit>` keeps a row iff that column's cell equals the literal's
+            // encoding; a NULL cell (`None`) never equals a (non-null) literal.
+            if let Some(p) = &bound.filter {
+                let want = encode_value(&p.value);
+                let cell = full_row.get(p.column_index).cloned().flatten();
+                if cell.as_deref() != Some(want.as_slice()) {
+                    continue;
+                }
+            }
+
+            rows.push(projection.iter().map(|&i| full_row[i].clone()).collect());
+        }
+
+        let columns = projection
+            .iter()
+            .map(|&i| schema_columns[i].clone())
+            .collect();
         Ok(StatementOutcome::Rows(SelectResult { columns, rows }))
     }
 
-    /// Apply a bound DML statement to the table's tiers, stamping fresh
-    /// provenance, and report the affected-row count.
-    ///
-    /// The key and payload [`ScalarValue`]s are encoded to bytes with
-    /// [`ScalarValue::encode`] — the inverse of the decode the wire layer applies
-    /// when it reads them back, so an `INSERT`ed value round-trips through a later
-    /// `SELECT`. `seq` is `0`: the commit clock hands each write a distinct
-    /// `sys_from`, so the per-commit tiebreak never decides between two versions.
+    /// Apply a bound DML statement to the table's tiers under fresh provenance,
+    /// and report the affected-row count. The encoding details (key + value
+    /// columns through the row codec, `UPDATE`'s read-modify-write merge) live in
+    /// [`apply_bound_dml`](Self::apply_bound_dml).
     fn apply_dml(&mut self, dml: BoundDml) -> Result<StatementOutcome, EngineError> {
         let txn_id = TxnId(self.next_txn);
         self.next_txn += 1;
@@ -628,11 +668,15 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// ([`commit`](Self::commit)) — the latter passes one `txn_id` for every write
     /// in the transaction, so they share provenance.
     ///
-    /// The key and payload [`ScalarValue`]s are encoded to bytes with
-    /// [`ScalarValue::encode`] — the inverse of the decode the wire layer applies
-    /// when it reads them back, so an `INSERT`ed value round-trips through a later
-    /// `SELECT`. `seq` is `0`: the commit clock hands each write a distinct
-    /// `sys_from`, so the per-commit tiebreak never decides between two versions.
+    /// The row's value columns are folded to bytes with
+    /// [`ScalarValue::encode`] and packed into the stored payload by the
+    /// [row codec](stele_common::row_codec) — the inverse of the decode
+    /// [`run_select`](Self::run_select) applies — so an `INSERT`ed row round-trips
+    /// through a later `SELECT`. An `UPDATE` is a read-modify-write: it starts
+    /// from the live row's value cells, overwrites the assigned columns, and
+    /// re-packs, so columns the `SET` did not name keep their prior value. `seq`
+    /// is `0`: the commit clock hands each write a distinct `sys_from`, so the
+    /// per-commit tiebreak never decides between two versions.
     fn apply_bound_dml(
         &mut self,
         dml: BoundDml,
@@ -641,16 +685,17 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     ) -> Result<DmlSummary, EngineError> {
         match dml {
             BoundDml::Insert {
-                table,
-                key,
-                payload,
-                ..
+                table, key, values, ..
             } => {
+                let cells: Vec<Option<Vec<u8>>> = values
+                    .iter()
+                    .map(|v| v.as_ref().map(encode_value))
+                    .collect();
                 self.insert(
                     &table,
                     business_key(&key),
                     None,
-                    encode_payload(payload.as_ref()),
+                    row_codec::encode_payload(&cells),
                     0,
                     txn_id,
                     principal.clone(),
@@ -660,14 +705,24 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             BoundDml::Update {
                 table,
                 key,
-                payload,
+                assignments,
                 ..
             } => {
+                // Read-modify-write: merge the SET overrides onto the live row's
+                // value cells so unnamed columns keep their prior value, then
+                // re-pack. (A read here sees the committed snapshot — a
+                // transaction does not yet read its own buffered writes, [STL-175].)
+                let value_count = self.value_column_count(&table)?;
+                let key = business_key(&key);
+                let mut cells = self.live_value_cells(&table, &key, value_count)?;
+                for (idx, value) in &assignments {
+                    cells[*idx] = value.as_ref().map(encode_value);
+                }
                 self.update(
                     &table,
-                    business_key(&key),
+                    key,
                     None,
-                    encode_payload(payload.as_ref()),
+                    row_codec::encode_payload(&cells),
                     0,
                     txn_id,
                     principal.clone(),
@@ -679,6 +734,58 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 Ok(DmlSummary::Delete(1))
             }
         }
+    }
+
+    /// The number of value columns (the schema's column count minus the business
+    /// key) for `table`, resolved at the current snapshot. Drives the row codec.
+    fn value_column_count(&self, table: &str) -> Result<usize, EngineError> {
+        let schema = self
+            .catalog
+            .resolve(table, self.clock.current())
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
+        Ok(schema.columns().len().saturating_sub(1))
+    }
+
+    /// The live row's value cells for `key` at the current snapshot, sliced out of
+    /// its payload by the [row codec](stele_common::row_codec) — or an all-`NULL`
+    /// row when `key` is not live (so an `UPDATE` of an absent key opens a fresh
+    /// row whose unset columns are `NULL`). The starting point for an `UPDATE`'s
+    /// read-modify-write merge.
+    fn live_value_cells(
+        &self,
+        table: &str,
+        key: &BusinessKey,
+        value_count: usize,
+    ) -> Result<Vec<Option<Vec<u8>>>, EngineError> {
+        if value_count == 0 {
+            return Ok(Vec::new());
+        }
+        let state = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
+        let snapshot = self.clock.current();
+        let readers = state.engine.open_segment_readers()?;
+        let out = SnapshotScan::new(
+            state.engine.delta(),
+            state.engine.index(),
+            &readers,
+            Snapshot(snapshot),
+        )
+        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .filter(Predicate::Eq {
+            column: ColumnId::BusinessKey,
+            value: ZoneBound::Bytes(key.as_bytes().to_vec()),
+        })
+        .execute()?;
+        // The key resolves to at most one live version; take its payload (the Eq
+        // predicate narrows the scan, but re-match the key defensively).
+        let payload = (0..out.batch.rows)
+            .find(|&r| {
+                column_cell(&out.batch, ColumnId::BusinessKey, r).as_deref() == Some(key.as_bytes())
+            })
+            .and_then(|r| column_cell(&out.batch, ColumnId::Payload, r));
+        Ok(row_codec::decode_payload(value_count, payload.as_deref())?)
     }
 
     /// Begin a multi-statement transaction — an empty write buffer the caller
@@ -871,14 +978,6 @@ fn encode_value(value: &ScalarValue) -> Vec<u8> {
     bytes
 }
 
-/// Encode an optional payload value into the storage payload form: `Some(bytes)`
-/// for a present value, `None` for a SQL `NULL` cell ([STL-154]). A `None`
-/// payload is carried through to the durable record as a distinct NULL, never an
-/// empty encoding.
-fn encode_payload(value: Option<&ScalarValue>) -> Option<Vec<u8>> {
-    value.map(encode_value)
-}
-
 /// The business key for a folded key [`ScalarValue`] — its canonical encoding, the
 /// same bytes a later `UPDATE` / `DELETE` / `SELECT` folds the literal to, so the
 /// key matches across operations.
@@ -886,30 +985,35 @@ fn business_key(value: &ScalarValue) -> BusinessKey {
     BusinessKey::new(encode_value(value))
 }
 
-/// Materialize a scan [`Batch`] into row-major raw-bytes cells, in `projection`
-/// order.
+/// The cell of bytes column `id` at `row`, or `None` if the column is absent,
+/// not a bytes column, or its cell is a SQL `NULL` ([STL-154]). The scan only
+/// ever projects [`ColumnId::BusinessKey`] / [`ColumnId::Payload`], both bytes
+/// columns; the business key is always present, the payload may be `None`.
+fn column_cell(batch: &Batch, id: ColumnId, row: usize) -> Option<Vec<u8>> {
+    batch.columns.iter().find_map(|(cid, col)| match col {
+        Column::Bytes(v) if *cid == id => v.get(row).cloned().flatten(),
+        _ => None,
+    })
+}
+
+/// The schema-column indices a [`Projection`] selects, in output order: `All` is
+/// every column left-to-right; `Columns` maps each name to its position.
 ///
-/// Both projected columns ([`ColumnId::BusinessKey`] and [`ColumnId::Payload`])
-/// are bytes columns; a non-bytes or absent column contributes a NULL (`None`)
-/// cell rather than panicking, but the v0.1 projection never produces one. A
-/// present cell carries the value's bytes; a `None` cell is a SQL `NULL`
-/// ([STL-154]) — the payload column is the one that can produce it.
-fn batch_to_rows(batch: &Batch, projection: &[ColumnId]) -> Vec<Vec<Option<Vec<u8>>>> {
-    let lookup = |id: ColumnId| -> Option<&Vec<Option<Vec<u8>>>> {
-        batch.columns.iter().find_map(|(cid, col)| match col {
-            Column::Bytes(v) if *cid == id => Some(v),
-            _ => None,
-        })
-    };
-    let cols: Vec<Option<&Vec<Option<Vec<u8>>>>> =
-        projection.iter().map(|id| lookup(*id)).collect();
-    (0..batch.rows)
-        .map(|r| {
-            cols.iter()
-                .map(|col| col.and_then(|c| c.get(r)).cloned().flatten())
-                .collect()
-        })
-        .collect()
+/// `bind_select` has already proved every named column exists in this schema, so
+/// the lookup never misses — a miss would be a binder/engine contract break.
+fn projection_indices(projection: &Projection, columns: &[(String, LogicalType)]) -> Vec<usize> {
+    match projection {
+        Projection::All => (0..columns.len()).collect(),
+        Projection::Columns(names) => names
+            .iter()
+            .map(|name| {
+                columns
+                    .iter()
+                    .position(|(n, _)| n == name)
+                    .expect("bind_select validated the projected column exists")
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -1125,15 +1229,15 @@ mod tests {
             .expect("insert ledger");
 
         // Same business key in both tables, distinct payloads — the namespaced
-        // tiers keep them apart.
+        // tiers keep them apart. Projecting the value column reads each back.
         let StatementOutcome::Rows(a) = engine
-            .execute(&parse_one("SELECT id FROM account"))
+            .execute(&parse_one("SELECT balance FROM account"))
             .expect("a")
         else {
             panic!("rows");
         };
         let StatementOutcome::Rows(l) = engine
-            .execute(&parse_one("SELECT id FROM ledger"))
+            .execute(&parse_one("SELECT amount FROM ledger"))
             .expect("l")
         else {
             panic!("rows");
@@ -1227,7 +1331,7 @@ mod tests {
             .execute(&parse_one(CREATE))
             .expect("re-create same policy");
         let StatementOutcome::Rows(batch) = engine
-            .execute(&parse_one("SELECT id FROM account"))
+            .execute(&parse_one("SELECT balance FROM account"))
             .expect("select")
         else {
             panic!("rows");
@@ -1339,9 +1443,8 @@ mod tests {
             else {
                 panic!("rows");
             };
-            // The engine always projects `(key, payload)`, so the payload (balance)
-            // is the second cell regardless of the SELECT list.
-            result.rows[0][1].clone()
+            // `SELECT balance` now projects exactly that one column ([STL-151]).
+            result.rows[0][0].clone()
         };
         assert_eq!(payload_cell(&mut engine), None, "balance is now NULL");
 
@@ -1569,13 +1672,158 @@ mod tests {
         assert_eq!(live[0].name, "ledger");
     }
 
-    /// The payload cell of every row in a `(key, payload)` [`SelectResult`] — the
-    /// second projected column.
+    /// A multi-column table `t (id INT, a INT, b TEXT)` — a key plus two value
+    /// columns — for the projection/predicate tests ([STL-151]).
+    const CREATE_WIDE: &str =
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b TEXT) WITH SYSTEM VERSIONING";
+
+    /// Run a SELECT and return its `(columns, rows)`.
+    fn select(engine: &mut SessionEngine<ZeroClock, MemDisk>, sql: &str) -> SelectResult {
+        let StatementOutcome::Rows(result) = engine.execute(&parse_one(sql)).expect("select")
+        else {
+            panic!("SELECT must return rows");
+        };
+        result
+    }
+
+    /// A row cell's expected encoding: `Some(value)` → its canonical bytes,
+    /// `None` → a SQL `NULL` cell — matching what a `SelectResult` row carries.
+    fn cell(value: Option<ScalarValue>) -> Option<Vec<u8>> {
+        value.map(|v| encode_value(&v))
+    }
+
+    #[test]
+    fn multi_column_select_honors_projection_and_where() {
+        // The DoD: a multi-row, multi-column table returns exactly the projected
+        // columns for exactly the matching rows.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_WIDE)).expect("create");
+        for sql in [
+            "INSERT INTO t VALUES (1, 10, 'one')",
+            "INSERT INTO t VALUES (2, 20, 'two')",
+            "INSERT INTO t VALUES (3, 20, 'three')",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+
+        // Project a subset, filter on the key: exactly one row, exactly the asked
+        // columns, in the asked order.
+        let r = select(&mut engine, "SELECT b, a FROM t WHERE id = 2");
+        assert_eq!(
+            r.columns,
+            vec![
+                ("b".to_owned(), LogicalType::Text),
+                ("a".to_owned(), LogicalType::Int4),
+            ]
+        );
+        assert_eq!(
+            r.rows,
+            vec![vec![
+                cell(Some(ScalarValue::Text("two".to_owned()))),
+                cell(Some(ScalarValue::Int4(20))),
+            ]]
+        );
+
+        // Filter on a non-key value column: both rows with a = 20, key order.
+        let r = select(&mut engine, "SELECT id FROM t WHERE a = 20");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![cell(Some(ScalarValue::Int4(2)))],
+                vec![cell(Some(ScalarValue::Int4(3)))],
+            ]
+        );
+
+        // Filter on the text value column.
+        let r = select(&mut engine, "SELECT id FROM t WHERE b = 'three'");
+        assert_eq!(r.rows, vec![vec![cell(Some(ScalarValue::Int4(3)))]]);
+
+        // SELECT * projects every column in declaration order.
+        let r = select(&mut engine, "SELECT * FROM t WHERE id = 1");
+        assert_eq!(
+            r.columns,
+            vec![
+                ("id".to_owned(), LogicalType::Int4),
+                ("a".to_owned(), LogicalType::Int4),
+                ("b".to_owned(), LogicalType::Text),
+            ]
+        );
+        assert_eq!(
+            r.rows,
+            vec![vec![
+                cell(Some(ScalarValue::Int4(1))),
+                cell(Some(ScalarValue::Int4(10))),
+                cell(Some(ScalarValue::Text("one".to_owned()))),
+            ]]
+        );
+
+        // A predicate matching nothing returns no rows (not every row).
+        assert!(
+            select(&mut engine, "SELECT id FROM t WHERE id = 99")
+                .rows
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn multi_column_update_preserves_unset_columns() {
+        // A partial UPDATE rewrites only its named columns; the rest keep their
+        // prior value via the engine's read-modify-write.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_WIDE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (1, 10, 'one')"))
+            .expect("insert");
+        engine
+            .execute(&parse_one("UPDATE t SET b = 'updated' WHERE id = 1"))
+            .expect("update b only");
+
+        let r = select(&mut engine, "SELECT a, b FROM t WHERE id = 1");
+        assert_eq!(
+            r.rows,
+            vec![vec![
+                cell(Some(ScalarValue::Int4(10))),                   // unchanged
+                cell(Some(ScalarValue::Text("updated".to_owned()))), // rewritten
+            ]],
+            "the unset column `a` keeps its prior value"
+        );
+    }
+
+    #[test]
+    fn multi_column_null_cell_round_trips_and_filters_out() {
+        // A NULL value cell reads back as NULL, and `WHERE col = <lit>` excludes
+        // it (NULL = x is never true).
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_WIDE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (1, NULL, 'one')"))
+            .expect("insert with null a");
+
+        let r = select(&mut engine, "SELECT a FROM t WHERE id = 1");
+        assert_eq!(r.rows, vec![vec![cell(None)]], "a reads back as SQL NULL");
+
+        assert!(
+            select(&mut engine, "SELECT id FROM t WHERE a = 10")
+                .rows
+                .is_empty(),
+            "a NULL cell does not match an equality predicate"
+        );
+    }
+
+    /// The value cell of every row in a [`SelectResult`] — the **last** projected
+    /// column. Now that the projection list is honored ([STL-151]), the value
+    /// column the tests assert on is whichever they listed last (`SELECT balance`
+    /// or `SELECT id, balance`), not a fixed second cell.
     fn payload_column(result: &SelectResult) -> Vec<Vec<u8>> {
         result
             .rows
             .iter()
-            .map(|row| row[1].clone().expect("non-null payload in this test"))
+            .map(|row| {
+                row.last()
+                    .cloned()
+                    .flatten()
+                    .expect("non-null value in this test")
+            })
             .collect()
     }
 }

@@ -44,8 +44,9 @@ sleep 2
 
 "${PSQL[@]}" -c "UPDATE account SET balance = 250 WHERE id = 1"
 
-# `SELECT balance` projects the (key, payload) pair = (id, balance) in v0.1, so
-# the balance is the last `|`-separated field of the row (`1|100` -> `100`).
+# `SELECT balance … WHERE id = 1` projects exactly the `balance` column for the
+# one matching row ([STL-151]); the value is the whole single-column row. (The
+# `##*|` strip is a no-op here and stays harmless if the projection ever widens.)
 live_row="$("${PSQL[@]}" -c "SELECT balance FROM account WHERE id = 1")"
 live_balance="${live_row##*|}"
 

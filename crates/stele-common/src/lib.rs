@@ -12,6 +12,7 @@
 
 pub mod hash;
 pub mod provenance;
+pub mod row_codec;
 pub mod time;
 pub mod types;
 

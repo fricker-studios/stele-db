@@ -69,6 +69,7 @@ pub mod ddl;
 pub mod dialect;
 pub mod dml;
 pub mod error;
+mod fold;
 mod parser;
 pub mod select;
 pub mod types;
@@ -80,7 +81,8 @@ pub use dml::{BoundDml, DmlError, bind_dml};
 pub use error::ParseError;
 pub use parser::parse;
 pub use select::{
-    AsOfError, BindContext, BoundSelect, Projection, SelectError, bind_select, resolve_as_of,
+    AsOfError, BindContext, BoundPredicate, BoundSelect, Projection, SelectError, bind_select,
+    resolve_as_of,
 };
 pub use types::logical_type;
 

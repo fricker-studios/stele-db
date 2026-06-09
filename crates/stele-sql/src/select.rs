@@ -51,8 +51,10 @@ use sqlparser::ast::{
 };
 use stele_catalog::{Catalog, SchemaId, TableSchema};
 use stele_common::time::SystemTimeMicros;
+use stele_common::types::{LogicalType, ScalarValue};
 
 use crate::ast::{Statement, TimeDimension};
+use crate::fold::{self, FoldError};
 
 /// The context a [`bind_select`] needs: the transaction snapshot and the
 /// catalog to resolve names against.
@@ -75,14 +77,32 @@ pub enum Projection {
     Columns(Vec<String>),
 }
 
+/// A bound `WHERE <column> = <literal>` predicate ([STL-151]).
+///
+/// The one filter shape v0.2 lowers: a single column compared for equality
+/// against a folded literal. The executor applies it after resolving the row's
+/// cells, and pushes it down to segment zone-map pruning when the column is the
+/// business key (the only column a zone map can currently reason about). Richer
+/// comparisons (`<`, `>`, ranges, conjunctions) are a deferred follow-up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundPredicate {
+    /// The column the predicate compares (its name, for diagnostics).
+    pub column: String,
+    /// The column's position in the resolved schema — `0` is the business key,
+    /// the rest are value columns. The executor projects this column out of the
+    /// resolved row to test it.
+    pub column_index: usize,
+    /// The literal the column must equal, folded to the column's type.
+    pub value: ScalarValue,
+}
+
 /// A bound `SELECT … [FOR SYSTEM_TIME AS OF …]`, ready to lower to a
 /// `SnapshotScan`.
 ///
 /// Carries the resolved system-time [`snapshot`](Self::snapshot) — the
 /// `sys_from ≤ s` bound the executor pushes into zone-map pruning — together
-/// with the table, the schema that was live at that snapshot, and the
-/// projection. The `WHERE` predicate stays on the parsed AST for the
-/// executor-glue layer to lower into a storage predicate ([STL-104]).
+/// with the table, the schema that was live at that snapshot, the projection, and
+/// the lowered `WHERE` [`filter`](Self::filter) ([STL-151]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundSelect {
     /// The (single, unqualified) table the query reads.
@@ -100,6 +120,9 @@ pub struct BoundSelect {
     pub valid_snapshot: Option<SystemTimeMicros>,
     /// The columns the query projects.
     pub projection: Projection,
+    /// The lowered `WHERE` predicate, or `None` for an unfiltered read. v0.2
+    /// lowers `<column> = <literal>` only ([STL-151]).
+    pub filter: Option<BoundPredicate>,
 }
 
 /// Why binding a `SELECT` failed.
@@ -140,6 +163,14 @@ pub enum SelectError {
         /// The projected column that the resolved schema does not contain.
         column: String,
     },
+
+    /// The `WHERE` clause is not the one shape v0.2 lowers — `<column> =
+    /// <literal>` ([STL-151]). A join predicate, a non-equality comparison, a
+    /// column-to-column compare, an `AND`/`OR` chain, or a literal that cannot
+    /// fold to the column's type all surface here rather than being silently
+    /// dropped (which would return unfiltered rows — a wrong answer).
+    #[error("v0.2 supports only a `<column> = <literal>` WHERE ({0})")]
+    UnsupportedPredicate(String),
 
     /// `FOR VALID_TIME AS OF` was given for a table that does not opt into a
     /// valid-time period — there is no valid axis to travel along. The catalog's
@@ -276,13 +307,98 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
         }
     }
 
+    let filter = bind_filter(select, schema, table)?;
+
     Ok(BoundSelect {
         table: table.to_owned(),
         schema_id: schema.schema_id(),
         snapshot,
         valid_snapshot,
         projection,
+        filter,
     })
+}
+
+/// Lower a `WHERE` clause to a [`BoundPredicate`], or `None` when there is none.
+///
+/// v0.2 lowers exactly `<column> = <literal>` (the column on either side): the
+/// column must exist in the schema and the literal must fold to its type. Every
+/// other shape is [`SelectError::UnsupportedPredicate`] — never silently dropped,
+/// since dropping a filter returns rows the query excluded.
+fn bind_filter(
+    select: &Select,
+    schema: &TableSchema,
+    table: &str,
+) -> Result<Option<BoundPredicate>, SelectError> {
+    let Some(expr) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    else {
+        return Err(SelectError::UnsupportedPredicate(
+            "the WHERE is not an equality".to_owned(),
+        ));
+    };
+    // The column may be on either side: `col = <lit>` or `<lit> = col`. A bare
+    // identifier is a column; anything else (a literal, a qualified name, an
+    // expression) is the comparand side.
+    let (column, value_expr) = match (where_column(left), where_column(right)) {
+        (Some(column), None) => (column, right.as_ref()),
+        (None, Some(column)) => (column, left.as_ref()),
+        _ => {
+            return Err(SelectError::UnsupportedPredicate(
+                "the WHERE is not `<column> = <literal>`".to_owned(),
+            ));
+        }
+    };
+    let column_index = schema
+        .columns()
+        .iter()
+        .position(|c| c.name() == column)
+        .ok_or_else(|| SelectError::UnknownColumn {
+            table: table.to_owned(),
+            column: column.to_owned(),
+        })?;
+    let ty = schema.columns()[column_index].ty();
+    let value = fold::fold_scalar(value_expr, ty)
+        .map_err(|err| SelectError::UnsupportedPredicate(predicate_reason(&err, column, ty)))?;
+    Ok(Some(BoundPredicate {
+        column: column.to_owned(),
+        column_index,
+        value,
+    }))
+}
+
+/// The bare column name a `WHERE` side references, peeling parentheses; `None`
+/// for any non-bare-identifier expression (a literal, a qualified name, an
+/// arithmetic expression), which marks the comparand side.
+fn where_column(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Identifier(id) => Some(id.value.as_str()),
+        Expr::Nested(inner) => where_column(inner),
+        _ => None,
+    }
+}
+
+/// Render a literal-fold failure as the reason carried by
+/// [`SelectError::UnsupportedPredicate`].
+fn predicate_reason(err: &FoldError, column: &str, ty: LogicalType) -> String {
+    match err {
+        FoldError::Null => format!("NULL cannot be compared to column {column:?}"),
+        FoldError::TypeMismatch { found } => {
+            format!("{found} is not a {ty} value for column {column:?}")
+        }
+        FoldError::BadLiteral { literal } => {
+            format!("{literal:?} is not a valid {ty} for column {column:?}")
+        }
+        FoldError::UnsupportedType(ty) => {
+            format!("comparing a {ty} column ({column:?}) to a literal is not supported yet")
+        }
+    }
 }
 
 /// Resolve the statement's `(system-time, valid-time)` snapshots from its
@@ -1070,5 +1186,99 @@ mod tests {
             bind_select(&join, &ctx),
             Err(SelectError::UnsupportedFrom(_))
         ));
+    }
+
+    fn bind(sql: &str, catalog: &Catalog) -> Result<BoundSelect, SelectError> {
+        let ctx = BindContext {
+            snapshot: NOW,
+            catalog,
+        };
+        bind_select(&parse_one(sql), &ctx)
+    }
+
+    #[test]
+    fn no_where_leaves_the_filter_unset() {
+        let catalog = catalog_with_account(1_000);
+        assert_eq!(
+            bind("SELECT balance FROM account", &catalog)
+                .unwrap()
+                .filter,
+            None
+        );
+    }
+
+    #[test]
+    fn where_on_the_key_binds_to_column_zero() {
+        // `id` is the business key — column index 0 — so the executor can push it
+        // down to zone-map pruning.
+        let catalog = catalog_with_account(1_000);
+        assert_eq!(
+            bind("SELECT balance FROM account WHERE id = 7", &catalog)
+                .unwrap()
+                .filter,
+            Some(BoundPredicate {
+                column: "id".to_owned(),
+                column_index: 0,
+                value: ScalarValue::Int4(7),
+            })
+        );
+    }
+
+    #[test]
+    fn where_on_a_value_column_binds_to_its_index() {
+        // `balance` is a value column — index 1 — folded against its int4 type.
+        // The column may sit on either side of the `=`.
+        let catalog = catalog_with_account(1_000);
+        let want = Some(BoundPredicate {
+            column: "balance".to_owned(),
+            column_index: 1,
+            value: ScalarValue::Int4(100),
+        });
+        assert_eq!(
+            bind("SELECT id FROM account WHERE balance = 100", &catalog)
+                .unwrap()
+                .filter,
+            want
+        );
+        assert_eq!(
+            bind("SELECT id FROM account WHERE 100 = balance", &catalog)
+                .unwrap()
+                .filter,
+            want
+        );
+    }
+
+    #[test]
+    fn where_on_an_unknown_column_is_rejected() {
+        let catalog = catalog_with_account(1_000);
+        assert_eq!(
+            bind("SELECT id FROM account WHERE nope = 1", &catalog),
+            Err(SelectError::UnknownColumn {
+                table: "account".to_owned(),
+                column: "nope".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn unsupported_where_shapes_are_rejected_not_dropped() {
+        // A dropped filter would return rows the query excluded — a wrong answer —
+        // so each unsupported shape is a bind error.
+        let catalog = catalog_with_account(1_000);
+        for sql in [
+            "SELECT id FROM account WHERE balance > 100", // non-equality
+            "SELECT id FROM account WHERE id = balance",  // column = column
+            "SELECT id FROM account WHERE balance = 'x'", // type mismatch
+            "SELECT id FROM account WHERE balance = NULL", // NULL comparand
+            "SELECT id FROM account WHERE id = 1 AND balance = 2", // conjunction
+        ] {
+            assert!(
+                matches!(
+                    bind(sql, &catalog),
+                    Err(SelectError::UnsupportedPredicate(_))
+                ),
+                "expected UnsupportedPredicate for: {sql}"
+            );
+        }
     }
 }

@@ -1037,9 +1037,12 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
             SQLSTATE_FEATURE_NOT_SUPPORTED
         }
         // Catalog/storage/scan errors are unexpected on the read/write path but
-        // map cleanly rather than panicking if the contract ever shifts.
+        // map cleanly rather than panicking if the contract ever shifts. A row
+        // codec failure is corrupt stored bytes — an internal error, like storage.
         EngineError::Catalog(_) | EngineError::ValidTimePolicyChange { .. } => sqlstate_for(err),
-        EngineError::Storage(_) | EngineError::Scan(_) => SQLSTATE_INTERNAL_ERROR,
+        EngineError::Storage(_) | EngineError::Scan(_) | EngineError::RowCodec(_) => {
+            SQLSTATE_INTERNAL_ERROR
+        }
     }
 }
 
