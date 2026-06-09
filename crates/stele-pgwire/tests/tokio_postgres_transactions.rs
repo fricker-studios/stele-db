@@ -26,15 +26,20 @@ fn row_count(messages: &[SimpleQueryMessage]) -> usize {
         .count()
 }
 
-/// Every `id` cell of a `SELECT id …` reply, as owned strings.
+/// Every `id` cell of a `SELECT id …` reply, **sorted** as owned strings. The
+/// query carries no `ORDER BY` (and the v0.1 scan does not order rows), so the
+/// values are sorted here to make the assertions independent of scan/physical
+/// layout order.
 fn ids(messages: &[SimpleQueryMessage]) -> Vec<String> {
-    messages
+    let mut ids: Vec<String> = messages
         .iter()
         .filter_map(|m| match m {
             SimpleQueryMessage::Row(row) => Some(row.get("id").expect("id column").to_owned()),
             _ => None,
         })
-        .collect()
+        .collect();
+    ids.sort();
+    ids
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

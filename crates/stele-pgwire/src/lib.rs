@@ -631,10 +631,22 @@ async fn handle_simple_query(
         // first so `COMMIT`/`ROLLBACK` can still end a transaction that is in the
         // aborted state.
         if let Some(ctl) = txn_control(stmt) {
-            match ctl {
-                TxnControl::Begin => run_begin(stream, txn).await?,
+            let proceed = match ctl {
+                TxnControl::Begin => {
+                    run_begin(stream, txn).await?;
+                    true
+                }
+                // A failed COMMIT writes an ErrorResponse and returns `false`, so
+                // the batch aborts here like any other statement error — nothing
+                // more may follow an error on the wire.
                 TxnControl::Commit => run_commit(stream, session, txn).await?,
-                TxnControl::Rollback => run_rollback(stream, txn).await?,
+                TxnControl::Rollback => {
+                    run_rollback(stream, txn).await?;
+                    true
+                }
+            };
+            if !proceed {
+                return Ok(());
             }
             continue;
         }
@@ -734,21 +746,29 @@ async fn run_begin(stream: &mut TcpStream, txn: &mut ConnTxn) -> Result<(), Wire
 /// idle. A `COMMIT` of an aborted transaction rolls it back and reports `ROLLBACK`,
 /// matching Postgres; a `COMMIT` with no open transaction is a warning-only no-op
 /// that still reports `COMMIT`.
+///
+/// Returns whether the batch may continue: `Ok(true)` on success, `Ok(false)` when
+/// the commit replay failed — an `ErrorResponse` was written, so the caller must
+/// stop processing this message (nothing may follow an error on the wire).
 async fn run_commit(
     stream: &mut TcpStream,
     session: &SharedSession,
     txn: &mut ConnTxn,
-) -> Result<(), WireError> {
+) -> Result<bool, WireError> {
     match std::mem::replace(txn, ConnTxn::Idle) {
         ConnTxn::Active(buffered) => match commit_txn(session, buffered) {
             Ok(()) => write_command_complete_tag(stream, "COMMIT").await?,
             Err(e) => {
-                // The commit itself failed; the transaction is over (already reset
-                // to idle) and rolled back. Surface the error — the trailing
-                // ReadyForQuery reports idle.
+                // The commit replay failed partway. The transaction is over (state
+                // already reset to idle), but — unlike a clean ROLLBACK — any writes
+                // applied before the failure are NOT undone: `SessionEngine::commit`
+                // replays through the per-write WAL path with no rollback (the
+                // crash-atomic group-commit follow-up). Surface the error and abort
+                // the batch; the trailing ReadyForQuery reports idle.
                 info!(error = %e, "COMMIT failed");
                 write_error_response(stream, "ERROR", sqlstate_for_query(&e), &e.to_string())
                     .await?;
+                return Ok(false);
             }
         },
         // Postgres rolls a failed transaction back on COMMIT and reports ROLLBACK.
@@ -756,7 +776,7 @@ async fn run_commit(
         // No open transaction — a warning-only no-op that still reports COMMIT.
         ConnTxn::Idle => write_command_complete_tag(stream, "COMMIT").await?,
     }
-    Ok(())
+    Ok(true)
 }
 
 /// `ROLLBACK` / `ABORT` — discard the transaction's buffered writes ([STL-174]).
