@@ -1,4 +1,4 @@
-//! Zone-map pruning integration tests (STL-89, STL-115).
+//! Zone-map pruning integration tests (STL-89, STL-115, STL-120).
 //!
 //! Covers the ticket's Definition of done:
 //!
@@ -15,6 +15,10 @@
 //!   it to the valid-time axis (`valid_from` / `valid_to`), so the no-false-
 //!   negative proof now covers `sys_from` / value / `valid_*` — the full triple
 //!   the segment still stores after `sys_to` moved to the validity index.
+//!   STL-120 extends it again to the **degenerate bounded-prefix ends** — an
+//!   empty lex-min and an all-`0xFF` max — proving the new open (−∞ / +∞) bound
+//!   recovers pruning on the representable side while still never dropping a
+//!   real match.
 
 #![allow(
     clippy::significant_drop_tightening,
@@ -35,7 +39,9 @@ use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros, ValidTimeMicros};
 use stele_storage::backend::MemDisk;
 use stele_storage::delta::{BusinessKey, Snapshot, Version};
 use stele_storage::merge::{fold_chains, resolve_snapshot};
-use stele_storage::segment::{ColumnId, Predicate, SegmentReader, SegmentWriter, ZoneBound};
+use stele_storage::segment::{
+    ColumnId, Predicate, SegmentReader, SegmentWriter, ZoneBound, ZoneEnd,
+};
 use stele_storage::validity::{Close, SysUpperBound, ValidityConfig, ValidityIndex};
 use stele_storage::validtime::{VALID_TIME_PREFIX_LEN, ValidInterval, frame_payload};
 use stele_storage::wal::{Disk, DiskFile};
@@ -338,8 +344,8 @@ fn zone_map_records_per_column_min_max() {
     let zm = r.zone_map();
 
     let sys_from = zm.column(ColumnId::SysFrom).expect("sys_from stats");
-    assert_eq!(sys_from.min, ZoneBound::I64(10));
-    assert_eq!(sys_from.max, ZoneBound::I64(30));
+    assert_eq!(sys_from.min, ZoneEnd::Value(ZoneBound::I64(10)));
+    assert_eq!(sys_from.max, ZoneEnd::Value(ZoneBound::I64(30)));
 
     // There is no `sys_to` zone (v6, ADR-0023): `ColumnId::SysTo` no longer
     // exists — the period end lives in the validity index, so the segment
@@ -348,14 +354,14 @@ fn zone_map_records_per_column_min_max() {
     let bk = zm
         .column(ColumnId::BusinessKey)
         .expect("business_key stats");
-    assert_eq!(bk.min, ZoneBound::Bytes(b"a".to_vec()));
-    assert_eq!(bk.max, ZoneBound::Bytes(b"z".to_vec()));
+    assert_eq!(bk.min, ZoneEnd::Value(ZoneBound::Bytes(b"a".to_vec())));
+    assert_eq!(bk.max, ZoneEnd::Value(ZoneBound::Bytes(b"z".to_vec())));
 
     // Payload now carries bounded-prefix stats (STL-115). These payloads are
     // single bytes, well under the prefix cap, so the bounds are exact.
     let payload = zm.column(ColumnId::Payload).expect("payload stats");
-    assert_eq!(payload.min, ZoneBound::Bytes(b"w".to_vec()));
-    assert_eq!(payload.max, ZoneBound::Bytes(b"y".to_vec()));
+    assert_eq!(payload.min, ZoneEnd::Value(ZoneBound::Bytes(b"w".to_vec())));
+    assert_eq!(payload.max, ZoneEnd::Value(ZoneBound::Bytes(b"y".to_vec())));
 }
 
 // --- DoD: correctness oracle (no false negatives) ---------------------------
@@ -441,6 +447,266 @@ fn might_contain_never_prunes_a_real_match() {
             );
         }
     }
+}
+
+// --- DoD: degenerate bounded-prefix ends (STL-120) --------------------------
+
+/// STL-120 DoD (empty lex-min): a `Payload` whose lex-min is the empty byte
+/// string keeps a zone entry — an open (−∞) min — and still prunes on its
+/// concrete max. Pre-STL-120 the empty min encoded as the zero-length "no stats"
+/// sentinel, which dropped the whole `Payload` zone (an entry needs both bounds),
+/// forfeiting pruning on *both* sides.
+#[test]
+fn empty_min_payload_recovers_max_side_pruning() {
+    let disk = CountingDisk::new();
+    // One row with an empty payload (lex-min `b""`) and one with a short
+    // concrete payload. `version` stores `Some(payload)`, so `b""` is an empty
+    // (not NULL) payload — exactly the empty-lex-min edge.
+    write_segment(
+        &disk,
+        "empty-min.seg",
+        &[version(b"a", 0, b""), version(b"b", 0, b"mmmm")],
+    );
+    let r = SegmentReader::open(&disk, "empty-min.seg").expect("open");
+    let payload = r
+        .zone_map()
+        .column(ColumnId::Payload)
+        .expect("payload zone present despite the empty min");
+    assert_eq!(
+        payload.min,
+        ZoneEnd::Unbounded,
+        "empty lex-min is open below"
+    );
+    assert_eq!(
+        payload.max,
+        ZoneEnd::Value(ZoneBound::Bytes(b"mmmm".to_vec()))
+    );
+
+    let snapshot = snap(0);
+    // Recovered pruning: a value strictly above the concrete max is provably absent.
+    assert!(
+        !r.might_contain(
+            &Predicate::Eq {
+                column: ColumnId::Payload,
+                value: ZoneBound::Bytes(b"zzzz".to_vec()),
+            },
+            snapshot,
+        ),
+        "max-side pruning must be recovered: `zzzz` > max `mmmm`"
+    );
+    // No false negatives: both real rows must be kept.
+    for present in [b"".as_slice(), b"mmmm".as_slice()] {
+        assert!(
+            r.might_contain(
+                &Predicate::Eq {
+                    column: ColumnId::Payload,
+                    value: ZoneBound::Bytes(present.to_vec()),
+                },
+                snapshot,
+            ),
+            "a real payload row ({present:?}) must never be pruned"
+        );
+    }
+}
+
+/// STL-120 DoD (saturating max): a `Payload` whose max prefix is all-`0xFF` keeps
+/// a zone entry — an open (+∞) max — and still prunes on its concrete min. The
+/// all-`0xFF` prefix has no shorter representable upper bound, so pre-STL-120 it
+/// collapsed the whole zone exactly like the empty-min case.
+#[test]
+fn all_ff_max_payload_recovers_min_side_pruning() {
+    let disk = CountingDisk::new();
+    // 256 bytes of 0xFF is safely longer than any plausible prefix cap (64 at
+    // time of writing), so its bounded max-prefix is all-`0xFF` and saturates.
+    let all_ff = vec![0xFFu8; 256];
+    write_segment(
+        &disk,
+        "ff-max.seg",
+        &[version(b"a", 0, b"mmmm"), version(b"b", 0, &all_ff)],
+    );
+    let r = SegmentReader::open(&disk, "ff-max.seg").expect("open");
+    let payload = r
+        .zone_map()
+        .column(ColumnId::Payload)
+        .expect("payload zone present despite the saturating max");
+    assert_eq!(
+        payload.min,
+        ZoneEnd::Value(ZoneBound::Bytes(b"mmmm".to_vec()))
+    );
+    assert_eq!(
+        payload.max,
+        ZoneEnd::Unbounded,
+        "all-0xFF max is open above"
+    );
+
+    let snapshot = snap(0);
+    // Recovered pruning: a value strictly below the concrete min is provably absent.
+    assert!(
+        !r.might_contain(
+            &Predicate::Eq {
+                column: ColumnId::Payload,
+                value: ZoneBound::Bytes(b"aaaa".to_vec()),
+            },
+            snapshot,
+        ),
+        "min-side pruning must be recovered: `aaaa` < min `mmmm`"
+    );
+    // No false negatives: both real rows must be kept, including the all-0xFF one
+    // that sits at the open (+∞) max.
+    for present in [b"mmmm".as_slice(), all_ff.as_slice()] {
+        assert!(
+            r.might_contain(
+                &Predicate::Eq {
+                    column: ColumnId::Payload,
+                    value: ZoneBound::Bytes(present.to_vec()),
+                },
+                snapshot,
+            ),
+            "a real payload row must never be pruned"
+        );
+    }
+}
+
+/// STL-120 differential oracle: build segments whose payloads deliberately mix
+/// the two degenerate ends — an empty `b""` (open −∞ min) and an over-cap
+/// all-`0xFF` blob (open +∞ max) — alongside ordinary over-cap stress payloads,
+/// then fire random `Eq` / `Range` probes. The brute-force oracle decides by
+/// exact byte comparison whether a visible matching row exists; `might_contain`
+/// must never answer `false` when one does. A non-vacuity guard asserts the
+/// sweep actually exercises the prune path (some probe is pruned), so a bug that
+/// made `might_contain` blindly keep everything could not pass silently.
+#[test]
+fn might_contain_never_prunes_with_degenerate_payload_bounds() {
+    let mut prunes = 0u64;
+    for seed in 0..300u64 {
+        let mut rng = Lcg(seed.wrapping_mul(2_654_435_761).wrapping_add(13));
+        let disk = CountingDisk::new();
+
+        // 1..=6 rows. 1-in-4 empty (open min), 1-in-4 over-cap all-0xFF (open
+        // max), else an ordinary over-cap stress payload. The segment stores
+        // only birth state (v6, ADR-0023); the oracle tracks the period end.
+        let row_count = 1 + rng.below(6);
+        let mut rows: Vec<(Version, i64)> = Vec::new();
+        for i in 0..row_count {
+            let payload = degenerate_payload(&mut rng);
+            let sys_from = rng.below(100) as i64;
+            let sys_to = if rng.below(4) == 0 {
+                SYSTEM_TIME_OPEN.0
+            } else {
+                sys_from + 1 + rng.below(100) as i64
+            };
+            rows.push((
+                version(format!("k{i}").as_bytes(), sys_from, &payload),
+                sys_to,
+            ));
+        }
+        let versions: Vec<Version> = rows.iter().map(|(v, _)| v.clone()).collect();
+        write_segment(&disk, "d.seg", &versions);
+        let reader = SegmentReader::open(&disk, "d.seg").expect("open");
+
+        for _ in 0..24 {
+            let snapshot = snap(rng.below(210) as i64 - 5);
+            let predicate = payload_probe(&mut rng, &rows);
+            let real_match = payload_visible_match(&rows, &predicate, snapshot);
+            let kept = reader.might_contain(&predicate, snapshot);
+            assert!(
+                !real_match || kept,
+                "seed {seed}: might_contain pruned a segment holding a real match \
+                 (snapshot={snapshot:?}, predicate={predicate:?}, rows={rows:?})"
+            );
+            if !kept {
+                prunes += 1;
+            }
+        }
+    }
+    assert!(
+        prunes > 0,
+        "the open-ended bounds must still prune across the sweep — a vacuous keep-all \
+         would pass the no-false-negative check but prove nothing"
+    );
+}
+
+/// One payload for the STL-120 degenerate-bounds sweep: 1-in-4 empty (open −∞
+/// min), 1-in-4 over-cap all-`0xFF` (open +∞ max), else an ordinary over-cap
+/// stress payload (concrete bounds, truncated/rounded).
+fn degenerate_payload(rng: &mut Lcg) -> Vec<u8> {
+    match rng.below(4) {
+        0 => Vec::new(),
+        1 => {
+            let len = 128 + rng.below(64) as usize;
+            vec![0xFFu8; len]
+        }
+        _ => {
+            let len = 97 + rng.below(48) as usize;
+            stress_bytes(rng, len)
+        }
+    }
+}
+
+/// A random `Payload` probe. `Eq` sometimes targets a real row (forcing the keep
+/// path) and otherwise draws a value from the edge cases (empty, all-`0xFF`) so
+/// the open ends are exercised; `Range` is a random inclusive interval.
+fn payload_probe(rng: &mut Lcg, rows: &[(Version, i64)]) -> Predicate {
+    if rng.below(2) == 0 {
+        let value = match rng.below(4) {
+            0 if !rows.is_empty() => {
+                let idx = rng.below(rows.len() as u64) as usize;
+                rows[idx].0.payload.clone().unwrap()
+            }
+            1 => Vec::new(),
+            2 => {
+                let len = 100 + rng.below(80) as usize;
+                vec![0xFFu8; len]
+            }
+            _ => {
+                let len = 40 + rng.below(50) as usize;
+                stress_bytes(rng, len)
+            }
+        };
+        Predicate::Eq {
+            column: ColumnId::Payload,
+            value: ZoneBound::Bytes(value),
+        }
+    } else {
+        let a_len = rng.below(80) as usize;
+        let a = stress_bytes(rng, a_len);
+        let b_len = rng.below(80) as usize;
+        let b = stress_bytes(rng, b_len);
+        let (low, high) = if a <= b { (a, b) } else { (b, a) };
+        Predicate::Range {
+            column: ColumnId::Payload,
+            low: ZoneBound::Bytes(low),
+            high: ZoneBound::Bytes(high),
+        }
+    }
+}
+
+/// Brute-force oracle for [`payload_probe`]: whether a row visible at `snapshot`
+/// satisfies the predicate by exact byte comparison.
+fn payload_visible_match(
+    rows: &[(Version, i64)],
+    predicate: &Predicate,
+    snapshot: Snapshot,
+) -> bool {
+    rows.iter().any(|(v, sys_to)| {
+        let visible = v.sys_from <= snapshot.0 && *sys_to > snapshot.0.0;
+        let pred_holds = match predicate {
+            Predicate::Eq {
+                value: ZoneBound::Bytes(value),
+                ..
+            } => v.payload.as_deref() == Some(value.as_slice()),
+            Predicate::Range {
+                low: ZoneBound::Bytes(low),
+                high: ZoneBound::Bytes(high),
+                ..
+            } => {
+                let p = v.payload.as_deref().unwrap();
+                p >= low.as_slice() && p <= high.as_slice()
+            }
+            _ => unreachable!("only bytes Eq/Range predicates are built above"),
+        };
+        visible && pred_holds
+    })
 }
 
 // --- DoD: valid-time zone-map pruning (STL-117) -----------------------------
@@ -580,12 +846,12 @@ fn valid_time_columns_populate_zone_map_and_round_trip() {
     let zm = r.zone_map();
 
     let vf = zm.column(ColumnId::ValidFrom).expect("valid_from stats");
-    assert_eq!(vf.min, ZoneBound::I64(10));
-    assert_eq!(vf.max, ZoneBound::I64(30));
+    assert_eq!(vf.min, ZoneEnd::Value(ZoneBound::I64(10)));
+    assert_eq!(vf.max, ZoneEnd::Value(ZoneBound::I64(30)));
 
     let vt = zm.column(ColumnId::ValidTo).expect("valid_to stats");
-    assert_eq!(vt.min, ZoneBound::I64(80));
-    assert_eq!(vt.max, ZoneBound::I64(100));
+    assert_eq!(vt.min, ZoneEnd::Value(ZoneBound::I64(80)));
+    assert_eq!(vt.max, ZoneEnd::Value(ZoneBound::I64(100)));
 
     let read = r.read_versions().expect("read versions");
     assert_eq!(read, rows.to_vec(), "framed payload round-trips unchanged");

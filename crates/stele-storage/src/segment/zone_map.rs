@@ -72,18 +72,47 @@ pub enum ZoneBound {
     Bytes(Vec<u8>),
 }
 
+/// One end (min or max) of a column's value range in a [`ColumnZone`].
+///
+/// Almost always a concrete [`Self::Value`], but a bounded-prefix bytes
+/// column (the segment writer) can have an end that is *open*: the lex-min is the
+/// empty byte string (so the lower bound is effectively −∞ — everything is
+/// `>= b""`), or the lex-max prefix saturates at all-`0xFF` and has no shorter
+/// representable upper bound (so the upper bound is +∞). [`Self::Unbounded`]
+/// records that end as open so the column **keeps its zone entry and prunes on
+/// the other, representable side** ([STL-120]) — instead of the pre-STL-120
+/// behaviour, where the degenerate end's zero-length "no stats" sentinel
+/// collapsed the whole column zone and gave up pruning on both sides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZoneEnd {
+    /// A concrete recorded bound. On the `min` side a sound lower bound
+    /// (truncated *down* for an over-cap bytes prefix); on the `max` side a sound
+    /// upper bound (rounded *up*).
+    Value(ZoneBound),
+    /// The end is open: −∞ for a `min`, +∞ for a `max`. Carries no value and
+    /// never prunes — a value can be neither provably below −∞ nor provably
+    /// above +∞ — so the segment is always kept on this side, which is exactly
+    /// the conservative, no-false-negative behaviour the soundness contract
+    /// requires.
+    Unbounded,
+}
+
 /// The min/max pair for one column across the whole segment.
 ///
 /// Both bounds are always present together — a column either has stats (then
 /// both `min` and `max` are recorded) or it has none (then there is no
-/// [`ColumnZone`] entry at all). The two bounds are always the same
-/// [`ZoneBound`] variant, dictated by the column's `ColumnType`.
+/// [`ColumnZone`] entry at all). Each bound is a [`ZoneEnd`]: a concrete
+/// [`ZoneBound`] value (same variant for both ends, dictated by the column's
+/// `ColumnType`), or [`ZoneEnd::Unbounded`] for a degenerate bounded-prefix
+/// bytes end ([STL-120]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnZone {
-    /// Smallest value observed for the column in this segment.
-    pub min: ZoneBound,
-    /// Largest value observed for the column in this segment.
-    pub max: ZoneBound,
+    /// Smallest value observed for the column in this segment, or
+    /// [`ZoneEnd::Unbounded`] (−∞) when the lower bound is open.
+    pub min: ZoneEnd,
+    /// Largest value observed for the column in this segment, or
+    /// [`ZoneEnd::Unbounded`] (+∞) when the upper bound is open.
+    pub max: ZoneEnd,
 }
 
 /// Resident per-segment zone map: the min/max digest for every column that
@@ -92,13 +121,15 @@ pub struct ColumnZone {
 /// Cheap to clone and independent of the file handle — the planner can retain
 /// it after the segment's bytes have been tiered to cold storage
 /// ([ADR-0021](../../../../../docs/adr/0021-storage-lifecycle-tiered-archival.md)).
-/// Variable-length bytes columns such as [`ColumnId::Payload`] now record a
+/// Variable-length bytes columns such as [`ColumnId::Payload`] record a
 /// bounded min/max *prefix* (the writer caps it at `MAX_BYTES_STAT_PREFIX_LEN`)
-/// rather than opting out of stats entirely. A column may still have **no
-/// entry**: an empty segment, or the degenerate case where a bound encodes as
-/// the zero-length "no stats" sentinel (an empty min, or an all-`0xFF` max) —
-/// since an entry needs *both* bounds, that drops the column's zone for the
-/// segment. A column with no entry simply never contributes a skip.
+/// rather than opting out of stats entirely. A degenerate bounded-prefix end —
+/// an empty lex-min, or an all-`0xFF` max with no shorter upper bound — is
+/// recorded as [`ZoneEnd::Unbounded`] (−∞ / +∞) rather than collapsing the
+/// column's zone, so the column still prunes on its representable side ([STL-120]).
+/// A column has **no entry** only when it carries no values at all (an empty
+/// segment, or an all-NULL `payload`); a column with no entry never contributes
+/// a skip.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ZoneMap {
     // Small, fixed-cardinality column set (four in v0.1) — a linear-scan Vec
@@ -109,9 +140,11 @@ pub struct ZoneMap {
 
 impl ZoneMap {
     /// Build a zone map from per-column `(min, max)` bounds, skipping any
-    /// column whose bounds are absent (no stats recorded).
+    /// column whose bounds are absent (no stats recorded). A present-but-open
+    /// end is [`ZoneEnd::Unbounded`] — `Some(ZoneEnd::Unbounded)`, distinct from
+    /// the `None` that drops the column ([STL-120]).
     pub(super) fn from_bounds(
-        bounds: impl IntoIterator<Item = (ColumnId, Option<ZoneBound>, Option<ZoneBound>)>,
+        bounds: impl IntoIterator<Item = (ColumnId, Option<ZoneEnd>, Option<ZoneEnd>)>,
     ) -> Self {
         let mut columns = Vec::new();
         for (col, min, max) in bounds {
@@ -166,7 +199,10 @@ impl ZoneMap {
         // snapshot, no row has begun yet at `s`. Match on a reference and copy
         // the inner `i64` out — `ZoneBound` is not `Copy`.
         if let Some(zone) = self.column(ColumnId::SysFrom) {
-            if let ZoneBound::I64(min_sys_from) = &zone.min {
+            // `sys_from` is a fixed-width i64 column — its bounds are always
+            // concrete (only bounded-prefix *bytes* columns ever go open), so a
+            // non-`Value` min here is not reachable and simply skips the prune.
+            if let ZoneEnd::Value(ZoneBound::I64(min_sys_from)) = &zone.min {
                 if SystemTimeMicros(*min_sys_from) > s {
                     return false;
                 }
@@ -184,18 +220,19 @@ impl ZoneMap {
             // A point survives only if it lies within [min, max]. We keep the
             // segment unless we can *prove* `value` is outside — a value whose
             // variant doesn't match the column's stat (a mistyped predicate) is
-            // incomparable, so neither `is_below` nor `is_above` fires and the
+            // incomparable, and an open end (−∞ / +∞) is unprovable on its side,
+            // so in either case the corresponding test does not fire and the
             // segment is conservatively kept. No stats ⇒ `is_none_or` keeps it.
             Predicate::Eq { column, value } => self
                 .column(*column)
-                .is_none_or(|zone| !value.is_below(&zone.min) && !value.is_above(&zone.max)),
+                .is_none_or(|zone| !zone.min.prunes_below(value) && !zone.max.prunes_above(value)),
             // Ranges [low, high] and [min, max] are provably disjoint only when
-            // `high < min` or `low > max`; either proof prunes. Cross-variant
-            // bounds are incomparable, so neither proof fires and the segment
+            // `high < min` or `low > max`; either proof prunes. Cross-variant or
+            // open bounds are unprovable, so neither proof fires and the segment
             // is kept.
             Predicate::Range { column, low, high } => self
                 .column(*column)
-                .is_none_or(|zone| !high.is_below(&zone.min) && !low.is_above(&zone.max)),
+                .is_none_or(|zone| !zone.min.prunes_below(high) && !zone.max.prunes_above(low)),
         }
     }
 }
@@ -265,6 +302,28 @@ impl ZoneBound {
     }
 }
 
+impl ZoneEnd {
+    /// As a `min` end: `true` only when `value` is *provably* below this lower
+    /// bound, justifying a skip. An open end (−∞) and a cross-variant comparison
+    /// are both unprovable, so they return `false` — the segment is kept ([STL-120]).
+    fn prunes_below(&self, value: &ZoneBound) -> bool {
+        match self {
+            Self::Value(min) => value.is_below(min),
+            Self::Unbounded => false,
+        }
+    }
+
+    /// As a `max` end: `true` only when `value` is *provably* above this upper
+    /// bound, justifying a skip. An open end (+∞) and a cross-variant comparison
+    /// are both unprovable, so they return `false` — the segment is kept ([STL-120]).
+    fn prunes_above(&self, value: &ZoneBound) -> bool {
+        match self {
+            Self::Value(max) => value.is_above(max),
+            Self::Unbounded => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,19 +332,23 @@ mod tests {
         col: ColumnId,
         min: i64,
         max: i64,
-    ) -> (ColumnId, Option<ZoneBound>, Option<ZoneBound>) {
-        (col, Some(ZoneBound::I64(min)), Some(ZoneBound::I64(max)))
+    ) -> (ColumnId, Option<ZoneEnd>, Option<ZoneEnd>) {
+        (
+            col,
+            Some(ZoneEnd::Value(ZoneBound::I64(min))),
+            Some(ZoneEnd::Value(ZoneBound::I64(max))),
+        )
     }
 
     fn bytes_zone(
         col: ColumnId,
         min: &[u8],
         max: &[u8],
-    ) -> (ColumnId, Option<ZoneBound>, Option<ZoneBound>) {
+    ) -> (ColumnId, Option<ZoneEnd>, Option<ZoneEnd>) {
         (
             col,
-            Some(ZoneBound::Bytes(min.to_vec())),
-            Some(ZoneBound::Bytes(max.to_vec())),
+            Some(ZoneEnd::Value(ZoneBound::Bytes(min.to_vec()))),
+            Some(ZoneEnd::Value(ZoneBound::Bytes(max.to_vec()))),
         )
     }
 
@@ -431,5 +494,113 @@ mod tests {
         let zm = ZoneMap::default();
         assert!(zm.might_contain(&Predicate::All, snap(0)));
         assert!(zm.might_contain(&Predicate::All, snap(i64::MAX)));
+    }
+
+    /// A bytes column whose `min` is open (−∞, the empty-lex-min case) still
+    /// prunes on its concrete `max`, but never on the low side ([STL-120]).
+    #[test]
+    fn unbounded_min_prunes_only_on_the_max_side() {
+        let pl = ColumnId::Payload;
+        let zm = ZoneMap::from_bounds([(
+            pl,
+            Some(ZoneEnd::Unbounded),
+            Some(ZoneEnd::Value(ZoneBound::Bytes(b"m".to_vec()))),
+        )]);
+        let inside = snap(0);
+        // Above the concrete max ⇒ provably outside ⇒ prune.
+        assert!(!zm.might_contain(
+            &Predicate::Eq {
+                column: pl,
+                value: ZoneBound::Bytes(b"z".to_vec()),
+            },
+            inside,
+        ));
+        // Below the (open) min ⇒ unprovable ⇒ kept: nothing is below −∞.
+        assert!(zm.might_contain(
+            &Predicate::Eq {
+                column: pl,
+                value: ZoneBound::Bytes(b"".to_vec()),
+            },
+            inside,
+        ));
+        // A range wholly above the max still prunes; one straddling it is kept.
+        assert!(!zm.might_contain(
+            &Predicate::Range {
+                column: pl,
+                low: ZoneBound::Bytes(b"x".to_vec()),
+                high: ZoneBound::Bytes(b"z".to_vec()),
+            },
+            inside,
+        ));
+        assert!(zm.might_contain(
+            &Predicate::Range {
+                column: pl,
+                low: ZoneBound::Bytes(b"a".to_vec()),
+                high: ZoneBound::Bytes(b"z".to_vec()),
+            },
+            inside,
+        ));
+    }
+
+    /// A bytes column whose `max` is open (+∞, the all-`0xFF` case) still prunes
+    /// on its concrete `min`, but never on the high side ([STL-120]).
+    #[test]
+    fn unbounded_max_prunes_only_on_the_min_side() {
+        let pl = ColumnId::Payload;
+        let zm = ZoneMap::from_bounds([(
+            pl,
+            Some(ZoneEnd::Value(ZoneBound::Bytes(b"m".to_vec()))),
+            Some(ZoneEnd::Unbounded),
+        )]);
+        let inside = snap(0);
+        // Below the concrete min ⇒ provably outside ⇒ prune.
+        assert!(!zm.might_contain(
+            &Predicate::Eq {
+                column: pl,
+                value: ZoneBound::Bytes(b"a".to_vec()),
+            },
+            inside,
+        ));
+        // Above the (open) max ⇒ unprovable ⇒ kept: nothing is above +∞.
+        assert!(zm.might_contain(
+            &Predicate::Eq {
+                column: pl,
+                value: ZoneBound::Bytes(vec![0xFF; 100]),
+            },
+            inside,
+        ));
+        // A range wholly below the min prunes; one straddling it is kept.
+        assert!(!zm.might_contain(
+            &Predicate::Range {
+                column: pl,
+                low: ZoneBound::Bytes(b"a".to_vec()),
+                high: ZoneBound::Bytes(b"c".to_vec()),
+            },
+            inside,
+        ));
+        assert!(zm.might_contain(
+            &Predicate::Range {
+                column: pl,
+                low: ZoneBound::Bytes(b"a".to_vec()),
+                high: ZoneBound::Bytes(b"z".to_vec()),
+            },
+            inside,
+        ));
+    }
+
+    /// Both ends open (a single-row column whose value is `b""` would land here
+    /// if its max also saturated) keeps everything — equivalent to no entry, but
+    /// it is a present `ColumnZone`, never a panic on either prune side.
+    #[test]
+    fn both_ends_unbounded_keeps_everything() {
+        let pl = ColumnId::Payload;
+        let zm = ZoneMap::from_bounds([(pl, Some(ZoneEnd::Unbounded), Some(ZoneEnd::Unbounded))]);
+        assert!(zm.might_contain(
+            &Predicate::Eq {
+                column: pl,
+                value: ZoneBound::Bytes(b"anything".to_vec()),
+            },
+            snap(0),
+        ));
     }
 }

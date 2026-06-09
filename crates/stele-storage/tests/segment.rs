@@ -24,7 +24,7 @@ use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::SystemTimeMicros;
 use stele_storage::delta::{BusinessKey, Version};
 use stele_storage::segment::{
-    ColumnData, ColumnId, SegmentError, SegmentReader, SegmentWriter, ZoneBound,
+    ColumnData, ColumnId, SegmentError, SegmentReader, SegmentWriter, ZoneBound, ZoneEnd,
 };
 use stele_storage::validity::Close;
 use stele_storage::wal::{Disk, DiskFile};
@@ -319,14 +319,20 @@ fn retraction_columns_populate_the_zone_map() {
     let key_zone = zm
         .column(ColumnId::RetractKey)
         .expect("retract_key has a zone entry");
-    assert_eq!(key_zone.min, ZoneBound::Bytes(b"a".to_vec()));
-    assert_eq!(key_zone.max, ZoneBound::Bytes(b"z".to_vec()));
+    assert_eq!(
+        key_zone.min,
+        ZoneEnd::Value(ZoneBound::Bytes(b"a".to_vec()))
+    );
+    assert_eq!(
+        key_zone.max,
+        ZoneEnd::Value(ZoneBound::Bytes(b"z".to_vec()))
+    );
 
     let closed_zone = zm
         .column(ColumnId::RetractClosedAt)
         .expect("retract_closed_at has a zone entry");
-    assert_eq!(closed_zone.min, ZoneBound::I64(20));
-    assert_eq!(closed_zone.max, ZoneBound::I64(60));
+    assert_eq!(closed_zone.min, ZoneEnd::Value(ZoneBound::I64(20)));
+    assert_eq!(closed_zone.max, ZoneEnd::Value(ZoneBound::I64(60)));
 }
 
 /// A representative workload: a handful of business keys with version chains

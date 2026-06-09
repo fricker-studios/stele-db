@@ -36,9 +36,9 @@ use crate::validtime::reframe_payload;
 use super::SegmentError;
 use super::format::{
     BYTES_NULL_SENTINEL, CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FORMAT_VERSION, HEADER_LEN,
-    HEADER_MAGIC, TRAILER_LEN, TRAILER_MAGIC,
+    HEADER_MAGIC, STAT_MAX_UNBOUNDED, STAT_MIN_UNBOUNDED, TRAILER_LEN, TRAILER_MAGIC,
 };
-use super::zone_map::{Predicate, ZoneBound, ZoneMap};
+use super::zone_map::{Predicate, ZoneBound, ZoneEnd, ZoneMap};
 
 /// Decoded contents of one projected column chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,8 +93,8 @@ struct ColumnChunkMeta {
     offset: u64,
     length: u64,
     value_count: u32,
-    stat_min: Option<ZoneBound>,
-    stat_max: Option<ZoneBound>,
+    stat_min: Option<ZoneEnd>,
+    stat_max: Option<ZoneEnd>,
 }
 
 impl<F: DiskFile> SegmentReader<F> {
@@ -664,21 +664,26 @@ fn parse_chunk_meta(
     let codec_raw = p.u8()?;
     let codec =
         Codec::from_byte(codec_raw).ok_or(SegmentError::Corrupt("unknown codec in footer"))?;
-    let _reserved = p.u8()?;
+    // Stat presence flags ([STL-120]): the byte after the codec marks an
+    // empty-but-*present* (open) min/max distinctly from an absent one. An older
+    // writer left this byte zero, so an absent bit reads exactly as before.
+    let stat_flags = p.u8()?;
     let offset = p.u64()?;
     let length = p.u64()?;
     let value_count = p.u32()?;
     let _reserved = p.u32()?;
     // Stats feed zone-map pruning (STL-89). A zero-length field is the writer's
-    // "no stats" sentinel; a non-empty field is decoded into a typed bound
-    // matching the column's `ColumnType`. The declared lengths are bounded by the
-    // footer-CRC envelope, so an oversized length can't escape the footer.
+    // "no stats" sentinel *unless* the matching unbounded flag is set, in which
+    // case it is a present open end (−∞ / +∞, STL-120); a non-empty field is
+    // decoded into a typed bound matching the column's `ColumnType`. The declared
+    // lengths are bounded by the footer-CRC envelope, so an oversized length
+    // can't escape the footer.
     let min_len = p.u32()? as usize;
     let min_bytes = p.bytes(min_len)?;
     let max_len = p.u32()? as usize;
     let max_bytes = p.bytes(max_len)?;
-    let stat_min = decode_stat(column_id, min_bytes)?;
-    let stat_max = decode_stat(column_id, max_bytes)?;
+    let stat_min = decode_stat(column_id, min_bytes, stat_flags & STAT_MIN_UNBOUNDED != 0)?;
+    let stat_max = decode_stat(column_id, max_bytes, stat_flags & STAT_MAX_UNBOUNDED != 0)?;
     if value_count != expected_value_count {
         // One typed message; `what` distinguishes which section disagreed.
         return Err(SegmentError::Corrupt(match what {
@@ -697,12 +702,26 @@ fn parse_chunk_meta(
     })
 }
 
-/// Decode one footer stat field into a typed [`ZoneBound`]. The zero-length
-/// sentinel maps to `None` ("no stats"); a non-empty field is interpreted
-/// according to the column's [`ColumnType`], and an `i64` stat whose length is
-/// not exactly 8 bytes is rejected as corruption rather than silently
-/// truncated.
-fn decode_stat(col: ColumnId, bytes: &[u8]) -> Result<Option<ZoneBound>, SegmentError> {
+/// Decode one footer stat field into a typed [`ZoneEnd`]. When `unbounded` is
+/// set the end is open (−∞ for a min, +∞ for a max, [STL-120]) and the field
+/// must carry no bytes — an unbounded end has no value, so a non-empty field
+/// alongside the flag is corruption. Otherwise the zero-length sentinel maps to
+/// `None` ("no stats"); a non-empty field is interpreted according to the
+/// column's [`ColumnType`], and an `i64` stat whose length is not exactly 8
+/// bytes is rejected as corruption rather than silently truncated.
+fn decode_stat(
+    col: ColumnId,
+    bytes: &[u8],
+    unbounded: bool,
+) -> Result<Option<ZoneEnd>, SegmentError> {
+    if unbounded {
+        if !bytes.is_empty() {
+            return Err(SegmentError::Corrupt(
+                "unbounded stat flag set but the stat field carries bytes",
+            ));
+        }
+        return Ok(Some(ZoneEnd::Unbounded));
+    }
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -711,9 +730,11 @@ fn decode_stat(col: ColumnId, bytes: &[u8]) -> Result<Option<ZoneBound>, Segment
             let arr: [u8; 8] = bytes
                 .try_into()
                 .map_err(|_| SegmentError::Corrupt("i64 column stat is not 8 bytes"))?;
-            Ok(Some(ZoneBound::I64(i64::from_le_bytes(arr))))
+            Ok(Some(ZoneEnd::Value(ZoneBound::I64(i64::from_le_bytes(
+                arr,
+            )))))
         }
-        ColumnType::Bytes => Ok(Some(ZoneBound::Bytes(bytes.to_vec()))),
+        ColumnType::Bytes => Ok(Some(ZoneEnd::Value(ZoneBound::Bytes(bytes.to_vec())))),
     }
 }
 
@@ -744,27 +765,21 @@ fn build_zone_map(footer: &Footer) -> ZoneMap {
         }
     }
     let bounds = present.into_iter().map(|col| {
-        let mut min: Option<ZoneBound> = None;
-        let mut max: Option<ZoneBound> = None;
+        let mut min: Option<ZoneEnd> = None;
+        let mut max: Option<ZoneEnd> = None;
         {
             for c in all_metas().filter(|c| c.column_id == col) {
-                // Compare by reference (`ZoneBound` isn't `Copy`); replace only
-                // on a *provable* same-variant ordering. Every chunk for one
-                // column shares that column's type, so the fold always sees a
-                // `Some` ordering here.
+                // Fold the least min / greatest max across the column's chunks.
+                // An open end dominates: `Unbounded` is −∞ for a min (least) and
+                // +∞ for a max (greatest). Concrete ends compare same-variant —
+                // every chunk for one column shares that column's type.
                 if let Some(m) = &c.stat_min {
-                    if min
-                        .as_ref()
-                        .is_none_or(|cur| m.cmp_same_variant(cur) == Some(Ordering::Less))
-                    {
+                    if end_is_smaller(m, min.as_ref()) {
                         min = Some(m.clone());
                     }
                 }
                 if let Some(m) = &c.stat_max {
-                    if max
-                        .as_ref()
-                        .is_none_or(|cur| m.cmp_same_variant(cur) == Some(Ordering::Greater))
-                    {
+                    if end_is_larger(m, max.as_ref()) {
                         max = Some(m.clone());
                     }
                 }
@@ -773,6 +788,32 @@ fn build_zone_map(footer: &Footer) -> ZoneMap {
         (col, min, max)
     });
     ZoneMap::from_bounds(bounds)
+}
+
+/// Whether `cand` should replace the running *min* `cur` — i.e. `cand` is the
+/// smaller lower bound, with [`ZoneEnd::Unbounded`] (−∞) the smallest of all.
+fn end_is_smaller(cand: &ZoneEnd, cur: Option<&ZoneEnd>) -> bool {
+    match (cur, cand) {
+        (Some(ZoneEnd::Unbounded), _) => false, // running min already −∞
+        // no running min yet, or the candidate is −∞ ⇒ take the candidate
+        (None, _) | (Some(_), ZoneEnd::Unbounded) => true,
+        (Some(ZoneEnd::Value(c)), ZoneEnd::Value(v)) => {
+            v.cmp_same_variant(c) == Some(Ordering::Less)
+        }
+    }
+}
+
+/// Whether `cand` should replace the running *max* `cur` — i.e. `cand` is the
+/// larger upper bound, with [`ZoneEnd::Unbounded`] (+∞) the largest of all.
+fn end_is_larger(cand: &ZoneEnd, cur: Option<&ZoneEnd>) -> bool {
+    match (cur, cand) {
+        (Some(ZoneEnd::Unbounded), _) => false, // running max already +∞
+        // no running max yet, or the candidate is +∞ ⇒ take the candidate
+        (None, _) | (Some(_), ZoneEnd::Unbounded) => true,
+        (Some(ZoneEnd::Value(c)), ZoneEnd::Value(v)) => {
+            v.cmp_same_variant(c) == Some(Ordering::Greater)
+        }
+    }
 }
 
 fn chunk_meta(rg: &RowGroup, col: ColumnId) -> Result<&ColumnChunkMeta, SegmentError> {
@@ -1070,19 +1111,44 @@ mod tests {
 
     #[test]
     fn empty_stat_decodes_to_no_stats_sentinel() {
-        assert_eq!(decode_stat(ColumnId::SysFrom, &[]).unwrap(), None);
-        assert_eq!(decode_stat(ColumnId::BusinessKey, &[]).unwrap(), None);
+        // Flag clear + zero length ⇒ absent (no stats).
+        assert_eq!(decode_stat(ColumnId::SysFrom, &[], false).unwrap(), None);
+        assert_eq!(
+            decode_stat(ColumnId::BusinessKey, &[], false).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn typed_stats_decode_by_column_type() {
         assert_eq!(
-            decode_stat(ColumnId::SysFrom, &42i64.to_le_bytes()).unwrap(),
-            Some(ZoneBound::I64(42)),
+            decode_stat(ColumnId::SysFrom, &42i64.to_le_bytes(), false).unwrap(),
+            Some(ZoneEnd::Value(ZoneBound::I64(42))),
         );
         assert_eq!(
-            decode_stat(ColumnId::BusinessKey, b"abc").unwrap(),
-            Some(ZoneBound::Bytes(b"abc".to_vec())),
+            decode_stat(ColumnId::BusinessKey, b"abc", false).unwrap(),
+            Some(ZoneEnd::Value(ZoneBound::Bytes(b"abc".to_vec()))),
+        );
+    }
+
+    #[test]
+    fn unbounded_flag_decodes_to_open_end() {
+        // Flag set + zero length ⇒ a present open end ([STL-120]) — distinct
+        // from the `None` an absent (flag-clear) zero-length field decodes to.
+        assert_eq!(
+            decode_stat(ColumnId::Payload, &[], true).unwrap(),
+            Some(ZoneEnd::Unbounded),
+        );
+    }
+
+    #[test]
+    fn unbounded_flag_with_bytes_is_rejected() {
+        // The flag means "no value"; bytes alongside it are contradictory and
+        // must surface as corruption rather than be silently dropped.
+        let err = decode_stat(ColumnId::Payload, b"x", true).unwrap_err();
+        assert!(
+            matches!(err, SegmentError::Corrupt(msg) if msg.contains("unbounded")),
+            "unbounded flag + bytes must be rejected, got {err:?}"
         );
     }
 
@@ -1090,7 +1156,7 @@ mod tests {
     fn i64_stat_with_non_8_byte_length_is_rejected() {
         // A corrupt footer that declares a 4-byte min for an i64 column must
         // surface a typed error, not silently decode a truncated value.
-        let err = decode_stat(ColumnId::SysFrom, &[0u8; 4]).unwrap_err();
+        let err = decode_stat(ColumnId::SysFrom, &[0u8; 4], false).unwrap_err();
         assert!(
             matches!(err, SegmentError::Corrupt(msg) if msg.contains("8 bytes")),
             "i64 stat length mismatch must be rejected, got {err:?}"
