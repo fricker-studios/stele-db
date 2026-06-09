@@ -34,6 +34,8 @@
 
 use std::fmt;
 
+use crate::period::{Interval, IntervalError};
+
 /// A Postgres type OID, as it appears in a `RowDescription` field and in the
 /// `pg_type` catalog. `u32` matches libpq's `Oid`.
 pub type PgOid = u32;
@@ -47,13 +49,15 @@ const OID_INT4: PgOid = 23;
 const OID_TEXT: PgOid = 25;
 const OID_DATE: PgOid = 1082;
 const OID_TIMESTAMP: PgOid = 1114;
+const OID_TSRANGE: PgOid = 3908;
 
-/// The closed set of logical column types Stele understands at v0.1.
+/// The closed set of logical column types Stele understands.
 ///
-/// Deliberately minimal: the six types the identity-proof demos need and that
-/// every Postgres driver can already decode ([STL-96] scope). Numeric breadth
-/// (`NUMERIC`, `FLOAT8`, `UUID`, …) and `timestamptz` come later — each is a new
-/// variant plus its OID, with no churn to the existing ones.
+/// Started as the six scalar/temporal types the identity-proof demos need and
+/// that every Postgres driver can already decode ([STL-96] scope); [`Self::Period`]
+/// joined them in v0.2 ([STL-180]). Further numeric breadth (`NUMERIC`,
+/// `FLOAT8`, `UUID`, …) and `timestamptz` come later — each is a new variant
+/// plus its OID, with no churn to the existing ones.
 ///
 /// ```
 /// use stele_common::types::LogicalType;
@@ -89,19 +93,31 @@ pub enum LogicalType {
     /// Calendar date with no time component — SQL `DATE`, Postgres `date`. The
     /// value is days since the Unix epoch ([`ScalarValue::Date`]).
     Date,
+    /// A half-open `[from, to)` period of [`Self::Timestamp`] instants — the
+    /// first-class type backing system/valid time, instead of two loose `int8`
+    /// columns ([STL-180]).
+    ///
+    /// It maps to Postgres `tsrange` (OID 3908), a range of `timestamp without
+    /// time zone` whose default `[)` bound flavor is exactly Stele's half-open
+    /// rule — so a stock driver decodes it with no custom type support. The
+    /// value is a [`ScalarValue::Period`] wrapping an [`Interval`]; the upper
+    /// bound may be `+∞` for an open-ended period. Generic user range types over
+    /// other element types are a deliberate later addition, each its own OID.
+    Period,
 }
 
 impl LogicalType {
     /// Every logical type, in a stable order. The single source of truth tests
     /// and exhaustive consumers iterate so a new variant can't be silently
     /// missed.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Int4,
         Self::Int8,
         Self::Text,
         Self::Bool,
         Self::Timestamp,
         Self::Date,
+        Self::Period,
     ];
 
     /// The Postgres type OID a wire client uses to interpret this type
@@ -116,6 +132,7 @@ impl LogicalType {
             Self::Bool => OID_BOOL,
             Self::Timestamp => OID_TIMESTAMP,
             Self::Date => OID_DATE,
+            Self::Period => OID_TSRANGE,
         }
     }
 
@@ -130,6 +147,7 @@ impl LogicalType {
             OID_BOOL => Some(Self::Bool),
             OID_TIMESTAMP => Some(Self::Timestamp),
             OID_DATE => Some(Self::Date),
+            OID_TSRANGE => Some(Self::Period),
             _ => None,
         }
     }
@@ -146,6 +164,7 @@ impl LogicalType {
             Self::Bool => "bool",
             Self::Timestamp => "timestamp",
             Self::Date => "date",
+            Self::Period => "tsrange",
         }
     }
 
@@ -170,7 +189,7 @@ impl LogicalType {
         match self {
             Self::Text => ColumnCodec::Dictionary,
             Self::Timestamp | Self::Date => ColumnCodec::Delta,
-            Self::Int4 | Self::Int8 | Self::Bool => ColumnCodec::Plain,
+            Self::Int4 | Self::Int8 | Self::Bool | Self::Period => ColumnCodec::Plain,
         }
     }
 }
@@ -232,6 +251,12 @@ pub enum ScalarValue {
     Timestamp(i64),
     /// A date in days since the Unix epoch ([`LogicalType::Date`]).
     Date(i32),
+    /// A half-open `[from, to)` period of timestamp microseconds
+    /// ([`LogicalType::Period`]). The wrapped [`Interval`] is well-formed by
+    /// construction (`from < to`); the upper bound may be `i64::MAX` for an
+    /// open-ended period. This is the value the SQL:2011 period predicates
+    /// ([`crate::period::PeriodPredicate`]) range over.
+    Period(Interval),
 }
 
 /// Why decoding a [`ScalarValue`] from bytes failed.
@@ -255,6 +280,10 @@ pub enum DecodeError {
     /// A [`LogicalType::Text`] buffer was not valid UTF-8.
     #[error("decoding text: invalid utf-8")]
     Utf8,
+    /// A [`LogicalType::Period`] buffer held bounds that are not a valid
+    /// half-open interval (`from >= to`).
+    #[error("decoding period: {0}")]
+    Period(#[from] IntervalError),
 }
 
 impl ScalarValue {
@@ -268,6 +297,21 @@ impl ScalarValue {
             Self::Bool(_) => LogicalType::Bool,
             Self::Timestamp(_) => LogicalType::Timestamp,
             Self::Date(_) => LogicalType::Date,
+            Self::Period(_) => LogicalType::Period,
+        }
+    }
+
+    /// The half-open [`Interval`] a [`Self::Period`] value carries, or `None` for
+    /// any other type.
+    ///
+    /// The bridge from a stored PERIOD value to the SQL:2011 period predicates:
+    /// `stele_exec::evaluate` ranges over [`Interval`]s, and a `Period` value
+    /// hands one straight over.
+    #[must_use]
+    pub const fn as_period(&self) -> Option<Interval> {
+        match self {
+            Self::Period(iv) => Some(*iv),
+            _ => None,
         }
     }
 
@@ -282,6 +326,9 @@ impl ScalarValue {
     /// * `Bool` — 1 byte (`0` / `1`).
     /// * `Text` — the raw UTF-8 bytes; the surrounding column framing carries
     ///   the length.
+    /// * `Period` — 16 bytes: the `from` bound then the `to` bound, each an
+    ///   `i64`. (This canonical storage form is distinct from the Postgres
+    ///   `tsrange` *wire* encoding in [`crate::period`].)
     ///
     /// This is the value-level half of the ticket's round-trip contract;
     /// [`Self::decode`] is its exact inverse for the matching [`LogicalType`].
@@ -294,6 +341,10 @@ impl ScalarValue {
             Self::Int8(v) | Self::Timestamp(v) => out.extend_from_slice(&v.to_le_bytes()),
             Self::Text(s) => out.extend_from_slice(s.as_bytes()),
             Self::Bool(b) => out.push(u8::from(*b)),
+            Self::Period(iv) => {
+                out.extend_from_slice(&iv.from.to_le_bytes());
+                out.extend_from_slice(&iv.to.to_le_bytes());
+            }
         }
     }
 
@@ -318,6 +369,12 @@ impl ScalarValue {
             LogicalType::Text => std::str::from_utf8(bytes)
                 .map(|s| Self::Text(s.to_owned()))
                 .map_err(|_| DecodeError::Utf8),
+            LogicalType::Period => {
+                let raw = fixed::<16>(ty, bytes)?;
+                let from = i64::from_le_bytes(raw[..8].try_into().unwrap());
+                let to = i64::from_le_bytes(raw[8..].try_into().unwrap());
+                Ok(Self::Period(Interval::new(from, to)?))
+            }
         }
     }
 }
@@ -343,6 +400,39 @@ mod tests {
         assert_eq!(LogicalType::Bool.pg_oid(), 16);
         assert_eq!(LogicalType::Timestamp.pg_oid(), 1114);
         assert_eq!(LogicalType::Date.pg_oid(), 1082);
+        // PERIOD borrows Postgres `tsrange` so a stock driver can decode it.
+        assert_eq!(LogicalType::Period.pg_oid(), 3908);
+        assert_eq!(LogicalType::Period.pg_type_name(), "tsrange");
+    }
+
+    #[test]
+    fn period_value_carries_its_interval() {
+        let iv = Interval::new(10, 20).unwrap();
+        let v = ScalarValue::Period(iv);
+        assert_eq!(v.logical_type(), LogicalType::Period);
+        assert_eq!(v.as_period(), Some(iv));
+        assert_eq!(ScalarValue::Int4(1).as_period(), None);
+    }
+
+    #[test]
+    fn period_decode_rejects_reversed_bounds() {
+        // 16 bytes whose `from` (5) is not < `to` (5): a corrupt period.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&5i64.to_le_bytes());
+        buf.extend_from_slice(&5i64.to_le_bytes());
+        assert_eq!(
+            ScalarValue::decode(LogicalType::Period, &buf),
+            Err(DecodeError::Period(IntervalError::EmptyOrReversed(5, 5)))
+        );
+        // A wrong-width period buffer is a plain width error.
+        assert_eq!(
+            ScalarValue::decode(LogicalType::Period, &[0; 8]),
+            Err(DecodeError::Width {
+                ty: LogicalType::Period,
+                expected: 16,
+                got: 8
+            })
+        );
     }
 
     #[test]
@@ -374,6 +464,7 @@ mod tests {
         assert_eq!(LogicalType::Int4.default_codec(), ColumnCodec::Plain);
         assert_eq!(LogicalType::Int8.default_codec(), ColumnCodec::Plain);
         assert_eq!(LogicalType::Bool.default_codec(), ColumnCodec::Plain);
+        assert_eq!(LogicalType::Period.default_codec(), ColumnCodec::Plain);
     }
 
     #[test]
@@ -385,6 +476,10 @@ mod tests {
             (ScalarValue::Bool(true), LogicalType::Bool),
             (ScalarValue::Timestamp(1), LogicalType::Timestamp),
             (ScalarValue::Date(1), LogicalType::Date),
+            (
+                ScalarValue::Period(Interval::new(1, 2).unwrap()),
+                LogicalType::Period,
+            ),
         ];
         for (value, ty) in samples {
             assert_eq!(value.logical_type(), ty);
@@ -413,6 +508,9 @@ mod tests {
             ScalarValue::Date(i32::MIN),
             ScalarValue::Date(0),
             ScalarValue::Date(20_000),
+            ScalarValue::Period(Interval::new(0, 1).unwrap()),
+            ScalarValue::Period(Interval::new(i64::MIN, i64::MAX).unwrap()),
+            ScalarValue::Period(Interval::new(1_700_000_000_000_000, i64::MAX).unwrap()),
         ];
         for value in cases {
             let mut buf = Vec::new();

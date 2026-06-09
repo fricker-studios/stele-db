@@ -31,6 +31,7 @@
 //! the length-`-1` sentinel ([STL-105] Definition of Done) and never calls in
 //! here.
 
+use stele_common::period::Interval;
 use stele_common::types::{LogicalType, ScalarValue};
 
 /// Microseconds in one second.
@@ -48,7 +49,8 @@ pub(crate) const fn pg_typlen(ty: LogicalType) -> i16 {
         LogicalType::Int4 | LogicalType::Date => 4,
         LogicalType::Int8 | LogicalType::Timestamp => 8,
         LogicalType::Bool => 1,
-        LogicalType::Text => -1,
+        // `text` and `tsrange` are both variable-length (`typlen = -1`).
+        LogicalType::Text | LogicalType::Period => -1,
     }
 }
 
@@ -64,6 +66,23 @@ pub(crate) fn encode_text(value: &ScalarValue) -> String {
         ScalarValue::Bool(b) => if *b { "t" } else { "f" }.to_owned(),
         ScalarValue::Timestamp(micros) => format_timestamp(*micros),
         ScalarValue::Date(days) => format_date(*days),
+        ScalarValue::Period(iv) => format_period(iv),
+    }
+}
+
+/// Render a `period` in Postgres `tsrange` text format: a `[`, the lower bound,
+/// the upper bound, and a `)` — lower inclusive, upper exclusive, matching the
+/// half-open `[from, to)` value. Each finite bound is the `timestamp` rendering
+/// in double quotes (Postgres quotes range elements that contain spaces); an
+/// open-ended period (`to == i64::MAX`) leaves the upper slot empty, exactly as
+/// `psql` prints `["…",)`.
+fn format_period(iv: &Interval) -> String {
+    let lower = format_timestamp(iv.from);
+    if iv.to == i64::MAX {
+        format!("[\"{lower}\",)")
+    } else {
+        let upper = format_timestamp(iv.to);
+        format!("[\"{lower}\",\"{upper}\")")
     }
 }
 
@@ -151,6 +170,27 @@ mod tests {
         assert_eq!(pg_typlen(LogicalType::Date), 4);
         assert_eq!(pg_typlen(LogicalType::Timestamp), 8);
         assert_eq!(pg_typlen(LogicalType::Text), -1, "text is variable-length");
+        assert_eq!(
+            pg_typlen(LogicalType::Period),
+            -1,
+            "tsrange is variable-length"
+        );
+    }
+
+    #[test]
+    fn period_renders_as_postgres_tsrange_text() {
+        // 2023-11-14 22:13:20 UTC and one hour later — half-open `[lower,upper)`.
+        let from = 1_700_000_000_000_000;
+        let to = from + 3_600_000_000;
+        assert_eq!(
+            encode_text(&ScalarValue::Period(Interval::new(from, to).unwrap())),
+            "[\"2023-11-14 22:13:20\",\"2023-11-14 23:13:20\")"
+        );
+        // An open-ended period leaves the upper slot empty, as psql prints it.
+        assert_eq!(
+            encode_text(&ScalarValue::Period(Interval::new(from, i64::MAX).unwrap())),
+            "[\"2023-11-14 22:13:20\",)"
+        );
     }
 
     #[test]
