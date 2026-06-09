@@ -280,13 +280,17 @@ impl<D: Disk> Delta<D> {
     ///
     /// Surfaces I/O or corruption errors loading spill files.
     pub fn flush_to_segment(&mut self) -> Result<Vec<Version>, DeltaError> {
-        // Merge first; remove spills only after a successful merge — if a read
-        // failed halfway through, the caller can re-read on the next attempt.
+        // Merge first — the only fallible step; on a read error the tier is left
+        // untouched and the caller can retry. The merged rows are now in `out`, so
+        // clearing the tier can't lose anything: reset memory and best-effort drop
+        // the consumed spill files (a removal failure only leaks a stale file the
+        // next `open` discards, never makes a staged row disappear).
         let out = self.merge_staged()?;
-        for idx in std::mem::take(&mut self.live_spills) {
-            spill::remove_spill(&self.disk, idx)?;
-        }
+        let spills = std::mem::take(&mut self.live_spills);
         self.mem = MemTier::new();
+        for idx in spills {
+            let _ = spill::remove_spill(&self.disk, idx);
+        }
         Ok(out)
     }
 
@@ -319,21 +323,21 @@ impl<D: Disk> Delta<D> {
     }
 
     /// Drop the tier's staged contents after a flush has *committed* them to a
-    /// sealed segment: clear the in-memory rows, remove every spill file, and clear
-    /// the retraction buffer. The caller ([`Engine::flush`](crate::engine::Engine::flush))
+    /// sealed segment. The caller ([`Engine::flush`](crate::engine::Engine::flush))
     /// invokes this only once the segment and its checkpoint record are durable, so
     /// a crash before that point leaves everything in place for WAL replay.
     ///
-    /// # Errors
-    ///
-    /// Surfaces I/O errors removing spill files.
-    pub fn discard_flushed(&mut self) -> Result<(), DeltaError> {
-        for idx in std::mem::take(&mut self.live_spills) {
-            spill::remove_spill(&self.disk, idx)?;
-        }
+    /// The in-memory rows and retraction buffer are cleared **first** (infallible —
+    /// the rows are already durable in the segment), then the now-redundant spill
+    /// files are dropped **best-effort**: a removal failure only leaks a stale file
+    /// the next [`open`](Self::open) discards, so it must not abort the flush after
+    /// the commit point or leave the tier half-cleared.
+    pub fn discard_flushed(&mut self) {
         self.mem = MemTier::new();
         self.retractions.clear();
-        Ok(())
+        for idx in std::mem::take(&mut self.live_spills) {
+            let _ = spill::remove_spill(&self.disk, idx);
+        }
     }
 
     /// Stage a retraction tombstone (a logical delete — a [`Close`] with no

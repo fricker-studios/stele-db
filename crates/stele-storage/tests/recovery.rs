@@ -323,7 +323,7 @@ fn recover_rejects_a_corrupt_committed_segment() {
     }
 }
 
-// --- 6. flush bounds replay to the WAL tail (STL-177) -----------------------
+// --- 5. flush bounds replay to the WAL tail (STL-177) -----------------------
 
 /// After a [`Engine::flush`], recovery replays **only the tail**: the flushed
 /// prefix is rebuilt from the sealed segment, not the WAL, so corruption in the
@@ -552,7 +552,7 @@ fn two_flushes_commit_two_segments_and_bound_replay() {
     );
 }
 
-// --- 5. the checkpoint records the last fully-flushed WAL offset ------------
+// --- 6. the checkpoint records the last fully-flushed WAL offset ------------
 
 /// [`Engine::checkpoint`] advances the persisted durable fence: after a second
 /// checkpoint past more writes, recovery loads the newer offset.

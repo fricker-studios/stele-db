@@ -471,16 +471,20 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
             },
         )?;
 
-        // 5. Adopt the now-durable segment: drop the delta's flushed rows and fold
-        //    the versions into the resident sealed set the write/read paths use.
-        self.delta.discard_flushed()?;
-        let mut sealed = self.sealed.versions().to_vec();
-        sealed.extend(versions);
-        self.sealed = SealedVersions::new(sealed);
+        // 5. The segment and its committing record are durable, so adopt them.
+        //    Advance the in-memory recovery point and fold the versions into the
+        //    resident sealed set *first* — `extend` appends in place, so a flush
+        //    stays O(flushed batch), not O(total sealed history). Only then free
+        //    the delta's now-redundant staged rows, **best-effort**: a cleanup
+        //    failure must not abort after the commit point and strand the
+        //    in-memory state behind the durable manifest (a later flush would then
+        //    overwrite the just-committed segment).
+        self.sealed.extend(versions);
         self.segment_names.push(name);
         self.next_segment_index = idx + 1;
         self.replay_floor = fence;
         self.checkpoint = Some(fence);
+        self.delta.discard_flushed();
         Ok(fence)
     }
 
