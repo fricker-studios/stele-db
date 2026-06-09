@@ -1,6 +1,8 @@
-//! The v0.1 logical type system: the minimal scalar + temporal set the early
-//! demos need, with the metadata that lets values round-trip cleanly through
-//! the Postgres wire protocol ([STL-96]).
+//! Stele's logical type system: the scalar + temporal set the engine speaks,
+//! with the metadata that lets values round-trip cleanly through the Postgres
+//! wire protocol. It began as the minimal v0.1 set the early demos need
+//! ([STL-96]) and grows additively — the v0.2 `UUID` / `BYTEA` types
+//! ([STL-181]) are the current additions.
 //!
 //! Three things live here, and only here:
 //!
@@ -139,7 +141,7 @@ impl LogicalType {
     }
 
     /// The logical type a Postgres OID denotes, or `None` if it is outside the
-    /// v0.1 set. Inverse of [`Self::pg_oid`].
+    /// set Stele understands. Inverse of [`Self::pg_oid`].
     #[must_use]
     pub const fn from_pg_oid(oid: PgOid) -> Option<Self> {
         match oid {

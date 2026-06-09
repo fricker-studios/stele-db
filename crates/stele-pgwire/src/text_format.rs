@@ -1,7 +1,8 @@
-//! Postgres **text-format** value encoding for the v0.1 scalar set
-//! ([STL-105]).
+//! Postgres **text-format** value encoding for Stele's scalar set
+//! (originally the v0.1 types, [STL-105]; extended with `uuid` / `bytea` in
+//! [STL-181]).
 //!
-//! [`stele_common::types`] fixes the v0.1 logical types and their OIDs but
+//! [`stele_common::types`] fixes the logical types and their OIDs but
 //! deliberately stops short of wire serialization — turning a [`ScalarValue`]
 //! into the bytes a `DataRow` carries is the wire front end's job, and this is
 //! where it lives. The simple-query loop sends every value in **text format**
@@ -40,11 +41,11 @@ const MICROS_PER_SEC: i64 = 1_000_000;
 /// Microseconds in one calendar day (no leap seconds — UTC instants).
 const MICROS_PER_DAY: i64 = 86_400 * MICROS_PER_SEC;
 
-/// Postgres `pg_type.typlen` for a v0.1 logical type: the fixed on-the-wire
-/// width of the binary form, or `-1` for the variable-length `text`. This is the
-/// `typlen` advertised in a `RowDescription` field — it describes the type, not
-/// the rendered text length (text format is always length-prefixed in the
-/// `DataRow` regardless).
+/// Postgres `pg_type.typlen` for a logical type: the fixed on-the-wire width of
+/// the binary form, or `-1` for the variable-length types (`text`, `bytea`).
+/// This is the `typlen` advertised in a `RowDescription` field — it describes the
+/// type, not the rendered text length (text format is always length-prefixed in
+/// the `DataRow` regardless).
 pub(crate) const fn pg_typlen(ty: LogicalType) -> i16 {
     match ty {
         LogicalType::Int4 | LogicalType::Date => 4,
