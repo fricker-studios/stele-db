@@ -96,7 +96,7 @@ use stele_storage::segment::{
     ColumnData, ColumnId, Predicate, SegmentError, SegmentReader, ZoneBound,
 };
 use stele_storage::validity::{ValidityError, ValidityIndex};
-use stele_storage::validtime::{ValidTimeError, unframe_payload};
+use stele_storage::validtime::{VALID_TIME_PREFIX_LEN, ValidTimeError, unframe_payload};
 
 /// A sealed row's identity — its `(business_key, sys_from, seq)` triple, the key
 /// the validity index and the per-key version chains are keyed by (STL-145).
@@ -614,14 +614,20 @@ fn filter_delta_by_valid(
 ) -> Result<Vec<Version>, ScanError> {
     let mut kept = Vec::with_capacity(versions.len());
     for mut v in versions {
-        let (from, to, user) = {
+        let (from, to) = {
             let stored = v.payload.as_deref().unwrap_or_default();
-            let (interval, user) = unframe_payload(true, stored)?;
+            let (interval, _user) = unframe_payload(true, stored)?;
             let interval = interval.expect("a valid-time table's payload frames an interval");
-            (interval.from.0, interval.to.0, user.to_vec())
+            (interval.from.0, interval.to.0)
         };
         if valid_contains(from, to, point) {
-            v.payload = Some(user);
+            // Strip the 16-byte interval prefix in place — `unframe_payload`
+            // above already proved the payload is at least that long, so the
+            // drain reuses the row's existing buffer rather than allocating a
+            // fresh bare copy.
+            if let Some(payload) = v.payload.as_mut() {
+                payload.drain(0..VALID_TIME_PREFIX_LEN);
+            }
             kept.push(v);
         }
     }
