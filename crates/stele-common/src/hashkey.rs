@@ -127,19 +127,28 @@ pub fn hash_key(args: &[Option<ScalarValue>]) -> Digest {
 
 /// Append one argument's `[tag][len:u64be][body]` frame to `msg`.
 fn encode_arg(arg: Option<&ScalarValue>, msg: &mut Vec<u8>) {
-    // (tag, body) for the value; `None` is the NULL frame with an empty body.
-    let (tag, body): (u8, Vec<u8>) = match arg {
-        None => (TAG_NULL, Vec::new()),
-        Some(ScalarValue::Bool(b)) => (TAG_BOOL, vec![u8::from(*b)]),
-        Some(ScalarValue::Int4(v)) => (TAG_INT4, v.to_be_bytes().to_vec()),
-        Some(ScalarValue::Int8(v)) => (TAG_INT8, v.to_be_bytes().to_vec()),
-        Some(ScalarValue::Text(s)) => (TAG_TEXT, s.as_bytes().to_vec()),
-        Some(ScalarValue::Timestamp(v)) => (TAG_TIMESTAMP, v.to_be_bytes().to_vec()),
-        Some(ScalarValue::Date(v)) => (TAG_DATE, v.to_be_bytes().to_vec()),
-    };
+    // The body is borrowed (a slice of `msg`-bound bytes or a stack array), so no
+    // per-argument heap allocation — a long `TEXT` body streams straight through.
+    // `None` is the NULL frame with an empty body.
+    match arg {
+        None => push_frame(msg, TAG_NULL, &[]),
+        Some(ScalarValue::Bool(b)) => push_frame(msg, TAG_BOOL, &[u8::from(*b)]),
+        Some(ScalarValue::Int4(v)) => push_frame(msg, TAG_INT4, &v.to_be_bytes()),
+        Some(ScalarValue::Int8(v)) => push_frame(msg, TAG_INT8, &v.to_be_bytes()),
+        Some(ScalarValue::Text(s)) => push_frame(msg, TAG_TEXT, s.as_bytes()),
+        Some(ScalarValue::Timestamp(v)) => push_frame(msg, TAG_TIMESTAMP, &v.to_be_bytes()),
+        Some(ScalarValue::Date(v)) => push_frame(msg, TAG_DATE, &v.to_be_bytes()),
+    }
+}
+
+/// Append a `[tag][len:u64be][body]` frame to `msg`. A `body` longer than
+/// `u64::MAX` is impossible (it would not fit in memory), so the length cast is
+/// infallible.
+fn push_frame(msg: &mut Vec<u8>, tag: u8, body: &[u8]) {
     msg.push(tag);
-    msg.extend_from_slice(&(body.len() as u64).to_be_bytes());
-    msg.extend_from_slice(&body);
+    let len = u64::try_from(body.len()).expect("body length fits u64");
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(body);
 }
 
 /// One published hash-key test vector.
