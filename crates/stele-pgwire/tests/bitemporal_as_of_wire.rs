@@ -67,14 +67,22 @@ fn iv(from: i64, to: i64) -> ValidInterval {
 }
 
 /// The single `balance` cell of a one-row reply, or `None` when the reply carried
-/// no rows (no version live on both axes).
+/// no rows (no version live on both axes). Asserts at most one row came back — one
+/// key resolves to at most one live version, so a wider reply is a regression a
+/// first-row-wins read would silently mask.
 fn balance(messages: &[SimpleQueryMessage]) -> Option<String> {
-    messages.iter().find_map(|m| match m {
+    let mut cells = messages.iter().filter_map(|m| match m {
         SimpleQueryMessage::Row(row) => {
             Some(row.get("balance").expect("balance column").to_owned())
         }
         _ => None,
-    })
+    });
+    let first = cells.next();
+    assert!(
+        cells.next().is_none(),
+        "one key resolves to at most one live version, but the reply carried multiple rows"
+    );
+    first
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -166,5 +174,11 @@ async fn tokio_postgres_reads_a_both_axes_as_of_cell() {
     assert_eq!(read(c1, 25).await, None);
 
     drop(client);
-    let _ = driver.await;
+    // Dropping the client ends the connection; the driver future must then resolve
+    // cleanly — a panicked task or a connection-level protocol error after the
+    // queries completed would otherwise go unnoticed.
+    driver
+        .await
+        .expect("connection driver task joined")
+        .expect("the connection closed without a protocol error");
 }
