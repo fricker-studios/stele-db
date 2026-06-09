@@ -26,14 +26,23 @@
 //!    [`BoundSelect`] *is* the rewrite — the executor's `SnapshotScan` already
 //!    prunes by it ([architecture §3.5](../../../docs/02-architecture.md#35-read-path--as-of-flow)).
 //!
-//! ## Scope at v0.1
+//! ## The valid axis ([STL-162])
+//!
+//! A `FOR VALID_TIME AS OF <expr>` qualifier resolves the same way (same fold,
+//! same `now()`) and is carried as [`BoundSelect::valid_snapshot`] alongside the
+//! system-time snapshot — a query may give one qualifier per axis, in either
+//! order, so the executor can resolve a version at a joint `(sys, valid)` point
+//! ([STL-163]). Valid-time `AS OF` only means something on a table that opts into
+//! a valid-time period: against a system-only table it is the documented
+//! [`SelectError::ValidTimeUnsupported`]. With no valid qualifier,
+//! `valid_snapshot` is `None` — the executor reads the present of the valid axis.
+//!
+//! ## Scope
 //!
 //! A single, unqualified table; projection of `*` or bare column names; the
 //! `WHERE` clause is left on the AST for the executor-glue layer to lower
-//! (pgwire, [STL-104]). `FOR VALID_TIME AS OF` parses but is
-//! [rejected here](SelectError::ValidTimeAsOf) until valid-time time-travel
-//! lands (post-v0.1). Absolute `TIMESTAMP '…'` / `DATE '…'` literals in an
-//! `AS OF` are not folded yet (no civil-time codec at v0.1); they surface
+//! (pgwire, [STL-104]). Absolute `TIMESTAMP '…'` / `DATE '…'` literals in an
+//! `AS OF` are not folded yet (no civil-time codec); they surface
 //! [`AsOfError::Unsupported`] rather than a wrong instant.
 
 use sqlparser::ast::{
@@ -43,7 +52,7 @@ use sqlparser::ast::{
 use stele_catalog::{Catalog, SchemaId, TableSchema};
 use stele_common::time::SystemTimeMicros;
 
-use crate::ast::Statement;
+use crate::ast::{Statement, TimeDimension};
 
 /// The context a [`bind_select`] needs: the transaction snapshot and the
 /// catalog to resolve names against.
@@ -83,6 +92,12 @@ pub struct BoundSelect {
     pub schema_id: SchemaId,
     /// The resolved system-time snapshot the scan reads at.
     pub snapshot: SystemTimeMicros,
+    /// The resolved valid-time instant from a `FOR VALID_TIME AS OF <expr>`
+    /// qualifier, or `None` when the query gave none. `Some(v)` only when the
+    /// table opts into a valid-time period (else [`SelectError::ValidTimeUnsupported`]);
+    /// the executor resolves the version live at the joint `(snapshot, v)` point
+    /// ([STL-163]). `None` reads the present of the valid axis.
+    pub valid_snapshot: Option<SystemTimeMicros>,
     /// The columns the query projects.
     pub projection: Projection,
 }
@@ -126,17 +141,20 @@ pub enum SelectError {
         column: String,
     },
 
-    /// `FOR VALID_TIME AS OF` was given. The parser accepts it (and tags the
-    /// axis) so the binder can reject it with this precise message; valid-time
-    /// time-travel is post-v0.1 ([`TimeDimension::Valid`](crate::TimeDimension)).
-    #[error("FOR VALID_TIME AS OF is parsed but not yet implemented (system-time only in v0.1)")]
-    ValidTimeAsOf,
+    /// `FOR VALID_TIME AS OF` was given for a table that does not opt into a
+    /// valid-time period — there is no valid axis to travel along. The catalog's
+    /// system-only tables (every table without `VALID TIME (…)`) reject it here.
+    #[error("table {table:?} has no valid-time period — FOR VALID_TIME AS OF does not apply")]
+    ValidTimeUnsupported {
+        /// The table read.
+        table: String,
+    },
 
-    /// More than one `AS OF` qualifier appeared — only reachable via the
-    /// multi-table forms [`UnsupportedFrom`](Self::UnsupportedFrom) already
-    /// rejects, but kept explicit so the diagnostic never degrades to a panic.
-    #[error("multiple AS OF qualifiers ({0}) — v0.1 binds a single-table SELECT")]
-    MultipleAsOf(usize),
+    /// More than one `AS OF` qualifier appeared on the same axis. A table may
+    /// carry at most one `FOR SYSTEM_TIME AS OF` and one `FOR VALID_TIME AS OF`;
+    /// a repeated axis would name two snapshots for one dimension.
+    #[error("multiple FOR {0:?} AS OF qualifiers — at most one per axis")]
+    MultipleAsOf(TimeDimension),
 
     /// The `AS OF` expression could not be folded to a concrete instant.
     #[error("AS OF: {0}")]
@@ -208,15 +226,15 @@ pub enum AsOfError {
 ///
 /// # Errors
 ///
-/// A [`SelectError`] variant: the statement is not a single-table `SELECT`, the
-/// `AS OF` expression cannot be folded, valid-time `AS OF` was used, or the
-/// table is unknown / not live (including the [before-history](SelectError::BeforeHistory)
-/// case) at the resolved snapshot.
+/// A [`SelectError`] variant: the statement is not a single-table `SELECT`, an
+/// `AS OF` expression cannot be folded, a valid-time `AS OF` names a table with
+/// no valid axis, or the table is unknown / not live (including the
+/// [before-history](SelectError::BeforeHistory) case) at the resolved snapshot.
 pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, SelectError> {
     let select = single_select(&stmt.body)?;
     let table = single_table(select)?;
     let projection = bind_projection(select)?;
-    let snapshot = resolve_snapshot(stmt, ctx.snapshot)?;
+    let (snapshot, valid_snapshot) = resolve_snapshots(stmt, ctx.snapshot)?;
 
     let schema = match resolve_table_at(ctx.catalog, table, snapshot) {
         TableResolution::Found(schema) => schema,
@@ -236,6 +254,14 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
         }
     };
 
+    // A valid-time `AS OF` only means something on a table with a valid-time
+    // period; against a system-only table there is no valid axis to travel.
+    if valid_snapshot.is_some() && !schema.temporal().valid_time_enabled() {
+        return Err(SelectError::ValidTimeUnsupported {
+            table: table.to_owned(),
+        });
+    }
+
     // Every named projected column must exist in the schema live *at the
     // snapshot* — a column added after the `AS OF` instant is not yet present
     // and is rejected here rather than deferred to the executor.
@@ -254,36 +280,40 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
         table: table.to_owned(),
         schema_id: schema.schema_id(),
         snapshot,
+        valid_snapshot,
         projection,
     })
 }
 
-/// Resolve the statement's system-time snapshot: fold its single
-/// `FOR SYSTEM_TIME AS OF` expression, or default to `now` (the transaction
-/// snapshot) when there is none.
+/// Resolve the statement's `(system-time, valid-time)` snapshots from its
+/// `FOR { SYSTEM_TIME | VALID_TIME } AS OF` qualifiers.
 ///
-/// `now` plays both roles — the default snapshot, and the value `now()` folds
-/// to inside the expression.
+/// The system-time snapshot defaults to `now` (the transaction snapshot) when no
+/// system qualifier is given — a plain `SELECT` reads the present. The valid-time
+/// instant is `None` unless a `FOR VALID_TIME AS OF` qualifier is present; both
+/// fold the same way, and `now` is the value `now()` folds to on either axis.
 ///
 /// # Errors
 ///
-/// [`SelectError::ValidTimeAsOf`] for a `FOR VALID_TIME AS OF` qualifier,
-/// [`SelectError::MultipleAsOf`] for more than one qualifier, or
-/// [`SelectError::AsOf`] if the expression cannot be folded.
-fn resolve_snapshot(
+/// [`SelectError::MultipleAsOf`] if either axis carries more than one qualifier,
+/// or [`SelectError::AsOf`] if an expression cannot be folded to an instant.
+fn resolve_snapshots(
     stmt: &Statement,
     now: SystemTimeMicros,
-) -> Result<SystemTimeMicros, SelectError> {
-    match stmt.temporal.as_of.as_slice() {
-        [] => Ok(now),
-        [as_of] => {
-            if !as_of.dimension.is_implemented() {
-                return Err(SelectError::ValidTimeAsOf);
-            }
-            Ok(resolve_as_of(&as_of.timestamp, now)?)
+) -> Result<(SystemTimeMicros, Option<SystemTimeMicros>), SelectError> {
+    let mut system: Option<SystemTimeMicros> = None;
+    let mut valid: Option<SystemTimeMicros> = None;
+    for as_of in &stmt.temporal.as_of {
+        let slot = match as_of.dimension {
+            TimeDimension::System => &mut system,
+            TimeDimension::Valid => &mut valid,
+        };
+        if slot.is_some() {
+            return Err(SelectError::MultipleAsOf(as_of.dimension));
         }
-        many => Err(SelectError::MultipleAsOf(many.len())),
+        *slot = Some(resolve_as_of(&as_of.timestamp, now)?);
     }
+    Ok((system.unwrap_or(now), valid))
 }
 
 /// The outcome of resolving a table name against the catalog at a snapshot.
@@ -649,7 +679,7 @@ fn bind_projection(select: &Select) -> Result<Projection, SelectError> {
 mod tests {
     use super::*;
     use crate::parse;
-    use stele_catalog::{ColumnDef, TableTemporal};
+    use stele_catalog::{ColumnDef, TableTemporal, ValidTimeSpec};
     use stele_common::types::LogicalType;
 
     /// `now()` as a fixed instant for deterministic folding tests.
@@ -683,6 +713,25 @@ mod tests {
                 SystemTimeMicros(created),
             )
             .expect("create account");
+        catalog
+    }
+
+    /// A catalog with `booking` — a bitemporal table opting into a valid-time
+    /// period over `(vf, vt)` — created at system time `created`.
+    fn catalog_with_booking(created: i64) -> Catalog {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(
+                "booking",
+                vec![
+                    ColumnDef::new("id", LogicalType::Int4).expect("col"),
+                    ColumnDef::new("vf", LogicalType::Timestamp).expect("col"),
+                    ColumnDef::new("vt", LogicalType::Timestamp).expect("col"),
+                ],
+                TableTemporal::with_valid_time(ValidTimeSpec::new("vf", "vt").expect("spec")),
+                SystemTimeMicros(created),
+            )
+            .expect("create booking");
         catalog
     }
 
@@ -844,14 +893,104 @@ mod tests {
     }
 
     #[test]
-    fn valid_time_as_of_is_rejected() {
-        let stmt = parse_one("SELECT x FROM account FOR VALID_TIME AS OF now()");
+    fn valid_time_as_of_on_a_system_only_table_is_unsupported() {
+        // `account` has no valid axis, so a valid-time AS OF has nothing to
+        // travel along — caught at bind time.
+        let stmt = parse_one("SELECT balance FROM account FOR VALID_TIME AS OF now()");
         let catalog = catalog_with_account(1_000);
         let ctx = BindContext {
             snapshot: NOW,
             catalog: &catalog,
         };
-        assert_eq!(bind_select(&stmt, &ctx), Err(SelectError::ValidTimeAsOf));
+        assert_eq!(
+            bind_select(&stmt, &ctx),
+            Err(SelectError::ValidTimeUnsupported {
+                table: "account".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn valid_time_as_of_binds_on_a_bitemporal_table() {
+        // Valid-only AS OF: the valid instant is carried; the system axis
+        // defaults to the transaction snapshot.
+        let stmt = parse_one(
+            "SELECT id FROM booking FOR VALID_TIME AS OF (now() - interval '1 day') WHERE id = 1",
+        );
+        let catalog = catalog_with_booking(1_000);
+        let ctx = BindContext {
+            snapshot: NOW,
+            catalog: &catalog,
+        };
+        let bound = bind_select(&stmt, &ctx).expect("bind");
+        assert_eq!(bound.snapshot, NOW);
+        assert_eq!(
+            bound.valid_snapshot,
+            Some(SystemTimeMicros(NOW.0 - 86_400_000_000))
+        );
+    }
+
+    #[test]
+    fn both_axes_as_of_carries_both_instants() {
+        let catalog = catalog_with_booking(1_000);
+        let ctx = BindContext {
+            snapshot: NOW,
+            catalog: &catalog,
+        };
+        // Both orders bind to the same pair — the axis, not the position, decides.
+        for sql in [
+            "SELECT id FROM booking \
+             FOR SYSTEM_TIME AS OF 1700000000000000 FOR VALID_TIME AS OF 1600000000000000",
+            "SELECT id FROM booking \
+             FOR VALID_TIME AS OF 1600000000000000 FOR SYSTEM_TIME AS OF 1700000000000000",
+        ] {
+            let stmt = parse_one(sql);
+            let bound = bind_select(&stmt, &ctx).expect("bind");
+            assert_eq!(
+                bound.snapshot,
+                SystemTimeMicros(1_700_000_000_000_000),
+                "{sql}"
+            );
+            assert_eq!(
+                bound.valid_snapshot,
+                Some(SystemTimeMicros(1_600_000_000_000_000)),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn system_only_as_of_leaves_the_valid_axis_unset() {
+        let stmt = parse_one("SELECT id FROM booking FOR SYSTEM_TIME AS OF 1700000000000000");
+        let catalog = catalog_with_booking(1_000);
+        let ctx = BindContext {
+            snapshot: NOW,
+            catalog: &catalog,
+        };
+        let bound = bind_select(&stmt, &ctx).expect("bind");
+        assert_eq!(bound.snapshot, SystemTimeMicros(1_700_000_000_000_000));
+        assert_eq!(bound.valid_snapshot, None);
+    }
+
+    #[test]
+    fn a_repeated_axis_is_rejected() {
+        let catalog = catalog_with_booking(1_000);
+        let ctx = BindContext {
+            snapshot: NOW,
+            catalog: &catalog,
+        };
+        let dup_system =
+            parse_one("SELECT id FROM booking FOR SYSTEM_TIME AS OF 1 FOR SYSTEM_TIME AS OF 2");
+        assert_eq!(
+            bind_select(&dup_system, &ctx),
+            Err(SelectError::MultipleAsOf(TimeDimension::System))
+        );
+        let dup_valid =
+            parse_one("SELECT id FROM booking FOR VALID_TIME AS OF 1 FOR VALID_TIME AS OF 2");
+        assert_eq!(
+            bind_select(&dup_valid, &ctx),
+            Err(SelectError::MultipleAsOf(TimeDimension::Valid))
+        );
     }
 
     #[test]

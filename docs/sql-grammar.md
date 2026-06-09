@@ -1,9 +1,11 @@
 # SQL grammar — temporal extensions
 
 > **Status:** v0.1 parser bootstrap (STL-97) + DDL binding (STL-95) + the
-> `SELECT … FOR SYSTEM_TIME AS OF` query binder (STL-101). The parser, the
-> `CREATE TABLE` / `DROP TABLE` binder, and AS-OF snapshot resolution are live;
-> wiring the bound plan through the pgwire query loop lands in later tickets.
+> `SELECT … FOR SYSTEM_TIME AS OF` query binder (STL-101), extended to the
+> **valid axis** — `FOR VALID_TIME AS OF` now binds too (STL-162). The parser,
+> the `CREATE TABLE` / `DROP TABLE` binder, and both-axes AS-OF snapshot
+> resolution are live; the executor's joint `(sys, valid)` resolution and wiring
+> the bound plan through the pgwire query loop land in later tickets.
 > **Read with:** [02 — Architecture §6](02-architecture.md#6-query-layer).
 
 Stele's SQL frontend (`stele-sql`) starts from [`sqlparser-rs`][sqlparser] and
@@ -31,13 +33,16 @@ let statements: Vec<stele_sql::Statement> = stele_sql::parse(sql)?;
 
 ### How it is parsed
 
-`sqlparser-rs` parses `FOR SYSTEM_TIME AS OF` natively (Stele enables it via the
-dialect flag `supports_table_versioning`), but has no grammar for the other
-clauses below. Rather than fork the parser this early, `parse` runs a small pass
-over the **token stream**: it lifts the non-standard clauses into `temporal`,
-rewrites `VALID_TIME` → `SYSTEM_TIME` so the qualifier parses, and hands the
-standard remainder to `sqlparser-rs`. The lifted time axis is recovered
-afterward from the recorded order.
+`sqlparser-rs` has no grammar for the clauses below, and allows only one
+`FOR … AS OF` qualifier per table — too few for a bitemporal `… FOR SYSTEM_TIME
+AS OF s FOR VALID_TIME AS OF v`. Rather than fork the parser this early, `parse`
+runs a small pass over the **token stream**: it lifts the non-standard clauses
+into `temporal`, including **every** `FOR { SYSTEM_TIME | VALID_TIME } AS OF
+<expr>` qualifier — parsing each `<expr>` with `sqlparser-rs`'s own expression
+parser — and hands the clean standard-SQL remainder to `sqlparser-rs`. The lifted
+qualifiers (with their axis, in source order) are the single source of truth; the
+dialect leaves `supports_table_versioning` **off**, so `sqlparser-rs` never parses
+a versioned table itself.
 
 ## Temporal constructs
 
@@ -56,15 +61,15 @@ optimizer fold it to a concrete timestamp.
 Captured as `Temporal::as_of: Vec<AsOf>`, one entry per qualifier in
 left-to-right source order, each with:
 
-| Axis          | Meaning                              | v0.1 status |
-|---------------|--------------------------------------|-------------|
-| `SYSTEM_TIME` | when a fact was *recorded*           | implemented |
-| `VALID_TIME`  | when a fact was *true in the world*  | **parsed, not yet implemented** |
+| Axis          | Meaning                              | status |
+|---------------|--------------------------------------|--------|
+| `SYSTEM_TIME` | when a fact was *recorded*           | binds + executes |
+| `VALID_TIME`  | when a fact was *true in the world*  | **binds (STL-162); executor resolution lands in STL-163** |
 
-`VALID_TIME AS OF` is intentionally **accepted** by the parser and tagged
-`TimeDimension::Valid` (`is_implemented() == false`) so the binder can reject it
-with a precise message, rather than the parser silently mis-parsing or
-misleadingly accepting it. Full valid-time `AS OF` is post-v0.1.
+A table may carry **one qualifier per axis**, in either order, so a bitemporal
+point names both. A `VALID_TIME AS OF` against a table with no valid-time period
+is rejected at bind time (`SelectError::ValidTimeUnsupported`) — there is no valid
+axis to travel.
 
 ### `CREATE TABLE … WITH SYSTEM VERSIONING` — opt into system-time history
 
@@ -110,34 +115,40 @@ into a `DdlStatement` that `apply`s to a `stele-catalog` `Catalog`:
   the identity-demo `CREATE TABLE account (id INT PRIMARY KEY, balance INT) …`
   binds.
 
-## Query binding (STL-101)
+## Query binding (STL-101, STL-162)
 
-`stele_sql::bind_select` lowers a `SELECT … [FOR SYSTEM_TIME AS OF <expr>]` into
-a `BoundSelect` — a single table, the schema live at the resolved snapshot, a
-resolved system-time `snapshot`, and a projection — ready for the executor to
-lower to a `SnapshotScan` (STL-100):
+`stele_sql::bind_select` lowers a `SELECT … [FOR SYSTEM_TIME AS OF <s>]
+[FOR VALID_TIME AS OF <v>]` into a `BoundSelect` — a single table, the schema
+live at the resolved system-time snapshot, that `snapshot`, an optional
+`valid_snapshot`, and a projection — ready for the executor to lower to a
+`SnapshotScan` (STL-100):
 
-- **`AS OF <expr>` is folded to a concrete system-time instant.** Supported
-  forms: `now()` (folds to the transaction snapshot), `now() ± interval '<n>
-  <unit>'` (seconds … weeks; calendar units month/year are rejected — they have
-  no fixed microsecond length), and a bare integer read as explicit
-  microseconds. Absolute `TIMESTAMP '…'` literals are **not** folded at v0.1
-  (no civil-time codec yet) — they are rejected, not silently mis-resolved.
-- **No `AS OF` ⇒ the transaction snapshot.** A plain `SELECT` reads the present.
+- **Each `AS OF <expr>` is folded to a concrete instant.** Supported forms:
+  `now()` (folds to the transaction snapshot), `now() ± interval '<n> <unit>'`
+  (seconds … weeks; calendar units month/year are rejected — they have no fixed
+  microsecond length), and a bare integer read as explicit microseconds. Both
+  axes fold the same way. Absolute `TIMESTAMP '…'` literals are **not** folded yet
+  (no civil-time codec) — they are rejected, not silently mis-resolved.
+- **No system `AS OF` ⇒ the transaction snapshot.** A plain `SELECT` reads the
+  present. **No valid `AS OF` ⇒ `valid_snapshot` is `None`** — the executor reads
+  the present of the valid axis.
+- **At most one qualifier per axis**, in either order; a repeated axis is
+  `SelectError::MultipleAsOf`. A `FOR VALID_TIME AS OF` against a table with no
+  valid-time period is `SelectError::ValidTimeUnsupported`.
 - **The table is resolved against the versioned catalog at that snapshot**, so a
   past `AS OF` binds under the schema that was live *then*. A snapshot *before
   the table's first commit* is the documented **before-history** error
   (`SelectError::BeforeHistory`) — never a silent empty read; a name the catalog
   never registered is the distinct `UnknownTable`.
-- **The resolved snapshot is the `sys_from ≤ s` push-down** the executor applies
-  to segment-level zone-map pruning (system-time only; the close bound comes from
-  the validity index — [ADR-0023], STL-133). The binder does not re-implement the
-  prune; carrying the snapshot *is* the rewrite.
-- **Rejected in v0.1**: `FOR VALID_TIME AS OF` (parsed and tagged, rejected with a
-  precise message until valid-time time-travel lands), joins / set operations /
-  subqueries (single-table scan only), schema-qualified table names, and
-  projections other than `*` or bare column names. The `WHERE` clause stays on
-  the AST for the executor-glue layer (pgwire, STL-104) to lower.
+- **The resolved system snapshot is the `sys_from ≤ s` push-down** the executor
+  applies to segment-level zone-map pruning (the close bound comes from the
+  validity index — [ADR-0023], STL-133). The binder does not re-implement the
+  prune; carrying the snapshot *is* the rewrite. Joint `(sys, valid)` version
+  resolution from `valid_snapshot` is the executor's job (STL-163).
+- **Rejected in v0.1**: joins / set operations / subqueries (single-table scan
+  only), schema-qualified table names, and projections other than `*` or bare
+  column names. The `WHERE` clause stays on the AST for the executor-glue layer
+  (pgwire, STL-104) to lower.
 
 ## Type vocabulary
 
@@ -178,9 +189,10 @@ A statement with no temporal grammar carries `Temporal::default()` (all empty);
 ## Not yet supported (deferred)
 
 These are recognized as future work, not silently accepted. Some are already
-*parsed* (e.g. `FOR VALID_TIME AS OF`) but deferred in *implementation*:
+*bound* (e.g. `FOR VALID_TIME AS OF`) but deferred in *execution*:
 
-- `FOR VALID_TIME AS OF` execution (parsed and tagged; binder rejects — above).
+- `FOR VALID_TIME AS OF` executor resolution (binds and carries the instant; the
+  joint `(sys, valid)` version pick is STL-163 — above).
 - Period predicates (`WHERE … CONTAINS PERIOD …`, `OVERLAPS`).
 - `AS OF` on DML and on system-versioned `DROP`/`ALTER`.
 - A hand-written parser — revisited only if `sqlparser-rs` becomes a constraint

@@ -19,9 +19,10 @@ pub struct Statement {
     /// clauses have been stripped from the token stream before this was parsed,
     /// so it is always a clean, standard-SQL AST.
     pub body: SqlStatement,
-    /// Temporal grammar captured from the clauses that were stripped (plus
-    /// `FOR SYSTEM_TIME AS OF`, which rides natively on `body` but is surfaced
-    /// here too, with its time dimension, for the binder's convenience).
+    /// Temporal grammar captured from the clauses that were stripped — including
+    /// every `FOR { SYSTEM_TIME | VALID_TIME } AS OF` qualifier, lifted off the
+    /// token stream with its time dimension for the binder to act on. `body`
+    /// itself is always clean standard SQL with no version qualifier.
     pub temporal: Temporal,
 }
 
@@ -72,18 +73,8 @@ pub struct AsOf {
 /// A bitemporal time axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeDimension {
-    /// `SYSTEM_TIME` — when a fact was recorded. Implemented in v0.1.
+    /// `SYSTEM_TIME` — when a fact was recorded.
     System,
-    /// `VALID_TIME` — when a fact was true in the world. Parsed in v0.1 but not
-    /// yet wired through the binder/executor; see [`Self::is_implemented`].
+    /// `VALID_TIME` — when a fact was true in the world.
     Valid,
-}
-
-impl TimeDimension {
-    /// Whether v0.1 implements time-travel along this axis. The parser accepts
-    /// both dimensions; the binder rejects [`Self::Valid`] until valid-time
-    /// `AS OF` lands (tracked post-v0.1).
-    pub const fn is_implemented(self) -> bool {
-        matches!(self, Self::System)
-    }
 }

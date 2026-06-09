@@ -99,15 +99,14 @@ fn select_captures_system_time_as_of() {
     let as_of = &stmts[0].temporal.as_of;
     assert_eq!(as_of.len(), 1);
     assert_eq!(as_of[0].dimension, TimeDimension::System);
-    assert!(as_of[0].dimension.is_implemented());
 
-    // The AS OF also rides natively on the underlying AST.
-    assert!(table_has_version(&stmts[0].body));
+    // The qualifier is lifted off the token stream into `temporal`; the body
+    // `sqlparser` parses is clean standard SQL with no native version.
+    assert!(!table_has_version(&stmts[0].body));
 }
 
 #[test]
-fn select_accepts_valid_time_as_of_but_marks_unimplemented() {
-    // Per STL-97: accept FOR VALID_TIME, tag it not-yet-implemented for the binder.
+fn select_captures_valid_time_as_of() {
     let stmts = parse(
         "SELECT balance FROM account \
          FOR VALID_TIME AS OF TIMESTAMP '2020-01-01 00:00:00' WHERE id = 1",
@@ -116,10 +115,27 @@ fn select_accepts_valid_time_as_of_but_marks_unimplemented() {
     let as_of = &stmts[0].temporal.as_of;
     assert_eq!(as_of.len(), 1);
     assert_eq!(as_of[0].dimension, TimeDimension::Valid);
-    assert!(
-        !as_of[0].dimension.is_implemented(),
-        "valid-time AS OF is parsed but not yet implemented"
-    );
+    assert!(!table_has_version(&stmts[0].body));
+}
+
+#[test]
+fn select_captures_both_axes_as_of_in_source_order() {
+    // sqlparser allows only one `FOR … AS OF` per table; both qualifiers are
+    // lifted at the token level, preserving source order and per-axis tagging.
+    let stmts = parse(
+        "SELECT id FROM booking \
+         FOR VALID_TIME AS OF 1600000000000000 \
+         FOR SYSTEM_TIME AS OF 1700000000000000 WHERE id = 1",
+    )
+    .unwrap();
+    let dims: Vec<TimeDimension> = stmts[0]
+        .temporal
+        .as_of
+        .iter()
+        .map(|a| a.dimension)
+        .collect();
+    assert_eq!(dims, vec![TimeDimension::Valid, TimeDimension::System]);
+    assert!(!table_has_version(&stmts[0].body));
 }
 
 #[test]
