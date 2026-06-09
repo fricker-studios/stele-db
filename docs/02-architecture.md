@@ -336,7 +336,7 @@ flowchart LR
 
 - **Parser:** start from `sqlparser-rs` to move fast, with Stele-specific temporal grammar; revisit a hand-written parser only if needed.
 - **Optimizer:** rule-based first (pushdown, pruning, temporal predicate normalization), cost-based as statistics mature. **Temporal-aware rules** are the differentiating part — e.g., pushing an `AS OF` predicate into segment-level `sys_time` zone-map pruning.
-- **Executor:** vectorized, batch-at-a-time over **Arrow-shaped** columnar batches ([assumption A7](assumptions.md)) for SIMD-friendliness and ecosystem interop. The execution core is written to run under the deterministic simulation scheduler ([06](06-testing-strategy.md)).
+- **Executor:** vectorized, **batch-at-a-time pull (Volcano)** over **Arrow-shaped** columnar batches ([assumption A7](assumptions.md)) for SIMD-friendliness and ecosystem interop — one object-safe operator trait, with `SnapshotScan` as a source operator ([ADR-0027](adr/0027-vectorized-execution-model.md)). The execution core is written to run under the deterministic simulation scheduler ([06](06-testing-strategy.md)).
 
 ---
 
@@ -494,6 +494,8 @@ flowchart TB
 ```
 
 > The `stele-sim` crate provides the injectable virtual clock, deterministic RNG, and simulated disk/network that the storage/txn core runs against — the FoundationDB/TigerBeetle pattern ([06](06-testing-strategy.md)). Keeping the core runtime-agnostic is an architectural constraint, not an afterthought.
+
+> `stele-exec`'s "vectorized operators" are a **batch-at-a-time Volcano pull** pipeline over Arrow-shaped batches — one object-safe operator trait, `SnapshotScan` adapted as a source operator ([ADR-0027](adr/0027-vectorized-execution-model.md)).
 
 ---
 

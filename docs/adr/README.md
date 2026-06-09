@@ -34,6 +34,7 @@ Use the [template](_template.md) for new records. Number sequentially.
 | [0024](0024-time-representation.md) | Time representation: µs / int64 / +∞ sentinel / sequence | Accepted |
 | [0025](0025-valid-time-indexing.md) | Valid-time indexing & the scatter problem | Accepted |
 | [0026](0026-verifiable-audit-log.md) | Verifiable audit log (hash-chain + Merkle proofs) | Accepted |
+| [0027](0027-vectorized-execution-model.md) | Vectorized execution: batch-at-a-time Volcano pull over Arrow-shaped batches | Accepted |
 
 ## Conventions
 
