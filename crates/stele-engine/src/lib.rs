@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use stele_catalog::{Catalog, CatalogError};
 use stele_common::provenance::{Principal, TxnId};
 use stele_common::row_codec::{self, RowCodecError};
-use stele_common::time::{Clock, SystemTimeMicros};
+use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
 use stele_common::types::{LogicalType, ScalarValue};
 use stele_exec::{Batch, Column, ScanError, SnapshotScan};
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
@@ -627,15 +627,24 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         };
 
         let readers = state.engine.open_segment_readers()?;
-        let out = SnapshotScan::new(
+        let mut scan = SnapshotScan::new(
             state.engine.delta(),
             state.engine.index(),
             &readers,
             Snapshot(snapshot),
         )
         .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
-        .filter(predicate)
-        .execute()?;
+        .filter(predicate);
+        // Pin the valid axis too when the bound plan carries a `FOR VALID_TIME
+        // AS OF v` instant ([STL-164]). `bind_select` sets `valid_snapshot` only
+        // for a table that opts into a valid-time period, so turning on both-axes
+        // resolution here is sound; the micros name the same instant, reinterpreted
+        // on the valid axis. `None` leaves the scan system-only — byte-for-byte the
+        // prior behavior.
+        if let Some(v) = bound.valid_snapshot {
+            scan = scan.valid_as_of(ValidTimeMicros(v.0));
+        }
+        let out = scan.execute()?;
 
         // Reconstruct each full row [key, value cells…], then filter + project.
         let projection = projection_indices(&bound.projection, &schema_columns);
@@ -1346,6 +1355,111 @@ mod tests {
             matches!(err, EngineError::ValidTimePolicyChange { .. }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn valid_time_as_of_resolves_the_cell_live_on_both_axes() {
+        // The valid-axis sibling of the system-time identity demo ([STL-164]): a
+        // single key whose value differs across two disjoint valid windows, where
+        // the later version also superseded the earlier one on the *system* axis.
+        //
+        //   INSERT id=1, balance=100, valid [10, 20)  → commit c1
+        //   UPDATE id=1, balance=250, valid [20, 30)  → commit c2
+        //
+        // Pinning both axes with literal-microsecond `AS OF` instants
+        // (`resolve_as_of` reads a bare integer as micros) proves `run_select`
+        // threads `BoundSelect::valid_snapshot` into the both-axes scan: the same
+        // valid instant returns different cells at different system snapshots, and
+        // the same system snapshot returns different cells at different valid
+        // instants — neither axis alone explains the four answers. The underlying
+        // resolution is the oracle-backed one from [STL-163]; this asserts only
+        // that the engine glue reaches it.
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE account (id INT PRIMARY KEY, balance INT, vf TIMESTAMP, vt TIMESTAMP) \
+                 WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+            ))
+            .expect("create valid-time table");
+
+        let who = || Principal::new(b"demo".to_vec());
+        let key = || business_key(&ScalarValue::Int4(1));
+        // The stored payload packs all three value columns (balance, vf, vt); the
+        // valid interval itself rides the framed prefix `engine.insert` adds, so
+        // the period cells are redundant scaffolding here and only `balance` is
+        // asserted (materializing the period columns from the interval is the
+        // deferred binder/executor work this ticket explicitly excludes).
+        let payload = |balance: i32, from: i64, to: i64| {
+            row_codec::encode_payload(&[
+                cell(Some(ScalarValue::Int4(balance))),
+                cell(Some(ScalarValue::Timestamp(from))),
+                cell(Some(ScalarValue::Timestamp(to))),
+            ])
+        };
+        let iv = |from: i64, to: i64| {
+            ValidInterval::new(ValidTimeMicros(from), ValidTimeMicros(to)).expect("well-formed")
+        };
+
+        let c1 = engine
+            .insert(
+                "account",
+                key(),
+                Some(iv(10, 20)),
+                payload(100, 10, 20),
+                0,
+                TxnId(1),
+                who(),
+            )
+            .expect("insert")
+            .commit;
+        let c2 = engine
+            .update(
+                "account",
+                key(),
+                Some(iv(20, 30)),
+                payload(250, 20, 30),
+                0,
+                TxnId(2),
+                who(),
+            )
+            .expect("update")
+            .commit;
+        assert!(c1.0 < c2.0, "the update commits strictly after the insert");
+
+        // The single `balance` cell of a both-axes `SELECT`, or `None` when no
+        // version is live on both axes at `(sys, valid)`.
+        let mut balance = |sys: i64, valid: i64| -> Option<Vec<u8>> {
+            let sql = format!(
+                "SELECT balance FROM account \
+                 FOR SYSTEM_TIME AS OF {sys} FOR VALID_TIME AS OF {valid}"
+            );
+            let StatementOutcome::Rows(r) = engine.execute(&parse_one(&sql)).expect("select")
+            else {
+                panic!("SELECT must return rows");
+            };
+            assert!(
+                r.rows.len() <= 1,
+                "one key resolves to at most one live version, got {}",
+                r.rows.len()
+            );
+            r.rows
+                .into_iter()
+                .next()
+                .and_then(|row| row.into_iter().next().expect("the projected balance cell"))
+        };
+
+        // Pre-update system + first valid window → 100.
+        assert_eq!(balance(c1.0, 15), cell(Some(ScalarValue::Int4(100))));
+        // Post-update system + second valid window → 250.
+        assert_eq!(balance(c2.0, 25), cell(Some(ScalarValue::Int4(250))));
+        // Post-update system + first valid window → none: v1 is superseded on the
+        // system axis and v2's window `[20, 30)` excludes 15. (Only the valid axis
+        // differs from the 250 case — so the valid instant is load-bearing.)
+        assert_eq!(balance(c2.0, 15), None);
+        // Pre-update system + second valid window → none: v1 is system-live but its
+        // window `[10, 20)` excludes 25. (Only the system axis differs from the 100
+        // case — so the system instant is load-bearing.)
+        assert_eq!(balance(c1.0, 25), None);
     }
 
     #[test]
