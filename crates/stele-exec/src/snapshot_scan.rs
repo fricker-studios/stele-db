@@ -50,6 +50,23 @@
 //! 5. **Project.** Only the requested [`ColumnId`]s are materialized into the
 //!    output batch.
 //!
+//! ## The valid axis (STL-163)
+//!
+//! The steps above resolve the **system** axis. A bitemporal `AS OF (s, v)`
+//! query also pins the **valid** axis: [`valid_as_of`](SnapshotScan::valid_as_of)
+//! supplies the valid instant `v`, and the operator keeps, per key, only the
+//! system-live version whose `[valid_from, valid_to)` interval *also* contains
+//! `v` (the half-open
+//! [`ValidInterval::contains`](stele_storage::validtime::ValidInterval) test).
+//! The filter runs **after** the system-time live set is resolved and the two
+//! tiers carry the interval differently: a delta row frames it on the payload
+//! ([`unframe_payload`]), a sealed segment lifts it into first-class
+//! `valid_from` / `valid_to` columns ([STL-117]) the filter reads directly —
+//! before bulk materialization, so a row excluded on the valid axis never has
+//! its payload read. On a both-axes scan the emitted payload is the bare user
+//! value, the framing prefix stripped. A scan with no valid instant
+//! (`valid_as_of` unset) is system-only and untouched by any of this.
+//!
 //! ## Determinism
 //!
 //! The operator reads the validity index (deterministic [`Disk`] I/O) and holds
@@ -71,7 +88,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 use stele_common::provenance::{Principal, Provenance, TxnId};
-use stele_common::time::SystemTimeMicros;
+use stele_common::time::{SystemTimeMicros, ValidTimeMicros};
 use stele_storage::backend::{Disk, DiskFile};
 use stele_storage::delta::{BusinessKey, Delta, DeltaError, Snapshot, Version};
 use stele_storage::merge;
@@ -79,6 +96,7 @@ use stele_storage::segment::{
     ColumnData, ColumnId, Predicate, SegmentError, SegmentReader, ZoneBound,
 };
 use stele_storage::validity::{ValidityError, ValidityIndex};
+use stele_storage::validtime::{VALID_TIME_PREFIX_LEN, ValidTimeError, unframe_payload};
 
 /// A sealed row's identity — its `(business_key, sys_from, seq)` triple, the key
 /// the validity index and the per-key version chains are keyed by (STL-145).
@@ -102,6 +120,12 @@ pub enum ScanError {
     /// sealed segments' versions.
     #[error("validity index: {0}")]
     Validity(#[from] ValidityError),
+
+    /// A delta version's framed valid-time payload could not be decoded while
+    /// resolving the valid axis (a truncated interval prefix on a row from a
+    /// table the scan was told tracks valid-time).
+    #[error("valid-time decode: {0}")]
+    ValidTime(#[from] ValidTimeError),
 
     /// A projection requested a column the operator does not materialize at
     /// v0.1 — the version row-group set ([`ColumnId::ALL`]) is projectable; the
@@ -249,6 +273,13 @@ pub struct SnapshotScan<'a, D: Disk, I: Disk, F: DiskFile> {
     index: &'a ValidityIndex<I>,
     segments: &'a [SegmentReader<F>],
     snapshot: Snapshot,
+    /// The valid-time instant to resolve the *second* axis at, set via
+    /// [`valid_as_of`](Self::valid_as_of). `None` is a system-only scan — the
+    /// valid axis is not consulted and the operator behaves exactly as it did
+    /// before STL-163. `Some(v)` turns on both-axes resolution: after the
+    /// system-time live set is resolved, each version is kept only when its
+    /// `[valid_from, valid_to)` interval contains `v`.
+    valid_snapshot: Option<ValidTimeMicros>,
     projection: Vec<ColumnId>,
     predicate: Predicate,
 }
@@ -271,9 +302,38 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             index,
             segments,
             snapshot,
+            valid_snapshot: None,
             projection: ColumnId::ALL.to_vec(),
             predicate: Predicate::All,
         }
+    }
+
+    /// Resolve the **valid-time** axis at `point` as well as the system axis,
+    /// turning the scan bitemporal: a row is returned only when its system
+    /// interval contains the [`snapshot`](Self::new) *and* its valid interval
+    /// `[valid_from, valid_to)` contains `point` (the half-open
+    /// [`ValidInterval::contains`](stele_storage::validtime::ValidInterval::contains)
+    /// test) — the one version live on both axes at `(snapshot, point)`
+    /// (STL-163).
+    ///
+    /// **Only meaningful for a valid-time-enabled table.** The caller (the
+    /// query executor) supplies `point` exactly when the table opts into
+    /// valid-time, the same way the write path takes the per-table policy as a
+    /// resolved flag rather than re-deriving it
+    /// ([`frame_payload`](stele_storage::validtime::frame_payload)). A
+    /// valid-time table's delta rows carry the interval framed on the payload
+    /// and its sealed segments carry first-class `valid_from` / `valid_to`
+    /// columns ([STL-117], written via
+    /// [`SegmentWriter::create_valid_time`](stele_storage::segment::SegmentWriter::create_valid_time));
+    /// the operator reads the interval from whichever its tier provides. On a
+    /// both-axes scan the projected [`ColumnId::Payload`] is the **bare** user
+    /// payload — the interval prefix the delta tier frames on is stripped, so
+    /// the value is consistent with what a sealed segment already stores and is
+    /// the user's value, not the 16-byte temporal envelope.
+    #[must_use]
+    pub const fn valid_as_of(mut self, point: ValidTimeMicros) -> Self {
+        self.valid_snapshot = Some(point);
+        self
     }
 
     /// Restrict the output to `columns`, in the given order (projection
@@ -333,9 +393,20 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
         // by `might_contain` below. The range is conservative (never drops a key
         // the predicate could match) and the row filter still applies.
         let key_range = predicate_key_range(&self.predicate);
-        let delta_live = self
+        let mut delta_live = self
             .delta
             .range_scan(key_range, self.snapshot, self.index)?;
+
+        // Valid axis, delta tier. A valid-time table's delta rows carry the
+        // interval framed on the payload ([`frame_payload`]); recover it with
+        // [`unframe_payload`], keep the row only when its `[valid_from,
+        // valid_to)` contains the valid snapshot, and strip the prefix so the
+        // emitted payload is the bare user value (the sealed tier already stores
+        // it bare). System-only scans (`valid_snapshot == None`) skip this and
+        // leave the payload untouched.
+        if let Some(point) = self.valid_snapshot {
+            delta_live = filter_delta_by_valid(delta_live, point)?;
+        }
 
         // The bulk (non-identity) columns a survivor must materialize for this
         // scan — the union of the projected and predicate-referenced columns.
@@ -395,6 +466,19 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
         }
         let sealed_chains = merge::fold_chains(identities, self.index)?;
         let mut sealed_live = merge::resolve_snapshot(&sealed_chains, self.snapshot);
+
+        // Valid axis, sealed tier. A valid-time segment lifts the interval into
+        // first-class `valid_from` / `valid_to` i64 columns ([STL-117]), so the
+        // membership test reads those two narrow columns — never the bulk
+        // payload — and drops every system-live row whose interval does not
+        // contain the valid snapshot. Running it *before* late materialization
+        // means a row pruned on the valid axis never has its payload/provenance
+        // read. The segments touched here are already in `segments_scanned`
+        // (they hold a system-live row); the valid filter prunes rows, not
+        // segments, so [`ScanStats`] keeps its shape.
+        if let Some(point) = self.valid_snapshot {
+            self.filter_sealed_by_valid(&mut sealed_live, &locator, &rows_in_seg, point)?;
+        }
 
         // Late materialization: read each needed bulk column once per survivor
         // that actually holds a live row, then patch it into the resolved
@@ -466,6 +550,42 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
         needed
     }
 
+    /// Drop, in place, every system-live sealed row whose valid interval does
+    /// not contain `point`. Reads only the two narrow `valid_from` / `valid_to`
+    /// columns of the segments that hold a live row, the same late-bound, per
+    /// column discipline the bulk materialization uses. Runs before bulk
+    /// materialization, so a row pruned here never has its payload read.
+    fn filter_sealed_by_valid(
+        &self,
+        sealed_live: &mut Vec<Version>,
+        locator: &BTreeMap<VersionId, (usize, usize)>,
+        rows_in_seg: &BTreeMap<usize, usize>,
+        point: ValidTimeMicros,
+    ) -> Result<(), ScanError> {
+        let live_segs: BTreeSet<usize> = sealed_live.iter().map(|v| locate(locator, v).0).collect();
+        let mut valid_by_seg: BTreeMap<usize, (Vec<i64>, Vec<i64>)> = BTreeMap::new();
+        for seg_idx in live_segs {
+            let from = read_i64_column(&self.segments[seg_idx], ColumnId::ValidFrom)?;
+            let to = read_i64_column(&self.segments[seg_idx], ColumnId::ValidTo)?;
+            // The valid-time columns share the row-group's row count, the same
+            // contract the bulk columns honor; a disagreement is a corrupt
+            // segment, surfaced rather than indexed past its end below.
+            let expected = rows_in_seg[&seg_idx];
+            if from.len() != expected || to.len() != expected {
+                return Err(ScanError::Segment(SegmentError::Corrupt(
+                    "valid-time column value count disagrees with the segment's identity row count",
+                )));
+            }
+            valid_by_seg.insert(seg_idx, (from, to));
+        }
+        sealed_live.retain(|v| {
+            let (seg_idx, row_idx) = locate(locator, v);
+            let (from, to) = &valid_by_seg[&seg_idx];
+            valid_contains(from[row_idx], to[row_idx], point)
+        });
+        Ok(())
+    }
+
     /// Materialize the projected columns into an Arrow-shaped [`Batch`].
     fn project_batch(&self, rows: &[Version]) -> Result<Batch, ScanError> {
         let columns = self
@@ -478,6 +598,65 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             rows: rows.len(),
         })
     }
+}
+
+/// Resolve the valid axis over the delta tier's system-live rows: keep each
+/// version whose framed `[valid_from, valid_to)` interval contains `point`, and
+/// replace its payload with the bare user value (the 16-byte interval prefix
+/// stripped). A valid-time table's delta payload is always framed
+/// ([`frame_payload`](stele_storage::validtime::frame_payload)), so the interval
+/// is present; a row that carries no payload at all (unreachable from v0.1
+/// valid-time DML) decodes as a truncated frame and surfaces as
+/// [`ScanError::ValidTime`].
+fn filter_delta_by_valid(
+    versions: Vec<Version>,
+    point: ValidTimeMicros,
+) -> Result<Vec<Version>, ScanError> {
+    let mut kept = Vec::with_capacity(versions.len());
+    for mut v in versions {
+        let (from, to) = {
+            let stored = v.payload.as_deref().unwrap_or_default();
+            let (interval, _user) = unframe_payload(true, stored)?;
+            let interval = interval.expect("a valid-time table's payload frames an interval");
+            (interval.from.0, interval.to.0)
+        };
+        if valid_contains(from, to, point) {
+            // Strip the 16-byte interval prefix in place — `unframe_payload`
+            // above already proved the payload is at least that long, so the
+            // drain reuses the row's existing buffer rather than allocating a
+            // fresh bare copy.
+            if let Some(payload) = v.payload.as_mut() {
+                payload.drain(0..VALID_TIME_PREFIX_LEN);
+            }
+            kept.push(v);
+        }
+    }
+    Ok(kept)
+}
+
+/// Project one `i64` column out of a sealed segment, erroring if it decoded as
+/// any other [`ColumnData`] variant. The valid-axis filter's narrow read of the
+/// `valid_from` / `valid_to` columns; a non-`i64` result is a corrupt segment
+/// (the writer types both as `i64`).
+fn read_i64_column<F: DiskFile>(
+    reader: &SegmentReader<F>,
+    col: ColumnId,
+) -> Result<Vec<i64>, ScanError> {
+    match reader.read_column(col)? {
+        ColumnData::I64(v) => Ok(v),
+        ColumnData::Bytes(_) | ColumnData::NullableBytes(_) => Err(ScanError::Segment(
+            SegmentError::Corrupt("valid-time column was not stored as i64"),
+        )),
+    }
+}
+
+/// The half-open `[from, to)` membership test on raw valid-time boundary
+/// microseconds — the i64-column mirror of
+/// [`ValidInterval::contains`](stele_storage::validtime::ValidInterval::contains),
+/// for the sealed tier whose interval lives in columns rather than a framed
+/// payload.
+const fn valid_contains(from: i64, to: i64, point: ValidTimeMicros) -> bool {
+    from <= point.0 && point.0 < to
 }
 
 /// Build one projected column by reading `col` from every resolved row.
