@@ -32,6 +32,7 @@ This `/docs` set is the **single source of truth** for the project's vision, arc
 
 - [**Architecture Decision Records**](adr/README.md) — one record per significant decision (Context / Decision / Status / Consequences). Twenty-six ADRs to date.
 - [**Assumptions log**](assumptions.md) — the running ledger of what was decided on faith, and the open questions.
+- [**Portable hash-key spec v1**](hash-key-v1.md) — the frozen byte-encoding behind SQL `hash(...)`, with test vectors, so external clients compute identical keys ([ADR-0011](adr/0011-hash-distribution-integration-groundwork.md)).
 
 ## The thesis in four SQL statements
 
