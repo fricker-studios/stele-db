@@ -70,6 +70,14 @@ pub enum RowCodecError {
         /// The out-of-range length read from the frame.
         len: u64,
     },
+    /// A cell's presence byte was neither `0` (NULL) nor `1` (present) — a
+    /// corrupt frame. Caught rather than treated as "present", which would read
+    /// arbitrary following bytes as a length.
+    #[error("framed payload has an invalid cell presence tag {tag} (expected 0 or 1)")]
+    InvalidTag {
+        /// The out-of-range presence byte read from the frame.
+        tag: u8,
+    },
 }
 
 /// Pack a row's value cells into the stored payload form. See the
@@ -138,18 +146,22 @@ pub fn decode_payload(
                     what: "a cell presence byte",
                     needed: 1,
                 })?;
-                if tag == 0 {
-                    cells.push(None);
-                    rest = after_tag;
-                    continue;
+                match tag {
+                    0 => {
+                        cells.push(None);
+                        rest = after_tag;
+                    }
+                    1 => {
+                        let (len_bytes, after_len) = take(after_tag, 8, "a cell length")?;
+                        let len = u64::from_le_bytes(len_bytes.try_into().expect("took 8 bytes"));
+                        let len = usize::try_from(len)
+                            .map_err(|_| RowCodecError::LengthOverflow { len })?;
+                        let (value, after_value) = take(after_len, len, "a cell value")?;
+                        cells.push(Some(value.to_vec()));
+                        rest = after_value;
+                    }
+                    tag => return Err(RowCodecError::InvalidTag { tag }),
                 }
-                let (len_bytes, after_len) = take(after_tag, 8, "a cell length")?;
-                let len = u64::from_le_bytes(len_bytes.try_into().expect("took 8 bytes"));
-                let len =
-                    usize::try_from(len).map_err(|_| RowCodecError::LengthOverflow { len })?;
-                let (value, after_value) = take(after_len, len, "a cell value")?;
-                cells.push(Some(value.to_vec()));
-                rest = after_value;
             }
             if !rest.is_empty() {
                 return Err(RowCodecError::TrailingBytes {
@@ -251,6 +263,16 @@ mod tests {
             decode_payload(2, Some(&frame)),
             Err(RowCodecError::Truncated { .. })
         ));
+    }
+
+    #[test]
+    fn an_invalid_presence_tag_is_rejected() {
+        // A tag other than 0/1 is corruption — not silently read as "present".
+        let frame = vec![2u8, 0, 0];
+        assert_eq!(
+            decode_payload(2, Some(&frame)),
+            Err(RowCodecError::InvalidTag { tag: 2 })
+        );
     }
 
     #[test]

@@ -333,11 +333,13 @@ fn bind_filter(
     let Some(expr) = select.selection.as_ref() else {
         return Ok(None);
     };
+    // Peel parentheses around the whole predicate so `WHERE (id = 1)` binds like
+    // `WHERE id = 1` — the column/comparand sides are unwrapped the same way.
     let Expr::BinaryOp {
         left,
         op: BinaryOperator::Eq,
         right,
-    } = expr
+    } = unwrap_nested(expr)
     else {
         return Err(SelectError::UnsupportedPredicate(
             "the WHERE is not an equality".to_owned(),
@@ -371,6 +373,16 @@ fn bind_filter(
         column_index,
         value,
     }))
+}
+
+/// Peel any number of parentheses (`Expr::Nested`) wrapping `expr`, returning the
+/// inner expression. Lets a fully-parenthesized predicate bind like its bare form.
+const fn unwrap_nested(expr: &Expr) -> &Expr {
+    let mut expr = expr;
+    while let Expr::Nested(inner) = expr {
+        expr = inner;
+    }
+    expr
 }
 
 /// The bare column name a `WHERE` side references, peeling parentheses; `None`
@@ -1245,6 +1257,21 @@ mod tests {
                 .unwrap()
                 .filter,
             want
+        );
+    }
+
+    #[test]
+    fn a_parenthesized_where_binds_like_its_bare_form() {
+        let catalog = catalog_with_account(1_000);
+        assert_eq!(
+            bind("SELECT balance FROM account WHERE (id = 7)", &catalog)
+                .unwrap()
+                .filter,
+            Some(BoundPredicate {
+                column: "id".to_owned(),
+                column_index: 0,
+                value: ScalarValue::Int4(7),
+            })
         );
     }
 

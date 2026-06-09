@@ -344,6 +344,25 @@ pub enum EngineError {
         table: String,
     },
 
+    /// A bound write was applied against a table whose shape changed since it was
+    /// bound — its value-column count no longer matches the bound values /
+    /// assignments. Reachable when DDL drops and re-creates a table between
+    /// staging a write in a transaction and committing it; refused rather than
+    /// writing a payload that no longer matches the live schema (or panicking on
+    /// an out-of-range value-column index).
+    #[error(
+        "table {table:?} shape changed between binding and applying a write \
+         (live has {live} value column(s), the write was bound for {bound})"
+    )]
+    SchemaChanged {
+        /// The table written.
+        table: String,
+        /// The value-column count the table has now.
+        live: usize,
+        /// The value-column count (or highest index) the write was bound for.
+        bound: usize,
+    },
+
     /// A statement kind the session engine does not route — it is neither DDL, a
     /// `SELECT`, nor an `INSERT` / `UPDATE` / `DELETE`.
     #[error("statement not routable by the session engine: {0}")]
@@ -687,6 +706,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             BoundDml::Insert {
                 table, key, values, ..
             } => {
+                // The bound row width must still match the live schema — DDL could
+                // have changed it since binding (drop/re-create between staging and
+                // committing a transaction). Refuse rather than write a payload the
+                // current schema cannot decode.
+                let value_count = self.value_column_count(&table)?;
+                if values.len() != value_count {
+                    return Err(EngineError::SchemaChanged {
+                        table,
+                        live: value_count,
+                        bound: values.len(),
+                    });
+                }
                 let cells: Vec<Option<Vec<u8>>> = values
                     .iter()
                     .map(|v| v.as_ref().map(encode_value))
@@ -713,6 +744,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 // re-pack. (A read here sees the committed snapshot — a
                 // transaction does not yet read its own buffered writes, [STL-175].)
                 let value_count = self.value_column_count(&table)?;
+                // Guard against a narrowed schema since binding: an assignment
+                // index past the live value columns would otherwise panic on the
+                // `cells[*idx]` write below.
+                if let Some(&(idx, _)) = assignments.iter().find(|(idx, _)| *idx >= value_count) {
+                    return Err(EngineError::SchemaChanged {
+                        table,
+                        live: value_count,
+                        bound: idx + 1,
+                    });
+                }
                 let key = business_key(&key);
                 let mut cells = self.live_value_cells(&table, &key, value_count)?;
                 for (idx, value) in &assignments {
@@ -1690,6 +1731,48 @@ mod tests {
     /// `None` → a SQL `NULL` cell — matching what a `SelectResult` row carries.
     fn cell(value: Option<ScalarValue>) -> Option<Vec<u8>> {
         value.map(|v| encode_value(&v))
+    }
+
+    #[test]
+    fn a_write_bound_against_a_changed_shape_fails_safely() {
+        // Stage an UPDATE against a 2-value-column table, then drop and re-create
+        // the table narrower before committing. The buffered assignment's index
+        // now points past the live value columns; the guard returns a clean error
+        // instead of panicking on an out-of-range cell write.
+        let mut engine = session();
+        engine
+            .execute(&parse_one(CREATE_WIDE))
+            .expect("create wide");
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (1, 10, 'one')"))
+            .expect("insert");
+
+        let mut txn = engine.begin();
+        engine
+            .stage_dml(&parse_one("UPDATE t SET b = 'two' WHERE id = 1"), &mut txn)
+            .expect("stage update of column b (value index 1)");
+
+        // Re-create `t` with only one value column — same (system-only) policy, so
+        // the tier is reused, but `b` no longer exists.
+        engine.execute(&parse_one("DROP TABLE t")).expect("drop");
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE t (id INT PRIMARY KEY, a INT) WITH SYSTEM VERSIONING",
+            ))
+            .expect("re-create narrower");
+
+        let err = engine.commit(txn).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::SchemaChanged {
+                    live: 1,
+                    bound: 2,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]

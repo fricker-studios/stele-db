@@ -1043,6 +1043,8 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
         EngineError::Storage(_) | EngineError::Scan(_) | EngineError::RowCodec(_) => {
             SQLSTATE_INTERNAL_ERROR
         }
+        // A schema that changed under a bound write — concurrent-ish schema drift.
+        EngineError::SchemaChanged { .. } => SQLSTATE_INTERNAL_ERROR,
     }
 }
 
