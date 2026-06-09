@@ -8,58 +8,62 @@
 //! to a `DmlWriter` call (`insert` / `update` / `delete`). The pgwire query
 //! loop ([STL-147]) is the consumer.
 //!
-//! ## The v0.1 mapping — `(key, payload)`
+//! ## The column mapping — key + value columns
 //!
-//! v0.1 has **no row codec** (a v0.2 concern) and the catalog does not yet record
-//! which column is the primary key ([`bind_ddl`](crate::bind_ddl) parses
-//! `PRIMARY KEY` but stores only name + type). So DML binds the *identity-demo
-//! shape* positionally: a
-//! table must have exactly two columns, the **first is the business key** and the
-//! **second is the (opaque) payload**. Each is folded from its SQL literal into a
-//! [`ScalarValue`] of the column's type; the engine encodes those to bytes with
-//! [`ScalarValue::encode`](stele_common::types::ScalarValue::encode) when it
-//! applies the write, so the round-trip back through a read is exact. A table
-//! with any other shape is [rejected](DmlError::UnsupportedTableShape) rather than
-//! guessed at.
+//! The catalog does not yet record which column is the primary key
+//! ([`bind_ddl`](crate::bind_ddl) parses `PRIMARY KEY` but stores only name +
+//! type), so DML keeps the positional convention: the **first column is the
+//! business key**, and the remaining columns are the row's **value columns**. A
+//! table may now be any width ([STL-151]) — the value columns are packed into the
+//! one stored payload by the [row codec](stele_common::row_codec) when the engine
+//! applies the write, and sliced back out on read. Each supplied literal is folded
+//! to a [`ScalarValue`] of its column's type (via the `fold` module); the engine
+//! encodes those to bytes with
+//! [`ScalarValue::encode`](stele_common::types::ScalarValue::encode), so the
+//! round-trip back through a read is exact.
 //!
 //! The three operations map to the write path ([STL-94],
 //! [architecture §3.4](../../../docs/02-architecture.md#34-write-path-sequence)):
 //!
-//! * `INSERT INTO t VALUES (k, p)` — open a fresh period for `k` carrying `p`.
-//! * `UPDATE t SET <payload> = p WHERE <key> = k` — close `k`'s prior period,
-//!   open a new one with `p`.
+//! * `INSERT INTO t VALUES (k, …)` — open a fresh period for `k` carrying the
+//!   row's value columns.
+//! * `UPDATE t SET <col> = v[, …] WHERE <key> = k` — close `k`'s prior period and
+//!   open a new one; columns the `SET` does not name keep their prior value
+//!   (a read-modify-write the engine performs).
 //! * `DELETE FROM t WHERE <key> = k` — close `k`'s prior period, no successor.
 //!
-//! ## What v0.1 rejects (with a clear bind error, never a wrong write)
+//! ## What this rejects (with a clear bind error, never a wrong write)
 //!
 //! Multi-row `INSERT`, `INSERT … SELECT`, a `WHERE` that is not `<key> =
 //! <literal>` (including a whole-table `UPDATE`/`DELETE` with no `WHERE`),
-//! updating the key column, multi-column-payload tables, `RETURNING`, `ON
-//! CONFLICT`, `USING`/`FROM` joins, qualified names, a `NULL` business key, and
-//! out-of-range literals. A `NULL` **payload** is accepted (it folds to `None`,
-//! [STL-154]); a `NULL` key is not. Folding a `TIMESTAMP`/`DATE` literal is also
-//! out of scope at v0.1 (no civil-time codec — mirrors the
-//! [`AS OF`](crate::select) stance).
+//! updating the key column, `RETURNING`, `ON CONFLICT`, `USING`/`FROM` joins,
+//! qualified names, a `NULL` business key, and out-of-range literals. A `NULL`
+//! **value column** is accepted (it folds to `None`, [STL-154]); a `NULL` key is
+//! not. Folding a `TIMESTAMP`/`DATE` literal is still out of scope (no civil-time
+//! codec — mirrors the [`AS OF`](crate::select) stance).
+//!
+//! [STL-151]: https://allegromusic.atlassian.net/browse/STL-151
 
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, Insert, ObjectName,
-    SetExpr, Statement as SqlStatement, TableFactor, TableObject, TableWithJoins, UnaryOperator,
-    Update, Value,
+    SetExpr, Statement as SqlStatement, TableFactor, TableObject, TableWithJoins, Update,
 };
 use stele_catalog::{ColumnDef, SchemaId, TableSchema};
 use stele_common::types::{LogicalType, ScalarValue};
 
 use crate::ast::Statement;
+use crate::fold::{self, FoldError};
 use crate::select::{BindContext, TableResolution, resolve_table_at};
 
 /// A bound `INSERT` / `UPDATE` / `DELETE`, ready for the engine to apply.
 ///
 /// Carries the resolved table, the schema version it bound under, and the
-/// already-folded [`ScalarValue`]s for the business key and (for writes) the
-/// payload. See the [module docs](self) for the `(key, payload)` mapping.
+/// already-folded [`ScalarValue`]s for the business key and the row's value
+/// columns. See the [module docs](self) for the key + value-column mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoundDml {
-    /// `INSERT`: open a fresh `[commit, +∞)` period for `key` carrying `payload`.
+    /// `INSERT`: open a fresh `[commit, +∞)` period for `key` carrying the row's
+    /// value columns.
     Insert {
         /// The table written.
         table: String,
@@ -67,11 +71,15 @@ pub enum BoundDml {
         schema_id: SchemaId,
         /// The business key (the first column's value).
         key: ScalarValue,
-        /// The opaque payload (the second column's value), or `None` for a SQL
-        /// `NULL` payload ([STL-154]).
-        payload: Option<ScalarValue>,
+        /// The value columns' values, in schema order (the columns *after* the
+        /// business key). Each is `None` for a SQL `NULL` cell ([STL-154]). The
+        /// engine packs these into the stored payload with the
+        /// [row codec](stele_common::row_codec).
+        values: Vec<Option<ScalarValue>>,
     },
-    /// `UPDATE`: close `key`'s prior period and open a new one with `payload`.
+    /// `UPDATE`: close `key`'s prior period and open a new one. The `assignments`
+    /// overwrite the named value columns; any column the `SET` does not name keeps
+    /// its prior value (the engine reads the current row and merges).
     Update {
         /// The table written.
         table: String,
@@ -79,9 +87,10 @@ pub enum BoundDml {
         schema_id: SchemaId,
         /// The business key the `WHERE` clause selected.
         key: ScalarValue,
-        /// The new opaque payload from the `SET` clause, or `None` for a SQL
-        /// `NULL` payload ([STL-154]).
-        payload: Option<ScalarValue>,
+        /// The `SET` clause as `(value-column index, new value)` pairs, where the
+        /// index is 0-based over the **value columns** (the columns after the
+        /// business key). A `None` value is a SQL `NULL` ([STL-154]).
+        assignments: Vec<(usize, Option<ScalarValue>)>,
     },
     /// `DELETE`: close `key`'s prior period with no successor (a period close,
     /// not a row removal — history is preserved).
@@ -165,17 +174,13 @@ pub enum DmlError {
         snapshot: i64,
     },
 
-    /// The table is not the v0.1 two-column `(key, payload)` shape. A general
-    /// multi-column row codec is a v0.2 concern, so a wider (or narrower) table
-    /// cannot be written through this path yet.
-    #[error(
-        "v0.1 DML requires a two-column (key, payload) table; {table:?} has {columns} column(s)"
-    )]
-    UnsupportedTableShape {
+    /// The table declares no columns — every table has at least a business-key
+    /// column, so this guards an otherwise-impossible shape (DDL never creates
+    /// one) rather than panicking.
+    #[error("table {table:?} has no columns")]
+    EmptyTable {
         /// The table written.
         table: String,
-        /// How many columns it actually declares.
-        columns: usize,
     },
 
     /// An `INSERT` supplied more than one row of `VALUES`. v0.1 inserts a single
@@ -321,23 +326,25 @@ fn bind_insert(insert: &Insert, ctx: &BindContext) -> Result<BoundDml, DmlError>
         ));
     };
     let table = bare_name(name)?;
-    let (schema, key_col, payload_col) = resolve_shape(ctx, &table)?;
+    let (schema, key_col, value_cols) = resolve_shape(ctx, &table)?;
 
     let row = single_values_row(insert)?;
 
-    // Map each target column to the value expression at the same position. With
-    // no explicit column list the order is the schema's declaration order
-    // (key first, payload second); with a list, values are matched by name.
-    let (key_expr, payload_expr) = match insert.columns.as_slice() {
-        [] => match row {
-            [key, payload] => (key, payload),
-            _ => {
+    // Resolve, for every schema column in declaration order, the value expression
+    // that supplies it. With no explicit column list the values map positionally;
+    // with a list, each schema column takes the value at its name's position (and
+    // every column must be supplied — there are no defaults).
+    let columns = schema.columns();
+    let exprs: Vec<&Expr> = match insert.columns.as_slice() {
+        [] => {
+            if row.len() != columns.len() {
                 return Err(DmlError::ColumnCountMismatch {
-                    expected: 2,
+                    expected: columns.len(),
                     found: row.len(),
                 });
             }
-        },
+            row.iter().collect()
+        }
         cols => {
             if cols.len() != row.len() {
                 return Err(DmlError::ColumnCountMismatch {
@@ -346,25 +353,36 @@ fn bind_insert(insert: &Insert, ctx: &BindContext) -> Result<BoundDml, DmlError>
                 });
             }
             let names = validated_columns(&table, cols, schema)?;
-            let value_for = |column: &ColumnDef| {
-                names
-                    .iter()
-                    .position(|n| n == column.name())
-                    .map(|i| &row[i])
-                    .ok_or_else(|| DmlError::MissingColumn {
-                        table: table.clone(),
-                        column: column.name().to_owned(),
-                    })
-            };
-            (value_for(key_col)?, value_for(payload_col)?)
+            columns
+                .iter()
+                .map(|column| {
+                    names
+                        .iter()
+                        .position(|n| n == column.name())
+                        .map(|i| &row[i])
+                        .ok_or_else(|| DmlError::MissingColumn {
+                            table: table.clone(),
+                            column: column.name().to_owned(),
+                        })
+                })
+                .collect::<Result<_, _>>()?
         }
     };
+
+    // `exprs` is aligned to `columns`: the first is the business key, the rest are
+    // the value columns in order.
+    let key = fold_value(exprs[0], &table, key_col)?;
+    let values = value_cols
+        .iter()
+        .zip(&exprs[1..])
+        .map(|(column, expr)| fold_payload(expr, &table, column))
+        .collect::<Result<_, _>>()?;
 
     Ok(BoundDml::Insert {
         table: table.clone(),
         schema_id: schema.schema_id(),
-        key: fold_value(key_expr, &table, key_col)?,
-        payload: fold_payload(payload_expr, &table, payload_col)?,
+        key,
+        values,
     })
 }
 
@@ -470,36 +488,49 @@ fn bind_update(update: &Update, ctx: &BindContext) -> Result<BoundDml, DmlError>
     }
 
     let table = table_of(&update.table)?;
-    let (schema, key_col, payload_col) = resolve_shape(ctx, &table)?;
+    let (schema, key_col, value_cols) = resolve_shape(ctx, &table)?;
 
-    // Exactly one assignment, targeting the payload column.
-    let [assignment] = update.assignments.as_slice() else {
-        return Err(DmlError::Unsupported(format!(
-            "UPDATE with {} assignments (v0.1 sets the one payload column)",
-            update.assignments.len()
-        )));
-    };
-    let target = assignment_column(assignment)?;
-    if target == key_col.name() {
-        return Err(DmlError::CannotUpdateKey {
-            table: table.clone(),
-            column: target.to_owned(),
-        });
+    // One or more `SET <col> = <value>` assignments, each targeting a value
+    // column. Columns the SET does not name keep their prior value — the engine
+    // reads the current row and merges, so the binder only carries the overrides.
+    if update.assignments.is_empty() {
+        return Err(DmlError::Unsupported(
+            "UPDATE with no SET assignments".to_owned(),
+        ));
     }
-    if target != payload_col.name() {
-        return Err(DmlError::UnknownColumn {
-            table: table.clone(),
-            column: target.to_owned(),
-        });
+    let mut assignments: Vec<(usize, Option<ScalarValue>)> = Vec::new();
+    for assignment in &update.assignments {
+        let target = assignment_column(assignment)?;
+        if target == key_col.name() {
+            return Err(DmlError::CannotUpdateKey {
+                table: table.clone(),
+                column: target.to_owned(),
+            });
+        }
+        let idx = value_cols
+            .iter()
+            .position(|c| c.name() == target)
+            .ok_or_else(|| DmlError::UnknownColumn {
+                table: table.clone(),
+                column: target.to_owned(),
+            })?;
+        // A column assigned twice would silently keep only the last value — reject
+        // it rather than guess which the user meant.
+        if assignments.iter().any(|(prev, _)| *prev == idx) {
+            return Err(DmlError::Unsupported(format!(
+                "UPDATE assigns column {target:?} more than once"
+            )));
+        }
+        let value = fold_payload(&assignment.value, &table, &value_cols[idx])?;
+        assignments.push((idx, value));
     }
 
     let key = key_predicate(update.selection.as_ref(), &table, key_col)?;
-    let payload = fold_payload(&assignment.value, &table, payload_col)?;
     Ok(BoundDml::Update {
         table,
         schema_id: schema.schema_id(),
         key,
-        payload,
+        assignments,
     })
 }
 
@@ -542,7 +573,7 @@ fn bind_delete(delete: &Delete, ctx: &BindContext) -> Result<BoundDml, DmlError>
         ));
     };
     let table = table_of(target)?;
-    let (schema, key_col, _payload_col) = resolve_shape(ctx, &table)?;
+    let (schema, key_col, _value_cols) = resolve_shape(ctx, &table)?;
 
     let key = key_predicate(delete.selection.as_ref(), &table, key_col)?;
     Ok(BoundDml::Delete {
@@ -556,12 +587,13 @@ fn bind_delete(delete: &Delete, ctx: &BindContext) -> Result<BoundDml, DmlError>
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve `table` at the context snapshot and enforce the v0.1 two-column
-/// `(key, payload)` shape, returning the schema and its key / payload columns.
+/// Resolve `table` at the context snapshot and split its schema into the business
+/// key (the first column) and the value columns (the rest), returning the schema
+/// alongside.
 fn resolve_shape<'a>(
     ctx: &'a BindContext,
     table: &str,
-) -> Result<(&'a TableSchema, &'a ColumnDef, &'a ColumnDef), DmlError> {
+) -> Result<(&'a TableSchema, &'a ColumnDef, &'a [ColumnDef]), DmlError> {
     let schema = match resolve_table_at(ctx.catalog, table, ctx.snapshot) {
         TableResolution::Found(schema) => schema,
         TableResolution::Unknown => return Err(DmlError::UnknownTable(table.to_owned())),
@@ -579,13 +611,15 @@ fn resolve_shape<'a>(
             });
         }
     };
-    match schema.columns() {
-        [key, payload] => Ok((schema, key, payload)),
-        cols => Err(DmlError::UnsupportedTableShape {
+    // The first column is the business key; the rest are value columns (possibly
+    // none, for a key-only table).
+    let (key, values) = schema
+        .columns()
+        .split_first()
+        .ok_or_else(|| DmlError::EmptyTable {
             table: table.to_owned(),
-            columns: cols.len(),
-        }),
-    }
+        })?;
+    Ok((schema, key, values))
 }
 
 /// Bind an `UPDATE` / `DELETE` `WHERE` clause: it must be `<key> = <literal>`,
@@ -652,9 +686,9 @@ fn column_side(expr: &Expr) -> Result<Option<&str>, DmlError> {
     }
 }
 
-/// Fold a payload-column literal, accepting SQL `NULL` as `None` ([STL-154]).
+/// Fold a value-column literal, accepting SQL `NULL` as `None` ([STL-154]).
 ///
-/// The payload column is nullable end to end (storage carries a `None` payload
+/// A value column is nullable end to end (storage carries a `None` cell
 /// distinctly), so `NULL` here is a valid write rather than a rejected one — the
 /// sibling of [`fold_value`], which still rejects `NULL` for the never-null
 /// business key. A present literal folds through [`fold_value`] unchanged.
@@ -663,7 +697,7 @@ fn fold_payload(
     table: &str,
     column: &ColumnDef,
 ) -> Result<Option<ScalarValue>, DmlError> {
-    if is_null(expr) {
+    if fold::is_null(expr) {
         return Ok(None);
     }
     fold_value(expr, table, column).map(Some)
@@ -671,110 +705,37 @@ fn fold_payload(
 
 /// Fold a literal expression into a [`ScalarValue`] of `column`'s type, rejecting
 /// `NULL`, type mismatches, and out-of-range / unsupported literals. Used for the
-/// business key (never nullable); the payload column folds through
-/// [`fold_payload`], which accepts `NULL`.
+/// business key (never nullable); a value column folds through [`fold_payload`],
+/// which accepts `NULL`. The folding itself lives in the `fold` module; this only
+/// attaches the table/column names to the failure.
 fn fold_value(expr: &Expr, table: &str, column: &ColumnDef) -> Result<ScalarValue, DmlError> {
-    if is_null(expr) {
-        return Err(DmlError::NullValue {
+    fold::fold_scalar(expr, column.ty()).map_err(|err| fold_err_to_dml(err, table, column))
+}
+
+/// Map a table/column-agnostic [`FoldError`] to the DML error that names the
+/// table and column it occurred on. Reproduces the binder's pre-existing errors
+/// exactly, so the surface is unchanged.
+fn fold_err_to_dml(err: FoldError, table: &str, column: &ColumnDef) -> DmlError {
+    match err {
+        FoldError::Null => DmlError::NullValue {
             table: table.to_owned(),
             column: column.name().to_owned(),
-        });
-    }
-    let mismatch = |found: &str| DmlError::TypeMismatch {
-        table: table.to_owned(),
-        column: column.name().to_owned(),
-        expected: column.ty(),
-        found: found.to_owned(),
-    };
-    match column.ty() {
-        LogicalType::Int4 => {
-            let digits = signed_number(expr).ok_or_else(|| mismatch(describe(expr)))?;
-            digits
-                .parse::<i32>()
-                .map(ScalarValue::Int4)
-                .map_err(|_| bad_literal(table, column, &digits))
+        },
+        FoldError::TypeMismatch { found } => DmlError::TypeMismatch {
+            table: table.to_owned(),
+            column: column.name().to_owned(),
+            expected: column.ty(),
+            found: found.to_owned(),
+        },
+        FoldError::BadLiteral { literal } => DmlError::BadLiteral {
+            table: table.to_owned(),
+            column: column.name().to_owned(),
+            ty: column.ty(),
+            literal,
+        },
+        FoldError::UnsupportedType(ty) => {
+            DmlError::Unsupported(format!("a {ty} literal for column {:?}", column.name()))
         }
-        LogicalType::Int8 => {
-            let digits = signed_number(expr).ok_or_else(|| mismatch(describe(expr)))?;
-            digits
-                .parse::<i64>()
-                .map(ScalarValue::Int8)
-                .map_err(|_| bad_literal(table, column, &digits))
-        }
-        LogicalType::Text => match literal(expr) {
-            Some(Value::SingleQuotedString(s)) => Ok(ScalarValue::Text(s.clone())),
-            _ => Err(mismatch(describe(expr))),
-        },
-        LogicalType::Bool => match literal(expr) {
-            Some(Value::Boolean(b)) => Ok(ScalarValue::Bool(*b)),
-            _ => Err(mismatch(describe(expr))),
-        },
-        // No civil-time literal codec at v0.1 (mirrors AS OF); a TIMESTAMP/DATE
-        // column cannot be written through DML yet.
-        ty @ (LogicalType::Timestamp | LogicalType::Date) => Err(DmlError::Unsupported(format!(
-            "a {ty} literal for column {:?}",
-            column.name()
-        ))),
-    }
-}
-
-fn bad_literal(table: &str, column: &ColumnDef, literal: &str) -> DmlError {
-    DmlError::BadLiteral {
-        table: table.to_owned(),
-        column: column.name().to_owned(),
-        ty: column.ty(),
-        literal: literal.to_owned(),
-    }
-}
-
-/// Whether an expression is the `NULL` literal.
-fn is_null(expr: &Expr) -> bool {
-    matches!(literal(expr), Some(Value::Null))
-}
-
-/// The literal [`Value`] an expression carries, peeling parentheses; `None` if it
-/// is not a bare literal.
-fn literal(expr: &Expr) -> Option<&Value> {
-    match expr {
-        Expr::Value(v) => Some(&v.value),
-        Expr::Nested(inner) => literal(inner),
-        _ => None,
-    }
-}
-
-/// The (possibly signed) decimal digits of a numeric literal, folding a leading
-/// unary `+` / `-` into the string so it parses directly. `None` for any
-/// non-numeric expression.
-fn signed_number(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Value(v) => match &v.value {
-            Value::Number(n, _) => Some(n.clone()),
-            _ => None,
-        },
-        Expr::Nested(inner) => signed_number(inner),
-        Expr::UnaryOp {
-            op: UnaryOperator::Plus,
-            expr,
-        } => signed_number(expr),
-        Expr::UnaryOp {
-            op: UnaryOperator::Minus,
-            expr,
-        } => signed_number(expr).map(|s| {
-            s.strip_prefix('-')
-                .map_or_else(|| format!("-{s}"), ToOwned::to_owned)
-        }),
-        _ => None,
-    }
-}
-
-/// A short label for an expression, for the type-mismatch diagnostics.
-fn describe(expr: &Expr) -> &'static str {
-    match literal(expr) {
-        Some(Value::SingleQuotedString(_)) => "a string literal",
-        Some(Value::Boolean(_)) => "a boolean literal",
-        Some(Value::Number(..)) => "a numeric literal",
-        Some(Value::Null) => "NULL",
-        _ => "a non-literal expression",
     }
 }
 
@@ -860,7 +821,7 @@ mod tests {
                 table: "account".to_owned(),
                 schema_id: SchemaId(1),
                 key: ScalarValue::Int4(1),
-                payload: Some(ScalarValue::Int4(100)),
+                values: vec![Some(ScalarValue::Int4(100))],
             })
         );
     }
@@ -874,7 +835,7 @@ mod tests {
                 table: "account".to_owned(),
                 schema_id: SchemaId(1),
                 key: ScalarValue::Int4(1),
-                payload: Some(ScalarValue::Int4(250)),
+                assignments: vec![(0, Some(ScalarValue::Int4(250)))],
             })
         );
     }
@@ -905,7 +866,7 @@ mod tests {
                 table: "account".to_owned(),
                 schema_id: SchemaId(1),
                 key: ScalarValue::Int4(1),
-                payload: Some(ScalarValue::Int4(100)),
+                values: vec![Some(ScalarValue::Int4(100))],
             })
         );
     }
@@ -927,12 +888,12 @@ mod tests {
     #[test]
     fn negative_literals_fold() {
         let catalog = account_catalog();
-        let BoundDml::Insert { payload, .. } =
+        let BoundDml::Insert { values, .. } =
             bind("INSERT INTO account VALUES (1, -42)", &catalog).expect("bind")
         else {
             panic!("expected an INSERT");
         };
-        assert_eq!(payload, Some(ScalarValue::Int4(-42)));
+        assert_eq!(values, vec![Some(ScalarValue::Int4(-42))]);
     }
 
     #[test]
@@ -1030,7 +991,7 @@ mod tests {
                 table: "account".to_owned(),
                 schema_id: SchemaId(1),
                 key: ScalarValue::Int4(1),
-                payload: None,
+                values: vec![None],
             })
         );
     }
@@ -1044,7 +1005,7 @@ mod tests {
                 table: "account".to_owned(),
                 schema_id: SchemaId(1),
                 key: ScalarValue::Int4(1),
-                payload: None,
+                assignments: vec![(0, None)],
             })
         );
     }
@@ -1125,8 +1086,9 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn multi_column_payload_table_is_rejected() {
+    /// A catalog with a three-value-column table `wide (id, a, b, c)`
+    /// (`a`/`b` int4, `c` text), created at system time `1_000`.
+    fn wide_catalog() -> Catalog {
         let mut catalog = Catalog::new();
         catalog
             .create_table(
@@ -1135,16 +1097,111 @@ mod tests {
                     ColumnDef::new("id", LogicalType::Int4).expect("col"),
                     ColumnDef::new("a", LogicalType::Int4).expect("col"),
                     ColumnDef::new("b", LogicalType::Int4).expect("col"),
+                    ColumnDef::new("c", LogicalType::Text).expect("col"),
                 ],
                 TableTemporal::system_only(),
                 SystemTimeMicros(1_000),
             )
             .expect("create wide");
+        catalog
+    }
+
+    #[test]
+    fn multi_column_insert_binds_all_value_columns_in_order() {
+        // The row codec ([STL-151]) lets a table be wider than (key, value): the
+        // value columns bind in schema order, NULLs included.
+        let catalog = wide_catalog();
         assert_eq!(
-            bind("INSERT INTO wide VALUES (1, 2, 3)", &catalog),
-            Err(DmlError::UnsupportedTableShape {
+            bind("INSERT INTO wide VALUES (1, 2, 3, 'x')", &catalog),
+            Ok(BoundDml::Insert {
                 table: "wide".to_owned(),
-                columns: 3,
+                schema_id: SchemaId(1),
+                key: ScalarValue::Int4(1),
+                values: vec![
+                    Some(ScalarValue::Int4(2)),
+                    Some(ScalarValue::Int4(3)),
+                    Some(ScalarValue::Text("x".to_owned())),
+                ],
+            })
+        );
+        // A reordering column list still maps each value to its column by name.
+        assert_eq!(
+            bind(
+                "INSERT INTO wide (c, id, b, a) VALUES ('x', 1, 3, 2)",
+                &catalog
+            ),
+            Ok(BoundDml::Insert {
+                table: "wide".to_owned(),
+                schema_id: SchemaId(1),
+                key: ScalarValue::Int4(1),
+                values: vec![
+                    Some(ScalarValue::Int4(2)),
+                    Some(ScalarValue::Int4(3)),
+                    Some(ScalarValue::Text("x".to_owned())),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn multi_column_update_sets_a_subset_by_index() {
+        // Each SET targets a value column; the index is 0-based over the value
+        // columns (a=0, b=1, c=2). Unnamed columns are merged by the engine.
+        let catalog = wide_catalog();
+        assert_eq!(
+            bind("UPDATE wide SET b = 9, c = 'z' WHERE id = 1", &catalog),
+            Ok(BoundDml::Update {
+                table: "wide".to_owned(),
+                schema_id: SchemaId(1),
+                key: ScalarValue::Int4(1),
+                assignments: vec![
+                    (1, Some(ScalarValue::Int4(9))),
+                    (2, Some(ScalarValue::Text("z".to_owned()))),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn multi_column_update_rejects_a_repeated_set_target() {
+        let catalog = wide_catalog();
+        assert!(matches!(
+            bind("UPDATE wide SET a = 1, a = 2 WHERE id = 1", &catalog),
+            Err(DmlError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn key_only_table_inserts_just_the_key() {
+        // A one-column table has no value columns: the row is the key alone.
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(
+                "solo",
+                vec![ColumnDef::new("id", LogicalType::Int4).expect("col")],
+                TableTemporal::system_only(),
+                SystemTimeMicros(1_000),
+            )
+            .expect("create solo");
+        assert_eq!(
+            bind("INSERT INTO solo VALUES (1)", &catalog),
+            Ok(BoundDml::Insert {
+                table: "solo".to_owned(),
+                schema_id: SchemaId(1),
+                key: ScalarValue::Int4(1),
+                values: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn wrong_value_count_for_a_wide_table_is_rejected() {
+        let catalog = wide_catalog();
+        assert_eq!(
+            bind("INSERT INTO wide VALUES (1, 2)", &catalog),
+            Err(DmlError::ColumnCountMismatch {
+                expected: 4,
+                found: 2,
             })
         );
     }
@@ -1215,7 +1272,7 @@ mod tests {
                 table: "flags".to_owned(),
                 schema_id: SchemaId(1),
                 key: ScalarValue::Text("alpha".to_owned()),
-                payload: Some(ScalarValue::Bool(true)),
+                values: vec![Some(ScalarValue::Bool(true))],
             })
         );
     }
