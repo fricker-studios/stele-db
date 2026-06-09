@@ -93,17 +93,25 @@ impl Interval {
     /// [`Self::from_pg_binary`] is the exact inverse. Timestamps cross the wire
     /// relative to 2000-01-01, so the body is shifted by
     /// [`PG_EPOCH_OFFSET_MICROS`] here and shifted back on the way in.
-    pub fn to_pg_binary(self, out: &mut Vec<u8>) {
+    ///
+    /// # Errors
+    ///
+    /// [`PeriodWireError::TimestampOutOfRange`] if a finite bound cannot be
+    /// re-based onto the Postgres epoch without `i64` overflow — a value so far
+    /// before 2000-01-01 that no stock driver could represent it. The codec
+    /// rejects it rather than wrap to an unrelated instant.
+    pub fn to_pg_binary(self, out: &mut Vec<u8>) -> Result<(), PeriodWireError> {
         let open_upper = self.to == i64::MAX;
         let mut flags = RANGE_LB_INC;
         if open_upper {
             flags |= RANGE_UB_INF;
         }
         out.push(flags);
-        push_timestamp(out, self.from);
+        push_timestamp(out, self.from)?;
         if !open_upper {
-            push_timestamp(out, self.to);
+            push_timestamp(out, self.to)?;
         }
+        Ok(())
     }
 
     /// Decode the bytes [`Self::to_pg_binary`] produced — a Postgres `tsrange`
@@ -159,17 +167,23 @@ const RANGE_UB_INF: u8 = 0x10;
 
 /// Append one bound as Postgres frames a `tsrange` element: an `int32` length of
 /// `8` then the `timestamp` body (big-endian microseconds since 2000-01-01).
-fn push_timestamp(out: &mut Vec<u8>, unix_micros: i64) {
+///
+/// Re-bases onto the Postgres epoch with checked arithmetic so an
+/// unrepresentable instant is rejected, never silently wrapped.
+fn push_timestamp(out: &mut Vec<u8>, unix_micros: i64) -> Result<(), PeriodWireError> {
+    let pg_micros = unix_micros
+        .checked_sub(PG_EPOCH_OFFSET_MICROS)
+        .ok_or(PeriodWireError::TimestampOutOfRange)?;
     out.extend_from_slice(&8i32.to_be_bytes());
-    out.extend_from_slice(
-        &unix_micros
-            .wrapping_sub(PG_EPOCH_OFFSET_MICROS)
-            .to_be_bytes(),
-    );
+    out.extend_from_slice(&pg_micros.to_be_bytes());
+    Ok(())
 }
 
 /// Read one length-framed `timestamp` element from the front of `rest`,
 /// advancing it past the bytes consumed and shifting back to the Unix epoch.
+///
+/// The epoch shift is checked: a Postgres-epoch value so large it cannot be a
+/// Unix-epoch `i64` is rejected, not wrapped into an unrelated instant.
 fn pop_timestamp(rest: &mut &[u8]) -> Result<i64, PeriodWireError> {
     let (len_bytes, after_len) = rest
         .split_first_chunk::<4>()
@@ -181,7 +195,9 @@ fn pop_timestamp(rest: &mut &[u8]) -> Result<i64, PeriodWireError> {
         .split_first_chunk::<8>()
         .ok_or(PeriodWireError::Truncated)?;
     *rest = after_body;
-    Ok(i64::from_be_bytes(*body).wrapping_add(PG_EPOCH_OFFSET_MICROS))
+    i64::from_be_bytes(*body)
+        .checked_add(PG_EPOCH_OFFSET_MICROS)
+        .ok_or(PeriodWireError::TimestampOutOfRange)
 }
 
 /// Why a buffer is not a Postgres `tsrange` binary value Stele can decode into
@@ -203,6 +219,10 @@ pub enum PeriodWireError {
     /// A bound element did not advertise the 8-byte `timestamp` width.
     #[error("period wire bound is not an 8-byte timestamp")]
     BadElementLength,
+    /// A bound could not be re-based between the Unix and Postgres epochs
+    /// without `i64` overflow — an instant no stock driver can represent.
+    #[error("period wire bound is out of the representable timestamp range")]
+    TimestampOutOfRange,
     /// The buffer ended mid-bound.
     #[error("period wire value is truncated")]
     Truncated,
@@ -310,11 +330,13 @@ mod tests {
         for iv in [
             Interval::new(T0, T1).unwrap(),
             Interval::new(T0, i64::MAX).unwrap(), // open upper
-            Interval::new(i64::MIN + 1, 0).unwrap(),
             Interval::new(-1, 1).unwrap(),
+            // The widest representable closed range: a lower bound exactly at the
+            // Postgres epoch floor, an upper bound just inside the ceiling.
+            Interval::new(i64::MIN + PG_EPOCH_OFFSET_MICROS, i64::MAX - 1).unwrap(),
         ] {
             let mut buf = Vec::new();
-            iv.to_pg_binary(&mut buf);
+            iv.to_pg_binary(&mut buf).expect("bound is representable");
             assert_eq!(
                 Interval::from_pg_binary(&buf),
                 Ok(iv),
@@ -324,11 +346,34 @@ mod tests {
     }
 
     #[test]
+    fn pg_binary_rejects_out_of_range_bounds() {
+        // A lower bound further before 2000-01-01 than `i64` can re-base: the
+        // codec rejects it rather than wrap to an unrelated instant.
+        let mut buf = Vec::new();
+        assert_eq!(
+            Interval::new(i64::MIN, 0).unwrap().to_pg_binary(&mut buf),
+            Err(PeriodWireError::TimestampOutOfRange)
+        );
+        // The decode mirror: a Postgres-epoch body so large it cannot be a
+        // Unix-epoch `i64` is rejected, not wrapped.
+        let mut overflow = vec![0x02];
+        overflow.extend_from_slice(&8i32.to_be_bytes());
+        overflow.extend_from_slice(&i64::MAX.to_be_bytes());
+        assert_eq!(
+            Interval::from_pg_binary(&overflow),
+            Err(PeriodWireError::TimestampOutOfRange)
+        );
+    }
+
+    #[test]
     fn pg_binary_layout_matches_postgres_range_send() {
         // A finite `tsrange`: flags `LB_INC` (0x02), then each bound as an int32
         // length of 8 and a big-endian timestamp body relative to 2000-01-01.
         let mut buf = Vec::new();
-        Interval::new(T0, T1).unwrap().to_pg_binary(&mut buf);
+        Interval::new(T0, T1)
+            .unwrap()
+            .to_pg_binary(&mut buf)
+            .unwrap();
 
         let lo = (T0 - PG_EPOCH_OFFSET_MICROS).to_be_bytes();
         let hi = (T1 - PG_EPOCH_OFFSET_MICROS).to_be_bytes();
@@ -341,7 +386,10 @@ mod tests {
 
         // An open-ended period sets `UB_INF` (0x10) and omits the upper element.
         let mut open = Vec::new();
-        Interval::new(T0, i64::MAX).unwrap().to_pg_binary(&mut open);
+        Interval::new(T0, i64::MAX)
+            .unwrap()
+            .to_pg_binary(&mut open)
+            .unwrap();
         let mut expected_open = vec![0x02 | 0x10];
         expected_open.extend_from_slice(&8i32.to_be_bytes());
         expected_open.extend_from_slice(&lo);
@@ -363,8 +411,8 @@ mod tests {
         );
         // Inclusive upper bound (LB_INC | UB_INC) after a valid lower.
         let mut buf = vec![0x02 | 0x04];
-        push_timestamp(&mut buf, T0);
-        push_timestamp(&mut buf, T1);
+        push_timestamp(&mut buf, T0).unwrap();
+        push_timestamp(&mut buf, T1).unwrap();
         assert_eq!(
             Interval::from_pg_binary(&buf),
             Err(PeriodWireError::UnsupportedUpperBound)
@@ -373,7 +421,8 @@ mod tests {
         let mut trailing = Vec::new();
         Interval::new(T0, i64::MAX)
             .unwrap()
-            .to_pg_binary(&mut trailing);
+            .to_pg_binary(&mut trailing)
+            .unwrap();
         trailing.push(0xFF);
         assert_eq!(
             Interval::from_pg_binary(&trailing),
