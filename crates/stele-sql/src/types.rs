@@ -80,6 +80,16 @@ mod tests {
         assert_eq!(logical_type(&DataType::Text).unwrap(), LogicalType::Text);
         assert_eq!(logical_type(&DataType::Boolean).unwrap(), LogicalType::Bool);
         assert_eq!(logical_type(&DataType::Date).unwrap(), LogicalType::Date);
+        // Bare TIMESTAMP and its zone-bearing spellings map to the two distinct
+        // instant types (STL-189).
+        assert_eq!(
+            logical_type(&DataType::Timestamp(None, TimezoneInfo::None)).unwrap(),
+            LogicalType::Timestamp
+        );
+        assert_eq!(
+            logical_type(&DataType::Timestamp(None, TimezoneInfo::WithTimeZone)).unwrap(),
+            LogicalType::TimestampTz
+        );
         // STL-181 additions.
         assert_eq!(logical_type(&DataType::Uuid).unwrap(), LogicalType::Uuid);
         assert_eq!(logical_type(&DataType::Bytea).unwrap(), LogicalType::Bytea);

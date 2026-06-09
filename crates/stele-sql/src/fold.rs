@@ -98,7 +98,7 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
                 .map(ScalarValue::Uuid)
                 .ok_or_else(|| FoldError::BadLiteral {
                     literal: s.clone(),
-                    reason: None,
+                    reason: Some("expected a UUID: 32 hex digits, optionally hyphenated"),
                 })
         }
         LogicalType::Bytea => {
@@ -109,7 +109,7 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
                 .map(ScalarValue::Bytea)
                 .ok_or_else(|| FoldError::BadLiteral {
                     literal: s.clone(),
-                    reason: None,
+                    reason: Some("expected bytea hex: `\\x` then an even number of hex digits"),
                 })
         }
         // A `timestamptz` literal carries a zone offset that is normalized to the

@@ -97,7 +97,7 @@ fn format_period(iv: &Interval) -> String {
     }
 }
 
-/// Lowercase hex digit for the low nibble of `b`'s high/low half — the shared
+/// Append `byte` as two lowercase hex digits (high nibble then low) — the shared
 /// primitive behind the `uuid` and `bytea` renderings.
 fn push_hex(out: &mut String, byte: u8) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
