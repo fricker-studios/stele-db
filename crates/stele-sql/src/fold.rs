@@ -27,10 +27,14 @@ pub(crate) enum FoldError {
         found: &'static str,
     },
     /// The literal is the right shape for the type but cannot be represented
-    /// (out of range, or not an integer). Carries the offending literal text.
+    /// (out of range, not an integer, or a malformed civil-time literal). Carries
+    /// the offending literal text and, where the codec produced one, a short
+    /// reason (e.g. `"month out of range"`).
     BadLiteral {
         /// The literal text that could not be represented.
         literal: String,
+        /// A short, stable explanation from the type's codec, when it has one.
+        reason: Option<&'static str>,
     },
     /// The column's type has no literal codec (the zone-less `TIMESTAMP` / `DATE`
     /// — no civil-time literal parsing yet; mirrors the `AS OF` stance).
@@ -55,7 +59,10 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
             digits
                 .parse::<i32>()
                 .map(ScalarValue::Int4)
-                .map_err(|_| FoldError::BadLiteral { literal: digits })
+                .map_err(|_| FoldError::BadLiteral {
+                    literal: digits,
+                    reason: None,
+                })
         }
         LogicalType::Int8 => {
             let digits = signed_number(expr).ok_or(FoldError::TypeMismatch {
@@ -64,7 +71,10 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
             digits
                 .parse::<i64>()
                 .map(ScalarValue::Int8)
-                .map_err(|_| FoldError::BadLiteral { literal: digits })
+                .map_err(|_| FoldError::BadLiteral {
+                    literal: digits,
+                    reason: None,
+                })
         }
         LogicalType::Text => match literal(expr) {
             Some(Value::SingleQuotedString(s)) => Ok(ScalarValue::Text(s.clone())),
@@ -83,7 +93,10 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
         LogicalType::TimestampTz => match literal(expr) {
             Some(Value::SingleQuotedString(s)) => stele_common::datetime::parse_timestamptz(s)
                 .map(ScalarValue::TimestampTz)
-                .map_err(|_| FoldError::BadLiteral { literal: s.clone() }),
+                .map_err(|e| FoldError::BadLiteral {
+                    literal: e.literal,
+                    reason: Some(e.reason),
+                }),
             _ => Err(FoldError::TypeMismatch {
                 found: describe(expr),
             }),

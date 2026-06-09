@@ -167,10 +167,15 @@ fn format_timestamp(micros: i64) -> String {
 /// UTC-internal and carries no session time zone, so the offset is always `+00`
 /// — matching what Postgres prints for a `timestamptz` read back with `TimeZone`
 /// set to `UTC` (STL-189).
+///
+/// The offset goes *before* any era suffix: Postgres renders a pre-AD instant as
+/// `0001-01-01 00:00:00+00 BC`, with ` BC` last. `format_timestamp` already
+/// appends ` BC` for proleptic years ≤ 0, so it is split back off before the
+/// offset is inserted.
 fn format_timestamptz(micros: i64) -> String {
-    let mut out = format_timestamp(micros);
-    out.push_str("+00");
-    out
+    let base = format_timestamp(micros);
+    base.strip_suffix(" BC")
+        .map_or_else(|| format!("{base}+00"), |head| format!("{head}+00 BC"))
 }
 
 #[cfg(test)]
@@ -303,6 +308,17 @@ mod tests {
         assert_eq!(
             encode_text(&ScalarValue::TimestampTz(1_700_000_000_120_000)),
             "2023-11-14 22:13:20.12+00"
+        );
+    }
+
+    #[test]
+    fn timestamptz_offset_precedes_the_bc_era_suffix() {
+        // Proleptic astronomical year 0 = `1 BC`; 0001-01-01 BC at 00:00:00 UTC.
+        // Postgres orders the offset before the era: `... 00:00:00+00 BC`.
+        let micros = -719_528 * MICROS_PER_DAY;
+        assert_eq!(
+            encode_text(&ScalarValue::TimestampTz(micros)),
+            "0001-01-01 00:00:00+00 BC"
         );
     }
 

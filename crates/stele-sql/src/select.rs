@@ -478,8 +478,9 @@ fn predicate_reason(err: &FoldError, column: &str, ty: LogicalType) -> String {
         FoldError::TypeMismatch { found } => {
             format!("{found} is not a {ty} value for column {column:?}")
         }
-        FoldError::BadLiteral { literal } => {
-            format!("{literal:?} is not a valid {ty} for column {column:?}")
+        FoldError::BadLiteral { literal, reason } => {
+            let detail = reason.map(|r| format!(" ({r})")).unwrap_or_default();
+            format!("{literal:?} is not a valid {ty} for column {column:?}{detail}")
         }
         FoldError::UnsupportedType(ty) => {
             format!("comparing a {ty} column ({column:?}) to a literal is not supported yet")

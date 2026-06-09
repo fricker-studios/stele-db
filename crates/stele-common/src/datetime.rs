@@ -112,7 +112,7 @@ pub fn parse_timestamptz(input: &str) -> Result<i64, TimestamptzParseError> {
 
     let offset_secs = parse_zone(zone_str).ok_or_else(|| err("malformed time zone offset"))?;
 
-    let days = days_from_civil(year, month, day);
+    let days = days_from_civil(year, month, day).ok_or_else(|| err("instant out of range"))?;
     let tod_us = (i64::from(hh) * SECS_PER_HOUR + i64::from(mm) * 60 + i64::from(ss))
         * MICROS_PER_SEC
         + frac_us;
@@ -250,17 +250,24 @@ const fn is_leap_year(year: i64) -> bool {
 }
 
 /// Days from the Unix epoch (1970-01-01) for a proleptic-Gregorian `(year,
-/// month, day)`. Howard Hinnant's `days_from_civil` (public domain) — the exact
-/// inverse of the encoder's `civil_from_days`, valid across the full `i64` range.
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let m = i64::from(month);
-    let d = i64::from(day);
-    let y = year - i64::from(m <= 2);
+/// month, day)`, or `None` if the result does not fit `i64`. Howard Hinnant's
+/// `days_from_civil` (public domain) — the exact inverse of the encoder's
+/// `civil_from_days`.
+///
+/// The intermediates (`era * 146_097`) overflow `i64` for years near its bounds —
+/// a `9223372036854775807-01-01` literal would silently wrap — so the math runs
+/// in `i128` and narrows back with a checked conversion. An out-of-range year
+/// then surfaces as the caller's `"instant out of range"` rather than a wrong
+/// instant or a debug panic.
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    let m = i128::from(month);
+    let d = i128::from(day);
+    let y = i128::from(year) - i128::from(m <= 2);
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400; // [0, 399]
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146_097 + doe - 719_468
+    i64::try_from(era * 146_097 + doe - 719_468).ok()
 }
 
 /// True if every byte of `s` is an ASCII digit (and `s` is non-empty).
@@ -405,9 +412,20 @@ mod tests {
             let (y, m, d) = civil_from_days(days);
             assert_eq!(
                 days_from_civil(y, m, d),
-                days,
+                Some(days),
                 "round-trip failed at {days}"
             );
         }
+    }
+
+    #[test]
+    fn astronomically_large_year_is_rejected_not_wrapped() {
+        // A year near `i64::MAX` overflows the `era * 146_097` intermediate; the
+        // i128 math + checked narrowing must turn that into a clean error rather
+        // than a silently-wrapped (or debug-panicking) instant.
+        assert!(parse_timestamptz("9223372036854775807-01-01 00:00:00Z").is_err());
+        // A merely huge-but-representable calendar year still overflows the µs
+        // instant, which the caller's `checked_mul` rejects.
+        assert!(parse_timestamptz("900000-01-01 00:00:00Z").is_err());
     }
 }
