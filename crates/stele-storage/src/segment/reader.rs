@@ -965,7 +965,7 @@ fn assemble_version_keys(
 ) -> Result<Vec<(BusinessKey, SystemTimeMicros, u64)>, SegmentError> {
     if business_keys.len() != sys_from.len() || business_keys.len() != seqs.len() {
         return Err(SegmentError::Corrupt(
-            "business_key / sys_from / seq value counts disagree within row-group",
+            "business_key / sys_from / seq value counts disagree",
         ));
     }
     // `mem::take` the owned key bytes out — the column vector is discarded at the
