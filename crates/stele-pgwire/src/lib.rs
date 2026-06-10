@@ -1827,6 +1827,13 @@ async fn handle_bind(
     };
     let (pstmt, param_oids) = (prepared.stmt.clone(), prepared.param_oids.clone());
 
+    // The parameter format-code array must be a valid shape for the parameter
+    // count before we read it through `format_at`. (Result formats are validated
+    // later, against the actual column count, in Describe / Execute.)
+    if let Err(m) = validate_formats(&msg.param_formats, msg.params.len()) {
+        return fail_extended(stream, state, SQLSTATE_PROTOCOL_VIOLATION, &m).await;
+    }
+
     let mut values = Vec::with_capacity(msg.params.len());
     for (i, raw) in msg.params.iter().enumerate() {
         let oid = param_oids.get(i).copied().unwrap_or(0);
@@ -1933,6 +1940,11 @@ async fn handle_describe_portal(
         _ => Vec::new(),
     };
     let formats = portal.result_formats.clone();
+    // Now that the column count is known, the negotiated result format array must
+    // be a valid shape for it (Postgres `08P01` otherwise).
+    if let Err(m) = validate_formats(&formats, header.len()) {
+        return fail_extended(stream, state, SQLSTATE_PROTOCOL_VIOLATION, &m).await;
+    }
     write_row_description(stream, &header, &formats).await?;
     Ok(())
 }
@@ -1980,6 +1992,18 @@ async fn handle_execute(
     };
     if let Err(e) = ensure_executed(state, &msg.portal, session, &stmt, txn) {
         return fail_extended(stream, state, e.sqlstate, &e.message).await;
+    }
+
+    // Validate the negotiated result formats against the now-known column count
+    // before streaming anything — an Execute that skipped Describe still gets the
+    // shape check (Postgres `08P01`). A non-row portal has zero columns.
+    let entry = state.portals.get(&msg.portal).expect("portal present");
+    let cols = match &entry.executed {
+        Some(Executed::Rows { header, .. }) => header.len(),
+        _ => 0,
+    };
+    if let Err(m) = validate_formats(&entry.result_formats, cols) {
+        return fail_extended(stream, state, SQLSTATE_PROTOCOL_VIOLATION, &m).await;
     }
 
     let entry = state.portals.get_mut(&msg.portal).expect("portal present");
@@ -2280,6 +2304,32 @@ fn format_at(formats: &[i16], i: usize) -> i16 {
         [] => FORMAT_TEXT,
         [single] => *single,
         many => many.get(i).copied().unwrap_or(FORMAT_TEXT),
+    }
+}
+
+/// Validate a `Bind` format-code array against the `slots` it applies to (the
+/// parameter count, or a result's column count). The protocol allows only the
+/// codes `0` (text) and `1` (binary), and only three array shapes: empty (all
+/// text), one code (broadcast to every slot), or exactly one code per slot. Any
+/// other code or length is a protocol violation (Postgres `08P01`), returned as
+/// the error message — rejecting it here keeps [`format_at`]'s text fallback from
+/// silently masking a malformed frame.
+fn validate_formats(formats: &[i16], slots: usize) -> Result<(), String> {
+    if let Some(&bad) = formats
+        .iter()
+        .find(|&&f| f != FORMAT_TEXT && f != FORMAT_BINARY)
+    {
+        return Err(format!(
+            "invalid format code {bad}: must be 0 (text) or 1 (binary)"
+        ));
+    }
+    if matches!(formats.len(), 0 | 1) || formats.len() == slots {
+        Ok(())
+    } else {
+        Err(format!(
+            "format-code count {} does not match {slots} (must be 0, 1, or {slots})",
+            formats.len()
+        ))
     }
 }
 
@@ -4317,12 +4367,82 @@ mod tests {
         send_sync(&mut client).await;
 
         let msgs = drain_to_ready(&mut client).await;
-        let err = msgs.iter().find(|(k, _)| *k == MSG_ERROR_RESPONSE).unwrap();
         assert!(
-            err.1
-                .windows(SQLSTATE_INVALID_BINARY_REPRESENTATION.len())
-                .any(|w| w == SQLSTATE_INVALID_BINARY_REPRESENTATION.as_bytes()),
+            error_has_sqlstate(&msgs, SQLSTATE_INVALID_BINARY_REPRESENTATION),
             "ErrorResponse carries SQLSTATE 22P03"
+        );
+        terminate(server, client).await;
+    }
+
+    /// Whether the batch's `ErrorResponse` carries `sqlstate` (the `S`-prefixed
+    /// `C…` field is a NUL-delimited cstring in the payload).
+    fn error_has_sqlstate(msgs: &[(u8, Vec<u8>)], sqlstate: &str) -> bool {
+        msgs.iter().any(|(k, p)| {
+            *k == MSG_ERROR_RESPONSE && p.windows(sqlstate.len()).any(|w| w == sqlstate.as_bytes())
+        })
+    }
+
+    /// A parameter format code other than 0/1 is a protocol violation (`08P01`),
+    /// caught at Bind before any decode.
+    #[tokio::test]
+    async fn invalid_parameter_format_code_is_a_protocol_violation() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+
+        send_parse(
+            &mut client,
+            "",
+            "INSERT INTO account VALUES ($1, $2)",
+            &[OID_INT4, OID_INT4],
+        )
+        .await;
+        // Format code 2 is neither text (0) nor binary (1).
+        send_bind_raw(
+            &mut client,
+            "",
+            "",
+            &[2],
+            &[Some(&7i32.to_be_bytes()), Some(&700i32.to_be_bytes())],
+            &[],
+        )
+        .await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        assert!(
+            error_has_sqlstate(&msgs, SQLSTATE_PROTOCOL_VIOLATION),
+            "bad format code is 08P01: {msgs:?}"
+        );
+        terminate(server, client).await;
+    }
+
+    /// A result format-code array whose length is neither 0, 1, nor the column
+    /// count is a protocol violation (`08P01`), caught against the real column
+    /// count at Describe.
+    #[tokio::test]
+    async fn wrong_length_result_format_array_is_a_protocol_violation() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+        run_simple(&mut client, "INSERT INTO account VALUES (1, 100)").await;
+
+        send_parse(&mut client, "", "SELECT id, balance FROM account", &[]).await;
+        // Three result format codes for a two-column result.
+        send_bind_raw(
+            &mut client,
+            "",
+            "",
+            &[],
+            &[],
+            &[FORMAT_TEXT, FORMAT_BINARY, FORMAT_TEXT],
+        )
+        .await;
+        send_describe(&mut client, b'P', "").await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        assert!(
+            error_has_sqlstate(&msgs, SQLSTATE_PROTOCOL_VIOLATION),
+            "mismatched result-format count is 08P01: {msgs:?}"
         );
         terminate(server, client).await;
     }

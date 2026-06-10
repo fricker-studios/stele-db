@@ -241,10 +241,11 @@ pub(crate) enum ParamError {
     #[error("invalid input syntax for type boolean: {0:?}")]
     BadBool(String),
 
-    /// A binary-format parameter was sent without a declared type OID — there is
-    /// no text form to fall back on, so the type must be known to decode the bytes.
-    #[error("binary-format parameter has no declared type (OID 0)")]
-    BinaryUntyped,
+    /// A binary-format parameter could not be matched to a Stele type from its
+    /// declared OID — either the untyped sentinel `0` (no text form to fall back
+    /// on) or an OID outside the supported set. Binary decode needs a known type.
+    #[error("cannot decode binary-format parameter: no supported type for OID {oid}")]
+    BinaryUntyped { oid: u32 },
 
     /// A binary-format parameter's bytes did not decode under its declared type.
     #[error(transparent)]
@@ -256,7 +257,7 @@ impl ParamError {
     /// reports `invalid_binary_representation` (`22P03`) for these and
     /// `invalid_text_representation` (`22P02`) for the rest.
     pub(crate) const fn is_binary(&self) -> bool {
-        matches!(self, Self::BinaryUntyped | Self::Binary(_))
+        matches!(self, Self::BinaryUntyped { .. } | Self::Binary(_))
     }
 }
 
@@ -281,7 +282,7 @@ pub(crate) fn param_to_value(
     // params are decoded to a value and rendered to their canonical text.
     let owned;
     let text: &str = if binary {
-        let ty = LogicalType::from_pg_oid(oid).ok_or(ParamError::BinaryUntyped)?;
+        let ty = LogicalType::from_pg_oid(oid).ok_or(ParamError::BinaryUntyped { oid })?;
         owned = text_format::encode_text(&binary_format::decode_binary(ty, bytes)?);
         &owned
     } else {
@@ -656,10 +657,16 @@ mod tests {
 
     #[test]
     fn binary_parameter_errors_surface_cleanly() {
-        // A binary parameter with no declared type cannot be decoded.
+        // A binary parameter with no declared type cannot be decoded — and the
+        // error names the offending OID rather than hard-coding `0`.
         assert_eq!(
             param_to_value(0, true, Some(&[0, 0, 0, 1])),
-            Err(ParamError::BinaryUntyped)
+            Err(ParamError::BinaryUntyped { oid: 0 })
+        );
+        // An unsupported but non-zero OID reports that OID, not `0`.
+        assert_eq!(
+            param_to_value(9999, true, Some(&[0, 0, 0, 1])),
+            Err(ParamError::BinaryUntyped { oid: 9999 })
         );
         assert!(
             param_to_value(0, true, Some(&[0, 0, 0, 1]))
