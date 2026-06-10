@@ -3500,7 +3500,7 @@ mod tests {
                         let bytes = row[0].clone().expect("id is never NULL");
                         match ScalarValue::decode(LogicalType::Int4, &bytes).expect("decode id") {
                             ScalarValue::Int4(id) => id,
-                            other => panic!("id column is INT, got {other:?}"),
+                            _ => panic!("id column is declared INT"),
                         }
                     })
                     .collect();
@@ -3599,7 +3599,7 @@ mod tests {
                     let bytes = row[0].clone().expect("id is never NULL");
                     match ScalarValue::decode(LogicalType::Int4, &bytes).expect("decode id") {
                         ScalarValue::Int4(id) => id,
-                        other => panic!("id column is INT, got {other:?}"),
+                        _ => panic!("id column is declared INT"),
                     }
                 })
                 .collect();
