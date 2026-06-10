@@ -1147,7 +1147,7 @@ mod tests {
         for value in values {
             let mut buf = Vec::new();
             value.encode(&mut buf);
-            let col = Column::Bytes(vec![Some(buf), None]);
+            let col = Column::Bytes(vec![Some(buf), None].into());
             let vector = Vector::from_column(value.logical_type(), &col).expect("bridge");
             assert_eq!(vector.get(0), Some(value.clone()), "present cell");
             assert_eq!(vector.get(1), None, "null cell");
@@ -1156,7 +1156,7 @@ mod tests {
 
     #[test]
     fn from_column_reads_i64_fixed_width_directly() {
-        let col = Column::I64(vec![1, -2, 3]);
+        let col = Column::I64(vec![1, -2, 3].into());
         assert_eq!(
             Vector::from_column(LogicalType::Int8, &col).expect("bridge"),
             Vector::Int8(vec![Some(1), Some(-2), Some(3)])
@@ -1166,7 +1166,7 @@ mod tests {
     #[test]
     fn from_column_rejects_out_of_scope_type() {
         // `float8` is the only logical type still outside the evaluator's scope.
-        let col = Column::Bytes(vec![Some(vec![0; 8])]);
+        let col = Column::Bytes(vec![Some(vec![0; 8])].into());
         assert_eq!(
             Vector::from_column(LogicalType::Float8, &col),
             Err(ExprError::UnsupportedColumn {

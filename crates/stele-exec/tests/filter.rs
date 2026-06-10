@@ -103,16 +103,22 @@ fn filter_keeps_true_rows_and_skips_fully_filtered_batches() {
 fn filter_passes_through_unreferenced_columns() {
     // Two columns; the predicate only references column 0 (an int4 key), so the
     // opaque column 1 rides along untouched — its schema entry is never read.
-    let keys = Column::Bytes(vec![
-        cell(&ScalarValue::Int4(1)),
-        cell(&ScalarValue::Int4(2)),
-        cell(&ScalarValue::Int4(3)),
-    ]);
-    let payloads = Column::Bytes(vec![
-        Some(b"one".to_vec()),
-        Some(b"two".to_vec()),
-        Some(b"three".to_vec()),
-    ]);
+    let keys = Column::Bytes(
+        vec![
+            cell(&ScalarValue::Int4(1)),
+            cell(&ScalarValue::Int4(2)),
+            cell(&ScalarValue::Int4(3)),
+        ]
+        .into(),
+    );
+    let payloads = Column::Bytes(
+        vec![
+            Some(b"one".to_vec()),
+            Some(b"two".to_vec()),
+            Some(b"three".to_vec()),
+        ]
+        .into(),
+    );
     let batch = Batch {
         columns: vec![(ColumnId::BusinessKey, keys), (ColumnId::Payload, payloads)],
         rows: 3,
@@ -130,9 +136,12 @@ fn filter_passes_through_unreferenced_columns() {
     // The surviving row carries both columns, aligned: key 2 and payload "two".
     assert_eq!(
         out.columns[0].1,
-        Column::Bytes(vec![cell(&ScalarValue::Int4(2))])
+        Column::Bytes(vec![cell(&ScalarValue::Int4(2))].into())
     );
-    assert_eq!(out.columns[1].1, Column::Bytes(vec![Some(b"two".to_vec())]));
+    assert_eq!(
+        out.columns[1].1,
+        Column::Bytes(vec![Some(b"two".to_vec())].into())
+    );
 }
 
 #[test]
@@ -143,9 +152,12 @@ fn a_referenced_column_with_no_schema_type_is_a_distinct_error() {
         columns: vec![
             (
                 ColumnId::BusinessKey,
-                Column::Bytes(vec![cell(&ScalarValue::Int4(1))]),
+                Column::Bytes(vec![cell(&ScalarValue::Int4(1))].into()),
             ),
-            (ColumnId::Payload, Column::Bytes(vec![Some(b"x".to_vec())])),
+            (
+                ColumnId::Payload,
+                Column::Bytes(vec![Some(b"x".to_vec())].into()),
+            ),
         ],
         rows: 1,
     };

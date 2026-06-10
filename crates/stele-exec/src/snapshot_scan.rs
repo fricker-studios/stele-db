@@ -96,6 +96,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
+use std::sync::Arc;
 
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::row_codec::RowCodecError;
@@ -164,19 +165,131 @@ pub enum ScanError {
     RowCodec(#[from] RowCodecError),
 }
 
+/// A shared, immutable, windowed cell buffer — the zero-copy backing store of a
+/// [`Column`] ([STL-191]).
+///
+/// The cells live in one reference-counted allocation (`Arc<[T]>`); a `Cells`
+/// value is a `(offset, len)` window over it. Cloning bumps the refcount and
+/// [`slice`](Self::slice) narrows the window — neither touches a cell, so
+/// cutting a resolved column into pull-pipeline batches ([`crate::ScanSource`])
+/// and re-emitting columns through [`Project`](crate::Project) never copy
+/// payload bytes. The buffer is never mutated after construction, the same
+/// immutability an Arrow buffer guarantees (assumption A7).
+///
+/// It dereferences to the windowed `[T]` slice, so reading code treats it
+/// exactly like the `Vec` it replaced (`iter()`, indexing, `len()`); equality
+/// and `Debug` also see only the window, never the shared allocation around it.
+pub struct Cells<T> {
+    buf: Arc<[T]>,
+    offset: usize,
+    len: usize,
+}
+
+impl<T> Cells<T> {
+    /// The windowed cells as a slice.
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        &self.buf[self.offset..self.offset + self.len]
+    }
+
+    /// A `len`-cell window starting at `offset` (relative to this window),
+    /// sharing the backing buffer — a refcount bump, no cell is copied.
+    ///
+    /// # Panics
+    ///
+    /// If `offset + len` exceeds this window's length.
+    #[must_use]
+    pub fn slice(&self, offset: usize, len: usize) -> Self {
+        assert!(
+            offset.checked_add(len).is_some_and(|end| end <= self.len),
+            "slice [{offset}, {offset}+{len}) out of bounds of a {}-cell window",
+            self.len
+        );
+        Self {
+            buf: Arc::clone(&self.buf),
+            offset: self.offset + offset,
+            len,
+        }
+    }
+}
+
+impl<T> From<Vec<T>> for Cells<T> {
+    fn from(cells: Vec<T>) -> Self {
+        let len = cells.len();
+        Self {
+            buf: cells.into(),
+            offset: 0,
+            len,
+        }
+    }
+}
+
+impl<T> FromIterator<T> for Cells<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        iter.into_iter().collect::<Vec<T>>().into()
+    }
+}
+
+impl<T> std::ops::Deref for Cells<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Cells<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+// Manual impls so none of them bounds `T: Clone` and all of them see the
+// window, not the backing allocation: two windows are equal iff their visible
+// cells are, regardless of how they share buffers.
+impl<T> Clone for Cells<T> {
+    fn clone(&self) -> Self {
+        Self {
+            buf: Arc::clone(&self.buf),
+            offset: self.offset,
+            len: self.len,
+        }
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for Cells<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.as_slice()).finish()
+    }
+}
+
+impl<T: PartialEq> PartialEq for Cells<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<T: Eq> Eq for Cells<T> {}
+
 /// One column of a [`Batch`] — Arrow-shaped: a single typed, contiguous array
 /// whose length equals the batch's row count.
+///
+/// Backed by a shared [`Cells`] buffer, so cloning, slicing, and re-projecting
+/// a column are shallow refcount operations ([STL-191]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Column {
     /// A variable-length bytes column (business key, payload, principal). Each
     /// cell is `Option<Vec<u8>>` so a SQL `NULL` payload ([STL-154]) is carried
     /// as `None`, distinct from `Some(vec![])` (an empty value). The always-present
     /// columns (business key, principal) only ever hold `Some`.
-    Bytes(Vec<Option<Vec<u8>>>),
+    Bytes(Cells<Option<Vec<u8>>>),
     /// A fixed-width `i64` column (system time, seq, provenance scalars). `u64`
     /// columns (`seq`, `txn_id`) are carried as their `i64` bit-reinterpretation,
     /// the same lossless round-trip the segment format uses ([`ColumnId::TxnId`]).
-    I64(Vec<i64>),
+    I64(Cells<i64>),
 }
 
 impl Column {
@@ -199,9 +312,9 @@ impl Column {
     /// batch-at-a-time pull pipeline ([`crate::Operator`]) to cut a fully
     /// resolved column into fixed-size batches.
     ///
-    /// This currently deep-copies the window: `Column` owns its cells rather than
-    /// a shared buffer, so an Arrow-style zero-copy slice awaits the shared-buffer
-    /// `Column` representation (a tracked v0.2 follow-up; see PR #77 / STL-170).
+    /// Zero-copy: the window shares the column's [`Cells`] buffer ([STL-191]),
+    /// so slicing costs a refcount bump however large the window — no payload
+    /// byte is copied.
     ///
     /// # Panics
     ///
@@ -210,16 +323,17 @@ impl Column {
     #[must_use]
     pub fn slice(&self, offset: usize, len: usize) -> Self {
         match self {
-            Self::Bytes(v) => Self::Bytes(v[offset..offset + len].to_vec()),
-            Self::I64(v) => Self::I64(v[offset..offset + len].to_vec()),
+            Self::Bytes(v) => Self::Bytes(v.slice(offset, len)),
+            Self::I64(v) => Self::I64(v.slice(offset, len)),
         }
     }
 
     /// Gather the cells at `rows`, in the given order, into a new column — the
     /// row-selection a [`Filter`](crate::Filter) applies once it knows which
-    /// rows its predicate kept. Like [`slice`](Self::slice) this copies (a
-    /// `Column` owns its cells); the same shared-buffer follow-up would make it
-    /// zero-copy.
+    /// rows its predicate kept. Unlike [`slice`](Self::slice) a gather is not a
+    /// window — the kept rows are not contiguous — so it materializes a fresh
+    /// buffer, cloning the selected cells (a selection-vector batch form would
+    /// defer even that; out of scope here).
     ///
     /// # Panics
     ///

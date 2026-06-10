@@ -31,7 +31,7 @@ fn scan_batch(keys: &[&[u8]], payloads: Vec<Option<Vec<u8>>>) -> Batch {
                 ColumnId::BusinessKey,
                 Column::Bytes(keys.iter().map(|k| Some(k.to_vec())).collect()),
             ),
-            (ColumnId::Payload, Column::Bytes(payloads)),
+            (ColumnId::Payload, Column::Bytes(payloads.into())),
         ],
         rows: keys.len(),
     }

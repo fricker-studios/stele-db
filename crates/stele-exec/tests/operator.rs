@@ -10,7 +10,12 @@
 //!   at most that many rows and the windows tile the result exactly;
 //! * **projection** — the [`Project`] operator selects and reorders its child's
 //!   columns, and names a column the child did not emit → `MissingColumn`;
-//! * **empty stream** — a scan that resolves no rows emits no batches.
+//! * **empty stream** — a scan that resolves no rows emits no batches;
+//! * **zero-copy batches** — slicing or cloning a column, and the source's
+//!   emitted batch windows, share one backing cell buffer rather than copying
+//!   payload bytes ([STL-191]), shown by cell-address aliasing.
+//!
+//! [STL-191]: https://allegromusic.atlassian.net/browse/STL-191
 
 #![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 
@@ -260,4 +265,91 @@ fn source_exposes_scan_stats_after_first_pull() {
     let stats = source.stats().expect("stats after first pull");
     // No sealed segments in this fixture, so the accounting is all zeros.
     assert_eq!(stats.segments_total, 0);
+}
+
+// --- zero-copy representation (STL-191) -------------------------------------
+
+/// The payload column's cells as the raw windowed slice — for the aliasing
+/// assertions below, which compare cell *addresses*, not contents.
+fn payload_cells(batch: &Batch) -> &[Option<Vec<u8>>] {
+    let (_, column) = batch
+        .columns
+        .iter()
+        .find(|(c, _)| *c == ColumnId::Payload)
+        .expect("payload projected");
+    match column {
+        Column::Bytes(cells) => cells.as_slice(),
+        Column::I64(_) => panic!("payload is a bytes column"),
+    }
+}
+
+#[test]
+fn slice_shares_the_backing_cells_instead_of_copying() {
+    let col = Column::Bytes(
+        vec![
+            Some(b"alpha".to_vec()),
+            Some(b"beta".to_vec()),
+            None,
+            Some(b"gamma".to_vec()),
+        ]
+        .into(),
+    );
+    let Column::Bytes(all) = &col else {
+        unreachable!()
+    };
+
+    let window = col.slice(1, 2);
+    let Column::Bytes(sliced) = &window else {
+        panic!("slice preserves the column variant")
+    };
+
+    // The window's cells are the very same memory as the original's — a slice
+    // is a refcount bump over the shared buffer, not a copy of the cells…
+    assert!(std::ptr::eq(&all[1], &sliced[0]));
+    assert!(std::ptr::eq(&all[2], &sliced[1]));
+    // …so a cell's payload bytes stay the same heap allocation, byte pointer
+    // and all (a deep copy would re-allocate them).
+    assert_eq!(
+        all[1].as_ref().map(Vec::as_ptr),
+        sliced[0].as_ref().map(Vec::as_ptr),
+    );
+    // Equality still sees only the window's contents, not the buffer around it.
+    assert_eq!(
+        window,
+        Column::Bytes(vec![Some(b"beta".to_vec()), None].into())
+    );
+}
+
+#[test]
+// The clone *is* the unit under test — its sharing is what the assertion probes.
+#[allow(clippy::redundant_clone)]
+fn clone_shares_the_backing_cells_instead_of_copying() {
+    // `Project` re-emits columns by move, and its degenerate duplicate-projection
+    // path by clone — which must be equally shallow.
+    let col = Column::I64(vec![1, 2, 3].into());
+    let copy = col.clone();
+    let (Column::I64(a), Column::I64(b)) = (&col, &copy) else {
+        unreachable!()
+    };
+    assert!(std::ptr::eq(&a[0], &b[0]));
+}
+
+#[test]
+fn scan_source_batches_are_windows_over_one_shared_buffer() {
+    // End-to-end through the pull pipeline: each emitted batch is a zero-copy
+    // window over the one resolved payload column, so adjacent batches' cells
+    // sit end-to-end in the same backing allocation — batch N+1 begins exactly
+    // where batch N ends.
+    let (delta, index, snap) = table_with_rows(5);
+    let source = SnapshotScan::new(&delta, &index, &NO_SEGMENTS, snap).into_source(2);
+    let batches = drain(source);
+    assert_eq!(batches.len(), 3, "5 rows in windows of 2");
+    for pair in batches.windows(2) {
+        let (a, b) = (payload_cells(&pair[0]), payload_cells(&pair[1]));
+        assert_eq!(
+            a.as_ptr().wrapping_add(a.len()),
+            b.as_ptr(),
+            "adjacent batches must window the same shared buffer",
+        );
+    }
 }

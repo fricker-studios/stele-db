@@ -185,9 +185,10 @@ impl<C: Operator> Operator for Project<C> {
         let rows = batch.rows;
         // Move the child's columns into takeable slots so a projection that
         // selects + reorders distinct columns (the common case) *moves* each one
-        // out of the owned batch — no per-batch deep clone. A column projected
-        // more than once (degenerate) clones from the copy already emitted this
-        // batch; a column the child never emitted is a plan error.
+        // out of the owned batch. A column projected more than once (degenerate)
+        // clones the copy already emitted this batch — a shallow refcount bump
+        // on the shared cell buffer ([STL-191]), never a byte copy; a column the
+        // child never emitted is a plan error.
         let mut slots: Vec<(ColumnId, Option<Column>)> = batch
             .columns
             .into_iter()
@@ -307,7 +308,7 @@ impl<C: Operator> Operator for ExplodePayload<C> {
         columns.extend(
             value_cols
                 .into_iter()
-                .map(|cells| (ColumnId::Payload, Column::Bytes(cells))),
+                .map(|cells| (ColumnId::Payload, Column::Bytes(cells.into()))),
         );
         Ok(Some(Batch { columns, rows }))
     }

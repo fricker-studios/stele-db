@@ -315,7 +315,7 @@ fn projection_selects_and_orders_columns() {
     );
     assert_eq!(one_bytes(&out, ColumnId::BusinessKey), key.as_bytes());
     match &out.batch.columns[2].1 {
-        Column::I64(v) => assert_eq!(v, &[commit.0]),
+        Column::I64(v) => assert_eq!(v.as_slice(), &[commit.0]),
         Column::Bytes(_) => panic!("sys_from is an i64 column"),
     }
 }
