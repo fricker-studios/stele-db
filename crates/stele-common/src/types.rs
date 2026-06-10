@@ -53,6 +53,7 @@ const OID_BYTEA: PgOid = 17;
 const OID_INT8: PgOid = 20;
 const OID_INT4: PgOid = 23;
 const OID_TEXT: PgOid = 25;
+const OID_FLOAT8: PgOid = 701;
 const OID_DATE: PgOid = 1082;
 const OID_TIMESTAMP: PgOid = 1114;
 const OID_TIMESTAMPTZ: PgOid = 1184;
@@ -66,8 +67,9 @@ const OID_TSRANGE: PgOid = 3908;
 /// ([STL-96] scope). The set grows additively: each new type is a new variant
 /// plus its OID, with no churn to the existing ones — v0.2 added the
 /// time-zone-aware [`Self::TimestampTz`] ([STL-189]), [`Self::Period`]
-/// ([STL-180]), and `UUID` / `BYTEA` ([STL-181]). Further numeric breadth
-/// (`NUMERIC`, `FLOAT8`) comes later.
+/// ([STL-180]), `UUID` / `BYTEA` ([STL-181]), and the fractional
+/// [`Self::Float8`] that `AVG` returns ([STL-209]). Arbitrary-precision
+/// `NUMERIC` comes later.
 ///
 /// ```
 /// use stele_common::types::LogicalType;
@@ -137,13 +139,22 @@ pub enum LogicalType {
     /// hash-digest / opaque-blob type that backs business-key hash digests
     /// ([STL-181]).
     Bytea,
+    /// IEEE-754 double-precision float — SQL `DOUBLE PRECISION` / `FLOAT8`,
+    /// Postgres `float8` (OID 701). The fractional result type `AVG` returns
+    /// over integer columns, instead of the truncated integer mean it produced
+    /// before any fractional type existed ([STL-209]). The value is a
+    /// [`ScalarValue::Float8`]; the text form is the shortest decimal that
+    /// round-trips. v0.2 introduces it only as that aggregate result — there is
+    /// no `float8` column, literal, or arithmetic yet (the evaluator's tracked
+    /// follow-up, STL-207).
+    Float8,
 }
 
 impl LogicalType {
     /// Every logical type, in a stable order. The single source of truth tests
     /// and exhaustive consumers iterate so a new variant can't be silently
     /// missed.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Int4,
         Self::Int8,
         Self::Text,
@@ -154,6 +165,7 @@ impl LogicalType {
         Self::Period,
         Self::Uuid,
         Self::Bytea,
+        Self::Float8,
     ];
 
     /// The Postgres type OID a wire client uses to interpret this type
@@ -172,6 +184,7 @@ impl LogicalType {
             Self::Period => OID_TSRANGE,
             Self::Uuid => OID_UUID,
             Self::Bytea => OID_BYTEA,
+            Self::Float8 => OID_FLOAT8,
         }
     }
 
@@ -190,6 +203,7 @@ impl LogicalType {
             OID_TSRANGE => Some(Self::Period),
             OID_UUID => Some(Self::Uuid),
             OID_BYTEA => Some(Self::Bytea),
+            OID_FLOAT8 => Some(Self::Float8),
             _ => None,
         }
     }
@@ -210,6 +224,7 @@ impl LogicalType {
             Self::Period => "tsrange",
             Self::Uuid => "uuid",
             Self::Bytea => "bytea",
+            Self::Float8 => "float8",
         }
     }
 
@@ -237,9 +252,13 @@ impl LogicalType {
         match self {
             Self::Text => ColumnCodec::Dictionary,
             Self::Timestamp | Self::TimestampTz | Self::Date => ColumnCodec::Delta,
-            Self::Int4 | Self::Int8 | Self::Bool | Self::Period | Self::Uuid | Self::Bytea => {
-                ColumnCodec::Plain
-            }
+            Self::Int4
+            | Self::Int8
+            | Self::Bool
+            | Self::Period
+            | Self::Uuid
+            | Self::Bytea
+            | Self::Float8 => ColumnCodec::Plain,
         }
     }
 }
@@ -316,6 +335,16 @@ pub enum ScalarValue {
     Uuid([u8; 16]),
     /// A variable-length byte string ([`LogicalType::Bytea`]).
     Bytea(Vec<u8>),
+    /// An IEEE-754 double, held as its **bit pattern** ([`LogicalType::Float8`]).
+    ///
+    /// The payload is `f64::to_bits` of the value, not the `f64` itself: a raw
+    /// `f64` is not `Eq` / `Ord` / `Hash`, which the whole [`ScalarValue`] /
+    /// [`Vector`](../../stele_exec/expr/enum.Vector.html) set derives, so the
+    /// bits are carried instead and compared bitwise (two values are equal iff
+    /// their encodings are). Construct with [`Self::float8`] and read with
+    /// [`Self::as_f64`] rather than touching the bits directly. The result type
+    /// of `AVG` ([STL-209]).
+    Float8(u64),
 }
 
 /// Why decoding a [`ScalarValue`] from bytes failed.
@@ -360,6 +389,27 @@ impl ScalarValue {
             Self::Period(_) => LogicalType::Period,
             Self::Uuid(_) => LogicalType::Uuid,
             Self::Bytea(_) => LogicalType::Bytea,
+            Self::Float8(_) => LogicalType::Float8,
+        }
+    }
+
+    /// A [`Self::Float8`] from an `f64`, storing its IEEE-754 bit pattern.
+    ///
+    /// The constructor to use instead of `Self::Float8(bits)` directly — it keeps
+    /// the bits-not-`f64` representation an implementation detail. [`Self::as_f64`]
+    /// is the inverse.
+    #[must_use]
+    pub const fn float8(value: f64) -> Self {
+        Self::Float8(value.to_bits())
+    }
+
+    /// The `f64` a [`Self::Float8`] carries (decoding its stored bits), or `None`
+    /// for any other type. Inverse of [`Self::float8`].
+    #[must_use]
+    pub const fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Float8(bits) => Some(f64::from_bits(*bits)),
+            _ => None,
         }
     }
 
@@ -385,6 +435,7 @@ impl ScalarValue {
     ///
     /// * `Int4` / `Date` — 4 bytes.
     /// * `Int8` / `Timestamp` / `TimestampTz` — 8 bytes.
+    /// * `Float8` — 8 bytes: the IEEE-754 bit pattern, little-endian.
     /// * `Bool` — 1 byte (`0` / `1`).
     /// * `Uuid` — the 16 raw bytes, network order.
     /// * `Text` / `Bytea` — the raw bytes; the surrounding column framing carries
@@ -412,6 +463,9 @@ impl ScalarValue {
             }
             Self::Uuid(bytes) => out.extend_from_slice(bytes),
             Self::Bytea(bytes) => out.extend_from_slice(bytes),
+            // The stored `u64` is already `f64::to_bits`, so its little-endian
+            // bytes are exactly the IEEE-754 form.
+            Self::Float8(bits) => out.extend_from_slice(&bits.to_le_bytes()),
         }
     }
 
@@ -447,6 +501,7 @@ impl ScalarValue {
             }
             LogicalType::Uuid => Ok(Self::Uuid(fixed::<16>(ty, bytes)?)),
             LogicalType::Bytea => Ok(Self::Bytea(bytes.to_vec())),
+            LogicalType::Float8 => Ok(Self::Float8(u64::from_le_bytes(fixed::<8>(ty, bytes)?))),
         }
     }
 }
@@ -475,6 +530,8 @@ mod tests {
         assert_eq!(LogicalType::Date.pg_oid(), 1082);
         assert_eq!(LogicalType::Uuid.pg_oid(), 2950);
         assert_eq!(LogicalType::Bytea.pg_oid(), 17);
+        assert_eq!(LogicalType::Float8.pg_oid(), 701);
+        assert_eq!(LogicalType::Float8.pg_type_name(), "float8");
         // PERIOD borrows Postgres `tsrange` so a stock driver can decode it.
         assert_eq!(LogicalType::Period.pg_oid(), 3908);
         assert_eq!(LogicalType::Period.pg_type_name(), "tsrange");
@@ -482,10 +539,11 @@ mod tests {
 
     #[test]
     fn type_set_grew_additively_without_disturbing_the_original_six() {
-        // v0.2 added TIMESTAMPTZ (STL-189), PERIOD (STL-180), and UUID/BYTEA
-        // (STL-181); the original six keep their identity (OID + name), so a wire
-        // client that knew only the original set is unaffected.
-        assert_eq!(LogicalType::ALL.len(), 10);
+        // v0.2 added TIMESTAMPTZ (STL-189), PERIOD (STL-180), UUID/BYTEA
+        // (STL-181), and FLOAT8 (STL-209); the original six keep their identity
+        // (OID + name), so a wire client that knew only the original set is
+        // unaffected.
+        assert_eq!(LogicalType::ALL.len(), 11);
         for (ty, oid, name) in [
             (LogicalType::Int4, 23, "int4"),
             (LogicalType::Int8, 20, "int8"),
@@ -579,10 +637,27 @@ mod tests {
             ),
             (ScalarValue::Uuid([0; 16]), LogicalType::Uuid),
             (ScalarValue::Bytea(vec![1, 2, 3]), LogicalType::Bytea),
+            (ScalarValue::float8(3.5), LogicalType::Float8),
         ];
         for (value, ty) in samples {
             assert_eq!(value.logical_type(), ty);
         }
+    }
+
+    #[test]
+    fn float8_carries_its_f64_through_the_bit_pattern() {
+        // The constructor stores `to_bits`; `as_f64` reads it back exactly.
+        for v in [0.0, -0.0, 1.5, -2.5, f64::MIN, f64::MAX, f64::INFINITY] {
+            assert_eq!(ScalarValue::float8(v).as_f64(), Some(v));
+        }
+        // NaN survives as the same bit pattern (compares equal to itself here,
+        // unlike `f64` `==`, because the value identity is bitwise).
+        let nan = ScalarValue::float8(f64::NAN);
+        assert!(nan.as_f64().is_some_and(f64::is_nan));
+        assert_eq!(nan, ScalarValue::float8(f64::NAN));
+        assert_eq!(nan.logical_type(), LogicalType::Float8);
+        // `as_f64` is float8-only.
+        assert_eq!(ScalarValue::Int8(1).as_f64(), None);
     }
 
     /// The Definition-of-Done property at the value level: every type encodes
@@ -622,6 +697,14 @@ mod tests {
             ScalarValue::Bytea(Vec::new()),
             ScalarValue::Bytea(vec![0xDE, 0xAD, 0xBE, 0xEF]),
             ScalarValue::Bytea(vec![0; 32]),
+            ScalarValue::float8(0.0),
+            ScalarValue::float8(-0.0),
+            ScalarValue::float8(183.333_333_333_333_34),
+            ScalarValue::float8(f64::MIN),
+            ScalarValue::float8(f64::MAX),
+            ScalarValue::float8(f64::INFINITY),
+            ScalarValue::float8(f64::NEG_INFINITY),
+            ScalarValue::float8(f64::NAN),
         ];
         for value in cases {
             let mut buf = Vec::new();

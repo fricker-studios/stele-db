@@ -203,8 +203,8 @@ pub enum AggregateFunc {
     Min,
     /// `MAX` — greatest non-NULL value. Result the argument's type.
     Max,
-    /// `AVG` — integer mean of non-NULL integer values. Result `INT8` (the
-    /// fractional result awaits a `FLOAT8` / `NUMERIC` type, [STL-209]).
+    /// `AVG` — exact fractional mean of non-NULL integer values. Result `FLOAT8`
+    /// ([STL-209]).
     Avg,
 }
 
@@ -235,11 +235,13 @@ impl AggregateFunc {
     }
 
     /// The result type for this aggregate over an argument of type `arg` (`None`
-    /// for `COUNT(*)`). `COUNT` / `SUM` / `AVG` produce `INT8`; `MIN` / `MAX`
-    /// produce the argument's own type.
+    /// for `COUNT(*)`). `COUNT` / `SUM` produce `INT8`; `AVG` produces the
+    /// fractional `FLOAT8` ([STL-209]); `MIN` / `MAX` produce the argument's own
+    /// type.
     const fn result_type(self, arg: Option<LogicalType>) -> LogicalType {
         match self {
-            Self::Count | Self::Sum | Self::Avg => LogicalType::Int8,
+            Self::Count | Self::Sum => LogicalType::Int8,
+            Self::Avg => LogicalType::Float8,
             Self::Min | Self::Max => arg.expect("MIN/MAX carries an argument"),
         }
     }

@@ -245,7 +245,12 @@ pub(crate) fn param_to_value(oid: u32, bytes: Option<&[u8]>) -> Result<Value, Pa
     };
     let text = std::str::from_utf8(bytes).map_err(|_| ParamError::NotUtf8)?;
     let value = match LogicalType::from_pg_oid(oid) {
-        Some(LogicalType::Int4 | LogicalType::Int8) => Value::Number(text.to_owned(), false),
+        // The numeric types substitute as a numeric literal. `float8` ([STL-209])
+        // has no column or DML codec yet, so a float8 param has nowhere to fold —
+        // the binder rejects it cleanly against any real column, like the integers.
+        Some(LogicalType::Int4 | LogicalType::Int8 | LogicalType::Float8) => {
+            Value::Number(text.to_owned(), false)
+        }
         Some(LogicalType::Bool) => {
             Value::Boolean(parse_bool(text).ok_or_else(|| ParamError::BadBool(text.to_owned()))?)
         }

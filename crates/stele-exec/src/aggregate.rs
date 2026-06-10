@@ -35,14 +35,15 @@
 //!   even over zero input rows — `SELECT COUNT(*) FROM empty` is `0`, not no
 //!   rows. A **grouped** aggregate over zero rows emits zero rows.
 //!
-//! ## Result types & the `AVG` limitation
+//! ## Result types
 //!
-//! `COUNT` / `SUM` / `AVG` produce [`INT8`](stele_common::types::LogicalType::Int8);
-//! `MIN` / `MAX` produce their argument's type. Because the logical type set has
-//! no `FLOAT8` / `NUMERIC` yet (a tracked later addition), `AVG` returns the
-//! **integer mean** (`SUM / COUNT`, truncated toward zero) rather than a
-//! fractional value — a documented v0.2 limitation, upgraded to a true fractional
-//! average once a fractional type lands ([STL-209]).
+//! `COUNT` / `SUM` produce [`INT8`](stele_common::types::LogicalType::Int8);
+//! `AVG` produces [`FLOAT8`](stele_common::types::LogicalType::Float8) — the
+//! exact fractional mean (`SUM / COUNT` as `f64`, no truncation), now that a
+//! fractional type exists ([STL-209]; it returned the truncated integer mean
+//! before). `MIN` / `MAX` produce their argument's type. The `i128` sum is
+//! converted to `f64` once and divided by the count, so the result is the
+//! nearest double to the true rational mean.
 //!
 //! ## Output shape
 //!
@@ -77,9 +78,9 @@ pub enum AggregateFunc {
     /// `MAX` — greatest non-NULL argument. Result the argument's type, NULL over
     /// an all-NULL group.
     Max,
-    /// `AVG` — integer mean of the non-NULL integer arguments (`SUM / COUNT`,
-    /// truncated). Result `INT8`, NULL over an all-NULL group. The fractional
-    /// result awaits a `FLOAT8` / `NUMERIC` type ([STL-209]).
+    /// `AVG` — exact fractional mean of the non-NULL integer arguments
+    /// (`SUM / COUNT` as `f64`). Result `FLOAT8`, NULL over an all-NULL group
+    /// ([STL-209]).
     Avg,
 }
 
@@ -204,7 +205,7 @@ fn build_aggregate_column(
     arg: Option<&Vector>,
 ) -> Vector {
     match func {
-        // `COUNT` / `SUM` / `AVG` are computed integers, built directly as `INT8`.
+        // `COUNT` / `SUM` are computed integers, built directly as `INT8`.
         // COUNT is never NULL, so its cells are always `Some`.
         AggregateFunc::Count => Vector::Int8(
             groups
@@ -213,7 +214,14 @@ fn build_aggregate_column(
                 .collect(),
         ),
         AggregateFunc::Sum => Vector::Int8(groups.iter().map(|g| g.accs[k].sum_value()).collect()),
-        AggregateFunc::Avg => Vector::Int8(groups.iter().map(|g| g.accs[k].avg_value()).collect()),
+        // `AVG` is the fractional mean, a `FLOAT8` column carrying each group's
+        // mean as IEEE-754 bits (NULL over an all-NULL group).
+        AggregateFunc::Avg => Vector::Float8(
+            groups
+                .iter()
+                .map(|g| g.accs[k].avg_value().map(f64::to_bits))
+                .collect(),
+        ),
         // `MIN` / `MAX` are a value of the argument's type — gathered from the
         // argument vector at the row that held each group's extreme (or `None`,
         // a NULL cell, for an all-NULL group).
@@ -289,12 +297,13 @@ impl Acc {
         }
     }
 
-    /// `AVG` as the truncated integer mean: NULL over an all-NULL group.
-    fn avg_value(&self) -> Option<i64> {
+    /// `AVG` as the exact fractional mean (`acc / count` in `f64`): NULL over an
+    /// all-NULL group. The `i128` total is converted to `f64` once and divided by
+    /// the count, yielding the nearest double to the true rational mean.
+    #[allow(clippy::cast_precision_loss)] // the mean is fractional; f64 is the result type
+    fn avg_value(&self) -> Option<f64> {
         match self {
-            Self::Avg { acc, count } => (*count != 0)
-                .then(|| i64::try_from(acc / i128::from(*count)).ok())
-                .flatten(),
+            Self::Avg { acc, count } => (*count != 0).then(|| *acc as f64 / *count as f64),
             _ => None,
         }
     }
@@ -549,12 +558,21 @@ mod tests {
     }
 
     #[test]
-    fn avg_is_truncated_integer_mean_skipping_nulls() {
-        // (100 + 200 + 250) / 3 = 183.33 → 183 (truncated). NULL is skipped.
+    fn avg_is_exact_fractional_mean_skipping_nulls() {
+        // (100 + 200 + 250) / 3 = 183.333…, the exact f64 mean — *not* truncated
+        // to 183. NULL is skipped. The column is FLOAT8, carrying the mean's bits.
         let vals = Vector::Int8(vec![Some(100), Some(200), Some(250), None]);
         let out =
             hash_aggregate(&[], &[agg(AggregateFunc::Avg, 0)], &[vals], 4).expect("aggregate");
-        assert_eq!(out.aggregates[0], Vector::Int8(vec![Some(183)]));
+        assert_eq!(
+            out.aggregates[0],
+            Vector::Float8(vec![Some((550.0_f64 / 3.0).to_bits())])
+        );
+        // And it is genuinely fractional, not the old truncated 183.
+        assert_eq!(
+            out.aggregates[0].get(0).and_then(|v| v.as_f64()),
+            Some(550.0 / 3.0)
+        );
     }
 
     #[test]
@@ -562,7 +580,7 @@ mod tests {
         let vals = Vector::Int4(vec![None]);
         let out =
             hash_aggregate(&[], &[agg(AggregateFunc::Avg, 0)], &[vals], 1).expect("aggregate");
-        assert_eq!(out.aggregates[0], Vector::Int8(vec![None]));
+        assert_eq!(out.aggregates[0], Vector::Float8(vec![None]));
     }
 
     #[test]
@@ -652,12 +670,14 @@ mod tests {
 
     /// The reference: group rows with a plain `HashMap` and compute each aggregate
     /// the obvious way. Returns, per group key (`Option<i64>`), the tuple
-    /// `(count_star, count_v, sum, min, max, avg)`.
-    #[allow(clippy::type_complexity)]
+    /// `(count_star, count_v, sum, min, max, avg)`. `avg` is the exact fractional
+    /// mean as `f64` — the same `i128`-sum-then-one-`f64`-division the operator
+    /// does, so the two agree bit-for-bit ([STL-209]).
+    #[allow(clippy::type_complexity, clippy::cast_precision_loss)]
     fn reference(
         keys: &[Option<i64>],
         vals: &[Option<i64>],
-    ) -> HashMap<Option<i64>, (i64, i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>)> {
+    ) -> HashMap<Option<i64>, (i64, i64, Option<i64>, Option<i64>, Option<i64>, Option<f64>)> {
         let mut groups: HashMap<Option<i64>, Vec<Option<i64>>> = HashMap::new();
         for (k, v) in keys.iter().zip(vals) {
             groups.entry(*k).or_default().push(*v);
@@ -678,7 +698,8 @@ mod tests {
                 let avg = if present.is_empty() {
                     None
                 } else {
-                    Some(present.iter().sum::<i64>() / count_v)
+                    let total: i128 = present.iter().map(|&v| i128::from(v)).sum();
+                    Some(total as f64 / count_v as f64)
                 };
                 (k, (count_star, count_v, sum, min, max, avg))
             })
@@ -724,6 +745,15 @@ mod tests {
                     };
                     c[g]
                 };
+                // AVG is a FLOAT8 column carrying each mean's bits. Compare those
+                // bits against the reference mean's bits: an exact match witnesses
+                // the two computed the identical f64, with no `float_cmp` fuzz.
+                let avg_bits = |v: &Vector| -> Option<u64> {
+                    let Vector::Float8(c) = v else {
+                        panic!("float8 aggregate")
+                    };
+                    c[g]
+                };
                 assert_eq!(
                     cell(&out.aggregates[0]),
                     Some(cs),
@@ -737,7 +767,11 @@ mod tests {
                 assert_eq!(cell(&out.aggregates[2]), sum, "SUM seed {seed} key {key:?}");
                 assert_eq!(cell(&out.aggregates[3]), min, "MIN seed {seed} key {key:?}");
                 assert_eq!(cell(&out.aggregates[4]), max, "MAX seed {seed} key {key:?}");
-                assert_eq!(cell(&out.aggregates[5]), avg, "AVG seed {seed} key {key:?}");
+                assert_eq!(
+                    avg_bits(&out.aggregates[5]),
+                    avg.map(f64::to_bits),
+                    "AVG seed {seed} key {key:?}"
+                );
             }
         }
     }
@@ -751,10 +785,9 @@ mod tests {
         ));
     }
 
-    /// `LogicalType` is in scope only to keep the doctest-style type references
-    /// honest; touch it so an unused import never slips in.
+    /// `SUM` is `INT8`; `AVG` is the fractional `FLOAT8` ([STL-209]).
     #[test]
-    fn result_types_are_int8_for_count_sum_avg() {
+    fn sum_is_int8_and_avg_is_float8() {
         let vals = Vector::Int4(vec![Some(1), Some(2)]);
         let out = hash_aggregate(
             &[],
@@ -764,6 +797,8 @@ mod tests {
         )
         .expect("aggregate");
         assert_eq!(out.aggregates[0].logical_type(), LogicalType::Int8);
-        assert_eq!(out.aggregates[1].logical_type(), LogicalType::Int8);
+        assert_eq!(out.aggregates[1].logical_type(), LogicalType::Float8);
+        // AVG(1, 2) is the exact 1.5, not a truncated 1.
+        assert_eq!(out.aggregates[1].get(0).and_then(|v| v.as_f64()), Some(1.5));
     }
 }

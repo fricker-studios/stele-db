@@ -129,10 +129,13 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
         // yet (mirrors AS OF); such a column cannot be written or compared against
         // a literal. `timestamptz` above is the one civil-time type with a codec.
         // (Period predicates build their intervals from PERIOD(a,b) endpoints, not
-        // from a folded period scalar — see stele-exec.)
-        ty @ (LogicalType::Timestamp | LogicalType::Date | LogicalType::Period) => {
-            Err(FoldError::UnsupportedType(ty))
-        }
+        // from a folded period scalar — see stele-exec.) `FLOAT8` is an aggregate
+        // result type only ([STL-209]) — there is no `float8` column or literal to
+        // fold into, so a float literal also has nowhere to go here (STL-207).
+        ty @ (LogicalType::Timestamp
+        | LogicalType::Date
+        | LogicalType::Period
+        | LogicalType::Float8) => Err(FoldError::UnsupportedType(ty)),
     }
 }
 

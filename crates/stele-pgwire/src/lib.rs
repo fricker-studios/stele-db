@@ -2847,6 +2847,11 @@ mod tests {
                 ty: LogicalType::Bytea,
                 value: Some(ScalarValue::Bytea(vec![0xDE, 0xAD, 0xBE, 0xEF])),
             },
+            ResultColumn {
+                name: "f8".into(),
+                ty: LogicalType::Float8,
+                value: Some(ScalarValue::float8(1.5)),
+            },
         ];
         let cells = parse_data_row(&data_row_payload(&columns).expect("payload"));
         let rendered: Vec<String> = cells
@@ -2864,6 +2869,7 @@ mod tests {
                 "2023-11-14",
                 "550e8400-e29b-41d4-a716-446655440000",
                 "\\xdeadbeef",
+                "1.5",
             ]
         );
     }
