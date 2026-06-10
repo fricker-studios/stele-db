@@ -240,10 +240,18 @@ pub enum DmlSummary {
 /// before `COMMIT`, and `ROLLBACK` discards the buffer with no effect ever
 /// reaching storage.
 ///
+/// The transaction reads under **snapshot isolation** ([STL-175], [ADR-0008]): a
+/// single system-time snapshot is pinned at [`begin`](SessionEngine::begin) and
+/// every statement in the block resolves its reads at it, so the transaction sees
+/// one consistent snapshot for its whole life even while other connections commit.
+/// Write-write conflicts are detected at [`commit`](SessionEngine::commit), first
+/// committer wins.
+///
 /// What this deliberately does *not* yet do (each its own follow-up):
-/// * **Read-your-own-writes.** A `SELECT` inside the transaction still reads the
-///   committed snapshot and does not see the buffer — a consistent
-///   transaction-local snapshot is snapshot-isolation work ([STL-175]).
+/// * **Read-your-own-writes.** A `SELECT` inside the transaction reads the pinned
+///   snapshot, but does **not** see the transaction's own buffered, not-yet-
+///   committed writes — overlaying the write buffer on the snapshot read is a
+///   follow-up ([STL-203]).
 /// * **Crash-atomic group commit.** [`commit`](SessionEngine::commit) replays the
 ///   buffer through the per-write WAL path, so a crash *mid-commit* can leave a
 ///   prefix durable; a single transaction-boundary WAL record (the `stele-txn`
@@ -253,20 +261,18 @@ pub enum DmlSummary {
 ///
 /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
 /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
-#[derive(Debug, Default)]
+/// [STL-203]: https://allegromusic.atlassian.net/browse/STL-203
+/// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
+#[derive(Debug)]
 pub struct SessionTransaction {
+    /// The system-time snapshot pinned at [`begin`](SessionEngine::begin). Every
+    /// read in the transaction resolves here, and a write-write conflict is one
+    /// whose key was committed by another transaction *after* this instant.
+    snapshot: SystemTimeMicros,
     /// The bound writes staged so far, in statement order. Applied front-to-back
     /// at commit so a later `UPDATE` of a key staged after its `INSERT` lands in
     /// the order the client issued them.
     writes: Vec<BoundDml>,
-}
-
-impl SessionTransaction {
-    /// A fresh transaction with an empty write buffer.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self { writes: Vec::new() }
-    }
 }
 
 /// A live table's shape at the current read snapshot, for catalog introspection.
@@ -367,6 +373,21 @@ pub enum EngineError {
     /// `SELECT`, nor an `INSERT` / `UPDATE` / `DELETE`.
     #[error("statement not routable by the session engine: {0}")]
     Unsupported(&'static str),
+
+    /// A snapshot-isolation **write-write conflict**: a key this transaction wrote
+    /// was committed by another transaction *after* this one's pinned snapshot.
+    /// First committer wins — the loser is aborted and the **whole transaction
+    /// must be retried** ([ADR-0008], [STL-175]). Surfaced at `COMMIT`; the wire
+    /// layer maps it to SQLSTATE `40001` (`serialization_failure`), which stock
+    /// clients treat as retryable.
+    ///
+    /// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
+    /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+    #[error(
+        "write-write conflict: this transaction's write set was modified by a concurrent commit \
+         after its snapshot; retry the transaction"
+    )]
+    Conflict,
 }
 
 /// One table's live state inside a session.
@@ -398,6 +419,19 @@ pub struct SessionEngine<C: Clock + Clone, D: Disk + Clone> {
     /// transaction manager yet ([STL-99]); a per-session monotonic counter gives
     /// each `INSERT` / `UPDATE` / `DELETE` distinct provenance until one exists.
     next_txn: u64,
+    /// The MVCC write index: per-`(table, key)`, the commit instant of the most
+    /// recent committed write. Every applied write records its commit instant
+    /// here, and a multi-statement [`commit`](Self::commit) checks its write set
+    /// against it for first-committer-wins conflict detection ([STL-175],
+    /// [ADR-0008]). Keyed by table name + business key; one entry per distinct key
+    /// (a later write overwrites the instant), so it grows with the number of
+    /// distinct keys ever written, not with the number of writes — pruning entries
+    /// older than the oldest live snapshot is a deferred refinement ([STL-204]).
+    ///
+    /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+    /// [STL-204]: https://allegromusic.atlassian.net/browse/STL-204
+    /// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
+    write_index: BTreeMap<(String, BusinessKey), SystemTimeMicros>,
 }
 
 impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
@@ -417,6 +451,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             tables: BTreeMap::new(),
             next_namespace: 0,
             next_txn: 1,
+            write_index: BTreeMap::new(),
         }
     }
 
@@ -471,6 +506,52 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// [`EngineError`] if binding, catalog application, the scan, or the write
     /// fails.
     pub fn execute(&mut self, stmt: &Statement) -> Result<StatementOutcome, EngineError> {
+        // An auto-committed statement is its own snapshot: read the latest
+        // committed state, then write immediately. (Snapshot isolation pins one
+        // snapshot for a whole multi-statement transaction instead — see
+        // [`execute_in_txn`](Self::execute_in_txn).)
+        self.execute_at(stmt, self.clock.current())
+    }
+
+    /// Execute one statement inside an open multi-statement transaction, under
+    /// **snapshot isolation** ([ADR-0008], [STL-175]).
+    ///
+    /// An `INSERT` / `UPDATE` / `DELETE` is **buffered** into `txn` (applied as a
+    /// unit at [`commit`](Self::commit)), bound at the transaction's pinned
+    /// snapshot. Anything else — a `SELECT` or DDL — runs immediately, with its
+    /// reads resolved at that *same* pinned snapshot, so every statement in the
+    /// block observes one consistent system-time snapshot even while other
+    /// connections commit. (Transactional DDL is not yet modeled: a `CREATE` /
+    /// `DROP` inside a block still takes effect at once.)
+    ///
+    /// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
+    /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+    ///
+    /// # Errors
+    ///
+    /// As [`execute`](Self::execute); a malformed buffered DML rejects the
+    /// statement and buffers nothing.
+    pub fn execute_in_txn(
+        &mut self,
+        stmt: &Statement,
+        txn: &mut SessionTransaction,
+    ) -> Result<StatementOutcome, EngineError> {
+        if let Some(summary) = self.stage_dml(stmt, txn)? {
+            return Ok(StatementOutcome::Dml(summary));
+        }
+        self.execute_at(stmt, txn.snapshot)
+    }
+
+    /// The shared statement router, resolving **reads** — a `SELECT`, and the
+    /// table/literal binding of an auto-committed DML — at `read_snapshot`. DDL
+    /// always takes effect at the commit clock's next instant, independent of the
+    /// read snapshot. Routes by binding, in order: DDL, then `SELECT`, then
+    /// `INSERT` / `UPDATE` / `DELETE`.
+    fn execute_at(
+        &mut self,
+        stmt: &Statement,
+        read_snapshot: SystemTimeMicros,
+    ) -> Result<StatementOutcome, EngineError> {
         // DDL first: `bind_ddl` cleanly rejects non-DDL with `NotDdl`, which we
         // treat as "try the next router".
         match bind_ddl(stmt) {
@@ -479,14 +560,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             Err(e) => return Err(EngineError::Bind(e)),
         }
 
-        // SELECT next, bound against the current read snapshot. The bind context
-        // borrows the catalog immutably; the read path is `&self`, so a hit can
-        // run before the borrow ends, but DML below needs `&mut self`, so the
-        // borrow is scoped and released first.
-        let snapshot = self.clock.current();
+        // SELECT next, bound against the read snapshot. The bind context borrows
+        // the catalog immutably; the read path is `&self`, so a hit can run before
+        // the borrow ends, but DML below needs `&mut self`, so the borrow is scoped
+        // and released first.
         {
             let ctx = BindContext {
-                snapshot,
+                snapshot: read_snapshot,
                 catalog: &self.catalog,
             };
             match bind_select(stmt, &ctx) {
@@ -501,7 +581,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // the key/payload literals; `NotDml` means this is none of the routes.
         let bound = {
             let ctx = BindContext {
-                snapshot,
+                snapshot: read_snapshot,
                 catalog: &self.catalog,
             };
             match bind_dml(stmt, &ctx) {
@@ -730,7 +810,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         txn_id: TxnId,
         principal: &Principal,
     ) -> Result<DmlSummary, EngineError> {
-        match dml {
+        // The (table, business key) this write commits, captured before the match
+        // consumes `dml`, so its commit instant can be recorded for conflict
+        // detection once the write lands.
+        let committed = (dml.table().to_owned(), dml_business_key(&dml));
+        let summary = match dml {
             BoundDml::Insert {
                 table, key, values, ..
             } => {
@@ -759,7 +843,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     txn_id,
                     principal.clone(),
                 )?;
-                Ok(DmlSummary::Insert(1))
+                DmlSummary::Insert(1)
             }
             BoundDml::Update {
                 table,
@@ -769,8 +853,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             } => {
                 // Read-modify-write: merge the SET overrides onto the live row's
                 // value cells so unnamed columns keep their prior value, then
-                // re-pack. (A read here sees the committed snapshot — a
-                // transaction does not yet read its own buffered writes, [STL-175].)
+                // re-pack. The base is read at the committed state, which — for a
+                // key that passed `commit`'s write-write conflict check — is
+                // unchanged since this transaction's snapshot. (A transaction does
+                // not yet read its own buffered writes, [STL-203].)
                 let value_count = self.value_column_count(&table)?;
                 // Guard against a narrowed schema since binding: an assignment
                 // index past the live value columns would otherwise panic on the
@@ -796,13 +882,22 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     txn_id,
                     principal.clone(),
                 )?;
-                Ok(DmlSummary::Update(1))
+                DmlSummary::Update(1)
             }
             BoundDml::Delete { table, key, .. } => {
                 self.delete(&table, &business_key(&key), txn_id, principal.clone())?;
-                Ok(DmlSummary::Delete(1))
+                DmlSummary::Delete(1)
             }
-        }
+        };
+        // Record this key's commit instant for first-committer-wins conflict
+        // detection (ADR-0008). The write advanced the commit clock to its
+        // `sys_from`, so the high-water mark is this write's commit instant — the
+        // latest in a multi-statement commit, a conservative upper bound any
+        // transaction whose pinned snapshot precedes it will conflict against. Both
+        // the auto-commit path and a multi-statement `COMMIT` funnel through here,
+        // so every committed write is tracked.
+        self.write_index.insert(committed, self.clock.current());
+        Ok(summary)
     }
 
     /// The number of value columns (the schema's column count minus the business
@@ -858,33 +953,45 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     }
 
     /// Begin a multi-statement transaction — an empty write buffer the caller
-    /// feeds with [`stage_dml`](Self::stage_dml) and applies with
-    /// [`commit`](Self::commit) ([STL-174]).
+    /// feeds with [`stage_dml`](Self::stage_dml) / [`execute_in_txn`](Self::execute_in_txn)
+    /// and applies with [`commit`](Self::commit) ([STL-174]).
+    ///
+    /// The transaction's **read snapshot is pinned here, at `BEGIN`** — the commit
+    /// clock's current instant — so every statement in the block reads one
+    /// consistent system-time snapshot under snapshot isolation ([STL-175],
+    /// [ADR-0008]).
     ///
     /// The transaction is held *per connection* (the pgwire front end owns one per
     /// session), not on the shared engine, so two connections' open transactions
-    /// stay independent. Nothing is allocated against the engine here — a
-    /// transaction id is taken only at [`commit`](Self::commit), so a `BEGIN`
-    /// followed by `ROLLBACK` (or a read-only transaction) consumes none.
+    /// stay independent. No transaction id is allocated until
+    /// [`commit`](Self::commit), so a `BEGIN` followed by `ROLLBACK` (or a
+    /// read-only transaction) consumes none.
     ///
     /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
+    /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+    /// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
     #[must_use]
-    pub const fn begin(&self) -> SessionTransaction {
-        SessionTransaction::new()
+    pub fn begin(&self) -> SessionTransaction {
+        SessionTransaction {
+            snapshot: self.clock.current(),
+            writes: Vec::new(),
+        }
     }
 
     /// Bind a DML statement and **buffer** it into `txn` without applying it,
     /// returning the affected-row summary the wire client expects for its
     /// `CommandComplete`. Returns `Ok(None)` if `stmt` is not an
-    /// `INSERT`/`UPDATE`/`DELETE` — a `SELECT` or DDL inside a transaction is the
-    /// caller's to route through [`execute`](Self::execute), which runs it at once
-    /// against the committed state (the buffer stays write-only, [STL-174]).
+    /// `INSERT`/`UPDATE`/`DELETE` — a `SELECT` or DDL inside a transaction routes
+    /// through [`execute_in_txn`](Self::execute_in_txn), which runs it at once
+    /// against the pinned snapshot (the buffer stays write-only, [STL-174]).
     ///
     /// Binding here folds the statement's literals and resolves its table against
-    /// the catalog at the current snapshot, exactly as the auto-commit path does;
-    /// only the *application* is deferred to [`commit`](Self::commit).
+    /// the catalog at the transaction's **pinned snapshot** ([STL-175]) — so the
+    /// whole block binds under one consistent schema view — and only the
+    /// *application* is deferred to [`commit`](Self::commit).
     ///
     /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
+    /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
     ///
     /// # Errors
     ///
@@ -896,7 +1003,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         txn: &mut SessionTransaction,
     ) -> Result<Option<DmlSummary>, EngineError> {
         let ctx = BindContext {
-            snapshot: self.clock.current(),
+            snapshot: txn.snapshot,
             catalog: &self.catalog,
         };
         match bind_dml(stmt, &ctx) {
@@ -920,15 +1027,39 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// logical commit. The writes are applied in staged order through the same
     /// typed path the auto-commit route uses.
     ///
+    /// ## Snapshot-isolation conflict detection ([STL-175], [ADR-0008])
+    ///
+    /// Before any write is applied, the transaction's write set is checked against
+    /// the engine's per-key MVCC write index: if any key it writes was committed by
+    /// another transaction *after* this one's pinned snapshot, this transaction
+    /// lost the race (first committer wins) and the commit is refused with
+    /// [`EngineError::Conflict`] — a retryable error — having touched nothing.
+    ///
     /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
+    /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+    /// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
     ///
     /// # Errors
     ///
+    /// [`EngineError::Conflict`] if a concurrent commit modified this transaction's
+    /// write set after its snapshot (retry the transaction). Otherwise
     /// [`EngineError`] if applying any buffered write fails (e.g. its table was
     /// dropped between staging and commit). A write that has already been applied
-    /// when a later one fails is **not** rolled back — crash/-failure-atomic group
-    /// commit is the deferred follow-up noted on [`SessionTransaction`].
+    /// when a *later* one fails is **not** rolled back — crash/-failure-atomic
+    /// group commit is the deferred follow-up noted on [`SessionTransaction`].
     pub fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError> {
+        // First-committer-wins write-write conflict detection. Checked up front, so
+        // a conflict aborts the whole transaction before any write lands.
+        for dml in &txn.writes {
+            let key = (dml.table().to_owned(), dml_business_key(dml));
+            if self
+                .write_index
+                .get(&key)
+                .is_some_and(|&committed_at| committed_at > txn.snapshot)
+            {
+                return Err(EngineError::Conflict);
+            }
+        }
         let txn_id = TxnId(self.next_txn);
         self.next_txn += 1;
         let principal = Principal::new(WIRE_PRINCIPAL.to_vec());
@@ -1052,6 +1183,18 @@ fn encode_value(value: &ScalarValue) -> Vec<u8> {
 /// key matches across operations.
 fn business_key(value: &ScalarValue) -> BusinessKey {
     BusinessKey::new(encode_value(value))
+}
+
+/// The [`BusinessKey`] a bound DML writes — the unit of write-write conflict
+/// detection ([`commit`](SessionEngine::commit)). Every `BoundDml` variant carries
+/// a single key (the positional first column), so this is total over the enum.
+fn dml_business_key(dml: &BoundDml) -> BusinessKey {
+    let key = match dml {
+        BoundDml::Insert { key, .. }
+        | BoundDml::Update { key, .. }
+        | BoundDml::Delete { key, .. } => key,
+    };
+    business_key(key)
 }
 
 /// The cell of bytes column `id` at `row`, or `None` if the column is absent,
@@ -1747,6 +1890,186 @@ mod tests {
         assert_eq!(
             payload_column(&result),
             vec![encode_value(&ScalarValue::Int4(250))]
+        );
+    }
+
+    // --- Snapshot isolation oracle (STL-175, ADR-0008) ---------------------
+    //
+    // The engine is mutex-serialized in the server, so concurrency is modeled
+    // here as interleaved `begin`/`stage_dml`/`commit` calls — the same shape a
+    // pair of connections produces. These assert the two STL-175 properties: a
+    // transaction reads one consistent snapshot, and first-committer-wins
+    // write-write conflict detection surfaces a retryable error.
+
+    #[test]
+    fn a_transaction_reads_one_consistent_snapshot() {
+        // A transaction pins its read snapshot at BEGIN; every statement reads at
+        // it, even while another transaction commits a newer value.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("seed 100");
+
+        // Pin the snapshot — it sees balance = 100.
+        let mut txn = engine.begin();
+
+        // A concurrent auto-committed write moves the live balance to 200.
+        engine
+            .execute(&parse_one("UPDATE account SET balance = 200 WHERE id = 1"))
+            .expect("concurrent update");
+
+        // The transaction still reads its pinned snapshot: 100, and stably so
+        // across repeated reads.
+        for _ in 0..2 {
+            let StatementOutcome::Rows(in_txn) = engine
+                .execute_in_txn(&parse_one("SELECT balance FROM account"), &mut txn)
+                .expect("read inside the transaction")
+            else {
+                panic!("rows");
+            };
+            assert_eq!(
+                payload_column(&in_txn),
+                vec![encode_value(&ScalarValue::Int4(100))],
+                "the transaction reads its pinned snapshot, not the concurrent commit"
+            );
+        }
+
+        // An auto-committed read outside the transaction is its own snapshot and
+        // sees the latest value, 200.
+        let StatementOutcome::Rows(live) = engine
+            .execute(&parse_one("SELECT balance FROM account"))
+            .expect("read live")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            payload_column(&live),
+            vec![encode_value(&ScalarValue::Int4(200))],
+            "outside a transaction each statement reads the latest committed state"
+        );
+    }
+
+    #[test]
+    fn concurrent_writes_to_the_same_key_conflict_first_committer_wins() {
+        // Two transactions pin the same snapshot and both write id = 1. The first
+        // to commit wins; the second sees a retryable conflict and never lands.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("seed");
+
+        let mut first = engine.begin();
+        let mut second = engine.begin();
+        engine
+            .stage_dml(
+                &parse_one("UPDATE account SET balance = 200 WHERE id = 1"),
+                &mut first,
+            )
+            .expect("stage first");
+        engine
+            .stage_dml(
+                &parse_one("UPDATE account SET balance = 300 WHERE id = 1"),
+                &mut second,
+            )
+            .expect("stage second");
+
+        engine.commit(first).expect("first committer wins");
+        let err = engine.commit(second).unwrap_err();
+        assert!(
+            matches!(err, EngineError::Conflict),
+            "the loser gets a retryable conflict, got {err:?}"
+        );
+
+        // The winner's value stands; the loser touched nothing.
+        let StatementOutcome::Rows(result) = engine
+            .execute(&parse_one("SELECT balance FROM account"))
+            .expect("select")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            payload_column(&result),
+            vec![encode_value(&ScalarValue::Int4(200))],
+            "first committer wins; the conflicting transaction had no effect"
+        );
+    }
+
+    #[test]
+    fn concurrent_writes_to_distinct_keys_do_not_conflict() {
+        // Conflict detection is per key: two transactions on the same snapshot
+        // writing *different* keys both commit — no false serialization failure.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("seed 1");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (2, 200)"))
+            .expect("seed 2");
+
+        let mut first = engine.begin();
+        let mut second = engine.begin();
+        engine
+            .stage_dml(
+                &parse_one("UPDATE account SET balance = 111 WHERE id = 1"),
+                &mut first,
+            )
+            .expect("stage first");
+        engine
+            .stage_dml(
+                &parse_one("UPDATE account SET balance = 222 WHERE id = 2"),
+                &mut second,
+            )
+            .expect("stage second");
+
+        engine.commit(first).expect("first commits");
+        engine
+            .commit(second)
+            .expect("second commits — a distinct key never conflicts");
+    }
+
+    #[test]
+    fn a_serial_transaction_does_not_conflict_with_an_earlier_one() {
+        // A transaction that begins *after* another committed the same key sees
+        // that write in its snapshot and updates on top of it — no conflict.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("seed");
+
+        let mut first = engine.begin();
+        engine
+            .stage_dml(
+                &parse_one("UPDATE account SET balance = 200 WHERE id = 1"),
+                &mut first,
+            )
+            .expect("stage first");
+        engine.commit(first).expect("first commits");
+
+        // Begins now — its snapshot already includes the first transaction's write.
+        let mut second = engine.begin();
+        engine
+            .stage_dml(
+                &parse_one("UPDATE account SET balance = 300 WHERE id = 1"),
+                &mut second,
+            )
+            .expect("stage second");
+        engine
+            .commit(second)
+            .expect("second commits — it started after the first");
+
+        let StatementOutcome::Rows(result) = engine
+            .execute(&parse_one("SELECT balance FROM account"))
+            .expect("select")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            payload_column(&result),
+            vec![encode_value(&ScalarValue::Int4(300))]
         );
     }
 
