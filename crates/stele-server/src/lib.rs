@@ -307,6 +307,20 @@ mod tests {
     }
 
     #[test]
+    fn the_committed_sample_config_parses_to_the_documented_defaults() {
+        // The shipped `stele.example.toml` must always load — this guards it from
+        // silently drifting out of sync with the parser (STL-208). It uses the
+        // documented defaults, so a config-file run resolves to exactly them
+        // (non-dev, local backend, default listen + data_dir).
+        let cfg = Config::from_toml_str(include_str!("../../../stele.example.toml"))
+            .expect("stele.example.toml must parse");
+        assert!(!cfg.dev, "a config-file run is never dev mode");
+        assert_eq!(cfg.backend, BackendKind::Local);
+        assert_eq!(cfg.listen, default_listen());
+        assert_eq!(cfg.data_dir, PathBuf::from(DEFAULT_DATA_DIR));
+    }
+
+    #[test]
     fn dev_defaults_to_local_in_scratch() {
         let cfg = Config::dev();
         assert!(cfg.dev);

@@ -21,6 +21,10 @@ Thumbs.db
 /scratch/
 *.log
 
+# An operator's real config, copied from stele.example.toml (the sample is
+# committed; a live stele.toml — which may grow secrets — is not).
+/stele.toml
+
 # Coverage / profiling
 /coverage/
 *.gcda

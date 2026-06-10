@@ -324,4 +324,6 @@ metrics    = "0.0.0.0:9090"     # Prometheus/OpenMetrics
 tracing    = "info"
 ```
 
+A ready-to-copy sample lives at [`stele.example.toml`](../stele.example.toml) in the repo root — `cp stele.example.toml stele.toml` and edit. Only `[server] listen`/`data_dir` and `[storage] backend` are read today (STL-116); the other sections above are reserved (the parser ignores unknown sections) and land in later tickets.
+
 Dev mode (`--dev`) supplies safe defaults so a contributor needs **no config file** to get running — config is for operators, not for the five-minute path.
