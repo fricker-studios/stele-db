@@ -108,9 +108,13 @@ pub struct DmlOutcome {
     /// The system-time `sys_from` stamped on the new version (for `INSERT` /
     /// `UPDATE`), or the `sys_to` the period was closed at (for `DELETE`).
     pub commit: SystemTimeMicros,
-    /// The WAL position immediately after this operation's redo record. Pass it
-    /// to [`Wal::commit`] to await durability — the operation is staged in the
-    /// delta but is only durable once an fsync covers this offset.
+    /// The WAL position to await for durability. On the auto-commit path it is the
+    /// offset immediately *after* this operation's redo record — pass it to
+    /// [`Wal::commit`]; the operation is durable once an fsync covers it. In
+    /// **group-commit** mode the redo record is deferred to
+    /// [`DmlWriter::commit_group`], so this is instead the current durable end (this
+    /// write is not past it yet); the caller awaits the group's durability through
+    /// `commit_group`, not this offset.
     pub wal: LogOffset,
 }
 
@@ -330,9 +334,21 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     ///
     /// # Errors
     ///
-    /// [`DmlError::Wal`] if the append or fsync fails (e.g. a full disk or a torn
-    /// write) — the transaction did not durably commit, and recovery will find no
-    /// trace of it.
+    /// [`DmlError::Wal`] if the append or fsync fails. Two cases, per the WAL
+    /// durability contract:
+    ///
+    /// * **the append fails / is torn** — no complete record reaches the log, so
+    ///   recovery finds nothing of the transaction (a torn frame fails its CRC and
+    ///   is dropped at the fence); and
+    /// * **the append succeeds but the fsync ([`Wal::tick`]) fails** — the complete
+    ///   record is already *staged* in the WAL, so its durability is **indeterminate**:
+    ///   a later successful `tick` (e.g. a [`checkpoint`](crate::engine::Engine::checkpoint))
+    ///   could still make it durable. An fsync failure must therefore be treated as a
+    ///   crash (the engine should stop and recover) rather than as a clean abort —
+    ///   hardening the engine to enforce that is [STL-217]. Either way no *new*
+    ///   durability point is introduced: the fsync is the only one.
+    ///
+    /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
     pub fn commit_group(&mut self) -> Result<LogOffset, DmlError> {
         let redos = self.group.take().unwrap_or_default();
         if redos.is_empty() {
@@ -340,7 +356,10 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
         }
         let record = encode_redo(&redos)?;
         self.wal.append(&record)?;
-        // The single group-commit fsync — the transaction's durability point.
+        // The single group-commit fsync — the transaction's durability point. If it
+        // fails after the append above, the staged record's durability is
+        // indeterminate (a later tick may still flush it); the caller must treat
+        // that as a crash, not a clean abort (STL-217).
         self.wal.tick()?;
         Ok(self.wal.durable_end())
     }

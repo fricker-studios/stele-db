@@ -396,8 +396,11 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     ///
     /// # Errors
     ///
-    /// [`EngineError::Dml`] if the append or fsync fails — the transaction did not
-    /// durably commit and recovery will find no trace of it.
+    /// [`EngineError::Dml`] if the append or fsync fails. A torn or unwritten append
+    /// recovers to nothing; but if the append succeeds and only the fsync fails the
+    /// staged record's durability is **indeterminate** (a later `tick` may still
+    /// flush it), so that case must be treated as a crash rather than a clean abort —
+    /// see [`DmlWriter::commit_group`] and [STL-217].
     pub fn commit_group(&mut self) -> Result<LogOffset, EngineError> {
         Ok(self.writer.commit_group()?)
     }

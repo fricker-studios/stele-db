@@ -1545,11 +1545,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// [`EngineError::Conflict`] if a concurrent commit modified this transaction's
     /// write set after its snapshot (retry the transaction). Otherwise
     /// [`EngineError`] if applying any buffered write fails (e.g. its table was
-    /// dropped between staging and commit) or a group-commit append/fsync fails;
-    /// nothing the transaction wrote is made durable. A write already applied to the
-    /// in-memory tiers when a *later* one fails is not yet rolled back in memory
-    /// (it is never made durable, and recovery drops it) — in-memory rollback of an
-    /// aborted commit is the follow-up.
+    /// dropped between staging and commit) or a group-commit append/fsync fails. A
+    /// failure before the fsync makes nothing durable (a torn record is dropped on
+    /// recovery); a *failed fsync after a successful append* leaves the staged record's
+    /// durability **indeterminate** and must be treated as a crash, not a clean abort
+    /// (the WAL contract, [STL-217]). A write already applied to the in-memory tiers
+    /// when a *later* one fails is not yet rolled back in memory ([STL-216]).
     pub fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError> {
         // First-committer-wins write-write conflict detection. Checked up front, so
         // a conflict aborts the whole transaction before any write lands.
@@ -1594,6 +1595,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// buffering — which would otherwise silently swallow a later auto-commit write.
     /// A mid-sequence failure can thus leave earlier tables durable and later ones
     /// not — the cross-table atomicity limitation noted on [`commit`](Self::commit).
+    ///
+    /// One caveat on the failing table: if its `commit_group` failed *after* the WAL
+    /// append (a failed fsync, not a torn write), its staged record's durability is
+    /// indeterminate — returning `Err` reports the commit as failed, but the record
+    /// may still flush on a later `tick`. Per the WAL contract that case is a crash,
+    /// not a clean abort; enforcing it (poisoning the engine on fsync failure) is
+    /// [STL-217].
     fn finish_group_commit(&mut self, touched: &[String]) -> Result<(), EngineError> {
         let mut error: Option<EngineError> = None;
         for table in touched {
@@ -1616,6 +1624,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// A table is put in group-commit mode the first time the transaction writes to
     /// it; the write itself routes through the shared [`apply_bound_dml`](Self::apply_bound_dml)
     /// path, which now buffers rather than appends (the table is in group mode).
+    ///
+    /// The table name is allocated only on first touch — the membership scan is over
+    /// `touched`, the set of *distinct* tables (typically one or a few), not the
+    /// write count — so a large single-table transaction stays allocation-free here.
     fn apply_group(
         &mut self,
         writes: Vec<BoundDml>,
@@ -1624,10 +1636,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         touched: &mut Vec<String>,
     ) -> Result<(), EngineError> {
         for dml in writes {
-            let table = dml.table().to_owned();
-            if !touched.contains(&table) {
-                self.table_mut(&table)?.engine.begin_group();
-                touched.push(table);
+            if !touched.iter().any(|t| t == dml.table()) {
+                self.table_mut(dml.table())?.engine.begin_group();
+                touched.push(dml.table().to_owned());
             }
             self.apply_bound_dml(dml, txn_id, principal)?;
         }
