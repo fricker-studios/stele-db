@@ -506,7 +506,7 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
                 // `SegmentReader::read_versions` applies across its columns).
                 if column_len(&data) != sel.selected_rows {
                     return Err(ScanError::Segment(SegmentError::Corrupt(
-                        "segment column value count disagrees with its identity row count",
+                        "segment column value count disagrees with the selected row-groups' row count",
                     )));
                 }
                 cols.push((col, data));
@@ -582,7 +582,7 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             // segment, surfaced rather than indexed past its end below.
             if from.len() != sel.selected_rows || to.len() != sel.selected_rows {
                 return Err(ScanError::Segment(SegmentError::Corrupt(
-                    "valid-time column value count disagrees with the segment's identity row count",
+                    "valid-time column value count disagrees with the selected row-groups' row count",
                 )));
             }
             valid_by_seg.insert(seg_idx, (sel, from, to));
