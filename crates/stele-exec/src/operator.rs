@@ -291,9 +291,13 @@ impl<C: Operator> Operator for ExplodePayload<C> {
 
         // Decode each row's packed payload into its value cells once, then
         // transpose the per-row cells into `value_count` columns. `decode_payload`
-        // always returns exactly `value_count` cells, so the zip is total.
-        let mut value_cols: Vec<Vec<Option<Vec<u8>>>> =
-            vec![Vec::with_capacity(rows); self.value_count];
+        // always returns exactly `value_count` cells, so the zip is total. Build
+        // the columns by mapping — not `vec![Vec::with_capacity(rows); n]`, whose
+        // clones would drop the reservation (cloning a `Vec` does not preserve
+        // capacity), so each column reserves its `rows` cells up front.
+        let mut value_cols: Vec<Vec<Option<Vec<u8>>>> = (0..self.value_count)
+            .map(|_| Vec::with_capacity(rows))
+            .collect();
         for cell in payload_cells {
             let decoded = row_codec::decode_payload(self.value_count, cell.as_deref())?;
             for (slot, value) in value_cols.iter_mut().zip(decoded) {
