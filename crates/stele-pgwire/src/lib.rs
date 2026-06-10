@@ -1891,8 +1891,8 @@ async fn handle_describe(
             write_parameter_description(stream, &oids).await?;
             // The row shape of an unbound statement needs its parameters resolved;
             // we report NoData and surface the real RowDescription from a
-            // Describe-portal after Bind. (Statement-level row description is a
-            // follow-up — see STL-183 fan-out.)
+            // Describe-portal after Bind. Statement-level row description (the
+            // tokio-postgres / JDBC prepared-SELECT path) is the STL-212 follow-up.
             write_no_data(stream).await?;
             Ok(())
         }
