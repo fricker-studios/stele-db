@@ -63,7 +63,8 @@ fn read_all(disk: &MemDisk, name: &str) -> Vec<u8> {
 fn segment_digests(disk: &MemDisk) -> BTreeMap<String, Digest> {
     let mut out = BTreeMap::new();
     for name in disk.list().expect("list") {
-        // Mirrors the engine's own `seg-{index}.seg` filename discovery.
+        // Mirrors the engine's own discovery of its zero-padded
+        // `seg-{index:020}.seg` filenames (`engine::segment_name`).
         let is_segment = name
             .strip_prefix("seg-")
             .and_then(|rest| rest.strip_suffix(".seg"))
@@ -96,8 +97,9 @@ fn assert_sealed_unchanged(disk: &MemDisk, sealed: &BTreeMap<String, Digest>, st
 }
 
 /// Record the digests of any segments not yet tracked in `sealed` — called right
-/// after a flush commits, so every committed segment is hashed exactly once, at
-/// seal time.
+/// after a flush commits, so each committed segment's *recorded* digest is the
+/// one taken at seal time (`or_insert` never overwrites an earlier record, even
+/// though re-listing the disk re-hashes every segment present).
 fn adopt_new_segments(disk: &MemDisk, sealed: &mut BTreeMap<String, Digest>) {
     for (name, digest) in segment_digests(disk) {
         sealed.entry(name).or_insert(digest);
