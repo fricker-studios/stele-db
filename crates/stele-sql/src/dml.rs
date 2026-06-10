@@ -32,6 +32,24 @@
 //!   (a read-modify-write the engine performs).
 //! * `DELETE FROM t WHERE <key> = k` — close `k`'s prior period, no successor.
 //!
+//! ## Valid-time tables ([STL-194])
+//!
+//! A table that opted into a valid axis (`… VALID TIME (vf, vt)`) carries a second
+//! `[from, to)` interval per version: *when the fact is true in the world*. The
+//! two period columns (`vf`, `vt`) are ordinary declared columns, so they appear
+//! in the `INSERT` value list / `UPDATE … SET` like any other — but their values
+//! are *lifted* into an [`Interval`] the engine
+//! frames onto the stored payload, **and** kept as the row's
+//! [`Timestamp`](stele_common::types::ScalarValue::Timestamp) value cells so the
+//! row codec stays width-agnostic to the opt-in. The bounds fold the same way a
+//! [`FOR VALID_TIME AS OF`](crate::select) instant does (an integer microsecond
+//! value, `now()`, or `now() ± interval`) — they are not civil-time `TIMESTAMP`
+//! literals. The start (`vf`) is mandatory; the end (`vt`) defaults to
+//! [`VALID_TIME_OPEN`] (an open period) when
+//! omitted from the column list or given `NULL`. The bound interval rides
+//! the `valid` field of [`BoundDml::Insert`] / [`BoundDml::Update`]; it is `None` for a
+//! system-only table.
+//!
 //! ## What this rejects (with a clear bind error, never a wrong write)
 //!
 //! Multi-row `INSERT`, `INSERT … SELECT`, a `WHERE` that is not `<key> =
@@ -48,12 +66,14 @@ use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, Insert, ObjectName,
     SetExpr, Statement as SqlStatement, TableFactor, TableObject, TableWithJoins, Update,
 };
-use stele_catalog::{ColumnDef, SchemaId, TableSchema};
+use stele_catalog::{ColumnDef, SchemaId, TableSchema, ValidTimeSpec};
+use stele_common::period::Interval;
+use stele_common::time::{SystemTimeMicros, VALID_TIME_OPEN};
 use stele_common::types::{LogicalType, ScalarValue};
 
 use crate::ast::Statement;
 use crate::fold::{self, FoldError};
-use crate::select::{BindContext, TableResolution, resolve_table_at};
+use crate::select::{AsOfError, BindContext, TableResolution, resolve_as_of, resolve_table_at};
 
 /// A bound `INSERT` / `UPDATE` / `DELETE`, ready for the engine to apply.
 ///
@@ -74,8 +94,17 @@ pub enum BoundDml {
         /// The value columns' values, in schema order (the columns *after* the
         /// business key). Each is `None` for a SQL `NULL` cell ([STL-154]). The
         /// engine packs these into the stored payload with the
-        /// [row codec](stele_common::row_codec).
+        /// [row codec](stele_common::row_codec). On a valid-time table the period
+        /// columns are *included here* as [`ScalarValue::Timestamp`] cells (their
+        /// literal bounds), so the row codec is width-agnostic to the valid-time
+        /// opt-in; the `valid` interval is *derived* from the same two bounds and
+        /// framed onto the stored payload ([STL-194]).
         values: Vec<Option<ScalarValue>>,
+        /// The `[from, to)` valid-time period for this write, or `None` for a
+        /// system-only table. `Some` for a valid-time table — the engine frames
+        /// it onto the stored payload; `to` is [`VALID_TIME_OPEN`] when the
+        /// `INSERT` named only the start bound ([STL-194]).
+        valid: Option<Interval>,
     },
     /// `UPDATE`: close `key`'s prior period and open a new one. The `assignments`
     /// overwrite the named value columns; any column the `SET` does not name keeps
@@ -89,8 +118,15 @@ pub enum BoundDml {
         key: ScalarValue,
         /// The `SET` clause as `(value-column index, new value)` pairs, where the
         /// index is 0-based over the **value columns** (the columns after the
-        /// business key). A `None` value is a SQL `NULL` ([STL-154]).
+        /// business key). A `None` value is a SQL `NULL` ([STL-154]). On a
+        /// valid-time table the period columns appear here too, carrying the new
+        /// version's bounds as [`ScalarValue::Timestamp`] cells ([STL-194]).
         assignments: Vec<(usize, Option<ScalarValue>)>,
+        /// The new version's `[from, to)` valid-time period, or `None` for a
+        /// system-only table ([STL-194]). A valid-time `UPDATE` opens a new period
+        /// and so must `SET` the start bound; the end bound defaults to
+        /// [`VALID_TIME_OPEN`] when the `SET` omits it.
+        valid: Option<Interval>,
     },
     /// `DELETE`: close `key`'s prior period with no successor (a period close,
     /// not a row removal — history is preserved).
@@ -295,6 +331,49 @@ pub enum DmlError {
         /// The column a `NULL` was bound to.
         column: String,
     },
+
+    /// A write to a valid-time table did not supply its period **start** (`from`)
+    /// bound: the `INSERT` omitted that column or gave it `NULL`, or the `UPDATE`'s
+    /// `SET` did not assign it. Every version of a valid-time row must say when it
+    /// begins being true; only the `to` bound defaults (to an open period,
+    /// [`VALID_TIME_OPEN`]) ([STL-194]).
+    #[error("valid-time table {table:?} requires a value for its period start column {column:?}")]
+    ValidTimeStartRequired {
+        /// The valid-time table written.
+        table: String,
+        /// The period's `from` (start) column.
+        column: String,
+    },
+
+    /// A valid-time period boundary (`vf` / `vt`) could not be folded to a concrete
+    /// instant. The bounds accept the same shapes a [`FOR VALID_TIME AS OF`](crate::select)
+    /// instant does — an integer microsecond value, `now()`, or `now() ± interval`
+    /// — and are *not* civil-time `TIMESTAMP` literals (no civil-time codec yet).
+    #[error(
+        "valid-time bound for column {column:?} in table {table:?} is not a valid instant: {source}"
+    )]
+    BadValidTimeBound {
+        /// The valid-time table written.
+        table: String,
+        /// The period boundary column the bad bound was given for.
+        column: String,
+        /// The fold failure from the shared `AS OF` resolver.
+        source: AsOfError,
+    },
+
+    /// The valid-time period a write named is empty or reversed (`from >= to`).
+    /// Half-open `[from, to)` requires the start strictly before the end.
+    #[error(
+        "valid-time period for table {table:?} is empty or reversed: from ({from}) must be < to ({to})"
+    )]
+    EmptyValidInterval {
+        /// The valid-time table written.
+        table: String,
+        /// The period's resolved start microseconds.
+        from: i64,
+        /// The period's resolved end microseconds.
+        to: i64,
+    },
 }
 
 /// Bind a parsed [`Statement`] into a [`BoundDml`].
@@ -337,11 +416,13 @@ fn bind_insert(insert: &Insert, ctx: &BindContext) -> Result<BoundDml, DmlError>
     let row = single_values_row(insert)?;
 
     // Resolve, for every schema column in declaration order, the value expression
-    // that supplies it. With no explicit column list the values map positionally;
-    // with a list, each schema column takes the value at its name's position (and
-    // every column must be supplied — there are no defaults).
+    // that supplies it (`None` when omitted). With no explicit column list the
+    // values map positionally (and the count must match exactly); with a list,
+    // each schema column takes the value at its name's position. An omitted column
+    // is only legal for the valid-time period's *end* bound (which opens the
+    // period); every other omission is a `MissingColumn` at the point of use.
     let columns = schema.columns();
-    let exprs: Vec<&Expr> = match insert.columns.as_slice() {
+    let exprs: Vec<Option<&Expr>> = match insert.columns.as_slice() {
         [] => {
             if row.len() != columns.len() {
                 return Err(DmlError::ColumnCountMismatch {
@@ -349,7 +430,7 @@ fn bind_insert(insert: &Insert, ctx: &BindContext) -> Result<BoundDml, DmlError>
                     found: row.len(),
                 });
             }
-            row.iter().collect()
+            row.iter().map(Some).collect()
         }
         cols => {
             if cols.len() != row.len() {
@@ -366,29 +447,32 @@ fn bind_insert(insert: &Insert, ctx: &BindContext) -> Result<BoundDml, DmlError>
                         .iter()
                         .position(|n| n == column.name())
                         .map(|i| &row[i])
-                        .ok_or_else(|| DmlError::MissingColumn {
-                            table: table.clone(),
-                            column: column.name().to_owned(),
-                        })
                 })
-                .collect::<Result<_, _>>()?
+                .collect()
         }
     };
 
     // `exprs` is aligned to `columns`: the first is the business key, the rest are
     // the value columns in order.
-    let key = fold_value(exprs[0], &table, key_col)?;
-    let values = value_cols
-        .iter()
-        .zip(&exprs[1..])
-        .map(|(column, expr)| fold_payload(expr, &table, column))
-        .collect::<Result<_, _>>()?;
+    let key_expr = exprs[0].ok_or_else(|| DmlError::MissingColumn {
+        table: table.clone(),
+        column: key_col.name().to_owned(),
+    })?;
+    let key = fold_value(key_expr, &table, key_col)?;
+    let (values, valid) = fold_value_columns(
+        &table,
+        value_cols,
+        &exprs[1..],
+        schema.temporal().valid_time(),
+        ctx.snapshot,
+    )?;
 
     Ok(BoundDml::Insert {
         table: table.clone(),
         schema_id: schema.schema_id(),
         key,
         values,
+        valid,
     })
 }
 
@@ -504,7 +588,14 @@ fn bind_update(update: &Update, ctx: &BindContext) -> Result<BoundDml, DmlError>
             "UPDATE with no SET assignments".to_owned(),
         ));
     }
+    // A valid-time UPDATE opens a *new* period, so its SET supplies the new
+    // version's bounds (the period columns fold as instants, like a `FOR
+    // VALID_TIME AS OF`); a system-only UPDATE carries no interval. Tracked while
+    // walking the assignments and reconciled into the interval below.
+    let period = schema.temporal().valid_time();
     let mut assignments: Vec<(usize, Option<ScalarValue>)> = Vec::new();
+    let mut from: Option<i64> = None;
+    let mut to: Option<i64> = None;
     for assignment in &update.assignments {
         let target = assignment_column(assignment)?;
         if target == key_col.name() {
@@ -527,9 +618,37 @@ fn bind_update(update: &Update, ctx: &BindContext) -> Result<BoundDml, DmlError>
                 "UPDATE assigns column {target:?} more than once"
             )));
         }
-        let value = fold_payload(&assignment.value, &table, &value_cols[idx])?;
+        let value = match period_role(period, target) {
+            Some(PeriodRole::From) => {
+                let micros =
+                    fold_from_bound(Some(&assignment.value), &table, target, ctx.snapshot)?;
+                from = Some(micros);
+                Some(ScalarValue::Timestamp(micros))
+            }
+            Some(PeriodRole::To) => {
+                let micros = fold_to_bound(Some(&assignment.value), &table, target, ctx.snapshot)?;
+                to = Some(micros);
+                Some(ScalarValue::Timestamp(micros))
+            }
+            None => fold_payload(&assignment.value, &table, &value_cols[idx])?,
+        };
         assignments.push((idx, value));
     }
+
+    // The end bound defaults to an open period when the SET omits it — synthesize
+    // the cell so the row codec payload and the framed interval agree.
+    if let Some(period) = period {
+        if to.is_none() {
+            if let Some(to_idx) = value_cols
+                .iter()
+                .position(|c| c.name() == period.to_column())
+            {
+                assignments.push((to_idx, Some(ScalarValue::Timestamp(VALID_TIME_OPEN.0))));
+            }
+            to = Some(VALID_TIME_OPEN.0);
+        }
+    }
+    let valid = build_interval(&table, period, from, to)?;
 
     let key = key_predicate(update.selection.as_ref(), &table, key_col)?;
     Ok(BoundDml::Update {
@@ -537,6 +656,7 @@ fn bind_update(update: &Update, ctx: &BindContext) -> Result<BoundDml, DmlError>
         schema_id: schema.schema_id(),
         key,
         assignments,
+        valid,
     })
 }
 
@@ -692,6 +812,155 @@ fn column_side(expr: &Expr) -> Result<Option<&str>, DmlError> {
     }
 }
 
+/// Which boundary of a table's valid-time period a column is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeriodRole {
+    /// The period's `from` (inclusive start) column.
+    From,
+    /// The period's `to` (exclusive end) column.
+    To,
+}
+
+/// The valid-time role of `column`, or `None` when the table has no valid axis or
+/// the column is an ordinary value column.
+fn period_role(period: Option<&ValidTimeSpec>, column: &str) -> Option<PeriodRole> {
+    let period = period?;
+    if period.from_column() == column {
+        Some(PeriodRole::From)
+    } else if period.to_column() == column {
+        Some(PeriodRole::To)
+    } else {
+        None
+    }
+}
+
+/// Fold an `INSERT`'s value columns into row-codec cells and, for a valid-time
+/// table, the `[from, to)` interval framed onto the stored payload.
+///
+/// `exprs` is aligned to `value_cols`; a `None` entry is a column omitted from the
+/// `INSERT`'s column list. For a system-only table every column must be supplied
+/// and the returned interval is `None`. For a valid-time table the two period
+/// columns are *also* kept as [`ScalarValue::Timestamp`] cells — so the row codec
+/// stays width-agnostic to the valid-time opt-in (the engine's read path slices
+/// the same N value columns either way) — and the interval is derived from their
+/// bounds: the `from` bound is mandatory, the `to` bound defaults to
+/// [`VALID_TIME_OPEN`] when omitted or `NULL`.
+fn fold_value_columns(
+    table: &str,
+    value_cols: &[ColumnDef],
+    exprs: &[Option<&Expr>],
+    period: Option<&ValidTimeSpec>,
+    now: SystemTimeMicros,
+) -> Result<(Vec<Option<ScalarValue>>, Option<Interval>), DmlError> {
+    let mut values = Vec::with_capacity(value_cols.len());
+    let mut from: Option<i64> = None;
+    let mut to: Option<i64> = None;
+    for (column, expr) in value_cols.iter().zip(exprs) {
+        let value = match period_role(period, column.name()) {
+            Some(PeriodRole::From) => {
+                let micros = fold_from_bound(*expr, table, column.name(), now)?;
+                from = Some(micros);
+                Some(ScalarValue::Timestamp(micros))
+            }
+            Some(PeriodRole::To) => {
+                let micros = fold_to_bound(*expr, table, column.name(), now)?;
+                to = Some(micros);
+                Some(ScalarValue::Timestamp(micros))
+            }
+            None => {
+                let expr = expr.ok_or_else(|| DmlError::MissingColumn {
+                    table: table.to_owned(),
+                    column: column.name().to_owned(),
+                })?;
+                fold_payload(expr, table, column)?
+            }
+        };
+        values.push(value);
+    }
+    let valid = build_interval(table, period, from, to)?;
+    Ok((values, valid))
+}
+
+/// Build the `[from, to)` interval for a write from its resolved bounds and the
+/// table's valid-time policy: `None` for a system-only table; for a valid-time
+/// table the `from` bound is mandatory ([`DmlError::ValidTimeStartRequired`]) and
+/// the `to` bound defaults to [`VALID_TIME_OPEN`].
+fn build_interval(
+    table: &str,
+    period: Option<&ValidTimeSpec>,
+    from: Option<i64>,
+    to: Option<i64>,
+) -> Result<Option<Interval>, DmlError> {
+    let Some(period) = period else {
+        return Ok(None);
+    };
+    let from = from.ok_or_else(|| DmlError::ValidTimeStartRequired {
+        table: table.to_owned(),
+        column: period.from_column().to_owned(),
+    })?;
+    let to = to.unwrap_or(VALID_TIME_OPEN.0);
+    Interval::new(from, to)
+        .map(Some)
+        .map_err(|_| DmlError::EmptyValidInterval {
+            table: table.to_owned(),
+            from,
+            to,
+        })
+}
+
+/// Fold a valid-time `from` (period start) bound to its microsecond instant. The
+/// start is mandatory — an omitted column (`None`) or a SQL `NULL` is
+/// [`DmlError::ValidTimeStartRequired`].
+fn fold_from_bound(
+    expr: Option<&Expr>,
+    table: &str,
+    column: &str,
+    now: SystemTimeMicros,
+) -> Result<i64, DmlError> {
+    match expr {
+        Some(expr) if !fold::is_null(expr) => fold_instant(expr, table, column, now),
+        _ => Err(DmlError::ValidTimeStartRequired {
+            table: table.to_owned(),
+            column: column.to_owned(),
+        }),
+    }
+}
+
+/// Fold a valid-time `to` (period end) bound. An omitted column (`None`) or a SQL
+/// `NULL` opens the period ([`VALID_TIME_OPEN`]).
+fn fold_to_bound(
+    expr: Option<&Expr>,
+    table: &str,
+    column: &str,
+    now: SystemTimeMicros,
+) -> Result<i64, DmlError> {
+    match expr {
+        Some(expr) if !fold::is_null(expr) => fold_instant(expr, table, column, now),
+        _ => Ok(VALID_TIME_OPEN.0),
+    }
+}
+
+/// Fold a valid-time boundary expression to microseconds with the shared `AS OF`
+/// resolver ([`resolve_as_of`]) — an integer microsecond instant, `now()`, or
+/// `now() ± interval`. The bounds deliberately reuse the read side's folding, so a
+/// value written into a period column resolves the same way it does in a `FOR
+/// VALID_TIME AS OF`; they are *not* civil-time `TIMESTAMP` literals (no
+/// civil-time codec yet — mirrors the [`AS OF`](crate::select) stance).
+fn fold_instant(
+    expr: &Expr,
+    table: &str,
+    column: &str,
+    now: SystemTimeMicros,
+) -> Result<i64, DmlError> {
+    resolve_as_of(expr, now)
+        .map(|m| m.0)
+        .map_err(|source| DmlError::BadValidTimeBound {
+            table: table.to_owned(),
+            column: column.to_owned(),
+            source,
+        })
+}
+
 /// Fold a value-column literal, accepting SQL `NULL` as `None` ([STL-154]).
 ///
 /// A value column is nullable end to end (storage carries a `None` cell
@@ -829,6 +1098,7 @@ mod tests {
                 schema_id: SchemaId(1),
                 key: ScalarValue::Int4(1),
                 values: vec![Some(ScalarValue::Int4(100))],
+                valid: None,
             })
         );
     }
@@ -843,6 +1113,7 @@ mod tests {
                 schema_id: SchemaId(1),
                 key: ScalarValue::Int4(1),
                 assignments: vec![(0, Some(ScalarValue::Int4(250)))],
+                valid: None,
             })
         );
     }
@@ -874,6 +1145,7 @@ mod tests {
                 schema_id: SchemaId(1),
                 key: ScalarValue::Int4(1),
                 values: vec![Some(ScalarValue::Int4(100))],
+                valid: None,
             })
         );
     }
@@ -1000,6 +1272,7 @@ mod tests {
                 schema_id: SchemaId(1),
                 key: ScalarValue::Int4(1),
                 values: vec![None],
+                valid: None,
             })
         );
     }
@@ -1014,6 +1287,7 @@ mod tests {
                 schema_id: SchemaId(1),
                 key: ScalarValue::Int4(1),
                 assignments: vec![(0, None)],
+                valid: None,
             })
         );
     }
@@ -1130,6 +1404,7 @@ mod tests {
                     Some(ScalarValue::Int4(3)),
                     Some(ScalarValue::Text("x".to_owned())),
                 ],
+                valid: None,
             })
         );
         // A reordering column list still maps each value to its column by name.
@@ -1147,6 +1422,7 @@ mod tests {
                     Some(ScalarValue::Int4(3)),
                     Some(ScalarValue::Text("x".to_owned())),
                 ],
+                valid: None,
             })
         );
     }
@@ -1166,6 +1442,7 @@ mod tests {
                     (1, Some(ScalarValue::Int4(9))),
                     (2, Some(ScalarValue::Text("z".to_owned()))),
                 ],
+                valid: None,
             })
         );
     }
@@ -1198,6 +1475,7 @@ mod tests {
                 schema_id: SchemaId(1),
                 key: ScalarValue::Int4(1),
                 values: vec![],
+                valid: None,
             })
         );
     }
@@ -1281,6 +1559,256 @@ mod tests {
                 schema_id: SchemaId(1),
                 key: ScalarValue::Text("alpha".to_owned()),
                 values: vec![Some(ScalarValue::Bool(true))],
+                valid: None,
+            })
+        );
+    }
+
+    // --- valid-time DML ([STL-194]) ----------------------------------------
+
+    /// A catalog with a valid-time `vt (id, balance, vf, vt)` table — the period
+    /// columns `vf`/`vt` are declared `TIMESTAMP` columns named by `VALID TIME`.
+    fn valid_time_catalog() -> Catalog {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(
+                "vt",
+                vec![
+                    ColumnDef::new("id", LogicalType::Int4).expect("col"),
+                    ColumnDef::new("balance", LogicalType::Int4).expect("col"),
+                    ColumnDef::new("vf", LogicalType::Timestamp).expect("col"),
+                    ColumnDef::new("vt", LogicalType::Timestamp).expect("col"),
+                ],
+                TableTemporal::with_valid_time(ValidTimeSpec::new("vf", "vt").expect("spec")),
+                SystemTimeMicros(1_000),
+            )
+            .expect("create vt");
+        catalog
+    }
+
+    #[test]
+    fn insert_lifts_the_period_columns_into_an_interval() {
+        // The period columns fold as instants (integer microseconds) into the
+        // bound interval, and are *also* kept as Timestamp value cells so the row
+        // codec stays width-agnostic to the valid-time opt-in.
+        let catalog = valid_time_catalog();
+        assert_eq!(
+            bind("INSERT INTO vt VALUES (1, 100, 10, 20)", &catalog),
+            Ok(BoundDml::Insert {
+                table: "vt".to_owned(),
+                schema_id: SchemaId(1),
+                key: ScalarValue::Int4(1),
+                values: vec![
+                    Some(ScalarValue::Int4(100)),
+                    Some(ScalarValue::Timestamp(10)),
+                    Some(ScalarValue::Timestamp(20)),
+                ],
+                valid: Some(Interval::new(10, 20).expect("interval")),
+            })
+        );
+    }
+
+    #[test]
+    fn insert_omitting_the_end_bound_opens_the_period() {
+        // A column list that names only the start bound opens `[from, +∞)` — the
+        // omitted `vt` defaults to VALID_TIME_OPEN, in both the interval and the
+        // synthesized period cell.
+        let catalog = valid_time_catalog();
+        assert_eq!(
+            bind(
+                "INSERT INTO vt (id, balance, vf) VALUES (1, 100, 10)",
+                &catalog
+            ),
+            Ok(BoundDml::Insert {
+                table: "vt".to_owned(),
+                schema_id: SchemaId(1),
+                key: ScalarValue::Int4(1),
+                values: vec![
+                    Some(ScalarValue::Int4(100)),
+                    Some(ScalarValue::Timestamp(10)),
+                    Some(ScalarValue::Timestamp(VALID_TIME_OPEN.0)),
+                ],
+                valid: Some(Interval::new(10, VALID_TIME_OPEN.0).expect("open interval")),
+            })
+        );
+    }
+
+    #[test]
+    fn insert_null_end_bound_opens_the_period() {
+        // A positional INSERT can open the period by passing NULL for `vt`.
+        let catalog = valid_time_catalog();
+        let bound = bind("INSERT INTO vt VALUES (1, 100, 10, NULL)", &catalog).expect("bind");
+        assert_eq!(
+            bound,
+            BoundDml::Insert {
+                table: "vt".to_owned(),
+                schema_id: SchemaId(1),
+                key: ScalarValue::Int4(1),
+                values: vec![
+                    Some(ScalarValue::Int4(100)),
+                    Some(ScalarValue::Timestamp(10)),
+                    Some(ScalarValue::Timestamp(VALID_TIME_OPEN.0)),
+                ],
+                valid: Some(Interval::new(10, VALID_TIME_OPEN.0).expect("open interval")),
+            }
+        );
+    }
+
+    #[test]
+    fn insert_now_relative_bounds_fold_like_as_of() {
+        // The bounds reuse the `AS OF` resolver: `now()` and `now() ± interval`
+        // fold against the bind snapshot, exactly as a `FOR VALID_TIME AS OF` does.
+        let catalog = valid_time_catalog();
+        let now = NOW.0;
+        let bound = bind(
+            "INSERT INTO vt VALUES (1, 100, now(), now() + interval '1 day')",
+            &catalog,
+        )
+        .expect("bind");
+        let day = 86_400_000_000i64;
+        assert_eq!(
+            bound,
+            BoundDml::Insert {
+                table: "vt".to_owned(),
+                schema_id: SchemaId(1),
+                key: ScalarValue::Int4(1),
+                values: vec![
+                    Some(ScalarValue::Int4(100)),
+                    Some(ScalarValue::Timestamp(now)),
+                    Some(ScalarValue::Timestamp(now + day)),
+                ],
+                valid: Some(Interval::new(now, now + day).expect("interval")),
+            }
+        );
+    }
+
+    #[test]
+    fn insert_missing_the_start_bound_is_rejected() {
+        let catalog = valid_time_catalog();
+        // Column list omits `vf`.
+        assert_eq!(
+            bind(
+                "INSERT INTO vt (id, balance, vt) VALUES (1, 100, 20)",
+                &catalog
+            ),
+            Err(DmlError::ValidTimeStartRequired {
+                table: "vt".to_owned(),
+                column: "vf".to_owned(),
+            })
+        );
+        // Positional INSERT supplies NULL for `vf`.
+        assert_eq!(
+            bind("INSERT INTO vt VALUES (1, 100, NULL, 20)", &catalog),
+            Err(DmlError::ValidTimeStartRequired {
+                table: "vt".to_owned(),
+                column: "vf".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn insert_empty_or_reversed_interval_is_rejected() {
+        let catalog = valid_time_catalog();
+        assert_eq!(
+            bind("INSERT INTO vt VALUES (1, 100, 20, 10)", &catalog),
+            Err(DmlError::EmptyValidInterval {
+                table: "vt".to_owned(),
+                from: 20,
+                to: 10,
+            })
+        );
+        assert_eq!(
+            bind("INSERT INTO vt VALUES (1, 100, 15, 15)", &catalog),
+            Err(DmlError::EmptyValidInterval {
+                table: "vt".to_owned(),
+                from: 15,
+                to: 15,
+            })
+        );
+    }
+
+    #[test]
+    fn insert_non_instant_bound_is_a_bad_bound() {
+        // A period bound is not a civil-time TIMESTAMP literal — a string surfaces
+        // as a BadValidTimeBound, never a silently wrong instant.
+        let catalog = valid_time_catalog();
+        assert!(matches!(
+            bind("INSERT INTO vt VALUES (1, 100, 'noon', 20)", &catalog),
+            Err(DmlError::BadValidTimeBound {
+                column,
+                ..
+            }) if column == "vf"
+        ));
+    }
+
+    #[test]
+    fn update_sets_a_new_period() {
+        // An UPDATE opens a new version with a new interval; the period columns are
+        // assigned alongside any value column and lifted into the interval.
+        let catalog = valid_time_catalog();
+        assert_eq!(
+            bind(
+                "UPDATE vt SET balance = 250, vf = 20, vt = 30 WHERE id = 1",
+                &catalog
+            ),
+            Ok(BoundDml::Update {
+                table: "vt".to_owned(),
+                schema_id: SchemaId(1),
+                key: ScalarValue::Int4(1),
+                assignments: vec![
+                    (0, Some(ScalarValue::Int4(250))),
+                    (1, Some(ScalarValue::Timestamp(20))),
+                    (2, Some(ScalarValue::Timestamp(30))),
+                ],
+                valid: Some(Interval::new(20, 30).expect("interval")),
+            })
+        );
+    }
+
+    #[test]
+    fn update_omitting_the_end_bound_opens_the_period() {
+        // Setting only the start bound opens the new period; the end-bound cell is
+        // synthesized to VALID_TIME_OPEN so the payload and the interval agree.
+        let catalog = valid_time_catalog();
+        assert_eq!(
+            bind("UPDATE vt SET vf = 40 WHERE id = 1", &catalog),
+            Ok(BoundDml::Update {
+                table: "vt".to_owned(),
+                schema_id: SchemaId(1),
+                key: ScalarValue::Int4(1),
+                assignments: vec![
+                    (1, Some(ScalarValue::Timestamp(40))),
+                    (2, Some(ScalarValue::Timestamp(VALID_TIME_OPEN.0))),
+                ],
+                valid: Some(Interval::new(40, VALID_TIME_OPEN.0).expect("open interval")),
+            })
+        );
+    }
+
+    #[test]
+    fn update_without_the_start_bound_is_rejected() {
+        // A valid-time UPDATE must say when the new fact starts being true.
+        let catalog = valid_time_catalog();
+        assert_eq!(
+            bind("UPDATE vt SET balance = 250 WHERE id = 1", &catalog),
+            Err(DmlError::ValidTimeStartRequired {
+                table: "vt".to_owned(),
+                column: "vf".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn delete_on_a_valid_time_table_carries_no_interval() {
+        // A DELETE closes the system period; it records no valid-time interval (a
+        // delete is a system-time fact), so `BoundDml::Delete` is unchanged.
+        let catalog = valid_time_catalog();
+        assert_eq!(
+            bind("DELETE FROM vt WHERE id = 1", &catalog),
+            Ok(BoundDml::Delete {
+                table: "vt".to_owned(),
+                schema_id: SchemaId(1),
+                key: ScalarValue::Int4(1),
             })
         );
     }

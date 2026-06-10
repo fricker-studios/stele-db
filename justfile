@@ -79,10 +79,11 @@ cli *args:
 docker-build:
     docker build -f docker/Dockerfile -t stele:dev .
 
-# Five-minute-path smoke test (STL-112): build the image, run the engine, drive
-# the four-statement identity demo over pg-wire, assert the AS OF query returns
-# 100. Mirrors the CI `five-minute path` job. Needs Docker + psql.
+# Five-minute-path smoke test (STL-112, STL-194): build the image, run the engine,
+# drive the system-time identity demo *and* the valid-time demo over pg-wire,
+# asserting both the `FOR SYSTEM_TIME` and `FOR VALID_TIME` AS OF queries resolve.
+# Mirrors the CI `five-minute path` job. Needs Docker + psql.
 docker-smoke: docker-build
     docker rm -f stele-smoke >/dev/null 2>&1 || true
     docker run -d --name stele-smoke -p 5454:5454 stele:dev --dev
-    ci/identity-demo-smoke.sh localhost 5454; status=$?; docker rm -f stele-smoke >/dev/null 2>&1 || true; exit $status
+    ci/identity-demo-smoke.sh localhost 5454 && ci/valid-time-demo-smoke.sh localhost 5454; status=$?; docker rm -f stele-smoke >/dev/null 2>&1 || true; exit $status
