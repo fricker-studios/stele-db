@@ -31,12 +31,14 @@
 
 mod aggregate;
 mod expr;
+mod join;
 mod operator;
 mod period;
 mod snapshot_scan;
 
 pub use aggregate::{AggregateFunc, AggregateOutput, Aggregator, hash_aggregate};
 pub use expr::{ArithOp, CmpOp, Expr, ExprError, LogicOp, Vector, eval_expr};
+pub use join::{JoinIndices, JoinType, hash_join};
 pub use operator::{DEFAULT_BATCH_SIZE, ExplodePayload, Filter, Operator, Project, ScanSource};
 pub use period::evaluate;
 pub use snapshot_scan::{Batch, Column, ScanError, ScanOutput, ScanStats, SnapshotScan};

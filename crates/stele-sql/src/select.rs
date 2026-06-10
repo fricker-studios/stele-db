@@ -47,7 +47,8 @@
 
 use sqlparser::ast::{
     BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, Query, Select, SelectItem, SetExpr, Statement as SqlStatement, TableFactor, Value,
+    GroupByExpr, Join, JoinConstraint, JoinOperator, Query, Select, SelectItem, SetExpr,
+    Statement as SqlStatement, TableFactor, TableWithJoins, Value,
 };
 use stele_catalog::{Catalog, SchemaId, TableSchema};
 use stele_common::period::{Interval, IntervalError, PeriodPredicate};
@@ -141,6 +142,17 @@ pub struct BoundSelect {
     ///
     /// [STL-171]: https://allegromusic.atlassian.net/browse/STL-171
     pub aggregate: Option<BoundAggregate>,
+    /// A bound two-table `JOIN` plan, or `None` for a single-table read
+    /// ([STL-172]). When `Some`, the query reads the join's two sides and the
+    /// result columns are the [join's](BoundJoin::columns); the single-table
+    /// fields above ([`table`](Self::table), [`schema_id`](Self::schema_id),
+    /// [`filter`](Self::filter), [`aggregate`](Self::aggregate), …) are left at
+    /// their defaults — the executor routes to the join path instead. A `WHERE` /
+    /// aggregate / `AS OF` *over* a join is rejected at bind time (each a tracked
+    /// follow-up), so they cannot co-occur.
+    ///
+    /// [STL-172]: https://allegromusic.atlassian.net/browse/STL-172
+    pub join: Option<BoundJoin>,
 }
 
 /// A bound `GROUP BY` + aggregate query: the grouping columns, the aggregates to
@@ -260,6 +272,90 @@ pub struct BoundPeriodPredicate {
     pub predicate: PeriodPredicate,
     /// The right period operand.
     pub right: Interval,
+}
+
+/// The join algorithms the binder lowers ([STL-172]).
+///
+/// Mirrors the executor's `stele_exec::JoinType`; the engine maps between them
+/// when it lowers the bound plan (the two crates do not depend on each other, the
+/// same split [`AggregateFunc`] draws).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    /// `INNER JOIN` / `JOIN` — matching rows from both sides.
+    Inner,
+    /// `LEFT [OUTER] JOIN` — every left row, `NULL`-extended on the right when
+    /// unmatched.
+    Left,
+    /// `LEFT SEMI JOIN` / `SEMI JOIN` — left rows that have a right match, once.
+    Semi,
+    /// `LEFT ANTI JOIN` / `ANTI JOIN` — left rows that have no right match.
+    Anti,
+}
+
+impl JoinType {
+    /// Whether the output carries the right side's columns. `INNER` / `LEFT`
+    /// combine both sides; `SEMI` / `ANTI` filter the left and emit only it — so a
+    /// projected right column is meaningless for them.
+    const fn keeps_right(self) -> bool {
+        matches!(self, Self::Inner | Self::Left)
+    }
+}
+
+/// One side of a bound [`BoundJoin`]: the table and the schema-ordered columns it
+/// contributes ([STL-172]).
+///
+/// The column list is the side's schema (`(name, type)`, position `0` the business
+/// key) — it gives the executor the side's value-column count (for the row codec)
+/// and the join key's type (for decoding), and a [`JoinColumnRef`] indexes into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundJoinSide {
+    /// The table this side reads.
+    pub table: String,
+    /// The schema id live at the read snapshot.
+    pub schema_id: SchemaId,
+    /// The side's columns in schema order — `(name, type)`, position `0` the
+    /// business key.
+    pub columns: Vec<(String, LogicalType)>,
+}
+
+/// Which side of a join an output column is drawn from, and its position in that
+/// side's schema ([STL-172]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinColumnRef {
+    /// The left side's column at this schema index.
+    Left(usize),
+    /// The right side's column at this schema index. Never produced for a
+    /// [`Semi`](JoinType::Semi) / [`Anti`](JoinType::Anti) join (it has no right
+    /// columns).
+    Right(usize),
+}
+
+/// A bound two-table equi-join ([STL-172]).
+///
+/// The executor scans each side at the read snapshot, joins their rows on
+/// `left[left_key] = right[right_key]`, and assembles the [`output`](Self::output)
+/// columns. v0.2 binds a single equality condition over one column per side; a
+/// `WHERE` / aggregate / `AS OF` over the join, multi-condition / non-equi joins,
+/// `RIGHT` / `FULL` joins, and N-way joins are tracked follow-ups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundJoin {
+    /// Which join to compute.
+    pub join_type: JoinType,
+    /// The left (probe) side.
+    pub left: BoundJoinSide,
+    /// The right (build) side.
+    pub right: BoundJoinSide,
+    /// The equi-join key's column index in the left side's schema.
+    pub left_key: usize,
+    /// The equi-join key's column index in the right side's schema. The two key
+    /// columns share a [`LogicalType`] (the binder enforces it).
+    pub right_key: usize,
+    /// The output columns, in SELECT-list order — each drawn from one side. For a
+    /// `SEMI` / `ANTI` join every entry is [`JoinColumnRef::Left`].
+    pub output: Vec<JoinColumnRef>,
+    /// The result columns `(name, type)`, aligned to [`output`](Self::output) — a
+    /// `RowDescription` header for the joined result.
+    pub columns: Vec<(String, LogicalType)>,
 }
 
 /// Why binding a `SELECT` failed.
@@ -392,6 +488,61 @@ pub enum SelectError {
         /// The resolved snapshot, in system-time microseconds.
         snapshot: i64,
     },
+
+    /// A `JOIN` shape v0.2 does not bind — a `RIGHT` / `FULL` / `CROSS` / `ASOF`
+    /// join, an N-way join, or a clause v0.2 does not support *over* a join
+    /// (`WHERE`, an aggregate, `FOR … AS OF`) ([STL-172]). Each is a tracked
+    /// follow-up; rejected rather than silently mis-bound.
+    #[error("v0.2 does not support this JOIN ({0})")]
+    UnsupportedJoin(String),
+
+    /// A `JOIN`'s condition is not the one shape v0.2 lowers — a single
+    /// `left.col = right.col` equality relating the two sides ([STL-172]). A
+    /// `USING` / `NATURAL` / missing `ON`, a non-equality, a non-column operand, or
+    /// an equality that does not span both tables surfaces here.
+    #[error("v0.2 supports only a `left.col = right.col` JOIN condition ({0})")]
+    JoinCondition(String),
+
+    /// A `JOIN`'s two equi-join key columns have different types, so their values
+    /// can never compare equal ([STL-172]).
+    #[error(
+        "JOIN key types differ: {left_column:?} is {left_type} but {right_column:?} is {right_type}"
+    )]
+    JoinColumnTypeMismatch {
+        /// The left key column.
+        left_column: String,
+        /// The right key column.
+        right_column: String,
+        /// The left key column's type.
+        left_type: LogicalType,
+        /// The right key column's type.
+        right_type: LogicalType,
+    },
+
+    /// A bare (unqualified) column in a `JOIN`'s condition or projection exists in
+    /// *both* tables, so it is ambiguous — qualify it with a table name or alias
+    /// ([STL-172]).
+    #[error("column {column:?} is ambiguous in the JOIN — qualify it with a table name")]
+    AmbiguousColumn {
+        /// The ambiguous column name.
+        column: String,
+    },
+
+    /// A column named in a `JOIN`'s condition or projection is in neither side's
+    /// schema, or its qualifier names neither table ([STL-172]).
+    #[error("column {column:?} is not a column of either JOIN table")]
+    UnknownJoinColumn {
+        /// The unresolved (possibly qualified) column reference.
+        column: String,
+    },
+
+    /// A projected item in a `JOIN` is not one v0.2 lowers — `*` mixed with named
+    /// columns, a non-column expression, or (for a `SEMI` / `ANTI` join) a
+    /// right-table column the join does not output ([STL-172]). Distinct from the
+    /// single-table [`UnsupportedProjection`](Self::UnsupportedProjection) so the
+    /// rejection does not borrow that variant's v0.1 single-table wording.
+    #[error("v0.2 cannot project this from the JOIN ({0})")]
+    UnsupportedJoinProjection(String),
 }
 
 /// Why folding an `AS OF <expr>` to an instant failed.
@@ -433,6 +584,11 @@ pub enum AsOfError {
 /// [before-history](SelectError::BeforeHistory) case) at the resolved snapshot.
 pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, SelectError> {
     let select = single_select(&stmt.body)?;
+    // A two-table `JOIN` binds to a wholly different shape (two sides, a join
+    // condition, a combined header), so it is routed before the single-table path.
+    if let Some(join) = detect_join(select)? {
+        return bind_join(stmt, ctx, select, join);
+    }
     let table = single_table(select)?;
     // An aggregate query (a `GROUP BY`, or an aggregate in the SELECT list) takes
     // a different shape: its output columns come from the aggregate plan, so the
@@ -518,6 +674,7 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
         filter,
         period_filter,
         aggregate,
+        join: None,
     })
 }
 
@@ -828,6 +985,424 @@ fn bare_column(expr: &Expr) -> Option<&str> {
 /// A column's position in the schema (0 = business key), or `None` if absent.
 fn column_index(schema: &TableSchema, column: &str) -> Option<usize> {
     schema.columns().iter().position(|c| c.name() == column)
+}
+
+/// A single two-table `JOIN` in the `FROM` clause, or `None` for any other shape
+/// (a single table, a comma join, an N-way join — each handled or rejected
+/// elsewhere).
+///
+/// Returns the [`TableWithJoins`] (its `relation` the left table, its lone join
+/// the right) only for exactly one table with exactly one join. More than one join
+/// is the explicit [`SelectError::UnsupportedJoin`] (N-way joins are a follow-up);
+/// zero joins or a non-singleton `FROM` returns `None` so the single-table path
+/// reports it.
+fn detect_join(select: &Select) -> Result<Option<&TableWithJoins>, SelectError> {
+    let [from] = select.from.as_slice() else {
+        return Ok(None);
+    };
+    match from.joins.len() {
+        0 => Ok(None),
+        1 => Ok(Some(from)),
+        _ => Err(SelectError::UnsupportedJoin(
+            "only a single JOIN is supported (N-way joins are a follow-up)".to_owned(),
+        )),
+    }
+}
+
+/// Bind a two-table `JOIN` `SELECT` into a [`BoundSelect`] carrying a
+/// [`BoundJoin`] ([STL-172]).
+///
+/// Resolves both tables at the transaction snapshot, lowers the join operator to a
+/// [`JoinType`], binds the `ON left.col = right.col` equi-condition to a key column
+/// per side, and binds the projection to output columns drawn from the two sides.
+/// A `WHERE` / aggregate / `FOR … AS OF` *over* the join, and `RIGHT` / `FULL` /
+/// `CROSS` joins, are rejected (each a tracked follow-up) rather than mis-bound.
+fn bind_join<'a>(
+    stmt: &Statement,
+    ctx: &BindContext,
+    select: &'a Select,
+    from: &'a TableWithJoins,
+) -> Result<BoundSelect, SelectError> {
+    // Clauses v0.2 does not yet support over a join: rejected, never dropped.
+    if !stmt.temporal.as_of.is_empty() {
+        return Err(SelectError::UnsupportedJoin(
+            "FOR … AS OF over a JOIN".to_owned(),
+        ));
+    }
+    if stmt.temporal.period_predicate.is_some() {
+        return Err(SelectError::UnsupportedJoin(
+            "a period predicate over a JOIN".to_owned(),
+        ));
+    }
+    if select.selection.is_some() {
+        return Err(SelectError::UnsupportedJoin(
+            "a WHERE over a JOIN".to_owned(),
+        ));
+    }
+    if is_aggregate_query(select) {
+        return Err(SelectError::UnsupportedJoin(
+            "an aggregate over a JOIN".to_owned(),
+        ));
+    }
+
+    let snapshot = ctx.snapshot;
+    let join_ast: &Join = &from.joins[0];
+    let (join_type, constraint) = join_kind_and_constraint(&join_ast.join_operator)?;
+
+    let left_ref = table_ref(&from.relation)?;
+    let right_ref = table_ref(&join_ast.relation)?;
+    let left = SideSchema {
+        table: left_ref.name,
+        alias: left_ref.alias,
+        schema: resolve_join_table(ctx.catalog, left_ref.name, snapshot)?,
+    };
+    let right = SideSchema {
+        table: right_ref.name,
+        alias: right_ref.alias,
+        schema: resolve_join_table(ctx.catalog, right_ref.name, snapshot)?,
+    };
+
+    let (left_key, right_key) = bind_join_condition(constraint, &left, &right)?;
+    let (output, columns) = bind_join_projection(select, join_type, &left, &right)?;
+
+    Ok(BoundSelect {
+        // The single-table fields are unused on the join path (see `BoundSelect`):
+        // the executor routes to the join plan, never reading these.
+        table: String::new(),
+        schema_id: left.schema.schema_id(),
+        snapshot,
+        valid_snapshot: None,
+        projection: Projection::All,
+        filter: None,
+        period_filter: None,
+        aggregate: None,
+        join: Some(BoundJoin {
+            join_type,
+            left: bound_side(&left),
+            right: bound_side(&right),
+            left_key,
+            right_key,
+            output,
+            columns,
+        }),
+    })
+}
+
+/// Which side of a join a resolved column came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Left,
+    Right,
+}
+
+/// A join side during binding: its table name, optional alias, and resolved
+/// schema. The alias and table name are both valid qualifiers for the side's
+/// columns (`t.c` or `alias.c`).
+struct SideSchema<'a> {
+    table: &'a str,
+    alias: Option<&'a str>,
+    schema: &'a TableSchema,
+}
+
+impl SideSchema<'_> {
+    /// Whether `qualifier` (a `t.c` prefix) names this side — its table name or
+    /// its alias. Stele does not case-fold identifiers, so the match is exact.
+    fn qualifier_matches(&self, qualifier: &str) -> bool {
+        self.table == qualifier || self.alias == Some(qualifier)
+    }
+
+    /// The schema index of `column` in this side, or `None` if absent.
+    fn column_index(&self, column: &str) -> Option<usize> {
+        self.schema
+            .columns()
+            .iter()
+            .position(|c| c.name() == column)
+    }
+}
+
+/// Snapshot the binding [`SideSchema`] into the owned [`BoundJoinSide`] the plan
+/// carries.
+fn bound_side(side: &SideSchema) -> BoundJoinSide {
+    BoundJoinSide {
+        table: side.table.to_owned(),
+        schema_id: side.schema.schema_id(),
+        columns: side
+            .schema
+            .columns()
+            .iter()
+            .map(|c| (c.name().to_owned(), c.ty()))
+            .collect(),
+    }
+}
+
+/// A table reference in a `JOIN`'s `FROM`: an unqualified table name plus an
+/// optional alias.
+struct TableRef<'a> {
+    name: &'a str,
+    alias: Option<&'a str>,
+}
+
+/// Extract the (unqualified) table name and optional alias of a join relation.
+/// A subquery, table function, or schema-qualified name is rejected.
+fn table_ref(factor: &TableFactor) -> Result<TableRef, SelectError> {
+    let TableFactor::Table { name, alias, .. } = factor else {
+        return Err(SelectError::UnsupportedJoin(
+            "a non-table relation (subquery / derived table) in a JOIN".to_owned(),
+        ));
+    };
+    let name = match name.0.as_slice() {
+        [part] => part.as_ident().map(|id| id.value.as_str()).ok_or_else(|| {
+            SelectError::UnsupportedJoin("a non-identifier table name in a JOIN".to_owned())
+        })?,
+        _ => {
+            return Err(SelectError::UnsupportedJoin(
+                "a schema-qualified table name in a JOIN".to_owned(),
+            ));
+        }
+    };
+    Ok(TableRef {
+        name,
+        alias: alias.as_ref().map(|a| a.name.value.as_str()),
+    })
+}
+
+/// Resolve a join table at the snapshot, mapping the shared
+/// [`TableResolution`](TableResolution) taxonomy to a [`SelectError`] (the same
+/// errors the single-table path reports).
+fn resolve_join_table<'a>(
+    catalog: &'a Catalog,
+    table: &str,
+    snapshot: SystemTimeMicros,
+) -> Result<&'a TableSchema, SelectError> {
+    match resolve_table_at(catalog, table, snapshot) {
+        TableResolution::Found(schema) => Ok(schema),
+        TableResolution::Unknown => Err(SelectError::UnknownTable(table.to_owned())),
+        TableResolution::BeforeHistory { first_commit } => Err(SelectError::BeforeHistory {
+            table: table.to_owned(),
+            snapshot: snapshot.0,
+            first_commit: first_commit.0,
+        }),
+        TableResolution::NotLive => Err(SelectError::TableNotLive {
+            table: table.to_owned(),
+            snapshot: snapshot.0,
+        }),
+    }
+}
+
+/// Lower a parsed [`JoinOperator`] to a [`JoinType`] and its constraint. Only the
+/// left-driven inner/left/semi/anti operators bind; `RIGHT` / `FULL` / `CROSS` /
+/// `ASOF` and the apply/array operators are the [`SelectError::UnsupportedJoin`]
+/// follow-ups.
+fn join_kind_and_constraint(op: &JoinOperator) -> Result<(JoinType, &JoinConstraint), SelectError> {
+    use JoinOperator as J;
+    Ok(match op {
+        J::Inner(c) | J::Join(c) => (JoinType::Inner, c),
+        J::Left(c) | J::LeftOuter(c) => (JoinType::Left, c),
+        J::Semi(c) | J::LeftSemi(c) => (JoinType::Semi, c),
+        J::Anti(c) | J::LeftAnti(c) => (JoinType::Anti, c),
+        J::Right(_) | J::RightOuter(_) | J::RightSemi(_) | J::RightAnti(_) => {
+            return Err(SelectError::UnsupportedJoin(
+                "a RIGHT join — rewrite it as a LEFT join".to_owned(),
+            ));
+        }
+        J::FullOuter(_) => {
+            return Err(SelectError::UnsupportedJoin("a FULL OUTER join".to_owned()));
+        }
+        J::CrossJoin(_) => return Err(SelectError::UnsupportedJoin("a CROSS join".to_owned())),
+        _ => {
+            return Err(SelectError::UnsupportedJoin(
+                "this join operator".to_owned(),
+            ));
+        }
+    })
+}
+
+/// Bind a join's `ON` constraint to the `(left_key, right_key)` schema indices of
+/// a single `left.col = right.col` equality. The two key columns must share a
+/// type.
+fn bind_join_condition(
+    constraint: &JoinConstraint,
+    left: &SideSchema,
+    right: &SideSchema,
+) -> Result<(usize, usize), SelectError> {
+    let JoinConstraint::On(expr) = constraint else {
+        return Err(SelectError::JoinCondition(match constraint {
+            JoinConstraint::Using(_) => "USING is not supported — use ON".to_owned(),
+            JoinConstraint::Natural => "NATURAL join is not supported".to_owned(),
+            JoinConstraint::None | JoinConstraint::On(_) => {
+                "the JOIN has no ON condition".to_owned()
+            }
+        }));
+    };
+    let Expr::BinaryOp {
+        left: lhs,
+        op: BinaryOperator::Eq,
+        right: rhs,
+    } = unwrap_nested(expr)
+    else {
+        return Err(SelectError::JoinCondition(
+            "the ON condition is not an equality".to_owned(),
+        ));
+    };
+    // The two operands must be one column from each side; either order is fine.
+    let a = resolve_join_column(lhs, left, right)?;
+    let b = resolve_join_column(rhs, left, right)?;
+    let (((Side::Left, li), (Side::Right, ri)) | ((Side::Right, ri), (Side::Left, li))) = (a, b)
+    else {
+        return Err(SelectError::JoinCondition(
+            "the ON equality must relate a column of each joined table".to_owned(),
+        ));
+    };
+    let left_ty = left.schema.columns()[li].ty();
+    let right_ty = right.schema.columns()[ri].ty();
+    if left_ty != right_ty {
+        return Err(SelectError::JoinColumnTypeMismatch {
+            left_column: left.schema.columns()[li].name().to_owned(),
+            right_column: right.schema.columns()[ri].name().to_owned(),
+            left_type: left_ty,
+            right_type: right_ty,
+        });
+    }
+    Ok((li, ri))
+}
+
+/// Resolve a column reference in a join (a bare `c` or qualified `t.c`) to the
+/// side it belongs to and its index in that side's schema.
+///
+/// A bare column must be in exactly one side (in both is
+/// [`SelectError::AmbiguousColumn`], in neither
+/// [`SelectError::UnknownJoinColumn`]). A qualified `t.c`'s qualifier must name one
+/// side (by table name or alias), and `c` must be a column of it.
+fn resolve_join_column(
+    expr: &Expr,
+    left: &SideSchema,
+    right: &SideSchema,
+) -> Result<(Side, usize), SelectError> {
+    match expr {
+        Expr::Nested(inner) => resolve_join_column(inner, left, right),
+        Expr::Identifier(id) => match (left.column_index(&id.value), right.column_index(&id.value))
+        {
+            (Some(i), None) => Ok((Side::Left, i)),
+            (None, Some(j)) => Ok((Side::Right, j)),
+            (Some(_), Some(_)) => Err(SelectError::AmbiguousColumn {
+                column: id.value.clone(),
+            }),
+            (None, None) => Err(SelectError::UnknownJoinColumn {
+                column: id.value.clone(),
+            }),
+        },
+        Expr::CompoundIdentifier(parts) => {
+            let [qualifier, column] = parts.as_slice() else {
+                return Err(SelectError::UnknownJoinColumn {
+                    column: compound_name(parts),
+                });
+            };
+            let (q, c) = (qualifier.value.as_str(), column.value.as_str());
+            let on_left = left.qualifier_matches(q);
+            let on_right = right.qualifier_matches(q);
+            let qualified = || format!("{q}.{c}");
+            match (on_left, on_right) {
+                (true, false) => left
+                    .column_index(c)
+                    .map(|i| (Side::Left, i))
+                    .ok_or_else(|| SelectError::UnknownJoinColumn {
+                        column: qualified(),
+                    }),
+                (false, true) => right
+                    .column_index(c)
+                    .map(|j| (Side::Right, j))
+                    .ok_or_else(|| SelectError::UnknownJoinColumn {
+                        column: qualified(),
+                    }),
+                (true, true) => Err(SelectError::AmbiguousColumn {
+                    column: qualified(),
+                }),
+                (false, false) => Err(SelectError::UnknownJoinColumn {
+                    column: qualified(),
+                }),
+            }
+        }
+        other => Err(SelectError::JoinCondition(format!(
+            "operand `{other}` is not a column reference"
+        ))),
+    }
+}
+
+/// Render a multi-part identifier (`a.b.c`) for a diagnostic.
+fn compound_name(parts: &[sqlparser::ast::Ident]) -> String {
+    parts
+        .iter()
+        .map(|p| p.value.as_str())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// A bound join projection: the output column references and their aligned
+/// `(name, type)` result header.
+type JoinProjection = (Vec<JoinColumnRef>, Vec<(String, LogicalType)>);
+
+/// Bind a join's projection to its output columns ([`JoinColumnRef`]) and the
+/// result header. `SELECT *` is the left side's columns followed by the right's
+/// (left only for `SEMI` / `ANTI`); a named list resolves each item to a side.
+fn bind_join_projection(
+    select: &Select,
+    join_type: JoinType,
+    left: &SideSchema,
+    right: &SideSchema,
+) -> Result<JoinProjection, SelectError> {
+    // `SELECT *` — every column of each kept side, in schema order.
+    if let [SelectItem::Wildcard(_)] = select.projection.as_slice() {
+        let mut output = Vec::new();
+        let mut columns = Vec::new();
+        for (i, c) in left.schema.columns().iter().enumerate() {
+            output.push(JoinColumnRef::Left(i));
+            columns.push((c.name().to_owned(), c.ty()));
+        }
+        if join_type.keeps_right() {
+            for (j, c) in right.schema.columns().iter().enumerate() {
+                output.push(JoinColumnRef::Right(j));
+                columns.push((c.name().to_owned(), c.ty()));
+            }
+        }
+        return Ok((output, columns));
+    }
+
+    let mut output = Vec::with_capacity(select.projection.len());
+    let mut columns = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(
+                expr @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Nested(_)),
+            ) => expr,
+            SelectItem::Wildcard(_) => {
+                return Err(SelectError::UnsupportedJoinProjection(
+                    "`*` mixed with named columns".to_owned(),
+                ));
+            }
+            other => return Err(SelectError::UnsupportedJoinProjection(other.to_string())),
+        };
+        let (side, idx) = resolve_join_column(expr, left, right)?;
+        let schema = match side {
+            Side::Left => left.schema,
+            Side::Right => {
+                // A SEMI / ANTI join's result is the left table alone, so a right
+                // column has nowhere to come from.
+                if !join_type.keeps_right() {
+                    return Err(SelectError::UnsupportedJoinProjection(
+                        "a SEMI/ANTI join projects only its left table's columns".to_owned(),
+                    ));
+                }
+                right.schema
+            }
+        };
+        let col = &schema.columns()[idx];
+        columns.push((col.name().to_owned(), col.ty()));
+        output.push(match side {
+            Side::Left => JoinColumnRef::Left(idx),
+            Side::Right => JoinColumnRef::Right(idx),
+        });
+    }
+    Ok((output, columns))
 }
 
 /// Bind a parsed [`PeriodPredicateClause`] to a [`BoundPeriodPredicate`] of two
@@ -1728,7 +2303,7 @@ mod tests {
     }
 
     #[test]
-    fn non_select_and_joins_are_rejected() {
+    fn non_select_is_rejected() {
         let catalog = catalog_with_account(1_000);
         let ctx = BindContext {
             snapshot: NOW,
@@ -1736,11 +2311,22 @@ mod tests {
         };
         let ddl = parse_one("CREATE TABLE t (a INT) WITH SYSTEM VERSIONING");
         assert_eq!(bind_select(&ddl, &ctx), Err(SelectError::NotSelect));
-        let join = parse_one("SELECT a FROM account JOIN other ON account.id = other.id");
-        assert!(matches!(
+    }
+
+    #[test]
+    fn a_join_against_an_unknown_table_reports_the_unknown_table() {
+        // Joins now bind ([STL-172]); a join with an unknown right table fails on
+        // *resolution*, not as an unsupported FROM shape.
+        let catalog = catalog_with_account(1_000);
+        let ctx = BindContext {
+            snapshot: NOW,
+            catalog: &catalog,
+        };
+        let join = parse_one("SELECT id FROM account JOIN other ON account.id = other.id");
+        assert_eq!(
             bind_select(&join, &ctx),
-            Err(SelectError::UnsupportedFrom(_))
-        ));
+            Err(SelectError::UnknownTable("other".to_owned()))
+        );
     }
 
     fn bind(sql: &str, catalog: &Catalog) -> Result<BoundSelect, SelectError> {
@@ -2205,5 +2791,298 @@ mod tests {
                 value: ScalarValue::Int4(1),
             })
         );
+    }
+
+    // ---- joins (STL-172) ----
+
+    /// A catalog with two joinable tables: `users (id INT, name TEXT)` and
+    /// `orders (oid INT, uid INT)`, joinable on `users.id = orders.uid` (both INT).
+    fn catalog_with_join_tables() -> Catalog {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(
+                "users",
+                vec![
+                    ColumnDef::new("id", LogicalType::Int4).expect("col"),
+                    ColumnDef::new("name", LogicalType::Text).expect("col"),
+                ],
+                TableTemporal::system_only(),
+                SystemTimeMicros(1_000),
+            )
+            .expect("create users");
+        catalog
+            .create_table(
+                "orders",
+                vec![
+                    ColumnDef::new("oid", LogicalType::Int4).expect("col"),
+                    ColumnDef::new("uid", LogicalType::Int4).expect("col"),
+                ],
+                TableTemporal::system_only(),
+                SystemTimeMicros(1_000),
+            )
+            .expect("create orders");
+        catalog
+    }
+
+    fn join_of(sql: &str, catalog: &Catalog) -> BoundJoin {
+        bind(sql, catalog)
+            .expect("bind join")
+            .join
+            .expect("join plan")
+    }
+
+    #[test]
+    fn inner_join_binds_keys_output_and_header() {
+        let catalog = catalog_with_join_tables();
+        let join = join_of(
+            "SELECT * FROM users JOIN orders ON users.id = orders.uid",
+            &catalog,
+        );
+        assert_eq!(join.join_type, JoinType::Inner);
+        assert_eq!(join.left.table, "users");
+        assert_eq!(join.right.table, "orders");
+        // users.id is index 0; orders.uid is index 1.
+        assert_eq!((join.left_key, join.right_key), (0, 1));
+        // `SELECT *` over an inner join = the left's columns then the right's.
+        assert_eq!(
+            join.output,
+            vec![
+                JoinColumnRef::Left(0),
+                JoinColumnRef::Left(1),
+                JoinColumnRef::Right(0),
+                JoinColumnRef::Right(1),
+            ]
+        );
+        assert_eq!(
+            join.columns,
+            vec![
+                ("id".to_owned(), LogicalType::Int4),
+                ("name".to_owned(), LogicalType::Text),
+                ("oid".to_owned(), LogicalType::Int4),
+                ("uid".to_owned(), LogicalType::Int4),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_join_keyword_binds_to_its_type() {
+        let catalog = catalog_with_join_tables();
+        let cases = [
+            ("JOIN", JoinType::Inner),
+            ("INNER JOIN", JoinType::Inner),
+            ("LEFT JOIN", JoinType::Left),
+            ("LEFT OUTER JOIN", JoinType::Left),
+            ("SEMI JOIN", JoinType::Semi),
+            ("LEFT SEMI JOIN", JoinType::Semi),
+            ("ANTI JOIN", JoinType::Anti),
+            ("LEFT ANTI JOIN", JoinType::Anti),
+        ];
+        for (kw, want) in cases {
+            let sql = format!("SELECT users.id FROM users {kw} orders ON users.id = orders.uid");
+            assert_eq!(join_of(&sql, &catalog).join_type, want, "{kw}");
+        }
+    }
+
+    #[test]
+    fn semi_and_anti_project_only_the_left_side() {
+        let catalog = catalog_with_join_tables();
+        for kw in ["SEMI JOIN", "ANTI JOIN"] {
+            let sql = format!("SELECT * FROM users {kw} orders ON users.id = orders.uid");
+            let join = join_of(&sql, &catalog);
+            assert_eq!(
+                join.output,
+                vec![JoinColumnRef::Left(0), JoinColumnRef::Left(1)],
+                "{kw}"
+            );
+            assert_eq!(
+                join.columns,
+                vec![
+                    ("id".to_owned(), LogicalType::Int4),
+                    ("name".to_owned(), LogicalType::Text),
+                ],
+                "{kw}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_on_equality_binds_in_either_order() {
+        let catalog = catalog_with_join_tables();
+        for on in ["users.id = orders.uid", "orders.uid = users.id"] {
+            let sql = format!("SELECT users.id FROM users JOIN orders ON {on}");
+            let join = join_of(&sql, &catalog);
+            assert_eq!((join.left_key, join.right_key), (0, 1), "{on}");
+        }
+    }
+
+    #[test]
+    fn table_aliases_and_bare_columns_resolve() {
+        let catalog = catalog_with_join_tables();
+        // Aliased, qualified projection.
+        let aliased = join_of(
+            "SELECT u.name, o.oid FROM users u JOIN orders o ON u.id = o.uid",
+            &catalog,
+        );
+        assert_eq!(
+            aliased.output,
+            vec![JoinColumnRef::Left(1), JoinColumnRef::Right(0)]
+        );
+        assert_eq!(
+            aliased.columns,
+            vec![
+                ("name".to_owned(), LogicalType::Text),
+                ("oid".to_owned(), LogicalType::Int4),
+            ]
+        );
+        // Unqualified columns unique to one side resolve without a qualifier.
+        let bare = join_of(
+            "SELECT name, oid FROM users JOIN orders ON id = uid",
+            &catalog,
+        );
+        assert_eq!((bare.left_key, bare.right_key), (0, 1));
+        assert_eq!(
+            bare.output,
+            vec![JoinColumnRef::Left(1), JoinColumnRef::Right(0)]
+        );
+    }
+
+    #[test]
+    fn unsupported_join_operators_are_rejected() {
+        let catalog = catalog_with_join_tables();
+        for sql in [
+            "SELECT users.id FROM users RIGHT JOIN orders ON users.id = orders.uid",
+            "SELECT users.id FROM users FULL OUTER JOIN orders ON users.id = orders.uid",
+            "SELECT users.id FROM users CROSS JOIN orders",
+        ] {
+            assert!(
+                matches!(bind(sql, &catalog), Err(SelectError::UnsupportedJoin(_))),
+                "expected UnsupportedJoin for: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_n_way_join_is_rejected() {
+        let catalog = catalog_with_join_tables();
+        let sql = "SELECT users.id FROM users \
+                   JOIN orders ON users.id = orders.uid \
+                   JOIN orders o2 ON users.id = o2.uid";
+        assert!(matches!(
+            bind(sql, &catalog),
+            Err(SelectError::UnsupportedJoin(_))
+        ));
+    }
+
+    #[test]
+    fn clauses_over_a_join_are_rejected_not_dropped() {
+        let catalog = catalog_with_join_tables();
+        for sql in [
+            // A WHERE over the join (a follow-up) — dropping it would over-return.
+            "SELECT users.id FROM users JOIN orders ON users.id = orders.uid WHERE users.id = 1",
+            // An aggregate over the join.
+            "SELECT COUNT(*) FROM users JOIN orders ON users.id = orders.uid",
+        ] {
+            assert!(
+                matches!(bind(sql, &catalog), Err(SelectError::UnsupportedJoin(_))),
+                "expected UnsupportedJoin for: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_join_conditions_are_rejected() {
+        let catalog = catalog_with_join_tables();
+        for sql in [
+            // Non-equality.
+            "SELECT users.id FROM users JOIN orders ON users.id > orders.uid",
+            // Equality that does not span both tables.
+            "SELECT users.id FROM users JOIN orders ON users.id = users.id",
+            // USING / NATURAL are not lowered.
+            "SELECT users.id FROM users JOIN orders USING (id)",
+            "SELECT users.id FROM users NATURAL JOIN orders",
+        ] {
+            assert!(
+                matches!(bind(sql, &catalog), Err(SelectError::JoinCondition(_))),
+                "expected JoinCondition for: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn mismatched_join_key_types_are_rejected() {
+        // users.name is TEXT, orders.uid is INT — they can never compare equal.
+        let catalog = catalog_with_join_tables();
+        assert!(matches!(
+            bind(
+                "SELECT users.id FROM users JOIN orders ON users.name = orders.uid",
+                &catalog,
+            ),
+            Err(SelectError::JoinColumnTypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_join_columns_are_rejected() {
+        let catalog = catalog_with_join_tables();
+        // Unknown column in the ON.
+        assert!(matches!(
+            bind(
+                "SELECT users.id FROM users JOIN orders ON users.id = orders.nope",
+                &catalog,
+            ),
+            Err(SelectError::UnknownJoinColumn { .. })
+        ));
+        // Unknown column in the projection.
+        assert!(matches!(
+            bind(
+                "SELECT nope FROM users JOIN orders ON users.id = orders.uid",
+                &catalog,
+            ),
+            Err(SelectError::UnknownJoinColumn { .. })
+        ));
+    }
+
+    #[test]
+    fn a_semi_join_cannot_project_a_right_column() {
+        let catalog = catalog_with_join_tables();
+        assert!(matches!(
+            bind(
+                "SELECT orders.oid FROM users SEMI JOIN orders ON users.id = orders.uid",
+                &catalog,
+            ),
+            Err(SelectError::UnsupportedJoinProjection(_))
+        ));
+    }
+
+    #[test]
+    fn a_column_in_both_tables_is_ambiguous_unless_qualified() {
+        // Two tables that share an `id` column.
+        let mut catalog = Catalog::new();
+        for table in ["a", "b"] {
+            catalog
+                .create_table(
+                    table,
+                    vec![
+                        ColumnDef::new("id", LogicalType::Int4).expect("col"),
+                        ColumnDef::new("v", LogicalType::Int4).expect("col"),
+                    ],
+                    TableTemporal::system_only(),
+                    SystemTimeMicros(1_000),
+                )
+                .expect("create");
+        }
+        // Bare `id` is ambiguous in the ON…
+        assert!(matches!(
+            bind("SELECT a.v FROM a JOIN b ON id = id", &catalog),
+            Err(SelectError::AmbiguousColumn { .. })
+        ));
+        // …and in the projection.
+        assert!(matches!(
+            bind("SELECT id FROM a JOIN b ON a.id = b.id", &catalog),
+            Err(SelectError::AmbiguousColumn { .. })
+        ));
+        // Qualifying resolves it.
+        let join = join_of("SELECT a.id FROM a JOIN b ON a.id = b.id", &catalog);
+        assert_eq!(join.output, vec![JoinColumnRef::Left(0)]);
     }
 }

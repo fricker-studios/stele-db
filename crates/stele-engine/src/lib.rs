@@ -50,13 +50,14 @@ use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
 use stele_common::types::{LogicalType, ScalarValue};
 use stele_exec::{
     AggregateFunc as ExecAggregateFunc, Aggregator, Batch, CmpOp, Column, DEFAULT_BATCH_SIZE,
-    ExplodePayload, Expr, Filter, Operator, ScanError, ScanSource, SnapshotScan, Vector, evaluate,
-    hash_aggregate,
+    ExplodePayload, Expr, Filter, JoinType as ExecJoinType, Operator, ScanError, ScanSource,
+    SnapshotScan, Vector, evaluate, hash_aggregate, hash_join,
 };
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::dml::{BoundDml, DmlError};
 use stele_sql::select::{
-    AggregateFunc, BoundAggregate, BoundPredicate, BoundSelect, OutputItem, Projection, SelectError,
+    AggregateFunc, BoundAggregate, BoundJoin, BoundPredicate, BoundSelect, JoinColumnRef, JoinType,
+    OutputItem, Projection, SelectError,
 };
 use stele_sql::{BindContext, BindError, Statement, bind_ddl, bind_dml, bind_select};
 use stele_storage::backend::Disk;
@@ -793,6 +794,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// filtered rows into grouped output ([`run_aggregate`]); a plain query
     /// projects them.
     fn run_select(&self, bound: &BoundSelect) -> Result<StatementOutcome, EngineError> {
+        // A two-table `JOIN` ([STL-172]) takes a wholly different path: it scans
+        // both sides and combines their rows, rather than projecting one table's
+        // reconstructed rows. The single-table fields below are unused for it.
+        if let Some(join) = &bound.join {
+            return self.run_join(join, bound.snapshot);
+        }
         let table = bound.table.as_str();
         let snapshot = bound.snapshot;
         let state = self
@@ -913,6 +920,129 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let ncols = value_count + 1;
         let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
         while let Some(batch) = pipeline.next()? {
+            for r in 0..batch.rows {
+                rows.push((0..ncols).map(|i| batch_cell(&batch, i, r)).collect());
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Run a bound two-table `JOIN` ([STL-172]).
+    ///
+    /// Both sides are scanned to their reconstructed rows at `snapshot`
+    /// ([`scan_all_rows`](Self::scan_all_rows)); the join key column of each side is
+    /// decoded into a typed [`Vector`] and handed to the [`hash_join`] operator,
+    /// which returns the surviving rows as input-row indices. The output rows are
+    /// then assembled by gathering each side's raw cells per the bound
+    /// [`output`](BoundJoin::output) references — a `LEFT` join's unmatched row
+    /// drawing `NULL` for every right column. Non-key columns are never decoded;
+    /// they pass through as the opaque canonical bytes the scan produced.
+    fn run_join(
+        &self,
+        join: &BoundJoin,
+        snapshot: SystemTimeMicros,
+    ) -> Result<StatementOutcome, EngineError> {
+        let left_state = self
+            .tables
+            .get(&join.left.table)
+            .ok_or_else(|| EngineError::UnknownTable(join.left.table.clone()))?;
+        let right_state = self
+            .tables
+            .get(&join.right.table)
+            .ok_or_else(|| EngineError::UnknownTable(join.right.table.clone()))?;
+        let left_value_count = join.left.columns.len().saturating_sub(1);
+        let right_value_count = join.right.columns.len().saturating_sub(1);
+
+        let left_rows = Self::scan_all_rows(left_state, snapshot, left_value_count)?;
+        let right_rows = Self::scan_all_rows(right_state, snapshot, right_value_count)?;
+
+        // Decode only the join-key column of each side into a typed vector; every
+        // other column stays opaque bytes (gathered by index below), so a column
+        // the join merely carries through is never forced through the evaluator.
+        let left_keys = decode_key_column(&left_rows, &join.left.columns, join.left_key)?;
+        let right_keys = decode_key_column(&right_rows, &join.right.columns, join.right_key)?;
+
+        let join_type = lower_join_type(join.join_type);
+        let indices = hash_join(
+            join_type,
+            &left_keys,
+            left_rows.len(),
+            &Expr::col(join.left_key),
+            &right_keys,
+            right_rows.len(),
+            &Expr::col(join.right_key),
+        )
+        .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
+
+        // Gather each output row's cells per the bound output references. A
+        // right-keeping join reads both sides (a `None` right index — a LEFT join's
+        // unmatched row — yields NULL right cells); SEMI/ANTI read the left alone.
+        let rows: Vec<Vec<Option<Vec<u8>>>> = if join_type.keeps_right() {
+            indices
+                .left
+                .iter()
+                .zip(&indices.right)
+                .map(|(&l, &r)| {
+                    join.output
+                        .iter()
+                        .map(|col| match col {
+                            JoinColumnRef::Left(i) => left_rows[l][*i].clone(),
+                            JoinColumnRef::Right(j) => r.and_then(|rr| right_rows[rr][*j].clone()),
+                        })
+                        .collect()
+                })
+                .collect()
+        } else {
+            indices
+                .left
+                .iter()
+                .map(|&l| {
+                    join.output
+                        .iter()
+                        .map(|col| match col {
+                            JoinColumnRef::Left(i) => left_rows[l][*i].clone(),
+                            // The binder proves a SEMI/ANTI output is left-only.
+                            JoinColumnRef::Right(_) => {
+                                unreachable!("SEMI/ANTI output references only the left side")
+                            }
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+
+        Ok(StatementOutcome::Rows(SelectResult {
+            columns: join.columns.clone(),
+            rows,
+        }))
+    }
+
+    /// Scan a table's reconstructed rows at `snapshot`, unfiltered — the join's
+    /// per-side input ([STL-172]).
+    ///
+    /// The same `ScanSource → ExplodePayload` pipeline [`scan_rows`](Self::scan_rows)
+    /// runs, minus the `WHERE` filter and valid-time pinning (a join carries no
+    /// per-side predicate at v0.2), so each row comes back as its full
+    /// `[business key, value cells…]` canonical bytes.
+    fn scan_all_rows(
+        state: &TableState<C, D>,
+        snapshot: SystemTimeMicros,
+        value_count: usize,
+    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+        let readers = state.engine.open_segment_readers()?;
+        let scan = SnapshotScan::new(
+            state.engine.delta(),
+            state.engine.index(),
+            &readers,
+            Snapshot(snapshot),
+        )
+        .project(vec![ColumnId::BusinessKey, ColumnId::Payload]);
+        let source = ScanSource::new(scan, DEFAULT_BATCH_SIZE);
+        let mut exploded = ExplodePayload::new(source, value_count);
+
+        let ncols = value_count + 1;
+        let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+        while let Some(batch) = exploded.next()? {
             for r in 0..batch.rows {
                 rows.push((0..ncols).map(|i| batch_cell(&batch, i, r)).collect());
             }
@@ -1361,6 +1491,40 @@ fn column_cell(batch: &Batch, id: ColumnId, row: usize) -> Option<Vec<u8>> {
 /// NULL that the comparison (and `Filter`'s "keep TRUE only") drops.
 fn lower_predicate(predicate: &BoundPredicate) -> Expr {
     Expr::col(predicate.column_index).compare(CmpOp::Eq, Expr::lit(predicate.value.clone()))
+}
+
+/// Map a bound [`JoinType`] to the executor's `ExecJoinType`. The two enums are
+/// parallel; stele-sql and stele-exec do not depend on each other, so the engine
+/// is the lowering point (the same split [`lower_aggregate_func`] draws).
+const fn lower_join_type(join_type: JoinType) -> ExecJoinType {
+    match join_type {
+        JoinType::Inner => ExecJoinType::Inner,
+        JoinType::Left => ExecJoinType::Left,
+        JoinType::Semi => ExecJoinType::Semi,
+        JoinType::Anti => ExecJoinType::Anti,
+    }
+}
+
+/// Decode one side's join-key column into a positional [`Vector`] slot for the
+/// [`hash_join`] operator ([STL-172]).
+///
+/// Only the key column at `key` is decoded — the rest stay empty placeholders the
+/// key expression (`Expr::col(key)`) never reads (the same discipline
+/// [`run_aggregate`] uses), so a non-key column is never forced through the
+/// evaluator. The vector is one slot per side column so `Expr::col(key)` addresses
+/// the key by its schema index.
+fn decode_key_column(
+    rows: &[Vec<Option<Vec<u8>>>],
+    columns: &[(String, LogicalType)],
+    key: usize,
+) -> Result<Vec<Vector>, EngineError> {
+    let mut cols: Vec<Vector> = (0..columns.len())
+        .map(|_| Vector::Bool(Vec::new()))
+        .collect();
+    let cells: Vec<Option<Vec<u8>>> = rows.iter().map(|r| r[key].clone()).collect();
+    cols[key] = Vector::from_column(columns[key].1, &Column::Bytes(cells))
+        .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
+    Ok(cols)
 }
 
 /// Read the cell at `position`/`row` of an exploded pipeline batch as the
@@ -3042,5 +3206,212 @@ mod tests {
                     .expect("non-null value in this test")
             })
             .collect()
+    }
+
+    // ---- joins (STL-172) ----
+
+    /// The canonical encoding of an `int4` cell — the bytes the join's
+    /// reconstructed rows carry, so expected rows are built without decoding.
+    fn i4(v: i32) -> Option<Vec<u8>> {
+        cell(Some(ScalarValue::Int4(v)))
+    }
+
+    /// The canonical encoding of a `text` cell.
+    fn txt(s: &str) -> Option<Vec<u8>> {
+        cell(Some(ScalarValue::Text(s.to_owned())))
+    }
+
+    /// The result rows, sorted — joins do not order their output (no `ORDER BY`),
+    /// so tests compare row *sets*.
+    fn sorted(mut rows: Vec<Vec<Option<Vec<u8>>>>) -> Vec<Vec<Option<Vec<u8>>>> {
+        rows.sort();
+        rows
+    }
+
+    /// A session with `users (id INT, name TEXT)` and `orders (oid INT, uid INT)`,
+    /// rows joinable on `users.id = orders.uid`:
+    /// users `{1: alice, 2: bob, 3: carol}`; orders `{10→1, 11→1, 12→2}` (so alice
+    /// has two orders, bob one, carol none).
+    fn joinable_session() -> SessionEngine<ZeroClock, MemDisk> {
+        let mut engine = session();
+        for ddl in [
+            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE orders (oid INT PRIMARY KEY, uid INT) WITH SYSTEM VERSIONING",
+        ] {
+            engine.execute(&parse_one(ddl)).expect("create");
+        }
+        for dml in [
+            "INSERT INTO users VALUES (1, 'alice')",
+            "INSERT INTO users VALUES (2, 'bob')",
+            "INSERT INTO users VALUES (3, 'carol')",
+            "INSERT INTO orders VALUES (10, 1)",
+            "INSERT INTO orders VALUES (11, 1)",
+            "INSERT INTO orders VALUES (12, 2)",
+        ] {
+            engine.execute(&parse_one(dml)).expect("insert");
+        }
+        engine
+    }
+
+    #[test]
+    fn inner_join_combines_matching_rows() {
+        let mut engine = joinable_session();
+        let result = select(
+            &mut engine,
+            "SELECT * FROM users JOIN orders ON users.id = orders.uid",
+        );
+        assert_eq!(
+            result.columns,
+            vec![
+                ("id".to_owned(), LogicalType::Int4),
+                ("name".to_owned(), LogicalType::Text),
+                ("oid".to_owned(), LogicalType::Int4),
+                ("uid".to_owned(), LogicalType::Int4),
+            ]
+        );
+        // alice(1) has orders 10 and 11; bob(2) has 12; carol(3) is dropped.
+        assert_eq!(
+            sorted(result.rows),
+            sorted(vec![
+                vec![i4(1), txt("alice"), i4(10), i4(1)],
+                vec![i4(1), txt("alice"), i4(11), i4(1)],
+                vec![i4(2), txt("bob"), i4(12), i4(2)],
+            ])
+        );
+    }
+
+    #[test]
+    fn left_join_keeps_unmatched_left_rows_null_extended() {
+        let mut engine = joinable_session();
+        let result = select(
+            &mut engine,
+            "SELECT * FROM users LEFT JOIN orders ON users.id = orders.uid",
+        );
+        // carol(3) has no order → a single NULL-extended row.
+        assert_eq!(
+            sorted(result.rows),
+            sorted(vec![
+                vec![i4(1), txt("alice"), i4(10), i4(1)],
+                vec![i4(1), txt("alice"), i4(11), i4(1)],
+                vec![i4(2), txt("bob"), i4(12), i4(2)],
+                vec![i4(3), txt("carol"), None, None],
+            ])
+        );
+    }
+
+    #[test]
+    fn semi_join_keeps_left_rows_with_a_match_once() {
+        let mut engine = joinable_session();
+        let result = select(
+            &mut engine,
+            "SELECT * FROM users SEMI JOIN orders ON users.id = orders.uid",
+        );
+        assert_eq!(
+            result.columns,
+            vec![
+                ("id".to_owned(), LogicalType::Int4),
+                ("name".to_owned(), LogicalType::Text),
+            ],
+            "SEMI projects only the left table's columns"
+        );
+        // alice and bob have orders (alice once, not twice); carol does not.
+        assert_eq!(
+            sorted(result.rows),
+            sorted(vec![vec![i4(1), txt("alice")], vec![i4(2), txt("bob")]])
+        );
+    }
+
+    #[test]
+    fn anti_join_keeps_left_rows_with_no_match() {
+        let mut engine = joinable_session();
+        let result = select(
+            &mut engine,
+            "SELECT id, name FROM users ANTI JOIN orders ON users.id = orders.uid",
+        );
+        assert_eq!(sorted(result.rows), vec![vec![i4(3), txt("carol")]]);
+    }
+
+    #[test]
+    fn join_projection_selects_and_reorders_across_both_sides() {
+        let mut engine = joinable_session();
+        let result = select(
+            &mut engine,
+            "SELECT orders.oid, users.name FROM users JOIN orders ON users.id = orders.uid",
+        );
+        assert_eq!(
+            result.columns,
+            vec![
+                ("oid".to_owned(), LogicalType::Int4),
+                ("name".to_owned(), LogicalType::Text),
+            ]
+        );
+        assert_eq!(
+            sorted(result.rows),
+            sorted(vec![
+                vec![i4(10), txt("alice")],
+                vec![i4(11), txt("alice")],
+                vec![i4(12), txt("bob")],
+            ])
+        );
+    }
+
+    #[test]
+    fn join_over_an_empty_right_side() {
+        // No orders: INNER empty, LEFT all NULL-extended, ANTI all kept.
+        let mut engine = session();
+        for ddl in [
+            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE orders (oid INT PRIMARY KEY, uid INT) WITH SYSTEM VERSIONING",
+        ] {
+            engine.execute(&parse_one(ddl)).expect("create");
+        }
+        engine
+            .execute(&parse_one("INSERT INTO users VALUES (1, 'alice')"))
+            .expect("insert");
+
+        let inner = select(
+            &mut engine,
+            "SELECT * FROM users JOIN orders ON users.id = orders.uid",
+        );
+        assert!(inner.rows.is_empty());
+
+        let left = select(
+            &mut engine,
+            "SELECT * FROM users LEFT JOIN orders ON users.id = orders.uid",
+        );
+        assert_eq!(left.rows, vec![vec![i4(1), txt("alice"), None, None]]);
+
+        let anti = select(
+            &mut engine,
+            "SELECT id FROM users ANTI JOIN orders ON users.id = orders.uid",
+        );
+        assert_eq!(anti.rows, vec![vec![i4(1)]]);
+    }
+
+    #[test]
+    fn join_on_a_text_key() {
+        // A TEXT join key on both sides (a value column = a business key) exercises
+        // the non-integer decode path through `run_join`.
+        let mut engine = session();
+        for ddl in [
+            "CREATE TABLE emp (id INT PRIMARY KEY, dept TEXT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE dept (name TEXT PRIMARY KEY, floor INT) WITH SYSTEM VERSIONING",
+        ] {
+            engine.execute(&parse_one(ddl)).expect("create");
+        }
+        for dml in [
+            "INSERT INTO emp VALUES (1, 'eng')",
+            "INSERT INTO emp VALUES (2, 'sales')",
+            "INSERT INTO dept VALUES ('eng', 3)",
+        ] {
+            engine.execute(&parse_one(dml)).expect("insert");
+        }
+        // emp.dept (a TEXT value column) joins to dept.name (the TEXT business key);
+        // emp 2 ('sales') has no department, so the inner join drops it.
+        let result = select(
+            &mut engine,
+            "SELECT emp.id, dept.floor FROM emp JOIN dept ON emp.dept = dept.name",
+        );
+        assert_eq!(sorted(result.rows), vec![vec![i4(1), i4(3)]]);
     }
 }
