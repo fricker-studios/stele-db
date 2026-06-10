@@ -46,8 +46,8 @@
 //! [`AsOfError::Unsupported`] rather than a wrong instant.
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArguments, GroupByExpr, Query, Select, SelectItem, SetExpr,
-    Statement as SqlStatement, TableFactor, Value,
+    BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
+    GroupByExpr, Query, Select, SelectItem, SetExpr, Statement as SqlStatement, TableFactor, Value,
 };
 use stele_catalog::{Catalog, SchemaId, TableSchema};
 use stele_common::period::{Interval, IntervalError, PeriodPredicate};
@@ -132,6 +132,117 @@ pub struct BoundSelect {
     /// exclusive with [`filter`](Self::filter) — a `WHERE` is one shape or the
     /// other.
     pub period_filter: Option<BoundPeriodPredicate>,
+    /// A bound `GROUP BY` + aggregate plan, or `None` for a plain row-returning
+    /// query ([STL-171]). When `Some`, the executor folds the scanned rows into
+    /// grouped aggregate output and the query's result columns are the
+    /// [aggregate's](BoundAggregate::columns), not [`projection`](Self::projection)
+    /// (which is left a placeholder). [`filter`](Self::filter) still applies — a
+    /// `WHERE` filters rows *before* grouping.
+    ///
+    /// [STL-171]: https://allegromusic.atlassian.net/browse/STL-171
+    pub aggregate: Option<BoundAggregate>,
+}
+
+/// A bound `GROUP BY` + aggregate query: the grouping columns, the aggregates to
+/// compute, and the output columns in SELECT-list order ([STL-171]).
+///
+/// The executor evaluates each grouping key and aggregate argument over the
+/// scanned rows (via the vectorized evaluator), folds them per group, and emits
+/// one row per group. Columns are referenced by **schema index** (0 = business
+/// key, the rest value columns) — the same positional convention
+/// [`BoundPredicate`] uses — so the executor reads them straight out of the
+/// reconstructed row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundAggregate {
+    /// The grouping columns, as schema indices. Empty for an ungrouped aggregate
+    /// (`SELECT COUNT(*) FROM t`), which is one whole-table group.
+    pub group_by: Vec<usize>,
+    /// The aggregates to compute, in first-appearance order. An
+    /// [`OutputItem::Aggregate`] indexes into this list.
+    pub aggregates: Vec<AggregateCall>,
+    /// The output columns, in SELECT-list order — each either a passed-through
+    /// grouping column or an aggregate.
+    pub items: Vec<OutputItem>,
+    /// The result columns `(name, type)`, aligned to [`items`](Self::items): a
+    /// `RowDescription` header for the grouped result.
+    pub columns: Vec<(String, LogicalType)>,
+}
+
+/// One output column of an aggregate query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputItem {
+    /// A passed-through grouping column — the i-th entry of
+    /// [`BoundAggregate::group_by`].
+    Group(usize),
+    /// An aggregate — the i-th entry of [`BoundAggregate::aggregates`].
+    Aggregate(usize),
+}
+
+/// A bound aggregate function call: a function over an optional value column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggregateCall {
+    /// Which aggregate to compute.
+    pub func: AggregateFunc,
+    /// The value column the aggregate reads, as a schema index, or `None` for
+    /// `COUNT(*)` (which counts rows, not a column's values).
+    pub arg: Option<usize>,
+}
+
+/// The aggregate functions the binder lowers ([STL-171]).
+///
+/// Mirrors the executor's `stele_exec::AggregateFunc`; the engine maps between
+/// them when it lowers the bound plan (the two crates do not depend on each
+/// other).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunc {
+    /// `COUNT` — row / non-NULL-value count. Result `INT8`.
+    Count,
+    /// `SUM` — total of non-NULL integer values. Result `INT8`.
+    Sum,
+    /// `MIN` — least non-NULL value. Result the argument's type.
+    Min,
+    /// `MAX` — greatest non-NULL value. Result the argument's type.
+    Max,
+    /// `AVG` — integer mean of non-NULL integer values. Result `INT8` (the
+    /// fractional result awaits a `FLOAT8` / `NUMERIC` type, [STL-209]).
+    Avg,
+}
+
+impl AggregateFunc {
+    /// The aggregate a function name denotes (case-insensitive), or `None` if the
+    /// name is not one of the core aggregates.
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match () {
+            () if name.eq_ignore_ascii_case("count") => Self::Count,
+            () if name.eq_ignore_ascii_case("sum") => Self::Sum,
+            () if name.eq_ignore_ascii_case("min") => Self::Min,
+            () if name.eq_ignore_ascii_case("max") => Self::Max,
+            () if name.eq_ignore_ascii_case("avg") => Self::Avg,
+            () => return None,
+        })
+    }
+
+    /// The default output column name (when no `AS` alias is given) — the
+    /// lowercase function name, as Postgres labels an unaliased aggregate.
+    const fn default_name(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Avg => "avg",
+        }
+    }
+
+    /// The result type for this aggregate over an argument of type `arg` (`None`
+    /// for `COUNT(*)`). `COUNT` / `SUM` / `AVG` produce `INT8`; `MIN` / `MAX`
+    /// produce the argument's own type.
+    const fn result_type(self, arg: Option<LogicalType>) -> LogicalType {
+        match self {
+            Self::Count | Self::Sum | Self::Avg => LogicalType::Int8,
+            Self::Min | Self::Max => arg.expect("MIN/MAX carries an argument"),
+        }
+    }
 }
 
 /// A bound `PERIOD(a, b) <predicate> PERIOD(c, d)` clause: two constant-folded
@@ -195,6 +306,28 @@ pub enum SelectError {
     /// dropped (which would return unfiltered rows — a wrong answer).
     #[error("v0.2 supports only a `<column> = <literal>` WHERE ({0})")]
     UnsupportedPredicate(String),
+
+    /// A `SELECT` item in an aggregate query is a bare column that is **not** in
+    /// the `GROUP BY` ([STL-171]). SQL requires every non-aggregated output column
+    /// to be a grouping column; one that is not has no single value per group, so
+    /// it is rejected rather than returning an arbitrary row's value.
+    #[error(
+        "column {column:?} of table {table:?} must appear in GROUP BY or be used in an aggregate"
+    )]
+    UngroupedColumn {
+        /// The table read.
+        table: String,
+        /// The ungrouped, non-aggregated column.
+        column: String,
+    },
+
+    /// An aggregate query's `GROUP BY`, a `SELECT` item, or an aggregate call is
+    /// not a shape v0.2 supports ([STL-171]) — a non-column grouping key, an
+    /// unknown function, `DISTINCT` / `FILTER` / `OVER` on an aggregate, a wrong
+    /// argument arity (`SUM(*)`), or an aggregate over a type the evaluator does
+    /// not read. Rejected with the reason rather than computed wrongly.
+    #[error("unsupported aggregate query: {0}")]
+    UnsupportedAggregate(String),
 
     /// `FOR VALID_TIME AS OF` was given for a table that does not opt into a
     /// valid-time period — there is no valid axis to travel along. The catalog's
@@ -299,7 +432,18 @@ pub enum AsOfError {
 pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, SelectError> {
     let select = single_select(&stmt.body)?;
     let table = single_table(select)?;
-    let projection = bind_projection(select)?;
+    // An aggregate query (a `GROUP BY`, or an aggregate in the SELECT list) takes
+    // a different shape: its output columns come from the aggregate plan, so the
+    // plain projection is bound only for a non-aggregate read. Detection is purely
+    // syntactic, so it runs before name resolution.
+    let aggregate_query = is_aggregate_query(select);
+    let projection = if aggregate_query {
+        // The output columns are the aggregate's; the projection is an unused
+        // placeholder the executor never consults on the aggregate path.
+        Projection::All
+    } else {
+        bind_projection(select)?
+    };
     let (snapshot, valid_snapshot) = resolve_snapshots(stmt, ctx.snapshot)?;
 
     let schema = match resolve_table_at(ctx.catalog, table, snapshot) {
@@ -342,6 +486,14 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
         }
     }
 
+    // Bind the `GROUP BY` + aggregate plan against the resolved schema, which
+    // gives the grouping/argument columns their indices and types.
+    let aggregate = if aggregate_query {
+        Some(bind_aggregate(select, schema, table)?)
+    } else {
+        None
+    };
+
     let filter = bind_filter(select, schema, table)?;
 
     // A period predicate is lifted off the token stream (the executor-glue
@@ -363,7 +515,317 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
         projection,
         filter,
         period_filter,
+        aggregate,
     })
+}
+
+/// Whether a `SELECT` is an aggregate query — it carries a non-empty `GROUP BY`,
+/// or any projected item is an aggregate function call. Purely syntactic (no
+/// catalog), so it gates binding before name resolution.
+fn is_aggregate_query(select: &Select) -> bool {
+    let grouped = matches!(
+        &select.group_by,
+        GroupByExpr::Expressions(exprs, _) if !exprs.is_empty()
+    );
+    grouped || select.projection.iter().any(projection_item_is_aggregate)
+}
+
+/// Whether a projected item is an aggregate function call (`COUNT(*)`,
+/// `SUM(x)`, …) — used to detect an aggregate query.
+fn projection_item_is_aggregate(item: &SelectItem) -> bool {
+    let expr = match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+        SelectItem::ExprWithAliases { .. }
+        | SelectItem::Wildcard(_)
+        | SelectItem::QualifiedWildcard(..) => return false,
+    };
+    matches!(expr, Expr::Function(func) if function_name(func).is_some_and(|n| AggregateFunc::from_name(n).is_some()))
+}
+
+/// The single, unqualified name of a function call, or `None` for a qualified or
+/// empty name (which is never one of the core aggregates).
+fn function_name(func: &sqlparser::ast::Function) -> Option<&str> {
+    match func.name.0.as_slice() {
+        [part] => part.as_ident().map(|id| id.value.as_str()),
+        _ => None,
+    }
+}
+
+/// Bind a `GROUP BY` + aggregate `SELECT` into a [`BoundAggregate`] against the
+/// resolved `schema` ([STL-171]).
+///
+/// Resolves the grouping columns to schema indices, then walks the SELECT list:
+/// each item is either an aggregate function call or a passed-through grouping
+/// column (one that is not in `GROUP BY` is [`SelectError::UngroupedColumn`]).
+fn bind_aggregate(
+    select: &Select,
+    schema: &TableSchema,
+    table: &str,
+) -> Result<BoundAggregate, SelectError> {
+    let group_by = bind_group_by(select, schema, table)?;
+
+    let mut aggregates: Vec<AggregateCall> = Vec::new();
+    let mut items: Vec<OutputItem> = Vec::new();
+    let mut columns: Vec<(String, LogicalType)> = Vec::new();
+
+    for item in &select.projection {
+        let (expr, alias) = select_item(item)?;
+        if let Some(call) = bind_aggregate_call(expr, schema, table)? {
+            let arg_ty = call.arg.map(|i| schema.columns()[i].ty());
+            let ty = call.func.result_type(arg_ty);
+            let name = alias.unwrap_or_else(|| call.func.default_name().to_owned());
+            items.push(OutputItem::Aggregate(aggregates.len()));
+            aggregates.push(call);
+            columns.push((name, ty));
+        } else {
+            // Not an aggregate ⇒ it must be a grouping column passed through.
+            let column = bare_column(expr).ok_or_else(|| {
+                SelectError::UnsupportedAggregate(
+                    "a SELECT item must be a grouping column or an aggregate".to_owned(),
+                )
+            })?;
+            let idx = column_index(schema, column).ok_or_else(|| SelectError::UnknownColumn {
+                table: table.to_owned(),
+                column: column.to_owned(),
+            })?;
+            let group_pos = group_by.iter().position(|&g| g == idx).ok_or_else(|| {
+                SelectError::UngroupedColumn {
+                    table: table.to_owned(),
+                    column: column.to_owned(),
+                }
+            })?;
+            let name = alias.unwrap_or_else(|| column.to_owned());
+            items.push(OutputItem::Group(group_pos));
+            columns.push((name, schema.columns()[idx].ty()));
+        }
+    }
+
+    Ok(BoundAggregate {
+        group_by,
+        aggregates,
+        items,
+        columns,
+    })
+}
+
+/// Resolve the `GROUP BY` columns to schema indices, rejecting a non-column
+/// grouping key or a grouping column of a type the evaluator cannot read.
+fn bind_group_by(
+    select: &Select,
+    schema: &TableSchema,
+    table: &str,
+) -> Result<Vec<usize>, SelectError> {
+    let exprs = match &select.group_by {
+        GroupByExpr::Expressions(exprs, modifiers) => {
+            if !modifiers.is_empty() {
+                return Err(SelectError::UnsupportedAggregate(
+                    "GROUP BY modifiers (ROLLUP/CUBE/GROUPING SETS) are not supported".to_owned(),
+                ));
+            }
+            exprs
+        }
+        GroupByExpr::All(_) => {
+            return Err(SelectError::UnsupportedAggregate(
+                "GROUP BY ALL is not supported".to_owned(),
+            ));
+        }
+    };
+    let mut group_by = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        let column = bare_column(expr).ok_or_else(|| {
+            SelectError::UnsupportedAggregate("GROUP BY supports bare column names only".to_owned())
+        })?;
+        let idx = column_index(schema, column).ok_or_else(|| SelectError::UnknownColumn {
+            table: table.to_owned(),
+            column: column.to_owned(),
+        })?;
+        require_evaluable(schema.columns()[idx].ty(), || {
+            format!(
+                "GROUP BY on a {} column is not supported yet",
+                schema.columns()[idx].ty()
+            )
+        })?;
+        group_by.push(idx);
+    }
+    Ok(group_by)
+}
+
+/// Bind one aggregate function call expression, or `Ok(None)` if `expr` is not a
+/// function call at all (so the caller treats it as a grouping column). A
+/// function call that is *not* a core aggregate, or a supported aggregate in an
+/// unsupported form, is an error rather than `None`.
+fn bind_aggregate_call(
+    expr: &Expr,
+    schema: &TableSchema,
+    table: &str,
+) -> Result<Option<AggregateCall>, SelectError> {
+    let Expr::Function(func) = expr else {
+        return Ok(None);
+    };
+    let name = function_name(func).ok_or_else(|| {
+        SelectError::UnsupportedAggregate("qualified function names are not supported".to_owned())
+    })?;
+    let func_kind = AggregateFunc::from_name(name).ok_or_else(|| {
+        SelectError::UnsupportedAggregate(format!("function {name}() is not a supported aggregate"))
+    })?;
+
+    // Reject everything beyond a plain single-argument aggregate: `DISTINCT`,
+    // `FILTER (WHERE …)`, an `OVER` window, `WITHIN GROUP`, and parametric calls.
+    // Each changes the meaning, so silently ignoring it would be a wrong answer.
+    if func.over.is_some() {
+        return Err(SelectError::UnsupportedAggregate(
+            "window aggregates (OVER) are not supported".to_owned(),
+        ));
+    }
+    if func.filter.is_some() {
+        return Err(SelectError::UnsupportedAggregate(
+            "aggregate FILTER (WHERE …) is not supported".to_owned(),
+        ));
+    }
+    if !func.within_group.is_empty() || func.null_treatment.is_some() {
+        return Err(SelectError::UnsupportedAggregate(
+            "WITHIN GROUP / NULL-treatment aggregates are not supported".to_owned(),
+        ));
+    }
+    if !matches!(func.parameters, FunctionArguments::None) {
+        return Err(SelectError::UnsupportedAggregate(
+            "parametric aggregates are not supported".to_owned(),
+        ));
+    }
+
+    let FunctionArguments::List(list) = &func.args else {
+        return Err(SelectError::UnsupportedAggregate(format!(
+            "{name}() requires a single argument"
+        )));
+    };
+    // `DISTINCT` changes the meaning and is unsupported; `ALL` is the default
+    // (`COUNT(ALL col)` == `COUNT(col)`) and is accepted, as is no treatment.
+    if matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct)) {
+        return Err(SelectError::UnsupportedAggregate(format!(
+            "{name}(DISTINCT …) is not supported"
+        )));
+    }
+    if !list.clauses.is_empty() {
+        return Err(SelectError::UnsupportedAggregate(format!(
+            "{name}() with an argument-list clause (e.g. ORDER BY) is not supported"
+        )));
+    }
+    let [FunctionArg::Unnamed(arg)] = list.args.as_slice() else {
+        return Err(SelectError::UnsupportedAggregate(format!(
+            "{name}() takes exactly one positional argument"
+        )));
+    };
+
+    // `COUNT(*)` is the one wildcard-argument aggregate; everything else needs a
+    // column. A bare `COUNT(col)` / `SUM(col)` / … resolves the column and checks
+    // its type fits the aggregate.
+    let arg = match arg {
+        FunctionArgExpr::Wildcard => {
+            if func_kind != AggregateFunc::Count {
+                return Err(SelectError::UnsupportedAggregate(format!(
+                    "{name}(*) is not valid; only COUNT(*) takes a wildcard"
+                )));
+            }
+            None
+        }
+        FunctionArgExpr::Expr(expr) => {
+            let column = bare_column(expr).ok_or_else(|| {
+                SelectError::UnsupportedAggregate(format!(
+                    "{name}() supports a bare column argument only"
+                ))
+            })?;
+            let idx = column_index(schema, column).ok_or_else(|| SelectError::UnknownColumn {
+                table: table.to_owned(),
+                column: column.to_owned(),
+            })?;
+            check_aggregate_arg_type(func_kind, schema.columns()[idx].ty())?;
+            Some(idx)
+        }
+        FunctionArgExpr::QualifiedWildcard(_) | FunctionArgExpr::WildcardWithOptions(_) => {
+            return Err(SelectError::UnsupportedAggregate(format!(
+                "{name}() does not support a qualified or option-bearing wildcard"
+            )));
+        }
+    };
+
+    Ok(Some(AggregateCall {
+        func: func_kind,
+        arg,
+    }))
+}
+
+/// Check an aggregate argument's column type: `SUM` / `AVG` need an integer;
+/// `MIN` / `MAX` / `COUNT(col)` need any type the evaluator can read.
+fn check_aggregate_arg_type(func: AggregateFunc, ty: LogicalType) -> Result<(), SelectError> {
+    match func {
+        AggregateFunc::Sum | AggregateFunc::Avg => {
+            if matches!(ty, LogicalType::Int4 | LogicalType::Int8) {
+                Ok(())
+            } else {
+                Err(SelectError::UnsupportedAggregate(format!(
+                    "{} requires an integer argument, got {ty}",
+                    func.default_name().to_uppercase()
+                )))
+            }
+        }
+        AggregateFunc::Count | AggregateFunc::Min | AggregateFunc::Max => {
+            require_evaluable(ty, || {
+                format!(
+                    "{}({ty}) is not supported yet",
+                    func.default_name().to_uppercase()
+                )
+            })
+        }
+    }
+}
+
+/// Accept a type the vectorized evaluator can decode (`INT4` / `INT8` / `BOOL` /
+/// `TEXT`); reject anything else with `reason`. Grouping keys and `MIN` / `MAX` /
+/// `COUNT` arguments must be evaluable because the executor decodes them into
+/// typed vectors; the temporal / `PERIOD` / `UUID` / `BYTEA` types are the
+/// evaluator's tracked follow-up (STL-207).
+fn require_evaluable(ty: LogicalType, reason: impl FnOnce() -> String) -> Result<(), SelectError> {
+    if matches!(
+        ty,
+        LogicalType::Int4 | LogicalType::Int8 | LogicalType::Bool | LogicalType::Text
+    ) {
+        Ok(())
+    } else {
+        Err(SelectError::UnsupportedAggregate(reason()))
+    }
+}
+
+/// The `(expression, optional alias)` of a SELECT item, rejecting a wildcard
+/// (`*` is meaningless in an aggregate query — every column must be grouped or
+/// aggregated).
+fn select_item(item: &SelectItem) -> Result<(&Expr, Option<String>), SelectError> {
+    match item {
+        SelectItem::UnnamedExpr(expr) => Ok((expr, None)),
+        SelectItem::ExprWithAlias { expr, alias } => Ok((expr, Some(alias.value.clone()))),
+        SelectItem::ExprWithAliases { .. } => Err(SelectError::UnsupportedAggregate(
+            "multi-alias `AS (a, b, …)` SELECT items are not supported".to_owned(),
+        )),
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
+            Err(SelectError::UnsupportedAggregate(
+                "`*` is not supported with GROUP BY / aggregates".to_owned(),
+            ))
+        }
+    }
+}
+
+/// The bare column name an expression references (peeling parentheses), or `None`
+/// for any non-bare-identifier expression.
+fn bare_column(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Identifier(id) => Some(id.value.as_str()),
+        Expr::Nested(inner) => bare_column(inner),
+        _ => None,
+    }
+}
+
+/// A column's position in the schema (0 = business key), or `None` if absent.
+fn column_index(schema: &TableSchema, column: &str) -> Option<usize> {
+    schema.columns().iter().position(|c| c.name() == column)
 }
 
 /// Bind a parsed [`PeriodPredicateClause`] to a [`BoundPeriodPredicate`] of two
@@ -795,11 +1257,13 @@ fn reject_unsupported_select_clauses(select: &Select) -> Result<(), SelectError>
     if select.into.is_some() {
         return reject("SELECT INTO");
     }
-    // `GROUP BY ALL`, or `GROUP BY <exprs>` / a trailing modifier — only the
-    // empty `Expressions(<none>, <none>)` is "no grouping".
-    if !matches!(&select.group_by, GroupByExpr::Expressions(exprs, modifiers) if exprs.is_empty() && modifiers.is_empty())
-    {
-        return reject("GROUP BY");
+    // `GROUP BY <exprs>` is bound as an aggregate query ([STL-171], in
+    // `bind_aggregate`); only the non-standard `GROUP BY ALL` (group by the whole
+    // projection) is rejected here, since the binder does not model it. Trailing
+    // modifiers (ROLLUP/CUBE/GROUPING SETS) on an expression list are rejected in
+    // `bind_group_by` with a precise reason.
+    if matches!(&select.group_by, GroupByExpr::All(_)) {
+        return reject("GROUP BY ALL");
     }
     if select.having.is_some() {
         return reject("HAVING");
@@ -1221,8 +1685,10 @@ mod tests {
             "SELECT balance FROM account ORDER BY balance",
             "SELECT balance FROM account LIMIT 1",
             "SELECT DISTINCT balance FROM account",
-            "SELECT balance FROM account GROUP BY balance",
+            // `GROUP BY balance` now binds as an aggregate query ([STL-171]);
+            // HAVING and GROUP BY ALL remain unsupported clauses.
             "SELECT balance FROM account GROUP BY balance HAVING balance > 0",
+            "SELECT balance FROM account GROUP BY ALL",
             "WITH t AS (SELECT 1) SELECT balance FROM account",
         ] {
             let stmt = parse_one(sql);
@@ -1493,5 +1959,249 @@ mod tests {
             ),
             Err(SelectError::PeriodOperand(_))
         ));
+    }
+
+    // ---- GROUP BY + aggregates (STL-171) ----
+
+    /// `sales(id INT key, region TEXT, amount INT)` — a 3-column table to group on
+    /// a value column and aggregate another.
+    fn catalog_with_sales() -> Catalog {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(
+                "sales",
+                vec![
+                    ColumnDef::new("id", LogicalType::Int4).expect("col"),
+                    ColumnDef::new("region", LogicalType::Text).expect("col"),
+                    ColumnDef::new("amount", LogicalType::Int8).expect("col"),
+                ],
+                TableTemporal::system_only(),
+                SystemTimeMicros(1_000),
+            )
+            .expect("create sales");
+        catalog
+    }
+
+    #[test]
+    fn a_plain_select_has_no_aggregate_plan() {
+        let catalog = catalog_with_sales();
+        assert_eq!(
+            bind("SELECT region FROM sales", &catalog)
+                .unwrap()
+                .aggregate,
+            None
+        );
+    }
+
+    #[test]
+    fn group_by_with_aggregates_binds() {
+        let catalog = catalog_with_sales();
+        let agg = bind(
+            "SELECT region, COUNT(*), SUM(amount) FROM sales GROUP BY region",
+            &catalog,
+        )
+        .unwrap()
+        .aggregate
+        .expect("aggregate plan");
+        assert_eq!(agg.group_by, vec![1]); // region is value column index 1
+        assert_eq!(
+            agg.aggregates,
+            vec![
+                AggregateCall {
+                    func: AggregateFunc::Count,
+                    arg: None
+                },
+                AggregateCall {
+                    func: AggregateFunc::Sum,
+                    arg: Some(2)
+                },
+            ]
+        );
+        assert_eq!(
+            agg.items,
+            vec![
+                OutputItem::Group(0),
+                OutputItem::Aggregate(0),
+                OutputItem::Aggregate(1),
+            ]
+        );
+        assert_eq!(
+            agg.columns,
+            vec![
+                ("region".to_owned(), LogicalType::Text),
+                ("count".to_owned(), LogicalType::Int8),
+                ("sum".to_owned(), LogicalType::Int8),
+            ]
+        );
+    }
+
+    #[test]
+    fn ungrouped_aggregate_binds_with_no_grouping_columns() {
+        let catalog = catalog_with_sales();
+        let agg = bind("SELECT COUNT(*), MAX(amount) FROM sales", &catalog)
+            .unwrap()
+            .aggregate
+            .expect("aggregate plan");
+        assert!(agg.group_by.is_empty());
+        assert_eq!(
+            agg.items,
+            vec![OutputItem::Aggregate(0), OutputItem::Aggregate(1)]
+        );
+        // MAX's result type is its argument's type (int8 here).
+        assert_eq!(
+            agg.columns,
+            vec![
+                ("count".to_owned(), LogicalType::Int8),
+                ("max".to_owned(), LogicalType::Int8),
+            ]
+        );
+    }
+
+    #[test]
+    fn aliases_name_the_output_columns() {
+        let catalog = catalog_with_sales();
+        let agg = bind(
+            "SELECT region AS r, SUM(amount) AS total FROM sales GROUP BY region",
+            &catalog,
+        )
+        .unwrap()
+        .aggregate
+        .expect("aggregate plan");
+        assert_eq!(
+            agg.columns,
+            vec![
+                ("r".to_owned(), LogicalType::Text),
+                ("total".to_owned(), LogicalType::Int8),
+            ]
+        );
+    }
+
+    #[test]
+    fn min_max_result_type_is_the_argument_type() {
+        let catalog = catalog_with_sales();
+        let agg = bind("SELECT MIN(region) FROM sales", &catalog)
+            .unwrap()
+            .aggregate
+            .expect("aggregate plan");
+        assert_eq!(agg.columns, vec![("min".to_owned(), LogicalType::Text)]);
+    }
+
+    #[test]
+    fn grouping_with_no_aggregate_is_distinct() {
+        // `SELECT region FROM sales GROUP BY region` is a valid (DISTINCT-like)
+        // aggregate query — it has a GROUP BY even with no aggregate function.
+        let catalog = catalog_with_sales();
+        let agg = bind("SELECT region FROM sales GROUP BY region", &catalog)
+            .unwrap()
+            .aggregate
+            .expect("aggregate plan");
+        assert_eq!(agg.group_by, vec![1]);
+        assert!(agg.aggregates.is_empty());
+        assert_eq!(agg.items, vec![OutputItem::Group(0)]);
+    }
+
+    #[test]
+    fn a_non_grouped_column_is_rejected() {
+        // `region` is neither grouped nor aggregated — there is no single value
+        // per group, so it is rejected (SQL's GROUP BY rule).
+        let catalog = catalog_with_sales();
+        assert_eq!(
+            bind("SELECT region, SUM(amount) FROM sales", &catalog),
+            Err(SelectError::UngroupedColumn {
+                table: "sales".to_owned(),
+                column: "region".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn unsupported_aggregate_forms_are_rejected() {
+        let catalog = catalog_with_sales();
+        for sql in [
+            "SELECT SUM(region) FROM sales GROUP BY id", // SUM of text
+            "SELECT AVG(region) FROM sales GROUP BY id", // AVG of text
+            "SELECT SUM(*) FROM sales",                  // SUM(*) invalid
+            "SELECT COUNT(DISTINCT amount) FROM sales",  // DISTINCT
+            "SELECT SUM(amount) OVER () FROM sales",     // window
+            "SELECT lower(region) FROM sales GROUP BY region", // non-aggregate fn
+            "SELECT * FROM sales GROUP BY region",       // wildcard with GROUP BY
+            "SELECT SUM(amount + 1) FROM sales",         // non-column argument
+        ] {
+            assert!(
+                matches!(
+                    bind(sql, &catalog),
+                    Err(SelectError::UnsupportedAggregate(_))
+                ),
+                "expected UnsupportedAggregate for: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn count_all_is_accepted_as_the_default() {
+        // `ALL` is the default duplicate treatment (`COUNT(ALL col)` == `COUNT(col)`),
+        // so it binds; only `DISTINCT` is rejected.
+        let catalog = catalog_with_sales();
+        let agg = bind("SELECT COUNT(ALL amount) FROM sales", &catalog)
+            .unwrap()
+            .aggregate
+            .expect("aggregate plan");
+        assert_eq!(
+            agg.aggregates,
+            vec![AggregateCall {
+                func: AggregateFunc::Count,
+                arg: Some(2),
+            }]
+        );
+    }
+
+    #[test]
+    fn group_by_on_an_unsupported_type_is_rejected() {
+        // `vf` is a TIMESTAMP — outside the evaluator's scalar set, so grouping on
+        // it is rejected rather than mis-decoded.
+        let catalog = catalog_with_booking(1_000);
+        assert!(matches!(
+            bind("SELECT COUNT(*) FROM booking GROUP BY vf", &catalog),
+            Err(SelectError::UnsupportedAggregate(_))
+        ));
+    }
+
+    #[test]
+    fn an_unknown_aggregate_or_group_column_is_rejected() {
+        let catalog = catalog_with_sales();
+        assert_eq!(
+            bind("SELECT SUM(nope) FROM sales", &catalog),
+            Err(SelectError::UnknownColumn {
+                table: "sales".to_owned(),
+                column: "nope".to_owned(),
+            })
+        );
+        assert_eq!(
+            bind("SELECT COUNT(*) FROM sales GROUP BY nope", &catalog),
+            Err(SelectError::UnknownColumn {
+                table: "sales".to_owned(),
+                column: "nope".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn where_filters_rows_before_grouping() {
+        // A WHERE on an aggregate query still binds (it filters pre-aggregation).
+        let catalog = catalog_with_sales();
+        let bound = bind(
+            "SELECT region, COUNT(*) FROM sales WHERE id = 1 GROUP BY region",
+            &catalog,
+        )
+        .unwrap();
+        assert!(bound.aggregate.is_some());
+        assert_eq!(
+            bound.filter,
+            Some(BoundPredicate {
+                column: "id".to_owned(),
+                column_index: 0,
+                value: ScalarValue::Int4(1),
+            })
+        );
     }
 }

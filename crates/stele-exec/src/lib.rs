@@ -21,16 +21,21 @@
 //! three-valued NULL logic over a whole batch at a time. The [`ExplodePayload`]
 //! operator slices the row-codec payload blob into first-class value columns so
 //! that filter runs over arbitrary columns on the live query path ([STL-206]).
-//! The aggregate / join operators (STL-77 C11–C13) build on the same trait.
+//! On the same evaluator, [`hash_aggregate`] folds `GROUP BY` groups with the
+//! core aggregate set (`COUNT` / `SUM` / `MIN` / `MAX` / `AVG`, [STL-171]); the
+//! join operator (STL-77 C12) builds on the same pieces.
 //!
 //! [STL-170]: https://allegromusic.atlassian.net/browse/STL-170
+//! [STL-171]: https://allegromusic.atlassian.net/browse/STL-171
 //! [STL-206]: https://allegromusic.atlassian.net/browse/STL-206
 
+mod aggregate;
 mod expr;
 mod operator;
 mod period;
 mod snapshot_scan;
 
+pub use aggregate::{AggregateFunc, AggregateOutput, Aggregator, hash_aggregate};
 pub use expr::{ArithOp, CmpOp, Expr, ExprError, LogicOp, Vector, eval_expr};
 pub use operator::{DEFAULT_BATCH_SIZE, ExplodePayload, Filter, Operator, Project, ScanSource};
 pub use period::evaluate;
