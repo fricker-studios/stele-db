@@ -46,8 +46,8 @@
 //! [`AsOfError::Unsupported`] rather than a wrong instant.
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Query,
-    Select, SelectItem, SetExpr, Statement as SqlStatement, TableFactor, Value,
+    BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
+    GroupByExpr, Query, Select, SelectItem, SetExpr, Statement as SqlStatement, TableFactor, Value,
 };
 use stele_catalog::{Catalog, SchemaId, TableSchema};
 use stele_common::period::{Interval, IntervalError, PeriodPredicate};
@@ -674,7 +674,7 @@ fn bind_aggregate_call(
     // Each changes the meaning, so silently ignoring it would be a wrong answer.
     if func.over.is_some() {
         return Err(SelectError::UnsupportedAggregate(
-            "window aggregates (OVER) are not supported (v0.5)".to_owned(),
+            "window aggregates (OVER) are not supported".to_owned(),
         ));
     }
     if func.filter.is_some() {
@@ -698,7 +698,9 @@ fn bind_aggregate_call(
             "{name}() requires a single argument"
         )));
     };
-    if list.duplicate_treatment.is_some() {
+    // `DISTINCT` changes the meaning and is unsupported; `ALL` is the default
+    // (`COUNT(ALL col)` == `COUNT(col)`) and is accepted, as is no treatment.
+    if matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct)) {
         return Err(SelectError::UnsupportedAggregate(format!(
             "{name}(DISTINCT …) is not supported"
         )));
@@ -2133,6 +2135,24 @@ mod tests {
                 "expected UnsupportedAggregate for: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn count_all_is_accepted_as_the_default() {
+        // `ALL` is the default duplicate treatment (`COUNT(ALL col)` == `COUNT(col)`),
+        // so it binds; only `DISTINCT` is rejected.
+        let catalog = catalog_with_sales();
+        let agg = bind("SELECT COUNT(ALL amount) FROM sales", &catalog)
+            .unwrap()
+            .aggregate
+            .expect("aggregate plan");
+        assert_eq!(
+            agg.aggregates,
+            vec![AggregateCall {
+                func: AggregateFunc::Count,
+                arg: Some(2),
+            }]
+        );
     }
 
     #[test]

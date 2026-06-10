@@ -360,27 +360,39 @@ fn update_extreme(row: &mut Option<usize>, arg: Option<&Vector>, r: usize, want:
 }
 
 /// Total-order comparison of two same-typed scalar values, over the evaluator's
-/// scalar set. `MIN` / `MAX` fold a single argument column, so both operands are
-/// the same type by construction; the binder further restricts that type to this
-/// set, making any other pairing unreachable (treated as `Equal`).
+/// scalar set. `MIN` / `MAX` fold a single argument column, so both operands come
+/// from one [`Vector`] and are the same type by construction — a mixed pairing is
+/// impossible here. Rather than return a wrong ordering for one, this **fails
+/// fast**: a panic flags the contract break (e.g. a new [`Vector`] variant that
+/// reaches `MIN` / `MAX` without a `scalar_cmp` arm — STL-207 broadens the type
+/// set) instead of silently mis-ordering.
 fn scalar_cmp(a: &ScalarValue, b: &ScalarValue) -> Ordering {
     match (a, b) {
         (ScalarValue::Int4(x), ScalarValue::Int4(y)) => x.cmp(y),
         (ScalarValue::Int8(x), ScalarValue::Int8(y)) => x.cmp(y),
         (ScalarValue::Bool(x), ScalarValue::Bool(y)) => x.cmp(y),
         (ScalarValue::Text(x), ScalarValue::Text(y)) => x.cmp(y),
-        _ => Ordering::Equal,
+        _ => unreachable!(
+            "MIN/MAX compares values from one column, so both operands share a type \
+             the evaluator can read: got {} vs {}",
+            a.logical_type(),
+            b.logical_type()
+        ),
     }
 }
 
 /// The `i128` value of an integer scalar — `SUM` / `AVG` accumulate here to dodge
 /// `i64` overflow mid-fold. The binder restricts `SUM` / `AVG` arguments to
-/// integers, so a non-integer is unreachable (defensively `0`).
+/// integers, so a non-integer is a contract break: this **fails fast** with a
+/// panic rather than silently summing a wrong `0`.
 fn scalar_i128(value: &ScalarValue) -> i128 {
     match value {
         ScalarValue::Int4(v) => i128::from(*v),
         ScalarValue::Int8(v) => i128::from(*v),
-        _ => 0,
+        other => unreachable!(
+            "SUM/AVG argument is binder-restricted to integers, got {}",
+            other.logical_type()
+        ),
     }
 }
 
