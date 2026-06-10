@@ -1057,7 +1057,8 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
 /// Shapes are fixed and documented (see [`pg_catalog`]): a relation lookup
 /// returns `(oid, nspname, relname)` for the named table (zero rows if absent);
 /// an attribute lookup returns `(attname, atttypname, attnum)` per column of the
-/// table whose synthetic `oid` matches (zero rows if none).
+/// table whose synthetic `oid` matches (zero rows if none); a table list
+/// returns `(nspname, relname)` per live table, name-sorted (STL-198).
 fn introspection_reply(
     intro: &Introspection,
     session: &SharedSession,
@@ -1085,6 +1086,24 @@ fn introspection_reply(
                     ]]
                 })
                 .unwrap_or_default();
+            (header, rows)
+        }
+        Introspection::TableList => {
+            let header = vec![
+                field("nspname", LogicalType::Text),
+                field("relname", LogicalType::Text),
+            ];
+            let mut names: Vec<&str> = live.iter().map(|t| t.name.as_str()).collect();
+            names.sort_unstable();
+            let rows = names
+                .into_iter()
+                .map(|name| {
+                    vec![
+                        cell(ScalarValue::Text("public".to_owned())),
+                        cell(ScalarValue::Text(name.to_owned())),
+                    ]
+                })
+                .collect();
             (header, rows)
         }
         Introspection::Attributes { oid } => {

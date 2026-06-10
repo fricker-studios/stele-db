@@ -9,7 +9,10 @@
 use clap::{Parser, Subcommand};
 
 mod client;
+mod highlight;
+mod render;
 mod shell;
+mod theme;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -48,6 +51,15 @@ struct ShellArgs {
     /// Database name sent in the startup message.
     #[arg(long, default_value = "stele")]
     dbname: String,
+    /// Result-table border style.
+    #[arg(long, value_enum, default_value_t = render::BorderStyle::Psql)]
+    border: render::BorderStyle,
+    /// Prepend a 1-based row-number column to result tables.
+    #[arg(long)]
+    row_numbers: bool,
+    /// Disable ANSI color even on a terminal (NO_COLOR is also honored).
+    #[arg(long)]
+    no_color: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -98,6 +110,9 @@ fn main() -> anyhow::Result<()> {
             port: s.port,
             user: s.user,
             dbname: s.dbname,
+            border: s.border,
+            row_nums: s.row_numbers,
+            no_color: s.no_color,
         }),
         Cmd::Query { .. } => {
             anyhow::bail!(

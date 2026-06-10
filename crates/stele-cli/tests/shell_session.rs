@@ -1,12 +1,12 @@
 //! Scripted `stele shell` sessions against a live in-process engine — the
-//! STL-185 Definition of Done.
+//! STL-185 Definition of Done, extended with the STL-198 design surface.
 //!
 //! Each test boots a [`SessionEngine`] + pgwire [`Server`] on an ephemeral
 //! port, then spawns the **real `stele` binary** (`CARGO_BIN_EXE_stele`) with
 //! `shell --host … --port …`, pipes a scripted session into stdin, and asserts
-//! on the rendered stdout/stderr. This exercises the whole stack the way a
-//! user does: argv → clap → blocking pg-wire client → simple-query loop →
-//! table renderer.
+//! on the rendered stdout/stderr. Because stdin is a pipe (not a TTY), the
+//! shell suppresses the banner, prompts, and every ANSI escape — these
+//! assertions double as the guarantee that scripted output stays byte-clean.
 
 use std::io::Write as _;
 use std::net::SocketAddr;
@@ -33,10 +33,11 @@ async fn spawn_server() -> SocketAddr {
     addr
 }
 
-/// Run `stele shell` against `addr`, feed it `script` on stdin, and collect
-/// its output. A deadline guards against a hung shell taking CI with it: the
-/// child is killed (and the test fails) rather than waiting forever.
-fn run_shell(addr: SocketAddr, script: &str) -> Output {
+/// Run `stele shell` (plus `extra` flags) against `addr`, feed it `script` on
+/// stdin, and collect its output. A deadline guards against a hung shell
+/// taking CI with it: the child is killed (and the test fails) rather than
+/// waiting forever.
+fn run_shell(addr: SocketAddr, script: &str, extra: &[&str]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_stele"))
         .args([
             "shell",
@@ -45,6 +46,7 @@ fn run_shell(addr: SocketAddr, script: &str) -> Output {
             "--port",
             &addr.port().to_string(),
         ])
+        .args(extra)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -89,7 +91,7 @@ SELECT id, balance
 \\d account
 \\q
 ";
-    let output = tokio::task::spawn_blocking(move || run_shell(addr, script))
+    let output = tokio::task::spawn_blocking(move || run_shell(addr, script, &[]))
         .await
         .expect("shell task");
 
@@ -100,24 +102,31 @@ SELECT id, balance
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(stderr.is_empty(), "clean session wrote to stderr: {stderr}");
+    // Piped sessions must stay byte-clean: no ANSI escapes anywhere.
+    assert!(
+        !stdout.contains('\x1b'),
+        "escapes in piped output: {stdout}"
+    );
 
     // DDL + DML surface their CommandComplete tags.
     assert!(stdout.contains("CREATE TABLE"), "{stdout}");
     assert_eq!(stdout.matches("INSERT 0 1").count(), 2, "{stdout}");
 
-    // The (multi-line) SELECT renders as a psql-style table.
+    // The (multi-line) SELECT renders psql-style; int4 cells right-align.
     assert!(stdout.contains(" id | balance "), "{stdout}");
     assert!(stdout.contains("----+---------"), "{stdout}");
-    assert!(stdout.contains(" 1  | 100"), "{stdout}");
-    assert!(stdout.contains(" 2  | 250"), "{stdout}");
+    assert!(stdout.contains("  1 |     100"), "{stdout}");
+    assert!(stdout.contains("  2 |     250"), "{stdout}");
     assert!(stdout.contains("(2 rows)"), "{stdout}");
 
-    // `\d account` resolves through the pg_catalog shim to the live columns.
+    // `\d account` resolves through the pg_catalog shim to the live columns,
+    // and reports the always-on system versioning (architecture §12).
     assert!(stdout.contains("Table \"public.account\""), "{stdout}");
     assert!(stdout.contains(" Column "), "{stdout}");
     assert!(stdout.contains("id"), "{stdout}");
     assert!(stdout.contains("balance"), "{stdout}");
     assert!(stdout.contains("int4"), "{stdout}");
+    assert!(stdout.contains("System versioning: ENABLED"), "{stdout}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -129,7 +138,7 @@ SELECT balance FROM nowhere;
 \\d missing
 SELECT 1;
 ";
-    let output = tokio::task::spawn_blocking(move || run_shell(addr, script))
+    let output = tokio::task::spawn_blocking(move || run_shell(addr, script, &[]))
         .await
         .expect("shell task");
 
@@ -140,8 +149,8 @@ SELECT 1;
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
-    // The bad statement is reported on stderr, psql-style…
-    assert!(stderr.contains("ERROR"), "{stderr}");
+    // The bad statement renders the psql error block on stderr…
+    assert!(stderr.contains("ERROR:  "), "{stderr}");
     // …and the missing relation gets the psql wording on stdout.
     assert!(
         stdout.contains("Did not find any relation named \"missing\"."),
@@ -150,4 +159,127 @@ SELECT 1;
     // The session survived both: the final SELECT still ran and rendered.
     assert!(stdout.contains("?column?"), "{stdout}");
     assert!(stdout.contains("(1 row)"), "{stdout}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn design_surface_meta_commands_round_trip() {
+    let addr = spawn_server().await;
+    let script = "\
+CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING;
+INSERT INTO account VALUES (1, 100);
+\\dt
+\\conninfo
+\\l
+\\timing
+SELECT id, balance FROM account;
+\\x
+SELECT id, balance FROM account;
+\\x
+\\json
+SELECT id, balance FROM account;
+\\json
+\\?
+\\history account 1
+\\status
+\\zz
+\\q
+";
+    let output = tokio::task::spawn_blocking(move || run_shell(addr, script, &[]))
+        .await
+        .expect("shell task");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // \dt — the new pg_catalog table-list shape, end to end.
+    assert!(stdout.contains("List of relations"), "{stdout}");
+    assert!(
+        stdout.contains(" public | account | table | system "),
+        "{stdout}"
+    );
+
+    // \conninfo and \l reflect the live connection parameters.
+    assert!(
+        stdout.contains(
+            "You are connected to database \"stele\" as user \"stele\" via pg-wire on 127.0.0.1"
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("List of databases"), "{stdout}");
+
+    // \timing prints the toggle message and a Time: line after the SELECT.
+    assert!(stdout.contains("Timing is on."), "{stdout}");
+    assert!(stdout.contains("Time: "), "{stdout}");
+
+    // \x — psql-style expanded records, then back to aligned.
+    assert!(stdout.contains("Expanded display is on."), "{stdout}");
+    assert!(stdout.contains("-[ RECORD 1 ]"), "{stdout}");
+    assert!(stdout.contains("balance | 100"), "{stdout}");
+    assert!(stdout.contains("Expanded display is off."), "{stdout}");
+
+    // \json — typed values, NULL-safe, numerics unquoted.
+    assert!(stdout.contains("Output format is json."), "{stdout}");
+    assert!(stdout.contains("{\"id\": 1, \"balance\": 100}"), "{stdout}");
+
+    // \? lists the whole designed surface, including the future tiers.
+    assert!(stdout.contains("Meta-commands"), "{stdout}");
+    assert!(stdout.contains("list meta-commands"), "{stdout}");
+    assert!(stdout.contains("\\asof <ts|reset>"), "{stdout}");
+    assert!(
+        stdout.contains("verify the tamper-evident hash chain"),
+        "{stdout}"
+    );
+
+    // Designed-but-not-wired tiers point at their tickets.
+    assert!(
+        stdout.contains("NOTICE:  \\history") && stdout.contains("STL-199"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("NOTICE:  \\status") && stdout.contains("STL-200"),
+        "{stdout}"
+    );
+
+    // Unknown meta-command: the psql error block, on stderr.
+    assert!(stderr.contains("ERROR:  invalid command \\zz"), "{stderr}");
+    assert!(stderr.contains("SQLSTATE: 42601"), "{stderr}");
+    assert!(
+        stderr.contains("HINT:  Try \\? for a list of meta-commands."),
+        "{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn border_styles_and_row_numbers_render_from_flags() {
+    let addr = spawn_server().await;
+    let script = "\
+CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING;
+INSERT INTO account VALUES (1, 100);
+INSERT INTO account VALUES (2, 250);
+SELECT id, balance FROM account;
+\\q
+";
+    let output = tokio::task::spawn_blocking(move || {
+        run_shell(addr, script, &["--border", "markdown", "--row-numbers"])
+    })
+    .await
+    .expect("shell task");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // Markdown border + 1-based row numbers, numerics right-aligned.
+    assert!(stdout.contains("| # | id | balance |"), "{stdout}");
+    assert!(stdout.contains("| - | -- | ------- |"), "{stdout}");
+    assert!(stdout.contains("| 1 |  1 |     100 |"), "{stdout}");
+    assert!(stdout.contains("| 2 |  2 |     250 |"), "{stdout}");
+    assert!(stdout.contains("(2 rows)"), "{stdout}");
 }
