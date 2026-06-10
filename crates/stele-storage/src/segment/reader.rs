@@ -162,6 +162,33 @@ impl<F: DiskFile> SegmentReader<F> {
         &self.zone_map
     }
 
+    /// One [`ZoneMap`] per row-group, in on-disk (row) order — the finer-grained
+    /// sibling of [`Self::zone_map`] (which folds these into a single
+    /// segment-level digest).
+    ///
+    /// Each map is built from only its own row-group's column-chunk stats, so a
+    /// planner can rule out individual row-groups before reading even their
+    /// narrow identity columns ([STL-173]): a value/system-time predicate that
+    /// the segment-level fold cannot disprove (its `[min, max]` spans every
+    /// row-group) may still be provably disjoint from a particular row-group.
+    /// Footer-derived, so building these costs no column-chunk I/O — the same
+    /// resident-metadata property [`Self::zone_map`] documents, at row-group
+    /// granularity. Indices line up with [`Self::row_group_row_counts`] and the
+    /// selection [`Self::read_column_in_row_groups`] /
+    /// [`Self::version_keys_in_row_groups`] take.
+    ///
+    /// The retraction tombstone section is **not** a row-group and is excluded
+    /// here (it carries its own value count, decoupled from any row-group's row
+    /// count); it folds only into the segment-level [`Self::zone_map`].
+    #[must_use]
+    pub fn row_group_zone_maps(&self) -> Vec<ZoneMap> {
+        self.footer
+            .row_groups
+            .iter()
+            .map(|rg| zone_map_from_metas(rg.columns.iter()))
+            .collect()
+    }
+
     /// Whether this segment *might* contain a row visible at `snapshot` that
     /// satisfies `predicate` — the planner's per-segment skip test.
     ///
@@ -307,30 +334,70 @@ impl<F: DiskFile> SegmentReader<F> {
     /// snapshot ([STL-139]). The `seq` completes each version's `(sys_from, seq)`
     /// identity so the bound probes the right index entry when two versions share
     /// a `sys_from` ([ADR-0024], STL-145).
-    #[allow(clippy::cast_sign_loss)] // `seq` round-trips i64-bits → u64 (see `ColumnId::Seq`).
     pub fn version_keys(&self) -> Result<Vec<(BusinessKey, SystemTimeMicros, u64)>, SegmentError> {
-        let mut business_keys = self.read_bytes_column(ColumnId::BusinessKey)?;
+        let business_keys = self.read_bytes_column(ColumnId::BusinessKey)?;
         let sys_from = self.read_i64_column(ColumnId::SysFrom)?;
         let seqs = self.read_i64_column(ColumnId::Seq)?;
-        if business_keys.len() != sys_from.len() || business_keys.len() != seqs.len() {
-            return Err(SegmentError::Corrupt(
-                "business_key / sys_from / seq value counts disagree within row-group",
-            ));
+        assemble_version_keys(business_keys, sys_from, seqs)
+    }
+
+    /// The version identities of only the selected `row_groups`, in row-group
+    /// (and therefore row) order — [`Self::version_keys`] scoped to a subset.
+    ///
+    /// The row-group-pruned identity read ([STL-173]): once a planner has ruled
+    /// out the row-groups whose [`Self::row_group_zone_maps`] prove no visible
+    /// match, it resolves the snapshot from just the survivors' narrow
+    /// `(business_key, sys_from, seq)` columns — the pruned row-groups' identity
+    /// chunks are never touched. The returned keys are the concatenation of the
+    /// selected row-groups' rows, so a caller addressing segment-global row
+    /// indices maps them back through [`Self::row_group_row_counts`] exactly as
+    /// for [`Self::read_column_in_row_groups`].
+    ///
+    /// # Panics
+    ///
+    /// If a selected index is not below the footer's row-group count — the caller
+    /// derives its selection from this reader's own
+    /// [`row_group_zone_maps`](Self::row_group_zone_maps) /
+    /// [`row_group_row_counts`](Self::row_group_row_counts), so an out-of-range
+    /// index is a caller bug, not data corruption.
+    pub fn version_keys_in_row_groups(
+        &self,
+        row_groups: &BTreeSet<usize>,
+    ) -> Result<Vec<(BusinessKey, SystemTimeMicros, u64)>, SegmentError> {
+        let business_keys = self.read_bytes_column_in(ColumnId::BusinessKey, row_groups)?;
+        let sys_from = self.read_i64_column_in(ColumnId::SysFrom, row_groups)?;
+        let seqs = self.read_i64_column_in(ColumnId::Seq, row_groups)?;
+        assemble_version_keys(business_keys, sys_from, seqs)
+    }
+
+    /// Project one bytes column from only the selected row-groups, erroring on a
+    /// type mismatch — the scoped sibling of [`Self::read_bytes_column`].
+    fn read_bytes_column_in(
+        &self,
+        col: ColumnId,
+        row_groups: &BTreeSet<usize>,
+    ) -> Result<Vec<Vec<u8>>, SegmentError> {
+        match self.read_column_in_row_groups(col, row_groups)? {
+            ColumnData::Bytes(v) => Ok(v),
+            ColumnData::NullableBytes(_) | ColumnData::I64(_) => Err(SegmentError::Corrupt(
+                "column data type mismatched expected schema",
+            )),
         }
-        // `mem::take` the owned key bytes out — the column vector is discarded at
-        // function end, so there is nothing to gain from cloning each key.
-        Ok(business_keys
-            .iter_mut()
-            .zip(sys_from)
-            .zip(seqs)
-            .map(|((bk, sf), seq)| {
-                (
-                    BusinessKey::new(std::mem::take(bk)),
-                    SystemTimeMicros(sf),
-                    seq as u64,
-                )
-            })
-            .collect())
+    }
+
+    /// Project one `i64` column from only the selected row-groups, erroring on a
+    /// type mismatch — the scoped sibling of [`Self::read_i64_column`].
+    fn read_i64_column_in(
+        &self,
+        col: ColumnId,
+        row_groups: &BTreeSet<usize>,
+    ) -> Result<Vec<i64>, SegmentError> {
+        match self.read_column_in_row_groups(col, row_groups)? {
+            ColumnData::I64(v) => Ok(v),
+            ColumnData::Bytes(_) | ColumnData::NullableBytes(_) => Err(SegmentError::Corrupt(
+                "column data type mismatched expected schema",
+            )),
+        }
     }
 
     /// Read every column and reassemble [`Version`]s in row order — the
@@ -803,24 +870,34 @@ fn decode_stat(
 /// [`ZoneMap`]: the overall min is the least of the row-group mins, the overall
 /// max the greatest of the row-group maxes. v0.1 emits a single row-group, so
 /// this collapses to a copy; the fold keeps the segment-level digest correct
-/// once multi-row-group writes land.
+/// once multi-row-group writes land. The retraction tombstone columns (v7,
+/// STL-143) fold in here too, so a predicate on `retract_key` / `retract_closed_at`
+/// prunes a delete-free-irrelevant segment exactly like a version column does;
+/// the per-row-group maps ([`SegmentReader::row_group_zone_maps`]) deliberately
+/// exclude them.
 fn build_zone_map(footer: &Footer) -> ZoneMap {
-    // Fold over the columns the footer actually declares, not a fixed list:
-    // the always-on set plus, for a valid-time table, valid_from / valid_to
-    // ([STL-117]), plus the retraction tombstone columns when present (v7,
-    // STL-143). Collecting the present ids keeps this schema-agnostic — a future
-    // opt-in column flows through without touching this fold, and a tombstone
-    // column prunes (e.g. by `retract_key` or `retract_closed_at`) exactly like a
-    // version column.
-    let all_metas = || {
+    zone_map_from_metas(
         footer
             .row_groups
             .iter()
             .flat_map(|rg| rg.columns.iter())
-            .chain(footer.retractions.iter())
-    };
+            .chain(footer.retractions.iter()),
+    )
+}
+
+/// Fold an arbitrary set of column-chunk metas into a [`ZoneMap`]: the least min
+/// and greatest max per column id. The shared core of [`build_zone_map`] (fed
+/// every row-group's chunks plus the retraction section) and
+/// [`SegmentReader::row_group_zone_maps`] (fed a single row-group's chunks).
+///
+/// Folding over the column ids the metas actually declare — not a fixed list —
+/// keeps this schema-agnostic: the always-on set, a valid-time table's
+/// valid_from / valid_to ([STL-117]), and the retraction tombstone columns each
+/// flow through without special-casing.
+fn zone_map_from_metas<'a>(metas: impl IntoIterator<Item = &'a ColumnChunkMeta>) -> ZoneMap {
+    let metas: Vec<&ColumnChunkMeta> = metas.into_iter().collect();
     let mut present: Vec<ColumnId> = Vec::new();
-    for c in all_metas() {
+    for c in &metas {
         if !present.contains(&c.column_id) {
             present.push(c.column_id);
         }
@@ -828,21 +905,19 @@ fn build_zone_map(footer: &Footer) -> ZoneMap {
     let bounds = present.into_iter().map(|col| {
         let mut min: Option<ZoneEnd> = None;
         let mut max: Option<ZoneEnd> = None;
-        {
-            for c in all_metas().filter(|c| c.column_id == col) {
-                // Fold the least min / greatest max across the column's chunks.
-                // An open end dominates: `Unbounded` is −∞ for a min (least) and
-                // +∞ for a max (greatest). Concrete ends compare same-variant —
-                // every chunk for one column shares that column's type.
-                if let Some(m) = &c.stat_min {
-                    if end_is_smaller(m, min.as_ref()) {
-                        min = Some(m.clone());
-                    }
+        for c in metas.iter().filter(|c| c.column_id == col) {
+            // Fold the least min / greatest max across the column's chunks. An
+            // open end dominates: `Unbounded` is −∞ for a min (least) and +∞ for
+            // a max (greatest). Concrete ends compare same-variant — every chunk
+            // for one column shares that column's type.
+            if let Some(m) = &c.stat_min {
+                if end_is_smaller(m, min.as_ref()) {
+                    min = Some(m.clone());
                 }
-                if let Some(m) = &c.stat_max {
-                    if end_is_larger(m, max.as_ref()) {
-                        max = Some(m.clone());
-                    }
+            }
+            if let Some(m) = &c.stat_max {
+                if end_is_larger(m, max.as_ref()) {
+                    max = Some(m.clone());
                 }
             }
         }
@@ -875,6 +950,38 @@ fn end_is_larger(cand: &ZoneEnd, cur: Option<&ZoneEnd>) -> bool {
             v.cmp_same_variant(c) == Some(Ordering::Greater)
         }
     }
+}
+
+/// Zip the three identity columns into `(business_key, sys_from, seq)` triples,
+/// in row order — the shared tail of [`SegmentReader::version_keys`] and its
+/// row-group-scoped sibling [`SegmentReader::version_keys_in_row_groups`]. The
+/// columns must agree in length (the same row-group contract every per-column
+/// read upholds); a disagreement is a corrupt segment.
+#[allow(clippy::cast_sign_loss)] // `seq` round-trips i64-bits → u64 (see `ColumnId::Seq`).
+fn assemble_version_keys(
+    mut business_keys: Vec<Vec<u8>>,
+    sys_from: Vec<i64>,
+    seqs: Vec<i64>,
+) -> Result<Vec<(BusinessKey, SystemTimeMicros, u64)>, SegmentError> {
+    if business_keys.len() != sys_from.len() || business_keys.len() != seqs.len() {
+        return Err(SegmentError::Corrupt(
+            "business_key / sys_from / seq value counts disagree",
+        ));
+    }
+    // `mem::take` the owned key bytes out — the column vector is discarded at the
+    // call site, so there is nothing to gain from cloning each key.
+    Ok(business_keys
+        .iter_mut()
+        .zip(sys_from)
+        .zip(seqs)
+        .map(|((bk, sf), seq)| {
+            (
+                BusinessKey::new(std::mem::take(bk)),
+                SystemTimeMicros(sf),
+                seq as u64,
+            )
+        })
+        .collect())
 }
 
 fn chunk_meta(rg: &RowGroup, col: ColumnId) -> Result<&ColumnChunkMeta, SegmentError> {

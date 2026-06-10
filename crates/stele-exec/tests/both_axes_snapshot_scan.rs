@@ -551,3 +551,104 @@ fn duckdb_free_differential_matches_a_naive_reference() {
         "differential probed only {total_probes} (s,v) cells — widen the sweep"
     );
 }
+
+// --- STL-173: per-row-group valid-time (STL-117) zone-map skipping ----------
+
+/// A valid instant must skip the row-groups whose `valid_from` / `valid_to`
+/// columns (STL-117) prove no row is valid there — the valid axis of the STL-173
+/// row-group prune. Four keys with disjoint valid intervals land in four one-row
+/// row-groups; a scan `AS OF (s, v)` leaves only the row-group whose interval
+/// contains `v` a candidate. Asserted by the prune accounting and cross-checked
+/// against a brute-force reference across a sweep of `v`, so a wrongly skipped
+/// valid row would surface.
+#[test]
+fn valid_time_zone_map_skips_non_matching_row_groups() {
+    let seg_disk = MemDisk::new();
+    let (wal, mut delta, mut index) = new_tiers();
+    let mut dml = DmlWriter::new(wal, StepClock::new(1_000), true);
+
+    // Disjoint valid intervals, one per key, all committed on the same system tick
+    // region (so every version is system-live at the shared probe snapshot).
+    let intervals = [(0i64, 10i64), (10, 20), (20, 30), (30, 40)];
+    let mut commit = SystemTimeMicros(0);
+    for (i, (from, to)) in intervals.iter().enumerate() {
+        let k = u8::try_from(i + 1).unwrap();
+        commit = dml
+            .insert(
+                &mut delta,
+                &mut index,
+                &EmptySealed,
+                key_of(k),
+                Some(iv(*from, *to)),
+                Some(vec![b'A' + k]),
+                0,
+                TxnId(u64::from(k)),
+                who(),
+            )
+            .expect("insert")
+            .commit;
+    }
+
+    // Flush into one valid-time segment, one row per row-group, so each interval
+    // is an independently skippable block.
+    let rows = delta.flush_to_segment().expect("flush");
+    let mut w = SegmentWriter::create_valid_time(&seg_disk, "seg-0.seg")
+        .expect("create valid-time segment")
+        .with_max_row_group_rows(1);
+    for v in rows {
+        w.push(v).expect("push");
+    }
+    w.finish().expect("finish");
+    let segments = [SegmentReader::open(&seg_disk, "seg-0.seg").expect("open segment")];
+    assert_eq!(segments[0].row_group_row_counts(), vec![1, 1, 1, 1]);
+
+    // Brute-force reference: at valid instant `v`, key `k` is present iff
+    // `from <= v < to` (the half-open membership). The system axis is pinned at
+    // the shared commit, where every version is live.
+    let reference = |v: i64| -> Option<u8> {
+        intervals
+            .iter()
+            .position(|(from, to)| *from <= v && v < *to)
+            .map(|i| u8::try_from(i + 1).unwrap())
+    };
+
+    // Sweep `v` across every boundary: the scan must agree with the reference and
+    // its row-group accounting must partition the four row-groups exactly, with at
+    // most one candidate (the intervals are disjoint).
+    for v in [-5i64, 0, 5, 9, 10, 19, 20, 25, 29, 30, 39, 40, 100] {
+        let out = SnapshotScan::new(&delta, &index, &segments, Snapshot(commit))
+            .valid_as_of(ValidTimeMicros(v))
+            .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+            .execute()
+            .expect("scan");
+        let keys = bytes_column(&out, ColumnId::BusinessKey);
+        match reference(v) {
+            Some(k) => {
+                assert_eq!(keys.len(), 1, "@ v={v}: exactly one key valid");
+                assert_eq!(keys[0], key_of(k).0, "@ v={v}: the valid key");
+            }
+            None => assert!(keys.is_empty(), "@ v={v}: no key valid"),
+        }
+        assert_eq!(
+            out.stats.row_groups_total,
+            out.stats.row_groups_pruned_zone + out.stats.row_groups_scanned,
+            "@ v={v}: row-group counts must partition exactly",
+        );
+        assert!(
+            out.stats.row_groups_scanned <= 1,
+            "@ v={v}: disjoint intervals leave at most one candidate row-group, but {} were scanned",
+            out.stats.row_groups_scanned,
+        );
+    }
+
+    // A representative interior point prunes three of the four row-groups: only
+    // [20, 30) can contain 25.
+    let out = SnapshotScan::new(&delta, &index, &segments, Snapshot(commit))
+        .valid_as_of(ValidTimeMicros(25))
+        .project(vec![ColumnId::BusinessKey])
+        .execute()
+        .expect("scan");
+    assert_eq!(out.stats.row_groups_total, 4);
+    assert_eq!(out.stats.row_groups_pruned_zone, 3);
+    assert_eq!(out.stats.row_groups_scanned, 1);
+}

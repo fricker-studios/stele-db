@@ -102,6 +102,24 @@ fn seal(disk: &MemDisk, name: &str, delta: &mut Delta<MemDisk>) -> SegmentReader
     SegmentReader::open(disk, name).expect("open segment")
 }
 
+/// The payload cell paired with `key` in a `(BusinessKey, Payload)` batch —
+/// the multi-row reference lookup the row-group-prune equivalence check uses.
+fn payload_for_key(out: &stele_exec::ScanOutput, key: &[u8]) -> Vec<u8> {
+    let keys = match &out.batch.columns[0].1 {
+        Column::Bytes(rows) => rows,
+        Column::I64(_) => panic!("business key is a bytes column"),
+    };
+    let payloads = match &out.batch.columns[1].1 {
+        Column::Bytes(rows) => rows,
+        Column::I64(_) => panic!("payload is a bytes column"),
+    };
+    let pos = keys
+        .iter()
+        .position(|k| k.as_deref() == Some(key))
+        .expect("key present in batch");
+    payloads[pos].clone().expect("present payload")
+}
+
 /// Pull the single bytes value of column `col` from a one-row batch result.
 fn one_bytes(out: &stele_exec::ScanOutput, col: ColumnId) -> Vec<u8> {
     let (_, column) = out
@@ -770,108 +788,241 @@ fn scan_reads_only_the_live_rows_row_group_chunks() {
     );
 }
 
-/// Splitting a segment into row-groups must be invisible in every scan result:
-/// the same workload sealed with and without a row-group bound agrees at every
-/// commit boundary, batches and prune stats alike (the result-equivalence half
-/// of the STL-155 DoD; the seeded sweep in stele-sim covers the same property
-/// across random workloads).
-#[test]
-fn row_group_bounded_segments_scan_identically_to_the_default() {
-    fn run(rows_per_group: Option<usize>) -> Vec<stele_exec::ScanOutput> {
-        let seg_disk = MemDisk::new();
-        let wal = new_wal();
-        let mut delta = new_delta();
-        let mut index = new_index();
-        let mut dml = DmlWriter::new(wal, StepClock::new(1_000), false);
+/// A fixed insert / supersede / delete workload sealed with the given row-group
+/// bound (`None` = the default single row-group), scanned at every commit
+/// boundary. Hoisted out of the `#[test]` below so it is a peer function the test
+/// can call for both layouts and compare.
+fn scan_row_group_workload(rows_per_group: Option<usize>) -> Vec<stele_exec::ScanOutput> {
+    let seg_disk = MemDisk::new();
+    let wal = new_wal();
+    let mut delta = new_delta();
+    let mut index = new_index();
+    let mut dml = DmlWriter::new(wal, StepClock::new(1_000), false);
 
-        let mut commits = Vec::new();
-        for id in 1..=5i64 {
-            commits.push(
-                dml.insert(
-                    &mut delta,
-                    &mut index,
-                    &EmptySealed,
-                    key_of(id),
-                    None,
-                    Some(format!("v{id}").into_bytes()),
-                    0,
-                    TxnId(u64::try_from(id).unwrap()),
-                    who(),
-                )
-                .expect("insert")
-                .commit,
-            );
-        }
-
-        let rows = delta.flush_to_segment().expect("flush");
-        let mut w = SegmentWriter::create(&seg_disk, "seg-0.seg").expect("create segment");
-        if let Some(n) = rows_per_group {
-            w = w.with_max_row_group_rows(n);
-        }
-        for v in rows {
-            w.push(v).expect("push");
-        }
-        w.finish().expect("finish");
-        let segments = [SegmentReader::open(&seg_disk, "seg-0.seg").expect("open segment")];
-
-        // Supersede two sealed rows and delete a third across the flush
-        // boundary, so scans exercise live, superseded, and deleted rows in
-        // distinct row-groups.
-        let sealed = SealedSegments::new(&segments);
+    let mut commits = Vec::new();
+    for id in 1..=5i64 {
         commits.push(
-            dml.update(
+            dml.insert(
                 &mut delta,
                 &mut index,
-                &sealed,
-                key_of(2),
+                &EmptySealed,
+                key_of(id),
                 None,
-                Some(b"v2-updated".to_vec()),
+                Some(format!("v{id}").into_bytes()),
                 0,
-                TxnId(7),
+                TxnId(u64::try_from(id).unwrap()),
                 who(),
             )
-            .expect("update")
+            .expect("insert")
             .commit,
         );
-        commits.push(
-            dml.update(
-                &mut delta,
-                &mut index,
-                &sealed,
-                key_of(4),
-                None,
-                Some(b"v4-updated".to_vec()),
-                0,
-                TxnId(8),
-                who(),
-            )
-            .expect("update")
-            .commit,
-        );
-        commits.push(
-            dml.delete(&mut delta, &mut index, &sealed, &key_of(5), TxnId(9), who())
-                .expect("delete")
-                .commit,
-        );
-
-        commits
-            .iter()
-            .map(|c| {
-                SnapshotScan::new(&delta, &index, &segments, Snapshot(*c))
-                    .execute()
-                    .expect("scan")
-            })
-            .collect()
     }
 
-    let unbounded = run(None);
-    let bounded = run(Some(2));
+    let rows = delta.flush_to_segment().expect("flush");
+    let mut w = SegmentWriter::create(&seg_disk, "seg-0.seg").expect("create segment");
+    if let Some(n) = rows_per_group {
+        w = w.with_max_row_group_rows(n);
+    }
+    for v in rows {
+        w.push(v).expect("push");
+    }
+    w.finish().expect("finish");
+    let segments = [SegmentReader::open(&seg_disk, "seg-0.seg").expect("open segment")];
+
+    // Supersede two sealed rows and delete a third across the flush boundary, so
+    // scans exercise live, superseded, and deleted rows in distinct row-groups.
+    let sealed = SealedSegments::new(&segments);
+    commits.push(
+        dml.update(
+            &mut delta,
+            &mut index,
+            &sealed,
+            key_of(2),
+            None,
+            Some(b"v2-updated".to_vec()),
+            0,
+            TxnId(7),
+            who(),
+        )
+        .expect("update")
+        .commit,
+    );
+    commits.push(
+        dml.update(
+            &mut delta,
+            &mut index,
+            &sealed,
+            key_of(4),
+            None,
+            Some(b"v4-updated".to_vec()),
+            0,
+            TxnId(8),
+            who(),
+        )
+        .expect("update")
+        .commit,
+    );
+    commits.push(
+        dml.delete(&mut delta, &mut index, &sealed, &key_of(5), TxnId(9), who())
+            .expect("delete")
+            .commit,
+    );
+
+    commits
+        .iter()
+        .map(|c| {
+            SnapshotScan::new(&delta, &index, &segments, Snapshot(*c))
+                .execute()
+                .expect("scan")
+        })
+        .collect()
+}
+
+/// Splitting a segment into row-groups must be invisible in every scan result:
+/// the same workload sealed with and without a row-group bound agrees at every
+/// commit boundary. Segment-level prune accounting is layout-independent and
+/// must agree too; the row-group counts (STL-173) legitimately differ by layout
+/// (a bounded writer emits finer row-groups, some of which the per-row-group zone
+/// prune skips), so they are checked by the partition invariant rather than for
+/// equality. That batches still agree across the differing layouts is the
+/// soundness oracle for the row-group prune — a wrongly skipped row-group holding
+/// a live row would diverge here. (The seeded sweep in stele-sim covers the same
+/// property across random workloads.)
+#[test]
+fn row_group_bounded_segments_scan_identically_to_the_default() {
+    let unbounded = scan_row_group_workload(None);
+    let bounded = scan_row_group_workload(Some(2));
     assert_eq!(unbounded.len(), bounded.len());
+    let seg = |s: &stele_exec::ScanStats| {
+        (
+            s.segments_total,
+            s.segments_pruned_zone,
+            s.segments_pruned_superseded,
+            s.segments_scanned,
+        )
+    };
     for (u, b) in unbounded.iter().zip(&bounded) {
         assert_eq!(
             u.batch, b.batch,
             "a row-group split must not change any scan result"
         );
-        assert_eq!(u.stats, b.stats, "prune accounting must agree too");
+        assert_eq!(
+            seg(&u.stats),
+            seg(&b.stats),
+            "segment-level prune accounting must agree regardless of row-group layout"
+        );
+        for s in [&u.stats, &b.stats] {
+            assert_eq!(
+                s.row_groups_total,
+                s.row_groups_pruned_zone + s.row_groups_scanned,
+                "row-group counts must partition the zone survivors' row-groups exactly"
+            );
+        }
     }
+}
+
+// --- STL-173: per-row-group zone-map block skipping -------------------------
+
+/// STL-173 DoD: a value predicate matching a single row-group skips the others'
+/// chunks entirely — neither their identity nor their bulk columns are read.
+/// Four fat rows with distinct keys land in four one-row row-groups, all live; a
+/// point predicate on the third key leaves only its row-group a candidate, so the
+/// scan reads exactly one row-group's chunks. Proven by byte accounting on the
+/// segment disk, and cross-checked against an unfiltered scan so a wrongly
+/// skipped match would surface.
+#[test]
+fn zone_map_skips_non_matching_row_groups_by_predicate() {
+    const FAT: usize = 64 * 1024;
+    let seg_disk = CountingDisk::new();
+    let wal = new_wal();
+    let mut delta = new_delta();
+    let mut index = new_index();
+    let mut dml = DmlWriter::new(wal, StepClock::new(1_000), false);
+
+    // Four distinct keys, each with a fat payload, all open (no supersession).
+    for id in 1..=4i64 {
+        dml.insert(
+            &mut delta,
+            &mut index,
+            &EmptySealed,
+            key_of(id),
+            None,
+            Some(vec![b'0' + u8::try_from(id).unwrap(); FAT]),
+            0,
+            TxnId(u64::try_from(id).unwrap()),
+            who(),
+        )
+        .expect("insert");
+    }
+
+    // Flush into one segment, one row per row-group: each key's chunks are an
+    // independently skippable block.
+    let rows = delta.flush_to_segment().expect("flush");
+    let mut w = SegmentWriter::create(&seg_disk, "seg-0.seg")
+        .expect("create segment")
+        .with_max_row_group_rows(1);
+    for v in rows {
+        w.push(v).expect("push");
+    }
+    w.finish().expect("finish");
+    let segments = [SegmentReader::open(&seg_disk, "seg-0.seg").expect("open segment")];
+    assert_eq!(segments[0].row_group_row_counts(), vec![1, 1, 1, 1]);
+
+    let snapshot = Snapshot(SystemTimeMicros(2_000));
+
+    seg_disk.reset();
+    let out = SnapshotScan::new(&delta, &index, &segments, snapshot)
+        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .filter(Predicate::Eq {
+            column: ColumnId::BusinessKey,
+            value: key_bound(3),
+        })
+        .execute()
+        .expect("scan");
+
+    // Result: exactly key 3, its fat payload.
+    assert_eq!(out.batch.rows, 1);
+    assert_eq!(one_bytes(&out, ColumnId::BusinessKey), key_of(3).0);
+    assert_eq!(payload_for_key(&out, &key_of(3).0), vec![b'3'; FAT]);
+
+    // Row-group accounting: the segment survives the segment-level fold (its key
+    // range [1, 4] brackets 3), but three of its four row-groups are pruned by
+    // their own zone maps; only key 3's is scanned.
+    assert_eq!(out.stats.segments_scanned, 1);
+    assert_eq!(out.stats.row_groups_total, 4);
+    assert_eq!(out.stats.row_groups_pruned_zone, 3);
+    assert_eq!(out.stats.row_groups_scanned, 1);
+
+    // Read accounting (the DoD assertion): only key 3's row-group chunks were
+    // read — one fat payload plus a few narrow identity bytes. Reading any other
+    // row-group's chunks (its identity *or* its fat payload) would push past two
+    // rows' worth.
+    let read = seg_disk.bytes_read();
+    assert!(
+        read < 2 * FAT as u64,
+        "scan must read only the matching row-group's chunks (~{FAT} bytes + \
+         narrow identity), but read {read} bytes",
+    );
+    assert!(
+        read >= FAT as u64,
+        "the matching row-group's payload chunk must be materialized, but only \
+         {read} bytes were read",
+    );
+
+    // Equivalence + contrast: an unfiltered scan sees all four keys (and reads
+    // all four fat payloads), and key 3's value agrees — so the row-group prune
+    // dropped no real match while saving roughly three row-groups of I/O.
+    seg_disk.reset();
+    let full = SnapshotScan::new(&delta, &index, &segments, snapshot)
+        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .execute()
+        .expect("full scan");
+    assert_eq!(full.batch.rows, 4, "the unfiltered scan sees all four keys");
+    assert_eq!(full.stats.row_groups_scanned, 4);
+    assert_eq!(payload_for_key(&full, &key_of(3).0), vec![b'3'; FAT]);
+    assert!(
+        seg_disk.bytes_read() > 3 * FAT as u64,
+        "the unfiltered scan materializes every row-group's fat payload, the cost \
+         the predicate prune avoids",
+    );
 }
