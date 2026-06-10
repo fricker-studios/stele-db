@@ -2326,10 +2326,11 @@ mod tests {
             else {
                 panic!("SELECT must return rows");
             };
+            // Static assert message — interpolating the result here trips CodeQL's
+            // (false) cleartext-logging taint on the row payloads.
             assert!(
                 r.rows.len() <= 1,
-                "at most one live version, got {}",
-                r.rows.len()
+                "one key resolves to at most one live version"
             );
             r.rows
                 .into_iter()
