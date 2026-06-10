@@ -35,6 +35,7 @@ Use the [template](_template.md) for new records. Number sequentially.
 | [0025](0025-valid-time-indexing.md) | Valid-time indexing & the scatter problem | Accepted |
 | [0026](0026-verifiable-audit-log.md) | Verifiable audit log (hash-chain + Merkle proofs) | Accepted |
 | [0027](0027-vectorized-execution-model.md) | Vectorized execution: batch-at-a-time Volcano pull over Arrow-shaped batches | Accepted |
+| [0028](0028-durable-catalog-log.md) | Durable catalog: a dedicated append-only DDL log at the session level | Accepted |
 
 ## Conventions
 

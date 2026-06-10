@@ -149,8 +149,16 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         data_dir = %cfg.data_dir.display(),
         "storage backend ready"
     );
-    let engine = SessionEngine::open(disk, SystemClock);
-    info!("session engine ready");
+    // Boot through the cold-start recovery path (STL-210, ADR-0028): replay the
+    // durable catalog log and reopen every table's tiers. On an empty data dir
+    // this is exactly a fresh session, so it is unconditional — a restarted
+    // server resumes the tables (and their history) a prior run created.
+    let engine = SessionEngine::recover(disk, SystemClock)
+        .context("recovering session engine from on-disk state")?;
+    info!(
+        tables = engine.describe_live_tables().len(),
+        "session engine ready"
+    );
 
     // One engine shared across every connection, behind a mutex (STL-131): a
     // CREATE TABLE on any connection is visible to the next statement, and the
