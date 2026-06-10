@@ -58,7 +58,8 @@ impl Rng {
         self.below(n) == 0
     }
 
-    /// A uniform index into a slice of `len` elements (`len > 0`).
+    /// An index into a slice of `len` elements (`len > 0`). Like [`Self::below`],
+    /// the modulo carries a negligible bias for the tiny `len`s used here.
     fn index(&mut self, len: usize) -> usize {
         usize::try_from(self.next_u64() % len as u64).expect("index fits usize")
     }
@@ -123,11 +124,11 @@ fn small_interval(rng: &mut Rng) -> Interval {
     Interval::new(from, to).expect("from < to by construction")
 }
 
-/// A random UUID from a tiny domain (first byte `0..3`, rest zero), so the
+/// A random UUID from a tiny domain (first byte `0..=3`, rest zero), so the
 /// byte-ordered comparison sees ties and both orderings.
 fn small_uuid(rng: &mut Rng) -> [u8; 16] {
     let mut bytes = [0u8; 16];
-    bytes[0] = u8::try_from(rng.below(3)).expect("0..3");
+    bytes[0] = u8::try_from(rng.below(4)).expect("0..4");
     bytes
 }
 

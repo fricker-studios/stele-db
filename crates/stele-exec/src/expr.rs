@@ -927,7 +927,10 @@ fn as_bytea(value: ScalarValue) -> Vec<u8> {
 const fn as_period(value: &ScalarValue) -> Interval {
     match value {
         ScalarValue::Period(iv) => *iv,
-        _ => Interval { from: 0, to: 0 },
+        // Defensive only (decode returns the variant matching `ty`); use a
+        // well-formed `from < to` sentinel so the `Interval` invariant holds even
+        // if this ever fires.
+        _ => Interval { from: 0, to: 1 },
     }
 }
 
