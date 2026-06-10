@@ -249,6 +249,12 @@ pub enum DmlSummary {
 /// auto-commits and *advances* the snapshot, since transactional DDL is not yet
 /// modeled — see [`execute_in_txn`](SessionEngine::execute_in_txn).)
 ///
+/// Savepoints ([STL-176]) partition the buffer: [`savepoint`](Self::savepoint)
+/// records a marker at the current write position, [`rollback_to`](Self::rollback_to)
+/// truncates the buffer back to a marker (undoing only the writes staged after it,
+/// the transaction continuing), and [`release`](Self::release) drops a marker while
+/// keeping its writes.
+///
 /// What this deliberately does *not* yet do (each its own follow-up):
 /// * **Read-your-own-writes.** A `SELECT` inside the transaction reads the pinned
 ///   snapshot, but does **not** see the transaction's own buffered, not-yet-
@@ -263,6 +269,7 @@ pub enum DmlSummary {
 ///
 /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
 /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+/// [STL-176]: https://allegromusic.atlassian.net/browse/STL-176
 /// [STL-203]: https://allegromusic.atlassian.net/browse/STL-203
 /// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
 #[derive(Debug)]
@@ -275,6 +282,76 @@ pub struct SessionTransaction {
     /// at commit so a later `UPDATE` of a key staged after its `INSERT` lands in
     /// the order the client issued them.
     writes: Vec<BoundDml>,
+    /// The open savepoints, innermost last ([STL-176]). Each marks the length of
+    /// `writes` at the instant the savepoint was established, so `ROLLBACK TO`
+    /// truncates `writes` back to that marker — undoing exactly the writes staged
+    /// after the savepoint, and nothing before it.
+    savepoints: Vec<Savepoint>,
+}
+
+/// One open savepoint: a name plus the [`SessionTransaction::writes`] length when
+/// it was established ([STL-176]).
+///
+/// [STL-176]: https://allegromusic.atlassian.net/browse/STL-176
+#[derive(Debug)]
+struct Savepoint {
+    /// The savepoint's name, matched verbatim (Stele does not case-fold
+    /// identifiers, as elsewhere in the binder).
+    name: String,
+    /// `writes.len()` at the moment this savepoint was established — the point
+    /// `ROLLBACK TO` truncates back to.
+    mark: usize,
+}
+
+impl SessionTransaction {
+    /// Establish a savepoint at the current write position (`SAVEPOINT name`,
+    /// [STL-176]).
+    ///
+    /// Duplicate names are allowed, matching Postgres: both are kept on the stack
+    /// and [`rollback_to`](Self::rollback_to) / [`release`](Self::release) target
+    /// the most recent one. Releasing or rolling back to it then re-exposes the
+    /// shadowed older savepoint of the same name.
+    pub fn savepoint(&mut self, name: &str) {
+        self.savepoints.push(Savepoint {
+            name: name.to_owned(),
+            mark: self.writes.len(),
+        });
+    }
+
+    /// `ROLLBACK TO SAVEPOINT name` — discard the writes staged after the most
+    /// recent savepoint named `name`, and destroy every savepoint established
+    /// after it; the named savepoint itself survives and can be rolled back to
+    /// again ([STL-176]).
+    ///
+    /// Returns `false` if no savepoint named `name` is open (the caller surfaces
+    /// the Postgres "savepoint does not exist" error); `true` once the truncation
+    /// is applied. Writes staged *before* the savepoint are untouched.
+    #[must_use]
+    pub fn rollback_to(&mut self, name: &str) -> bool {
+        let Some(idx) = self.savepoints.iter().rposition(|s| s.name == name) else {
+            return false;
+        };
+        self.writes.truncate(self.savepoints[idx].mark);
+        // Keep the named savepoint (index `idx`); drop the ones nested inside it.
+        self.savepoints.truncate(idx + 1);
+        true
+    }
+
+    /// `RELEASE SAVEPOINT name` — destroy the most recent savepoint named `name`
+    /// and every savepoint established after it, **keeping** their writes (they
+    /// merge into the enclosing scope) ([STL-176]).
+    ///
+    /// Returns `false` if no savepoint named `name` is open, `true` otherwise.
+    #[must_use]
+    pub fn release(&mut self, name: &str) -> bool {
+        let Some(idx) = self.savepoints.iter().rposition(|s| s.name == name) else {
+            return false;
+        };
+        // Drop the named savepoint (index `idx`) and the ones nested inside it;
+        // the writes they staged stay buffered.
+        self.savepoints.truncate(idx);
+        true
+    }
 }
 
 /// A live table's shape at the current read snapshot, for catalog introspection.
@@ -1005,6 +1082,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         SessionTransaction {
             snapshot: self.clock.current(),
             writes: Vec::new(),
+            savepoints: Vec::new(),
         }
     }
 
@@ -2142,6 +2220,230 @@ mod tests {
             vec![encode_value(&ScalarValue::Int4(100))],
             "the buffered insert into the in-transaction table landed at commit"
         );
+    }
+
+    // --- Savepoints ([STL-176]) -------------------------------------------
+    //
+    // The savepoint stack rides the buffered write set: `savepoint` marks the
+    // current buffer length, `rollback_to` truncates back to a marker (undoing
+    // only the writes staged after it), and `release` drops a marker while
+    // keeping its writes. The buffer is asserted directly — these are pure
+    // pre-commit mechanics with no storage surface until COMMIT.
+
+    /// Stage `INSERT INTO account VALUES (id, balance)` into `txn`.
+    fn stage_insert(
+        engine: &SessionEngine<ZeroClock, MemDisk>,
+        txn: &mut SessionTransaction,
+        id: i32,
+        balance: i32,
+    ) {
+        engine
+            .stage_dml(
+                &parse_one(&format!("INSERT INTO account VALUES ({id}, {balance})")),
+                txn,
+            )
+            .expect("stage insert");
+    }
+
+    #[test]
+    fn rollback_to_savepoint_undoes_only_writes_after_it() {
+        // BEGIN; INSERT 1; SAVEPOINT sp1; INSERT 2; INSERT 3; ROLLBACK TO sp1;
+        // COMMIT. The pre-savepoint insert survives; the two staged after it are
+        // discarded — the DoD of [STL-176].
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        let mut txn = engine.begin();
+        stage_insert(&engine, &mut txn, 1, 100);
+        txn.savepoint("sp1");
+        stage_insert(&engine, &mut txn, 2, 200);
+        stage_insert(&engine, &mut txn, 3, 300);
+        assert_eq!(txn.writes.len(), 3, "three writes staged");
+
+        assert!(txn.rollback_to("sp1"), "the savepoint exists");
+        assert_eq!(
+            txn.writes.len(),
+            1,
+            "only the pre-savepoint write remains buffered"
+        );
+
+        engine.commit(txn).expect("commit");
+        let StatementOutcome::Rows(after) = engine
+            .execute(&parse_one("SELECT balance FROM account"))
+            .expect("select")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            payload_column(&after),
+            vec![encode_value(&ScalarValue::Int4(100))],
+            "only the pre-savepoint row committed"
+        );
+    }
+
+    #[test]
+    fn statements_after_rollback_to_continue_in_the_same_transaction() {
+        // ROLLBACK TO does not end the transaction: a write staged afterwards
+        // still commits alongside the surviving pre-savepoint writes ([STL-176]).
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        let mut txn = engine.begin();
+        stage_insert(&engine, &mut txn, 1, 100);
+        txn.savepoint("sp1");
+        stage_insert(&engine, &mut txn, 2, 200);
+        assert!(txn.rollback_to("sp1"));
+        stage_insert(&engine, &mut txn, 3, 300); // continues in the same txn
+        engine.commit(txn).expect("commit");
+
+        let StatementOutcome::Rows(after) = engine
+            .execute(&parse_one("SELECT balance FROM account"))
+            .expect("select")
+        else {
+            panic!("rows");
+        };
+        let mut got = payload_column(&after);
+        got.sort();
+        let mut want = vec![
+            encode_value(&ScalarValue::Int4(100)),
+            encode_value(&ScalarValue::Int4(300)),
+        ];
+        want.sort();
+        assert_eq!(
+            got, want,
+            "the pre-savepoint and post-rollback writes commit; the rolled-back one does not"
+        );
+    }
+
+    #[test]
+    fn nested_savepoints_roll_back_independently() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        let mut txn = engine.begin();
+        stage_insert(&engine, &mut txn, 1, 100);
+        txn.savepoint("a");
+        stage_insert(&engine, &mut txn, 2, 200);
+        txn.savepoint("b");
+        stage_insert(&engine, &mut txn, 3, 300);
+
+        assert!(txn.rollback_to("b"));
+        assert_eq!(
+            txn.writes.len(),
+            2,
+            "rolling back to the inner savepoint drops only the last write"
+        );
+        assert!(txn.rollback_to("a"));
+        assert_eq!(
+            txn.writes.len(),
+            1,
+            "rolling back to the outer savepoint drops the rest"
+        );
+        drop(txn);
+    }
+
+    #[test]
+    fn rollback_to_destroys_nested_savepoints_and_keeps_its_own() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        let mut txn = engine.begin();
+        txn.savepoint("a");
+        stage_insert(&engine, &mut txn, 1, 100);
+        txn.savepoint("b");
+        stage_insert(&engine, &mut txn, 2, 200);
+
+        assert!(txn.rollback_to("a"), "outer savepoint exists");
+        assert_eq!(txn.writes.len(), 0, "everything after `a` is discarded");
+        // `b` was established after `a`, so the rollback destroyed it...
+        assert!(!txn.rollback_to("b"), "the nested savepoint is gone");
+        // ...but `a` itself survives and can be rolled back to again.
+        stage_insert(&engine, &mut txn, 3, 300);
+        assert!(txn.rollback_to("a"), "the target savepoint is reusable");
+        assert_eq!(txn.writes.len(), 0);
+        drop(txn);
+    }
+
+    #[test]
+    fn release_keeps_writes_but_drops_the_savepoint() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        let mut txn = engine.begin();
+        stage_insert(&engine, &mut txn, 1, 100);
+        txn.savepoint("sp1");
+        stage_insert(&engine, &mut txn, 2, 200);
+
+        assert!(txn.release("sp1"), "the savepoint exists");
+        assert_eq!(
+            txn.writes.len(),
+            2,
+            "release keeps the writes staged after the savepoint"
+        );
+        assert!(txn.savepoints.is_empty(), "the marker is gone");
+        assert!(
+            !txn.rollback_to("sp1"),
+            "a released savepoint can no longer be rolled back to"
+        );
+
+        engine.commit(txn).expect("commit");
+        let StatementOutcome::Rows(after) = engine
+            .execute(&parse_one("SELECT id FROM account"))
+            .expect("select")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(after.rows.len(), 2, "both writes committed");
+    }
+
+    #[test]
+    fn rollback_to_or_release_of_an_unknown_savepoint_reports_missing() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        let mut txn = engine.begin();
+        assert!(
+            !txn.rollback_to("nope"),
+            "no such savepoint to roll back to"
+        );
+        assert!(!txn.release("nope"), "no such savepoint to release");
+        drop(txn);
+    }
+
+    #[test]
+    fn a_duplicate_savepoint_name_targets_the_most_recent() {
+        // Postgres keeps both savepoints of the same name. ROLLBACK TO hits the
+        // most recent one and keeps it (re-runnable); the older one stays shadowed
+        // until the most recent is released, which re-exposes it ([STL-176]).
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        let mut txn = engine.begin();
+        stage_insert(&engine, &mut txn, 1, 100);
+        txn.savepoint("sp"); // marks buffer length 1
+        stage_insert(&engine, &mut txn, 2, 200);
+        txn.savepoint("sp"); // shadows the first; marks buffer length 2
+        stage_insert(&engine, &mut txn, 3, 300);
+
+        assert!(txn.rollback_to("sp"));
+        assert_eq!(
+            txn.writes.len(),
+            2,
+            "rolled back to the most recent `sp` (after write 2)"
+        );
+        // The most recent `sp` survives the rollback and is hit again — the older
+        // one is still shadowed.
+        assert!(txn.rollback_to("sp"));
+        assert_eq!(
+            txn.writes.len(),
+            2,
+            "still the most recent `sp`, not the older one"
+        );
+
+        // Releasing the most recent `sp` re-exposes the older one (after write 1).
+        assert!(txn.release("sp"));
+        assert!(txn.rollback_to("sp"));
+        assert_eq!(
+            txn.writes.len(),
+            1,
+            "the older `sp` (after write 1) is now the target"
+        );
+        drop(txn);
     }
 
     #[test]
