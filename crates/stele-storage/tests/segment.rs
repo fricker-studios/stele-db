@@ -654,3 +654,134 @@ fn a_second_writer_cannot_reopen_an_existing_segment() {
     let r = SegmentReader::open(&disk, "sealed.seg").expect("original still readable");
     assert_eq!(r.read_versions().unwrap(), written);
 }
+
+// --- STL-155: bounded row-groups + row-group-scoped column reads -----------
+
+/// A writer bounded by `with_max_row_group_rows` splits the pushed rows into
+/// several row-groups — and everything still round-trips identically, in push
+/// order, across the group boundaries. The footer has enumerated row-groups
+/// since v1, so this is not a format change.
+#[test]
+fn bounded_writer_splits_rows_into_row_groups_and_round_trips() {
+    let disk = MemDisk::new();
+    let written: Vec<Version> = (0..7i64)
+        .map(|i| {
+            version(
+                format!("k{i}").as_bytes(),
+                10 + i,
+                format!("p{i}").as_bytes(),
+            )
+        })
+        .collect();
+    let mut w = SegmentWriter::create(&disk, "rg.seg")
+        .expect("create writer")
+        .with_max_row_group_rows(3);
+    for v in &written {
+        w.push(v.clone()).expect("push");
+    }
+    w.finish().expect("finish");
+
+    let r = SegmentReader::open(&disk, "rg.seg").expect("open");
+    assert_eq!(
+        r.row_group_row_counts(),
+        vec![3, 3, 1],
+        "7 rows bounded at 3 per group must split 3 + 3 + 1"
+    );
+    assert_eq!(r.row_count(), written.len() as u64);
+    assert_eq!(
+        r.read_versions().expect("read versions"),
+        written,
+        "row order must be preserved across row-group boundaries"
+    );
+    // The narrow identity projection crosses group boundaries in the same order.
+    let keys = r.version_keys().expect("version keys");
+    let got: Vec<Vec<u8>> = keys
+        .iter()
+        .map(|(bk, _, _)| bk.as_bytes().to_vec())
+        .collect();
+    let want: Vec<Vec<u8>> = written
+        .iter()
+        .map(|v| v.business_key.as_bytes().to_vec())
+        .collect();
+    assert_eq!(got, want);
+}
+
+/// A scoped read ([`SegmentReader::read_column_in_row_groups`]) must touch only
+/// the selected row-groups' chunks. Proven behaviorally: corrupt a byte inside
+/// a *non-selected* row-group's payload chunk — a scoped read that skipped that
+/// chunk succeeds (its CRC was never checked because its bytes were never
+/// read), while any read that includes the corrupt group fails.
+#[test]
+fn scoped_column_read_skips_unselected_row_group_chunks() {
+    use std::collections::BTreeSet;
+
+    let disk = MemDisk::new();
+    let written: Vec<Version> = (0..6i64)
+        .map(|i| {
+            version(
+                format!("k{i}").as_bytes(),
+                10 + i,
+                format!("payload-{i}").as_bytes(),
+            )
+        })
+        .collect();
+    let mut w = SegmentWriter::create(&disk, "scoped.seg")
+        .expect("create writer")
+        .with_max_row_group_rows(2);
+    for v in &written {
+        w.push(v.clone()).expect("push");
+    }
+    w.finish().expect("finish");
+
+    // Locate row-group 1's Payload chunk by walking the file: the writer emits
+    // each row-group's chunks contiguously in `ColumnId::ALL` order, row-groups
+    // back to back, so the target is chunk number `ALL.len() + payload_index`.
+    const HEADER_LEN: usize = 16;
+    const CHUNK_HEADER_LEN: usize = 16;
+    let payload_index = ColumnId::ALL
+        .iter()
+        .position(|&c| c == ColumnId::Payload)
+        .expect("Payload is in ColumnId::ALL");
+    let chunks_to_skip = ColumnId::ALL.len() + payload_index;
+    let file = disk.inner.lock().unwrap();
+    let bytes = file.get("scoped.seg").unwrap().lock().unwrap().clone();
+    drop(file);
+    let mut cursor = HEADER_LEN;
+    for _ in 0..chunks_to_skip {
+        let payload_len =
+            u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+        cursor += CHUNK_HEADER_LEN + payload_len;
+    }
+    // Flip a byte inside row-group 1's payload chunk body.
+    disk.flip_byte("scoped.seg", (cursor + CHUNK_HEADER_LEN) as u64);
+
+    let r = SegmentReader::open(&disk, "scoped.seg").expect("open");
+    assert_eq!(r.row_group_row_counts(), vec![2, 2, 2]);
+
+    // Selecting around the corrupt group succeeds and returns exactly the
+    // selected groups' values, concatenated in row order.
+    let got = r
+        .read_column_in_row_groups(ColumnId::Payload, &BTreeSet::from([0, 2]))
+        .expect("groups 0 and 2 are clean — their chunks alone are read");
+    let want: Vec<Option<Vec<u8>>> = [0usize, 1, 4, 5]
+        .iter()
+        .map(|&i| written[i].payload.clone())
+        .collect();
+    assert_eq!(got, ColumnData::NullableBytes(want));
+
+    // Any read that includes the corrupt group fails its chunk CRC.
+    let err = r
+        .read_column_in_row_groups(ColumnId::Payload, &BTreeSet::from([1]))
+        .expect_err("group 1's payload chunk is corrupt");
+    assert!(matches!(err, SegmentError::Corrupt(_)));
+    let err = r
+        .read_column(ColumnId::Payload)
+        .expect_err("the whole-column read includes the corrupt chunk");
+    assert!(matches!(err, SegmentError::Corrupt(_)));
+
+    // A different column is untouched by the payload flip, even in group 1.
+    let sf = r
+        .read_column_in_row_groups(ColumnId::SysFrom, &BTreeSet::from([1]))
+        .expect("sys_from chunks are clean");
+    assert_eq!(sf, ColumnData::I64(vec![12, 13]));
+}

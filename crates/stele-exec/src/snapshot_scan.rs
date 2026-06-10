@@ -40,9 +40,13 @@
 //!    holds the version live at `S`; the dedup is a belt-and-suspenders guard,
 //!    never a real tie-break in v0.1.
 //! 3. **Materialize.** Only the projected (and predicate-referenced) bulk columns
-//!    of the segments that resolved a live row are read, via
-//!    [`SegmentReader::read_column`] — late materialization. A surviving segment
-//!    with no live row at `S` is never read beyond its identity columns.
+//!    of the segments that resolved a live row are read — late materialization.
+//!    A surviving segment with no live row at `S` is never read beyond its
+//!    identity columns, and within a segment that *is* read, only the row-groups
+//!    holding a live row have their chunks touched
+//!    ([`SegmentReader::read_column_in_row_groups`], STL-155): the resolved live
+//!    row indices are mapped back to their owning row-groups
+//!    ([`RowGroupSelection`]) and the read is scoped to those.
 //! 4. **Filter.** The pushed-down [`Predicate`] is re-applied at the row level:
 //!    zone maps prune *segments* conservatively but a surviving segment can still
 //!    carry non-matching rows (e.g. other keys), so the row filter is what makes
@@ -74,15 +78,17 @@
 //! scheduler like the rest of the storage/txn core
 //! ([architecture §12 invariant 7](../../../docs/02-architecture.md#12-cross-cutting-architectural-invariants)).
 //!
-//! ## Not yet (follow-ups)
+//! ## Granularity (STL-146 → STL-155)
 //!
-//! Late materialization is per *column*: [`SegmentReader::read_column`] reads a
-//! whole column across every row-group, so a survivor with a single live row
-//! still reads that column's full chunks and the operator then indexes the row.
-//! True per-*row* skipping — reading only the row-groups (chunks) that hold a
-//! live row — is a further refinement that needs chunk-level row addressing the
-//! reader does not yet expose, and is left to the v0.2 vectorized-execution work
-//! (STL-77).
+//! Late materialization is per *column* (STL-146) **and** per *row-group*
+//! (STL-155): a survivor reads only the projected columns, and within each
+//! column only the chunks of row-groups that hold a live row. A chunk is the
+//! format's I/O unit, so row-group granularity is the finest skipping the
+//! on-disk layout admits — a one-row-group segment (the default the engine's
+//! flush writes today) degenerates to the STL-146 behavior, and the gain
+//! appears once a writer bounds its row-groups
+//! ([`SegmentWriter::with_max_row_group_rows`](stele_storage::segment::SegmentWriter::with_max_row_group_rows)).
+//! Wiring a row-group bound into the engine's flush policy is a follow-up.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
@@ -454,11 +460,7 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
         // their bulk columns read.
         let mut locator: BTreeMap<VersionId, (usize, usize)> = BTreeMap::new();
         let mut identities: Vec<Version> = Vec::new();
-        // The identity row count per survivor — the length every bulk column read
-        // from that segment must agree with, or it is corrupt (see below).
-        let mut rows_in_seg: BTreeMap<usize, usize> = BTreeMap::new();
         for (seg_idx, keys) in &survivors {
-            rows_in_seg.insert(*seg_idx, keys.len());
             for (row_idx, (bk, sys_from, seq)) in keys.iter().enumerate() {
                 locator.insert((bk.clone(), *sys_from, *seq), (*seg_idx, row_idx));
                 identities.push(identity_version(bk.clone(), *sys_from, *seq));
@@ -477,40 +479,46 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
         // (they hold a system-live row); the valid filter prunes rows, not
         // segments, so [`ScanStats`] keeps its shape.
         if let Some(point) = self.valid_snapshot {
-            self.filter_sealed_by_valid(&mut sealed_live, &locator, &rows_in_seg, point)?;
+            self.filter_sealed_by_valid(&mut sealed_live, &locator, point)?;
         }
 
         // Late materialization: read each needed bulk column once per survivor
         // that actually holds a live row, then patch it into the resolved
-        // version. `read_column` touches only that column's chunks, so the scan
-        // pays for the projected columns of the live rows — never the full row
-        // of every survivor, never a survivor with no live row.
-        let live_segs: BTreeSet<usize> =
-            sealed_live.iter().map(|v| locate(&locator, v).0).collect();
-        let mut cols_by_seg: BTreeMap<usize, Vec<(ColumnId, ColumnData)>> = BTreeMap::new();
-        for seg_idx in live_segs {
-            // Every bulk column must carry exactly as many values as the segment's
-            // identity columns ([`SegmentReader::version_keys`]); a disagreement is
-            // a corrupt segment, surfaced as an error rather than an out-of-bounds
-            // panic when the per-row patch indexes by `row_idx` (the same guard
-            // `SegmentReader::read_versions` applies across its columns).
-            let expected = rows_in_seg[&seg_idx];
+        // version. The read touches only that column's chunks, and only in the
+        // row-groups that hold a live row ([`RowGroupSelection`], STL-155) — so
+        // the scan pays for the projected columns of the live rows' row-groups,
+        // never the full column of every survivor, never a survivor with no
+        // live row.
+        let live_rows = live_rows_by_segment(&sealed_live, &locator);
+        let mut cols_by_seg: BTreeMap<usize, (RowGroupSelection, Vec<(ColumnId, ColumnData)>)> =
+            BTreeMap::new();
+        for (seg_idx, rows) in live_rows {
+            let sel = RowGroupSelection::new(&self.segments[seg_idx].row_group_row_counts(), &rows);
             let mut cols = Vec::with_capacity(needed.len());
             for &col in &needed {
-                let data = self.segments[seg_idx].read_column(col)?;
-                if column_len(&data) != expected {
+                let data = self.segments[seg_idx].read_column_in_row_groups(col, &sel.groups)?;
+                // Every bulk column must carry exactly as many values as the
+                // selected row-groups declare in the footer (the same counts the
+                // identity columns satisfied in [`SegmentReader::version_keys`]);
+                // a disagreement is a corrupt segment, surfaced as an error
+                // rather than an out-of-bounds panic when the per-row patch
+                // indexes into the read result (the same guard
+                // `SegmentReader::read_versions` applies across its columns).
+                if column_len(&data) != sel.selected_rows {
                     return Err(ScanError::Segment(SegmentError::Corrupt(
-                        "segment column value count disagrees with its identity row count",
+                        "segment column value count disagrees with the selected row-groups' row count",
                     )));
                 }
                 cols.push((col, data));
             }
-            cols_by_seg.insert(seg_idx, cols);
+            cols_by_seg.insert(seg_idx, (sel, cols));
         }
         for v in &mut sealed_live {
             let (seg_idx, row_idx) = locate(&locator, v);
-            for (col, data) in &cols_by_seg[&seg_idx] {
-                patch_version(v, *col, data, row_idx);
+            let (sel, cols) = &cols_by_seg[&seg_idx];
+            let local_idx = sel.local_index(row_idx);
+            for (col, data) in cols {
+                patch_version(v, *col, data, local_idx);
             }
         }
 
@@ -552,36 +560,38 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
 
     /// Drop, in place, every system-live sealed row whose valid interval does
     /// not contain `point`. Reads only the two narrow `valid_from` / `valid_to`
-    /// columns of the segments that hold a live row, the same late-bound, per
-    /// column discipline the bulk materialization uses. Runs before bulk
+    /// columns of the segments that hold a live row — and only the row-groups
+    /// holding one ([`RowGroupSelection`], STL-155) — the same late-bound,
+    /// per-column discipline the bulk materialization uses. Runs before bulk
     /// materialization, so a row pruned here never has its payload read.
     fn filter_sealed_by_valid(
         &self,
         sealed_live: &mut Vec<Version>,
         locator: &BTreeMap<VersionId, (usize, usize)>,
-        rows_in_seg: &BTreeMap<usize, usize>,
         point: ValidTimeMicros,
     ) -> Result<(), ScanError> {
-        let live_segs: BTreeSet<usize> = sealed_live.iter().map(|v| locate(locator, v).0).collect();
-        let mut valid_by_seg: BTreeMap<usize, (Vec<i64>, Vec<i64>)> = BTreeMap::new();
-        for seg_idx in live_segs {
-            let from = read_i64_column(&self.segments[seg_idx], ColumnId::ValidFrom)?;
-            let to = read_i64_column(&self.segments[seg_idx], ColumnId::ValidTo)?;
-            // The valid-time columns share the row-group's row count, the same
+        let live_rows = live_rows_by_segment(sealed_live, locator);
+        let mut valid_by_seg: BTreeMap<usize, (RowGroupSelection, Vec<i64>, Vec<i64>)> =
+            BTreeMap::new();
+        for (seg_idx, rows) in live_rows {
+            let sel = RowGroupSelection::new(&self.segments[seg_idx].row_group_row_counts(), &rows);
+            let from = read_i64_column(&self.segments[seg_idx], ColumnId::ValidFrom, &sel.groups)?;
+            let to = read_i64_column(&self.segments[seg_idx], ColumnId::ValidTo, &sel.groups)?;
+            // The valid-time columns share each row-group's row count, the same
             // contract the bulk columns honor; a disagreement is a corrupt
             // segment, surfaced rather than indexed past its end below.
-            let expected = rows_in_seg[&seg_idx];
-            if from.len() != expected || to.len() != expected {
+            if from.len() != sel.selected_rows || to.len() != sel.selected_rows {
                 return Err(ScanError::Segment(SegmentError::Corrupt(
-                    "valid-time column value count disagrees with the segment's identity row count",
+                    "valid-time column value count disagrees with the selected row-groups' row count",
                 )));
             }
-            valid_by_seg.insert(seg_idx, (from, to));
+            valid_by_seg.insert(seg_idx, (sel, from, to));
         }
         sealed_live.retain(|v| {
             let (seg_idx, row_idx) = locate(locator, v);
-            let (from, to) = &valid_by_seg[&seg_idx];
-            valid_contains(from[row_idx], to[row_idx], point)
+            let (sel, from, to) = &valid_by_seg[&seg_idx];
+            let local_idx = sel.local_index(row_idx);
+            valid_contains(from[local_idx], to[local_idx], point)
         });
         Ok(())
     }
@@ -634,20 +644,98 @@ fn filter_delta_by_valid(
     Ok(kept)
 }
 
-/// Project one `i64` column out of a sealed segment, erroring if it decoded as
-/// any other [`ColumnData`] variant. The valid-axis filter's narrow read of the
-/// `valid_from` / `valid_to` columns; a non-`i64` result is a corrupt segment
-/// (the writer types both as `i64`).
+/// Project one `i64` column out of a sealed segment's selected row-groups,
+/// erroring if it decoded as any other [`ColumnData`] variant. The valid-axis
+/// filter's narrow read of the `valid_from` / `valid_to` columns; a non-`i64`
+/// result is a corrupt segment (the writer types both as `i64`).
 fn read_i64_column<F: DiskFile>(
     reader: &SegmentReader<F>,
     col: ColumnId,
+    row_groups: &BTreeSet<usize>,
 ) -> Result<Vec<i64>, ScanError> {
-    match reader.read_column(col)? {
+    match reader.read_column_in_row_groups(col, row_groups)? {
         ColumnData::I64(v) => Ok(v),
         ColumnData::Bytes(_) | ColumnData::NullableBytes(_) => Err(ScanError::Segment(
             SegmentError::Corrupt("valid-time column was not stored as i64"),
         )),
     }
+}
+
+/// Group the resolved sealed-live rows by their source segment — the per-segment
+/// row sets late materialization and the valid-axis filter scope their column
+/// reads by ([`RowGroupSelection`], STL-155).
+fn live_rows_by_segment(
+    sealed_live: &[Version],
+    locator: &BTreeMap<VersionId, (usize, usize)>,
+) -> BTreeMap<usize, BTreeSet<usize>> {
+    let mut live_rows: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    for v in sealed_live {
+        let (seg_idx, row_idx) = locate(locator, v);
+        live_rows.entry(seg_idx).or_default().insert(row_idx);
+    }
+    live_rows
+}
+
+/// One scanned segment's live rows mapped onto the row-groups that hold them
+/// (STL-155): which row-groups a column read must touch, and how a
+/// segment-global row index translates into the concatenated read result
+/// [`SegmentReader::read_column_in_row_groups`] returns.
+struct RowGroupSelection {
+    /// The row-groups holding at least one live row, ascending.
+    groups: BTreeSet<usize>,
+    /// Each row-group's segment-global starting row — the prefix sums of
+    /// [`SegmentReader::row_group_row_counts`].
+    starts: Vec<usize>,
+    /// For each selected row-group, the offset of its first value within the
+    /// concatenated scoped read.
+    local_base: BTreeMap<usize, usize>,
+    /// Total rows across the selected row-groups — the value count every
+    /// scoped column read must agree with.
+    selected_rows: usize,
+}
+
+impl RowGroupSelection {
+    /// Map `live_rows` (segment-global row indices) onto their owning
+    /// row-groups, given the segment's per-row-group `counts`.
+    fn new(counts: &[u32], live_rows: &BTreeSet<usize>) -> Self {
+        let mut starts = Vec::with_capacity(counts.len());
+        let mut next_start = 0usize;
+        for &count in counts {
+            starts.push(next_start);
+            next_start += count as usize;
+        }
+        let mut groups = BTreeSet::new();
+        for &row in live_rows {
+            groups.insert(group_of(&starts, row));
+        }
+        let mut local_base = BTreeMap::new();
+        let mut selected_rows = 0usize;
+        for &group in &groups {
+            local_base.insert(group, selected_rows);
+            selected_rows += counts[group] as usize;
+        }
+        Self {
+            groups,
+            starts,
+            local_base,
+            selected_rows,
+        }
+    }
+
+    /// Translate a segment-global row index into its position within the
+    /// concatenated selected-row-group read.
+    fn local_index(&self, row: usize) -> usize {
+        let group = group_of(&self.starts, row);
+        self.local_base[&group] + (row - self.starts[group])
+    }
+}
+
+/// The row-group containing segment-global `row`, given the row-groups'
+/// starting rows: the last start at or below `row`. `starts` is non-empty and
+/// begins at 0, and every `row` comes from this segment's own identity columns,
+/// so the search cannot miss.
+fn group_of(starts: &[usize], row: usize) -> usize {
+    starts.partition_point(|&start| start <= row) - 1
 }
 
 /// The half-open `[from, to)` membership test on raw valid-time boundary

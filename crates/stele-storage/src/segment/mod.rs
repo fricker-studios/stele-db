@@ -52,9 +52,13 @@
 //!
 //! ## What is *not* in v0.1
 //!
-//! * Multi-row-group writes. The format describes N row-groups and the reader
-//!   walks them all; the writer emits one. Adding row-group flushing is a
-//!   writer-side change with no format implications.
+//! * Default multi-row-group writes. The format describes N row-groups and the
+//!   reader walks them all; the writer emits one unless
+//!   [`SegmentWriter::with_max_row_group_rows`] bounds it ([STL-155]), which
+//!   lets the read path scope a column read to the row-groups it needs
+//!   ([`SegmentReader::read_column_in_row_groups`]). Wiring a row-group bound
+//!   into the engine's flush policy is a follow-up; either way it is a
+//!   writer-side choice with no format implications.
 //! * Bloom filters. The footer reserves a stats area per column; the per-column
 //!   min/max stats it records feed the zone-map pruning that landed with
 //!   [STL-89] ([`ZoneMap`]), and bloom filters slot in alongside them as new

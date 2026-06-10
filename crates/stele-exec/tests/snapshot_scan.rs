@@ -598,3 +598,280 @@ fn late_materialization_resolves_live_rows_within_a_scanned_segment() {
         ],
     );
 }
+
+// --- STL-155: row-group-scoped late materialization -------------------------
+
+/// `MemDisk` wrapper that counts every byte `read_at` returns — the
+/// read-accounting harness for the chunk-level late-materialization DoD
+/// (STL-155). Counts are shared across every file opened through the disk.
+#[derive(Clone, Default)]
+struct CountingDisk {
+    inner: MemDisk,
+    bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl CountingDisk {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    fn reset(&self) {
+        self.bytes_read.store(0, Ordering::Relaxed);
+    }
+}
+
+struct CountingFile {
+    inner: MemFile,
+    bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl stele_storage::backend::Disk for CountingDisk {
+    type File = CountingFile;
+
+    fn create(&self, name: &str) -> std::io::Result<Self::File> {
+        Ok(CountingFile {
+            inner: self.inner.create(name)?,
+            bytes_read: std::sync::Arc::clone(&self.bytes_read),
+        })
+    }
+
+    fn open(&self, name: &str) -> std::io::Result<Self::File> {
+        Ok(CountingFile {
+            inner: self.inner.open(name)?,
+            bytes_read: std::sync::Arc::clone(&self.bytes_read),
+        })
+    }
+
+    fn list(&self) -> std::io::Result<Vec<String>> {
+        self.inner.list()
+    }
+
+    fn remove(&self, name: &str) -> std::io::Result<()> {
+        self.inner.remove(name)
+    }
+}
+
+impl stele_storage::backend::DiskFile for CountingFile {
+    fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.inner.append(bytes)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read_at(offset, buf)?;
+        self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+
+    fn sync(&mut self) -> std::io::Result<()> {
+        self.inner.sync()
+    }
+
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+}
+
+/// STL-155 DoD: a scan over a wide segment with a single live row reads only
+/// that row's row-group chunks for the projected columns — asserted by byte
+/// accounting on the segment's disk, not just the result. Four fat rows land in
+/// four one-row row-groups; three are superseded across the flush boundary, so
+/// the scan must materialize exactly one row-group's payload chunk.
+#[test]
+fn scan_reads_only_the_live_rows_row_group_chunks() {
+    const FAT: usize = 64 * 1024;
+    let seg_disk = CountingDisk::new();
+    let wal = new_wal();
+    let mut delta = new_delta();
+    let mut index = new_index();
+    let mut dml = DmlWriter::new(wal, StepClock::new(1_000), false);
+
+    for id in 1..=4i64 {
+        dml.insert(
+            &mut delta,
+            &mut index,
+            &EmptySealed,
+            key_of(id),
+            None,
+            Some(vec![b'0' + u8::try_from(id).unwrap(); FAT]),
+            0,
+            TxnId(u64::try_from(id).unwrap()),
+            who(),
+        )
+        .expect("insert");
+    }
+
+    // Flush into a sealed segment bounded at one row per row-group: the widest
+    // split the format admits, so every row's chunks are independently skippable.
+    let rows = delta.flush_to_segment().expect("flush");
+    let mut w = SegmentWriter::create(&seg_disk, "seg-0.seg")
+        .expect("create segment")
+        .with_max_row_group_rows(1);
+    for v in rows {
+        w.push(v).expect("push");
+    }
+    w.finish().expect("finish");
+    let segments = [SegmentReader::open(&seg_disk, "seg-0.seg").expect("open segment")];
+    assert_eq!(segments[0].row_group_row_counts(), vec![1, 1, 1, 1]);
+
+    // Supersede keys 1–3 across the flush boundary; only key 4's sealed row
+    // stays live, in the last row-group.
+    let sealed = SealedSegments::new(&segments);
+    let mut last = SystemTimeMicros(0);
+    for id in 1..=3i64 {
+        last = dml
+            .update(
+                &mut delta,
+                &mut index,
+                &sealed,
+                key_of(id),
+                None,
+                Some(format!("small-{id}").into_bytes()),
+                0,
+                TxnId(10 + u64::try_from(id).unwrap()),
+                who(),
+            )
+            .expect("update")
+            .commit;
+    }
+
+    seg_disk.reset();
+    let out = SnapshotScan::new(&delta, &index, &segments, Snapshot(last))
+        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .execute()
+        .expect("scan");
+
+    // Result first: all four keys resolve, key 4 to its fat sealed payload.
+    assert_eq!(out.batch.rows, 4);
+    assert_eq!(out.stats.segments_scanned, 1);
+    let payloads: Vec<Vec<u8>> = match &out.batch.columns[1].1 {
+        Column::Bytes(rows) => rows.iter().map(|c| c.clone().unwrap()).collect(),
+        Column::I64(_) => panic!("payload is a bytes column"),
+    };
+    assert_eq!(payloads[0], b"small-1");
+    assert_eq!(payloads[3], vec![b'4'; FAT]);
+
+    // Read accounting (the DoD assertion): the segment-side I/O is the three
+    // narrow identity columns (a few KiB) plus ONE fat payload chunk. Reading
+    // even one extra row-group's payload chunk would push past two rows' worth.
+    let read = seg_disk.bytes_read();
+    assert!(
+        read < 2 * FAT as u64,
+        "scan must read only the live row's row-group payload chunk \
+         (~{FAT} bytes + narrow identity columns), but read {read} bytes",
+    );
+    // Sanity floor: the one live payload chunk itself was actually read.
+    assert!(
+        read >= FAT as u64,
+        "the live row's payload chunk must be materialized, but only {read} bytes were read",
+    );
+}
+
+/// Splitting a segment into row-groups must be invisible in every scan result:
+/// the same workload sealed with and without a row-group bound agrees at every
+/// commit boundary, batches and prune stats alike (the result-equivalence half
+/// of the STL-155 DoD; the seeded sweep in stele-sim covers the same property
+/// across random workloads).
+#[test]
+fn row_group_bounded_segments_scan_identically_to_the_default() {
+    fn run(rows_per_group: Option<usize>) -> Vec<stele_exec::ScanOutput> {
+        let seg_disk = MemDisk::new();
+        let wal = new_wal();
+        let mut delta = new_delta();
+        let mut index = new_index();
+        let mut dml = DmlWriter::new(wal, StepClock::new(1_000), false);
+
+        let mut commits = Vec::new();
+        for id in 1..=5i64 {
+            commits.push(
+                dml.insert(
+                    &mut delta,
+                    &mut index,
+                    &EmptySealed,
+                    key_of(id),
+                    None,
+                    Some(format!("v{id}").into_bytes()),
+                    0,
+                    TxnId(u64::try_from(id).unwrap()),
+                    who(),
+                )
+                .expect("insert")
+                .commit,
+            );
+        }
+
+        let rows = delta.flush_to_segment().expect("flush");
+        let mut w = SegmentWriter::create(&seg_disk, "seg-0.seg").expect("create segment");
+        if let Some(n) = rows_per_group {
+            w = w.with_max_row_group_rows(n);
+        }
+        for v in rows {
+            w.push(v).expect("push");
+        }
+        w.finish().expect("finish");
+        let segments = [SegmentReader::open(&seg_disk, "seg-0.seg").expect("open segment")];
+
+        // Supersede two sealed rows and delete a third across the flush
+        // boundary, so scans exercise live, superseded, and deleted rows in
+        // distinct row-groups.
+        let sealed = SealedSegments::new(&segments);
+        commits.push(
+            dml.update(
+                &mut delta,
+                &mut index,
+                &sealed,
+                key_of(2),
+                None,
+                Some(b"v2-updated".to_vec()),
+                0,
+                TxnId(7),
+                who(),
+            )
+            .expect("update")
+            .commit,
+        );
+        commits.push(
+            dml.update(
+                &mut delta,
+                &mut index,
+                &sealed,
+                key_of(4),
+                None,
+                Some(b"v4-updated".to_vec()),
+                0,
+                TxnId(8),
+                who(),
+            )
+            .expect("update")
+            .commit,
+        );
+        commits.push(
+            dml.delete(&mut delta, &mut index, &sealed, &key_of(5), TxnId(9), who())
+                .expect("delete")
+                .commit,
+        );
+
+        commits
+            .iter()
+            .map(|c| {
+                SnapshotScan::new(&delta, &index, &segments, Snapshot(*c))
+                    .execute()
+                    .expect("scan")
+            })
+            .collect()
+    }
+
+    let unbounded = run(None);
+    let bounded = run(Some(2));
+    assert_eq!(unbounded.len(), bounded.len());
+    for (u, b) in unbounded.iter().zip(&bounded) {
+        assert_eq!(
+            u.batch, b.batch,
+            "a row-group split must not change any scan result"
+        );
+        assert_eq!(u.stats, b.stats, "prune accounting must agree too");
+    }
+}

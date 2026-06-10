@@ -1748,15 +1748,21 @@ fn apply_scan_op(
 }
 
 /// Flush the resident delta into a fresh sealed segment and append its reader —
-/// the columnar flush boundary the scan must merge across.
+/// the columnar flush boundary the scan must merge across. `max_row_group_rows`
+/// bounds the segment's row-groups, so seeds sweep multi-row-group segments
+/// through the row-group-scoped late-materialization path (STL-155) as well as
+/// the classic single-group shape.
 fn flush_into_segment(
     seg_disk: &MemDisk,
     name: &str,
     delta: &mut Delta<MemDisk>,
     readers: &mut Vec<SegmentReader<MemFile>>,
+    max_row_group_rows: usize,
 ) {
     let rows = delta.flush_to_segment().expect("flush");
-    let mut w = SegmentWriter::create(seg_disk, name).expect("create segment");
+    let mut w = SegmentWriter::create(seg_disk, name)
+        .expect("create segment")
+        .with_max_row_group_rows(max_row_group_rows);
     for v in rows {
         w.push(v).expect("push");
     }
@@ -1895,7 +1901,12 @@ pub fn run_snapshot_scan_seed(seed: u64) -> u64 {
         if rng.below(3) == 0 && delta.byte_size() > 0 {
             let name = format!("seg-{seg_idx:04}.seg");
             seg_idx += 1;
-            flush_into_segment(&seg_disk, &name, &mut delta, &mut readers);
+            // Seeded row-group bound (1–3 rows per group): most flushes split
+            // into several row-groups, so the oracle equivalence below also
+            // proves the row-group-scoped late materialization (STL-155)
+            // returns exactly what the unscoped read did.
+            let row_group_rows = 1 + rng.below_usize(3);
+            flush_into_segment(&seg_disk, &name, &mut delta, &mut readers, row_group_rows);
         }
     }
 
