@@ -64,6 +64,9 @@ fn run_shell(addr: SocketAddr, script: &str) -> Output {
             Some(_) => break,
             None if Instant::now() > deadline => {
                 child.kill().ok();
+                // Reap the killed child (dropping a `Child` does not `wait()`)
+                // so a timed-out test never leaves a zombie behind.
+                child.wait().ok();
                 panic!("stele shell did not exit within the deadline");
             }
             None => std::thread::sleep(Duration::from_millis(20)),

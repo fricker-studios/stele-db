@@ -126,6 +126,12 @@ fn describe(client: &mut Client, name: &str, out: &mut impl Write) -> anyhow::Re
     let replies = client.simple_query(&format!(
         "SELECT c.oid, c.relname FROM pg_catalog.pg_class c WHERE c.relname = '{escaped}'"
     ))?;
+    // A server-side error (shim incompatibility, failed txn, …) is not "no such
+    // table" — surface it like any other statement error and keep the session.
+    if let Some(message) = first_error(&replies) {
+        eprintln!("{message}");
+        return Ok(());
+    }
     let oid = first_result_set(&replies)
         .and_then(|set| set.rows.first())
         .and_then(|row| row.first())
@@ -145,6 +151,10 @@ fn describe(client: &mut Client, name: &str, out: &mut impl Write) -> anyhow::Re
         "SELECT a.attname, a.atttypname, a.attnum FROM pg_catalog.pg_attribute a \
          WHERE a.attrelid = {oid} AND a.attnum > 0"
     ))?;
+    if let Some(message) = first_error(&replies) {
+        eprintln!("{message}");
+        return Ok(());
+    }
     let columns = first_result_set(&replies).map(|set| {
         set.rows
             .iter()
@@ -171,6 +181,14 @@ fn describe(client: &mut Client, name: &str, out: &mut impl Write) -> anyhow::Re
 fn first_result_set(replies: &[Reply]) -> Option<&ResultSet> {
     replies.iter().find_map(|r| match r {
         Reply::Rows(set) => Some(set),
+        _ => None,
+    })
+}
+
+/// The first SQL error in a batch, if any.
+fn first_error(replies: &[Reply]) -> Option<&str> {
+    replies.iter().find_map(|r| match r {
+        Reply::Error(message) => Some(message.as_str()),
         _ => None,
     })
 }
