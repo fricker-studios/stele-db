@@ -1,0 +1,133 @@
+//! End-to-end `JOIN` over the wire, driven by the real `tokio-postgres` client
+//! (STL-172 Definition of Done: "wire test through SessionEngine").
+//!
+//! A stock Postgres driver connects to a live [`Server`], creates two tables
+//! (`users` and `orders`), inserts rows, then runs each join type — inner, left,
+//! semi, anti — over the **simple-query** protocol and asserts the combined
+//! result. Proving the join path renders correctly through the front end, not just
+//! in-process, is the point.
+
+use std::sync::{Arc, Mutex};
+
+use stele_common::time::SystemClock;
+use stele_engine::SessionEngine;
+use stele_pgwire::SharedSession;
+use stele_storage::backend::MemDisk;
+use tokio_postgres::{NoTls, SimpleQueryMessage};
+
+mod common;
+
+/// Collect a simple-query reply's data rows into a sorted `Vec` of the named
+/// columns' values (`None` for a SQL `NULL` cell). A join does not order its
+/// output, so callers compare row *sets*.
+fn rows(messages: &[SimpleQueryMessage], columns: &[&str]) -> Vec<Vec<Option<String>>> {
+    let mut out: Vec<Vec<Option<String>>> = messages
+        .iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(row) => Some(
+                columns
+                    .iter()
+                    .map(|c| row.get(c).map(ToOwned::to_owned))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_postgres_runs_each_join_type() {
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+
+    let (client, connection) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect to the stele pgwire server");
+    let driver = tokio::spawn(connection);
+
+    // `users` (id, name) and `orders` (oid, uid), joinable on users.id = orders.uid.
+    client
+        .batch_execute(
+            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT) WITH SYSTEM VERSIONING; \
+             CREATE TABLE orders (oid INT PRIMARY KEY, uid INT) WITH SYSTEM VERSIONING",
+        )
+        .await
+        .expect("create tables");
+    for insert in [
+        "INSERT INTO users VALUES (1, 'alice')",
+        "INSERT INTO users VALUES (2, 'bob')",
+        "INSERT INTO users VALUES (3, 'carol')",
+        "INSERT INTO orders VALUES (10, 1)",
+        "INSERT INTO orders VALUES (11, 1)",
+        "INSERT INTO orders VALUES (12, 2)",
+    ] {
+        client.simple_query(insert).await.expect("insert");
+    }
+
+    // INNER: alice has two orders, bob one, carol none.
+    let reply = client
+        .simple_query(
+            "SELECT users.name, orders.oid FROM users JOIN orders ON users.id = orders.uid",
+        )
+        .await
+        .expect("inner join");
+    assert_eq!(
+        rows(&reply, &["name", "oid"]),
+        vec![
+            vec![Some("alice".to_owned()), Some("10".to_owned())],
+            vec![Some("alice".to_owned()), Some("11".to_owned())],
+            vec![Some("bob".to_owned()), Some("12".to_owned())],
+        ]
+    );
+
+    // LEFT: carol survives with a NULL right side.
+    let reply = client
+        .simple_query(
+            "SELECT users.name, orders.oid FROM users LEFT JOIN orders ON users.id = orders.uid",
+        )
+        .await
+        .expect("left join");
+    assert_eq!(
+        rows(&reply, &["name", "oid"]),
+        vec![
+            vec![Some("alice".to_owned()), Some("10".to_owned())],
+            vec![Some("alice".to_owned()), Some("11".to_owned())],
+            vec![Some("bob".to_owned()), Some("12".to_owned())],
+            vec![Some("carol".to_owned()), None],
+        ]
+    );
+
+    // SEMI: each left row with at least one order, once.
+    let reply = client
+        .simple_query("SELECT name FROM users SEMI JOIN orders ON users.id = orders.uid")
+        .await
+        .expect("semi join");
+    assert_eq!(
+        rows(&reply, &["name"]),
+        vec![vec![Some("alice".to_owned())], vec![Some("bob".to_owned())]]
+    );
+
+    // ANTI: the left rows with no order.
+    let reply = client
+        .simple_query("SELECT name FROM users ANTI JOIN orders ON users.id = orders.uid")
+        .await
+        .expect("anti join");
+    assert_eq!(
+        rows(&reply, &["name"]),
+        vec![vec![Some("carol".to_owned())]]
+    );
+
+    // The CommandComplete tag reports the joined row count.
+    assert!(
+        reply
+            .iter()
+            .any(|m| matches!(m, SimpleQueryMessage::CommandComplete(1))),
+        "ANTI join returns one row"
+    );
+
+    drop(client);
+    let _ = driver.await;
+}
