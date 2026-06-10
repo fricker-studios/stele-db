@@ -69,9 +69,13 @@ boot `SessionEngine` through a `recover` path that replays it.**
   allocator past every recovered instant/id.
 - **Torn-tail contract, fail-closed on corruption:** a *partial* trailing
   record is tolerated and ignored — its fsync never returned, so the DDL was
-  never acknowledged. A *complete* record that fails magic/CRC is a hard
-  recovery error: it was acknowledged, so serving without it would silently
-  drop a table set change (mirrors `dml::recover_replay`'s fence semantics).
+  never acknowledged. So is a tail that does not begin with the record magic:
+  the framing cannot tell a magic-corrupted record from the zero/garbage fill
+  a crashed append leaves, so replay stops there (the magic bytes are the one
+  4-byte window where damage is read as a torn tail rather than detected).
+  A *complete* record with intact magic whose CRC fails is a hard recovery
+  error: it was acknowledged, so serving without it would silently drop a
+  table-set change (mirrors `dml::recover_replay`'s fence semantics).
 - The log is **authoritative for DDL** (unlike the validity index, which is
   derived): it is the only durable copy of the catalog timeline. It is tiny —
   one short record per DDL statement ever executed — so unbounded growth is a

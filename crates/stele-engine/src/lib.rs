@@ -683,7 +683,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             );
         }
 
-        // 3. Position the allocators past everything recovered.
+        // 3. Position the allocators past everything recovered. Saturating: a
+        //    recovered id at the u64 ceiling must not wrap the allocator back
+        //    into recovered provenance.
         clock.advance_to(max_commit);
         Ok(Self {
             catalog,
@@ -691,7 +693,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             disk,
             tables,
             next_namespace,
-            next_txn: max_txn_id + 1,
+            next_txn: max_txn_id.saturating_add(1),
             write_index: BTreeMap::new(),
         })
     }
