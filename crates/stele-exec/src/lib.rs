@@ -14,14 +14,22 @@
 //!
 //! v0.2 adds the [`Operator`] framework: a Volcano-style, batch-at-a-time pull
 //! pipeline over Arrow-shaped batches, with [`SnapshotScan`] re-expressed as a
-//! source operator ([`ScanSource`]) and a [`Project`] shaping operator. The
-//! aggregate / join / filter operators (STL-77 C10–C13) build on this trait.
+//! source operator ([`ScanSource`]) and a [`Project`] shaping operator. On top
+//! of it sits the vectorized scalar expression evaluator ([`eval_expr`], with
+//! its [`Expr`] / [`Vector`] vocabulary) and the [`Filter`] operator it powers
+//! ([STL-170]) — comparisons, integer arithmetic, boolean connectives, and SQL
+//! three-valued NULL logic over a whole batch at a time. The aggregate / join
+//! operators (STL-77 C11–C13) build on the same trait.
+//!
+//! [STL-170]: https://allegromusic.atlassian.net/browse/STL-170
 
+mod expr;
 mod operator;
 mod period;
 mod snapshot_scan;
 
-pub use operator::{DEFAULT_BATCH_SIZE, Operator, Project, ScanSource};
+pub use expr::{ArithOp, CmpOp, Expr, ExprError, LogicOp, Vector, eval_expr};
+pub use operator::{DEFAULT_BATCH_SIZE, Filter, Operator, Project, ScanSource};
 pub use period::evaluate;
 pub use snapshot_scan::{Batch, Column, ScanError, ScanOutput, ScanStats, SnapshotScan};
 // Re-exported so consumers (the binder's bound predicate, the oracle) name the

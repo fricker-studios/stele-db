@@ -144,6 +144,12 @@ pub enum ScanError {
     /// project list named a column the source was not configured to produce.
     #[error("column {0:?} is not present in the input batch")]
     MissingColumn(ColumnId),
+
+    /// A [`Filter`](crate::Filter) operator's predicate could not be evaluated
+    /// over a batch — a structurally invalid expression or an out-of-scope
+    /// column type ([STL-170]).
+    #[error("filter predicate: {0}")]
+    Eval(#[from] crate::expr::ExprError),
 }
 
 /// One column of a [`Batch`] — Arrow-shaped: a single typed, contiguous array
@@ -194,6 +200,24 @@ impl Column {
         match self {
             Self::Bytes(v) => Self::Bytes(v[offset..offset + len].to_vec()),
             Self::I64(v) => Self::I64(v[offset..offset + len].to_vec()),
+        }
+    }
+
+    /// Gather the cells at `rows`, in the given order, into a new column — the
+    /// row-selection a [`Filter`](crate::Filter) applies once it knows which
+    /// rows its predicate kept. Like [`slice`](Self::slice) this copies (a
+    /// `Column` owns its cells); the same shared-buffer follow-up would make it
+    /// zero-copy.
+    ///
+    /// # Panics
+    ///
+    /// If any index is out of range — the caller selects from this column's own
+    /// row count.
+    #[must_use]
+    pub fn take(&self, rows: &[usize]) -> Self {
+        match self {
+            Self::Bytes(v) => Self::Bytes(rows.iter().map(|&i| v[i].clone()).collect()),
+            Self::I64(v) => Self::I64(rows.iter().map(|&i| v[i]).collect()),
         }
     }
 }
