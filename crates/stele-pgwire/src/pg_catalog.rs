@@ -70,8 +70,9 @@ pub(crate) fn classify(stmt: &Statement) -> Option<Introspection> {
     match relation.to_ascii_lowercase().as_str() {
         "pg_class" => {
             // A name filter resolves one relation; a scan with no string
-            // literal anywhere (no WHERE, or a literal-free one) is the `\dt`
-            // shape — list everything (STL-198).
+            // literal in the WHERE (or no WHERE at all) is the `\dt` shape —
+            // list everything (STL-198). Literals elsewhere (projection,
+            // ORDER BY) are not consulted, like the relation lookup above.
             where_clause.and_then(first_string_literal).map_or(
                 Some(Introspection::TableList),
                 |literal| {
