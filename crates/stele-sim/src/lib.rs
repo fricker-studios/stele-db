@@ -2092,7 +2092,8 @@ pub fn four_statement_identity_demo() -> Vec<u8> {
     let Some((_, Column::Bytes(payloads))) = out.batch.columns.into_iter().next() else {
         panic!("scan must project the payload as a bytes column");
     };
-    let [payload] = <[Option<Vec<u8>>; 1]>::try_from(payloads).expect("exactly one row for id = 1");
+    let [payload] =
+        <[Option<Vec<u8>>; 1]>::try_from(payloads.to_vec()).expect("exactly one row for id = 1");
     // This scenario writes no SQL NULL payload, so the one cell is always present.
     payload.expect("this scenario writes no NULL payload")
 }

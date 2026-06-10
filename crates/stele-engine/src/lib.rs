@@ -1721,7 +1721,7 @@ fn decode_key_column(
         .map(|_| Vector::Bool(Vec::new()))
         .collect();
     let cells: Vec<Option<Vec<u8>>> = rows.iter().map(|r| r[key].clone()).collect();
-    cols[key] = Vector::from_column(columns[key].1, &Column::Bytes(cells))
+    cols[key] = Vector::from_column(columns[key].1, &Column::Bytes(cells.into()))
         .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
     Ok(cols)
 }
@@ -1780,7 +1780,7 @@ fn run_aggregate(
         .collect();
     for &i in &referenced_columns(agg) {
         let cells: Vec<Option<Vec<u8>>> = rows.iter().map(|r| r[i].clone()).collect();
-        columns[i] = Vector::from_column(schema_columns[i].1, &Column::Bytes(cells))
+        columns[i] = Vector::from_column(schema_columns[i].1, &Column::Bytes(cells.into()))
             .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
     }
 
