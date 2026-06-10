@@ -291,17 +291,24 @@ pub enum DmlSummary {
 /// the transaction continuing), and [`release`](Self::release) drops a marker while
 /// keeping its writes.
 ///
+/// [`commit`](SessionEngine::commit) is **crash-atomic** ([STL-192]): a
+/// transaction's writes to each table are group-committed as one WAL record with one
+/// fsync, so a crash mid-commit recovers all of that table's writes or none — never
+/// a partial prefix — and the writes share one transaction id.
+///
 /// What this deliberately does *not* yet do (each its own follow-up):
 /// * **Read-your-own-writes.** A `SELECT` inside the transaction reads the pinned
 ///   snapshot, but does **not** see the transaction's own buffered, not-yet-
 ///   committed writes — overlaying the write buffer on the snapshot read is a
 ///   follow-up ([STL-203]).
-/// * **Crash-atomic group commit.** [`commit`](SessionEngine::commit) replays the
-///   buffer through the per-write WAL path, so a crash *mid-commit* can leave a
-///   prefix durable; a single transaction-boundary WAL record (the `stele-txn`
-///   `commit_record` deferral note) is the follow-up that closes that window.
-///   Absent a crash, commit is all-or-nothing and shares one transaction id
-///   across every write.
+/// * **Cross-table commit atomicity.** A transaction spanning several tables writes
+///   one record + one fsync *per table* (each table owns its WAL), so each table's
+///   portion is crash-atomic but a crash *between* tables can leave some durable and
+///   some not; a transaction commit marker across the per-table logs is the follow-up.
+/// * **In-memory rollback of an aborted commit.** If applying a buffered write
+///   fails, nothing is made durable, but writes already applied to the in-memory
+///   tiers are not yet rolled back in place (recovery would drop them); targeted
+///   in-memory rollback is the follow-up.
 ///
 /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
 /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
@@ -1512,14 +1519,37 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
     /// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
     ///
+    /// ## Crash-atomic group commit ([STL-192])
+    ///
+    /// The buffered writes are not replayed one WAL record at a time. Each table the
+    /// transaction touches is put in **group-commit** mode
+    /// ([`Engine::begin_group`](stele_storage::engine::Engine::begin_group)): its
+    /// writes apply to the delta/index in staged order (so a later write sees an
+    /// earlier one) but their redos accumulate, and a single
+    /// [`commit_group`](stele_storage::engine::Engine::commit_group) then writes the
+    /// whole table's portion as **one** WAL record group-committed with **one** fsync
+    /// — the only durability point (invariant 2). That record is the atomic unit:
+    /// recovery replays it whole or, if a crash tears it, drops it at the durable
+    /// fence — so the transaction's writes recover all-or-none, never a partial
+    /// prefix. If applying a write fails, every touched table's buffer is discarded
+    /// ([`abort_group`](stele_storage::engine::Engine::abort_group)) so nothing is
+    /// made durable.
+    ///
+    /// A transaction spanning **multiple tables** writes one record + one fsync *per
+    /// table* (each table owns its WAL), so each table's portion is crash-atomic;
+    /// cross-table all-or-none would need a transaction commit marker across the
+    /// per-table logs and is a follow-up.
+    ///
     /// # Errors
     ///
     /// [`EngineError::Conflict`] if a concurrent commit modified this transaction's
     /// write set after its snapshot (retry the transaction). Otherwise
     /// [`EngineError`] if applying any buffered write fails (e.g. its table was
-    /// dropped between staging and commit). A write that has already been applied
-    /// when a *later* one fails is **not** rolled back — crash/-failure-atomic
-    /// group commit is the deferred follow-up noted on [`SessionTransaction`].
+    /// dropped between staging and commit) or a group-commit append/fsync fails;
+    /// nothing the transaction wrote is made durable. A write already applied to the
+    /// in-memory tiers when a *later* one fails is not yet rolled back in memory
+    /// (it is never made durable, and recovery drops it) — in-memory rollback of an
+    /// aborted commit is the follow-up.
     pub fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError> {
         // First-committer-wins write-write conflict detection. Checked up front, so
         // a conflict aborts the whole transaction before any write lands.
@@ -1536,8 +1566,70 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let txn_id = TxnId(self.next_txn);
         self.next_txn += 1;
         let principal = Principal::new(WIRE_PRINCIPAL.to_vec());
-        for dml in txn.writes {
-            self.apply_bound_dml(dml, txn_id, &principal)?;
+
+        // Apply every write into per-table group-commit buffers, tracking the tables
+        // touched so they can be group-committed (success) or discarded (failure).
+        let mut touched: Vec<String> = Vec::new();
+        match self.apply_group(txn.writes, txn_id, &principal, &mut touched) {
+            Ok(()) => self.finish_group_commit(&touched),
+            Err(e) => {
+                // Discard every buffered (un-logged) write so nothing is made durable
+                // and no table is left stuck in group-commit mode.
+                for table in &touched {
+                    if let Ok(state) = self.table_mut(table) {
+                        state.engine.abort_group();
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Group-commit every `touched` table — one WAL record + one fsync each — and
+    /// report the first failure, if any ([`commit`](Self::commit), [STL-192]).
+    ///
+    /// Every touched table is taken out of group-commit mode here: the ones up to a
+    /// failure are committed (durable), and any after it are discarded
+    /// ([`abort_group`](stele_storage::engine::Engine::abort_group)) so none is left
+    /// buffering — which would otherwise silently swallow a later auto-commit write.
+    /// A mid-sequence failure can thus leave earlier tables durable and later ones
+    /// not — the cross-table atomicity limitation noted on [`commit`](Self::commit).
+    fn finish_group_commit(&mut self, touched: &[String]) -> Result<(), EngineError> {
+        let mut error: Option<EngineError> = None;
+        for table in touched {
+            let Ok(state) = self.table_mut(table) else {
+                continue;
+            };
+            if error.is_some() {
+                state.engine.abort_group();
+            } else if let Err(e) = state.engine.commit_group() {
+                error = Some(EngineError::from(e));
+            }
+        }
+        error.map_or(Ok(()), Err)
+    }
+
+    /// Apply a transaction's buffered writes into per-table group-commit buffers, in
+    /// staged order, recording each table touched in `touched` (in first-touch order)
+    /// so the caller can group-commit or discard them ([`commit`](Self::commit)).
+    ///
+    /// A table is put in group-commit mode the first time the transaction writes to
+    /// it; the write itself routes through the shared [`apply_bound_dml`](Self::apply_bound_dml)
+    /// path, which now buffers rather than appends (the table is in group mode).
+    fn apply_group(
+        &mut self,
+        writes: Vec<BoundDml>,
+        txn_id: TxnId,
+        principal: &Principal,
+        touched: &mut Vec<String>,
+    ) -> Result<(), EngineError> {
+        for dml in writes {
+            let table = dml.table().to_owned();
+            if !touched.contains(&table) {
+                self.table_mut(&table)?.engine.begin_group();
+                touched.push(table);
+            }
+            self.apply_bound_dml(dml, txn_id, principal)?;
         }
         Ok(())
     }
@@ -2510,6 +2602,77 @@ mod tests {
             payload_column(&result),
             vec![encode_value(&ScalarValue::Int4(250))]
         );
+    }
+
+    #[test]
+    fn same_key_insert_then_update_in_one_transaction_applies_front_to_back() {
+        // STL-174 semantics preserved under group commit ([STL-192]): the writes
+        // apply front-to-back, so an UPDATE of a key the same COMMIT inserted earlier
+        // sees it and supersedes it — one live row, the updated value.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        let mut txn = engine.begin();
+        engine
+            .stage_dml(&parse_one("INSERT INTO account VALUES (1, 100)"), &mut txn)
+            .expect("stage insert");
+        engine
+            .stage_dml(
+                &parse_one("UPDATE account SET balance = 200 WHERE id = 1"),
+                &mut txn,
+            )
+            .expect("stage update of the just-inserted key");
+        engine.commit(txn).expect("commit");
+
+        let StatementOutcome::Rows(result) = engine
+            .execute(&parse_one("SELECT balance FROM account"))
+            .expect("select")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(result.rows.len(), 1, "one live row, not two");
+        assert_eq!(
+            payload_column(&result),
+            vec![encode_value(&ScalarValue::Int4(200))],
+            "the UPDATE saw the INSERT staged before it",
+        );
+    }
+
+    #[test]
+    fn a_multi_table_transaction_commits_every_table() {
+        // A transaction spanning two tables commits both — group commit is per
+        // table (one record + one fsync each, [STL-192]).
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create account");
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE ledger (id INT PRIMARY KEY, amount INT) WITH SYSTEM VERSIONING",
+            ))
+            .expect("create ledger");
+
+        let mut txn = engine.begin();
+        engine
+            .stage_dml(&parse_one("INSERT INTO account VALUES (1, 100)"), &mut txn)
+            .expect("stage account insert");
+        engine
+            .stage_dml(&parse_one("INSERT INTO ledger VALUES (9, 42)"), &mut txn)
+            .expect("stage ledger insert");
+        engine.commit(txn).expect("commit");
+
+        let StatementOutcome::Rows(account) = engine
+            .execute(&parse_one("SELECT id FROM account"))
+            .expect("select account")
+        else {
+            panic!("rows");
+        };
+        let StatementOutcome::Rows(ledger) = engine
+            .execute(&parse_one("SELECT id FROM ledger"))
+            .expect("select ledger")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(account.rows.len(), 1, "account row committed");
+        assert_eq!(ledger.rows.len(), 1, "ledger row committed");
     }
 
     // --- Snapshot isolation oracle (STL-175, ADR-0008) ---------------------
@@ -3834,6 +3997,70 @@ mod tests {
         assert_eq!(
             engine.next_txn, 10,
             "the next transaction id starts past the deleting close's id"
+        );
+    }
+
+    #[test]
+    fn a_committed_transaction_survives_a_restart() {
+        // Crash-atomic group commit, the "all present" branch ([STL-192]): a
+        // multi-statement COMMIT is group-committed (one fsynced WAL record), so
+        // every buffered write is durable across a restart.
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        let mut txn = engine.begin();
+        for sql in [
+            "INSERT INTO account VALUES (1, 100)",
+            "INSERT INTO account VALUES (2, 200)",
+            "INSERT INTO account VALUES (3, 300)",
+        ] {
+            engine.stage_dml(&parse_one(sql), &mut txn).expect("stage");
+        }
+        engine.commit(txn).expect("commit");
+        drop(engine);
+
+        let mut engine = recover_session(&disk);
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT id FROM account").rows),
+            vec![vec![i4(1)], vec![i4(2)], vec![i4(3)]],
+            "every committed write is durable across the restart",
+        );
+    }
+
+    #[test]
+    fn a_torn_group_commit_recovers_none_of_the_transaction() {
+        // Crash-atomic group commit, the "none" branch ([STL-192]): if the single
+        // group-commit WAL append fails (a crash mid-commit), nothing the
+        // transaction wrote becomes durable — recovery finds none of it, never a
+        // partial prefix. Group mode buffers every write, so the commit's *only*
+        // append is the group-commit record; tearing it tears the whole transaction.
+        let faults = Faults::new();
+        let disk = MemDisk::with_faults(faults.clone());
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        let mut txn = engine.begin();
+        for sql in [
+            "INSERT INTO account VALUES (1, 100)",
+            "INSERT INTO account VALUES (2, 200)",
+            "INSERT INTO account VALUES (3, 300)",
+        ] {
+            engine.stage_dml(&parse_one(sql), &mut txn).expect("stage");
+        }
+        // Fail the one group-commit append — the transaction's sole durability write.
+        faults.schedule(FaultOp::Append, io::ErrorKind::Other);
+        let err = engine
+            .commit(txn)
+            .expect_err("the torn group-commit append aborts the commit");
+        assert!(matches!(err, EngineError::Storage(_)), "got {err:?}");
+        drop(engine);
+
+        let mut engine = recover_session(&disk);
+        assert!(
+            select(&mut engine, "SELECT id FROM account")
+                .rows
+                .is_empty(),
+            "a torn group commit leaves none of the transaction's writes",
         );
     }
 

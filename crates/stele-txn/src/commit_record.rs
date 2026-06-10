@@ -7,15 +7,24 @@
 //! The record names the transaction and the system-time coordinate it committed
 //! at, so the commit ordering is recoverable from the log alone.
 //!
-//! ## Scope at v0.1
+//! ## Scope: this log vs. the DML redo log
 //!
-//! This is the *transaction-boundary* log. It is deliberately distinct from the
-//! DML *redo* log ([`stele_storage::dml`]), which records the version rows a
-//! write stages. Unifying the two under one tagged WAL record format — and
-//! replaying commit records on restart to rebuild the manager's commit
-//! high-water mark — is multi-statement transaction work that lands with v0.2;
-//! v0.1 single-statement transactions only need the commit marker to be durable,
-//! not yet re-read.
+//! This is the *transaction-boundary* log: the hash-chained, verifiable audit
+//! record of which transaction committed and when (invariant 10). It is
+//! deliberately distinct from the DML *redo* log ([`stele_storage::dml`]), which
+//! records the version rows a write stages.
+//!
+//! Multi-statement crash-atomic group commit ([STL-192]) lands a transaction's
+//! buffered writes as a **single redo record group-committed with one fsync** in
+//! that DML WAL — the record boundary *is* the transaction boundary there, so the
+//! writes recover all-or-none — rather than by unifying the two logs under one
+//! format. Folding this commit-boundary log into that path (replaying commit
+//! records on restart to rebuild the manager's commit high-water mark, and binding
+//! the redo set to its commit record) remains future work; the
+//! [`TxnManager`](crate::TxnManager)'s own recovery rebuilds its cursors from this
+//! chain ([`chain`](crate::chain)).
+//!
+//! [STL-192]: https://allegromusic.atlassian.net/browse/STL-192
 //!
 //! ## Frame layout
 //!
