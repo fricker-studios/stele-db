@@ -441,7 +441,8 @@ fn collect_columns(expr: &Expr, out: &mut BTreeSet<usize>) {
         Expr::Not(inner) | Expr::IsNull(inner) => collect_columns(inner, out),
         Expr::Compare { left, right, .. }
         | Expr::Logic { left, right, .. }
-        | Expr::Arith { left, right, .. } => {
+        | Expr::Arith { left, right, .. }
+        | Expr::Period { left, right, .. } => {
             collect_columns(left, out);
             collect_columns(right, out);
         }

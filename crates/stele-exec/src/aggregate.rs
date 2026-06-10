@@ -371,16 +371,24 @@ fn update_extreme(row: &mut Option<usize>, arg: Option<&Vector>, r: usize, want:
 /// Total-order comparison of two same-typed scalar values, over the evaluator's
 /// scalar set. `MIN` / `MAX` fold a single argument column, so both operands come
 /// from one [`Vector`] and are the same type by construction — a mixed pairing is
-/// impossible here. Rather than return a wrong ordering for one, this **fails
-/// fast**: a panic flags the contract break (e.g. a new [`Vector`] variant that
-/// reaches `MIN` / `MAX` without a `scalar_cmp` arm — STL-207 broadens the type
-/// set) instead of silently mis-ordering.
+/// impossible here. Every type the evaluator can read into a [`Vector`] has an
+/// arm (STL-207 broadened the set to the temporal / `uuid` / `bytea` / `period`
+/// types); only `float8`, which no column decodes into, is left out, so the
+/// fallthrough still **fails fast** rather than silently mis-ordering.
 fn scalar_cmp(a: &ScalarValue, b: &ScalarValue) -> Ordering {
     match (a, b) {
-        (ScalarValue::Int4(x), ScalarValue::Int4(y)) => x.cmp(y),
-        (ScalarValue::Int8(x), ScalarValue::Int8(y)) => x.cmp(y),
+        // `i32`- and `i64`-payload types share a comparison; group them so the
+        // identical arms merge.
+        (ScalarValue::Int4(x), ScalarValue::Int4(y))
+        | (ScalarValue::Date(x), ScalarValue::Date(y)) => x.cmp(y),
+        (ScalarValue::Int8(x), ScalarValue::Int8(y))
+        | (ScalarValue::Timestamp(x), ScalarValue::Timestamp(y))
+        | (ScalarValue::TimestampTz(x), ScalarValue::TimestampTz(y)) => x.cmp(y),
         (ScalarValue::Bool(x), ScalarValue::Bool(y)) => x.cmp(y),
         (ScalarValue::Text(x), ScalarValue::Text(y)) => x.cmp(y),
+        (ScalarValue::Uuid(x), ScalarValue::Uuid(y)) => x.cmp(y),
+        (ScalarValue::Bytea(x), ScalarValue::Bytea(y)) => x.cmp(y),
+        (ScalarValue::Period(x), ScalarValue::Period(y)) => x.cmp(y),
         _ => unreachable!(
             "MIN/MAX compares values from one column, so both operands share a type \
              the evaluator can read: got {} vs {}",
@@ -541,6 +549,38 @@ mod tests {
         .expect("aggregate");
         assert_eq!(out.aggregates[0], Vector::Text(vec![Some("apple".into())]));
         assert_eq!(out.aggregates[1], Vector::Text(vec![Some("banana".into())]));
+    }
+
+    /// MIN/MAX over the STL-207 types (`from_column` now decodes them, so they
+    /// reach `scalar_cmp` — previously an `unreachable!` panic).
+    #[test]
+    fn min_max_over_new_types() {
+        // Timestamp orders by its instant.
+        let ts = Vector::Timestamp(vec![Some(30), Some(10), None, Some(20)]);
+        let out = hash_aggregate(
+            &[],
+            &[agg(AggregateFunc::Min, 0), agg(AggregateFunc::Max, 0)],
+            &[ts],
+            4,
+        )
+        .expect("aggregate");
+        assert_eq!(out.aggregates[0], Vector::Timestamp(vec![Some(10)]));
+        assert_eq!(out.aggregates[1], Vector::Timestamp(vec![Some(30)]));
+
+        // UUID is byte-ordered.
+        let lo = [0u8; 16];
+        let mut hi = [0u8; 16];
+        hi[0] = 1;
+        let uuids = Vector::Uuid(vec![Some(hi), Some(lo)]);
+        let out = hash_aggregate(
+            &[],
+            &[agg(AggregateFunc::Min, 0), agg(AggregateFunc::Max, 0)],
+            &[uuids],
+            2,
+        )
+        .expect("aggregate");
+        assert_eq!(out.aggregates[0], Vector::Uuid(vec![Some(lo)]));
+        assert_eq!(out.aggregates[1], Vector::Uuid(vec![Some(hi)]));
     }
 
     #[test]

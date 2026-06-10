@@ -1,9 +1,11 @@
-//! Fuzz oracle for the vectorized scalar expression evaluator (STL-170 `[C10]`).
+//! Fuzz oracle for the vectorized scalar expression evaluator (STL-170 `[C10]`,
+//! extended for the full type/op set in STL-207).
 //!
 //! The Definition of Done is "expression eval matches scalar semantics on a
 //! fuzzed input set incl. NULLs (three-valued logic)". This test is that oracle:
 //! a seeded generator builds a random, **well-typed** expression tree
-//! (comparisons, integer arithmetic, `AND`/`OR`/`NOT`, `IS NULL`) over random
+//! (comparisons over every scalar type, integer arithmetic including `/`/`%`,
+//! `AND`/`OR`/`NOT`, `IS NULL`, and the SQL:2011 period predicates) over random
 //! columns sprinkled with NULLs, evaluates it two independent ways, and asserts
 //! they agree cell-for-cell:
 //!
@@ -20,7 +22,10 @@
 //! repro.
 
 use stele_common::types::ScalarValue;
-use stele_exec::{ArithOp, CmpOp, Expr, ExprError, LogicOp, Vector, eval_expr};
+use stele_exec::{
+    ArithOp, CmpOp, Expr, ExprError, Interval, LogicOp, PeriodPredicate, Vector, eval_expr,
+    evaluate,
+};
 
 // --- deterministic PRNG ----------------------------------------------------
 
@@ -52,9 +57,15 @@ impl Rng {
     fn one_in(&mut self, n: u32) -> bool {
         self.below(n) == 0
     }
+
+    /// An index into a slice of `len` elements (`len > 0`). Like [`Self::below`],
+    /// the modulo carries a negligible bias for the tiny `len`s used here.
+    fn index(&mut self, len: usize) -> usize {
+        usize::try_from(self.next_u64() % len as u64).expect("index fits usize")
+    }
 }
 
-// --- the four column types the evaluator supports --------------------------
+// --- every column type the evaluator supports ------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ty {
@@ -62,58 +73,131 @@ enum Ty {
     Int8,
     Bool,
     Text,
+    Timestamp,
+    TimestampTz,
+    Date,
+    Uuid,
+    Bytea,
+    Period,
 }
 
-const TYPES: [Ty; 4] = [Ty::Int4, Ty::Int8, Ty::Bool, Ty::Text];
+const TYPES: [Ty; 10] = [
+    Ty::Int4,
+    Ty::Int8,
+    Ty::Bool,
+    Ty::Text,
+    Ty::Timestamp,
+    Ty::TimestampTz,
+    Ty::Date,
+    Ty::Uuid,
+    Ty::Bytea,
+    Ty::Period,
+];
+
+/// The seven SQL:2011 period predicates, for the generator to pick among.
+const PERIOD_PREDICATES: [PeriodPredicate; 7] = [
+    PeriodPredicate::Contains,
+    PeriodPredicate::Overlaps,
+    PeriodPredicate::Equals,
+    PeriodPredicate::Precedes,
+    PeriodPredicate::Succeeds,
+    PeriodPredicate::ImmediatelyPrecedes,
+    PeriodPredicate::ImmediatelySucceeds,
+];
+
+/// A small i64 from `-3..=3` — the shared integer/temporal domain, chosen so
+/// equality and ordering collisions are frequent (and divisors hit zero).
+fn small_int(rng: &mut Rng) -> i64 {
+    i64::from(rng.below(7)) - 3
+}
+
+/// A random half-open interval over small coordinates, sometimes open-ended, so
+/// touching/overlapping boundary cases (the heart of the period predicates) come
+/// up often.
+fn small_interval(rng: &mut Rng) -> Interval {
+    let from = i64::from(rng.below(3)) * 10; // {0, 10, 20}
+    let to = if rng.one_in(5) {
+        i64::MAX // open-ended
+    } else {
+        from + i64::from(rng.below(2) + 1) * 10 // from + {10, 20} → {10,20,30,40}
+    };
+    Interval::new(from, to).expect("from < to by construction")
+}
+
+/// A random UUID from a tiny domain (first byte `0..=3`, rest zero), so the
+/// byte-ordered comparison sees ties and both orderings.
+fn small_uuid(rng: &mut Rng) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[0] = u8::try_from(rng.below(4)).expect("0..4");
+    bytes
+}
+
+/// A random short byte string from a tiny domain, so lexicographic comparison
+/// (including the prefix rule, `[0] < [0,0]`) is exercised.
+fn small_bytea(rng: &mut Rng) -> Vec<u8> {
+    [vec![], vec![0], vec![1], vec![0, 0]][rng.below(4) as usize].clone()
+}
 
 /// Build a random column of `ty` with `rows` cells, each NULL ~1/4 of the time.
-/// Small value/text domains make collisions (and so true comparisons) frequent.
+/// Small value domains make collisions (and so true comparisons) frequent.
 fn random_column(rng: &mut Rng, ty: Ty, rows: usize) -> Vector {
     let null = |rng: &mut Rng| rng.one_in(4);
+    macro_rules! col {
+        ($variant:ident, $gen:expr) => {
+            Vector::$variant((0..rows).map(|_| (!null(rng)).then(|| $gen(rng))).collect())
+        };
+    }
     match ty {
-        Ty::Int4 => Vector::Int4(
-            (0..rows)
-                .map(|_| (!null(rng)).then(|| i32::try_from(rng.below(7)).expect("0..7") - 3))
-                .collect(),
-        ),
-        Ty::Int8 => Vector::Int8(
-            (0..rows)
-                .map(|_| (!null(rng)).then(|| i64::from(rng.below(7)) - 3))
-                .collect(),
-        ),
-        Ty::Bool => Vector::Bool(
-            (0..rows)
-                .map(|_| (!null(rng)).then(|| rng.one_in(2)))
-                .collect(),
-        ),
-        Ty::Text => Vector::Text(
-            (0..rows)
-                .map(|_| (!null(rng)).then(|| ["a", "b", "c"][rng.below(3) as usize].to_owned()))
-                .collect(),
-        ),
+        Ty::Int4 => col!(Int4, |rng: &mut Rng| i32::try_from(small_int(rng) + 3)
+            .expect("0..7")
+            - 3),
+        Ty::Int8 => col!(Int8, small_int),
+        Ty::Bool => col!(Bool, |rng: &mut Rng| rng.one_in(2)),
+        Ty::Text => col!(Text, |rng: &mut Rng| ["a", "b", "c"][rng.below(3) as usize]
+            .to_owned()),
+        Ty::Timestamp => col!(Timestamp, small_int),
+        Ty::TimestampTz => col!(TimestampTz, small_int),
+        Ty::Date => col!(Date, |rng: &mut Rng| i32::try_from(small_int(rng) + 3)
+            .expect("0..7")
+            - 3),
+        Ty::Uuid => col!(Uuid, small_uuid),
+        Ty::Bytea => col!(Bytea, small_bytea),
+        Ty::Period => col!(Period, small_interval),
     }
 }
 
 /// A random non-null literal of `ty`, from the same small domains.
 fn random_literal(rng: &mut Rng, ty: Ty) -> ScalarValue {
     match ty {
-        Ty::Int4 => ScalarValue::Int4(i32::try_from(rng.below(7)).expect("0..7") - 3),
-        Ty::Int8 => ScalarValue::Int8(i64::from(rng.below(7)) - 3),
+        Ty::Int4 => ScalarValue::Int4(i32::try_from(small_int(rng) + 3).expect("0..7") - 3),
+        Ty::Int8 => ScalarValue::Int8(small_int(rng)),
         Ty::Bool => ScalarValue::Bool(rng.one_in(2)),
         Ty::Text => ScalarValue::Text(["a", "b", "c"][rng.below(3) as usize].to_owned()),
+        Ty::Timestamp => ScalarValue::Timestamp(small_int(rng)),
+        Ty::TimestampTz => ScalarValue::TimestampTz(small_int(rng)),
+        Ty::Date => ScalarValue::Date(i32::try_from(small_int(rng) + 3).expect("0..7") - 3),
+        Ty::Uuid => ScalarValue::Uuid(small_uuid(rng)),
+        Ty::Bytea => ScalarValue::Bytea(small_bytea(rng)),
+        Ty::Period => ScalarValue::Period(small_interval(rng)),
     }
 }
 
 // --- typed expression generator --------------------------------------------
 
 /// The column layout shared by the batch and the generator: one column per type,
-/// at the position the type's index gives.
+/// at the position the type holds in [`TYPES`] (the order the batch is built in).
 const fn column_of(ty: Ty) -> usize {
     match ty {
         Ty::Int4 => 0,
         Ty::Int8 => 1,
         Ty::Bool => 2,
         Ty::Text => 3,
+        Ty::Timestamp => 4,
+        Ty::TimestampTz => 5,
+        Ty::Date => 6,
+        Ty::Uuid => 7,
+        Ty::Bytea => 8,
+        Ty::Period => 9,
     }
 }
 
@@ -139,16 +223,32 @@ fn gen_expr(rng: &mut Rng, ty: Ty, budget: u32) -> Expr {
             if rng.one_in(2) {
                 leaf(rng)
             } else {
-                let op = [ArithOp::Add, ArithOp::Sub, ArithOp::Mul][rng.below(3) as usize];
+                // All five integer ops, so `/`/`%` (and their divide-by-zero and
+                // `MIN / -1` NULL cases) are exercised against the reference.
+                let op = [
+                    ArithOp::Add,
+                    ArithOp::Sub,
+                    ArithOp::Mul,
+                    ArithOp::Div,
+                    ArithOp::Mod,
+                ][rng.below(5) as usize];
                 gen_expr(rng, ty, budget - 1).arith(op, gen_expr(rng, ty, budget - 1))
             }
         }
-        Ty::Text => leaf(rng),
-        Ty::Bool => match rng.below(5) {
+        // The non-numeric, non-boolean types are leaves — they enter expressions
+        // only as comparison / period-predicate operands.
+        Ty::Text
+        | Ty::Timestamp
+        | Ty::TimestampTz
+        | Ty::Date
+        | Ty::Uuid
+        | Ty::Bytea
+        | Ty::Period => leaf(rng),
+        Ty::Bool => match rng.below(6) {
             0 => leaf(rng),
             1 => {
                 // A comparison over a randomly chosen operand type.
-                let operand = TYPES[rng.below(4) as usize];
+                let operand = TYPES[rng.index(TYPES.len())];
                 let op = [
                     CmpOp::Eq,
                     CmpOp::Ne,
@@ -168,9 +268,15 @@ fn gen_expr(rng: &mut Rng, ty: Ty, budget: u32) -> Expr {
                 gen_expr(rng, Ty::Bool, budget - 1).logic(op, gen_expr(rng, Ty::Bool, budget - 1))
             }
             3 => gen_expr(rng, Ty::Bool, budget - 1).negate(),
+            4 => {
+                // A period predicate over two PERIOD operands.
+                let pred = PERIOD_PREDICATES[rng.index(PERIOD_PREDICATES.len())];
+                gen_expr(rng, Ty::Period, budget - 1)
+                    .period(pred, gen_expr(rng, Ty::Period, budget - 1))
+            }
             _ => {
                 // IS NULL over any operand type.
-                let operand = TYPES[rng.below(4) as usize];
+                let operand = TYPES[rng.index(TYPES.len())];
                 gen_expr(rng, operand, budget - 1).is_null()
             }
         },
@@ -223,6 +329,18 @@ fn eval_scalar(expr: &Expr, row: &[Option<ScalarValue>]) -> Result<Option<Scalar
                 _ => None,
             }
         }
+        Expr::Period { pred, left, right } => {
+            let lhs = eval_scalar(left, row)?;
+            let rhs = eval_scalar(right, row)?;
+            match (lhs, rhs) {
+                (Some(lhs), Some(rhs)) => {
+                    let a = lhs.as_period().expect("left period operand");
+                    let b = rhs.as_period().expect("right period operand");
+                    Some(ScalarValue::Bool(evaluate(*pred, a, b)))
+                }
+                _ => None,
+            }
+        }
     })
 }
 
@@ -242,10 +360,16 @@ const fn as_bool(value: Option<&ScalarValue>) -> Result<Option<bool>, ExprError>
 fn scalar_compare(op: CmpOp, lhs: &ScalarValue, rhs: &ScalarValue) -> Result<bool, ExprError> {
     use std::cmp::Ordering;
     let ord = match (lhs, rhs) {
-        (ScalarValue::Int4(a), ScalarValue::Int4(b)) => a.cmp(b),
-        (ScalarValue::Int8(a), ScalarValue::Int8(b)) => a.cmp(b),
+        (ScalarValue::Int4(a), ScalarValue::Int4(b))
+        | (ScalarValue::Date(a), ScalarValue::Date(b)) => a.cmp(b),
+        (ScalarValue::Int8(a), ScalarValue::Int8(b))
+        | (ScalarValue::Timestamp(a), ScalarValue::Timestamp(b))
+        | (ScalarValue::TimestampTz(a), ScalarValue::TimestampTz(b)) => a.cmp(b),
         (ScalarValue::Bool(a), ScalarValue::Bool(b)) => a.cmp(b),
         (ScalarValue::Text(a), ScalarValue::Text(b)) => a.cmp(b),
+        (ScalarValue::Uuid(a), ScalarValue::Uuid(b)) => a.cmp(b),
+        (ScalarValue::Bytea(a), ScalarValue::Bytea(b)) => a.cmp(b),
+        (ScalarValue::Period(a), ScalarValue::Period(b)) => a.cmp(b),
         _ => {
             return Err(ExprError::CompareTypeMismatch {
                 left: lhs.logical_type(),
@@ -274,6 +398,8 @@ fn scalar_arith(
                 ArithOp::Add => a.checked_add(*b),
                 ArithOp::Sub => a.checked_sub(*b),
                 ArithOp::Mul => a.checked_mul(*b),
+                ArithOp::Div => a.checked_div(*b),
+                ArithOp::Mod => a.checked_rem(*b),
             };
             v.map(ScalarValue::Int4)
         }
@@ -282,6 +408,8 @@ fn scalar_arith(
                 ArithOp::Add => a.checked_add(*b),
                 ArithOp::Sub => a.checked_sub(*b),
                 ArithOp::Mul => a.checked_mul(*b),
+                ArithOp::Div => a.checked_div(*b),
+                ArithOp::Mod => a.checked_rem(*b),
             };
             v.map(ScalarValue::Int8)
         }
