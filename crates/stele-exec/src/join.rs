@@ -137,11 +137,11 @@ pub fn hash_join(
     let left_keys = eval_expr(left_key, left, left_rows)?;
     let right_keys = eval_expr(right_key, right, right_rows)?;
 
-    // Build the probe table on the right side, keyed by each non-NULL key cell's
-    // canonical encoding. A NULL right key joins to nothing (`NULL = NULL` is
-    // unknown), so it never enters the table. The `BTreeMap` keeps bucket lookup
+    // Build the hash table on the right (build) side, keyed by each non-NULL key
+    // cell's canonical encoding. A NULL right key joins to nothing (`NULL = NULL`
+    // is unknown), so it never enters the table. The `BTreeMap` keeps bucket lookup
     // deterministic, and pushing row indices in ascending order keeps each bucket
-    // ascending — so a probe emits its matches in a stable order.
+    // ascending — so a probe (the left side) emits its matches in a stable order.
     let mut table: BTreeMap<Vec<u8>, Vec<usize>> = BTreeMap::new();
     for r in 0..right_rows {
         if let Some(key) = right_keys.get(r) {

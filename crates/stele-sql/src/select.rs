@@ -533,6 +533,14 @@ pub enum SelectError {
         /// The unresolved (possibly qualified) column reference.
         column: String,
     },
+
+    /// A projected item in a `JOIN` is not one v0.2 lowers — `*` mixed with named
+    /// columns, a non-column expression, or (for a `SEMI` / `ANTI` join) a
+    /// right-table column the join does not output ([STL-172]). Distinct from the
+    /// single-table [`UnsupportedProjection`](Self::UnsupportedProjection) so the
+    /// rejection does not borrow that variant's v0.1 single-table wording.
+    #[error("v0.2 cannot project this from the JOIN ({0})")]
+    UnsupportedJoinProjection(String),
 }
 
 /// Why folding an `AS OF <expr>` to an instant failed.
@@ -1365,11 +1373,11 @@ fn bind_join_projection(
                 expr @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Nested(_)),
             ) => expr,
             SelectItem::Wildcard(_) => {
-                return Err(SelectError::UnsupportedProjection(
+                return Err(SelectError::UnsupportedJoinProjection(
                     "`*` mixed with named columns".to_owned(),
                 ));
             }
-            other => return Err(SelectError::UnsupportedProjection(other.to_string())),
+            other => return Err(SelectError::UnsupportedJoinProjection(other.to_string())),
         };
         let (side, idx) = resolve_join_column(expr, left, right)?;
         let schema = match side {
@@ -1378,7 +1386,7 @@ fn bind_join_projection(
                 // A SEMI / ANTI join's result is the left table alone, so a right
                 // column has nowhere to come from.
                 if !join_type.keeps_right() {
-                    return Err(SelectError::UnsupportedProjection(
+                    return Err(SelectError::UnsupportedJoinProjection(
                         "a SEMI/ANTI join projects only its left table's columns".to_owned(),
                     ));
                 }
@@ -3040,7 +3048,7 @@ mod tests {
                 "SELECT orders.oid FROM users SEMI JOIN orders ON users.id = orders.uid",
                 &catalog,
             ),
-            Err(SelectError::UnsupportedProjection(_))
+            Err(SelectError::UnsupportedJoinProjection(_))
         ));
     }
 
