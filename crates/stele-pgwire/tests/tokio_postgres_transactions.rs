@@ -1,17 +1,20 @@
 //! Multi-statement transactions over the wire, driven by the real
-//! `tokio-postgres` client (STL-174 Definition of Done, bullet 2).
+//! `tokio-postgres` client (STL-174 Definition of Done, bullet 2; STL-175
+//! snapshot isolation; STL-176 savepoints).
 //!
 //! `BEGIN … COMMIT` is atomic — every buffered write lands together — and
 //! `BEGIN … ROLLBACK` discards the lot. The transaction state is per connection
 //! and persists across simple-query messages, so each `BEGIN`/DML/`COMMIT` is
 //! sent as its own `simple_query` to prove the connection carries the state
-//! between messages (not just within one batch). Both paths ride the `Q` loop
-//! the v0.1 front end speaks; the extended protocol is a v0.2 concern.
-//!
-//! Savepoints (STL-176) extend the same loop: `SAVEPOINT` / `ROLLBACK TO
-//! SAVEPOINT` / `RELEASE SAVEPOINT` carve nested rollback points out of the one
-//! buffered write set, and `ROLLBACK TO` undoes only the writes staged after the
-//! savepoint while the transaction continues.
+//! between messages (not just within one batch). Under **snapshot isolation**
+//! (STL-175) a transaction reads one consistent snapshot pinned at `BEGIN`, and a
+//! write-write conflict surfaces at `COMMIT` as a retryable serialization failure
+//! (SQLSTATE `40001`) — both exercised here across two connections. **Savepoints**
+//! (STL-176) extend the same loop: `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` /
+//! `RELEASE SAVEPOINT` carve nested rollback points out of the one buffered write
+//! set, and `ROLLBACK TO` undoes only the writes staged after the savepoint while
+//! the transaction continues. Both paths ride the `Q` loop the v0.1 front end
+//! speaks; the extended protocol is a v0.2 concern.
 
 use std::sync::{Arc, Mutex};
 
@@ -19,6 +22,7 @@ use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
 use stele_pgwire::SharedSession;
 use stele_storage::backend::MemDisk;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
 mod common;
@@ -29,6 +33,19 @@ fn row_count(messages: &[SimpleQueryMessage]) -> usize {
         .iter()
         .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
         .count()
+}
+
+/// Every `balance` cell of a `SELECT balance …` reply, in row order.
+fn balances(messages: &[SimpleQueryMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(row) => {
+                Some(row.get("balance").expect("balance column").to_owned())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Every `id` cell of a `SELECT id …` reply, **sorted** as owned strings. The
@@ -45,6 +62,32 @@ fn ids(messages: &[SimpleQueryMessage]) -> Vec<String> {
         .collect();
     ids.sort();
     ids
+}
+
+/// The SQLSTATE of a failed `simple_query`, for the savepoint error-path asserts.
+fn sqlstate(err: &tokio_postgres::Error) -> Option<&str> {
+    err.code().map(tokio_postgres::error::SqlState::code)
+}
+
+/// Connect a fresh client to `addr` and `CREATE TABLE account`, returning the
+/// client and its connection driver task. Shared setup for the savepoint tests.
+async fn account_client(
+    addr: std::net::SocketAddr,
+) -> (
+    tokio_postgres::Client,
+    tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
+) {
+    let (client, connection) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect to the stele pgwire server");
+    let driver = tokio::spawn(connection);
+    client
+        .batch_execute(
+            "CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+        )
+        .await
+        .expect("create table");
+    (client, driver)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -76,8 +119,9 @@ async fn commit_is_atomic_and_rollback_discards() {
         .await
         .expect("insert 2");
 
-    // Before COMMIT the rows are buffered — a read on the same connection (which
-    // sees committed state, not the buffer) returns nothing.
+    // Before COMMIT the rows are buffered, and the transaction reads its pinned
+    // snapshot (taken at BEGIN, before these inserts) — so the read returns
+    // nothing: neither the write buffer nor any newer state is visible (STL-175).
     let mid_txn = client
         .simple_query("SELECT id FROM account")
         .await
@@ -152,30 +196,180 @@ async fn a_batched_transaction_commits_atomically() {
     let _ = driver.await;
 }
 
-/// The SQLSTATE of a failed `simple_query`, for the savepoint error-path asserts.
-fn sqlstate(err: &tokio_postgres::Error) -> Option<&str> {
-    err.code().map(tokio_postgres::error::SqlState::code)
-}
+/// DDL inside a transaction over the wire (STL-175 regression guard): a
+/// `BEGIN; CREATE TABLE …; INSERT …; COMMIT` resolves the just-created table for
+/// the buffered `INSERT`. DDL inside a block auto-commits and advances the pinned
+/// snapshot, so binding the `INSERT` against it sees the new table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ddl_then_dml_inside_one_transaction_over_the_wire() {
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
 
-/// Connect a fresh client to `addr` and `CREATE TABLE account`, returning the
-/// client and its connection driver task. Shared setup for the savepoint tests.
-async fn account_client(
-    addr: std::net::SocketAddr,
-) -> (
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
-) {
     let (client, connection) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
         .await
-        .expect("connect to the stele pgwire server");
+        .expect("connect");
     let driver = tokio::spawn(connection);
+
+    client.simple_query("BEGIN").await.expect("begin");
     client
-        .batch_execute(
-            "CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
-        )
+        .simple_query("CREATE TABLE t (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING")
         .await
-        .expect("create table");
-    (client, driver)
+        .expect("create inside the transaction");
+    client
+        .simple_query("INSERT INTO t VALUES (1, 100)")
+        .await
+        .expect("insert resolves the table created in the same block");
+    client.simple_query("COMMIT").await.expect("commit");
+
+    let rows = client
+        .simple_query("SELECT balance FROM t")
+        .await
+        .expect("select");
+    assert_eq!(
+        balances(&rows),
+        vec!["100"],
+        "the in-transaction CREATE + buffered INSERT both took effect"
+    );
+
+    drop(client);
+    let _ = driver.await;
+}
+
+/// Snapshot isolation over the wire (STL-175): a transaction reads one consistent
+/// snapshot for its whole life. `a` opens a transaction, pinning a snapshot that
+/// sees `balance = 100`; `b` then auto-commits `balance = 200`; `a`'s in-transaction
+/// `SELECT` still reads `100`. After `a` ends its transaction, it reads the latest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transaction_reads_a_stable_snapshot_over_the_wire() {
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+
+    let (a, a_conn) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect a");
+    let a_driver = tokio::spawn(a_conn);
+    let (b, b_conn) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect b");
+    let b_driver = tokio::spawn(b_conn);
+
+    a.batch_execute(
+        "CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+    )
+    .await
+    .expect("create table");
+    a.simple_query("INSERT INTO account VALUES (1, 100)")
+        .await
+        .expect("seed 100");
+
+    // `a` pins its snapshot at BEGIN (it sees balance = 100).
+    a.simple_query("BEGIN").await.expect("a begin");
+
+    // `b` auto-commits a newer value on another connection.
+    b.simple_query("UPDATE account SET balance = 200 WHERE id = 1")
+        .await
+        .expect("b update");
+
+    // `a` still reads its pinned snapshot, not `b`'s commit.
+    let mid = a
+        .simple_query("SELECT balance FROM account")
+        .await
+        .expect("a reads in-transaction");
+    assert_eq!(
+        balances(&mid),
+        vec!["100"],
+        "the transaction reads its pinned snapshot, not the concurrent commit"
+    );
+
+    a.simple_query("COMMIT").await.expect("a commit");
+
+    // Outside the transaction `a` is its own snapshot and sees the latest value.
+    let after = a
+        .simple_query("SELECT balance FROM account")
+        .await
+        .expect("a reads after commit");
+    assert_eq!(
+        balances(&after),
+        vec!["200"],
+        "after the transaction ends, the next statement sees the latest committed state"
+    );
+
+    drop(a);
+    drop(b);
+    let _ = a_driver.await;
+    let _ = b_driver.await;
+}
+
+/// First-committer-wins write-write conflict over the wire (STL-175): two
+/// transactions pin the same snapshot and both write `id = 1`; the first to COMMIT
+/// wins, and the second's COMMIT is a **retryable** serialization failure
+/// (SQLSTATE `40001`) — the signal a client uses to retry the whole transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_write_conflict_surfaces_a_retryable_error() {
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+
+    let (a, a_conn) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect a");
+    let a_driver = tokio::spawn(a_conn);
+    let (b, b_conn) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect b");
+    let b_driver = tokio::spawn(b_conn);
+
+    a.batch_execute(
+        "CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+    )
+    .await
+    .expect("create table");
+    a.simple_query("INSERT INTO account VALUES (1, 100)")
+        .await
+        .expect("seed");
+
+    // Both transactions begin (pinning the same snapshot) before either commits,
+    // and both stage a write to id = 1.
+    a.simple_query("BEGIN").await.expect("a begin");
+    a.simple_query("UPDATE account SET balance = 200 WHERE id = 1")
+        .await
+        .expect("a update");
+    b.simple_query("BEGIN").await.expect("b begin");
+    b.simple_query("UPDATE account SET balance = 300 WHERE id = 1")
+        .await
+        .expect("b update");
+
+    // First committer wins.
+    a.simple_query("COMMIT").await.expect("a commits");
+
+    // The loser's COMMIT is a retryable serialization failure (40001).
+    let err = b
+        .simple_query("COMMIT")
+        .await
+        .expect_err("b's commit must conflict");
+    assert_eq!(
+        err.code(),
+        Some(&SqlState::T_R_SERIALIZATION_FAILURE),
+        "a write-write conflict maps to 40001 (serialization_failure), which clients retry: {err}"
+    );
+
+    // The winner's value is what persisted; the loser touched nothing.
+    let rows = a
+        .simple_query("SELECT balance FROM account")
+        .await
+        .expect("select");
+    assert_eq!(
+        balances(&rows),
+        vec!["200"],
+        "first committer's write is the one that persisted"
+    );
+
+    drop(a);
+    drop(b);
+    let _ = a_driver.await;
+    let _ = b_driver.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

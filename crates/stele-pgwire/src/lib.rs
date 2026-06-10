@@ -170,6 +170,9 @@ const SQLSTATE_INVALID_TEXT_REPRESENTATION: &str = "22P02";
 // A statement issued while the transaction is already aborted — Postgres ignores
 // commands until the block ends (`COMMIT`/`ROLLBACK`), STL-174.
 const SQLSTATE_IN_FAILED_TRANSACTION: &str = "25P02";
+// A snapshot-isolation write-write conflict (`COMMIT` lost a first-committer-wins
+// race) — Postgres's `serialization_failure`, which stock clients retry (STL-175).
+const SQLSTATE_SERIALIZATION_FAILURE: &str = "40001";
 // A `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` issued with no open transaction —
 // Postgres's "can only be used in transaction blocks" (STL-176).
 const SQLSTATE_NO_ACTIVE_TRANSACTION: &str = "25P01";
@@ -222,21 +225,38 @@ pub trait SessionHandle: Send {
     /// `pg_catalog` `\d` shim — see [`SessionEngine::describe_live_tables`].
     fn describe_live_tables(&self) -> Vec<TableDescription>;
 
-    /// Bind and buffer a DML statement into the connection's open transaction,
-    /// returning its affected-row summary or `Ok(None)` if it is not DML — see
-    /// [`SessionEngine::stage_dml`] ([STL-174]).
+    /// Open a multi-statement transaction, **pinning its read snapshot now** — see
+    /// [`SessionEngine::begin`] ([STL-174], [STL-175]).
     ///
     /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
-    fn stage_dml(
-        &self,
+    /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+    fn begin(&self) -> SessionTransaction;
+
+    /// Run one statement inside an open transaction: a buffered `INSERT`/`UPDATE`/
+    /// `DELETE`, or a `SELECT`/DDL run at once against the pinned snapshot — see
+    /// [`SessionEngine::execute_in_txn`] ([STL-174], [STL-175]).
+    ///
+    /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
+    /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+    fn execute_in_txn(
+        &mut self,
         stmt: &Statement,
         txn: &mut SessionTransaction,
-    ) -> Result<Option<DmlSummary>, EngineError>;
+    ) -> Result<StatementOutcome, EngineError>;
 
-    /// Apply a transaction's buffered writes as a unit — see
-    /// [`SessionEngine::commit`] ([STL-174]).
+    /// Advance an open transaction's pinned read snapshot — see
+    /// [`SessionEngine::repin_snapshot`]. The wire DDL path calls this after a
+    /// `CREATE`/`DROP` auto-commits inside a block ([STL-175]).
+    ///
+    /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+    fn repin_snapshot(&self, txn: &mut SessionTransaction);
+
+    /// Apply a transaction's buffered writes as a unit, or fail with a retryable
+    /// [`EngineError::Conflict`] on a write-write conflict — see
+    /// [`SessionEngine::commit`] ([STL-174], [STL-175]).
     ///
     /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
+    /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
     fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError>;
 }
 
@@ -253,12 +273,20 @@ where
         Self::describe_live_tables(self)
     }
 
-    fn stage_dml(
-        &self,
+    fn begin(&self) -> SessionTransaction {
+        Self::begin(self)
+    }
+
+    fn execute_in_txn(
+        &mut self,
         stmt: &Statement,
         txn: &mut SessionTransaction,
-    ) -> Result<Option<DmlSummary>, EngineError> {
-        Self::stage_dml(self, stmt, txn)
+    ) -> Result<StatementOutcome, EngineError> {
+        Self::execute_in_txn(self, stmt, txn)
+    }
+
+    fn repin_snapshot(&self, txn: &mut SessionTransaction) {
+        Self::repin_snapshot(self, txn);
     }
 
     fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError> {
@@ -728,7 +756,7 @@ async fn handle_simple_query(
         if let Some(ctl) = txn_control(stmt) {
             let proceed = match ctl {
                 TxnControl::Begin => {
-                    run_begin(stream, txn).await?;
+                    run_begin(stream, session, txn).await?;
                     true
                 }
                 // A failed COMMIT writes an ErrorResponse and returns `false`, so
@@ -785,7 +813,7 @@ async fn handle_simple_query(
         // (STL-131). `bind_ddl` is the classifier: `Ok` means it is DDL, a
         // non-`NotDdl` error means it is malformed DDL we surface as such.
         match bind_ddl(stmt) {
-            Ok(_) => match run_ddl(session, stmt) {
+            Ok(_) => match run_ddl(session, stmt, txn) {
                 Ok(tag) => write_command_complete_tag(stream, tag).await?,
                 Err(e) => {
                     info!(query = %sql, error = %e, "DDL failed");
@@ -827,12 +855,29 @@ async fn handle_simple_query(
 
 /// `BEGIN` / `START TRANSACTION` — open an explicit transaction block ([STL-174]).
 ///
-/// From idle this enters [`ConnTxn::Active`] with an empty write buffer. A `BEGIN`
-/// already inside a transaction (active or aborted) leaves the state untouched —
-/// Postgres warns but stays in the block — and still reports `BEGIN`.
-async fn run_begin(stream: &mut TcpStream, txn: &mut ConnTxn) -> Result<(), WireError> {
+/// From idle this enters [`ConnTxn::Active`] with an empty write buffer, **pinning
+/// the transaction's read snapshot** through [`SessionHandle::begin`] so every
+/// statement in the block reads one consistent system-time snapshot (snapshot
+/// isolation, [STL-175]). A `BEGIN` already inside a transaction (active or
+/// aborted) leaves the state — and the pinned snapshot — untouched, as Postgres
+/// warns but stays in the block, and still reports `BEGIN`.
+///
+/// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
+/// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+async fn run_begin(
+    stream: &mut TcpStream,
+    session: &SharedSession,
+    txn: &mut ConnTxn,
+) -> Result<(), WireError> {
     if matches!(txn, ConnTxn::Idle) {
-        *txn = ConnTxn::Active(SessionTransaction::new());
+        // Pin the read snapshot now, at BEGIN. The guard is taken and released
+        // entirely within this synchronous call — never held across the `await`
+        // below — and a poisoned mutex is recovered, as in `run_ddl`.
+        let buffered = session
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .begin();
+        *txn = ConnTxn::Active(buffered);
     }
     write_command_complete_tag(stream, "BEGIN")
         .await
@@ -1033,16 +1078,37 @@ fn commit_txn(session: &SharedSession, txn: SessionTransaction) -> Result<(), En
 /// so it is never held across the caller's `await` writes. A poisoned mutex is
 /// recovered rather than propagated, so one panicking connection cannot wedge
 /// the whole server.
-fn run_ddl(session: &SharedSession, stmt: &Statement) -> Result<&'static str, EngineError> {
+///
+/// DDL auto-commits even inside a `BEGIN` block (transactional DDL is deferred).
+/// When a transaction is open, the committed DDL's catalog change is made visible
+/// to the rest of the block by advancing the transaction's pinned snapshot
+/// ([`SessionHandle::repin_snapshot`], [STL-175]) — under the same lock as the DDL
+/// — so a later `INSERT`/`SELECT` resolves the table it created/dropped.
+///
+/// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+fn run_ddl(
+    session: &SharedSession,
+    stmt: &Statement,
+    txn: &mut ConnTxn,
+) -> Result<&'static str, EngineError> {
     let mut engine = session.lock().unwrap_or_else(PoisonError::into_inner);
-    match engine.execute(stmt)? {
-        StatementOutcome::Ddl { tag } => Ok(tag),
+    let tag = match engine.execute(stmt)? {
+        StatementOutcome::Ddl { tag } => {
+            if let ConnTxn::Active(buffered) = txn {
+                engine.repin_snapshot(buffered);
+            }
+            tag
+        }
         // `bind_ddl` already classified this as DDL, so `execute` routes it to the
         // DDL arm; any other outcome would be an internal contract break.
-        StatementOutcome::Rows(_) | StatementOutcome::Dml(_) => Err(EngineError::Unsupported(
-            "DDL statement unexpectedly produced a non-DDL outcome",
-        )),
-    }
+        StatementOutcome::Rows(_) | StatementOutcome::Dml(_) => {
+            return Err(EngineError::Unsupported(
+                "DDL statement unexpectedly produced a non-DDL outcome",
+            ));
+        }
+    };
+    drop(engine); // release the session lock before returning (clippy: drop-tightening)
+    Ok(tag)
 }
 
 /// Route a table `SELECT` or an `INSERT` / `UPDATE` / `DELETE` through the session
@@ -1099,23 +1165,25 @@ async fn run_statement(
 /// mutex entirely within this synchronous call (never held across the caller's
 /// `await` writes). A poisoned mutex is recovered, as in [`run_ddl`].
 ///
-/// When a transaction is open ([`ConnTxn::Active`]) an `INSERT`/`UPDATE`/`DELETE`
-/// is **buffered** into it rather than committed — its `CommandComplete` reports
-/// the would-be affected count and the write applies later at `COMMIT` ([STL-174]).
-/// A `SELECT` (or anything not DML) still runs immediately against the committed
-/// state; the buffer is write-only until commit.
+/// When a transaction is open ([`ConnTxn::Active`]) the statement runs through
+/// [`SessionHandle::execute_in_txn`]: an `INSERT`/`UPDATE`/`DELETE` is **buffered**
+/// into it rather than committed — its `CommandComplete` reports the would-be
+/// affected count and the write applies later at `COMMIT` ([STL-174]) — while a
+/// `SELECT` (or anything not DML) runs immediately against the transaction's
+/// **pinned snapshot** ([STL-175]), not the latest committed state. Outside a
+/// transaction each statement auto-commits at the current snapshot.
 fn run_query(
     session: &SharedSession,
     stmt: &Statement,
     txn: &mut ConnTxn,
 ) -> Result<StatementOutcome, EngineError> {
     let mut engine = session.lock().unwrap_or_else(PoisonError::into_inner);
-    if let ConnTxn::Active(buffered) = txn {
-        if let Some(summary) = engine.stage_dml(stmt, buffered)? {
-            return Ok(StatementOutcome::Dml(summary));
-        }
+    match txn {
+        ConnTxn::Active(buffered) => engine.execute_in_txn(stmt, buffered),
+        // `Idle` auto-commits; `Failed` never reaches here (the dispatch refuses
+        // statements in an aborted block before routing).
+        ConnTxn::Idle | ConnTxn::Failed => engine.execute(stmt),
     }
-    engine.execute(stmt)
 }
 
 /// The `RowDescription` field descriptors for a [`SelectResult`] — one per
@@ -1197,6 +1265,8 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
         }
         // A schema that changed under a bound write — concurrent-ish schema drift.
         EngineError::SchemaChanged { .. } => SQLSTATE_INTERNAL_ERROR,
+        // A write-write conflict at COMMIT — the retryable serialization failure.
+        EngineError::Conflict => SQLSTATE_SERIALIZATION_FAILURE,
     }
 }
 
@@ -1601,7 +1671,7 @@ fn execute_stmt(
     }
     match bind_ddl(stmt) {
         Ok(_) => {
-            let tag = run_ddl(session, stmt).map_err(|e| ExecError {
+            let tag = run_ddl(session, stmt, txn).map_err(|e| ExecError {
                 sqlstate: sqlstate_for(&e),
                 message: e.to_string(),
             })?;
