@@ -270,6 +270,35 @@ impl Vector {
         }
     }
 
+    /// Gather cells at `rows` into a new vector of the same type, taking the
+    /// cell value for a `Some(r)` index and a NULL cell for a `None` index.
+    ///
+    /// The row-selection the hash-aggregation operator
+    /// ([`crate::hash_aggregate`]) uses to assemble its output columns: a group's
+    /// representative row for a passed-through grouping key, the row holding a
+    /// group's extreme value for `MIN` / `MAX`, or `None` for a group whose
+    /// `MIN` / `MAX` saw only NULLs. Type-preserving and total — every index in
+    /// `rows` must be in range for a `Some`, which the operator guarantees by
+    /// only ever naming rows of the vector it gathers from.
+    ///
+    /// # Panics
+    ///
+    /// If a `Some(r)` index is out of range.
+    #[must_use]
+    pub fn gather(&self, rows: &[Option<usize>]) -> Self {
+        fn pick<T: Clone>(cells: &[Option<T>], rows: &[Option<usize>]) -> Vec<Option<T>> {
+            rows.iter()
+                .map(|slot| slot.and_then(|r| cells[r].clone()))
+                .collect()
+        }
+        match self {
+            Self::Bool(v) => Self::Bool(pick(v, rows)),
+            Self::Int4(v) => Self::Int4(pick(v, rows)),
+            Self::Int8(v) => Self::Int8(pick(v, rows)),
+            Self::Text(v) => Self::Text(pick(v, rows)),
+        }
+    }
+
     /// Bridge a storage [`Column`] into the typed, nullable evaluation form,
     /// decoding by the column's `ty`.
     ///

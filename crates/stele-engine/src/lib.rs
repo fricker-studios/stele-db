@@ -38,7 +38,7 @@
 //! [STL-149]: https://allegromusic.atlassian.net/browse/STL-149
 //! [ADR-0010]: ../../../docs/adr/0010-deterministic-simulation-testing.md
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -49,12 +49,15 @@ use stele_common::row_codec::{self, RowCodecError};
 use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
 use stele_common::types::{LogicalType, ScalarValue};
 use stele_exec::{
-    Batch, CmpOp, Column, DEFAULT_BATCH_SIZE, ExplodePayload, Expr, Filter, Operator, ScanError,
-    ScanSource, SnapshotScan, evaluate,
+    AggregateFunc as ExecAggregateFunc, Aggregator, Batch, CmpOp, Column, DEFAULT_BATCH_SIZE,
+    ExplodePayload, Expr, Filter, Operator, ScanError, ScanSource, SnapshotScan, Vector, evaluate,
+    hash_aggregate,
 };
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::dml::{BoundDml, DmlError};
-use stele_sql::select::{BoundPredicate, BoundSelect, Projection, SelectError};
+use stele_sql::select::{
+    AggregateFunc, BoundAggregate, BoundPredicate, BoundSelect, OutputItem, Projection, SelectError,
+};
 use stele_sql::{BindContext, BindError, Statement, bind_ddl, bind_dml, bind_select};
 use stele_storage::backend::Disk;
 use stele_storage::delta::{BusinessKey, Snapshot};
@@ -785,6 +788,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     ///
     /// The schema is resolved at the read snapshot, so an `AS OF` read names and
     /// types its columns under the schema version live then.
+    ///
+    /// A `GROUP BY` / aggregate query ([STL-171]) folds the same reconstructed,
+    /// filtered rows into grouped output ([`run_aggregate`]); a plain query
+    /// projects them.
     fn run_select(&self, bound: &BoundSelect) -> Result<StatementOutcome, EngineError> {
         let table = bound.table.as_str();
         let snapshot = bound.snapshot;
@@ -807,26 +814,57 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .collect();
         let value_count = schema_columns.len().saturating_sub(1);
 
-        // The output header and the schema-column indices it projects, computed
-        // once: both the constant-period short-circuit and the materialized result
-        // report exactly these columns.
+        // Reconstruct the full rows [key, value cells…] live at the snapshot, after
+        // the `WHERE` filter, through the vectorized operator pipeline ([STL-206]).
+        let rows = Self::scan_rows(bound, state, &schema_columns, value_count)?;
+
+        // An aggregate query folds those rows into grouped output ([STL-171]); a
+        // plain query projects them.
+        if let Some(agg) = &bound.aggregate {
+            return Ok(StatementOutcome::Rows(run_aggregate(
+                agg,
+                &schema_columns,
+                &rows,
+            )?));
+        }
+
         let projection = projection_indices(&bound.projection, &schema_columns);
-        let columns: Vec<(String, LogicalType)> = projection
+        let columns = projection
             .iter()
             .map(|&i| schema_columns[i].clone())
             .collect();
+        let out_rows: Vec<Vec<Option<Vec<u8>>>> = rows
+            .iter()
+            .map(|full| projection.iter().map(|&i| full[i].clone()).collect())
+            .collect();
+        Ok(StatementOutcome::Rows(SelectResult {
+            columns,
+            rows: out_rows,
+        }))
+    }
 
-        // A constant period predicate ([STL-165]) is a whole-`WHERE` filter that
-        // folds to a single truth value: when it is false no row qualifies, so the
-        // scan is skipped and an empty result with the correct header is returned
-        // (never a silently-unfiltered read). A true predicate constrains no
-        // individual row, so the pipeline below proceeds unfiltered.
+    /// Resolve a bound `SELECT`'s rows through the vectorized operator pipeline
+    /// ([STL-206], ADR-0027): the scan source emits `(business_key, payload)`
+    /// batches, [`ExplodePayload`] slices the packed payload into first-class typed
+    /// value columns in schema order (position 0 the key, position i+1 value column
+    /// i), and the [`Filter`] operator evaluates the bound `WHERE <col> = <lit>`
+    /// over each batch via `eval_expr`. Returns each surviving row as a full
+    /// `[business key, value cells…]` tuple — the shared input the projection (a
+    /// plain `SELECT`) and the aggregation ([`run_aggregate`], [STL-171]) both read.
+    ///
+    /// A constant period predicate ([STL-165]) that folds false excludes every row,
+    /// so no scan runs (never a silently-unfiltered read). A key-equality predicate
+    /// is pushed down to the scan for zone-map pruning; the same `Filter` re-applies
+    /// it so the answer is exact regardless of what the prune could prove.
+    fn scan_rows(
+        bound: &BoundSelect,
+        state: &TableState<C, D>,
+        schema_columns: &[(String, LogicalType)],
+        value_count: usize,
+    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
         if let Some(p) = &bound.period_filter {
             if !evaluate(p.predicate, p.left, p.right) {
-                return Ok(StatementOutcome::Rows(SelectResult {
-                    columns,
-                    rows: Vec::new(),
-                }));
+                return Ok(Vec::new());
             }
         }
 
@@ -848,29 +886,20 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             state.engine.delta(),
             state.engine.index(),
             &readers,
-            Snapshot(snapshot),
+            Snapshot(bound.snapshot),
         )
         .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
         .filter(predicate);
         // Pin the valid axis too when the bound plan carries a `FOR VALID_TIME
-        // AS OF v` instant ([STL-164]). `bind_select` sets `valid_snapshot` only
-        // for a table that opts into a valid-time period, so turning on both-axes
-        // resolution here is sound; the micros name the same instant, reinterpreted
-        // on the valid axis. `None` leaves the scan system-only — byte-for-byte the
-        // prior behavior.
+        // AS OF v` instant ([STL-164]); `None` leaves the scan system-only.
         if let Some(v) = bound.valid_snapshot {
             scan = scan.valid_as_of(ValidTimeMicros(v.0));
         }
 
-        // The vectorized read pipeline ([STL-206], ADR-0027): the scan source emits
-        // `(business_key, payload)` batches; `ExplodePayload` slices the packed
-        // payload into first-class typed value columns (schema order: position 0 the
-        // key, position i+1 value column i); the `Filter` operator evaluates the
-        // bound `WHERE <col> = <lit>` over the whole batch via `eval_expr`, replacing
-        // the old row-at-a-time decode-and-compare loop. Columns are addressed by
-        // position — an exploded value column has no `ColumnId` of its own — so the
-        // projection is applied positionally below rather than through the
-        // id-addressed `Project` operator.
+        // ScanSource → ExplodePayload → [Filter]: explode the packed payload into
+        // first-class typed value columns (schema order: position 0 the key,
+        // position i+1 value column i), then filter the whole batch. Exploded value
+        // columns have no `ColumnId`, so the full row is read positionally.
         let source = ScanSource::new(scan, DEFAULT_BATCH_SIZE);
         let exploded = ExplodePayload::new(source, value_count);
         let mut pipeline: Box<dyn Operator + '_> = match &bound.filter {
@@ -881,18 +910,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             None => Box::new(exploded),
         };
 
+        let ncols = value_count + 1;
         let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
         while let Some(batch) = pipeline.next()? {
             for r in 0..batch.rows {
-                rows.push(
-                    projection
-                        .iter()
-                        .map(|&i| batch_cell(&batch, i, r))
-                        .collect(),
-                );
+                rows.push((0..ncols).map(|i| batch_cell(&batch, i, r)).collect());
             }
         }
-        Ok(StatementOutcome::Rows(SelectResult { columns, rows }))
+        Ok(rows)
     }
 
     /// Apply a bound DML statement to the table's tiers under fresh provenance,
@@ -1368,6 +1393,94 @@ fn projection_indices(projection: &Projection, columns: &[(String, LogicalType)]
                     .expect("bind_select validated the projected column exists")
             })
             .collect(),
+    }
+}
+
+/// Fold reconstructed rows into grouped aggregate output ([STL-171]).
+///
+/// Decodes the schema columns the plan references into typed, nullable
+/// [`Vector`]s, runs the vectorized [`hash_aggregate`], then re-interleaves the
+/// grouping and aggregate columns into SELECT-list order, encoding each output
+/// cell back to its canonical bytes for the wire. `rows` are the full rows
+/// (`[business key, value cells…]`) the scan produced after `WHERE`; `row_count`
+/// of `0` still yields one row for an ungrouped aggregate (`COUNT(*)` is `0`).
+fn run_aggregate(
+    agg: &BoundAggregate,
+    schema_columns: &[(String, LogicalType)],
+    rows: &[Vec<Option<Vec<u8>>>],
+) -> Result<SelectResult, EngineError> {
+    // Decode each referenced schema column into a typed vector; a column the plan
+    // never reads stays an empty placeholder the evaluator never touches (the same
+    // discipline the Filter operator uses).
+    let mut columns: Vec<Vector> = (0..schema_columns.len())
+        .map(|_| Vector::Bool(Vec::new()))
+        .collect();
+    for &i in &referenced_columns(agg) {
+        let cells: Vec<Option<Vec<u8>>> = rows.iter().map(|r| r[i].clone()).collect();
+        columns[i] = Vector::from_column(schema_columns[i].1, &Column::Bytes(cells))
+            .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
+    }
+
+    // Lower the bound plan to the executor's grouping keys + aggregators, both
+    // addressing columns by schema index.
+    let group_keys: Vec<Expr> = agg.group_by.iter().map(|&i| Expr::col(i)).collect();
+    let aggregators: Vec<Aggregator> = agg
+        .aggregates
+        .iter()
+        .map(|call| Aggregator {
+            func: lower_aggregate_func(call.func),
+            arg: call.arg.map(Expr::col),
+        })
+        .collect();
+
+    let out = hash_aggregate(&group_keys, &aggregators, &columns, rows.len())
+        .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
+
+    // Re-interleave grouping + aggregate columns into SELECT-list order and encode
+    // each cell back to its canonical bytes (`None` → a SQL NULL on the wire).
+    let output: Vec<&Vector> = agg
+        .items
+        .iter()
+        .map(|item| match item {
+            OutputItem::Group(j) => &out.groups[*j],
+            OutputItem::Aggregate(k) => &out.aggregates[*k],
+        })
+        .collect();
+    let result_rows: Vec<Vec<Option<Vec<u8>>>> = (0..out.num_groups)
+        .map(|g| {
+            output
+                .iter()
+                .map(|v| v.get(g).as_ref().map(encode_value))
+                .collect()
+        })
+        .collect();
+
+    Ok(SelectResult {
+        columns: agg.columns.clone(),
+        rows: result_rows,
+    })
+}
+
+/// The schema-column indices an aggregate plan reads — the union of its grouping
+/// columns and its aggregate arguments (`COUNT(*)` has none), ascending and
+/// deduplicated, so each is decoded into a vector once.
+fn referenced_columns(agg: &BoundAggregate) -> Vec<usize> {
+    let mut set: BTreeSet<usize> = BTreeSet::new();
+    set.extend(agg.group_by.iter().copied());
+    set.extend(agg.aggregates.iter().filter_map(|call| call.arg));
+    set.into_iter().collect()
+}
+
+/// Map a bound [`AggregateFunc`] to the executor's `ExecAggregateFunc`. The two
+/// enums are parallel; stele-sql and stele-exec do not depend on each other, so
+/// the engine is the lowering point.
+const fn lower_aggregate_func(func: AggregateFunc) -> ExecAggregateFunc {
+    match func {
+        AggregateFunc::Count => ExecAggregateFunc::Count,
+        AggregateFunc::Sum => ExecAggregateFunc::Sum,
+        AggregateFunc::Min => ExecAggregateFunc::Min,
+        AggregateFunc::Max => ExecAggregateFunc::Max,
+        AggregateFunc::Avg => ExecAggregateFunc::Avg,
     }
 }
 
@@ -2710,6 +2823,112 @@ mod tests {
                 .rows
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn group_by_and_aggregates_end_to_end() {
+        // STL-171: grouped + ungrouped aggregates, incl. NULL handling, end-to-end
+        // through the session engine.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_WIDE)).expect("create");
+        for sql in [
+            "INSERT INTO t VALUES (1, 10, 'x')",
+            "INSERT INTO t VALUES (2, 10, 'y')",
+            "INSERT INTO t VALUES (3, 20, 'x')",
+            "INSERT INTO t VALUES (4, 20, NULL)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+
+        // Grouped: COUNT(*) and SUM(id) per `a`. Groups emit in key order (10, 20).
+        let r = select(&mut engine, "SELECT a, COUNT(*), SUM(id) FROM t GROUP BY a");
+        assert_eq!(
+            r.columns,
+            vec![
+                ("a".to_owned(), LogicalType::Int4),
+                ("count".to_owned(), LogicalType::Int8),
+                ("sum".to_owned(), LogicalType::Int8),
+            ]
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![
+                    cell(Some(ScalarValue::Int4(10))),
+                    cell(Some(ScalarValue::Int8(2))),
+                    cell(Some(ScalarValue::Int8(3))), // ids 1 + 2
+                ],
+                vec![
+                    cell(Some(ScalarValue::Int4(20))),
+                    cell(Some(ScalarValue::Int8(2))),
+                    cell(Some(ScalarValue::Int8(7))), // ids 3 + 4
+                ],
+            ]
+        );
+
+        // Ungrouped MIN / MAX / AVG: MIN/MAX keep the argument type (int4), AVG is
+        // the truncated integer mean as int8. (10+10+20+20)/4 = 15.
+        let r = select(&mut engine, "SELECT MIN(a), MAX(a), AVG(a) FROM t");
+        assert_eq!(
+            r.columns,
+            vec![
+                ("min".to_owned(), LogicalType::Int4),
+                ("max".to_owned(), LogicalType::Int4),
+                ("avg".to_owned(), LogicalType::Int8),
+            ]
+        );
+        assert_eq!(
+            r.rows,
+            vec![vec![
+                cell(Some(ScalarValue::Int4(10))),
+                cell(Some(ScalarValue::Int4(20))),
+                cell(Some(ScalarValue::Int8(15))),
+            ]]
+        );
+
+        // COUNT(*) counts rows; COUNT(b) skips the one NULL `b`.
+        let r = select(&mut engine, "SELECT COUNT(*), COUNT(b) FROM t");
+        assert_eq!(
+            r.rows,
+            vec![vec![
+                cell(Some(ScalarValue::Int8(4))),
+                cell(Some(ScalarValue::Int8(3))),
+            ]]
+        );
+
+        // GROUP BY a column with a NULL: the NULL forms its own group, sorting
+        // first (NULL before any present key).
+        let r = select(&mut engine, "SELECT b, COUNT(*) FROM t GROUP BY b");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![cell(None), cell(Some(ScalarValue::Int8(1)))], // NULL b: row 4
+                vec![
+                    cell(Some(ScalarValue::Text("x".to_owned()))),
+                    cell(Some(ScalarValue::Int8(2))), // rows 1, 3
+                ],
+                vec![
+                    cell(Some(ScalarValue::Text("y".to_owned()))),
+                    cell(Some(ScalarValue::Int8(1))), // row 2
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn ungrouped_aggregate_over_an_empty_table_returns_one_row() {
+        // `SELECT COUNT(*), SUM(a) FROM empty` → exactly one row: COUNT 0, SUM NULL.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_WIDE)).expect("create");
+        let r = select(&mut engine, "SELECT COUNT(*), SUM(a) FROM t");
+        assert_eq!(
+            r.rows,
+            vec![vec![cell(Some(ScalarValue::Int8(0))), cell(None)]]
+        );
+
+        // A grouped aggregate over the empty table returns *no* rows.
+        let r = select(&mut engine, "SELECT a, COUNT(*) FROM t GROUP BY a");
+        assert!(r.rows.is_empty());
     }
 
     #[test]
