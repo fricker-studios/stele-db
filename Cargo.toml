@@ -67,6 +67,10 @@ serde              = { version = "1.0", features = ["derive"] }
 # `recursive-protection` (a default feature) pulls `stacker` → a build-dep that
 # needs a newer toolchain than our pinned 1.85; we drop it and keep just `std`.
 sqlparser          = { version = "0.62", default-features = false, features = ["std"] }
+# Line editing for `stele shell` (STL-198): ↑/↓ history, Emacs keys, ⌃L. MIT;
+# default features off — no file/sqlite history, no fuzzy matcher, no dirs probe.
+# CLI-only: never a dependency of the server or the runtime-agnostic core.
+rustyline          = { version = "18.0", default-features = false }
 thiserror          = "2.0"
 toml               = "0.8"
 tokio              = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }

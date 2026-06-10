@@ -22,6 +22,7 @@ stele-common = { workspace = true }
 anyhow       = { workspace = true }
 clap         = { workspace = true }
 tokio        = { workspace = true }
+rustyline    = { workspace = true }
 
 [dev-dependencies]
 # The scripted-shell integration test boots an in-process engine + pgwire

@@ -25,6 +25,8 @@ use std::net::TcpStream;
 
 use anyhow::{Context as _, bail};
 
+use crate::render::Column;
+
 // Backend message types this client consumes (the post-startup stream).
 const MSG_AUTHENTICATION: u8 = b'R';
 const MSG_READY_FOR_QUERY: u8 = b'Z';
@@ -44,12 +46,30 @@ const PROTOCOL_VERSION: i32 = 196_608;
 /// row-at-a-time and small; anything larger means a desynchronized stream.
 const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024;
 
-/// One result set: the `RowDescription` column names plus every `DataRow`,
-/// cells decoded from text format (`None` = SQL `NULL`).
+/// One result set: the `RowDescription` columns (name + type OID) plus every
+/// `DataRow`, cells decoded from text format (`None` = SQL `NULL`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultSet {
-    pub columns: Vec<String>,
+    pub columns: Vec<Column>,
     pub rows: Vec<Vec<Option<String>>>,
+}
+
+/// A decoded `ErrorResponse`: the fields the shell renders as the psql-style
+/// `ERROR:` / `SQLSTATE:` / `HINT:` block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerError {
+    pub severity: String,
+    /// The SQLSTATE code (field `C`), empty when the server omitted it.
+    pub code: String,
+    pub message: String,
+    /// Optional hint (field `H`).
+    pub hint: Option<String>,
+}
+
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.severity, self.message)
+    }
 }
 
 /// What one statement inside a simple-query round-trip produced.
@@ -59,9 +79,9 @@ pub enum Reply {
     Rows(ResultSet),
     /// A non-row statement's `CommandComplete` tag (`INSERT 0 1`, `CREATE TABLE`, …).
     Command(String),
-    /// The server rejected the statement (`ErrorResponse`), already rendered
-    /// as `SEVERITY: message`. The connection itself is still good.
-    Error(String),
+    /// The server rejected the statement (`ErrorResponse`). The connection
+    /// itself is still good.
+    Error(ServerError),
     /// An empty query string (`EmptyQueryResponse`).
     Empty,
 }
@@ -231,19 +251,23 @@ fn startup_payload(user: &str, database: &str) -> Vec<u8> {
     body
 }
 
-/// Column names out of a `RowDescription` payload.
-fn parse_row_description(payload: &[u8]) -> anyhow::Result<Vec<String>> {
+/// Columns (name + type OID) out of a `RowDescription` payload.
+fn parse_row_description(payload: &[u8]) -> anyhow::Result<Vec<Column>> {
     let mut pos = 0;
     let nfields = be_u16(payload, &mut pos).context("malformed RowDescription")?;
     let mut columns = Vec::with_capacity(usize::from(nfields));
     for _ in 0..nfields {
-        columns.push(read_cstring(payload, &mut pos).context("malformed RowDescription")?);
+        let name = read_cstring(payload, &mut pos).context("malformed RowDescription")?;
         // Fixed-width remainder of the field descriptor: table oid (4),
         // attnum (2), type oid (4), typlen (2), typmod (4), format (2).
+        let type_oid = be_i32(payload, pos + 6)
+            .and_then(|oid| u32::try_from(oid).ok())
+            .context("RowDescription truncated")?;
         pos += 18;
         if pos > payload.len() {
             bail!("RowDescription truncated");
         }
+        columns.push(Column { name, type_oid });
     }
     Ok(columns)
 }
@@ -273,10 +297,15 @@ fn parse_data_row(payload: &[u8]) -> anyhow::Result<Vec<Option<String>>> {
     Ok(cells)
 }
 
-/// Render an `ErrorResponse` payload as `SEVERITY: message`.
-fn parse_error(payload: &[u8]) -> String {
-    let mut severity = "ERROR".to_owned();
-    let mut message = "(no message)".to_owned();
+/// Decode an `ErrorResponse` payload into its severity / SQLSTATE / message /
+/// hint fields.
+fn parse_error(payload: &[u8]) -> ServerError {
+    let mut error = ServerError {
+        severity: "ERROR".to_owned(),
+        code: String::new(),
+        message: "(no message)".to_owned(),
+        hint: None,
+    };
     let mut pos = 0;
     while let Some(&code) = payload.get(pos) {
         if code == 0 {
@@ -287,12 +316,14 @@ fn parse_error(payload: &[u8]) -> String {
             break;
         };
         match code {
-            b'S' => severity = value,
-            b'M' => message = value,
+            b'S' => error.severity = value,
+            b'C' => error.code = value,
+            b'M' => error.message = value,
+            b'H' => error.hint = Some(value),
             _ => {}
         }
     }
-    format!("{severity}: {message}")
+    error
 }
 
 /// A NUL-terminated string starting at `*pos`; advances past the terminator.
@@ -324,14 +355,16 @@ fn be_i32(payload: &[u8], at: usize) -> Option<i32> {
 mod tests {
     use super::*;
 
-    /// Build a `RowDescription` payload for the given column names.
-    fn row_description(names: &[&str]) -> Vec<u8> {
+    /// Build a `RowDescription` payload for the given `(name, type oid)`s.
+    fn row_description(fields: &[(&str, u32)]) -> Vec<u8> {
         let mut p = Vec::new();
-        p.extend_from_slice(&u16::try_from(names.len()).unwrap().to_be_bytes());
-        for name in names {
+        p.extend_from_slice(&u16::try_from(fields.len()).unwrap().to_be_bytes());
+        for (name, oid) in fields {
             p.extend_from_slice(name.as_bytes());
             p.push(0);
-            p.extend_from_slice(&[0_u8; 18]); // oid/attnum/typoid/typlen/typmod/format
+            p.extend_from_slice(&[0_u8; 6]); // table oid + attnum
+            p.extend_from_slice(&oid.to_be_bytes());
+            p.extend_from_slice(&[0_u8; 8]); // typlen + typmod + format
         }
         p
     }
@@ -353,14 +386,20 @@ mod tests {
     }
 
     #[test]
-    fn row_description_yields_column_names_in_order() {
-        let payload = row_description(&["id", "balance"]);
-        assert_eq!(parse_row_description(&payload).unwrap(), ["id", "balance"]);
+    fn row_description_yields_names_and_type_oids_in_order() {
+        let payload = row_description(&[("id", 23), ("balance", 20)]);
+        let cols = parse_row_description(&payload).unwrap();
+        assert_eq!(
+            cols.iter()
+                .map(|c| (c.name.as_str(), c.type_oid))
+                .collect::<Vec<_>>(),
+            [("id", 23), ("balance", 20)]
+        );
     }
 
     #[test]
     fn truncated_row_description_is_an_error_not_a_panic() {
-        let mut payload = row_description(&["id"]);
+        let mut payload = row_description(&[("id", 23)]);
         payload.truncate(payload.len() - 4);
         assert!(parse_row_description(&payload).is_err());
     }
@@ -384,15 +423,25 @@ mod tests {
     }
 
     #[test]
-    fn error_response_renders_severity_and_message() {
+    fn error_response_decodes_all_fields() {
         let mut p = Vec::new();
-        for (code, value) in [(b'S', "ERROR"), (b'C', "42P01"), (b'M', "no such table")] {
+        for (code, value) in [
+            (b'S', "ERROR"),
+            (b'C', "42P01"),
+            (b'M', "no such table"),
+            (b'H', "Try \\dt."),
+        ] {
             p.push(code);
             p.extend_from_slice(value.as_bytes());
             p.push(0);
         }
         p.push(0);
-        assert_eq!(parse_error(&p), "ERROR: no such table");
+        let err = parse_error(&p);
+        assert_eq!(err.severity, "ERROR");
+        assert_eq!(err.code, "42P01");
+        assert_eq!(err.message, "no such table");
+        assert_eq!(err.hint.as_deref(), Some("Try \\dt."));
+        assert_eq!(err.to_string(), "ERROR: no such table");
     }
 
     #[test]

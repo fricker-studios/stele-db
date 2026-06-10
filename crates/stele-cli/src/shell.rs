@@ -1,31 +1,67 @@
-//! The `stele shell` REPL ([STL-185]): read statements from stdin, run them
-//! over pg-wire via the in-crate [`Client`], render results psql-style.
+//! The `stele shell` REPL — STL-185 mechanics wearing the STL-198 design:
+//! Datum-brand ANSI theming, the prototype's banner/prompt/meta surface, four
+//! table styles, `\x` / `\json` modes, `\timing`, and rustyline editing.
 //!
-//! Behavior notes, all chosen to keep scripted sessions (the integration test,
-//! pipes, heredocs) byte-clean:
+//! Two input paths share one statement handler:
 //!
-//! * Prompts and the banner print **only when stdin is a TTY**; a piped session
-//!   produces nothing but results.
-//! * A statement is sent when its buffer ends with `;` — statements may span
-//!   lines, and meta-commands are recognized only at a statement boundary.
-//! * SQL errors print to **stderr** (`ERROR: …`) and the session continues;
-//!   transport errors end the shell with a non-zero exit.
+//! * **Interactive** (stdin is a TTY): rustyline line editing — ↑/↓ history
+//!   (100 entries, consecutive dups collapsed), live syntax highlighting, ⌃L
+//!   clear, ⌃C cancels the buffered statement, ⌃D quits.
+//! * **Scripted** (piped): the plain `BufRead` loop. No prompts, no banner, no
+//!   escapes — output stays byte-clean for tests and pipelines.
 //!
-//! [STL-185]: https://allegromusic.atlassian.net/browse/STL-185
+//! SQL errors render as the psql-style `ERROR:` / `SQLSTATE:` / `HINT:` block
+//! on stderr and the session continues; transport errors end the shell.
 
-use std::fmt::Write as _;
 use std::io::{BufRead, IsTerminal as _, Write};
+use std::time::Instant;
 
 use anyhow::Context as _;
 
-use crate::client::{Client, Reply, ResultSet};
+use crate::client::{Client, Reply, ResultSet, ServerError};
+use crate::highlight;
+use crate::render::{self, BorderStyle, Column, TableOpts};
+use crate::theme::{Role, Seg, Theme, paint_segs};
 
-/// Connection parameters for `stele shell` (from clap in `main`).
+/// Connection + presentation options for `stele shell` (from clap in `main`).
 pub struct Opts {
     pub host: String,
     pub port: u16,
     pub user: String,
     pub dbname: String,
+    pub border: BorderStyle,
+    pub row_nums: bool,
+    pub no_color: bool,
+}
+
+/// Follow-up tickets the not-yet-wired command tiers point at.
+const TEMPORAL_TICKET: &str = "STL-199";
+const ADMIN_TICKET: &str = "STL-200";
+
+/// Per-session display state (the prototype's toggles), plus the two themes —
+/// stdout and stderr detect color independently.
+// The toggles are genuinely independent booleans (the prototype's switch set),
+// not an enum in disguise.
+#[allow(clippy::struct_excessive_bools)]
+struct Session {
+    theme: Theme,
+    err_theme: Theme,
+    border: BorderStyle,
+    row_nums: bool,
+    timing: bool,
+    expanded: bool,
+    json: bool,
+    interactive: bool,
+    host: String,
+    port: u16,
+    user: String,
+    dbname: String,
+}
+
+/// What a handled line tells the loop to do next.
+enum Flow {
+    Continue,
+    Quit,
 }
 
 /// Connect and run the REPL over stdin/stdout until `\q` or EOF.
@@ -38,98 +74,458 @@ pub fn run(opts: &Opts) -> anyhow::Result<()> {
         .context("starting stele shell")?;
     let stdin = std::io::stdin();
     let interactive = stdin.is_terminal();
+    let mut session = Session {
+        theme: if opts.no_color {
+            Theme::plain()
+        } else {
+            Theme::detect(std::io::stdout().is_terminal())
+        },
+        err_theme: if opts.no_color {
+            Theme::plain()
+        } else {
+            Theme::detect(std::io::stderr().is_terminal())
+        },
+        border: opts.border,
+        row_nums: opts.row_nums,
+        timing: false,
+        expanded: false,
+        json: false,
+        interactive,
+        host: opts.host.clone(),
+        port: opts.port,
+        user: opts.user.clone(),
+        dbname: opts.dbname.clone(),
+    };
+
     if interactive {
-        println!(
-            "stele shell — connected to {}:{} as {}.\nType \\q to quit, \\d <table> to describe a table; statements end with ;",
-            opts.host, opts.port, opts.user
-        );
+        let mut out = std::io::stdout().lock();
+        banner(&session, &mut out)?;
+        drop(out);
+        repl_interactive(&mut client, &mut session)
+    } else {
+        repl_scripted(&mut client, &mut session, stdin.lock(), std::io::stdout())
     }
-    repl(&mut client, stdin.lock(), std::io::stdout(), interactive)
 }
 
-/// The REPL proper, over injected streams so the loop is host-agnostic.
-fn repl(
+/// The scripted (piped) loop: plain lines in, plain results out.
+fn repl_scripted(
     client: &mut Client,
+    session: &mut Session,
     input: impl BufRead,
     mut out: impl Write,
-    interactive: bool,
 ) -> anyhow::Result<()> {
     let mut buffer = String::new();
-    if interactive {
-        prompt(client, &buffer, &mut out)?;
-    }
     for line in input.lines() {
         let line = line.context("reading stdin")?;
-
-        // Meta-commands are lines of their own, between statements.
-        if buffer.trim().is_empty() {
-            match parse_meta(&line) {
-                Some(Meta::Quit) => return Ok(()),
-                Some(Meta::Describe(Some(name))) => {
-                    describe(client, name, &mut out)?;
-                    if interactive {
-                        prompt(client, &buffer, &mut out)?;
-                    }
-                    continue;
-                }
-                Some(Meta::Describe(None)) => {
-                    eprintln!(r"\d needs a table name in v0.2 — usage: \d <table>");
-                    if interactive {
-                        prompt(client, &buffer, &mut out)?;
-                    }
-                    continue;
-                }
-                Some(Meta::Unknown(cmd)) => {
-                    eprintln!(r"unknown meta-command {cmd} — try \d <table> or \q");
-                    if interactive {
-                        prompt(client, &buffer, &mut out)?;
-                    }
-                    continue;
-                }
-                None => {}
-            }
-        }
-
-        buffer.push_str(&line);
-        buffer.push('\n');
-        if statement_complete(&buffer) {
-            let sql = std::mem::take(&mut buffer);
-            run_statement(client, sql.trim(), &mut out)?;
-        }
-        if interactive {
-            prompt(client, &buffer, &mut out)?;
+        if matches!(
+            handle_line(client, session, &mut out, &mut buffer, &line)?,
+            Flow::Quit
+        ) {
+            return Ok(());
         }
     }
     Ok(())
 }
 
-/// Send one buffered statement (or batch) and render every reply.
-fn run_statement(client: &mut Client, sql: &str, out: &mut impl Write) -> anyhow::Result<()> {
-    for reply in client.simple_query(sql)? {
-        match reply {
-            Reply::Rows(set) => out
-                .write_all(render_table(&set.columns, &set.rows).as_bytes())
-                .context("writing results")?,
-            Reply::Command(tag) => writeln!(out, "{tag}").context("writing results")?,
-            Reply::Error(message) => eprintln!("{message}"),
-            Reply::Empty => {}
+/// The interactive loop: rustyline editing + history + live highlighting.
+fn repl_interactive(client: &mut Client, session: &mut Session) -> anyhow::Result<()> {
+    use rustyline::error::ReadlineError;
+
+    let config = rustyline::Config::builder()
+        .max_history_size(100)
+        .context("configuring history size")?
+        .history_ignore_dups(true)
+        .context("configuring history dedupe")?
+        .auto_add_history(false)
+        .build();
+    let mut rl: rustyline::Editor<ShellHelper, rustyline::history::DefaultHistory> =
+        rustyline::Editor::with_config(config).context("initializing line editor")?;
+    rl.set_helper(Some(ShellHelper {
+        theme: session.theme,
+    }));
+
+    let mut out = std::io::stdout();
+    let mut buffer = String::new();
+    loop {
+        let prompt = prompt_text(client.txn_status(), &buffer);
+        match rl.readline(prompt) {
+            Ok(line) => {
+                if !line.trim().is_empty() {
+                    let _ = rl.add_history_entry(line.as_str());
+                }
+                if matches!(
+                    handle_line(client, session, &mut out, &mut buffer, &line)?,
+                    Flow::Quit
+                ) {
+                    return Ok(());
+                }
+            }
+            // ⌃C cancels the in-flight statement buffer, keeps the session.
+            Err(ReadlineError::Interrupted) => buffer.clear(),
+            // ⌃D at the prompt quits, like psql.
+            Err(ReadlineError::Eof) => return Ok(()),
+            Err(e) => return Err(e).context("reading input"),
         }
     }
-    out.flush().context("flushing results")
 }
 
-/// `\d <table>` — drive the two-query `pg_catalog` introspection sequence the
-/// server's shim answers (STL-131): `pg_class` by name → synthetic oid, then
-/// `pg_attribute` by that oid → one row per column.
-fn describe(client: &mut Client, name: &str, out: &mut impl Write) -> anyhow::Result<()> {
+/// The plain prompt text for the current buffer/transaction state. The
+/// continuation prompt follows the prototype (`stele-# `); the `*`/`!`
+/// transaction markers are a deliberate psql-ism the prototype lacks.
+const fn prompt_text(txn_status: u8, buffer: &str) -> &'static str {
+    if buffer.trim_ascii().is_empty() {
+        match txn_status {
+            b'T' => "stele*=# ",
+            b'E' => "stele!=# ",
+            _ => "stele=# ",
+        }
+    } else {
+        "stele-# "
+    }
+}
+
+/// Feed one input line through meta-command dispatch / statement buffering.
+fn handle_line(
+    client: &mut Client,
+    session: &mut Session,
+    out: &mut impl Write,
+    buffer: &mut String,
+    line: &str,
+) -> anyhow::Result<Flow> {
+    // Meta-commands are lines of their own, between statements.
+    if buffer.trim().is_empty() {
+        if let Some(meta) = parse_meta(line) {
+            return dispatch_meta(client, session, out, &meta);
+        }
+    }
+    buffer.push_str(line);
+    buffer.push('\n');
+    if buffer.trim_end().ends_with(';') {
+        let sql = std::mem::take(buffer);
+        run_statement(client, session, sql.trim(), out)?;
+    }
+    Ok(Flow::Continue)
+}
+
+// ---------------------------------------------------------------------------
+// Meta-commands
+// ---------------------------------------------------------------------------
+
+/// A recognized backslash meta-command (after alias resolution).
+#[derive(Debug, PartialEq, Eq)]
+enum Meta<'a> {
+    Quit,
+    Help,
+    SqlHelp,
+    Describe(Option<&'a str>),
+    ListTables,
+    ListDbs,
+    ConnInfo,
+    Timing,
+    Expanded,
+    Json,
+    Clear,
+    Connect,
+    /// A designed-but-not-yet-wired command (temporal or admin tier).
+    NotYet {
+        cmd: &'a str,
+        ticket: &'static str,
+        why: &'static str,
+    },
+    Unknown(&'a str),
+}
+
+/// Parse a meta-command line; `None` means the line is SQL.
+fn parse_meta(line: &str) -> Option<Meta<'_>> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix('\\')?;
+    let mut parts = rest.split_whitespace();
+    let cmd = parts.next().unwrap_or("");
+    let arg = parts.next();
+    Some(match cmd {
+        "q" => Meta::Quit,
+        "?" => Meta::Help,
+        "h" | "help" => Meta::SqlHelp,
+        "d" => arg.map_or(Meta::ListTables, |name| Meta::Describe(Some(name))),
+        "dt" => Meta::ListTables,
+        "l" | "list" => Meta::ListDbs,
+        "conninfo" => Meta::ConnInfo,
+        "timing" => Meta::Timing,
+        "x" => Meta::Expanded,
+        "json" => Meta::Json,
+        "clear" | "c!" => Meta::Clear,
+        "c" | "connect" => Meta::Connect,
+        "asof" | "history" | "timeline" | "lineage" | "audit" | "segments" => Meta::NotYet {
+            cmd,
+            ticket: TEMPORAL_TICKET,
+            why: "needs the temporal introspection surface",
+        },
+        "status" | "backup" | "restore" | "pitr" | "inspect-segment" | "inspect" => Meta::NotYet {
+            cmd,
+            ticket: ADMIN_TICKET,
+            why: "speaks the admin control-plane API (v0.3)",
+        },
+        _ => Meta::Unknown(trimmed),
+    })
+}
+
+/// Execute one meta-command.
+fn dispatch_meta(
+    client: &mut Client,
+    session: &mut Session,
+    out: &mut impl Write,
+    meta: &Meta<'_>,
+) -> anyhow::Result<Flow> {
+    match meta {
+        Meta::Quit => return Ok(Flow::Quit),
+        Meta::Help => help(session, out)?,
+        Meta::SqlHelp => sql_help(session, out)?,
+        Meta::Describe(Some(name)) => describe(client, session, name, out)?,
+        Meta::Describe(None) | Meta::ListTables => list_tables(client, session, out)?,
+        Meta::ListDbs => list_databases(session, out)?,
+        Meta::ConnInfo => conninfo(session, out)?,
+        Meta::Timing => {
+            session.timing = !session.timing;
+            let msg = if session.timing {
+                "Timing is on."
+            } else {
+                "Timing is off."
+            };
+            write_segs(session, out, &[(Role::Mut, msg.to_owned())])?;
+        }
+        Meta::Expanded => {
+            session.expanded = !session.expanded;
+            let msg = if session.expanded {
+                "Expanded display is on."
+            } else {
+                "Expanded display is off."
+            };
+            write_segs(session, out, &[(Role::Mut, msg.to_owned())])?;
+        }
+        Meta::Json => {
+            session.json = !session.json;
+            let msg = if session.json {
+                "Output format is json."
+            } else {
+                "Output format is aligned table."
+            };
+            write_segs(session, out, &[(Role::Mut, msg.to_owned())])?;
+        }
+        Meta::Clear => {
+            if session.interactive {
+                // Clear screen + scrollback, home the cursor.
+                write!(out, "\x1b[2J\x1b[3J\x1b[H").context("writing results")?;
+                out.flush().context("flushing results")?;
+            }
+        }
+        Meta::Connect => write_segs(
+            session,
+            out,
+            &[(
+                Role::Mut,
+                format!(
+                    "Only one database in dev mode: \"{}\" on {}:{}.",
+                    session.dbname, session.host, session.port
+                ),
+            )],
+        )?,
+        Meta::NotYet { cmd, ticket, why } => write_segs(
+            session,
+            out,
+            &[(
+                Role::Note,
+                format!("NOTICE:  \\{cmd} {why} — coming with {ticket}."),
+            )],
+        )?,
+        Meta::Unknown(cmd) => print_error(
+            session,
+            &usage_error(
+                format!("invalid command {cmd}"),
+                r"Try \? for a list of meta-commands.",
+            ),
+        ),
+    }
+    Ok(Flow::Continue)
+}
+
+/// The `\?` registry — the full designed surface, including the tiers that
+/// still point at their tickets, so the design is discoverable.
+fn help(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
+    let mut lines: Vec<Vec<Seg>> = vec![vec![(Role::Head, "Meta-commands".to_owned())]];
+    let entry = |cmd: &str, desc: &str| -> Vec<Seg> {
+        vec![
+            (Role::Acc, format!("  {cmd:<19}")),
+            (Role::Mut, format!("  {desc}")),
+        ]
+    };
+    let blank = Vec::new;
+    for (cmd, desc) in [
+        (r"\?", "list meta-commands"),
+        (r"\h", "SQL syntax help"),
+        (r"\d [name]", "describe a table (or list relations)"),
+        (r"\dt", "list tables"),
+        (r"\l", "list databases"),
+        (r"\conninfo", "current connection"),
+    ] {
+        lines.push(entry(cmd, desc));
+    }
+    lines.push(blank());
+    for (cmd, desc) in [
+        (
+            r"\asof <ts|reset>",
+            "set a session AS OF (time-travel) context",
+        ),
+        (r"\history T [pk]", "append-only version timeline of a row"),
+        (r"\timeline T <pk>", "a value across system-time"),
+        (
+            r"\lineage T <pk>",
+            "provenance — which txn wrote each version",
+        ),
+        (r"\audit [T]", "verify the tamper-evident hash chain"),
+        (r"\segments [T]", "columnar segments + zone maps"),
+    ] {
+        lines.push(entry(cmd, desc));
+    }
+    lines.push(blank());
+    for (cmd, desc) in [
+        (r"\status", "engine health  (control-plane)"),
+        (
+            r"\backup [--to URI]",
+            "consistent snapshot backup  (control-plane)",
+        ),
+        (r"\restore URI", "restore from a backup  (control-plane)"),
+        (
+            r"\pitr <ts>",
+            "point-in-time recovery plan  (control-plane)",
+        ),
+        (r"\inspect-segment ID", "dump a segment footer + zone maps"),
+    ] {
+        lines.push(entry(cmd, desc));
+    }
+    lines.push(blank());
+    for (cmd, desc) in [
+        (r"\timing", "toggle query timing"),
+        (r"\x", "toggle expanded display"),
+        (r"\json", "toggle aligned / json output"),
+        (r"\clear", "clear the screen  (⌃L)"),
+        (r"\q", "quit"),
+    ] {
+        lines.push(entry(cmd, desc));
+    }
+    lines.push(blank());
+    lines.push(vec![
+        (Role::Head, "  SQL".to_owned()),
+        (
+            Role::Mut,
+            "   statements end with ;  ·  time-travel any query with ".to_owned(),
+        ),
+        (Role::Kw, "FOR SYSTEM_TIME AS OF <ts>".to_owned()),
+    ]);
+    write_lines(session, out, &lines)
+}
+
+/// The `\h` SQL crib — the four statement shapes plus the thesis line.
+fn sql_help(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
+    let lines: Vec<Vec<Seg>> = vec![
+        vec![(
+            Role::Head,
+            "SQL — Stele speaks PostgreSQL over pg-wire".to_owned(),
+        )],
+        vec![
+            (Role::Kw, "  CREATE TABLE".to_owned()),
+            (Role::Mut, " t (...) ".to_owned()),
+            (Role::Kw, "WITH SYSTEM VERSIONING".to_owned()),
+            (Role::Dim, ";".to_owned()),
+        ],
+        vec![
+            (Role::Kw, "  INSERT".to_owned()),
+            (Role::Mut, " INTO t VALUES (...);   ".to_owned()),
+            (Role::Kw, "UPDATE".to_owned()),
+            (Role::Mut, " t SET c = v WHERE ...;".to_owned()),
+        ],
+        vec![
+            (Role::Kw, "  SELECT".to_owned()),
+            (Role::Mut, " ... FROM t ".to_owned()),
+            (Role::Kw, "FOR SYSTEM_TIME AS OF".to_owned()),
+            (Role::Mut, " (now() - interval '1 second')".to_owned()),
+            (Role::Dim, ";".to_owned()),
+        ],
+        vec![(
+            Role::Dim,
+            "  UPDATE and DELETE never destroy data — prior versions stay queryable via AS OF."
+                .to_owned(),
+        )],
+    ];
+    write_lines(session, out, &lines)
+}
+
+/// `\dt` (and bare `\d`) — list every live relation via the pg_catalog shim's
+/// table-list shape (STL-198 server side).
+fn list_tables(client: &mut Client, session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
+    let replies =
+        client.simple_query("SELECT c.relname FROM pg_catalog.pg_class c ORDER BY c.relname")?;
+    if let Some(err) = first_error(&replies) {
+        print_error(session, err);
+        return Ok(());
+    }
+    let names: Vec<String> = first_result_set(&replies)
+        .map(|set| {
+            set.rows
+                .iter()
+                .filter_map(|row| row.get(1).cloned().flatten())
+                .collect()
+        })
+        .unwrap_or_default();
+    if names.is_empty() {
+        return write_segs(
+            session,
+            out,
+            &[(Role::Mut, "No relations found.".to_owned())],
+        );
+    }
+    let columns = [
+        text_col("Schema"),
+        text_col("Name"),
+        text_col("Type"),
+        text_col("Versioning"),
+    ];
+    let rows: Vec<Vec<Option<String>>> = names
+        .into_iter()
+        .map(|name| {
+            vec![
+                Some("public".to_owned()),
+                Some(name),
+                Some("table".to_owned()),
+                // System-time versioning is an architectural invariant — every
+                // Stele table has it (architecture §12).
+                Some("system".to_owned()),
+            ]
+        })
+        .collect();
+    let mut lines = vec![vec![(Role::Head, "List of relations".to_owned())]];
+    lines.extend(render::table_lines(
+        &columns,
+        &rows,
+        session.table_opts(true),
+    ));
+    write_lines(session, out, &lines)
+}
+
+/// `\d <table>` — the two-query `pg_catalog` introspection sequence
+/// (STL-131): `pg_class` by name → synthetic oid, then `pg_attribute` by that
+/// oid → one row per column.
+fn describe(
+    client: &mut Client,
+    session: &Session,
+    name: &str,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
     let escaped = name.replace('\'', "''");
     let replies = client.simple_query(&format!(
         "SELECT c.oid, c.relname FROM pg_catalog.pg_class c WHERE c.relname = '{escaped}'"
     ))?;
-    // A server-side error (shim incompatibility, failed txn, …) is not "no such
-    // table" — surface it like any other statement error and keep the session.
-    if let Some(message) = first_error(&replies) {
-        eprintln!("{message}");
+    if let Some(err) = first_error(&replies) {
+        print_error(session, err);
         return Ok(());
     }
     let oid = first_result_set(&replies)
@@ -138,10 +534,7 @@ fn describe(client: &mut Client, name: &str, out: &mut impl Write) -> anyhow::Re
         .and_then(Option::as_deref)
         .map(str::to_owned);
     let Some(oid) = oid else {
-        writeln!(out, "Did not find any relation named \"{name}\".")
-            .and_then(|()| out.flush())
-            .context("writing results")?;
-        return Ok(());
+        return not_found(session, out, name);
     };
     // The shim mints oids as non-negative i32s; anything else means we are not
     // talking to a Stele server, so say so rather than interpolating it back.
@@ -151,30 +544,226 @@ fn describe(client: &mut Client, name: &str, out: &mut impl Write) -> anyhow::Re
         "SELECT a.attname, a.atttypname, a.attnum FROM pg_catalog.pg_attribute a \
          WHERE a.attrelid = {oid} AND a.attnum > 0"
     ))?;
-    if let Some(message) = first_error(&replies) {
-        eprintln!("{message}");
+    if let Some(err) = first_error(&replies) {
+        print_error(session, err);
         return Ok(());
     }
-    let columns = first_result_set(&replies).map(|set| {
-        set.rows
-            .iter()
-            .map(|row| {
-                let cell = |i: usize| row.get(i).cloned().flatten();
-                vec![cell(0), cell(1)]
-            })
-            .collect::<Vec<_>>()
-    });
-    let Some(columns) = columns else {
-        writeln!(out, "Did not find any relation named \"{name}\".")
-            .and_then(|()| out.flush())
-            .context("writing results")?;
-        return Ok(());
+    let Some(set) = first_result_set(&replies) else {
+        return not_found(session, out, name);
     };
+    let rows: Vec<Vec<Option<String>>> = set
+        .rows
+        .iter()
+        .map(|row| {
+            let cell = |i: usize| row.get(i).cloned().flatten();
+            vec![cell(0), cell(1)]
+        })
+        .collect();
 
-    writeln!(out, "Table \"public.{name}\"").context("writing results")?;
-    out.write_all(render_table(&["Column".to_owned(), "Type".to_owned()], &columns).as_bytes())
-        .context("writing results")?;
+    let mut lines = vec![vec![(Role::Head, format!("Table \"public.{name}\""))]];
+    lines.extend(render::table_lines(
+        &[text_col("Column"), text_col("Type")],
+        &rows,
+        session.table_opts(false),
+    ));
+    lines.push(vec![
+        (Role::Mut, "System versioning: ".to_owned()),
+        (Role::Ok, "ENABLED".to_owned()),
+        (Role::Dim, "  ·  history retained append-only".to_owned()),
+    ]);
+    write_lines(session, out, &lines)
+}
+
+/// `\l` — the single dev database, from the live connection parameters.
+fn list_databases(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
+    let columns = [
+        text_col("Name"),
+        text_col("Host"),
+        text_col("Mode"),
+        text_col("Owner"),
+    ];
+    let rows = vec![vec![
+        Some(session.dbname.clone()),
+        Some(format!("{}:{}", session.host, session.port)),
+        Some("dev".to_owned()),
+        Some(session.user.clone()),
+    ]];
+    let mut lines = vec![vec![(Role::Head, "List of databases".to_owned())]];
+    lines.extend(render::table_lines(
+        &columns,
+        &rows,
+        session.table_opts(true),
+    ));
+    write_lines(session, out, &lines)
+}
+
+/// `\conninfo` — one segmented status line.
+fn conninfo(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
+    write_segs(
+        session,
+        out,
+        &[
+            (Role::Mut, "You are connected to database ".to_owned()),
+            (Role::Head, format!("\"{}\"", session.dbname)),
+            (Role::Mut, " as user ".to_owned()),
+            (Role::Head, format!("\"{}\"", session.user)),
+            (Role::Mut, " via pg-wire on ".to_owned()),
+            (Role::Acc, session.host.clone()),
+            (Role::Dim, format!(":{} (dev).", session.port)),
+        ],
+    )
+}
+
+// ---------------------------------------------------------------------------
+// SQL execution + rendering
+// ---------------------------------------------------------------------------
+
+/// Send one buffered statement (or batch) and render every reply.
+fn run_statement(
+    client: &mut Client,
+    session: &Session,
+    sql: &str,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+    let replies = client.simple_query(sql)?;
+    let elapsed = started.elapsed();
+    for reply in replies {
+        match reply {
+            Reply::Rows(set) => {
+                let lines = if session.json {
+                    render::json_lines(&set.columns, &set.rows)
+                } else if session.expanded {
+                    render::expanded_lines(&set.columns, &set.rows)
+                } else {
+                    render::table_lines(&set.columns, &set.rows, session.table_opts(true))
+                };
+                write_lines(session, out, &lines)?;
+            }
+            Reply::Command(tag) => write_segs(session, out, &[(Role::Text, tag)])?,
+            Reply::Error(err) => print_error(session, &err),
+            Reply::Empty => {}
+        }
+    }
+    if session.timing {
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        write_segs(session, out, &[(Role::Mut, format!("Time: {ms:.3} ms"))])?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Output plumbing
+// ---------------------------------------------------------------------------
+
+/// The startup banner (interactive sessions only) — the prototype's lines with
+/// live connection values.
+fn banner(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
+    let lines: Vec<Vec<Seg>> = vec![
+        vec![(
+            Role::Banner,
+            format!(
+                "stele shell ({}) — reference pg-wire client",
+                env!("CARGO_PKG_VERSION")
+            ),
+        )],
+        vec![
+            (Role::Mut, "Type ".to_owned()),
+            (Role::Acc, r"\?".to_owned()),
+            (Role::Mut, " for help · ".to_owned()),
+            (Role::Acc, r"\q".to_owned()),
+            (Role::Mut, " to quit · ".to_owned()),
+            (Role::Acc, "↑↓".to_owned()),
+            (Role::Mut, " history".to_owned()),
+        ],
+        vec![],
+        vec![
+            (Role::Ok, "● ".to_owned()),
+            (Role::Mut, "Connected to database ".to_owned()),
+            (Role::Head, format!("\"{}\"", session.dbname)),
+            (Role::Mut, " on ".to_owned()),
+            (Role::Acc, format!("{}:{}", session.host, session.port)),
+            (Role::Dim, "  (dev · pg-wire 3.0 · BUSL-1.1)".to_owned()),
+        ],
+        vec![
+            (
+                Role::Mut,
+                "  append-only · bitemporal · audit-native".to_owned(),
+            ),
+            (Role::Dim, " — history is never destroyed".to_owned()),
+        ],
+        vec![],
+    ];
+    write_lines(session, out, &lines)
+}
+
+/// Write one segmented line through the stdout theme.
+fn write_segs(session: &Session, out: &mut impl Write, segs: &[Seg]) -> anyhow::Result<()> {
+    writeln!(out, "{}", paint_segs(session.theme, segs)).context("writing results")?;
     out.flush().context("flushing results")
+}
+
+/// Write a block of segmented lines through the stdout theme.
+fn write_lines(session: &Session, out: &mut impl Write, lines: &[Vec<Seg>]) -> anyhow::Result<()> {
+    for segs in lines {
+        writeln!(out, "{}", paint_segs(session.theme, segs)).context("writing results")?;
+    }
+    out.flush().context("flushing results")
+}
+
+/// The psql-style error block, on stderr: `ERROR:` + message, `SQLSTATE:` when
+/// the server sent a code, `HINT:` when it sent one. Brand gold, never red.
+fn print_error(session: &Session, err: &ServerError) {
+    let t = &session.err_theme;
+    eprintln!(
+        "{}{}",
+        t.paint(Role::Err, &format!("{}:  ", err.severity)),
+        t.paint(Role::Err, &err.message)
+    );
+    if !err.code.is_empty() {
+        eprintln!(
+            "{}{}",
+            t.paint(Role::Mut, "SQLSTATE: "),
+            t.paint(Role::Warn, &err.code)
+        );
+    }
+    if let Some(hint) = &err.hint {
+        eprintln!(
+            "{}{}",
+            t.paint(Role::Hint, "HINT:  "),
+            t.paint(Role::Hint, hint)
+        );
+    }
+}
+
+/// A client-side usage error in the server error shape (SQLSTATE 42601).
+fn usage_error(message: String, hint: &str) -> ServerError {
+    ServerError {
+        severity: "ERROR".to_owned(),
+        code: "42601".to_owned(),
+        message,
+        hint: Some(hint.to_owned()),
+    }
+}
+
+/// The psql "did not find" line for `\d` misses.
+fn not_found(session: &Session, out: &mut impl Write, name: &str) -> anyhow::Result<()> {
+    write_segs(
+        session,
+        out,
+        &[(
+            Role::Mut,
+            format!("Did not find any relation named \"{name}\"."),
+        )],
+    )
+}
+
+/// A text-typed render column (OID 25).
+fn text_col(name: &str) -> Column {
+    Column {
+        name: name.to_owned(),
+        type_oid: 25,
+    }
 }
 
 /// The first row-returning reply in a batch, if any.
@@ -186,159 +775,133 @@ fn first_result_set(replies: &[Reply]) -> Option<&ResultSet> {
 }
 
 /// The first SQL error in a batch, if any.
-fn first_error(replies: &[Reply]) -> Option<&str> {
+fn first_error(replies: &[Reply]) -> Option<&ServerError> {
     replies.iter().find_map(|r| match r {
-        Reply::Error(message) => Some(message.as_str()),
+        Reply::Error(err) => Some(err),
         _ => None,
     })
 }
 
-/// Write the prompt for the current buffer/transaction state and flush.
-fn prompt(client: &Client, buffer: &str, out: &mut impl Write) -> anyhow::Result<()> {
-    let p = if buffer.trim().is_empty() {
-        match client.txn_status() {
-            b'T' => "stele*=> ",
-            b'E' => "stele!=> ",
-            _ => "stele=> ",
+impl Session {
+    /// Table options for the current toggles.
+    const fn table_opts(&self, count: bool) -> TableOpts {
+        TableOpts {
+            style: self.border,
+            row_nums: self.row_nums,
+            count,
         }
-    } else {
-        "stele-> "
-    };
-    write!(out, "{p}")
-        .and_then(|()| out.flush())
-        .context("writing prompt")
-}
-
-/// A recognized backslash meta-command.
-#[derive(Debug, PartialEq, Eq)]
-enum Meta<'a> {
-    Quit,
-    Describe(Option<&'a str>),
-    Unknown(&'a str),
-}
-
-/// Parse a meta-command line; `None` means the line is SQL.
-fn parse_meta(line: &str) -> Option<Meta<'_>> {
-    let trimmed = line.trim();
-    let rest = trimmed.strip_prefix('\\')?;
-    let mut parts = rest.split_whitespace();
-    match parts.next() {
-        Some("q") => Some(Meta::Quit),
-        Some("d") => Some(Meta::Describe(parts.next())),
-        _ => Some(Meta::Unknown(trimmed)),
     }
 }
 
-/// A buffered statement is ready once it ends with `;`.
-fn statement_complete(buffer: &str) -> bool {
-    buffer.trim_end().ends_with(';')
+// ---------------------------------------------------------------------------
+// rustyline glue
+// ---------------------------------------------------------------------------
+
+/// Colors the prompt and the live input line; completion/hinting are no-ops
+/// for now (live-catalog completion is a follow-up).
+struct ShellHelper {
+    theme: Theme,
 }
 
-/// Render a result set psql-style: padded header, dashed separator, one line
-/// per row (NULL renders empty), and a `(N rows)` trailer.
-fn render_table(columns: &[String], rows: &[Vec<Option<String>>]) -> String {
-    let widths: Vec<usize> = columns
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            rows.iter()
-                .filter_map(|row| row.get(i))
-                .map(|cell| cell.as_deref().unwrap_or("").chars().count())
-                .chain([name.chars().count()])
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
+impl rustyline::Helper for ShellHelper {}
 
-    let mut text = String::new();
-    let render_line = |cells: &mut dyn Iterator<Item = &str>| {
-        cells
-            .zip(&widths)
-            .map(|(cell, width)| format!(" {cell:<width$} "))
-            .collect::<Vec<_>>()
-            .join("|")
-    };
-    let _ = writeln!(
-        text,
-        "{}",
-        render_line(&mut columns.iter().map(String::as_str))
-    );
-    let _ = writeln!(
-        text,
-        "{}",
-        widths
-            .iter()
-            .map(|w| "-".repeat(w + 2))
-            .collect::<Vec<_>>()
-            .join("+")
-    );
-    for row in rows {
-        let _ = writeln!(
-            text,
-            "{}",
-            render_line(&mut row.iter().map(|c| c.as_deref().unwrap_or("")))
-        );
+impl rustyline::completion::Completer for ShellHelper {
+    type Candidate = String;
+}
+
+impl rustyline::hint::Hinter for ShellHelper {
+    type Hint = String;
+}
+
+impl rustyline::validate::Validator for ShellHelper {}
+
+impl rustyline::highlight::Highlighter for ShellHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
+        if !self.theme.colored() || line.is_empty() {
+            return std::borrow::Cow::Borrowed(line);
+        }
+        std::borrow::Cow::Owned(paint_segs(self.theme, &highlight::tokenize(line)))
     }
-    let n = rows.len();
-    let noun = if n == 1 { "row" } else { "rows" };
-    let _ = writeln!(text, "({n} {noun})");
-    text
+
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        default: bool,
+    ) -> std::borrow::Cow<'b, str> {
+        if !default || !self.theme.colored() {
+            return std::borrow::Cow::Borrowed(prompt);
+        }
+        let role = if prompt.starts_with("stele-") {
+            Role::Cont
+        } else {
+            Role::Prompt
+        };
+        std::borrow::Cow::Owned(self.theme.paint(role, prompt))
+    }
+
+    fn highlight_char(
+        &self,
+        _line: &str,
+        _pos: usize,
+        _kind: rustyline::highlight::CmdKind,
+    ) -> bool {
+        self.theme.colored()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn s(v: &str) -> String {
-        v.to_owned()
-    }
-
     #[test]
-    fn render_table_pads_columns_and_counts_rows() {
-        let rendered = render_table(
-            &[s("id"), s("balance")],
-            &[
-                vec![Some(s("1")), Some(s("100"))],
-                vec![Some(s("2")), Some(s("250"))],
-            ],
-        );
-        let expected = " id | balance \n----+---------\n 1  | 100     \n 2  | 250     \n(2 rows)\n";
-        assert_eq!(rendered, expected);
-    }
-
-    #[test]
-    fn render_table_singular_row_and_empty_null() {
-        let rendered = render_table(&[s("a"), s("b")], &[vec![Some(s("x")), None]]);
-        assert!(rendered.contains("(1 row)"), "{rendered}");
-        // NULL renders as an empty (padded) cell, psql's default.
-        assert!(rendered.contains(" x | "), "{rendered}");
-    }
-
-    #[test]
-    fn render_table_with_no_rows_still_prints_header() {
-        let rendered = render_table(&[s("oid")], &[]);
-        assert!(rendered.starts_with(" oid \n-----\n"), "{rendered}");
-        assert!(rendered.ends_with("(0 rows)\n"), "{rendered}");
-    }
-
-    #[test]
-    fn meta_commands_parse_at_statement_boundaries() {
+    fn meta_commands_parse_with_aliases() {
         assert_eq!(parse_meta(r"\q"), Some(Meta::Quit));
-        assert_eq!(parse_meta(r"  \q  "), Some(Meta::Quit));
+        assert_eq!(parse_meta(r"\?"), Some(Meta::Help));
+        assert_eq!(parse_meta(r"\help"), Some(Meta::SqlHelp));
         assert_eq!(
             parse_meta(r"\d account"),
             Some(Meta::Describe(Some("account")))
         );
-        assert_eq!(parse_meta(r"\d"), Some(Meta::Describe(None)));
-        assert_eq!(parse_meta(r"\x on"), Some(Meta::Unknown(r"\x on")));
+        // Bare \d lists relations, like the prototype.
+        assert_eq!(parse_meta(r"\d"), Some(Meta::ListTables));
+        assert_eq!(parse_meta(r"\dt"), Some(Meta::ListTables));
+        assert_eq!(parse_meta(r"\list"), Some(Meta::ListDbs));
+        assert_eq!(parse_meta(r"\c!"), Some(Meta::Clear));
+        assert_eq!(parse_meta(r"\connect"), Some(Meta::Connect));
         assert_eq!(parse_meta("SELECT 1;"), None);
     }
 
     #[test]
-    fn statements_complete_only_on_a_trailing_semicolon() {
-        assert!(statement_complete("SELECT 1;"));
-        assert!(statement_complete("SELECT 1; \n"));
-        assert!(!statement_complete("SELECT 1"));
-        assert!(!statement_complete("SELECT id,\n"));
+    fn designed_tiers_resolve_to_their_tickets() {
+        let Some(Meta::NotYet { ticket, .. }) = parse_meta(r"\history account 1") else {
+            panic!("expected NotYet");
+        };
+        assert_eq!(ticket, TEMPORAL_TICKET);
+        let Some(Meta::NotYet { ticket, .. }) = parse_meta(r"\inspect seg-0002") else {
+            panic!("expected NotYet");
+        };
+        assert_eq!(ticket, ADMIN_TICKET);
+    }
+
+    #[test]
+    fn unknown_meta_is_a_usage_error_not_sql() {
+        assert_eq!(parse_meta(r"\x9 on"), Some(Meta::Unknown(r"\x9 on")));
+    }
+
+    #[test]
+    fn prompt_reflects_buffer_and_txn_state() {
+        assert_eq!(prompt_text(b'I', ""), "stele=# ");
+        assert_eq!(prompt_text(b'T', ""), "stele*=# ");
+        assert_eq!(prompt_text(b'E', "  \n"), "stele!=# ");
+        // Continuation beats transaction state.
+        assert_eq!(prompt_text(b'T', "SELECT"), "stele-# ");
+    }
+
+    #[test]
+    fn usage_error_carries_the_psql_fields() {
+        let err = usage_error("invalid command \\zz".to_owned(), "Try \\?");
+        assert_eq!(err.code, "42601");
+        assert_eq!(err.severity, "ERROR");
+        assert_eq!(err.hint.as_deref(), Some("Try \\?"));
     }
 }

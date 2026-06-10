@@ -31,7 +31,7 @@ use stele_sql::sqlparser::ast::{
     Expr, SetExpr, Statement as SqlStatement, TableFactor, UnaryOperator, Value,
 };
 
-/// A recognized `pg_catalog` introspection query from the `\d` sequence.
+/// A recognized `pg_catalog` introspection query from the `\d` / `\dt` sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Introspection {
     /// `pg_class` lookup by `relname` — resolve a relation to its `oid`.
@@ -44,6 +44,9 @@ pub(crate) enum Introspection {
         /// The synthetic `oid` ([`oid_for`]) the query filters on.
         oid: u32,
     },
+    /// `pg_class` scan with no name filter — list every live relation (`\dt`,
+    /// STL-198).
+    TableList,
 }
 
 /// Recognize one of the two `\d` introspection shapes, or `None` for any other
@@ -66,10 +69,17 @@ pub(crate) fn classify(stmt: &Statement) -> Option<Introspection> {
 
     match relation.to_ascii_lowercase().as_str() {
         "pg_class" => {
-            let literal = where_clause.and_then(first_string_literal)?;
-            Some(Introspection::Relation {
-                name: strip_regex_anchors(&literal),
-            })
+            // A name filter resolves one relation; a scan with no string
+            // literal anywhere (no WHERE, or a literal-free one) is the `\dt`
+            // shape — list everything (STL-198).
+            where_clause.and_then(first_string_literal).map_or(
+                Some(Introspection::TableList),
+                |literal| {
+                    Some(Introspection::Relation {
+                        name: strip_regex_anchors(&literal),
+                    })
+                },
+            )
         }
         "pg_attribute" => {
             let oid = where_clause.and_then(first_int_literal)?;
@@ -245,6 +255,33 @@ mod tests {
             classify(&stmt),
             Some(Introspection::Relation {
                 name: "x".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn pg_class_scan_without_a_name_literal_is_a_table_list() {
+        // The `\dt` shape: no WHERE at all, or a WHERE with no string literal.
+        for sql in [
+            "SELECT c.relname FROM pg_catalog.pg_class c ORDER BY c.relname",
+            "SELECT relname FROM pg_class WHERE oid > 0",
+        ] {
+            assert_eq!(
+                classify(&parse_one(sql)),
+                Some(Introspection::TableList),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn pg_class_with_a_name_literal_stays_a_relation_lookup() {
+        // The `\d <table>` shape must not regress into a list (STL-131).
+        let stmt = parse_one("SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relname ~ '^(t)$'");
+        assert_eq!(
+            classify(&stmt),
+            Some(Introspection::Relation {
+                name: "t".to_owned()
             })
         );
     }
