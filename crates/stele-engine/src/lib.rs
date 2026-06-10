@@ -2866,15 +2866,15 @@ mod tests {
             ]
         );
 
-        // Ungrouped MIN / MAX / AVG: MIN/MAX keep the argument type (int4), AVG is
-        // the truncated integer mean as int8. (10+10+20+20)/4 = 15.
+        // Ungrouped MIN / MAX / AVG: MIN/MAX keep the argument type (int4); AVG is
+        // the exact fractional mean as float8 ([STL-209]). (10+10+20+20)/4 = 15.
         let r = select(&mut engine, "SELECT MIN(a), MAX(a), AVG(a) FROM t");
         assert_eq!(
             r.columns,
             vec![
                 ("min".to_owned(), LogicalType::Int4),
                 ("max".to_owned(), LogicalType::Int4),
-                ("avg".to_owned(), LogicalType::Int8),
+                ("avg".to_owned(), LogicalType::Float8),
             ]
         );
         assert_eq!(
@@ -2882,9 +2882,15 @@ mod tests {
             vec![vec![
                 cell(Some(ScalarValue::Int4(10))),
                 cell(Some(ScalarValue::Int4(20))),
-                cell(Some(ScalarValue::Int8(15))),
+                cell(Some(ScalarValue::float8(15.0))),
             ]]
         );
+
+        // AVG over ids 1..=4 is the genuinely fractional 2.5 — proving the mean is
+        // no longer truncated toward zero (which would have shown 2).
+        let r = select(&mut engine, "SELECT AVG(id) FROM t");
+        assert_eq!(r.columns, vec![("avg".to_owned(), LogicalType::Float8)]);
+        assert_eq!(r.rows, vec![vec![cell(Some(ScalarValue::float8(2.5)))]]);
 
         // COUNT(*) counts rows; COUNT(b) skips the one NULL `b`.
         let r = select(&mut engine, "SELECT COUNT(*), COUNT(b) FROM t");

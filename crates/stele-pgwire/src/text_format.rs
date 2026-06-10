@@ -24,6 +24,7 @@
 //! | `uuid`        | canonical lowercase `8-4-4-4-12` hex               |
 //! | `bytea`       | `\x` + lowercase hex (Postgres `bytea_output = hex`) |
 //! | `period`      | `tsrange` text, e.g. `["…","…")` (half-open)       |
+//! | `float8`      | shortest round-tripping decimal, e.g. `1.5`, `-2.5` |
 //!
 //! Timestamps and dates are stored as raw offsets from the Unix epoch
 //! (microseconds and days respectively — see [`stele_common::types`]); the
@@ -52,7 +53,10 @@ const MICROS_PER_DAY: i64 = 86_400 * MICROS_PER_SEC;
 pub(crate) const fn pg_typlen(ty: LogicalType) -> i16 {
     match ty {
         LogicalType::Int4 | LogicalType::Date => 4,
-        LogicalType::Int8 | LogicalType::Timestamp | LogicalType::TimestampTz => 8,
+        LogicalType::Int8
+        | LogicalType::Timestamp
+        | LogicalType::TimestampTz
+        | LogicalType::Float8 => 8,
         LogicalType::Bool => 1,
         LogicalType::Uuid => 16,
         // `text`, `bytea`, and `tsrange` are all variable-length (`typlen = -1`).
@@ -78,6 +82,35 @@ pub(crate) fn encode_text(value: &ScalarValue) -> String {
         ScalarValue::Uuid(bytes) => format_uuid(bytes),
         ScalarValue::Bytea(bytes) => format_bytea(bytes),
         ScalarValue::Period(iv) => format_period(iv),
+        // The value carries `f64::to_bits`; recover the double to render it.
+        ScalarValue::Float8(bits) => format_float8(f64::from_bits(*bits)),
+    }
+}
+
+/// Render a `float8` in Postgres text format.
+///
+/// Postgres (≥ 12) prints the **shortest decimal that round-trips** to the same
+/// double, which is exactly what Rust's `f64` `Display` produces — so finite
+/// values defer to it (`1.5`, `-2.5`, `0`, `183.33333333333334`). The non-finite
+/// values use Postgres's spellings — `Infinity` / `-Infinity` / `NaN` — which
+/// differ from Rust's `inf` / `-inf` / `NaN`.
+///
+/// One known divergence: at magnitudes where Postgres switches to exponential
+/// notation (very large / very small), Rust's `Display` stays in plain decimal.
+/// The `AVG`-over-integer results this type exists for ([STL-209]) never reach
+/// that range, and the plain-decimal form still parses back to the same double,
+/// so a driver round-trips it losslessly.
+fn format_float8(v: f64) -> String {
+    if v.is_nan() {
+        "NaN".to_owned()
+    } else if v.is_infinite() {
+        if v.is_sign_negative() {
+            "-Infinity".to_owned()
+        } else {
+            "Infinity".to_owned()
+        }
+    } else {
+        v.to_string()
     }
 }
 
@@ -242,6 +275,31 @@ mod tests {
             -1,
             "tsrange is variable-length"
         );
+        assert_eq!(pg_typlen(LogicalType::Float8), 8);
+    }
+
+    #[test]
+    fn float8_renders_shortest_round_trip_decimal() {
+        // Postgres prints the shortest decimal that round-trips; finite values
+        // match Rust's `f64` Display.
+        assert_eq!(encode_text(&ScalarValue::float8(1.5)), "1.5");
+        assert_eq!(encode_text(&ScalarValue::float8(-2.5)), "-2.5");
+        // A whole-number double drops the fractional part, like Postgres.
+        assert_eq!(encode_text(&ScalarValue::float8(2.0)), "2");
+        assert_eq!(encode_text(&ScalarValue::float8(0.0)), "0");
+        // The exact f64 mean of (100 + 200 + 250) / 3 — the repeating decimal a
+        // true fractional AVG produces, where the old integer mean showed `183`.
+        assert_eq!(
+            encode_text(&ScalarValue::float8(550.0 / 3.0)),
+            "183.33333333333334"
+        );
+        // Non-finite values use Postgres's spellings, not Rust's `inf` / `NaN`.
+        assert_eq!(encode_text(&ScalarValue::float8(f64::INFINITY)), "Infinity");
+        assert_eq!(
+            encode_text(&ScalarValue::float8(f64::NEG_INFINITY)),
+            "-Infinity"
+        );
+        assert_eq!(encode_text(&ScalarValue::float8(f64::NAN)), "NaN");
     }
 
     #[test]

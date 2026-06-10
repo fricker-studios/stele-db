@@ -159,6 +159,14 @@ fn encode_arg(arg: Option<&ScalarValue>, msg: &mut Vec<u8>) {
         }
         Some(ScalarValue::Uuid(bytes)) => push_frame(msg, TAG_UUID, bytes),
         Some(ScalarValue::Bytea(bytes)) => push_frame(msg, TAG_BYTEA, bytes),
+        // `float8` is an aggregate *result* type only — what `AVG` returns
+        // ([STL-209]). There is no `float8` column or literal, so a `float8`
+        // value can never be a business key or a `hash(...)` argument. Rather
+        // than freeze a STLHK1 tag for a value that cannot reach here, fail fast
+        // if that invariant is ever broken.
+        Some(ScalarValue::Float8(_)) => {
+            unreachable!("float8 is an aggregate-result type only, never a hash-key argument")
+        }
     }
 }
 

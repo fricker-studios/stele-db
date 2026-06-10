@@ -219,6 +219,12 @@ pub enum Vector {
     Int8(Vec<Option<i64>>),
     /// UTF-8 text ([`LogicalType::Text`]).
     Text(Vec<Option<String>>),
+    /// Double-precision floats, each held as its IEEE-754 bit pattern
+    /// (`f64::to_bits`, the same representation [`ScalarValue::Float8`] uses) so
+    /// the vector stays `Eq`. The aggregator produces this for `AVG`
+    /// ([STL-209]); no storage column decodes into it, and the scalar evaluator
+    /// does not yet read or compute over it (STL-207).
+    Float8(Vec<Option<u64>>),
 }
 
 impl Vector {
@@ -230,6 +236,7 @@ impl Vector {
             Self::Int4(v) => v.len(),
             Self::Int8(v) => v.len(),
             Self::Text(v) => v.len(),
+            Self::Float8(v) => v.len(),
         }
     }
 
@@ -248,6 +255,7 @@ impl Vector {
             Self::Int4(_) => LogicalType::Int4,
             Self::Int8(_) => LogicalType::Int8,
             Self::Text(_) => LogicalType::Text,
+            Self::Float8(_) => LogicalType::Float8,
         }
     }
 
@@ -267,6 +275,9 @@ impl Vector {
             Self::Int4(v) => v[row].map(ScalarValue::Int4),
             Self::Int8(v) => v[row].map(ScalarValue::Int8),
             Self::Text(v) => v[row].clone().map(ScalarValue::Text),
+            // The cell already holds `f64::to_bits`, the same form
+            // `ScalarValue::Float8` carries — pass it straight through.
+            Self::Float8(v) => v[row].map(ScalarValue::Float8),
         }
     }
 
@@ -296,6 +307,7 @@ impl Vector {
             Self::Int4(v) => Self::Int4(pick(v, rows)),
             Self::Int8(v) => Self::Int8(pick(v, rows)),
             Self::Text(v) => Self::Text(pick(v, rows)),
+            Self::Float8(v) => Self::Float8(pick(v, rows)),
         }
     }
 
@@ -605,6 +617,7 @@ fn is_null(operand: &Vector) -> Vector {
         Vector::Int4(v) => v.iter().map(|c| Some(c.is_none())).collect(),
         Vector::Int8(v) => v.iter().map(|c| Some(c.is_none())).collect(),
         Vector::Text(v) => v.iter().map(|c| Some(c.is_none())).collect(),
+        Vector::Float8(v) => v.iter().map(|c| Some(c.is_none())).collect(),
     };
     Vector::Bool(mask)
 }
