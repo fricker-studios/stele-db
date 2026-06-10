@@ -170,6 +170,12 @@ const SQLSTATE_INVALID_TEXT_REPRESENTATION: &str = "22P02";
 // A statement issued while the transaction is already aborted — Postgres ignores
 // commands until the block ends (`COMMIT`/`ROLLBACK`), STL-174.
 const SQLSTATE_IN_FAILED_TRANSACTION: &str = "25P02";
+// A `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` issued with no open transaction —
+// Postgres's "can only be used in transaction blocks" (STL-176).
+const SQLSTATE_NO_ACTIVE_TRANSACTION: &str = "25P01";
+// A `ROLLBACK TO` / `RELEASE` naming a savepoint that does not exist — Postgres's
+// invalid-savepoint-specification (STL-176).
+const SQLSTATE_INVALID_SAVEPOINT: &str = "3B001";
 // Extended-query lifecycle errors (STL-182): preparing a name that already
 // exists, and naming a prepared statement / portal that does not.
 const SQLSTATE_DUPLICATE_PSTATEMENT: &str = "42P05";
@@ -432,27 +438,41 @@ impl ConnTxn {
 }
 
 /// The transaction-control statements the front end handles itself rather than
-/// routing to the engine ([STL-174]). `ROLLBACK TO <savepoint>` is intentionally
-/// not one of these (savepoints are [STL-176]) — it falls through to the engine,
-/// which rejects it as unsupported.
-enum TxnControl {
+/// routing to the engine ([STL-174], savepoints [STL-176]). These manage the
+/// connection's `txn` state and never reach the engine's routing.
+///
+/// The savepoint variants borrow their name from the statement; Stele matches
+/// savepoint names verbatim, as it does table and column names (no case-folding).
+enum TxnControl<'a> {
     /// `BEGIN` / `START TRANSACTION`.
     Begin,
     /// `COMMIT` / `END`.
     Commit,
     /// `ROLLBACK` / `ABORT` (without a savepoint target).
     Rollback,
+    /// `SAVEPOINT <name>` — establish a nested rollback point.
+    Savepoint(&'a str),
+    /// `RELEASE [SAVEPOINT] <name>` — drop a savepoint, keeping its writes.
+    Release(&'a str),
+    /// `ROLLBACK TO [SAVEPOINT] <name>` — undo writes staged after a savepoint.
+    RollbackTo(&'a str),
 }
 
 /// Classify a statement as transaction control, or `None` for anything the engine
-/// routes. A `ROLLBACK TO <savepoint>` is deliberately *not* matched here.
-const fn txn_control(stmt: &Statement) -> Option<TxnControl> {
+/// routes.
+fn txn_control(stmt: &Statement) -> Option<TxnControl<'_>> {
     match &stmt.body {
         SqlStatement::StartTransaction { .. } => Some(TxnControl::Begin),
         SqlStatement::Commit { .. } => Some(TxnControl::Commit),
         SqlStatement::Rollback {
             savepoint: None, ..
         } => Some(TxnControl::Rollback),
+        SqlStatement::Rollback {
+            savepoint: Some(name),
+            ..
+        } => Some(TxnControl::RollbackTo(name.value.as_str())),
+        SqlStatement::Savepoint { name } => Some(TxnControl::Savepoint(name.value.as_str())),
+        SqlStatement::ReleaseSavepoint { name } => Some(TxnControl::Release(name.value.as_str())),
         _ => None,
     }
 }
@@ -719,6 +739,12 @@ async fn handle_simple_query(
                     run_rollback(stream, txn).await?;
                     true
                 }
+                // Savepoint statements manipulate the open transaction's buffer in
+                // place ([STL-176]); each returns `false` (an error was written,
+                // batch aborts) when it had no usable open transaction.
+                TxnControl::Savepoint(name) => run_savepoint(stream, txn, name).await?,
+                TxnControl::Release(name) => run_release(stream, txn, name).await?,
+                TxnControl::RollbackTo(name) => run_rollback_to(stream, txn, name).await?,
             };
             if !proceed {
                 return Ok(());
@@ -864,6 +890,130 @@ async fn run_rollback(stream: &mut TcpStream, txn: &mut ConnTxn) -> Result<(), W
     write_command_complete_tag(stream, "ROLLBACK")
         .await
         .map_err(WireError::Io)
+}
+
+/// `SAVEPOINT <name>` — establish a nested rollback point in the open transaction
+/// ([STL-176]).
+///
+/// Records a marker at the current buffer position; nothing reaches storage. With
+/// no open transaction this is the Postgres error "SAVEPOINT can only be used in
+/// transaction blocks" (`25P01`); inside an aborted one it is refused like any
+/// other statement (`25P02`). Returns whether the batch may continue.
+async fn run_savepoint(
+    stream: &mut TcpStream,
+    txn: &mut ConnTxn,
+    name: &str,
+) -> Result<bool, WireError> {
+    match txn {
+        ConnTxn::Active(buffered) => {
+            buffered.savepoint(name);
+            write_command_complete_tag(stream, "SAVEPOINT").await?;
+            Ok(true)
+        }
+        ConnTxn::Idle => savepoint_not_in_txn(stream, "SAVEPOINT").await,
+        ConnTxn::Failed => savepoint_in_aborted_txn(stream).await,
+    }
+}
+
+/// `RELEASE [SAVEPOINT] <name>` — drop a savepoint, keeping the writes staged
+/// after it ([STL-176]).
+///
+/// Naming a savepoint that does not exist is the Postgres error `savepoint "<name>"
+/// does not exist` (`3B001`), which also aborts the transaction (like any error in
+/// a block). State errors mirror [`run_savepoint`]. Returns whether the batch may
+/// continue.
+async fn run_release(
+    stream: &mut TcpStream,
+    txn: &mut ConnTxn,
+    name: &str,
+) -> Result<bool, WireError> {
+    let released = match txn {
+        ConnTxn::Active(buffered) => buffered.release(name),
+        ConnTxn::Idle => return savepoint_not_in_txn(stream, "RELEASE SAVEPOINT").await,
+        ConnTxn::Failed => return savepoint_in_aborted_txn(stream).await,
+    };
+    if released {
+        write_command_complete_tag(stream, "RELEASE").await?;
+        Ok(true)
+    } else {
+        no_such_savepoint(stream, txn, name).await
+    }
+}
+
+/// `ROLLBACK TO [SAVEPOINT] <name>` — undo the writes staged after a savepoint,
+/// the transaction continuing ([STL-176]).
+///
+/// The named savepoint survives (it can be rolled back to again) while savepoints
+/// nested inside it are destroyed. Errors mirror [`run_release`]. Returns whether
+/// the batch may continue.
+///
+/// Recovering an *aborted* transaction via `ROLLBACK TO` (Postgres's
+/// `in_failed_sql_transaction` escape hatch) is not modelled: the [`ConnTxn::Failed`]
+/// state discards the buffer, so there is nothing to roll back to. It is refused
+/// like any statement in an aborted block, the deferred follow-up.
+async fn run_rollback_to(
+    stream: &mut TcpStream,
+    txn: &mut ConnTxn,
+    name: &str,
+) -> Result<bool, WireError> {
+    let rolled_back = match txn {
+        ConnTxn::Active(buffered) => buffered.rollback_to(name),
+        ConnTxn::Idle => return savepoint_not_in_txn(stream, "ROLLBACK TO SAVEPOINT").await,
+        ConnTxn::Failed => return savepoint_in_aborted_txn(stream).await,
+    };
+    if rolled_back {
+        write_command_complete_tag(stream, "ROLLBACK").await?;
+        Ok(true)
+    } else {
+        no_such_savepoint(stream, txn, name).await
+    }
+}
+
+/// Error reply for a savepoint statement issued with no open transaction (`25P01`).
+/// `verb` is the statement spelled for the message. Always `Ok(false)`: an error
+/// closes the wire turn, so the batch aborts.
+async fn savepoint_not_in_txn(stream: &mut TcpStream, verb: &str) -> Result<bool, WireError> {
+    write_error_response(
+        stream,
+        "ERROR",
+        SQLSTATE_NO_ACTIVE_TRANSACTION,
+        &format!("{verb} can only be used in transaction blocks"),
+    )
+    .await?;
+    Ok(false)
+}
+
+/// Error reply for a savepoint statement issued inside an aborted transaction
+/// (`25P02`) — the same refusal every other statement gets there. Always
+/// `Ok(false)`.
+async fn savepoint_in_aborted_txn(stream: &mut TcpStream) -> Result<bool, WireError> {
+    write_error_response(
+        stream,
+        "ERROR",
+        SQLSTATE_IN_FAILED_TRANSACTION,
+        "current transaction is aborted, commands ignored until end of transaction block",
+    )
+    .await?;
+    Ok(false)
+}
+
+/// Error reply for `ROLLBACK TO` / `RELEASE` of a savepoint that does not exist
+/// (`3B001`). Like any error inside a block this aborts the transaction, so the
+/// open transaction is moved to the failed state and `Ok(false)` returned.
+async fn no_such_savepoint(
+    stream: &mut TcpStream,
+    txn: &mut ConnTxn,
+    name: &str,
+) -> Result<bool, WireError> {
+    write_error_response(
+        stream,
+        "ERROR",
+        SQLSTATE_INVALID_SAVEPOINT,
+        &format!("savepoint \"{name}\" does not exist"),
+    )
+    .await?;
+    txn.mark_failed();
+    Ok(false)
 }
 
 /// Apply a transaction's buffered writes under the session lock, taking and

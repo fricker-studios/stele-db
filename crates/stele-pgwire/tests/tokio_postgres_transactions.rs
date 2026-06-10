@@ -7,6 +7,11 @@
 //! sent as its own `simple_query` to prove the connection carries the state
 //! between messages (not just within one batch). Both paths ride the `Q` loop
 //! the v0.1 front end speaks; the extended protocol is a v0.2 concern.
+//!
+//! Savepoints (STL-176) extend the same loop: `SAVEPOINT` / `ROLLBACK TO
+//! SAVEPOINT` / `RELEASE SAVEPOINT` carve nested rollback points out of the one
+//! buffered write set, and `ROLLBACK TO` undoes only the writes staged after the
+//! savepoint while the transaction continues.
 
 use std::sync::{Arc, Mutex};
 
@@ -142,6 +147,173 @@ async fn a_batched_transaction_commits_atomically() {
         vec!["1", "2"],
         "the batched COMMIT applied both"
     );
+
+    drop(client);
+    let _ = driver.await;
+}
+
+/// The SQLSTATE of a failed `simple_query`, for the savepoint error-path asserts.
+fn sqlstate(err: &tokio_postgres::Error) -> Option<&str> {
+    err.code().map(tokio_postgres::error::SqlState::code)
+}
+
+/// Connect a fresh client to `addr` and `CREATE TABLE account`, returning the
+/// client and its connection driver task. Shared setup for the savepoint tests.
+async fn account_client(
+    addr: std::net::SocketAddr,
+) -> (
+    tokio_postgres::Client,
+    tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
+) {
+    let (client, connection) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect to the stele pgwire server");
+    let driver = tokio::spawn(connection);
+    client
+        .batch_execute(
+            "CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+        )
+        .await
+        .expect("create table");
+    (client, driver)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollback_to_savepoint_undoes_only_later_writes() {
+    // The DoD of STL-176: ROLLBACK TO undoes only the writes staged after the
+    // savepoint; the pre-savepoint write survives, and a statement issued after
+    // the rollback continues in the same transaction and commits.
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+    let (client, driver) = account_client(addr).await;
+
+    client.simple_query("BEGIN").await.expect("begin");
+    client
+        .simple_query("INSERT INTO account VALUES (1, 100)")
+        .await
+        .expect("insert 1 (before the savepoint)");
+    client
+        .simple_query("SAVEPOINT sp1")
+        .await
+        .expect("savepoint");
+    client
+        .simple_query("INSERT INTO account VALUES (2, 200)")
+        .await
+        .expect("insert 2 (after the savepoint)");
+    client
+        .simple_query("INSERT INTO account VALUES (3, 300)")
+        .await
+        .expect("insert 3 (after the savepoint)");
+    client
+        .simple_query("ROLLBACK TO SAVEPOINT sp1")
+        .await
+        .expect("rollback to savepoint");
+    // The transaction is still open: a later write joins the survivors.
+    client
+        .simple_query("INSERT INTO account VALUES (4, 400)")
+        .await
+        .expect("insert 4 (continues the same transaction)");
+    client.simple_query("COMMIT").await.expect("commit");
+
+    let after = client
+        .simple_query("SELECT id FROM account")
+        .await
+        .expect("select after commit");
+    assert_eq!(
+        ids(&after),
+        vec!["1", "4"],
+        "the pre-savepoint insert and the post-rollback insert commit; the two staged \
+         after the savepoint are undone"
+    );
+
+    drop(client);
+    let _ = driver.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_keeps_writes_and_a_nested_rollback_undoes_only_its_own() {
+    // RELEASE drops a savepoint but keeps its writes; an enclosing savepoint then
+    // still rolls back the lot. BEGIN; 1; SAVEPOINT a; 2; SAVEPOINT b; 3;
+    // RELEASE b (keeps 1,2,3); ROLLBACK TO a (drops 2,3); COMMIT → only 1.
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+    let (client, driver) = account_client(addr).await;
+
+    for sql in [
+        "BEGIN",
+        "INSERT INTO account VALUES (1, 100)",
+        "SAVEPOINT a",
+        "INSERT INTO account VALUES (2, 200)",
+        "SAVEPOINT b",
+        "INSERT INTO account VALUES (3, 300)",
+        "RELEASE SAVEPOINT b",
+        "ROLLBACK TO SAVEPOINT a",
+        "COMMIT",
+    ] {
+        client
+            .simple_query(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    let after = client
+        .simple_query("SELECT id FROM account")
+        .await
+        .expect("select after commit");
+    assert_eq!(
+        ids(&after),
+        vec!["1"],
+        "RELEASE b kept 2 and 3 buffered, but ROLLBACK TO a then discarded them; only 1 commits"
+    );
+
+    drop(client);
+    let _ = driver.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn savepoint_error_paths_report_postgres_sqlstates() {
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+    let (client, driver) = account_client(addr).await;
+
+    // (1) A savepoint statement outside any transaction block — 25P01.
+    let err = client
+        .simple_query("SAVEPOINT sp1")
+        .await
+        .expect_err("SAVEPOINT outside a transaction is rejected");
+    assert_eq!(sqlstate(&err), Some("25P01"), "no active transaction");
+
+    // (2) ROLLBACK TO a savepoint that does not exist — 3B001 — and it aborts the
+    // transaction, so a following statement is refused until the block ends.
+    client.simple_query("BEGIN").await.expect("begin");
+    let err = client
+        .simple_query("ROLLBACK TO SAVEPOINT nope")
+        .await
+        .expect_err("unknown savepoint is rejected");
+    assert_eq!(sqlstate(&err), Some("3B001"), "savepoint does not exist");
+
+    let err = client
+        .simple_query("SELECT id FROM account")
+        .await
+        .expect_err("the transaction is now aborted");
+    assert_eq!(
+        sqlstate(&err),
+        Some("25P02"),
+        "commands are ignored until the aborted block ends"
+    );
+
+    // ROLLBACK ends the block; the connection is usable again.
+    client
+        .simple_query("ROLLBACK")
+        .await
+        .expect("rollback ends the aborted block");
+    client
+        .simple_query("SELECT id FROM account")
+        .await
+        .expect("the connection works after the block ends");
 
     drop(client);
     let _ = driver.await;
