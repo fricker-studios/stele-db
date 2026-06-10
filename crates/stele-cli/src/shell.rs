@@ -73,7 +73,10 @@ pub fn run(opts: &Opts) -> anyhow::Result<()> {
     let mut client = Client::connect(&opts.host, opts.port, &opts.user, &opts.dbname)
         .context("starting stele shell")?;
     let stdin = std::io::stdin();
-    let interactive = stdin.is_terminal();
+    // Interactive needs BOTH ends on a terminal: with stdout redirected
+    // (`stele shell > file`, `| tee`) the rustyline editor would spray
+    // prompts and refresh escapes into the capture, so that runs scripted.
+    let interactive = stdin.is_terminal() && std::io::stdout().is_terminal();
     let mut session = Session {
         theme: if opts.no_color {
             Theme::plain()
@@ -146,22 +149,37 @@ fn repl_interactive(client: &mut Client, session: &mut Session) -> anyhow::Resul
 
     let mut out = std::io::stdout();
     let mut buffer = String::new();
+    // Raw lines of the statement being assembled — recorded into history as
+    // ONE entry when the statement sends, so ↑ recalls the whole statement
+    // (psql behavior), not its last fragment.
+    let mut pending = String::new();
     loop {
         let prompt = prompt_text(client.txn_status(), &buffer);
         match rl.readline(prompt) {
             Ok(line) => {
-                if !line.trim().is_empty() {
-                    let _ = rl.add_history_entry(line.as_str());
+                let is_meta = buffer.trim().is_empty() && line.trim_start().starts_with('\\');
+                if is_meta {
+                    let _ = rl.add_history_entry(line.trim());
+                } else if !line.trim().is_empty() {
+                    if !pending.is_empty() {
+                        pending.push('\n');
+                    }
+                    pending.push_str(&line);
                 }
-                if matches!(
-                    handle_line(client, session, &mut out, &mut buffer, &line)?,
-                    Flow::Quit
-                ) {
+                let flow = handle_line(client, session, &mut out, &mut buffer, &line)?;
+                if buffer.trim().is_empty() && !pending.is_empty() {
+                    let _ = rl.add_history_entry(pending.as_str());
+                    pending.clear();
+                }
+                if matches!(flow, Flow::Quit) {
                     return Ok(());
                 }
             }
             // ⌃C cancels the in-flight statement buffer, keeps the session.
-            Err(ReadlineError::Interrupted) => buffer.clear(),
+            Err(ReadlineError::Interrupted) => {
+                buffer.clear();
+                pending.clear();
+            }
             // ⌃D at the prompt quits, like psql.
             Err(ReadlineError::Eof) => return Ok(()),
             Err(e) => return Err(e).context("reading input"),
@@ -200,11 +218,52 @@ fn handle_line(
     }
     buffer.push_str(line);
     buffer.push('\n');
-    if buffer.trim_end().ends_with(';') {
+    if statement_terminated(buffer) {
         let sql = std::mem::take(buffer);
         run_statement(client, session, sql.trim(), out)?;
     }
     Ok(Flow::Continue)
+}
+
+/// Whether the buffer ends in a statement-terminating `;` — quote- and
+/// comment-aware, so a `;` at a line break inside a `'…'` literal (or behind
+/// `--`) keeps the continuation prompt instead of sending a torn statement.
+fn statement_terminated(buffer: &str) -> bool {
+    let mut last_significant = None;
+    let mut chars = buffer.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                // Consume the literal, honoring '' escapes; an unterminated
+                // literal swallows the rest (still mid-string → not done).
+                loop {
+                    match chars.next() {
+                        None => return false,
+                        Some('\'') => {
+                            if chars.peek() == Some(&'\'') {
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                        Some(_) => {}
+                    }
+                }
+                last_significant = Some('\'');
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                // Line comment: skip to end of line.
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
+            c if c.is_whitespace() => {}
+            c => last_significant = Some(c),
+        }
+    }
+    last_significant == Some(';')
 }
 
 // ---------------------------------------------------------------------------
@@ -221,9 +280,12 @@ enum Meta<'a> {
     ListTables,
     ListDbs,
     ConnInfo,
-    Timing,
-    Expanded,
-    Json,
+    /// `\timing [on|off]` — bare toggles, an argument sets.
+    Timing(Option<&'a str>),
+    /// `\x [on|off]`.
+    Expanded(Option<&'a str>),
+    /// `\json [on|off]`.
+    Json(Option<&'a str>),
     Clear,
     Connect,
     /// A designed-but-not-yet-wired command (temporal or admin tier).
@@ -232,7 +294,25 @@ enum Meta<'a> {
         ticket: &'static str,
         why: &'static str,
     },
+    /// A recognized command with arguments it cannot honor.
+    BadArgs {
+        message: String,
+        hint: &'static str,
+    },
     Unknown(&'a str),
+}
+
+/// Resolve a toggle's `[on|off]` argument: bare flips, `on`/`off` set.
+fn toggle_value(current: bool, arg: Option<&str>) -> Result<bool, ServerError> {
+    match arg {
+        None => Ok(!current),
+        Some(a) if a.eq_ignore_ascii_case("on") => Ok(true),
+        Some(a) if a.eq_ignore_ascii_case("off") => Ok(false),
+        Some(other) => Err(usage_error(
+            format!("unrecognized value \"{other}\": expected on or off"),
+            r"e.g. \timing on",
+        )),
+    }
 }
 
 /// Parse a meta-command line; `None` means the line is SQL.
@@ -247,12 +327,20 @@ fn parse_meta(line: &str) -> Option<Meta<'_>> {
         "?" => Meta::Help,
         "h" | "help" => Meta::SqlHelp,
         "d" => arg.map_or(Meta::ListTables, |name| Meta::Describe(Some(name))),
-        "dt" => Meta::ListTables,
+        // A pattern argument is not supported yet — surface that instead of
+        // silently listing everything (the faithful shim is a later ticket).
+        "dt" => match arg {
+            None => Meta::ListTables,
+            Some(_) => Meta::BadArgs {
+                message: r"\dt does not support patterns yet".to_owned(),
+                hint: r"Bare \dt lists every table.",
+            },
+        },
         "l" | "list" => Meta::ListDbs,
         "conninfo" => Meta::ConnInfo,
-        "timing" => Meta::Timing,
-        "x" => Meta::Expanded,
-        "json" => Meta::Json,
+        "timing" => Meta::Timing(arg),
+        "x" => Meta::Expanded(arg),
+        "json" => Meta::Json(arg),
         "clear" | "c!" => Meta::Clear,
         "c" | "connect" => Meta::Connect,
         "asof" | "history" | "timeline" | "lineage" | "audit" | "segments" => Meta::NotYet {
@@ -284,33 +372,38 @@ fn dispatch_meta(
         Meta::Describe(None) | Meta::ListTables => list_tables(client, session, out)?,
         Meta::ListDbs => list_databases(session, out)?,
         Meta::ConnInfo => conninfo(session, out)?,
-        Meta::Timing => {
-            session.timing = !session.timing;
-            let msg = if session.timing {
-                "Timing is on."
-            } else {
-                "Timing is off."
-            };
-            write_segs(session, out, &[(Role::Mut, msg.to_owned())])?;
-        }
-        Meta::Expanded => {
-            session.expanded = !session.expanded;
-            let msg = if session.expanded {
-                "Expanded display is on."
-            } else {
-                "Expanded display is off."
-            };
-            write_segs(session, out, &[(Role::Mut, msg.to_owned())])?;
-        }
-        Meta::Json => {
-            session.json = !session.json;
-            let msg = if session.json {
-                "Output format is json."
-            } else {
-                "Output format is aligned table."
-            };
-            write_segs(session, out, &[(Role::Mut, msg.to_owned())])?;
-        }
+        Meta::Timing(arg) => match toggle_value(session.timing, *arg) {
+            Err(e) => print_error(session, &e),
+            Ok(v) => {
+                session.timing = v;
+                let msg = if v { "Timing is on." } else { "Timing is off." };
+                write_segs(session, out, &[(Role::Mut, msg.to_owned())])?;
+            }
+        },
+        Meta::Expanded(arg) => match toggle_value(session.expanded, *arg) {
+            Err(e) => print_error(session, &e),
+            Ok(v) => {
+                session.expanded = v;
+                let msg = if v {
+                    "Expanded display is on."
+                } else {
+                    "Expanded display is off."
+                };
+                write_segs(session, out, &[(Role::Mut, msg.to_owned())])?;
+            }
+        },
+        Meta::Json(arg) => match toggle_value(session.json, *arg) {
+            Err(e) => print_error(session, &e),
+            Ok(v) => {
+                session.json = v;
+                let msg = if v {
+                    "Output format is json."
+                } else {
+                    "Output format is aligned table."
+                };
+                write_segs(session, out, &[(Role::Mut, msg.to_owned())])?;
+            }
+        },
         Meta::Clear => {
             if session.interactive {
                 // Clear screen + scrollback, home the cursor.
@@ -337,6 +430,9 @@ fn dispatch_meta(
                 format!("NOTICE:  \\{cmd} {why} — coming with {ticket}."),
             )],
         )?,
+        Meta::BadArgs { message, hint } => {
+            print_error(session, &usage_error(message.clone(), hint));
+        }
         Meta::Unknown(cmd) => print_error(
             session,
             &usage_error(
@@ -468,14 +564,28 @@ fn list_tables(client: &mut Client, session: &Session, out: &mut impl Write) -> 
         print_error(session, err);
         return Ok(());
     }
-    let names: Vec<String> = first_result_set(&replies)
-        .map(|set| {
+    // Resolve the relname column by name from the RowDescription — never by
+    // position, so a projection-honoring server (real Postgres, a future
+    // faithful shim) fails loudly below instead of listing nothing.
+    let names: Vec<String> = match first_result_set(&replies) {
+        None => Vec::new(),
+        Some(set) => {
+            let Some(idx) = set.columns.iter().position(|c| c.name == "relname") else {
+                print_error(
+                    session,
+                    &usage_error(
+                        "unexpected table-list reply from server (no relname column)".to_owned(),
+                        "stele shell's \\dt speaks the Stele pg_catalog shim.",
+                    ),
+                );
+                return Ok(());
+            };
             set.rows
                 .iter()
-                .filter_map(|row| row.get(1).cloned().flatten())
+                .filter_map(|row| row.get(idx).cloned().flatten())
                 .collect()
-        })
-        .unwrap_or_default();
+        }
+    };
     if names.is_empty() {
         return write_segs(
             session,
@@ -886,6 +996,42 @@ mod tests {
     #[test]
     fn unknown_meta_is_a_usage_error_not_sql() {
         assert_eq!(parse_meta(r"\x9 on"), Some(Meta::Unknown(r"\x9 on")));
+    }
+
+    #[test]
+    fn toggles_accept_on_off_and_reject_junk() {
+        assert_eq!(parse_meta(r"\timing on"), Some(Meta::Timing(Some("on"))));
+        assert_eq!(toggle_value(false, None), Ok(true));
+        assert_eq!(toggle_value(true, None), Ok(false));
+        // `on` is idempotent — running it twice never inverts (psql habit).
+        assert_eq!(toggle_value(true, Some("on")), Ok(true));
+        assert_eq!(toggle_value(true, Some("OFF")), Ok(false));
+        let err = toggle_value(false, Some("maybe")).unwrap_err();
+        assert_eq!(err.code, "42601");
+    }
+
+    #[test]
+    fn dt_with_a_pattern_is_rejected_not_silently_unfiltered() {
+        assert!(matches!(
+            parse_meta(r"\dt acc*"),
+            Some(Meta::BadArgs { .. })
+        ));
+    }
+
+    #[test]
+    fn statement_termination_is_quote_and_comment_aware() {
+        assert!(statement_terminated("SELECT 1;"));
+        assert!(statement_terminated("SELECT 1; \n"));
+        assert!(statement_terminated("SELECT 1 -- tail comment\n;"));
+        assert!(!statement_terminated("SELECT 1"));
+        // A `;` at a line break inside a string literal is NOT a terminator…
+        assert!(!statement_terminated("INSERT INTO t VALUES ('a;\n"));
+        // …until the literal closes and a real `;` follows.
+        assert!(statement_terminated("INSERT INTO t VALUES ('a;\nb');\n"));
+        // '' escape keeps the literal open across an apparent close.
+        assert!(!statement_terminated("SELECT 'it''s;\n"));
+        // A `;` swallowed by a line comment does not terminate.
+        assert!(!statement_terminated("SELECT 1 -- done;\n"));
     }
 
     #[test]

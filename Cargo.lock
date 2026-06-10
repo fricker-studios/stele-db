@@ -2243,6 +2243,7 @@ dependencies = [
  "stele-server",
  "stele-storage",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]

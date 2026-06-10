@@ -260,9 +260,8 @@ fn parse_row_description(payload: &[u8]) -> anyhow::Result<Vec<Column>> {
         let name = read_cstring(payload, &mut pos).context("malformed RowDescription")?;
         // Fixed-width remainder of the field descriptor: table oid (4),
         // attnum (2), type oid (4), typlen (2), typmod (4), format (2).
-        let type_oid = be_i32(payload, pos + 6)
-            .and_then(|oid| u32::try_from(oid).ok())
-            .context("RowDescription truncated")?;
+        // OIDs are unsigned — a high-bit extension OID is legal on the wire.
+        let type_oid = be_u32(payload, pos + 6).context("RowDescription truncated")?;
         pos += 18;
         if pos > payload.len() {
             bail!("RowDescription truncated");
@@ -349,6 +348,12 @@ fn be_u16(payload: &[u8], pos: &mut usize) -> Option<u16> {
 fn be_i32(payload: &[u8], at: usize) -> Option<i32> {
     let bytes = payload.get(at..at + 4)?;
     Some(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// Big-endian `u32` at `at` — for fields that are unsigned on the wire (OIDs).
+fn be_u32(payload: &[u8], at: usize) -> Option<u32> {
+    let bytes = payload.get(at..at + 4)?;
+    Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 #[cfg(test)]

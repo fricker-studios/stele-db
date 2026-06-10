@@ -55,29 +55,35 @@ pub struct TableOpts {
 /// A rendered line: styled segments, no trailing newline.
 pub type Line = Vec<Seg>;
 
+/// Flatten rows into display cells — escaped, with the optional 1-based `#`
+/// column materialized so widths/alignment treat it like any other column.
+fn display_cells(ncols: usize, rows: &[Vec<Option<String>>], row_nums: bool) -> Vec<Vec<String>> {
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let mut out = Vec::with_capacity(ncols + usize::from(row_nums));
+            if row_nums {
+                out.push((i + 1).to_string());
+            }
+            out.extend((0..ncols).map(|c| {
+                row.get(c)
+                    .and_then(Option::as_deref)
+                    .map(display_cell)
+                    .unwrap_or_default()
+            }));
+            out
+        })
+        .collect()
+}
+
 /// Render a result set as an aligned table.
 pub fn table_lines(columns: &[Column], rows: &[Vec<Option<String>>], opts: TableOpts) -> Vec<Line> {
-    // Materialize the optional row-number column up front so widths/alignment
-    // treat it like any other column.
     let mut cols: Vec<(String, bool)> = Vec::new();
     if opts.row_nums {
         cols.push(("#".to_owned(), true));
     }
     cols.extend(columns.iter().map(|c| (c.name.clone(), c.right_align())));
-    let cells: Vec<Vec<String>> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, row)| {
-            let mut out = Vec::with_capacity(cols.len());
-            if opts.row_nums {
-                out.push((i + 1).to_string());
-            }
-            out.extend(
-                (0..columns.len()).map(|c| row.get(c).cloned().flatten().unwrap_or_default()),
-            );
-            out
-        })
-        .collect();
+    let cells = display_cells(columns.len(), rows, opts.row_nums);
 
     let widths: Vec<usize> = cols
         .iter()
@@ -170,13 +176,18 @@ pub fn expanded_lines(columns: &[Column], rows: &[Vec<Option<String>>]) -> Vec<L
     let mut lines: Vec<Line> = Vec::new();
     for (ri, row) in rows.iter().enumerate() {
         let hdr = format!("-[ RECORD {} ]", ri + 1);
-        let fill = (w + 3).saturating_sub(hdr.chars().count());
+        // `+` sits at column w+1, directly over the field lines' `|`.
+        let fill = (w + 1).saturating_sub(hdr.chars().count());
         lines.push(vec![(
             Role::Div,
             format!("{hdr}{}+{}", "-".repeat(fill), "-".repeat(22)),
         )]);
         for (ci, col) in columns.iter().enumerate() {
-            let value = row.get(ci).cloned().flatten().unwrap_or_default();
+            let value = row
+                .get(ci)
+                .and_then(Option::as_deref)
+                .map(display_cell)
+                .unwrap_or_default();
             let fill = w.saturating_sub(width_of(&col.name));
             lines.push(vec![
                 (Role::Mut, format!("{}{} ", col.name, " ".repeat(fill))),
@@ -258,9 +269,29 @@ fn count_line(n: usize) -> String {
     format!("({n} row{})", if n == 1 { "" } else { "s" })
 }
 
-/// Display width as a character count (the wire text is plain).
+/// Terminal display width — CJK/emoji occupy two columns, combining marks
+/// zero — so padded frames stay aligned for any cell text.
 fn width_of(s: &str) -> usize {
-    s.chars().count()
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
+/// A cell as displayed in an aligned frame: control characters (an embedded
+/// newline in a TEXT value, a tab, …) are escaped so a single wire cell can
+/// never split or skew a bordered row. JSON mode escapes on its own; the raw
+/// value always round-trips over the wire untouched.
+fn display_cell(text: &str) -> String {
+    if !text.chars().any(char::is_control) {
+        return text.to_owned();
+    }
+    text.chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -367,6 +398,50 @@ mod tests {
             rendered,
             "-[ RECORD 1 ]+----------------------\nid   | 1\nname | alice\n-[ RECORD 2 ]+----------------------\nid   | 20\nname | \n(2 rows)"
         );
+    }
+
+    #[test]
+    fn expanded_divider_plus_sits_over_the_field_pipe() {
+        // With a name wider than the record header, `+` must land at column
+        // w+1 — exactly over the `|` of the field lines (psql geometry).
+        let cols = vec![col("system_time_col", 25)];
+        let rows = vec![vec![Some("x".to_owned())]];
+        let rendered = text(&expanded_lines(&cols, &rows));
+        let lines: Vec<&str> = rendered.lines().collect();
+        let plus = lines[0].find('+').expect("divider has +");
+        let pipe = lines[1].find('|').expect("field has |");
+        assert_eq!(plus, pipe, "{rendered}");
+    }
+
+    #[test]
+    fn wide_glyph_cells_pad_by_display_width() {
+        // "日本語" is 3 chars but 6 terminal columns; the frame must not skew.
+        let cols = vec![col("t", 25)];
+        let rows = vec![
+            vec![Some("日本語".to_owned())],
+            vec![Some("abcdef".to_owned())],
+        ];
+        let rendered = text(&table_lines(&cols, &rows, opts(BorderStyle::Unicode)));
+        let widths: Vec<usize> = rendered
+            .lines()
+            .filter(|l| l.starts_with('│'))
+            .map(unicode_width::UnicodeWidthStr::width)
+            .collect();
+        assert!(!widths.is_empty());
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "frame rows differ in display width: {rendered}"
+        );
+    }
+
+    #[test]
+    fn control_characters_in_cells_are_escaped_not_framed_raw() {
+        let cols = vec![col("v", 25)];
+        let rows = vec![vec![Some("line one\nline two".to_owned())]];
+        let rendered = text(&table_lines(&cols, &rows, opts(BorderStyle::Psql)));
+        // One physical data row, newline rendered as the \n escape.
+        assert!(rendered.contains("line one\\nline two"), "{rendered}");
+        assert_eq!(rendered.lines().count(), 4, "{rendered}"); // header + rule + row + count
     }
 
     #[test]

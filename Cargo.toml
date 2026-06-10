@@ -71,6 +71,9 @@ sqlparser          = { version = "0.62", default-features = false, features = ["
 # default features off — no file/sqlite history, no fuzzy matcher, no dirs probe.
 # CLI-only: never a dependency of the server or the runtime-agnostic core.
 rustyline          = { version = "18.0", default-features = false }
+# Terminal display width (CJK/emoji are 2 columns) for the shell's table
+# alignment. Already in the tree as rustyline's own width dep — zero new surface.
+unicode-width      = "0.2"
 thiserror          = "2.0"
 toml               = "0.8"
 tokio              = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
