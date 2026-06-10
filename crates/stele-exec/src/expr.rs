@@ -49,16 +49,38 @@
 //!
 //! ## Scope
 //!
-//! The evaluator handles the scalar types a `WHERE` over the v0.2 row codec
-//! reaches: [`LogicalType::Int4`], [`LogicalType::Int8`], [`LogicalType::Bool`],
-//! and [`LogicalType::Text`]. The remaining logical types (temporal, `PERIOD`,
-//! `UUID`, `BYTEA`) and division/modulo are deliberate follow-ups; an expression
-//! that reaches one surfaces a typed [`ExprError`] rather than a wrong answer.
+//! The evaluator handles every scalar logical type a `WHERE` over the v0.2 row
+//! codec can reach: the four original [`LogicalType::Int4`],
+//! [`LogicalType::Int8`], [`LogicalType::Bool`], [`LogicalType::Text`]
+//! ([STL-170]), the temporal [`LogicalType::Timestamp`] /
+//! [`LogicalType::TimestampTz`] / [`LogicalType::Date`], byte-ordered
+//! [`LogicalType::Uuid`] / [`LogicalType::Bytea`], and [`LogicalType::Period`]
+//! ([STL-207]). Period operands additionally compose with the SQL:2011 period
+//! predicates ([`Expr::Period`], over [`crate::period::evaluate`]). Integer
+//! arithmetic covers `+`/`-`/`*` and `/`/`%`.
+//!
+//! [`LogicalType::Float8`] is the one type still outside the evaluator: it exists
+//! only as the result of `AVG` ([STL-209]) — no column decodes into it, no
+//! literal of it is folded — so an expression that reaches one surfaces a typed
+//! [`ExprError`] rather than a wrong answer.
+//!
+//! ## Divide-by-zero (and overflow) are NULL, not a trap
+//!
+//! Integer division and modulo by zero, like arithmetic overflow, yield a NULL
+//! result cell rather than erroring — the evaluator stays *total* over its data
+//! ([`arith`]). This deliberately diverges from Postgres, which raises
+//! `division_by_zero`: a vectorized kernel evaluates every row of a batch
+//! unconditionally, so a single zero divisor cannot be allowed to abort the
+//! whole batch, and "unknown result" is exactly what NULL already means here.
 //!
 //! [STL-170]: https://allegromusic.atlassian.net/browse/STL-170
+//! [STL-207]: https://allegromusic.atlassian.net/browse/STL-207
+//! [STL-209]: https://allegromusic.atlassian.net/browse/STL-209
 
+use stele_common::period::{Interval, PeriodPredicate};
 use stele_common::types::{DecodeError, LogicalType, ScalarValue};
 
+use crate::period::evaluate;
 use crate::snapshot_scan::Column;
 
 /// A comparison operator. Defined for every supported scalar type via that
@@ -88,8 +110,8 @@ pub enum LogicOp {
     Or,
 }
 
-/// An integer arithmetic operator. Division and modulo are a follow-up (their
-/// divide-by-zero semantics warrant their own treatment).
+/// An integer arithmetic operator. `/` and `%` divide-by-zero to a NULL cell
+/// (like overflow), keeping the evaluator total — see the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArithOp {
     /// `+` — addition.
@@ -98,6 +120,10 @@ pub enum ArithOp {
     Sub,
     /// `*` — multiplication.
     Mul,
+    /// `/` — truncating integer division; divide-by-zero ⇒ NULL.
+    Div,
+    /// `%` — remainder (sign follows the dividend); divide-by-zero ⇒ NULL.
+    Mod,
 }
 
 /// A scalar expression over a batch's columns.
@@ -141,6 +167,19 @@ pub enum Expr {
         /// Left operand.
         left: Box<Expr>,
         /// Right operand.
+        right: Box<Expr>,
+    },
+    /// `left <pred> right` — a SQL:2011 period predicate (`CONTAINS`, `OVERLAPS`,
+    /// …) over two [`LogicalType::Period`] operands, yielding a (nullable)
+    /// boolean. The membership/adjacency relations [`crate::period::evaluate`]
+    /// defines, lifted into the expression tree so they apply per row rather than
+    /// only to a constant-folded pair ([STL-165]).
+    Period {
+        /// The period predicate to apply.
+        pred: PeriodPredicate,
+        /// Left period operand.
+        left: Box<Expr>,
+        /// Right period operand.
         right: Box<Expr>,
     },
 }
@@ -188,6 +227,16 @@ impl Expr {
         }
     }
 
+    /// `self <pred> other` — a period-predicate node over two PERIOD operands.
+    #[must_use]
+    pub fn period(self, pred: PeriodPredicate, other: Self) -> Self {
+        Self::Period {
+            pred,
+            left: Box::new(self),
+            right: Box::new(other),
+        }
+    }
+
     /// `NOT self`.
     #[must_use]
     pub fn negate(self) -> Self {
@@ -219,11 +268,30 @@ pub enum Vector {
     Int8(Vec<Option<i64>>),
     /// UTF-8 text ([`LogicalType::Text`]).
     Text(Vec<Option<String>>),
+    /// Microsecond UTC instants ([`LogicalType::Timestamp`]).
+    Timestamp(Vec<Option<i64>>),
+    /// Time-zone-aware microsecond instants ([`LogicalType::TimestampTz`]) —
+    /// stored as the same UTC microseconds as [`Self::Timestamp`] but a distinct
+    /// type, so the two never silently compare against each other.
+    TimestampTz(Vec<Option<i64>>),
+    /// Calendar dates as days since the Unix epoch ([`LogicalType::Date`]).
+    Date(Vec<Option<i32>>),
+    /// 128-bit UUIDs ([`LogicalType::Uuid`]). Comparisons are byte-ordered over
+    /// the 16 raw network-order bytes.
+    Uuid(Vec<Option<[u8; 16]>>),
+    /// Variable-length byte strings ([`LogicalType::Bytea`]). Comparisons are
+    /// lexicographic over the raw bytes.
+    Bytea(Vec<Option<Vec<u8>>>),
+    /// Half-open `[from, to)` periods ([`LogicalType::Period`]). Plain
+    /// comparisons order lexicographically by `(from, to)`; the SQL:2011 period
+    /// predicates apply through [`Expr::Period`].
+    Period(Vec<Option<Interval>>),
     /// Double-precision floats, each held as its IEEE-754 bit pattern
     /// (`f64::to_bits`, the same representation [`ScalarValue::Float8`] uses) so
     /// the vector stays `Eq`. The aggregator produces this for `AVG`
     /// ([STL-209]); no storage column decodes into it, and the scalar evaluator
-    /// does not yet read or compute over it (STL-207).
+    /// neither compares nor computes over it — `float8` is the one logical type
+    /// still outside the evaluator's scope.
     Float8(Vec<Option<u64>>),
 }
 
@@ -233,9 +301,12 @@ impl Vector {
     pub fn len(&self) -> usize {
         match self {
             Self::Bool(v) => v.len(),
-            Self::Int4(v) => v.len(),
-            Self::Int8(v) => v.len(),
+            Self::Int4(v) | Self::Date(v) => v.len(),
+            Self::Int8(v) | Self::Timestamp(v) | Self::TimestampTz(v) => v.len(),
             Self::Text(v) => v.len(),
+            Self::Uuid(v) => v.len(),
+            Self::Bytea(v) => v.len(),
+            Self::Period(v) => v.len(),
             Self::Float8(v) => v.len(),
         }
     }
@@ -255,6 +326,12 @@ impl Vector {
             Self::Int4(_) => LogicalType::Int4,
             Self::Int8(_) => LogicalType::Int8,
             Self::Text(_) => LogicalType::Text,
+            Self::Timestamp(_) => LogicalType::Timestamp,
+            Self::TimestampTz(_) => LogicalType::TimestampTz,
+            Self::Date(_) => LogicalType::Date,
+            Self::Uuid(_) => LogicalType::Uuid,
+            Self::Bytea(_) => LogicalType::Bytea,
+            Self::Period(_) => LogicalType::Period,
             Self::Float8(_) => LogicalType::Float8,
         }
     }
@@ -275,6 +352,12 @@ impl Vector {
             Self::Int4(v) => v[row].map(ScalarValue::Int4),
             Self::Int8(v) => v[row].map(ScalarValue::Int8),
             Self::Text(v) => v[row].clone().map(ScalarValue::Text),
+            Self::Timestamp(v) => v[row].map(ScalarValue::Timestamp),
+            Self::TimestampTz(v) => v[row].map(ScalarValue::TimestampTz),
+            Self::Date(v) => v[row].map(ScalarValue::Date),
+            Self::Uuid(v) => v[row].map(ScalarValue::Uuid),
+            Self::Bytea(v) => v[row].clone().map(ScalarValue::Bytea),
+            Self::Period(v) => v[row].map(ScalarValue::Period),
             // The cell already holds `f64::to_bits`, the same form
             // `ScalarValue::Float8` carries — pass it straight through.
             Self::Float8(v) => v[row].map(ScalarValue::Float8),
@@ -307,6 +390,12 @@ impl Vector {
             Self::Int4(v) => Self::Int4(pick(v, rows)),
             Self::Int8(v) => Self::Int8(pick(v, rows)),
             Self::Text(v) => Self::Text(pick(v, rows)),
+            Self::Timestamp(v) => Self::Timestamp(pick(v, rows)),
+            Self::TimestampTz(v) => Self::TimestampTz(pick(v, rows)),
+            Self::Date(v) => Self::Date(pick(v, rows)),
+            Self::Uuid(v) => Self::Uuid(pick(v, rows)),
+            Self::Bytea(v) => Self::Bytea(pick(v, rows)),
+            Self::Period(v) => Self::Period(pick(v, rows)),
             Self::Float8(v) => Self::Float8(pick(v, rows)),
         }
     }
@@ -315,20 +404,21 @@ impl Vector {
     /// decoding by the column's `ty`.
     ///
     /// A fixed-width [`Column::I64`] is read as [`LogicalType::Int8`] directly —
-    /// the only i64-width type the evaluator reads from it at this scope (the
-    /// temporal i64 types are the STL-207 follow-up). A [`Column::Bytes`] column
-    /// decodes each present cell from the canonical [`ScalarValue`] byte layout
-    /// ([`ScalarValue::decode`]), and a `None` cell stays NULL.
+    /// the one i64-width type that reaches the evaluator through that physical
+    /// shape (the metadata columns). A [`Column::Bytes`] column decodes each
+    /// present cell from the canonical [`ScalarValue`] byte layout
+    /// ([`ScalarValue::decode`]), and a `None` cell stays NULL — this is the path
+    /// every row-codec value column (including the temporal, `uuid`, `bytea`, and
+    /// `period` types) arrives on.
     ///
     /// # Errors
     ///
     /// [`ExprError::UnsupportedColumn`] if `ty` is outside the evaluator's scope
-    /// or does not match the column's physical shape, or [`ExprError::Decode`] if
-    /// a byte cell is not a valid encoding of `ty`.
+    /// (only `float8`) or does not match the column's physical shape, or
+    /// [`ExprError::Decode`] if a byte cell is not a valid encoding of `ty`.
     pub fn from_column(ty: LogicalType, column: &Column) -> Result<Self, ExprError> {
         match (ty, column) {
-            // The fixed-width column carries `int8` directly (the only i64-width
-            // type read here at this scope; temporal i64 types are STL-207).
+            // The fixed-width column carries `int8` directly.
             (LogicalType::Int8, Column::I64(v)) => {
                 Ok(Self::Int8(v.iter().copied().map(Some).collect()))
             }
@@ -344,6 +434,24 @@ impl Vector {
             }
             (LogicalType::Text, Column::Bytes(cells)) => {
                 decode_cells(ty, cells, as_text).map(Self::Text)
+            }
+            (LogicalType::Timestamp, Column::Bytes(cells)) => {
+                decode_cells(ty, cells, |v| as_int64_payload(&v)).map(Self::Timestamp)
+            }
+            (LogicalType::TimestampTz, Column::Bytes(cells)) => {
+                decode_cells(ty, cells, |v| as_int64_payload(&v)).map(Self::TimestampTz)
+            }
+            (LogicalType::Date, Column::Bytes(cells)) => {
+                decode_cells(ty, cells, |v| as_date(&v)).map(Self::Date)
+            }
+            (LogicalType::Uuid, Column::Bytes(cells)) => {
+                decode_cells(ty, cells, |v| as_uuid(&v)).map(Self::Uuid)
+            }
+            (LogicalType::Bytea, Column::Bytes(cells)) => {
+                decode_cells(ty, cells, as_bytea).map(Self::Bytea)
+            }
+            (LogicalType::Period, Column::Bytes(cells)) => {
+                decode_cells(ty, cells, |v| as_period(&v)).map(Self::Period)
             }
             (_, Column::Bytes(_)) => Err(ExprError::UnsupportedColumn {
                 logical: ty,
@@ -429,10 +537,19 @@ pub enum ExprError {
         found: LogicalType,
     },
 
-    /// A literal of a type the evaluator does not handle yet (temporal, `PERIOD`,
-    /// `UUID`, `BYTEA`).
+    /// A literal of a type the evaluator does not handle (only `float8`, which
+    /// exists solely as the `AVG` aggregate result).
     #[error("the vectorized evaluator does not support {0} literals yet")]
     UnsupportedLiteral(LogicalType),
+
+    /// A period predicate ([`Expr::Period`]) got a non-`PERIOD` operand. The
+    /// binder is expected to type both sides as `PERIOD`; anything else is a plan
+    /// error.
+    #[error("a period predicate requires PERIOD operands, got {found}")]
+    PeriodOperand {
+        /// The non-period operand's type.
+        found: LogicalType,
+    },
 
     /// A column whose logical type is out of scope, or does not match its
     /// physical (`i64` / bytes) shape.
@@ -497,6 +614,11 @@ pub fn eval_expr(expr: &Expr, columns: &[Vector], rows: usize) -> Result<Vector,
             let r = eval_expr(right, columns, rows)?;
             arith(*op, &l, &r)
         }
+        Expr::Period { pred, left, right } => {
+            let l = eval_expr(left, columns, rows)?;
+            let r = eval_expr(right, columns, rows)?;
+            period(*pred, &l, &r)
+        }
     }
 }
 
@@ -507,17 +629,36 @@ fn broadcast(value: &ScalarValue, rows: usize) -> Result<Vector, ExprError> {
         ScalarValue::Int4(v) => Vector::Int4(vec![Some(*v); rows]),
         ScalarValue::Int8(v) => Vector::Int8(vec![Some(*v); rows]),
         ScalarValue::Text(s) => Vector::Text(vec![Some(s.clone()); rows]),
-        other => return Err(ExprError::UnsupportedLiteral(other.logical_type())),
+        ScalarValue::Timestamp(v) => Vector::Timestamp(vec![Some(*v); rows]),
+        ScalarValue::TimestampTz(v) => Vector::TimestampTz(vec![Some(*v); rows]),
+        ScalarValue::Date(v) => Vector::Date(vec![Some(*v); rows]),
+        ScalarValue::Uuid(v) => Vector::Uuid(vec![Some(*v); rows]),
+        ScalarValue::Bytea(v) => Vector::Bytea(vec![Some(v.clone()); rows]),
+        ScalarValue::Period(iv) => Vector::Period(vec![Some(*iv); rows]),
+        // `float8` has no column, literal, or arithmetic in the evaluator.
+        ScalarValue::Float8(_) => return Err(ExprError::UnsupportedLiteral(value.logical_type())),
     })
 }
 
 /// Three-valued comparison: NULL on either side ⇒ NULL, else the boolean.
 fn compare(op: CmpOp, left: &Vector, right: &Vector) -> Result<Vector, ExprError> {
+    // Same-type operands compare through that type's total order. Arms are
+    // grouped by physical cell type — the `i64` (int8 + the temporal instants)
+    // and `i32` (int4 + date) groups share a kernel binding, so they merge.
     let out = match (left, right) {
-        (Vector::Int4(a), Vector::Int4(b)) => compare_cells(op, a, b),
-        (Vector::Int8(a), Vector::Int8(b)) => compare_cells(op, a, b),
+        (Vector::Int4(a), Vector::Int4(b)) | (Vector::Date(a), Vector::Date(b)) => {
+            compare_cells(op, a, b)
+        }
+        (Vector::Int8(a), Vector::Int8(b))
+        | (Vector::Timestamp(a), Vector::Timestamp(b))
+        | (Vector::TimestampTz(a), Vector::TimestampTz(b)) => compare_cells(op, a, b),
         (Vector::Bool(a), Vector::Bool(b)) => compare_cells(op, a, b),
         (Vector::Text(a), Vector::Text(b)) => compare_cells(op, a, b),
+        // Byte-ordered: UUID over its 16 network-order bytes, BYTEA lexicographic.
+        (Vector::Uuid(a), Vector::Uuid(b)) => compare_cells(op, a, b),
+        (Vector::Bytea(a), Vector::Bytea(b)) => compare_cells(op, a, b),
+        // Periods order lexicographically by `(from, to)` (`Interval`'s `Ord`).
+        (Vector::Period(a), Vector::Period(b)) => compare_cells(op, a, b),
         _ => {
             return Err(ExprError::CompareTypeMismatch {
                 left: left.logical_type(),
@@ -550,6 +691,30 @@ const fn apply_cmp(op: CmpOp, ord: std::cmp::Ordering) -> bool {
         CmpOp::Gt => matches!(ord, Greater),
         CmpOp::Ge => !matches!(ord, Less),
     }
+}
+
+/// Three-valued SQL:2011 period predicate over two PERIOD vectors: NULL on
+/// either side ⇒ NULL, else the boolean [`evaluate`] gives for the pair.
+fn period(pred: PeriodPredicate, left: &Vector, right: &Vector) -> Result<Vector, ExprError> {
+    let (Vector::Period(a), Vector::Period(b)) = (left, right) else {
+        let found = if matches!(left, Vector::Period(_)) {
+            right
+        } else {
+            left
+        };
+        return Err(ExprError::PeriodOperand {
+            found: found.logical_type(),
+        });
+    };
+    let out = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| match (x, y) {
+            (Some(a), Some(b)) => Some(evaluate(pred, *a, *b)),
+            _ => None,
+        })
+        .collect();
+    Ok(Vector::Bool(out))
 }
 
 /// Three-valued `AND` / `OR` over two boolean vectors.
@@ -612,11 +777,18 @@ fn not(operand: &Vector) -> Result<Vector, ExprError> {
 
 /// `IS NULL`: a non-null boolean per cell, regardless of the operand's type.
 fn is_null(operand: &Vector) -> Vector {
+    // Every variant reports the same per-cell `is_none()` mask; arms are grouped
+    // by physical cell type so the identical bodies merge.
     let mask = match operand {
         Vector::Bool(v) => v.iter().map(|c| Some(c.is_none())).collect(),
-        Vector::Int4(v) => v.iter().map(|c| Some(c.is_none())).collect(),
-        Vector::Int8(v) => v.iter().map(|c| Some(c.is_none())).collect(),
+        Vector::Int4(v) | Vector::Date(v) => v.iter().map(|c| Some(c.is_none())).collect(),
+        Vector::Int8(v) | Vector::Timestamp(v) | Vector::TimestampTz(v) => {
+            v.iter().map(|c| Some(c.is_none())).collect()
+        }
         Vector::Text(v) => v.iter().map(|c| Some(c.is_none())).collect(),
+        Vector::Uuid(v) => v.iter().map(|c| Some(c.is_none())).collect(),
+        Vector::Bytea(v) => v.iter().map(|c| Some(c.is_none())).collect(),
+        Vector::Period(v) => v.iter().map(|c| Some(c.is_none())).collect(),
         Vector::Float8(v) => v.iter().map(|c| Some(c.is_none())).collect(),
     };
     Vector::Bool(mask)
@@ -655,21 +827,28 @@ fn arith_cells<T: Copy>(
         .collect()
 }
 
-/// Checked `i32` arithmetic; `None` on overflow.
+/// Checked `i32` arithmetic; `None` on overflow *and* on divide-by-zero
+/// (`checked_div`/`checked_rem` return `None` for a zero divisor and for the
+/// `MIN / -1` overflow alike), which becomes a NULL cell.
 const fn arith_i32(op: ArithOp, a: i32, b: i32) -> Option<i32> {
     match op {
         ArithOp::Add => a.checked_add(b),
         ArithOp::Sub => a.checked_sub(b),
         ArithOp::Mul => a.checked_mul(b),
+        ArithOp::Div => a.checked_div(b),
+        ArithOp::Mod => a.checked_rem(b),
     }
 }
 
-/// Checked `i64` arithmetic; `None` on overflow.
+/// Checked `i64` arithmetic; `None` on overflow and on divide-by-zero (see
+/// [`arith_i32`]).
 const fn arith_i64(op: ArithOp, a: i64, b: i64) -> Option<i64> {
     match op {
         ArithOp::Add => a.checked_add(b),
         ArithOp::Sub => a.checked_sub(b),
         ArithOp::Mul => a.checked_mul(b),
+        ArithOp::Div => a.checked_div(b),
+        ArithOp::Mod => a.checked_rem(b),
     }
 }
 
@@ -716,6 +895,39 @@ fn as_text(value: ScalarValue) -> String {
     match value {
         ScalarValue::Text(s) => s,
         _ => String::new(),
+    }
+}
+// `Timestamp` and `TimestampTz` share an `i64` payload — the column's `ty` (not
+// the bytes) chooses the `Vector` variant in `from_column`, so one extractor
+// serves both.
+const fn as_int64_payload(value: &ScalarValue) -> i64 {
+    match value {
+        ScalarValue::Timestamp(v) | ScalarValue::TimestampTz(v) => *v,
+        _ => 0,
+    }
+}
+const fn as_date(value: &ScalarValue) -> i32 {
+    match value {
+        ScalarValue::Date(v) => *v,
+        _ => 0,
+    }
+}
+const fn as_uuid(value: &ScalarValue) -> [u8; 16] {
+    match value {
+        ScalarValue::Uuid(bytes) => *bytes,
+        _ => [0; 16],
+    }
+}
+fn as_bytea(value: ScalarValue) -> Vec<u8> {
+    match value {
+        ScalarValue::Bytea(bytes) => bytes,
+        _ => Vec::new(),
+    }
+}
+const fn as_period(value: &ScalarValue) -> Interval {
+    match value {
+        ScalarValue::Period(iv) => *iv,
+        _ => Interval { from: 0, to: 0 },
     }
 }
 
@@ -897,11 +1109,13 @@ mod tests {
 
     #[test]
     fn unsupported_literal_is_rejected() {
+        // `float8` is the one type the evaluator still rejects as a literal — it
+        // exists only as the `AVG` aggregate result.
         let cols: Vec<Vector> = vec![];
-        let expr = Expr::lit(ScalarValue::Uuid([0; 16]));
+        let expr = Expr::lit(ScalarValue::float8(1.5));
         assert_eq!(
             eval_expr(&expr, &cols, 0),
-            Err(ExprError::UnsupportedLiteral(LogicalType::Uuid))
+            Err(ExprError::UnsupportedLiteral(LogicalType::Float8))
         );
     }
 
@@ -915,6 +1129,17 @@ mod tests {
             ScalarValue::Int4(-1),
             ScalarValue::Text("hi".to_owned()),
             ScalarValue::Bool(true),
+            ScalarValue::Timestamp(1_700_000_000_000_000),
+            ScalarValue::TimestampTz(-1),
+            ScalarValue::Date(20_000),
+            ScalarValue::Uuid([
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00,
+            ]),
+            ScalarValue::Bytea(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            ScalarValue::Bytea(Vec::new()),
+            ScalarValue::Period(Interval::new(10, 20).unwrap()),
+            ScalarValue::Period(Interval::new(1_700_000_000_000_000, i64::MAX).unwrap()),
         ];
         for value in values {
             let mut buf = Vec::new();
@@ -937,12 +1162,104 @@ mod tests {
 
     #[test]
     fn from_column_rejects_out_of_scope_type() {
-        let col = Column::Bytes(vec![Some(vec![0; 16])]);
+        // `float8` is the only logical type still outside the evaluator's scope.
+        let col = Column::Bytes(vec![Some(vec![0; 8])]);
         assert_eq!(
-            Vector::from_column(LogicalType::Uuid, &col),
+            Vector::from_column(LogicalType::Float8, &col),
             Err(ExprError::UnsupportedColumn {
-                logical: LogicalType::Uuid,
+                logical: LogicalType::Float8,
                 physical: "bytes",
+            })
+        );
+    }
+
+    /// `/` and `%` with a NULL result for a zero divisor — the documented
+    /// divide-by-zero semantics, plus the `MIN / -1` overflow that also NULLs.
+    #[test]
+    fn division_and_modulo_null_on_zero_divisor_and_overflow() {
+        let cols = vec![
+            Vector::Int4(vec![Some(7), Some(7), Some(-7), Some(i32::MIN), None]),
+            Vector::Int4(vec![Some(2), Some(0), Some(2), Some(-1), Some(3)]),
+        ];
+        let div =
+            eval_expr(&Expr::col(0).arith(ArithOp::Div, Expr::col(1)), &cols, 5).expect("div");
+        // 7/2 → 3 (trunc); 7/0 → NULL; -7/2 → -3; MIN/-1 → overflow → NULL; NULL/3 → NULL.
+        assert_eq!(div, Vector::Int4(vec![Some(3), None, Some(-3), None, None]));
+        let rem =
+            eval_expr(&Expr::col(0).arith(ArithOp::Mod, Expr::col(1)), &cols, 5).expect("mod");
+        // 7%2 → 1; 7%0 → NULL; -7%2 → -1 (sign of dividend); MIN%-1 → NULL; NULL%3 → NULL.
+        assert_eq!(rem, Vector::Int4(vec![Some(1), None, Some(-1), None, None]));
+    }
+
+    /// The new scalar types each compare through their natural total order, with
+    /// NULL propagating, and a cross-type comparison stays a plan error.
+    #[test]
+    fn new_types_compare_in_their_total_order() {
+        // Byte-ordered UUID: 0x00.. < 0x01.. , and a NULL cell yields NULL.
+        let lo = [0u8; 16];
+        let mut hi = [0u8; 16];
+        hi[0] = 1;
+        let cols = vec![
+            Vector::Uuid(vec![Some(lo), Some(hi), None]),
+            Vector::Uuid(vec![Some(hi), Some(hi), Some(lo)]),
+        ];
+        let lt = eval_expr(&Expr::col(0).compare(CmpOp::Lt, Expr::col(1)), &cols, 3).expect("lt");
+        assert_eq!(lt, Vector::Bool(vec![Some(true), Some(false), None]));
+
+        // Timestamp orders by its i64 instant.
+        let ts = vec![
+            Vector::Timestamp(vec![Some(10), Some(20)]),
+            Vector::Timestamp(vec![Some(20), Some(20)]),
+        ];
+        let le = eval_expr(&Expr::col(0).compare(CmpOp::Le, Expr::col(1)), &ts, 2).expect("le");
+        assert_eq!(le, Vector::Bool(vec![Some(true), Some(true)]));
+
+        // Timestamp vs TimestampTz are distinct types — comparing them is a plan
+        // error, not a silent same-instant match.
+        let mixed = vec![
+            Vector::Timestamp(vec![Some(1)]),
+            Vector::TimestampTz(vec![Some(1)]),
+        ];
+        assert_eq!(
+            eval_expr(&Expr::col(0).compare(CmpOp::Eq, Expr::col(1)), &mixed, 1),
+            Err(ExprError::CompareTypeMismatch {
+                left: LogicalType::Timestamp,
+                right: LogicalType::TimestampTz,
+            })
+        );
+    }
+
+    /// A period predicate over two PERIOD vectors evaluates per row with NULL
+    /// propagation, matching [`crate::period::evaluate`].
+    #[test]
+    fn period_predicate_evaluates_per_row() {
+        let iv = |from, to| Interval::new(from, to).expect("interval");
+        let cols = vec![
+            Vector::Period(vec![Some(iv(10, 40)), Some(iv(10, 20)), None]),
+            Vector::Period(vec![Some(iv(20, 30)), Some(iv(20, 30)), Some(iv(0, 5))]),
+        ];
+        // [10,40) CONTAINS [20,30) → T; [10,20) CONTAINS [20,30) → F; NULL → NULL.
+        let contains = eval_expr(
+            &Expr::col(0).period(PeriodPredicate::Contains, Expr::col(1)),
+            &cols,
+            3,
+        )
+        .expect("contains");
+        assert_eq!(contains, Vector::Bool(vec![Some(true), Some(false), None]));
+
+        // A non-PERIOD operand is a plan error.
+        let bad = vec![
+            Vector::Period(vec![Some(iv(1, 2))]),
+            Vector::Int4(vec![Some(1)]),
+        ];
+        assert_eq!(
+            eval_expr(
+                &Expr::col(0).period(PeriodPredicate::Overlaps, Expr::col(1)),
+                &bad,
+                1
+            ),
+            Err(ExprError::PeriodOperand {
+                found: LogicalType::Int4,
             })
         );
     }
