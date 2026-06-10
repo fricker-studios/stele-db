@@ -1345,3 +1345,64 @@ fn validity_index_prune_never_drops_a_visible_row() {
         }
     }
 }
+
+// --- STL-173: per-row-group zone maps --------------------------------------
+
+/// Each row-group carries its own zone map, finer than the segment-level fold.
+/// Three keys land in three one-row row-groups: the segment-level key range spans
+/// `[a, z]` and so cannot rule the segment out for `id = m`, but the per-row-group
+/// maps prune the outer two row-groups, and the scoped identity read then touches
+/// only the surviving one (STL-173).
+#[test]
+fn row_group_zone_maps_prune_where_the_segment_fold_cannot() {
+    let disk = MemDisk::new();
+    let mut w = SegmentWriter::create(&disk, "rg.seg")
+        .expect("create")
+        .with_max_row_group_rows(1);
+    for key in [b"a".as_slice(), b"m", b"z"] {
+        w.push(Version::open(
+            BusinessKey::new(key.to_vec()),
+            SystemTimeMicros(10),
+            0,
+            Provenance::new(
+                TxnId(1),
+                SystemTimeMicros(10),
+                Principal::new(b"t".to_vec()),
+            ),
+            Some(b"v".to_vec()),
+        ))
+        .expect("push");
+    }
+    w.finish().expect("finish");
+    let reader = SegmentReader::open(&disk, "rg.seg").expect("open");
+    assert_eq!(reader.row_group_row_counts(), vec![1, 1, 1]);
+
+    let snap = Snapshot(SystemTimeMicros(100));
+    let eq_m = Predicate::Eq {
+        column: ColumnId::BusinessKey,
+        value: ZoneBound::Bytes(b"m".to_vec()),
+    };
+
+    // The segment-level fold spans [a, z], so it cannot rule the segment out.
+    assert!(reader.might_contain(&eq_m, snap));
+
+    // But the per-row-group maps prune the outer two; only the middle ('m')
+    // row-group can hold `id = m`.
+    let maps = reader.row_group_zone_maps();
+    assert_eq!(maps.len(), 3);
+    let survivors: std::collections::BTreeSet<usize> = (0..maps.len())
+        .filter(|&g| maps[g].might_contain(&eq_m, snap))
+        .collect();
+    assert_eq!(
+        survivors.iter().copied().collect::<Vec<_>>(),
+        vec![1],
+        "only the 'm' row-group can hold id = m",
+    );
+
+    // The scoped identity read returns just that row-group's key.
+    let keys = reader
+        .version_keys_in_row_groups(&survivors)
+        .expect("scoped identity read");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].0, BusinessKey::new(b"m".to_vec()));
+}

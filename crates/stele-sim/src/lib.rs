@@ -1815,6 +1815,28 @@ fn verify_scan_at(
         readers.len() - out.stats.segments_scanned,
     );
 
+    // Row-group prune partition (STL-173). The per-row-group zone prune carves
+    // each zone-survivor segment's row-groups into those read for identity and
+    // those skipped; the counts must cover exactly the survivors' row-groups.
+    // Seeds that bound `max_row_group_rows` make these multi-row-group, so an
+    // early snapshot prunes whole row-groups on `sys_from` ("begins after S").
+    // Soundness — a skipped row-group never held a live row — rides the oracle
+    // equivalence below: a wrongly pruned row-group would drop a key and diverge.
+    let rg_survivor_total: usize = readers
+        .iter()
+        .filter(|r| r.might_contain(&Predicate::All, snapshot))
+        .map(|r| r.row_group_row_counts().len())
+        .sum();
+    assert_eq!(
+        out.stats.row_groups_total, rg_survivor_total,
+        "seed {seed}: row_groups_total must cover the zone survivors' row-groups at {s:?}",
+    );
+    assert_eq!(
+        out.stats.row_groups_pruned_zone + out.stats.row_groups_scanned,
+        out.stats.row_groups_total,
+        "seed {seed}: the row-group counts must partition exactly at {s:?}",
+    );
+
     // Oracle equivalence: the merged scan equals the tier-agnostic reference.
     let got = scan_map(&out);
     let mut want: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();

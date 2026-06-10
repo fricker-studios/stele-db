@@ -14,20 +14,24 @@
 //! ## Shape of the read
 //!
 //! ```text
-//! prune segments (zone maps, then validity index) → resolve per key at S from
-//!   the identity columns → late-materialize the projected columns of the live
-//!   rows + delta → filter by pushed-down predicate → project → Arrow batch
+//! prune segments (zone maps) → prune row-groups (zone maps) → prune segments
+//!   (validity index) → resolve per key at S from the identity columns →
+//!   late-materialize the projected columns of the live rows + delta → filter by
+//!   pushed-down predicate → project → Arrow batch
 //! ```
 //!
-//! 1. **Prune.** Each sealed segment runs two complementary skip tests before
-//!    any bulk column is read (STL-146). First, [`SegmentReader::might_contain`]
-//!    — a zone-map-only check ("begins after `S`", plus value bounds) that
-//!    touches no column chunk. A segment that survives the zone map then has only
-//!    its narrow `(business_key, sys_from, seq)` identity columns read, which
-//!    [`ValidityIndex::sys_upper_bound`] (STL-139) can use to prove every version
-//!    is already superseded at `S` ("ends before `S`") — skipping the bulk
-//!    chunks. [`ScanStats`] partitions the segments across the two prunes and the
-//!    survivors.
+//! 1. **Prune.** Each sealed segment runs three complementary skip tests before
+//!    any bulk column is read (STL-146, STL-173). First, [`SegmentReader::might_contain`]
+//!    — a segment-level zone-map check ("begins after `S`", plus value bounds)
+//!    that touches no column chunk. A segment that survives is then pruned again
+//!    at *row-group* granularity ([`SegmentReader::row_group_zone_maps`], STL-173):
+//!    a row-group whose own min/max prove no visible match is dropped even when
+//!    the segment-level fold cannot, so only the candidate row-groups' narrow
+//!    `(business_key, sys_from, seq)` identity columns are read. Those identities
+//!    feed [`ValidityIndex::sys_upper_bound`] (STL-139), which can prove every
+//!    surviving version is already superseded at `S` ("ends before `S`") and skip
+//!    the bulk chunks. [`ScanStats`] partitions both the segments and the
+//!    row-groups across the prunes and the survivors.
 //! 2. **Resolve.** The delta tier resolves its own staged versions at `S`
 //!    ([`Delta::range_scan`]); the surviving segments' *identities* are folded
 //!    with the validity index and resolved the same way
@@ -257,12 +261,26 @@ pub struct Batch {
 ///
 /// What remains is [`segments_scanned`](Self::segments_scanned): the segments
 /// whose projected columns are materialized for the rows that survive resolution.
+///
+/// ## Row-group accounting (STL-173)
+///
+/// Within a segment that survives the segment-level zone prune, the scan prunes
+/// again at *row-group* granularity: each row-group's own zone map
+/// ([`SegmentReader::row_group_zone_maps`]) can prove no visible matching row
+/// even when the segment-level fold (whose `[min, max]` spans every row-group)
+/// cannot. The three `row_groups_*` counts partition the row-groups of exactly
+/// the segment-level zone survivors —
+/// `row_groups_total == row_groups_pruned_zone + row_groups_scanned` — and a
+/// segment whose *every* row-group is pruned this way is itself counted in
+/// [`segments_pruned_zone`](Self::segments_pruned_zone) (no identity chunk read).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanStats {
     /// Total sealed segments offered to the scan.
     pub segments_total: usize,
     /// Segments the zone maps proved could hold no visible match — skipped with
-    /// no read I/O at all.
+    /// no read I/O at all. Includes segments ruled out wholesale at the segment
+    /// level *and* segments every one of whose row-groups the per-row-group zone
+    /// maps then ruled out (STL-173) — neither has an identity chunk read.
     pub segments_pruned_zone: usize,
     /// Segments that survived the zone map but whose every version the validity
     /// index proved superseded at the snapshot — skipped after reading only the
@@ -271,6 +289,17 @@ pub struct ScanStats {
     /// Segments that survived both prunes — their projected columns are read for
     /// any row live at the snapshot.
     pub segments_scanned: usize,
+    /// Row-groups across the segment-level zone survivors — the denominator the
+    /// two row-group counts below partition (STL-173). Excludes the row-groups of
+    /// segments pruned wholesale at the segment level (those are never examined
+    /// at row-group granularity).
+    pub row_groups_total: usize,
+    /// Row-groups a per-row-group zone map proved hold no visible match — their
+    /// identity (and bulk) chunks are never read.
+    pub row_groups_pruned_zone: usize,
+    /// Row-groups whose narrow identity columns were read to resolve the snapshot
+    /// (the candidates that survived the per-row-group prune).
+    pub row_groups_scanned: usize,
 }
 
 impl ScanStats {
@@ -415,6 +444,97 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
 
     /// Resolve one version per key, live at the snapshot, across both tiers,
     /// returning the rows alongside the segment-pruning [`ScanStats`].
+    /// Prune the sealed segments down to the survivors that may hold a row live
+    /// at the snapshot, returning each survivor's candidate identities (paired
+    /// with their segment-global row indices) and the pruning [`ScanStats`].
+    ///
+    /// Three complementary skip stages, none of which reads a bulk column chunk:
+    /// the segment-level zone map, the per-row-group zone maps (STL-173), and the
+    /// validity index's "every surviving version superseded" bound (STL-139).
+    #[allow(clippy::type_complexity)]
+    fn prune_segments(
+        &self,
+    ) -> Result<(Vec<(usize, Vec<(usize, VersionId)>)>, ScanStats), ScanError> {
+        // The predicate the zone maps prune against. A system-only scan prunes
+        // against the bare pushed-down predicate, unchanged; a both-axes scan
+        // (`valid_as_of` set) conjoins two sound one-sided valid-time skips
+        // derived from STL-117's first-class valid_from / valid_to columns. See
+        // [`Self::pruning_predicate`].
+        let pruning_pred = self.pruning_predicate();
+
+        let mut pruned_zone = 0usize;
+        let mut pruned_superseded = 0usize;
+        let mut rg_total = 0usize;
+        let mut rg_pruned = 0usize;
+        let mut rg_scanned = 0usize;
+        // (segment index, its surviving rows as (segment-global row index, identity)).
+        let mut survivors: Vec<(usize, Vec<(usize, VersionId)>)> = Vec::new();
+        for (seg_idx, reader) in self.segments.iter().enumerate() {
+            // Stage 1 — segment zone map: rules a whole segment out touching no
+            // column chunk.
+            if !reader.might_contain(&pruning_pred, self.snapshot) {
+                pruned_zone += 1;
+                continue;
+            }
+            // Stage 2 — per-row-group zone maps (STL-173): rule out the
+            // row-groups whose own min/max prove no visible match, even when the
+            // segment-level fold (its `[min, max]` spanning every row-group)
+            // cannot. Footer-resident, so this costs no chunk I/O — the pruned
+            // row-groups' identity chunks are then never read.
+            let rg_counts = reader.row_group_row_counts();
+            let rg_maps = reader.row_group_zone_maps();
+            rg_total += rg_maps.len();
+            let candidates: BTreeSet<usize> = (0..rg_maps.len())
+                .filter(|&g| rg_maps[g].might_contain(&pruning_pred, self.snapshot))
+                .collect();
+            rg_pruned += rg_maps.len() - candidates.len();
+            if candidates.is_empty() {
+                // Every row-group ruled out — the segment holds no visible match
+                // even though its coarse segment-level fold could not prove it.
+                // Counts as a zone prune: no identity chunk was read.
+                pruned_zone += 1;
+                continue;
+            }
+            rg_scanned += candidates.len();
+            // Stage 3 — validity index: read only the candidate row-groups'
+            // narrow `(business_key, sys_from, seq)` identity columns and ask
+            // whether every surviving version is already superseded at the
+            // snapshot (STL-139). Complementary to the zone map's "begins after
+            // the snapshot" test, this is "ends before the snapshot".
+            let keys = reader.version_keys_in_row_groups(&candidates)?;
+            if self
+                .index
+                .sys_upper_bound(keys.iter().cloned())?
+                .superseded_at_or_before(self.snapshot.0)
+            {
+                pruned_superseded += 1;
+                continue;
+            }
+            // Pair each identity with its segment-global row index: the candidate
+            // row-groups' rows are contiguous and the scoped read returns them in
+            // row-group order, so a global-index walk over the candidates lines
+            // up one-to-one with `keys` — the same addressing
+            // [`RowGroupSelection`] uses for the bulk read below.
+            let globals = global_row_indices(&rg_counts, &candidates);
+            if globals.len() != keys.len() {
+                return Err(ScanError::Segment(SegmentError::Corrupt(
+                    "segment identity row count disagrees with the selected row-groups' row count",
+                )));
+            }
+            survivors.push((seg_idx, globals.into_iter().zip(keys).collect()));
+        }
+        let stats = ScanStats {
+            segments_total: self.segments.len(),
+            segments_pruned_zone: pruned_zone,
+            segments_pruned_superseded: pruned_superseded,
+            segments_scanned: survivors.len(),
+            row_groups_total: rg_total,
+            row_groups_pruned_zone: rg_pruned,
+            row_groups_scanned: rg_scanned,
+        };
+        Ok((survivors, stats))
+    }
+
     fn resolve_rows(&self) -> Result<(Vec<Version>, ScanStats), ScanError> {
         // The delta tier resolves its own staged versions at the snapshot. Bound
         // its scan by the business-key range the predicate implies (predicate
@@ -442,39 +562,9 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
         // scan — the union of the projected and predicate-referenced columns.
         let needed = self.materialized_columns();
 
-        // Prune each sealed segment in two complementary stages, then keep the
-        // identity columns of the survivors for resolution + late materialization.
-        let mut pruned_zone = 0usize;
-        let mut pruned_superseded = 0usize;
-        let mut survivors: Vec<(usize, Vec<VersionId>)> = Vec::new();
-        for (seg_idx, reader) in self.segments.iter().enumerate() {
-            // Stage 1 — zone map: rules a segment out touching no column chunk.
-            if !reader.might_contain(&self.predicate, self.snapshot) {
-                pruned_zone += 1;
-                continue;
-            }
-            // Stage 2 — validity index: read only the narrow `(business_key,
-            // sys_from, seq)` identity columns and ask whether every version is
-            // already superseded at the snapshot (STL-139). Complementary to the
-            // zone map's "begins after the snapshot" test, this is "ends before
-            // the snapshot"; either prune skips the bulk column chunks.
-            let keys = reader.version_keys()?;
-            if self
-                .index
-                .sys_upper_bound(keys.iter().cloned())?
-                .superseded_at_or_before(self.snapshot.0)
-            {
-                pruned_superseded += 1;
-                continue;
-            }
-            survivors.push((seg_idx, keys));
-        }
-        let stats = ScanStats {
-            segments_total: self.segments.len(),
-            segments_pruned_zone: pruned_zone,
-            segments_pruned_superseded: pruned_superseded,
-            segments_scanned: survivors.len(),
-        };
+        // Prune the sealed segments (segment- then row-group-level zone maps,
+        // then the validity index), keeping each survivor's candidate identities.
+        let (survivors, stats) = self.prune_segments()?;
 
         // Resolve which survivor rows are live at the snapshot from the identity
         // columns alone: `fold_chains` overlays the validity index's closes and
@@ -485,8 +575,8 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
         let mut locator: BTreeMap<VersionId, (usize, usize)> = BTreeMap::new();
         let mut identities: Vec<Version> = Vec::new();
         for (seg_idx, keys) in &survivors {
-            for (row_idx, (bk, sys_from, seq)) in keys.iter().enumerate() {
-                locator.insert((bk.clone(), *sys_from, *seq), (*seg_idx, row_idx));
+            for (row_idx, (bk, sys_from, seq)) in keys {
+                locator.insert((bk.clone(), *sys_from, *seq), (*seg_idx, *row_idx));
                 identities.push(identity_version(bk.clone(), *sys_from, *seq));
             }
         }
@@ -580,6 +670,54 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             }
         }
         needed
+    }
+
+    /// The predicate the zone maps (segment- and row-group-level) prune against.
+    ///
+    /// For a system-only scan this is exactly the pushed-down
+    /// [`predicate`](Self::filter), so the prune is unchanged from before STL-173.
+    /// For a both-axes scan ([`valid_as_of`](Self::valid_as_of) set) it conjoins
+    /// the pushed-down predicate with two **sound, one-sided** valid-time skips,
+    /// expressed over STL-117's first-class `valid_from` / `valid_to` columns so
+    /// they prune through the same generic [`ZoneMap::might_contain`] machinery:
+    ///
+    /// * `min(valid_from) > v` ⇒ every row's validity begins after `v` ⇒ none is
+    ///   valid at `v` — encoded as `valid_from ∈ [i64::MIN, v]`, which the zone
+    ///   map can disprove only when the row-group's whole `valid_from` range lies
+    ///   above `v`.
+    /// * `max(valid_to) <= v` ⇒ every row's validity has ended by `v` (the
+    ///   interval is half-open, `point < valid_to`) ⇒ none is valid at `v` —
+    ///   encoded as `valid_to ∈ [v + 1, i64::MAX]`.
+    ///
+    /// Both mirror the half-open membership the row-level valid filter
+    /// ([`filter_sealed_by_valid`](Self::filter_sealed_by_valid)) applies, so a
+    /// row-group is pruned only when no row it holds could survive that filter —
+    /// never a false negative. A table without valid-time columns has no
+    /// `valid_from` / `valid_to` zone entry, so these terms simply never prune
+    /// (the conservative "no stats ⇒ keep" path), and the valid axis is folded in
+    /// only for the prune: the row-level filter still runs on
+    /// [`predicate`](Self::filter) alone.
+    fn pruning_predicate(&self) -> Predicate {
+        let Some(v) = self.valid_snapshot else {
+            return self.predicate.clone();
+        };
+        Predicate::And(vec![
+            self.predicate.clone(),
+            Predicate::Range {
+                column: ColumnId::ValidFrom,
+                low: ZoneBound::I64(i64::MIN),
+                high: ZoneBound::I64(v.0),
+            },
+            Predicate::Range {
+                column: ColumnId::ValidTo,
+                // `v + 1` saturates: at `v == i64::MAX` the low bound becomes
+                // i64::MAX, so the term prunes a row-group iff `max(valid_to)`
+                // is below i64::MAX — and a half-open interval can never contain
+                // i64::MAX anyway, so pruning there is still correct.
+                low: ZoneBound::I64(v.0.saturating_add(1)),
+                high: ZoneBound::I64(i64::MAX),
+            },
+        ])
     }
 
     /// Drop, in place, every system-live sealed row whose valid interval does
@@ -760,6 +898,28 @@ impl RowGroupSelection {
 /// so the search cannot miss.
 fn group_of(starts: &[usize], row: usize) -> usize {
     starts.partition_point(|&start| start <= row) - 1
+}
+
+/// The segment-global row indices of the selected row-groups' rows, in the
+/// row-group (and therefore row) order [`SegmentReader::version_keys_in_row_groups`]
+/// returns them — so zipping this with the scoped identity read recovers each
+/// surviving row's true position within the segment (STL-173). `counts` is the
+/// segment's per-row-group row count ([`SegmentReader::row_group_row_counts`]),
+/// and `groups` is the candidate selection, ascending.
+fn global_row_indices(counts: &[u32], groups: &BTreeSet<usize>) -> Vec<usize> {
+    let mut start = 0usize;
+    let mut starts = Vec::with_capacity(counts.len());
+    for &count in counts {
+        starts.push(start);
+        start += count as usize;
+    }
+    let mut out = Vec::new();
+    for &g in groups {
+        for local in 0..counts[g] as usize {
+            out.push(starts[g] + local);
+        }
+    }
+    out
 }
 
 /// The half-open `[from, to)` membership test on raw valid-time boundary
