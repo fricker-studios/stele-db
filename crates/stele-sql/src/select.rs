@@ -126,12 +126,12 @@ pub struct BoundSelect {
     /// lowers `<column> = <literal>` only ([STL-151]).
     pub filter: Option<BoundPredicate>,
     /// A bound `WHERE PERIOD(a, b) <pred> PERIOD(c, d)` period predicate, or
-    /// `None` when the `WHERE` is not one ([STL-165]). Both operands fold to
-    /// constant intervals, so the predicate is a constant truth value the
-    /// executor applies once: a `false` predicate excludes every row. (Per-row
-    /// periods built from value columns are the deferred follow-up.) Mutually
-    /// exclusive with [`filter`](Self::filter) — a `WHERE` is one shape or the
-    /// other.
+    /// `None` when the `WHERE` is not one ([STL-165], [STL-193]). When every
+    /// endpoint is a constant the predicate is a constant truth value the
+    /// executor applies once (a `false` predicate excludes every row); when an
+    /// endpoint references a value column the executor builds each row's interval
+    /// from its cells and evaluates per row. Mutually exclusive with
+    /// [`filter`](Self::filter) — a `WHERE` is one shape or the other.
     pub period_filter: Option<BoundPeriodPredicate>,
     /// A bound `GROUP BY` + aggregate plan, or `None` for a plain row-returning
     /// query ([STL-171]). When `Some`, the executor folds the scanned rows into
@@ -259,19 +259,50 @@ impl AggregateFunc {
     }
 }
 
-/// A bound `PERIOD(a, b) <predicate> PERIOD(c, d)` clause: two constant-folded
-/// half-open intervals and the predicate relating them ([STL-165]).
+/// A bound `PERIOD(a, b) <predicate> PERIOD(c, d)` clause: two half-open period
+/// operands and the predicate relating them ([STL-165], [STL-193]).
 ///
-/// Ready for `stele_exec::evaluate` — binding folded each `PERIOD(...)` operand
-/// to a concrete `[from, to)` interval, so evaluation is a pure constant.
+/// Each operand's endpoints may be constant instants (the STL-165 form — the
+/// whole predicate is then a constant truth value the executor applies once) or
+/// references to a row's value columns (the STL-193 per-row form — the executor
+/// builds each row's interval from its cells and calls `stele_exec::evaluate`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoundPeriodPredicate {
     /// The left period operand.
-    pub left: Interval,
+    pub left: BoundPeriod,
     /// The predicate relating the two operands.
     pub predicate: PeriodPredicate,
     /// The right period operand.
-    pub right: Interval,
+    pub right: BoundPeriod,
+}
+
+/// A bound `PERIOD(from, to)` operand — a half-open `[from, to)` whose endpoints
+/// are each a constant instant or a row's value column ([STL-193]).
+///
+/// A fully-constant operand is checked for `from < to` at bind time (the STL-165
+/// rule); an operand with a column endpoint can only be checked per row, so that
+/// well-formedness is enforced at evaluation (a NULL or reversed cell excludes
+/// the row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundPeriod {
+    /// The inclusive start endpoint.
+    pub from: PeriodEndpoint,
+    /// The exclusive end endpoint.
+    pub to: PeriodEndpoint,
+}
+
+/// One endpoint of a `PERIOD(from, to)` operand: a constant instant or a row's
+/// value column ([STL-193]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeriodEndpoint {
+    /// A constant-folded instant in microseconds — `now()`, `now() ± interval`,
+    /// or a bare integer literal, folded the same way an `AS OF` operand is
+    /// ([`resolve_as_of`], [STL-165]).
+    Const(i64),
+    /// The value column at this index in the resolved schema; each row's cell
+    /// supplies the endpoint's instant ([STL-193]). The column's type is one of
+    /// the microsecond-instant types (`BIGINT` / `TIMESTAMP` / `TIMESTAMPTZ`).
+    Column(usize),
 }
 
 /// The join algorithms the binder lowers ([STL-172]).
@@ -454,8 +485,26 @@ pub enum SelectError {
 
     /// A `PERIOD(from, to)` operand folded to an empty or reversed interval
     /// (`from >= to`) ([STL-165]). Half-open `[from, to)` requires `from < to`.
+    /// Only a fully-constant operand is checked here; a per-row operand's
+    /// well-formedness is enforced at evaluation.
     #[error("period predicate: {0}")]
     PeriodInterval(IntervalError),
+
+    /// A `PERIOD(from, to)` endpoint named a value column whose type is not a
+    /// microsecond instant the period codec can read ([STL-193]). Only `BIGINT`,
+    /// `TIMESTAMP`, and `TIMESTAMPTZ` columns form a period endpoint — never a
+    /// silently mis-scaled `INT` or `DATE`.
+    #[error(
+        "period predicate: column {column:?} of table {table:?} has type {ty:?}, not a microsecond instant (BIGINT/TIMESTAMP/TIMESTAMPTZ)"
+    )]
+    PeriodColumnType {
+        /// The table the endpoint column belongs to.
+        table: String,
+        /// The offending column's name.
+        column: String,
+        /// The column's logical type.
+        ty: LogicalType,
+    },
 
     /// The catalog has never registered this table name.
     #[error("unknown table {0:?}")]
@@ -662,7 +711,7 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
         .temporal
         .period_predicate
         .as_ref()
-        .map(|clause| bind_period_predicate(clause, ctx.snapshot))
+        .map(|clause| bind_period_predicate(clause, ctx.snapshot, schema, table))
         .transpose()?;
 
     Ok(BoundSelect {
@@ -1405,31 +1454,80 @@ fn bind_join_projection(
     Ok((output, columns))
 }
 
-/// Bind a parsed [`PeriodPredicateClause`] to a [`BoundPeriodPredicate`] of two
-/// constant-folded intervals ([STL-165]).
+/// Bind a parsed [`PeriodPredicateClause`] to a [`BoundPeriodPredicate`]
+/// ([STL-165], [STL-193]).
 ///
-/// Each `PERIOD(from, to)` endpoint folds the same way an `AS OF` instant does
-/// ([`resolve_as_of`]); the resulting `[from, to)` must be a well-formed
-/// half-open interval (`from < to`).
+/// Each `PERIOD(from, to)` endpoint is either a constant instant — folded the
+/// same way an `AS OF` operand is ([`resolve_as_of`]) — or a reference to a value
+/// column in `schema`, bound to its index. A fully-constant operand must be a
+/// well-formed half-open interval at bind time (`from < to`); an operand with a
+/// column endpoint defers that check to evaluation.
 fn bind_period_predicate(
     clause: &PeriodPredicateClause,
     now: SystemTimeMicros,
+    schema: &TableSchema,
+    table: &str,
 ) -> Result<BoundPeriodPredicate, SelectError> {
     Ok(BoundPeriodPredicate {
-        left: bind_period_operand(&clause.left, now)?,
+        left: bind_period_operand(&clause.left, now, schema, table)?,
         predicate: clause.predicate,
-        right: bind_period_operand(&clause.right, now)?,
+        right: bind_period_operand(&clause.right, now, schema, table)?,
     })
 }
 
-/// Fold one `PERIOD(from, to)` operand to a half-open [`Interval`].
+/// Bind one `PERIOD(from, to)` operand to a [`BoundPeriod`] of two endpoints.
+///
+/// A fully-constant operand is checked for `from < to` here (the STL-165 rule);
+/// an operand naming a value column can only be checked per row, so its
+/// well-formedness is left to evaluation.
 fn bind_period_operand(
     operand: &PeriodExpr,
     now: SystemTimeMicros,
-) -> Result<Interval, SelectError> {
-    let from = resolve_as_of(&operand.from, now).map_err(SelectError::PeriodOperand)?;
-    let to = resolve_as_of(&operand.to, now).map_err(SelectError::PeriodOperand)?;
-    Interval::new(from.0, to.0).map_err(SelectError::PeriodInterval)
+    schema: &TableSchema,
+    table: &str,
+) -> Result<BoundPeriod, SelectError> {
+    let from = bind_period_endpoint(&operand.from, now, schema, table)?;
+    let to = bind_period_endpoint(&operand.to, now, schema, table)?;
+    if let (PeriodEndpoint::Const(f), PeriodEndpoint::Const(t)) = (from, to) {
+        Interval::new(f, t).map_err(SelectError::PeriodInterval)?;
+    }
+    Ok(BoundPeriod { from, to })
+}
+
+/// Bind one `PERIOD(...)` endpoint: a bare column identifier resolves to a value
+/// column ([STL-193]); anything else folds to a constant instant ([STL-165]).
+///
+/// A column endpoint must be a microsecond-instant type — `BIGINT`, `TIMESTAMP`,
+/// or `TIMESTAMPTZ` — since the period codec reads each cell as `i64` µs; an
+/// `INT` (too narrow) or `DATE` (days, not µs) column is rejected rather than
+/// silently mis-scaled.
+fn bind_period_endpoint(
+    expr: &Expr,
+    now: SystemTimeMicros,
+    schema: &TableSchema,
+    table: &str,
+) -> Result<PeriodEndpoint, SelectError> {
+    if let Some(column) = where_column(expr) {
+        let index = column_index(schema, column).ok_or_else(|| SelectError::UnknownColumn {
+            table: table.to_owned(),
+            column: column.to_owned(),
+        })?;
+        let ty = schema.columns()[index].ty();
+        if !matches!(
+            ty,
+            LogicalType::Int8 | LogicalType::Timestamp | LogicalType::TimestampTz
+        ) {
+            return Err(SelectError::PeriodColumnType {
+                table: table.to_owned(),
+                column: column.to_owned(),
+                ty,
+            });
+        }
+        return Ok(PeriodEndpoint::Column(index));
+    }
+    resolve_as_of(expr, now)
+        .map(|instant| PeriodEndpoint::Const(instant.0))
+        .map_err(SelectError::PeriodOperand)
 }
 
 /// Lower a `WHERE` clause to a [`BoundPredicate`], or `None` when there is none.
@@ -1979,6 +2077,14 @@ mod tests {
         catalog
     }
 
+    /// A fully-constant `PERIOD(from, to)` operand, the STL-165 shape.
+    const fn const_period(from: i64, to: i64) -> BoundPeriod {
+        BoundPeriod {
+            from: PeriodEndpoint::Const(from),
+            to: PeriodEndpoint::Const(to),
+        }
+    }
+
     #[test]
     fn now_folds_to_the_transaction_snapshot() {
         assert_eq!(
@@ -2470,9 +2576,9 @@ mod tests {
             assert_eq!(
                 bind(&sql, &catalog).unwrap().period_filter,
                 Some(BoundPeriodPredicate {
-                    left: Interval::new(10, 20).unwrap(),
+                    left: const_period(10, 20),
                     predicate,
-                    right: Interval::new(30, 40).unwrap(),
+                    right: const_period(30, 40),
                 }),
                 "binding `{kw}`"
             );
@@ -2491,7 +2597,85 @@ mod tests {
         .unwrap()
         .period_filter
         .unwrap();
-        assert_eq!(bound.left, Interval::new(NOW.0 - 1_000_000, NOW.0).unwrap());
+        assert_eq!(bound.left, const_period(NOW.0 - 1_000_000, NOW.0));
+    }
+
+    #[test]
+    fn period_endpoints_bind_to_value_columns() {
+        // STL-193: a `PERIOD(...)` endpoint may be a value column, bound to its
+        // index against the resolved schema. `booking` has `vf`/`vt` TIMESTAMP
+        // columns at indices 1 and 2.
+        let catalog = catalog_with_booking(1_000);
+        let bound = bind(
+            "SELECT id FROM booking WHERE PERIOD(vf, vt) OVERLAPS PERIOD(0, 100)",
+            &catalog,
+        )
+        .unwrap()
+        .period_filter
+        .unwrap();
+        assert_eq!(
+            bound,
+            BoundPeriodPredicate {
+                left: BoundPeriod {
+                    from: PeriodEndpoint::Column(1),
+                    to: PeriodEndpoint::Column(2),
+                },
+                predicate: PeriodPredicate::Overlaps,
+                right: const_period(0, 100),
+            }
+        );
+    }
+
+    #[test]
+    fn a_mixed_period_operand_binds_a_column_and_a_constant() {
+        // One column endpoint, one constant endpoint — bound, not rejected. A
+        // mixed operand is not range-checked at bind time (the column side is
+        // only known per row).
+        let catalog = catalog_with_booking(1_000);
+        let bound = bind(
+            "SELECT id FROM booking WHERE PERIOD(vf, 100) CONTAINS PERIOD(20, 30)",
+            &catalog,
+        )
+        .unwrap()
+        .period_filter
+        .unwrap();
+        assert_eq!(
+            bound.left,
+            BoundPeriod {
+                from: PeriodEndpoint::Column(1),
+                to: PeriodEndpoint::Const(100),
+            }
+        );
+    }
+
+    #[test]
+    fn a_period_endpoint_on_a_non_instant_column_is_rejected() {
+        // STL-193: only BIGINT/TIMESTAMP/TIMESTAMPTZ columns form a period
+        // endpoint. `balance` is INT (too narrow for µs), so it is rejected with
+        // its type rather than silently mis-scaled.
+        let catalog = catalog_with_account(1_000);
+        assert!(matches!(
+            bind(
+                "SELECT id FROM account WHERE PERIOD(balance, 20) CONTAINS PERIOD(12, 15)",
+                &catalog,
+            ),
+            Err(SelectError::PeriodColumnType {
+                ty: LogicalType::Int4,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_period_endpoint_on_an_unknown_column_is_rejected() {
+        let catalog = catalog_with_booking(1_000);
+        assert!(matches!(
+            bind(
+                "SELECT id FROM booking WHERE PERIOD(vf, missing) CONTAINS PERIOD(12, 15)",
+                &catalog,
+            ),
+            Err(SelectError::UnknownColumn { column, .. }) if column == "missing"
+        ));
     }
 
     #[test]
@@ -2538,11 +2722,14 @@ mod tests {
 
     #[test]
     fn an_unfoldable_period_operand_is_a_period_operand_error() {
-        // A bare column reference is not a constant instant — rejected, not guessed.
+        // A non-column endpoint that is not a foldable instant is rejected, not
+        // guessed — here a calendar interval, which has no fixed µs length (the
+        // same stance `AS OF` takes).
         let catalog = catalog_with_account(1_000);
         assert!(matches!(
             bind(
-                "SELECT id FROM account WHERE PERIOD(balance, 20) CONTAINS PERIOD(12, 15)",
+                "SELECT id FROM account \
+                 WHERE PERIOD(now() + interval '1 month', now()) CONTAINS PERIOD(12, 15)",
                 &catalog,
             ),
             Err(SelectError::PeriodOperand(_))

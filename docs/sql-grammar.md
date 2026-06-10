@@ -5,9 +5,10 @@
 > **valid axis** — `FOR VALID_TIME AS OF` now binds too (STL-162) — plus the
 > SQL:2011 **period predicates** (`CONTAINS` / `OVERLAPS` / `PRECEDES` /
 > `SUCCEEDS` / `EQUALS` / `MEETS`, STL-165). The parser, the `CREATE TABLE` /
-> `DROP TABLE` binder, both-axes AS-OF snapshot resolution, and constant period
-> predicates are live; the executor's joint `(sys, valid)` resolution and wiring
-> the bound plan through the pgwire query loop land in later tickets.
+> `DROP TABLE` binder, both-axes AS-OF snapshot resolution, and period predicates
+> (constant operands, STL-165, and per-row value-column operands, STL-193) are
+> live; the executor's joint `(sys, valid)` resolution and wiring the bound plan
+> through the pgwire query loop land in later tickets.
 > **Read with:** [02 — Architecture §6](02-architecture.md#6-query-layer).
 
 Stele's SQL frontend (`stele-sql`) starts from [`sqlparser-rs`][sqlparser] and
@@ -107,14 +108,20 @@ deliberate boundary, not a silent gap:
 - A period predicate is recognized only as the **entire** `WHERE` clause (it
   begins with `PERIOD`). Combining it with other conditions
   (`… OVERLAPS … AND id = 1`) is rejected, not silently half-applied.
-- Each `PERIOD(from, to)` endpoint folds to a **constant instant** the same way an
-  `AS OF` operand does (`now()`, `now() ± interval '…'`, an integer microsecond
-  literal). The whole predicate is therefore a constant truth value the executor
-  applies once: a false predicate returns no rows. Building a period from a row's
-  value columns (a per-row filter) is the deferred follow-up — it needs the
-  vectorized Filter operator and a civil-time literal codec.
-- An endpoint that folds to an empty or reversed `[from, to)` (`from ≥ to`) is a
-  bind error — half-open periods require `from < to`.
+- Each `PERIOD(from, to)` endpoint is either a **constant instant** — folded the
+  same way an `AS OF` operand is (`now()`, `now() ± interval '…'`, an integer
+  microsecond literal) — or a **value column** of the row, read as microseconds
+  (a `BIGINT` / `TIMESTAMP` / `TIMESTAMPTZ` column; the two kinds may be mixed in
+  one operand). With only constant endpoints the whole predicate is a constant
+  truth value the executor applies once (a false predicate returns no rows); with
+  a column endpoint the executor builds each row's `[from, to)` from its cells and
+  keeps only the rows the predicate accepts ([STL-193]). A column endpoint of any
+  other type is rejected at bind time, never silently mis-scaled.
+- A **constant** operand that folds to an empty or reversed `[from, to)`
+  (`from ≥ to`) is a bind error — half-open periods require `from < to`. A
+  per-row operand can only be checked once its cells are known, so a NULL or
+  empty/reversed row period is *unknown* and excludes that row rather than
+  failing the query.
 
 Captured as `Temporal::period_predicate: Option<PeriodPredicateClause>`; bound to
 a `BoundPeriodPredicate` of two `Interval`s and a `PeriodPredicate`, evaluated by
@@ -252,10 +259,10 @@ These are recognized as future work, not silently accepted. Some are already
 
 - `FOR VALID_TIME AS OF` executor resolution (binds and carries the instant; the
   joint `(sys, valid)` version pick is STL-163 — above).
-- **Per-row** period predicates — a `PERIOD(...)` built from a row's valid/system
-  value columns rather than constant instants. The constant forms parse, bind,
-  and evaluate today ([above](#periodfrom-to-predicate-periodfrom-to--period-predicates));
-  the per-row filter rides with the vectorized Filter operator + civil-time codec.
+- A **constant `TIMESTAMP` / `DATE` literal** as a period endpoint or `AS OF`
+  operand — the zone-less civil-time codec is still missing, so a constant
+  endpoint is a bare integer-microsecond literal for now (per-row endpoints read
+  real `TIMESTAMP` columns; see [above](#periodfrom-to-predicate-periodfrom-to--period-predicates)).
 - `AS OF` on DML and on system-versioned `DROP`/`ALTER`.
 - A hand-written parser — revisited only if `sqlparser-rs` becomes a constraint
   ([Architecture §6](02-architecture.md#6-query-layer)).

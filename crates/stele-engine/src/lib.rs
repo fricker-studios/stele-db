@@ -58,6 +58,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use crate::catalog_log::CatalogRecord;
 
 use stele_catalog::{Catalog, CatalogError};
+use stele_common::period::Interval;
 use stele_common::provenance::{Principal, TxnId};
 use stele_common::row_codec::{self, RowCodecError};
 use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
@@ -70,8 +71,8 @@ use stele_exec::{
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::dml::{BoundDml, DmlError};
 use stele_sql::select::{
-    AggregateFunc, BoundAggregate, BoundJoin, BoundPredicate, BoundSelect, JoinColumnRef, JoinType,
-    OutputItem, Projection, SelectError,
+    AggregateFunc, BoundAggregate, BoundJoin, BoundPeriod, BoundPeriodPredicate, BoundPredicate,
+    BoundSelect, JoinColumnRef, JoinType, OutputItem, PeriodEndpoint, Projection, SelectError,
 };
 use stele_sql::{BindContext, BindError, Statement, bind_ddl, bind_dml, bind_select};
 use stele_storage::backend::Disk;
@@ -984,7 +985,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// key-equality predicate is additionally pushed down to the scan so its zone
     /// maps can prune; the same `Filter` re-applies it so the answer is exact
     /// regardless of what the prune could prove. A constant period predicate
-    /// ([STL-165]) short-circuits to an empty result when false, before the scan.
+    /// ([STL-165]) short-circuits to an empty result when false, before the scan;
+    /// a per-row one ([STL-193]) is evaluated against each decoded row.
     ///
     /// The schema is resolved at the read snapshot, so an `AS OF` read names and
     /// types its columns under the schema version live then.
@@ -1059,20 +1061,31 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// plain `SELECT`) and the aggregation ([`run_aggregate`], [STL-171]) both read.
     ///
     /// A constant period predicate ([STL-165]) that folds false excludes every row,
-    /// so no scan runs (never a silently-unfiltered read). A key-equality predicate
-    /// is pushed down to the scan for zone-map pruning; the same `Filter` re-applies
-    /// it so the answer is exact regardless of what the prune could prove.
+    /// so no scan runs (never a silently-unfiltered read); a per-row period predicate
+    /// ([STL-193]) builds each row's `[from, to)` from its value cells and drops the
+    /// rows it excludes. A key-equality predicate is pushed down to the scan for
+    /// zone-map pruning; the same `Filter` re-applies it so the answer is exact
+    /// regardless of what the prune could prove.
     fn scan_rows(
         bound: &BoundSelect,
         state: &TableState<C, D>,
         schema_columns: &[(String, LogicalType)],
         value_count: usize,
     ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
-        if let Some(p) = &bound.period_filter {
-            if !evaluate(p.predicate, p.left, p.right) {
-                return Ok(Vec::new());
-            }
-        }
+        // A period predicate ([STL-165], [STL-193]) is one of two shapes. A
+        // fully-constant one folds to a single truth value: a `false` excludes
+        // every row, so skip the scan entirely (never a silently-unfiltered read).
+        // One built from value columns ([STL-193]) cannot be decided until the
+        // rows are decoded, so it is evaluated per row in the collection loop
+        // below; `per_row_period` carries it there.
+        let per_row_period = match &bound.period_filter {
+            Some(p) => match const_period_truth(p) {
+                Some(false) => return Ok(Vec::new()),
+                Some(true) => None,
+                None => Some(p),
+            },
+            None => None,
+        };
 
         // Push a key-equality predicate down to the scan for zone-map pruning; a
         // filter on a value column lives inside the opaque payload, which a zone
@@ -1120,7 +1133,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
         while let Some(batch) = pipeline.next()? {
             for r in 0..batch.rows {
-                rows.push((0..ncols).map(|i| batch_cell(&batch, i, r)).collect());
+                let row: Vec<Option<Vec<u8>>> =
+                    (0..ncols).map(|i| batch_cell(&batch, i, r)).collect();
+                // A per-row period predicate ([STL-193]) builds each operand's
+                // `[from, to)` from the row's cells and drops the rows it excludes.
+                if let Some(p) = per_row_period {
+                    if !period_keeps_row(p, &row, schema_columns) {
+                        continue;
+                    }
+                }
+                rows.push(row);
             }
         }
         Ok(rows)
@@ -1690,6 +1712,81 @@ fn column_cell(batch: &Batch, id: ColumnId, row: usize) -> Option<Vec<u8>> {
 /// NULL that the comparison (and `Filter`'s "keep TRUE only") drops.
 fn lower_predicate(predicate: &BoundPredicate) -> Expr {
     Expr::col(predicate.column_index).compare(CmpOp::Eq, Expr::lit(predicate.value.clone()))
+}
+
+/// The single truth value of a fully-constant period predicate ([STL-165]), or
+/// `None` when any endpoint references a value column (then it must be evaluated
+/// per row — [STL-193]).
+fn const_period_truth(predicate: &BoundPeriodPredicate) -> Option<bool> {
+    let left = const_period_interval(&predicate.left)?;
+    let right = const_period_interval(&predicate.right)?;
+    Some(evaluate(predicate.predicate, left, right))
+}
+
+/// The `[from, to)` interval of an operand whose endpoints are both constants, or
+/// `None` if either is a column. The binder already proved a constant operand is
+/// well-formed (`from < to`), so the [`Interval::new`] never fails here.
+fn const_period_interval(operand: &BoundPeriod) -> Option<Interval> {
+    match (operand.from, operand.to) {
+        (PeriodEndpoint::Const(from), PeriodEndpoint::Const(to)) => Interval::new(from, to).ok(),
+        _ => None,
+    }
+}
+
+/// Whether a decoded row satisfies a per-row period predicate ([STL-193]).
+///
+/// Each operand's `[from, to)` is rebuilt from the row's cells (a constant
+/// endpoint is its folded instant; a column endpoint is that cell's µs value). A
+/// NULL cell or an empty/reversed `[from, to)` makes the operand *unknown*, and
+/// an unknown operand excludes the row — the three-valued-logic stance the
+/// `WHERE` filter takes everywhere else (only a TRUE keeps the row).
+fn period_keeps_row(
+    predicate: &BoundPeriodPredicate,
+    row: &[Option<Vec<u8>>],
+    schema_columns: &[(String, LogicalType)],
+) -> bool {
+    match (
+        row_period_interval(&predicate.left, row, schema_columns),
+        row_period_interval(&predicate.right, row, schema_columns),
+    ) {
+        (Some(left), Some(right)) => evaluate(predicate.predicate, left, right),
+        _ => false,
+    }
+}
+
+/// Build one operand's `[from, to)` interval for a single row, or `None` when an
+/// endpoint cell is NULL or the resulting period is empty/reversed.
+fn row_period_interval(
+    operand: &BoundPeriod,
+    row: &[Option<Vec<u8>>],
+    schema_columns: &[(String, LogicalType)],
+) -> Option<Interval> {
+    let from = period_endpoint_micros(operand.from, row, schema_columns)?;
+    let to = period_endpoint_micros(operand.to, row, schema_columns)?;
+    Interval::new(from, to).ok()
+}
+
+/// Resolve one period endpoint to its microsecond instant for a single row: a
+/// constant is itself; a column is its cell decoded as a µs instant
+/// (`BIGINT`/`TIMESTAMP`/`TIMESTAMPTZ` — the binder already enforced the type).
+/// `None` for a NULL cell or a cell that does not decode to an instant.
+fn period_endpoint_micros(
+    endpoint: PeriodEndpoint,
+    row: &[Option<Vec<u8>>],
+    schema_columns: &[(String, LogicalType)],
+) -> Option<i64> {
+    match endpoint {
+        PeriodEndpoint::Const(micros) => Some(micros),
+        PeriodEndpoint::Column(index) => {
+            let bytes = row[index].as_ref()?;
+            match ScalarValue::decode(schema_columns[index].1, bytes).ok()? {
+                ScalarValue::Int8(v) | ScalarValue::Timestamp(v) | ScalarValue::TimestampTz(v) => {
+                    Some(v)
+                }
+                _ => None,
+            }
+        }
+    }
 }
 
 /// Map a bound [`JoinType`] to the executor's `ExecJoinType`. The two enums are
@@ -3343,6 +3440,182 @@ mod tests {
             "SELECT id FROM t WHERE PERIOD(10, 20) PRECEDES PERIOD(20, 30)",
         );
         assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    fn per_row_period_predicate_matches_evaluate_oracle() {
+        use stele_common::period::PeriodPredicate;
+
+        // STL-193 oracle: a per-row `PERIOD(vf, vt) <pred> PERIOD(lo, hi)` must
+        // return exactly the rows whose own `[vf, vt)` satisfies the predicate
+        // against the probe `[lo, hi)`. The reference is `stele_exec::evaluate`
+        // called directly over the decoded intervals — the same primitive the
+        // engine evaluates per row, so a mismatch is a wiring bug, not a
+        // semantics one.
+        //
+        // The rows and probes are *every* half-open `[a, b)` over a small grid of
+        // boundary-relevant points, so each predicate is exercised true and false
+        // across the touch / overlap / abut boundaries the half-open rule turns
+        // on ([STL-165] truth table, lifted to the row level — DoD half-open
+        // correctness). `vf` / `vt` are BIGINT so the rows are writable in plain
+        // SQL (the zone-less TIMESTAMP literal codec is the deferred civil-time
+        // follow-up); the engine reads each cell as µs identically.
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE ev (id INT PRIMARY KEY, vf BIGINT, vt BIGINT) WITH SYSTEM VERSIONING",
+            ))
+            .expect("create");
+
+        let grid = [0_i64, 5, 10, 15, 20, 25, 30];
+        let intervals: Vec<(i64, i64)> = grid
+            .iter()
+            .flat_map(|&a| grid.iter().filter(move |&&b| b > a).map(move |&b| (a, b)))
+            .collect();
+        for (i, (vf, vt)) in intervals.iter().enumerate() {
+            engine
+                .execute(&parse_one(&format!(
+                    "INSERT INTO ev VALUES ({i}, {vf}, {vt})"
+                )))
+                .expect("insert row");
+        }
+
+        let predicates = [
+            ("CONTAINS", PeriodPredicate::Contains),
+            ("OVERLAPS", PeriodPredicate::Overlaps),
+            ("EQUALS", PeriodPredicate::Equals),
+            ("PRECEDES", PeriodPredicate::Precedes),
+            ("SUCCEEDS", PeriodPredicate::Succeeds),
+            ("IMMEDIATELY PRECEDES", PeriodPredicate::ImmediatelyPrecedes),
+            ("IMMEDIATELY SUCCEEDS", PeriodPredicate::ImmediatelySucceeds),
+        ];
+        for (kw, predicate) in predicates {
+            for &(lo, hi) in &intervals {
+                let probe = Interval::new(lo, hi).expect("probe well-formed");
+                let sql = format!("SELECT id FROM ev WHERE PERIOD(vf, vt) {kw} PERIOD({lo}, {hi})");
+                let mut got: Vec<i32> = select(&mut engine, &sql)
+                    .rows
+                    .into_iter()
+                    .map(|row| {
+                        let bytes = row[0].clone().expect("id is never NULL");
+                        match ScalarValue::decode(LogicalType::Int4, &bytes).expect("decode id") {
+                            ScalarValue::Int4(id) => id,
+                            other => panic!("id column is INT, got {other:?}"),
+                        }
+                    })
+                    .collect();
+                got.sort_unstable();
+
+                let mut expected: Vec<i32> = intervals
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &(vf, vt))| {
+                        evaluate(
+                            predicate,
+                            Interval::new(vf, vt).expect("row well-formed"),
+                            probe,
+                        )
+                    })
+                    .map(|(i, _)| i32::try_from(i).expect("id fits i32"))
+                    .collect();
+                expected.sort_unstable();
+
+                assert_eq!(got, expected, "predicate {kw} probe [{lo}, {hi})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_per_row_period_excludes_rows_with_a_null_endpoint() {
+        // A NULL endpoint cell makes the row's period unknown; an unknown period
+        // is never TRUE, so the row is dropped — the same 3VL stance the
+        // `<col> = <lit>` filter takes for a NULL cell.
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE ev (id INT PRIMARY KEY, vf BIGINT, vt BIGINT) WITH SYSTEM VERSIONING",
+            ))
+            .expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO ev VALUES (1, 10, 40)"))
+            .expect("row 1");
+        engine
+            .execute(&parse_one("INSERT INTO ev VALUES (2, NULL, 40)"))
+            .expect("row 2 with a NULL vf");
+
+        // [10, 40) CONTAINS [20, 30) holds for row 1; row 2's NULL `vf` excludes it.
+        let r = select(
+            &mut engine,
+            "SELECT id FROM ev WHERE PERIOD(vf, vt) CONTAINS PERIOD(20, 30)",
+        );
+        assert_eq!(r.rows, vec![vec![cell(Some(ScalarValue::Int4(1)))]]);
+    }
+
+    #[test]
+    fn per_row_period_over_a_both_axes_table() {
+        // STL-193 on a genuine bitemporal table: the period is built from the
+        // valid-time value columns `vf` / `vt`. Reading those value columns needs
+        // the valid axis resolved — a plain SELECT leaves a delta row's payload
+        // framed (the pre-existing STL-163 rule; tracked as a follow-up), so the
+        // query pins `FOR VALID_TIME AS OF` at an instant inside every row's
+        // window. The valid filter then keeps all rows and the per-row period
+        // predicate alone decides the result.
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE booking (id INT PRIMARY KEY, vf TIMESTAMP, vt TIMESTAMP) \
+                 WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+            ))
+            .expect("create");
+
+        // Three keys, one valid version each; every window contains the pin (25).
+        let rows = [(1, 10, 40), (2, 20, 30), (3, 0, 50)];
+        for (txn, &(id, vf, vt)) in rows.iter().enumerate() {
+            let payload = row_codec::encode_payload(&[
+                cell(Some(ScalarValue::Timestamp(vf))),
+                cell(Some(ScalarValue::Timestamp(vt))),
+            ]);
+            engine
+                .insert(
+                    "booking",
+                    business_key(&ScalarValue::Int4(id)),
+                    Some(ValidInterval::new(ValidTimeMicros(vf), ValidTimeMicros(vt)).unwrap()),
+                    payload,
+                    0,
+                    TxnId(u64::try_from(txn).unwrap() + 1),
+                    Principal::new(b"demo".to_vec()),
+                )
+                .expect("insert");
+        }
+
+        let ids = |engine: &mut SessionEngine<ZeroClock, MemDisk>, pred: &str| -> Vec<i32> {
+            let sql = format!(
+                "SELECT id FROM booking FOR VALID_TIME AS OF 25 WHERE PERIOD(vf, vt) {pred}"
+            );
+            let mut got: Vec<i32> = select(engine, &sql)
+                .rows
+                .into_iter()
+                .map(|row| {
+                    let bytes = row[0].clone().expect("id is never NULL");
+                    match ScalarValue::decode(LogicalType::Int4, &bytes).expect("decode id") {
+                        ScalarValue::Int4(id) => id,
+                        other => panic!("id column is INT, got {other:?}"),
+                    }
+                })
+                .collect();
+            got.sort_unstable();
+            got
+        };
+
+        // CONTAINS [22, 28): every window covers it.
+        assert_eq!(ids(&mut engine, "CONTAINS PERIOD(22, 28)"), vec![1, 2, 3]);
+        // CONTAINS [5, 45): only the widest window [0, 50) covers it.
+        assert_eq!(ids(&mut engine, "CONTAINS PERIOD(5, 45)"), vec![3]);
+        // EQUALS [20, 30): only key 2's window matches exactly.
+        assert_eq!(ids(&mut engine, "EQUALS PERIOD(20, 30)"), vec![2]);
+        // PRECEDES [40, 50): windows ending at or before 40 — keys 1 and 2, the
+        // half-open touch at 40 counting (key 1's `[10, 40)` precedes `[40, 50)`).
+        assert_eq!(ids(&mut engine, "PRECEDES PERIOD(40, 50)"), vec![1, 2]);
     }
 
     #[test]
