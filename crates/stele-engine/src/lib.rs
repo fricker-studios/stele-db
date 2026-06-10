@@ -3381,4 +3381,31 @@ mod tests {
         );
         assert_eq!(anti.rows, vec![vec![i4(1)]]);
     }
+
+    #[test]
+    fn join_on_a_text_key() {
+        // A TEXT join key on both sides (a value column = a business key) exercises
+        // the non-integer decode path through `run_join`.
+        let mut engine = session();
+        for ddl in [
+            "CREATE TABLE emp (id INT PRIMARY KEY, dept TEXT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE dept (name TEXT PRIMARY KEY, floor INT) WITH SYSTEM VERSIONING",
+        ] {
+            engine.execute(&parse_one(ddl)).expect("create");
+        }
+        for dml in [
+            "INSERT INTO emp VALUES (1, 'eng')",
+            "INSERT INTO emp VALUES (2, 'sales')",
+            "INSERT INTO dept VALUES ('eng', 3)",
+        ] {
+            engine.execute(&parse_one(dml)).expect("insert");
+        }
+        // emp.dept (a TEXT value column) joins to dept.name (the TEXT business key);
+        // emp 2 ('sales') has no department, so the inner join drops it.
+        let result = select(
+            &mut engine,
+            "SELECT emp.id, dept.floor FROM emp JOIN dept ON emp.dept = dept.name",
+        );
+        assert_eq!(sorted(result.rows), vec![vec![i4(1), i4(3)]]);
+    }
 }
