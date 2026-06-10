@@ -37,12 +37,20 @@ struct SchemaVersion {
 /// the dropped era) — so resolution is by interval containment, never by
 /// assuming an open tail.
 ///
-/// v0.1 keeps the catalog **in memory**. Persisting it onto the same
+/// The in-memory catalog is durable via the session-level **catalog log**
+/// ([ADR-0028]): every applied mutation is also appended to an fsynced DDL log,
+/// and a restart replays that log — in order, at the recorded instants — which
+/// reproduces these chains (and the [`SchemaId`] allocation order) exactly.
+/// `Clone` is part of that contract: the session engine validates a mutation on
+/// a copy and commits the copy only once the log append is durable, so the live
+/// catalog and the log can never disagree. Persisting the catalog onto the same
 /// sealed-segment substrate as user tables ("eat our own dog food") and wiring
-/// the [`SchemaId`] into the segment-footer write path are follow-ups; the
+/// the [`SchemaId`] into the segment-footer write path remain follow-ups; the
 /// resolution semantics this type fixes are what the binder and the on-disk
 /// `schema_id` reference both build on.
-#[derive(Debug)]
+///
+/// [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
+#[derive(Debug, Clone)]
 pub struct Catalog {
     /// Per table, its schema versions ordered by `sys_from`, oldest first. The
     /// last entry is the open one (`sys_to == SYSTEM_TIME_OPEN`) while the table

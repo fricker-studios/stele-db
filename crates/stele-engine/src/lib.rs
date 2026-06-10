@@ -24,6 +24,14 @@
 //! [`delete`](SessionEngine::delete) methods remain the lower-level write path the
 //! DML router and in-process tests call.
 //!
+//! The session is **durable across restarts** ([STL-210], [ADR-0028]): every
+//! DDL mutation is recorded in an fsynced, append-only catalog log beside the
+//! tables' own WALs, and [`SessionEngine::recover`] boots from existing on-disk
+//! state — replaying the catalog log, reopening each table's tiers through
+//! [`Engine::recover`](stele_storage::engine::Engine::recover), and
+//! repositioning the commit clock — so `CREATE`/`INSERT`/restart/`SELECT`
+//! (including `AS OF`) answers exactly as the live session did.
+//!
 //! ## Runtime-agnostic
 //!
 //! This crate is part of the deterministic core ([ADR-0010]): it depends only on
@@ -36,12 +44,18 @@
 //! [STL-131]: https://allegromusic.atlassian.net/browse/STL-131
 //! [STL-147]: https://allegromusic.atlassian.net/browse/STL-147
 //! [STL-149]: https://allegromusic.atlassian.net/browse/STL-149
+//! [STL-210]: https://allegromusic.atlassian.net/browse/STL-210
 //! [ADR-0010]: ../../../docs/adr/0010-deterministic-simulation-testing.md
+//! [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
+
+mod catalog_log;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+
+use crate::catalog_log::CatalogRecord;
 
 use stele_catalog::{Catalog, CatalogError};
 use stele_common::provenance::{Principal, TxnId};
@@ -103,6 +117,21 @@ impl<C> MonotonicClock<C> {
     #[must_use]
     pub fn current(&self) -> SystemTimeMicros {
         SystemTimeMicros(self.high_water.load(Ordering::Acquire))
+    }
+
+    /// Raise the high-water mark to at least `mark` (never lowers it).
+    ///
+    /// Recovery calls this with the largest commit instant found on disk
+    /// ([`SessionEngine::recover`]): afterwards [`current`](Self::current) — the
+    /// default read snapshot — covers every recovered commit (a fresh mark would
+    /// otherwise sit at the origin and a post-restart `SELECT` would see
+    /// nothing), and the next [`now`](Clock::now) is strictly past everything
+    /// already written, even if the inner clock has stepped backwards across
+    /// the restart ([ADR-0022]).
+    ///
+    /// [ADR-0022]: ../../../docs/adr/0022-clock-synchronization-and-ordering.md
+    pub fn advance_to(&self, mark: SystemTimeMicros) {
+        self.high_water.fetch_max(mark.0, Ordering::AcqRel);
     }
 }
 
@@ -405,6 +434,15 @@ pub enum EngineError {
     #[error(transparent)]
     Storage(#[from] StorageError),
 
+    /// The durable catalog log ([ADR-0028]) could not be appended (the DDL is
+    /// refused — nothing was acknowledged) or replayed at recovery (the log
+    /// could not be read, or an acknowledged record is corrupt — recovery
+    /// fails closed rather than serving a different table set).
+    ///
+    /// [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
+    #[error("catalog log: {0}")]
+    CatalogLog(#[source] io::Error),
+
     /// Executing the snapshot scan failed.
     #[error(transparent)]
     Scan(#[from] ScanError),
@@ -482,6 +520,13 @@ struct TableState<C: Clock + Clone, D: Disk + Clone> {
     /// The valid-time policy the tier's writer was opened with. Baked into the
     /// `DmlWriter`, so a re-create that changes it cannot reuse this tier.
     valid_time: bool,
+    /// The namespace index this tier lives on — which `t{idx:020}-` slice of the
+    /// shared disk. Recorded in the table's `CreateTable` catalog-log records
+    /// (the same index again on a tier-reusing re-create), so recovery reopens
+    /// exactly this slice ([ADR-0028]).
+    ///
+    /// [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
+    namespace: u64,
 }
 
 /// The per-connection database engine: the catalog, the commit clock, and the
@@ -523,11 +568,12 @@ pub struct SessionEngine<C: Clock + Clone, D: Disk + Clone> {
 impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// Open a **fresh** session over `disk` with commit time drawn from `clock`.
     ///
-    /// The catalog starts empty and no tiers exist; `CREATE TABLE` populates both.
-    /// To boot from existing on-disk state, the recovery hook composes
-    /// [`Engine::recover`] per table — but enumerating which tables exist on a
-    /// cold start needs durable catalog state, which is a separate concern (see
-    /// the crate-level note). This constructor is the v0.1 in-process path.
+    /// The catalog starts empty and no tiers exist; `CREATE TABLE` populates
+    /// both. Intended for an **empty** disk (mirroring [`Engine::open`]): to
+    /// boot from existing on-disk state — a restart — use
+    /// [`recover`](Self::recover), which replays the durable catalog log and
+    /// reopens every table's tiers. Opening a fresh session over a disk that
+    /// already holds a catalog log would shadow, not resume, its state.
     #[must_use]
     pub fn open(disk: D, clock: C) -> Self {
         Self {
@@ -539,6 +585,117 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             next_txn: 1,
             write_index: BTreeMap::new(),
         }
+    }
+
+    /// **Recover** a session from existing on-disk state — the cold-boot path
+    /// ([STL-210], [ADR-0028]) that closes the loop [`Engine::recover`] left
+    /// open at the session level ("enumerating which tables exist needs durable
+    /// catalog state"). On an empty disk this equals [`open`](Self::open), so a
+    /// server can boot through it unconditionally.
+    ///
+    /// The flow composes the durable pieces:
+    ///
+    /// 1. **Replay the catalog log** ([ADR-0028]): apply every recorded
+    ///    DDL mutation, in order, at its recorded instant. This reproduces the
+    ///    schema-version chains — so an `AS OF` read in the past still resolves
+    ///    the schema live *then*, across restarts — and the `SchemaId`
+    ///    allocation order, exactly.
+    /// 2. **Reopen every recorded namespace** through [`Engine::recover`]
+    ///    (segment checksums + checkpoint + WAL tail replay, [STL-102]/
+    ///    [STL-177]) — dropped names included: their retained history must keep
+    ///    answering `AS OF` reads, and a re-create must reuse the same tier so
+    ///    that history is neither duplicated nor orphaned.
+    /// 3. **Reposition the allocators.** The shared commit clock's high-water
+    ///    mark is raised past every recovered commit instant and DDL instant —
+    ///    without this, the default read snapshot would sit at the origin and a
+    ///    post-restart `SELECT` would see nothing — and `next_txn` past every
+    ///    recovered transaction id, so post-restart commits never share
+    ///    provenance with recovered ones.
+    ///
+    /// The MVCC write index restarts **empty**, deliberately: a conflict is a
+    /// commit *after* a transaction's pinned snapshot, every recovered commit
+    /// precedes the repositioned high-water mark, and any post-restart
+    /// transaction pins its snapshot at or past that mark — so no recovered
+    /// commit can ever conflict with a post-restart transaction.
+    ///
+    /// [STL-102]: https://allegromusic.atlassian.net/browse/STL-102
+    /// [STL-177]: https://allegromusic.atlassian.net/browse/STL-177
+    /// [STL-210]: https://allegromusic.atlassian.net/browse/STL-210
+    /// [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::CatalogLog`] if the catalog log cannot be read or holds a
+    /// corrupt acknowledged record; [`EngineError::Catalog`] if replaying a
+    /// record is refused (a log/catalog invariant break — fails closed);
+    /// [`EngineError::Storage`] if a table's tiers cannot be recovered.
+    pub fn recover(disk: D, clock: C) -> Result<Self, EngineError> {
+        let records = catalog_log::replay(&disk).map_err(EngineError::CatalogLog)?;
+        let clock = MonotonicClock::new(clock);
+
+        // 1. Rebuild the catalog by replaying the DDL history, tracking per
+        //    name the tier to reopen: the namespace and valid-time policy of
+        //    its *latest* create. (A drop keeps the entry — the tier stays
+        //    resident for history, exactly as in a live session.)
+        let mut catalog = Catalog::new();
+        let mut tiers: BTreeMap<String, (u64, bool)> = BTreeMap::new();
+        let mut next_namespace = 0u64;
+        let mut max_commit = SystemTimeMicros(0);
+        for record in records {
+            match record {
+                CatalogRecord::CreateTable {
+                    at,
+                    namespace,
+                    name,
+                    columns,
+                    temporal,
+                } => {
+                    let valid_time = temporal.valid_time_enabled();
+                    catalog.create_table(name.clone(), columns, temporal, at)?;
+                    tiers.insert(name, (namespace, valid_time));
+                    next_namespace = next_namespace.max(namespace + 1);
+                    max_commit = max_commit.max(at);
+                }
+                CatalogRecord::DropTable { at, name } => {
+                    catalog.drop_table(&name, at)?;
+                    max_commit = max_commit.max(at);
+                }
+            }
+        }
+
+        // 2. Reopen each recorded tier from its slice of the disk, and fold in
+        //    its high-water marks (largest commit instant / txn id on disk).
+        let mut tables = BTreeMap::new();
+        let mut max_txn_id = 0u64;
+        for (name, (namespace, valid_time)) in tiers {
+            let tier_disk = NamespacedDisk::new(disk.clone(), namespace);
+            let engine = Engine::recover(tier_disk, clock.clone(), valid_time)?;
+            let marks = engine.recovery_marks()?;
+            max_commit = max_commit.max(marks.max_commit);
+            max_txn_id = max_txn_id.max(marks.max_txn_id);
+            tables.insert(
+                name,
+                TableState {
+                    engine,
+                    valid_time,
+                    namespace,
+                },
+            );
+        }
+
+        // 3. Position the allocators past everything recovered. Saturating: a
+        //    recovered id at the u64 ceiling must not wrap the allocator back
+        //    into recovered provenance.
+        clock.advance_to(max_commit);
+        Ok(Self {
+            catalog,
+            clock,
+            disk,
+            tables,
+            next_namespace,
+            next_txn: max_txn_id.saturating_add(1),
+            write_index: BTreeMap::new(),
+        })
     }
 
     /// The session's catalog — schemas resolve at a snapshot through it.
@@ -712,11 +869,26 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     }
 
     /// Apply a bound DDL statement, taking effect at the commit clock's next
-    /// instant, and reconcile the tier map.
+    /// instant, durably record it in the catalog log, and reconcile the tier
+    /// map.
     ///
-    /// For `CREATE TABLE` the storage tier is stood up **before** the catalog
-    /// mutation: if the backend fails to open the tier the statement aborts, so
-    /// the catalog never names a table with no storage behind it.
+    /// The ordering is the write-ahead discipline of [ADR-0028]:
+    ///
+    /// 1. For `CREATE TABLE`, the storage tier is stood up first — a backend
+    ///    failure aborts before anything else, so the catalog never names a
+    ///    table with no storage behind it.
+    /// 2. The mutation is validated by applying it to a **copy** of the
+    ///    catalog (DDL is rare and the catalog small, so the clone is noise).
+    /// 3. The catalog-log record is appended and **fsynced** — the durability
+    ///    point. On failure the statement errors with the live catalog
+    ///    untouched, so the log and the session can never disagree. (A fresh
+    ///    `CREATE`'s just-opened tier is left behind as empty, unreferenced
+    ///    files — harmless: no record names its namespace, so recovery ignores
+    ///    it and a later table opening on that slice starts from the same
+    ///    empty state.)
+    /// 4. Only then is the copy committed and the tier map updated.
+    ///
+    /// [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
     fn apply_ddl(&mut self, ddl: DdlStatement) -> Result<StatementOutcome, EngineError> {
         let at = self.clock.now();
         match ddl {
@@ -726,23 +898,34 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 temporal,
             } => {
                 let valid_time = temporal.valid_time_enabled();
-                // A re-created name whose tier is still resident keeps it, so
-                // history is never dropped — but only if the valid-time policy is
-                // unchanged: the tier's writer bakes the policy in, so reusing it
-                // under a different policy would silently enforce the stale one
-                // (re-opening the tier with the new policy is the deferred
-                // alternative). A fresh name opens its tier first, so a backend
-                // failure aborts before the catalog is touched.
-                let tier = match self.tables.get(&name).map(|s| s.valid_time) {
-                    Some(prev) if prev != valid_time => {
+                // A re-created name whose tier is still resident keeps it (and
+                // its namespace), so history is never dropped — but only if the
+                // valid-time policy is unchanged: the tier's writer bakes the
+                // policy in, so reusing it under a different policy would
+                // silently enforce the stale one (re-opening the tier with the
+                // new policy is the deferred alternative).
+                let (tier, namespace) = match self.tables.get(&name) {
+                    Some(prev) if prev.valid_time != valid_time => {
                         return Err(EngineError::ValidTimePolicyChange { table: name });
                     }
-                    Some(_) => None,
-                    None => Some(self.open_tier(valid_time)?),
+                    Some(prev) => (None, prev.namespace),
+                    None => {
+                        let tier = self.open_tier(valid_time)?;
+                        let namespace = tier.namespace;
+                        (Some(tier), namespace)
+                    }
                 };
-                let schema_id = self
-                    .catalog
-                    .create_table(name.clone(), columns, temporal, at)?;
+                let record = CatalogRecord::CreateTable {
+                    at,
+                    namespace,
+                    name: name.clone(),
+                    columns: columns.clone(),
+                    temporal: temporal.clone(),
+                };
+                let mut staged = self.catalog.clone();
+                let schema_id = staged.create_table(name.clone(), columns, temporal, at)?;
+                catalog_log::append(&self.disk, &record).map_err(EngineError::CatalogLog)?;
+                self.catalog = staged;
                 if let Some(tier) = tier {
                     self.tables.insert(name, tier);
                 }
@@ -750,9 +933,20 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     tag: DdlOutcome::Created(schema_id).command_tag(),
                 })
             }
-            // A drop never opens storage; `apply` owns the `IF EXISTS` no-op.
-            DdlStatement::DropTable { .. } => {
-                let outcome = ddl.apply(&mut self.catalog, at)?;
+            // A drop never opens storage. The `IF EXISTS` no-op writes no
+            // record — nothing changed, so there is nothing to recover.
+            DdlStatement::DropTable { name, if_exists } => {
+                let mut staged = self.catalog.clone();
+                let outcome = match staged.drop_table(&name, at) {
+                    Ok(id) => DdlOutcome::Dropped(id),
+                    Err(CatalogError::UnknownTable(_)) if if_exists => DdlOutcome::DropNoOp,
+                    Err(e) => return Err(EngineError::Catalog(e)),
+                };
+                if matches!(outcome, DdlOutcome::Dropped(_)) {
+                    let record = CatalogRecord::DropTable { at, name };
+                    catalog_log::append(&self.disk, &record).map_err(EngineError::CatalogLog)?;
+                    self.catalog = staged;
+                }
                 Ok(StatementOutcome::Ddl {
                     tag: outcome.command_tag(),
                 })
@@ -767,10 +961,15 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     ///
     /// [`EngineError::Storage`] if the backend cannot open the tier's files.
     fn open_tier(&mut self, valid_time: bool) -> Result<TableState<C, D>, EngineError> {
-        let disk = NamespacedDisk::new(self.disk.clone(), self.next_namespace);
+        let namespace = self.next_namespace;
+        let disk = NamespacedDisk::new(self.disk.clone(), namespace);
         let engine = Engine::open(disk, self.clock.clone(), valid_time)?;
         self.next_namespace += 1;
-        Ok(TableState { engine, valid_time })
+        Ok(TableState {
+            engine,
+            valid_time,
+            namespace,
+        })
     }
 
     /// Run a snapshot scan for a bound `SELECT`, honoring its projection list and
@@ -3413,5 +3612,374 @@ mod tests {
             "SELECT emp.id, dept.floor FROM emp JOIN dept ON emp.dept = dept.name",
         );
         assert_eq!(sorted(result.rows), vec![vec![i4(1), i4(3)]]);
+    }
+
+    // ---- durable catalog + cold-boot recovery (STL-210, ADR-0028) ----
+
+    use stele_storage::backend::{DiskFile as _, FaultOp, Faults};
+
+    /// Boot a session from `disk`'s existing on-disk state — the restart half
+    /// of every round-trip below.
+    fn recover_session(disk: &MemDisk) -> SessionEngine<ZeroClock, MemDisk> {
+        SessionEngine::recover(disk.clone(), ZeroClock).expect("recover")
+    }
+
+    #[test]
+    fn recovery_round_trips_rows_and_as_of_across_a_restart() {
+        // The DoD round trip: CREATE → INSERT/UPDATE/DELETE, then a process
+        // restart, then SELECT (current and AS OF) answers exactly as the live
+        // session did. Dropping the engine *is* the kill: the session never
+        // checkpoints or flushes, so recovery runs from the WALs + catalog log
+        // alone — the crash-consistency the WAL-fsync invariant promises.
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert 1");
+        let s1 = engine.clock.current();
+        for dml in [
+            "UPDATE account SET balance = 250 WHERE id = 1",
+            "INSERT INTO account VALUES (2, 7)",
+            "DELETE FROM account WHERE id = 2", // a retraction must survive too
+        ] {
+            engine.execute(&parse_one(dml)).expect("dml");
+        }
+        let now_sql = "SELECT id, balance FROM account";
+        let as_of_sql = format!("{now_sql} FOR SYSTEM_TIME AS OF {}", s1.0);
+        let live_now = sorted(select(&mut engine, now_sql).rows);
+        let live_as_of = sorted(select(&mut engine, &as_of_sql).rows);
+        drop(engine);
+
+        let mut engine = recover_session(&disk);
+        let tables = engine.describe_live_tables();
+        assert_eq!(
+            tables,
+            vec![TableDescription {
+                name: "account".to_owned(),
+                columns: vec![
+                    ("id".to_owned(), LogicalType::Int4),
+                    ("balance".to_owned(), LogicalType::Int4),
+                ],
+            }],
+            "the catalog resolves the table at its schema"
+        );
+        assert_eq!(
+            sorted(select(&mut engine, now_sql).rows),
+            live_now,
+            "the current read answers as the live session did (update + deletion gap survive)"
+        );
+        assert_eq!(live_now, vec![vec![i4(1), i4(250)]]);
+        assert_eq!(
+            sorted(select(&mut engine, &as_of_sql).rows),
+            live_as_of,
+            "the AS OF read answers as the live session did"
+        );
+        assert_eq!(live_as_of, vec![vec![i4(1), i4(100)]]);
+    }
+
+    #[test]
+    fn recovery_resolves_old_schema_versions_and_reuses_the_namespace() {
+        // A dropped name re-created with different columns: post-restart, the
+        // live read sees only the new era and an AS OF read inside the old era
+        // resolves the *old* schema — neither duplicated nor orphaned, because
+        // the re-create's catalog-log record carries the *same* namespace and
+        // recovery reopens that one tier. The recovered session must answer
+        // exactly as the live one did — including the live session's existing
+        // quirk that a reused tier's dropped-era open rows stay visible to
+        // current reads (a DROP closes the catalog name, not the storage rows;
+        // tightening that is the filed follow-up STL-211) — so both reads are
+        // captured live and compared across the kill.
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE t (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+            ))
+            .expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (1, 100)"))
+            .expect("insert");
+        let s1 = engine.clock.current();
+        engine.execute(&parse_one("DROP TABLE t")).expect("drop");
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE t (id INT PRIMARY KEY, amount INT) WITH SYSTEM VERSIONING",
+            ))
+            .expect("re-create");
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (2, 5)"))
+            .expect("insert into the new era");
+        let now_sql = "SELECT id, amount FROM t";
+        let as_of_sql = format!("SELECT id, balance FROM t FOR SYSTEM_TIME AS OF {}", s1.0);
+        let live_now = sorted(select(&mut engine, now_sql).rows);
+        let live_as_of = sorted(select(&mut engine, &as_of_sql).rows);
+        drop(engine);
+
+        let mut engine = recover_session(&disk);
+        assert_eq!(
+            sorted(select(&mut engine, now_sql).rows),
+            live_now,
+            "the current read answers as the live session did"
+        );
+        assert_eq!(
+            sorted(select(&mut engine, &as_of_sql).rows),
+            live_as_of,
+            "the dropped era reads under the old schema, as live"
+        );
+        assert_eq!(
+            live_as_of,
+            vec![vec![i4(1), i4(100)]],
+            "the old era resolves the old schema and exactly its one row"
+        );
+        let state = engine.tables.get("t").expect("tier resident");
+        assert_eq!(state.namespace, 0, "the re-create reused the namespace");
+        assert_eq!(engine.next_namespace, 1, "no second namespace was burned");
+    }
+
+    #[test]
+    fn recovering_an_empty_disk_is_a_fresh_session() {
+        // The server boots through `recover` unconditionally, so a first boot
+        // (no catalog log at all) must come up empty and fully usable.
+        let disk = MemDisk::new();
+        let mut engine = recover_session(&disk);
+        assert!(engine.describe_live_tables().is_empty());
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+        assert_eq!(
+            select(&mut engine, "SELECT balance FROM account").rows,
+            vec![vec![i4(100)]]
+        );
+    }
+
+    #[test]
+    fn recovery_composes_across_repeated_restarts() {
+        // Lifecycle across two kills: writes and DDL issued *after* a recovery
+        // (including a committed multi-statement transaction — the recovered
+        // MVCC write index starts empty, and a post-restart snapshot must still
+        // commit cleanly) survive the next recovery too, on distinct namespaces.
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create account");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+        drop(engine);
+
+        let mut engine = recover_session(&disk);
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE ledger (id INT PRIMARY KEY, amount INT) WITH SYSTEM VERSIONING",
+            ))
+            .expect("create ledger after restart");
+        engine
+            .execute(&parse_one("INSERT INTO ledger VALUES (1, 5)"))
+            .expect("insert ledger");
+        let mut txn = engine.begin();
+        engine
+            .stage_dml(
+                &parse_one("UPDATE account SET balance = 111 WHERE id = 1"),
+                &mut txn,
+            )
+            .expect("stage");
+        engine
+            .commit(txn)
+            .expect("a post-restart snapshot commits cleanly");
+        drop(engine);
+
+        let mut engine = recover_session(&disk);
+        assert_eq!(
+            select(&mut engine, "SELECT balance FROM account").rows,
+            vec![vec![i4(111)]],
+            "the post-restart transactional update survives the second restart"
+        );
+        assert_eq!(
+            select(&mut engine, "SELECT amount FROM ledger").rows,
+            vec![vec![i4(5)]],
+            "the post-restart table survives the second restart"
+        );
+        assert_eq!(engine.tables["account"].namespace, 0);
+        assert_eq!(engine.tables["ledger"].namespace, 1);
+        assert_eq!(engine.next_namespace, 2);
+    }
+
+    #[test]
+    fn recovery_positions_the_transaction_id_allocator_past_recovered_commits() {
+        // Provenance distinctness across restarts: the recovered allocator must
+        // start past every transaction id on disk — including a *close's*
+        // provenance (the delete below), which no version row carries.
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        let who = Principal::new(b"demo".to_vec());
+        engine
+            .insert(
+                "account",
+                BusinessKey::new(b"1".to_vec()),
+                None,
+                Some(b"100".to_vec()),
+                0,
+                TxnId(7),
+                who.clone(),
+            )
+            .expect("insert");
+        engine
+            .delete("account", &BusinessKey::new(b"1".to_vec()), TxnId(9), who)
+            .expect("delete");
+        drop(engine);
+
+        let engine = recover_session(&disk);
+        assert_eq!(
+            engine.next_txn, 10,
+            "the next transaction id starts past the deleting close's id"
+        );
+    }
+
+    #[test]
+    fn a_failed_catalog_log_append_rolls_the_ddl_back() {
+        // Schedule the next file append to fail and run a CREATE: whichever
+        // append the fault lands on (the tier's WAL or the catalog log's
+        // record), the statement must fail atomically — no live table, no
+        // durable record — and both a retry and a later recovery see a single,
+        // consistent creation.
+        let faults = Faults::new();
+        let disk = MemDisk::with_faults(faults.clone());
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        faults.schedule(FaultOp::Append, io::ErrorKind::Other);
+        engine
+            .execute(&parse_one(CREATE))
+            .expect_err("the injected append failure refuses the CREATE");
+        assert!(
+            engine.describe_live_tables().is_empty(),
+            "the failed CREATE left no live table behind"
+        );
+
+        engine.execute(&parse_one(CREATE)).expect("retry");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+        drop(engine);
+
+        let mut engine = recover_session(&disk);
+        assert_eq!(
+            engine.describe_live_tables().len(),
+            1,
+            "exactly one account"
+        );
+        assert_eq!(
+            select(&mut engine, "SELECT balance FROM account").rows,
+            vec![vec![i4(100)]]
+        );
+    }
+
+    #[test]
+    fn recovery_tolerates_a_torn_catalog_log_tail() {
+        // A kill mid-DDL-append leaves a partial frame at the log's tail. Its
+        // fsync never returned — the statement was never acknowledged — so
+        // recovery must ignore it and serve everything acknowledged before it.
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+        drop(engine);
+        let mut file = disk
+            .open(crate::catalog_log::CATALOG_LOG_FILENAME)
+            .expect("open catalog log");
+        file.append(b"STCG\x40\x00\x00\x00partial")
+            .expect("torn tail");
+
+        let mut engine = recover_session(&disk);
+        assert_eq!(
+            select(&mut engine, "SELECT balance FROM account").rows,
+            vec![vec![i4(100)]],
+            "the acknowledged history survives the torn, unacknowledged tail"
+        );
+    }
+
+    #[test]
+    fn recovery_reopens_a_valid_time_tier_under_its_policy() {
+        // A bitemporal table round-trips: both-axes AS OF reads answer after
+        // the restart exactly as live (the tier reopened with valid-time
+        // framing), and the recovered policy still refuses a policy-changing
+        // re-create — proving the flag came back from the catalog log, not
+        // from a default.
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE account (id INT PRIMARY KEY, balance INT, vf TIMESTAMP, vt TIMESTAMP) \
+                 WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+            ))
+            .expect("create valid-time table");
+        let who = || Principal::new(b"demo".to_vec());
+        let key = || business_key(&ScalarValue::Int4(1));
+        let payload = |balance: i32, from: i64, to: i64| {
+            row_codec::encode_payload(&[
+                cell(Some(ScalarValue::Int4(balance))),
+                cell(Some(ScalarValue::Timestamp(from))),
+                cell(Some(ScalarValue::Timestamp(to))),
+            ])
+        };
+        let iv = |from: i64, to: i64| {
+            ValidInterval::new(ValidTimeMicros(from), ValidTimeMicros(to)).expect("well-formed")
+        };
+        let c1 = engine
+            .insert(
+                "account",
+                key(),
+                Some(iv(10, 20)),
+                payload(100, 10, 20),
+                0,
+                TxnId(1),
+                who(),
+            )
+            .expect("insert")
+            .commit;
+        let c2 = engine
+            .update(
+                "account",
+                key(),
+                Some(iv(20, 30)),
+                payload(250, 20, 30),
+                0,
+                TxnId(2),
+                who(),
+            )
+            .expect("update")
+            .commit;
+        drop(engine);
+
+        let mut engine = recover_session(&disk);
+        let mut balance = |sys: i64, valid: i64| -> Option<Vec<u8>> {
+            let sql = format!(
+                "SELECT balance FROM account \
+                 FOR SYSTEM_TIME AS OF {sys} FOR VALID_TIME AS OF {valid}"
+            );
+            select(&mut engine, &sql)
+                .rows
+                .into_iter()
+                .next()
+                .and_then(|row| row.into_iter().next().expect("projected cell"))
+        };
+        assert_eq!(balance(c1.0, 15), cell(Some(ScalarValue::Int4(100))));
+        assert_eq!(balance(c2.0, 25), cell(Some(ScalarValue::Int4(250))));
+        assert_eq!(balance(c2.0, 15), None, "superseded on the system axis");
+
+        engine
+            .execute(&parse_one("DROP TABLE account"))
+            .expect("drop");
+        let err = engine
+            .execute(&parse_one(
+                "CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::ValidTimePolicyChange { .. }),
+            "the recovered tier still enforces its valid-time policy, got {err:?}"
+        );
     }
 }

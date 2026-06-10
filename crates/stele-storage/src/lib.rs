@@ -20,7 +20,7 @@
 
 pub mod backend;
 pub(crate) mod checkpoint;
-pub(crate) mod checksum;
+pub mod checksum;
 pub mod delta;
 pub mod dml;
 pub mod engine;

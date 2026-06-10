@@ -80,6 +80,19 @@ const SEGMENT_FILENAME_PREFIX: &str = "seg-";
 /// Filename suffix for sealed segments.
 const SEGMENT_FILENAME_SUFFIX: &str = ".seg";
 
+/// The highest commit instant and transaction id an engine's recovered state
+/// contains — see [`Engine::recovery_marks`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryMarks {
+    /// The largest commit instant of any version or close. A caller resuming
+    /// writes must stamp them strictly after this.
+    pub max_commit: SystemTimeMicros,
+    /// The largest transaction id of any version's or close's provenance. A
+    /// caller allocating fresh transaction ids must start strictly after this,
+    /// or post-restart commits would share provenance with recovered ones.
+    pub max_txn_id: u64,
+}
+
 /// Errors surfaced from the engine boot/recovery flow and the write path.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -544,6 +557,48 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         &self,
     ) -> Result<BTreeMap<(BusinessKey, SystemTimeMicros, u64), ClosedInterval>, EngineError> {
         Ok(self.index.materialize()?)
+    }
+
+    /// The highest commit instant and transaction id present in this engine's
+    /// state — over every version (delta **and** sealed) and every close
+    /// (supersession or retraction) the validity index holds.
+    ///
+    /// The session-level recovery driver ([STL-210], [ADR-0028]) reads this
+    /// right after [`Self::recover`] to position its commit clock and
+    /// transaction-id allocator strictly past everything the table already
+    /// committed — the "position the clock past the recovered high-water mark"
+    /// obligation [`Self::recover`]'s docs place on the caller. Zeros when the
+    /// table has never committed anything.
+    ///
+    /// [STL-210]: https://allegromusic.atlassian.net/browse/STL-210
+    /// [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Delta`] / [`EngineError::Validity`] if a backing spill
+    /// cannot be read.
+    pub fn recovery_marks(&self) -> Result<RecoveryMarks, EngineError> {
+        let mut marks = RecoveryMarks {
+            max_commit: SystemTimeMicros(0),
+            max_txn_id: 0,
+        };
+        let mut fold = |committed_at: SystemTimeMicros, txn_id: u64| {
+            marks.max_commit = marks.max_commit.max(committed_at);
+            marks.max_txn_id = marks.max_txn_id.max(txn_id);
+        };
+        for v in &self.delta.staged_versions()? {
+            fold(v.provenance.committed_at, v.provenance.txn_id.0);
+        }
+        for v in self.sealed.versions() {
+            fold(v.provenance.committed_at, v.provenance.txn_id.0);
+        }
+        // A close is its own commit (a supersession's or a delete's): its
+        // `closed_by` provenance carries the closing transaction's instant/id,
+        // which for a deletion is not represented by any version row.
+        for interval in self.index.materialize()?.values() {
+            fold(interval.closed_by.committed_at, interval.closed_by.txn_id.0);
+        }
+        Ok(marks)
     }
 
     /// The durable WAL fence loaded at recovery / last recorded by

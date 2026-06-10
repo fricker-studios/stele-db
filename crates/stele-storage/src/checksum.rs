@@ -2,9 +2,13 @@
 //!
 //! Shared by every checksum the storage engine writes today —
 //! WAL record framing ([`crate::wal`]) and sealed-segment page/footer
-//! integrity ([`crate::segment`]). A single implementation keeps the
-//! "frame survives torn writes" contract uniform and means a future
-//! hardware-accelerated drop-in benefits every consumer at once.
+//! integrity ([`crate::segment`]) — and exported for the durable logs the
+//! layers above frame the same way (the session catalog log, [ADR-0028]).
+//! A single implementation keeps the "frame survives torn writes" contract
+//! uniform and means a future hardware-accelerated drop-in benefits every
+//! consumer at once.
+//!
+//! [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
 //!
 //! [Castagnoli]: https://datatracker.ietf.org/doc/html/rfc3720#appendix-B.4
 
@@ -32,7 +36,8 @@ const TABLE: [u32; 256] = {
 };
 
 /// Compute the CRC32C of `bytes`.
-pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
+#[must_use]
+pub fn crc32c(bytes: &[u8]) -> u32 {
     let mut crc: u32 = !0;
     for &b in bytes {
         let idx = ((crc ^ u32::from(b)) & 0xFF) as usize;
