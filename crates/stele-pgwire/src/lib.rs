@@ -238,6 +238,13 @@ pub trait SessionHandle: Send {
         txn: &mut SessionTransaction,
     ) -> Result<StatementOutcome, EngineError>;
 
+    /// Advance an open transaction's pinned read snapshot — see
+    /// [`SessionEngine::repin_snapshot`]. The wire DDL path calls this after a
+    /// `CREATE`/`DROP` auto-commits inside a block ([STL-175]).
+    ///
+    /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+    fn repin_snapshot(&self, txn: &mut SessionTransaction);
+
     /// Apply a transaction's buffered writes as a unit, or fail with a retryable
     /// [`EngineError::Conflict`] on a write-write conflict — see
     /// [`SessionEngine::commit`] ([STL-174], [STL-175]).
@@ -270,6 +277,10 @@ where
         txn: &mut SessionTransaction,
     ) -> Result<StatementOutcome, EngineError> {
         Self::execute_in_txn(self, stmt, txn)
+    }
+
+    fn repin_snapshot(&self, txn: &mut SessionTransaction) {
+        Self::repin_snapshot(self, txn);
     }
 
     fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError> {
@@ -776,7 +787,7 @@ async fn handle_simple_query(
         // (STL-131). `bind_ddl` is the classifier: `Ok` means it is DDL, a
         // non-`NotDdl` error means it is malformed DDL we surface as such.
         match bind_ddl(stmt) {
-            Ok(_) => match run_ddl(session, stmt) {
+            Ok(_) => match run_ddl(session, stmt, txn) {
                 Ok(tag) => write_command_complete_tag(stream, tag).await?,
                 Err(e) => {
                     info!(query = %sql, error = %e, "DDL failed");
@@ -917,16 +928,37 @@ fn commit_txn(session: &SharedSession, txn: SessionTransaction) -> Result<(), En
 /// so it is never held across the caller's `await` writes. A poisoned mutex is
 /// recovered rather than propagated, so one panicking connection cannot wedge
 /// the whole server.
-fn run_ddl(session: &SharedSession, stmt: &Statement) -> Result<&'static str, EngineError> {
+///
+/// DDL auto-commits even inside a `BEGIN` block (transactional DDL is deferred).
+/// When a transaction is open, the committed DDL's catalog change is made visible
+/// to the rest of the block by advancing the transaction's pinned snapshot
+/// ([`SessionHandle::repin_snapshot`], [STL-175]) — under the same lock as the DDL
+/// — so a later `INSERT`/`SELECT` resolves the table it created/dropped.
+///
+/// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+fn run_ddl(
+    session: &SharedSession,
+    stmt: &Statement,
+    txn: &mut ConnTxn,
+) -> Result<&'static str, EngineError> {
     let mut engine = session.lock().unwrap_or_else(PoisonError::into_inner);
-    match engine.execute(stmt)? {
-        StatementOutcome::Ddl { tag } => Ok(tag),
+    let tag = match engine.execute(stmt)? {
+        StatementOutcome::Ddl { tag } => {
+            if let ConnTxn::Active(buffered) = txn {
+                engine.repin_snapshot(buffered);
+            }
+            tag
+        }
         // `bind_ddl` already classified this as DDL, so `execute` routes it to the
         // DDL arm; any other outcome would be an internal contract break.
-        StatementOutcome::Rows(_) | StatementOutcome::Dml(_) => Err(EngineError::Unsupported(
-            "DDL statement unexpectedly produced a non-DDL outcome",
-        )),
-    }
+        StatementOutcome::Rows(_) | StatementOutcome::Dml(_) => {
+            return Err(EngineError::Unsupported(
+                "DDL statement unexpectedly produced a non-DDL outcome",
+            ));
+        }
+    };
+    drop(engine); // release the session lock before returning (clippy: drop-tightening)
+    Ok(tag)
 }
 
 /// Route a table `SELECT` or an `INSERT` / `UPDATE` / `DELETE` through the session
@@ -1489,7 +1521,7 @@ fn execute_stmt(
     }
     match bind_ddl(stmt) {
         Ok(_) => {
-            let tag = run_ddl(session, stmt).map_err(|e| ExecError {
+            let tag = run_ddl(session, stmt, txn).map_err(|e| ExecError {
                 sqlstate: sqlstate_for(&e),
                 message: e.to_string(),
             })?;

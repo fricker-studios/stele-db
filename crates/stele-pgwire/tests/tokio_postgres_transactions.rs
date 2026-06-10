@@ -167,6 +167,46 @@ async fn a_batched_transaction_commits_atomically() {
     let _ = driver.await;
 }
 
+/// DDL inside a transaction over the wire (STL-175 regression guard): a
+/// `BEGIN; CREATE TABLE …; INSERT …; COMMIT` resolves the just-created table for
+/// the buffered `INSERT`. DDL inside a block auto-commits and advances the pinned
+/// snapshot, so binding the `INSERT` against it sees the new table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ddl_then_dml_inside_one_transaction_over_the_wire() {
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+
+    let (client, connection) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect");
+    let driver = tokio::spawn(connection);
+
+    client.simple_query("BEGIN").await.expect("begin");
+    client
+        .simple_query("CREATE TABLE t (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING")
+        .await
+        .expect("create inside the transaction");
+    client
+        .simple_query("INSERT INTO t VALUES (1, 100)")
+        .await
+        .expect("insert resolves the table created in the same block");
+    client.simple_query("COMMIT").await.expect("commit");
+
+    let rows = client
+        .simple_query("SELECT balance FROM t")
+        .await
+        .expect("select");
+    assert_eq!(
+        balances(&rows),
+        vec!["100"],
+        "the in-transaction CREATE + buffered INSERT both took effect"
+    );
+
+    drop(client);
+    let _ = driver.await;
+}
+
 /// Snapshot isolation over the wire (STL-175): a transaction reads one consistent
 /// snapshot for its whole life. `a` opens a transaction, pinning a snapshot that
 /// sees `balance = 100`; `b` then auto-commits `balance = 200`; `a`'s in-transaction

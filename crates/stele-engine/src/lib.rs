@@ -245,7 +245,9 @@ pub enum DmlSummary {
 /// every statement in the block resolves its reads at it, so the transaction sees
 /// one consistent snapshot for its whole life even while other connections commit.
 /// Write-write conflicts are detected at [`commit`](SessionEngine::commit), first
-/// committer wins.
+/// committer wins. (The lone exception: a `CREATE` / `DROP` inside the block
+/// auto-commits and *advances* the snapshot, since transactional DDL is not yet
+/// modeled — see [`execute_in_txn`](SessionEngine::execute_in_txn).)
 ///
 /// What this deliberately does *not* yet do (each its own follow-up):
 /// * **Read-your-own-writes.** A `SELECT` inside the transaction reads the pinned
@@ -518,11 +520,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     ///
     /// An `INSERT` / `UPDATE` / `DELETE` is **buffered** into `txn` (applied as a
     /// unit at [`commit`](Self::commit)), bound at the transaction's pinned
-    /// snapshot. Anything else — a `SELECT` or DDL — runs immediately, with its
-    /// reads resolved at that *same* pinned snapshot, so every statement in the
-    /// block observes one consistent system-time snapshot even while other
-    /// connections commit. (Transactional DDL is not yet modeled: a `CREATE` /
-    /// `DROP` inside a block still takes effect at once.)
+    /// snapshot. A `SELECT` runs immediately, with its reads resolved at that
+    /// *same* pinned snapshot, so every statement in the block observes one
+    /// consistent system-time snapshot even while other connections commit.
+    ///
+    /// **DDL inside a transaction** is the one exception. Transactional DDL is not
+    /// yet modeled, so a `CREATE` / `DROP` inside a block takes effect at once
+    /// (auto-commits) — and its catalog change *must* be visible to the rest of
+    /// the block, or a `BEGIN; CREATE TABLE t …; INSERT INTO t …; COMMIT` could not
+    /// resolve `t`. So after a committed DDL the pinned snapshot is **advanced** to
+    /// the commit clock's current instant. This is the only point the
+    /// single-snapshot guarantee yields, and only to the transaction's own
+    /// committed DDL; a pure DML/`SELECT` transaction keeps one snapshot for life.
     ///
     /// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
     /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
@@ -539,7 +548,28 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         if let Some(summary) = self.stage_dml(stmt, txn)? {
             return Ok(StatementOutcome::Dml(summary));
         }
-        self.execute_at(stmt, txn.snapshot)
+        let outcome = self.execute_at(stmt, txn.snapshot)?;
+        // A DDL inside the block auto-committed (see above); advance the pinned
+        // snapshot past it so a later statement in the same block can resolve the
+        // table it created/dropped.
+        if matches!(outcome, StatementOutcome::Ddl { .. }) {
+            self.repin_snapshot(txn);
+        }
+        Ok(outcome)
+    }
+
+    /// Re-pin an open transaction's read snapshot to the commit clock's current
+    /// instant.
+    ///
+    /// Used after a DDL auto-commits inside a transaction block so the rest of the
+    /// block resolves the table it created/dropped (the one relaxation of the
+    /// single-snapshot guarantee — see [`execute_in_txn`](Self::execute_in_txn)).
+    /// The wire front end calls this on its DDL path, which auto-commits a `CREATE`
+    /// / `DROP` through [`execute`](Self::execute) rather than
+    /// [`execute_in_txn`](Self::execute_in_txn); the in-process path advances the
+    /// snapshot itself.
+    pub fn repin_snapshot(&self, txn: &mut SessionTransaction) {
+        txn.snapshot = self.clock.current();
     }
 
     /// The shared statement router, resolving **reads** — a `SELECT`, and the
@@ -2070,6 +2100,47 @@ mod tests {
         assert_eq!(
             payload_column(&result),
             vec![encode_value(&ScalarValue::Int4(300))]
+        );
+    }
+
+    #[test]
+    fn ddl_inside_a_transaction_is_visible_to_later_statements() {
+        // `BEGIN; CREATE TABLE t …; INSERT INTO t …; COMMIT`: DDL inside a block
+        // auto-commits (transactional DDL is deferred) and advances the pinned
+        // snapshot, so the later INSERT — and a SELECT — resolve the new table
+        // rather than failing at the pre-CREATE snapshot.
+        let mut engine = session();
+        let mut txn = engine.begin();
+
+        let created = engine
+            .execute_in_txn(
+                &parse_one("CREATE TABLE t (id INT PRIMARY KEY, v INT) WITH SYSTEM VERSIONING"),
+                &mut txn,
+            )
+            .expect("create inside the transaction");
+        assert!(
+            matches!(created, StatementOutcome::Ddl { .. }),
+            "got {created:?}"
+        );
+
+        // The INSERT binds against the advanced snapshot and resolves `t`.
+        let inserted = engine
+            .execute_in_txn(&parse_one("INSERT INTO t VALUES (1, 100)"), &mut txn)
+            .expect("insert resolves the table created earlier in the block");
+        assert_eq!(inserted, StatementOutcome::Dml(DmlSummary::Insert(1)));
+
+        engine.commit(txn).expect("commit");
+
+        let StatementOutcome::Rows(result) = engine
+            .execute(&parse_one("SELECT v FROM t"))
+            .expect("select")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            payload_column(&result),
+            vec![encode_value(&ScalarValue::Int4(100))],
+            "the buffered insert into the in-transaction table landed at commit"
         );
     }
 
