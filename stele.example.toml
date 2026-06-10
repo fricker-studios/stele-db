@@ -1,0 +1,60 @@
+# stele.example.toml — sample Stele engine configuration.
+#
+# Copy this to `stele.toml` and start the daemon against it:
+#
+#     stele-server --config stele.toml          # or: stele server --config stele.toml
+#
+# When `--config` is given, the file's values win and the server runs in
+# NON-dev mode. Without it the server uses dev defaults — a `local` backend in a
+# per-process scratch dir — and needs no config file at all (the "five-minute
+# path"); config is for operators, not contributors. See
+# docs/05-dev-environment.md#configuration.
+#
+# Only the keys flagged "(active)" are read today. Every other section here is
+# RESERVED: the parser ignores unknown sections (it is forward-compatible), so
+# they are shown commented out and do nothing yet — they land in later tickets.
+# Logging is configured by environment variables, not this file (see the bottom).
+
+[server]
+# pg-wire listen address. (active) Default: "0.0.0.0:5454" — Stele's default
+# Postgres-wire port (ADR-0017). A bare `--listen` flag is ignored when a config
+# file is given; this key wins.
+listen = "0.0.0.0:5454"
+
+# Directory the `local` backend roots its data at (created if absent). (active)
+# Ignored by the `memory` backend. Default: "/var/lib/stele".
+data_dir = "/var/lib/stele"
+
+[storage]
+# Which storage backend the engine boots on. (active) One of:
+#   "local"  — durable, rooted at [server] data_dir (the default)
+#   "memory" — ephemeral, in-process; nothing survives a restart (tests/throwaway)
+# An object-store backend (e.g. "s3") is planned but not yet a valid value —
+# setting it is a clear config error today.
+backend = "local"
+
+# ───────────────────────────────────────────────────────────────────────────
+# RESERVED — parsed-but-ignored today (unknown sections are skipped). These show
+# the intended shape from docs/05; uncommenting them has no effect yet.
+# ───────────────────────────────────────────────────────────────────────────
+
+# [storage.s3]                  # object-store cold tier (planned)
+# bucket   = "stele-cold"
+# endpoint = "http://minio:9000"
+
+# [storage.cache]               # hot-cache sizing (planned)
+# hot_cache_bytes = "8GiB"
+
+# [wal]                         # WAL group-commit policy (planned)
+# fsync = "on_commit"           # the durability point (docs/02 §3.4)
+
+# [telemetry]                   # metrics / trace endpoints (planned)
+# metrics = "0.0.0.0:9090"      # Prometheus / OpenMetrics
+# tracing = "info"
+
+# ───────────────────────────────────────────────────────────────────────────
+# Logging — environment variables, NOT this file (until [telemetry] is wired):
+#   RUST_LOG=info             verbosity (tracing EnvFilter; e.g. RUST_LOG=debug)
+#   STELE_LOG_FORMAT=json     structured JSON output (default is human text)
+# e.g.  STELE_LOG_FORMAT=json RUST_LOG=info stele-server --config stele.toml
+# ───────────────────────────────────────────────────────────────────────────
