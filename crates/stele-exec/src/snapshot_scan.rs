@@ -94,6 +94,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 use stele_common::provenance::{Principal, Provenance, TxnId};
+use stele_common::row_codec::RowCodecError;
 use stele_common::time::{SystemTimeMicros, ValidTimeMicros};
 use stele_storage::backend::{Disk, DiskFile};
 use stele_storage::delta::{BusinessKey, Delta, DeltaError, Snapshot, Version};
@@ -150,6 +151,13 @@ pub enum ScanError {
     /// column type ([STL-170]).
     #[error("filter predicate: {0}")]
     Eval(#[from] crate::expr::ExprError),
+
+    /// An [`ExplodePayload`](crate::ExplodePayload) operator could not slice a
+    /// stored payload into its value cells — the bytes do not match the table's
+    /// value-column count (corruption, or a width disagreement). See the
+    /// [row codec](stele_common::row_codec) ([STL-206]).
+    #[error("payload explode: {0}")]
+    RowCodec(#[from] RowCodecError),
 }
 
 /// One column of a [`Batch`] — Arrow-shaped: a single typed, contiguous array

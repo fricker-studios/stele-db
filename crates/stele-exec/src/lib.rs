@@ -18,10 +18,13 @@
 //! of it sits the vectorized scalar expression evaluator ([`eval_expr`], with
 //! its [`Expr`] / [`Vector`] vocabulary) and the [`Filter`] operator it powers
 //! ([STL-170]) — comparisons, integer arithmetic, boolean connectives, and SQL
-//! three-valued NULL logic over a whole batch at a time. The aggregate / join
-//! operators (STL-77 C11–C13) build on the same trait.
+//! three-valued NULL logic over a whole batch at a time. The [`ExplodePayload`]
+//! operator slices the row-codec payload blob into first-class value columns so
+//! that filter runs over arbitrary columns on the live query path ([STL-206]).
+//! The aggregate / join operators (STL-77 C11–C13) build on the same trait.
 //!
 //! [STL-170]: https://allegromusic.atlassian.net/browse/STL-170
+//! [STL-206]: https://allegromusic.atlassian.net/browse/STL-206
 
 mod expr;
 mod operator;
@@ -29,7 +32,7 @@ mod period;
 mod snapshot_scan;
 
 pub use expr::{ArithOp, CmpOp, Expr, ExprError, LogicOp, Vector, eval_expr};
-pub use operator::{DEFAULT_BATCH_SIZE, Filter, Operator, Project, ScanSource};
+pub use operator::{DEFAULT_BATCH_SIZE, ExplodePayload, Filter, Operator, Project, ScanSource};
 pub use period::evaluate;
 pub use snapshot_scan::{Batch, Column, ScanError, ScanOutput, ScanStats, SnapshotScan};
 // Re-exported so consumers (the binder's bound predicate, the oracle) name the
