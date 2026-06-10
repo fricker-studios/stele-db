@@ -47,6 +47,7 @@
 
 use std::collections::BTreeSet;
 
+use stele_common::row_codec;
 use stele_common::types::LogicalType;
 use stele_storage::backend::{Disk, DiskFile};
 use stele_storage::segment::ColumnId;
@@ -205,6 +206,109 @@ impl<C: Operator> Operator for Project<C> {
             };
             columns.push((want, col));
         }
+        Ok(Some(Batch { columns, rows }))
+    }
+}
+
+/// An operator that **explodes** the row-codec [`Payload`](ColumnId::Payload)
+/// blob into the table's value columns as first-class typed columns ([STL-206]).
+///
+/// The scan source materializes a row as two storage columns — the
+/// [`BusinessKey`](ColumnId::BusinessKey) and the opaque
+/// [`Payload`](ColumnId::Payload) blob that the [row codec](stele_common::row_codec)
+/// packs the value columns into. A value-column predicate (a [`Filter`] over
+/// `b = 'x'`) can only run vectorized once those value cells are *separate*
+/// columns; this operator is the vectorized mirror of
+/// [`row_codec::decode_payload`] that produces them, so the rest of the pipeline
+/// (filter, then the engine's projection) sees first-class value columns instead
+/// of one opaque blob.
+///
+/// Each input batch's `Payload` column is sliced — per row — into `value_count`
+/// cells, transposed into `value_count` [`Column::Bytes`] columns. The output
+/// batch is the business key followed by those value columns, in schema order:
+/// position `0` is the key, position `i + 1` is value column `i`.
+///
+/// ## Addressing is positional
+///
+/// Downstream operators ([`Filter`], the engine's positional projection) address
+/// these columns **by position**, not by [`ColumnId`]. A value column has no
+/// dedicated id — the storage [`ColumnId`] enum is closed (business key, payload,
+/// provenance, valid-time, …) with no per-value-column variant — so every
+/// exploded value column is tagged [`ColumnId::Payload`], the blob it was lifted
+/// from. Position, not the id, distinguishes them; the [`Project`] operator
+/// (which selects *by* id) therefore cannot disambiguate them, and the engine
+/// projects the exploded batch positionally instead.
+pub struct ExplodePayload<C: Operator> {
+    child: C,
+    /// The number of value columns packed in the payload — the table's column
+    /// count minus the business key. Drives [`row_codec::decode_payload`]'s
+    /// slicing; `0` (a key-only table) drops the payload entirely.
+    value_count: usize,
+}
+
+impl<C: Operator> ExplodePayload<C> {
+    /// Explode `child`'s batches into `value_count` value columns plus the
+    /// business key. `value_count` is the table's column count minus the
+    /// business key (the same count [`row_codec::decode_payload`] takes).
+    #[must_use]
+    pub const fn new(child: C, value_count: usize) -> Self {
+        Self { child, value_count }
+    }
+}
+
+impl<C: Operator> Operator for ExplodePayload<C> {
+    fn next(&mut self) -> Result<Option<Batch>, ScanError> {
+        let Some(batch) = self.child.next()? else {
+            return Ok(None);
+        };
+        let rows = batch.rows;
+
+        // The business key passes through unchanged at position 0.
+        let key = batch
+            .columns
+            .iter()
+            .find(|(id, _)| *id == ColumnId::BusinessKey)
+            .map(|(_, col)| col.clone())
+            .ok_or(ScanError::MissingColumn(ColumnId::BusinessKey))?;
+        let mut columns: Vec<(ColumnId, Column)> = Vec::with_capacity(self.value_count + 1);
+        columns.push((ColumnId::BusinessKey, key));
+
+        // A key-only table stores no value cells: drop the payload, emit the key.
+        if self.value_count == 0 {
+            return Ok(Some(Batch { columns, rows }));
+        }
+
+        let (_, payload) = batch
+            .columns
+            .iter()
+            .find(|(id, _)| *id == ColumnId::Payload)
+            .ok_or(ScanError::MissingColumn(ColumnId::Payload))?;
+        let Column::Bytes(payload_cells) = payload else {
+            // The payload is always a variable-length bytes column; a fixed-width
+            // `i64` here would be a plan break, reported as a missing payload.
+            return Err(ScanError::MissingColumn(ColumnId::Payload));
+        };
+
+        // Decode each row's packed payload into its value cells once, then
+        // transpose the per-row cells into `value_count` columns. `decode_payload`
+        // always returns exactly `value_count` cells, so the zip is total. Build
+        // the columns by mapping — not `vec![Vec::with_capacity(rows); n]`, whose
+        // clones would drop the reservation (cloning a `Vec` does not preserve
+        // capacity), so each column reserves its `rows` cells up front.
+        let mut value_cols: Vec<Vec<Option<Vec<u8>>>> = (0..self.value_count)
+            .map(|_| Vec::with_capacity(rows))
+            .collect();
+        for cell in payload_cells {
+            let decoded = row_codec::decode_payload(self.value_count, cell.as_deref())?;
+            for (slot, value) in value_cols.iter_mut().zip(decoded) {
+                slot.push(value);
+            }
+        }
+        columns.extend(
+            value_cols
+                .into_iter()
+                .map(|cells| (ColumnId::Payload, Column::Bytes(cells))),
+        );
         Ok(Some(Batch { columns, rows }))
     }
 }

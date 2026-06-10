@@ -48,10 +48,13 @@ use stele_common::provenance::{Principal, TxnId};
 use stele_common::row_codec::{self, RowCodecError};
 use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
 use stele_common::types::{LogicalType, ScalarValue};
-use stele_exec::{Batch, Column, ScanError, SnapshotScan, evaluate};
+use stele_exec::{
+    Batch, CmpOp, Column, DEFAULT_BATCH_SIZE, ExplodePayload, Expr, Filter, Operator, ScanError,
+    ScanSource, SnapshotScan, evaluate,
+};
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::dml::{BoundDml, DmlError};
-use stele_sql::select::{BoundSelect, Projection, SelectError};
+use stele_sql::select::{BoundPredicate, BoundSelect, Projection, SelectError};
 use stele_sql::{BindContext, BindError, Statement, bind_ddl, bind_dml, bind_select};
 use stele_storage::backend::Disk;
 use stele_storage::delta::{BusinessKey, Snapshot};
@@ -767,16 +770,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     }
 
     /// Run a snapshot scan for a bound `SELECT`, honoring its projection list and
-    /// `WHERE` filter ([STL-151]).
+    /// `WHERE` filter through the vectorized operator pipeline ([STL-151], [STL-206]).
     ///
-    /// The scan materializes the `(business_key, payload)` pair; the payload is
-    /// sliced back into the row's value columns by the
-    /// [row codec](stele_common::row_codec), reconstructing the full row in schema
-    /// order (the business key, then the value columns). The row is then
-    /// **filtered** by the bound predicate and **projected** to exactly the
-    /// requested columns. A key-equality predicate is additionally pushed down to
-    /// the scan so its zone maps can prune; every predicate is re-applied here so
-    /// the answer is correct regardless of what the prune could prove.
+    /// The scan materializes the `(business_key, payload)` pair into a source
+    /// operator; [`ExplodePayload`] slices the packed payload back into the row's
+    /// value columns ([row codec](stele_common::row_codec)) as first-class typed
+    /// columns in schema order (the business key, then the value columns); the
+    /// [`Filter`] operator evaluates the bound `WHERE <col> = <lit>` over each batch
+    /// via `eval_expr`; and the projection selects exactly the requested columns. A
+    /// key-equality predicate is additionally pushed down to the scan so its zone
+    /// maps can prune; the same `Filter` re-applies it so the answer is exact
+    /// regardless of what the prune could prove. A constant period predicate
+    /// ([STL-165]) short-circuits to an empty result when false, before the scan.
     ///
     /// The schema is resolved at the read snapshot, so an `AS OF` read names and
     /// types its columns under the schema version live then.
@@ -802,18 +807,22 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .collect();
         let value_count = schema_columns.len().saturating_sub(1);
 
+        // The output header and the schema-column indices it projects, computed
+        // once: both the constant-period short-circuit and the materialized result
+        // report exactly these columns.
+        let projection = projection_indices(&bound.projection, &schema_columns);
+        let columns: Vec<(String, LogicalType)> = projection
+            .iter()
+            .map(|&i| schema_columns[i].clone())
+            .collect();
+
         // A constant period predicate ([STL-165]) is a whole-`WHERE` filter that
         // folds to a single truth value: when it is false no row qualifies, so the
         // scan is skipped and an empty result with the correct header is returned
         // (never a silently-unfiltered read). A true predicate constrains no
-        // individual row, so the scan below proceeds unfiltered.
+        // individual row, so the pipeline below proceeds unfiltered.
         if let Some(p) = &bound.period_filter {
             if !evaluate(p.predicate, p.left, p.right) {
-                let projection = projection_indices(&bound.projection, &schema_columns);
-                let columns = projection
-                    .iter()
-                    .map(|&i| schema_columns[i].clone())
-                    .collect();
                 return Ok(StatementOutcome::Rows(SelectResult {
                     columns,
                     rows: Vec::new(),
@@ -823,7 +832,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
 
         // Push a key-equality predicate down to the scan for zone-map pruning; a
         // filter on a value column lives inside the opaque payload, which a zone
-        // map cannot reason about, so it is applied only after decode.
+        // map cannot reason about, so the vectorized `Filter` below is where it is
+        // applied. The pushed-down key predicate is re-applied by that same
+        // `Filter`, so the answer is exact regardless of what the prune could prove.
         let predicate = match &bound.filter {
             Some(p) if p.column_index == 0 => Predicate::Eq {
                 column: ColumnId::BusinessKey,
@@ -850,37 +861,37 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         if let Some(v) = bound.valid_snapshot {
             scan = scan.valid_as_of(ValidTimeMicros(v.0));
         }
-        let out = scan.execute()?;
 
-        // Reconstruct each full row [key, value cells…], then filter + project.
-        let projection = projection_indices(&bound.projection, &schema_columns);
-        let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(out.batch.rows);
-        for r in 0..out.batch.rows {
-            let key = column_cell(&out.batch, ColumnId::BusinessKey, r);
-            let payload = column_cell(&out.batch, ColumnId::Payload, r);
-            let mut full_row = Vec::with_capacity(schema_columns.len());
-            full_row.push(key);
-            full_row.extend(row_codec::decode_payload(value_count, payload.as_deref())?);
-
-            // Re-apply the predicate on the reconstructed row (belt-and-suspenders
-            // for the key case, the only filter for a value column). `WHERE col =
-            // <lit>` keeps a row iff that column's cell equals the literal's
-            // encoding; a NULL cell (`None`) never equals a (non-null) literal.
-            if let Some(p) = &bound.filter {
-                let want = encode_value(&p.value);
-                let cell = full_row.get(p.column_index).cloned().flatten();
-                if cell.as_deref() != Some(want.as_slice()) {
-                    continue;
-                }
+        // The vectorized read pipeline ([STL-206], ADR-0027): the scan source emits
+        // `(business_key, payload)` batches; `ExplodePayload` slices the packed
+        // payload into first-class typed value columns (schema order: position 0 the
+        // key, position i+1 value column i); the `Filter` operator evaluates the
+        // bound `WHERE <col> = <lit>` over the whole batch via `eval_expr`, replacing
+        // the old row-at-a-time decode-and-compare loop. Columns are addressed by
+        // position — an exploded value column has no `ColumnId` of its own — so the
+        // projection is applied positionally below rather than through the
+        // id-addressed `Project` operator.
+        let source = ScanSource::new(scan, DEFAULT_BATCH_SIZE);
+        let exploded = ExplodePayload::new(source, value_count);
+        let mut pipeline: Box<dyn Operator + '_> = match &bound.filter {
+            Some(p) => {
+                let schema_types = schema_columns.iter().map(|(_, ty)| *ty).collect();
+                Box::new(Filter::new(exploded, lower_predicate(p), schema_types))
             }
+            None => Box::new(exploded),
+        };
 
-            rows.push(projection.iter().map(|&i| full_row[i].clone()).collect());
+        let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+        while let Some(batch) = pipeline.next()? {
+            for r in 0..batch.rows {
+                rows.push(
+                    projection
+                        .iter()
+                        .map(|&i| batch_cell(&batch, i, r))
+                        .collect(),
+                );
+            }
         }
-
-        let columns = projection
-            .iter()
-            .map(|&i| schema_columns[i].clone())
-            .collect();
         Ok(StatementOutcome::Rows(SelectResult { columns, rows }))
     }
 
@@ -1314,6 +1325,30 @@ fn column_cell(batch: &Batch, id: ColumnId, row: usize) -> Option<Vec<u8>> {
         Column::Bytes(v) if *cid == id => v.get(row).cloned().flatten(),
         _ => None,
     })
+}
+
+/// Lower a bound `WHERE <column> = <literal>` predicate ([STL-151]) to the
+/// vectorized [`Expr`] the [`Filter`] operator evaluates over a whole batch
+/// ([STL-206]). The column is referenced by its schema position — the same index
+/// [`ExplodePayload`] puts it at — and the literal is broadcast as a constant. A
+/// typed equality over the decoded values is equivalent to the byte-equality the
+/// old loop applied, since the encoding is canonical and a NULL cell decodes to a
+/// NULL that the comparison (and `Filter`'s "keep TRUE only") drops.
+fn lower_predicate(predicate: &BoundPredicate) -> Expr {
+    Expr::col(predicate.column_index).compare(CmpOp::Eq, Expr::lit(predicate.value.clone()))
+}
+
+/// Read the cell at `position`/`row` of an exploded pipeline batch as the
+/// [`SelectResult`]'s raw-bytes form ([STL-206]). Every column the pipeline
+/// projects — the business key and the [`ExplodePayload`]-produced value columns —
+/// is a [`Column::Bytes`] carrying each cell's canonical encoding (`None` for a
+/// SQL `NULL`); a fixed-width column never reaches a projected position, but is
+/// reinterpreted losslessly rather than panicking if one ever did.
+fn batch_cell(batch: &Batch, position: usize, row: usize) -> Option<Vec<u8>> {
+    match &batch.columns[position].1 {
+        Column::Bytes(cells) => cells[row].clone(),
+        Column::I64(values) => Some(values[row].to_le_bytes().to_vec()),
+    }
 }
 
 /// The schema-column indices a [`Projection`] selects, in output order: `All` is
