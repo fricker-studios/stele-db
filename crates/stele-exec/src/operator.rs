@@ -45,9 +45,13 @@
 //! storage/txn core
 //! ([architecture §12 invariant 7](../../../docs/02-architecture.md#12-cross-cutting-architectural-invariants)).
 
+use std::collections::BTreeSet;
+
+use stele_common::types::LogicalType;
 use stele_storage::backend::{Disk, DiskFile};
 use stele_storage::segment::ColumnId;
 
+use crate::expr::{Expr, ExprError, Vector, eval_expr};
 use crate::snapshot_scan::{Batch, Column, ScanError, ScanStats, SnapshotScan};
 
 /// Default rows per emitted [`Batch`] when a caller picks no other size.
@@ -202,5 +206,134 @@ impl<C: Operator> Operator for Project<C> {
             columns.push((want, col));
         }
         Ok(Some(Batch { columns, rows }))
+    }
+}
+
+/// A **filter operator** — keeps the `TRUE` rows of its child's batches
+/// ([STL-170]).
+///
+/// `FALSE` *and* `NULL` rows are dropped, the SQL `WHERE` rule that an unknown
+/// is not kept.
+///
+/// The predicate is a vectorized [`Expr`] evaluated a whole batch at a time by
+/// [`eval_expr`]; it references the child's batch columns **by position**,
+/// and `schema` gives the [`LogicalType`] of each of those columns so the
+/// storage [`Column`]s can be decoded into the typed, nullable evaluation form.
+/// `schema` is positional — one entry per column the child emits, in the same
+/// order — so a predicate over the business key plus a value column reads each
+/// from its slot.
+///
+/// Only the columns the predicate actually references are decoded; an opaque or
+/// out-of-scope column the predicate ignores is passed through untouched (its
+/// `schema` entry is never consulted). A referenced column whose type the
+/// evaluator cannot read surfaces as [`ScanError::Eval`].
+///
+/// Like every [`Operator`], `Filter` never emits an empty batch: a batch all of
+/// whose rows are dropped is skipped, and the next non-empty batch (or
+/// end-of-stream) is returned, so a consumer's `while let Some(_)` loop needs no
+/// special case.
+pub struct Filter<C: Operator> {
+    child: C,
+    predicate: Expr,
+    schema: Vec<LogicalType>,
+}
+
+impl<C: Operator> Filter<C> {
+    /// Filter `child`'s batches by `predicate`, decoding referenced columns with
+    /// `schema` (one [`LogicalType`] per child column, positional).
+    #[must_use]
+    pub const fn new(child: C, predicate: Expr, schema: Vec<LogicalType>) -> Self {
+        Self {
+            child,
+            predicate,
+            schema,
+        }
+    }
+
+    /// The row indices of `batch` the predicate keeps (its `TRUE` rows).
+    fn kept_rows(&self, batch: &Batch) -> Result<Vec<usize>, ScanError> {
+        // Decode only the columns the predicate references — an unreferenced
+        // column (an opaque payload, a provenance scalar) is never touched, so a
+        // filter on one column does not force the whole batch through the bridge.
+        // Unreferenced slots hold an empty placeholder the evaluator never reads.
+        let mut referenced = BTreeSet::new();
+        collect_columns(&self.predicate, &mut referenced);
+        let mut columns: Vec<Vector> = (0..batch.columns.len())
+            .map(|_| Vector::Bool(Vec::new()))
+            .collect();
+        for index in referenced {
+            let (_, column) =
+                batch
+                    .columns
+                    .get(index)
+                    .ok_or(ScanError::Eval(ExprError::ColumnOutOfRange {
+                        index,
+                        columns: batch.columns.len(),
+                    }))?;
+            let ty =
+                *self
+                    .schema
+                    .get(index)
+                    .ok_or(ScanError::Eval(ExprError::ColumnOutOfRange {
+                        index,
+                        columns: self.schema.len(),
+                    }))?;
+            columns[index] = Vector::from_column(ty, column)?;
+        }
+
+        let result = eval_expr(&self.predicate, &columns, batch.rows)?;
+        let Vector::Bool(mask) = result else {
+            return Err(ScanError::Eval(ExprError::NotBoolean {
+                op: "WHERE",
+                found: result.logical_type(),
+            }));
+        };
+        Ok(mask
+            .iter()
+            .enumerate()
+            .filter_map(|(row, keep)| (*keep == Some(true)).then_some(row))
+            .collect())
+    }
+}
+
+impl<C: Operator> Operator for Filter<C> {
+    fn next(&mut self) -> Result<Option<Batch>, ScanError> {
+        // Pull until a batch has a surviving row or the child is exhausted —
+        // never surface a fully-filtered batch as an empty one.
+        loop {
+            let Some(batch) = self.child.next()? else {
+                return Ok(None);
+            };
+            let kept = self.kept_rows(&batch)?;
+            if kept.is_empty() {
+                continue;
+            }
+            let columns = batch
+                .columns
+                .iter()
+                .map(|(id, col)| (*id, col.take(&kept)))
+                .collect();
+            return Ok(Some(Batch {
+                columns,
+                rows: kept.len(),
+            }));
+        }
+    }
+}
+
+/// Collect the positions of every [`Expr::Column`] the predicate references.
+fn collect_columns(expr: &Expr, out: &mut BTreeSet<usize>) {
+    match expr {
+        Expr::Column(index) => {
+            out.insert(*index);
+        }
+        Expr::Literal(_) => {}
+        Expr::Not(inner) | Expr::IsNull(inner) => collect_columns(inner, out),
+        Expr::Compare { left, right, .. }
+        | Expr::Logic { left, right, .. }
+        | Expr::Arith { left, right, .. } => {
+            collect_columns(left, out);
+            collect_columns(right, out);
+        }
     }
 }
