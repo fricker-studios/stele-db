@@ -49,8 +49,11 @@
 //! statement once and execute it with bound values. The protocol decoding and
 //! the `$1 … $n` → literal substitution live in the `extended` module; this one
 //! owns the async handlers, the per-connection caches, and the result streaming.
-//! Only **text-format** parameters and results are handled here; binary encoders
-//! ride in with [STL-77] \[G23\].
+//!
+//! [STL-183] adds the **binary format** half: a `Bind` negotiates a wire format
+//! code per parameter and per result column, and parameters / `DataRow` cells ride
+//! in text (the `text_format` module) or binary (the `binary_format` module)
+//! accordingly. Mixed text/binary columns in one row are honored.
 //!
 //! ## Not yet
 //!
@@ -58,6 +61,7 @@
 //! * SCRAM-SHA-256 auth + TLS — v0.3.
 //!
 //! [STL-182]: https://allegromusic.atlassian.net/browse/STL-182
+//! [STL-183]: https://allegromusic.atlassian.net/browse/STL-183
 //! [STL-77]: https://allegromusic.atlassian.net/browse/STL-77
 //!
 //! ## Architectural constraint
@@ -68,6 +72,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+mod binary_format;
 mod extended;
 mod pg_catalog;
 mod text_format;
@@ -184,11 +189,18 @@ const SQLSTATE_INVALID_SAVEPOINT: &str = "3B001";
 const SQLSTATE_DUPLICATE_PSTATEMENT: &str = "42P05";
 const SQLSTATE_INVALID_PSTATEMENT_NAME: &str = "26000";
 const SQLSTATE_INVALID_CURSOR_NAME: &str = "34000";
+// A binary-format `Bind` parameter whose bytes do not decode under its declared
+// type — Postgres's `invalid_binary_representation`, distinct from the text-form
+// `22P02` (STL-183).
+const SQLSTATE_INVALID_BINARY_REPRESENTATION: &str = "22P03";
 
-// Text format code for `RowDescription` fields (binary is 1; a v0.2 concern).
-// The per-type OID and `typlen` advertised per field now come from the value's
-// [`LogicalType`] (`pg_oid` / [`text_format::pg_typlen`]).
+// Per-field / per-parameter wire format codes (STL-105 text, STL-183 binary). A
+// `RowDescription` field and a `Bind` parameter / result slot each carry one of
+// these; the per-type OID and `typlen` advertised per field come from the value's
+// [`LogicalType`] (`pg_oid` / [`text_format::pg_typlen`]), and the value bytes are
+// rendered by [`text_format`] or [`binary_format`] accordingly.
 const FORMAT_TEXT: i16 = 0;
+const FORMAT_BINARY: i16 = 1;
 
 // DoS guard: cap how large a single frame we will allocate for. The Postgres
 // protocol notionally allows up to ~1 GiB messages; in practice v0.1 traffic is
@@ -800,9 +812,9 @@ async fn handle_simple_query(
         // these are `SELECT`s that would otherwise fall to the deferral arm.
         if let Some(intro) = pg_catalog::classify(stmt) {
             let (header, rows) = introspection_reply(&intro, session);
-            write_row_description(stream, &header).await?;
+            write_row_description(stream, &header, &[]).await?;
             for row in &rows {
-                write_data_row(stream, row).await?;
+                write_data_row(stream, row, &[]).await?;
             }
             let n = u64::try_from(rows.len()).unwrap_or(u64::MAX);
             write_command_complete(stream, &CommandTag::Select(n)).await?;
@@ -828,8 +840,8 @@ async fn handle_simple_query(
                 // `DELETE` — routes through the session engine (STL-147), buffered
                 // into `txn` instead of committed when a transaction is open.
                 if let Some(columns) = constant_select(stmt) {
-                    write_row_description(stream, &columns).await?;
-                    write_data_row(stream, &columns).await?;
+                    write_row_description(stream, &columns, &[]).await?;
+                    write_data_row(stream, &columns, &[]).await?;
                     write_command_complete(stream, &CommandTag::Select(1)).await?;
                 } else if !run_statement(stream, stmt, session, txn).await? {
                     // The statement errored; the reply and SQLSTATE are already on
@@ -1128,9 +1140,9 @@ async fn run_statement(
     match run_query(session, stmt, txn) {
         Ok(StatementOutcome::Rows(result)) => match decode_result_rows(&result) {
             Ok(data_rows) => {
-                write_row_description(stream, &result_header(&result)).await?;
+                write_row_description(stream, &result_header(&result), &[]).await?;
                 for row in &data_rows {
-                    write_data_row(stream, row).await?;
+                    write_data_row(stream, row, &[]).await?;
                 }
                 let n = u64::try_from(data_rows.len()).unwrap_or(u64::MAX);
                 write_command_complete(stream, &CommandTag::Select(n)).await?;
@@ -1592,6 +1604,11 @@ struct PortalEntry {
     /// runs the read and a later Execute that drains it agree on one result, and
     /// a row-capped Execute can resume from where the previous one stopped.
     executed: Option<Executed>,
+    /// The result-column format codes negotiated in `Bind` (STL-183): empty → all
+    /// text; one code → applied to every column; else one per column. Both the
+    /// `RowDescription` (Describe) and the `DataRow`s (Execute) honor it, so a
+    /// column's advertised format matches the bytes it ships in.
+    result_formats: Vec<i16>,
 }
 
 /// The outcome of running a portal's statement, cached for streaming.
@@ -1790,8 +1807,10 @@ async fn handle_parse(
 }
 
 /// `Bind` ('B'): substitute the parameters into the named statement, creating a
-/// portal, reply `BindComplete`. Binary parameter / result formats are refused
-/// (text-only until the binary encoders land in \[G23\]).
+/// portal, reply `BindComplete`. Parameters arrive in the per-parameter format the
+/// client negotiated — text verbatim, or binary decoded under the declared type
+/// OID (STL-183) — and the requested result format codes are stashed on the portal
+/// for Describe / Execute to honor.
 async fn handle_bind(
     stream: &mut TcpStream,
     state: &mut ConnState,
@@ -1807,28 +1826,29 @@ async fn handle_bind(
         return fail_extended(stream, state, SQLSTATE_INVALID_PSTATEMENT_NAME, &m).await;
     };
     let (pstmt, param_oids) = (prepared.stmt.clone(), prepared.param_oids.clone());
-    if msg.param_formats.iter().any(|&f| f != FORMAT_TEXT) {
-        let m = "binary-format parameters are not yet supported";
-        return fail_extended(stream, state, SQLSTATE_FEATURE_NOT_SUPPORTED, m).await;
-    }
-    if msg.result_formats.iter().any(|&f| f != FORMAT_TEXT) {
-        let m = "binary-format results are not yet supported";
-        return fail_extended(stream, state, SQLSTATE_FEATURE_NOT_SUPPORTED, m).await;
+
+    // The parameter format-code array must be a valid shape for the parameter
+    // count before we read it through `format_at`. (Result formats are validated
+    // later, against the actual column count, in Describe / Execute.)
+    if let Err(m) = validate_formats(&msg.param_formats, msg.params.len()) {
+        return fail_extended(stream, state, SQLSTATE_PROTOCOL_VIOLATION, &m).await;
     }
 
     let mut values = Vec::with_capacity(msg.params.len());
     for (i, raw) in msg.params.iter().enumerate() {
         let oid = param_oids.get(i).copied().unwrap_or(0);
-        match extended::param_to_value(oid, raw.as_deref()) {
+        let binary = format_at(&msg.param_formats, i) == FORMAT_BINARY;
+        match extended::param_to_value(oid, binary, raw.as_deref()) {
             Ok(value) => values.push(value),
             Err(e) => {
-                return fail_extended(
-                    stream,
-                    state,
-                    SQLSTATE_INVALID_TEXT_REPRESENTATION,
-                    &e.to_string(),
-                )
-                .await;
+                // A binary decode failure is `invalid_binary_representation`; a
+                // text one is `invalid_text_representation`.
+                let sqlstate = if e.is_binary() {
+                    SQLSTATE_INVALID_BINARY_REPRESENTATION
+                } else {
+                    SQLSTATE_INVALID_TEXT_REPRESENTATION
+                };
+                return fail_extended(stream, state, sqlstate, &e.to_string()).await;
             }
         }
     }
@@ -1848,6 +1868,7 @@ async fn handle_bind(
         PortalEntry {
             stmt: bound,
             executed: None,
+            result_formats: msg.result_formats,
         },
     );
     write_bind_complete(stream).await?;
@@ -1877,8 +1898,8 @@ async fn handle_describe(
             write_parameter_description(stream, &oids).await?;
             // The row shape of an unbound statement needs its parameters resolved;
             // we report NoData and surface the real RowDescription from a
-            // Describe-portal after Bind. (Statement-level row description is a
-            // follow-up — see STL-183 fan-out.)
+            // Describe-portal after Bind. Statement-level row description (the
+            // tokio-postgres / JDBC prepared-SELECT path) is the STL-212 follow-up.
             write_no_data(stream).await?;
             Ok(())
         }
@@ -1910,11 +1931,21 @@ async fn handle_describe_portal(
     if let Err(e) = ensure_executed(state, name, session, &stmt, txn) {
         return fail_extended(stream, state, e.sqlstate, &e.message).await;
     }
-    let header = match state.portals.get(name).and_then(|p| p.executed.as_ref()) {
+    // The portal was present above and `ensure_executed` only populates its cached
+    // result, so it is still here; clone the header + negotiated formats so the
+    // session borrow is released before the wire write.
+    let portal = state.portals.get(name).expect("portal present");
+    let header = match &portal.executed {
         Some(Executed::Rows { header, .. }) => header.clone(),
         _ => Vec::new(),
     };
-    write_row_description(stream, &header).await?;
+    let formats = portal.result_formats.clone();
+    // Now that the column count is known, the negotiated result format array must
+    // be a valid shape for it (Postgres `08P01` otherwise).
+    if let Err(m) = validate_formats(&formats, header.len()) {
+        return fail_extended(stream, state, SQLSTATE_PROTOCOL_VIOLATION, &m).await;
+    }
+    write_row_description(stream, &header, &formats).await?;
     Ok(())
 }
 
@@ -1963,7 +1994,22 @@ async fn handle_execute(
         return fail_extended(stream, state, e.sqlstate, &e.message).await;
     }
 
+    // Validate the negotiated result formats against the now-known column count
+    // before streaming anything — an Execute that skipped Describe still gets the
+    // shape check (Postgres `08P01`). A non-row portal has zero columns.
+    let entry = state.portals.get(&msg.portal).expect("portal present");
+    let cols = match &entry.executed {
+        Some(Executed::Rows { header, .. }) => header.len(),
+        _ => 0,
+    };
+    if let Err(m) = validate_formats(&entry.result_formats, cols) {
+        return fail_extended(stream, state, SQLSTATE_PROTOCOL_VIOLATION, &m).await;
+    }
+
     let entry = state.portals.get_mut(&msg.portal).expect("portal present");
+    // The negotiated result formats are a portal-level field disjoint from the
+    // cached `executed` rows; clone them so the streaming borrow below is clean.
+    let formats = entry.result_formats.clone();
     match entry.executed.as_mut().expect("executed cached") {
         Executed::Rows { rows, sent, .. } => {
             let remaining = rows.len() - *sent;
@@ -1979,7 +2025,7 @@ async fn handle_execute(
             let start = *sent;
             let end = start + take;
             for row in &rows[start..end] {
-                write_data_row(stream, row).await?;
+                write_data_row(stream, row, &formats).await?;
             }
             *sent = end;
             if *sent < rows.len() {
@@ -2248,18 +2294,62 @@ fn column_count(columns: &[ResultColumn]) -> Result<i16, WireError> {
         .map_err(|_| WireError::Protocol("result has more than 32767 columns"))
 }
 
+/// The wire format code negotiated for result column / parameter `i`, given the
+/// `Bind` format-code array. Postgres allows three shapes: empty → every slot is
+/// text; exactly one code → it applies to every slot; otherwise one code per slot
+/// (a malformed array shorter than the slot count falls back to text rather than
+/// panicking).
+fn format_at(formats: &[i16], i: usize) -> i16 {
+    match formats {
+        [] => FORMAT_TEXT,
+        [single] => *single,
+        many => many.get(i).copied().unwrap_or(FORMAT_TEXT),
+    }
+}
+
+/// Validate a `Bind` format-code array against the `slots` it applies to (the
+/// parameter count, or a result's column count). The protocol allows only the
+/// codes `0` (text) and `1` (binary), and only three array shapes: empty (all
+/// text), one code (broadcast to every slot), or exactly one code per slot. Any
+/// other code or length is a protocol violation (Postgres `08P01`), returned as
+/// the error message — rejecting it here keeps [`format_at`]'s text fallback from
+/// silently masking a malformed frame.
+fn validate_formats(formats: &[i16], slots: usize) -> Result<(), String> {
+    if let Some(&bad) = formats
+        .iter()
+        .find(|&&f| f != FORMAT_TEXT && f != FORMAT_BINARY)
+    {
+        return Err(format!(
+            "invalid format code {bad}: must be 0 (text) or 1 (binary)"
+        ));
+    }
+    if matches!(formats.len(), 0 | 1) || formats.len() == slots {
+        Ok(())
+    } else {
+        Err(format!(
+            "format-code count {} does not match {slots} (must be 0, 1, or {slots})",
+            formats.len()
+        ))
+    }
+}
+
 /// Build the `RowDescription` ('T') payload — one field descriptor per column.
 ///
 /// Per field: name (cstring), table OID (Int32), column attr number (Int16),
 /// type OID (Int32), type size (Int16), type modifier (Int32), format code
 /// (Int16). We have no real relation behind these columns, so table OID and
 /// attr number are `0`, and the type modifier is `-1` (none). The OID and size
-/// come from each column's [`LogicalType`].
-fn row_description_payload(columns: &[ResultColumn]) -> Result<BytesMut, WireError> {
+/// come from each column's [`LogicalType`]; the format code per column comes from
+/// the portal's negotiated `formats` (STL-183) and must match the format the
+/// subsequent `DataRow` cells ride in.
+fn row_description_payload(
+    columns: &[ResultColumn],
+    formats: &[i16],
+) -> Result<BytesMut, WireError> {
     let count = column_count(columns)?;
     let mut payload = BytesMut::new();
     payload.put_i16(count);
-    for col in columns {
+    for (i, col) in columns.iter().enumerate() {
         payload.put_slice(col.name.as_bytes());
         payload.put_u8(0);
         payload.put_i32(0); // table OID — not a stored relation
@@ -2271,50 +2361,61 @@ fn row_description_payload(columns: &[ResultColumn]) -> Result<BytesMut, WireErr
         payload.put_u32(col.ty.pg_oid());
         payload.put_i16(text_format::pg_typlen(col.ty));
         payload.put_i32(-1); // type modifier
-        payload.put_i16(FORMAT_TEXT);
+        payload.put_i16(format_at(formats, i));
     }
     Ok(payload)
 }
 
-/// Build the `DataRow` ('D') payload — one cell per column, in text format. A
-/// `None` cell is SQL `NULL`, encoded as the length-`-1` sentinel with no value
-/// bytes; a present value is rendered through [`text_format::encode_text`].
-fn data_row_payload(columns: &[ResultColumn]) -> Result<BytesMut, WireError> {
+/// Build the `DataRow` ('D') payload — one cell per column, each in the format
+/// negotiated for its column (text by default; binary where `formats` selects it,
+/// STL-183). A `None` cell is SQL `NULL`, encoded as the length-`-1` sentinel with
+/// no value bytes regardless of format; a present value is rendered through
+/// [`text_format::encode_text`] or [`binary_format::encode_binary`].
+fn data_row_payload(columns: &[ResultColumn], formats: &[i16]) -> Result<BytesMut, WireError> {
     let count = column_count(columns)?;
     let mut payload = BytesMut::new();
     payload.put_i16(count);
-    for col in columns {
+    for (i, col) in columns.iter().enumerate() {
         match &col.value {
             None => payload.put_i32(-1),
             Some(value) => {
-                let text = text_format::encode_text(value);
-                let bytes = text.as_bytes();
+                let bytes = if format_at(formats, i) == FORMAT_BINARY {
+                    binary_format::encode_binary(value)
+                } else {
+                    text_format::encode_text(value).into_bytes()
+                };
                 // The DataRow length prefix is an Int32. Clamping an oversized
                 // value would desync the client (prefix would not match the
                 // bytes written), so refuse it rather than emit a torn frame.
                 let len = i32::try_from(bytes.len())
                     .map_err(|_| WireError::Protocol("DataRow value exceeds 2 GiB"))?;
                 payload.put_i32(len);
-                payload.put_slice(bytes);
+                payload.put_slice(&bytes);
             }
         }
     }
     Ok(payload)
 }
 
-/// `RowDescription` ('T').
+/// `RowDescription` ('T'). `formats` is the portal's negotiated result format-code
+/// array (empty → all text); the text-only simple-query path passes `&[]`.
 async fn write_row_description(
     stream: &mut TcpStream,
     columns: &[ResultColumn],
+    formats: &[i16],
 ) -> Result<(), WireError> {
-    let payload = row_description_payload(columns)?;
+    let payload = row_description_payload(columns, formats)?;
     write_framed(stream, MSG_ROW_DESCRIPTION, &payload).await?;
     Ok(())
 }
 
-/// `DataRow` ('D').
-async fn write_data_row(stream: &mut TcpStream, columns: &[ResultColumn]) -> Result<(), WireError> {
-    let payload = data_row_payload(columns)?;
+/// `DataRow` ('D'). `formats` selects each cell's wire format (empty → all text).
+async fn write_data_row(
+    stream: &mut TcpStream,
+    columns: &[ResultColumn],
+    formats: &[i16],
+) -> Result<(), WireError> {
+    let payload = data_row_payload(columns, formats)?;
     write_framed(stream, MSG_DATA_ROW, &payload).await?;
     Ok(())
 }
@@ -2795,7 +2896,7 @@ mod tests {
                 value: Some(ScalarValue::Text("hi".into())),
             },
         ];
-        let payload = data_row_payload(&columns).expect("payload");
+        let payload = data_row_payload(&columns, &[]).expect("payload");
         assert_eq!(
             parse_data_row(&payload),
             vec![Some(b"7".to_vec()), None, Some(b"hi".to_vec())]
@@ -2856,7 +2957,7 @@ mod tests {
                 value: Some(ScalarValue::float8(1.5)),
             },
         ];
-        let cells = parse_data_row(&data_row_payload(&columns).expect("payload"));
+        let cells = parse_data_row(&data_row_payload(&columns, &[]).expect("payload"));
         let rendered: Vec<String> = cells
             .into_iter()
             .map(|c| String::from_utf8(c.expect("non-null")).unwrap())
@@ -2888,7 +2989,7 @@ mod tests {
                 value: None,
             })
             .collect();
-        let payload = row_description_payload(&columns).expect("payload");
+        let payload = row_description_payload(&columns, &[]).expect("payload");
         let count = i16::from_be_bytes(payload[0..2].try_into().unwrap());
         assert_eq!(usize::try_from(count).unwrap(), LogicalType::ALL.len());
 
@@ -3656,6 +3757,60 @@ mod tests {
         send_msg(client, MSG_BIND, &b).await;
     }
 
+    /// `Bind` with explicit per-parameter and per-result format-code arrays and
+    /// raw parameter bytes — the STL-183 binary path. A `None` parameter is a SQL
+    /// `NULL`. (Text `Bind` uses the [`send_bind`] convenience above.)
+    async fn send_bind_raw(
+        client: &mut TcpStream,
+        portal: &str,
+        stmt: &str,
+        param_formats: &[i16],
+        params: &[Option<&[u8]>],
+        result_formats: &[i16],
+    ) {
+        let mut b = BytesMut::new();
+        put_cstr(&mut b, portal);
+        put_cstr(&mut b, stmt);
+        b.put_i16(i16::try_from(param_formats.len()).unwrap());
+        for &f in param_formats {
+            b.put_i16(f);
+        }
+        b.put_i16(i16::try_from(params.len()).unwrap());
+        for p in params {
+            match p {
+                None => b.put_i32(-1),
+                Some(bytes) => {
+                    b.put_i32(i32::try_from(bytes.len()).unwrap());
+                    b.put_slice(bytes);
+                }
+            }
+        }
+        b.put_i16(i16::try_from(result_formats.len()).unwrap());
+        for &f in result_formats {
+            b.put_i16(f);
+        }
+        send_msg(client, MSG_BIND, &b).await;
+    }
+
+    /// The per-field format codes of a `RowDescription` payload (the last `Int16`
+    /// of each field's fixed tail), parallel to [`parse_row_description_names`].
+    fn parse_row_description_formats(payload: &[u8]) -> Vec<i16> {
+        let count = i16::from_be_bytes(payload[0..2].try_into().unwrap());
+        let mut formats = Vec::new();
+        let mut pos = 2;
+        for _ in 0..count {
+            let end = payload[pos..].iter().position(|&b| b == 0).unwrap() + pos;
+            // name cstring + table OID(4) + attr(2) + type OID(4) + typlen(2) +
+            // typmod(4); the format code is the final Int16 of the 18-byte tail.
+            pos = end + 1 + 16;
+            formats.push(i16::from_be_bytes(
+                payload[pos..pos + 2].try_into().unwrap(),
+            ));
+            pos += 2;
+        }
+        formats
+    }
+
     /// `Describe` a statement (`b'S'`) or portal (`b'P'`).
     async fn send_describe(client: &mut TcpStream, target: u8, name: &str) {
         let mut b = BytesMut::new();
@@ -4068,6 +4223,226 @@ mod tests {
         assert!(
             data_row_text(&after).is_empty(),
             "ROLLBACK discarded the write"
+        );
+        terminate(server, client).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Binary-format encoders + format-code negotiation (STL-183)
+    // -----------------------------------------------------------------------
+
+    /// A binary result format (a single `1`, broadcast to every column) makes both
+    /// the `RowDescription` advertise format `1` and the `DataRow` cells carry the
+    /// big-endian binary encoding instead of ASCII text.
+    #[tokio::test]
+    async fn binary_result_format_encodes_rows_and_row_description() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+        run_simple(&mut client, "INSERT INTO account VALUES (1, 100)").await;
+
+        send_parse(&mut client, "", "SELECT id, balance FROM account", &[]).await;
+        // One result format code (`1`) → applies to every column.
+        send_bind_raw(&mut client, "", "", &[], &[], &[FORMAT_BINARY]).await;
+        send_describe(&mut client, b'P', "").await;
+        send_execute(&mut client, "", 0).await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        // BindComplete, RowDescription, DataRow, CommandComplete.
+        let rd = msgs
+            .iter()
+            .find(|(k, _)| *k == MSG_ROW_DESCRIPTION)
+            .unwrap();
+        assert_eq!(
+            parse_row_description_formats(&rd.1),
+            vec![FORMAT_BINARY, FORMAT_BINARY],
+            "both columns advertise binary"
+        );
+        let dr = msgs.iter().find(|(k, _)| *k == MSG_DATA_ROW).unwrap();
+        assert_eq!(
+            parse_data_row(&dr.1),
+            vec![
+                Some(1i32.to_be_bytes().to_vec()),
+                Some(100i32.to_be_bytes().to_vec()),
+            ],
+            "cells are 4-byte big-endian int4"
+        );
+        terminate(server, client).await;
+    }
+
+    /// A per-column format array negotiates a *mix*: column 0 stays text, column 1
+    /// rides in binary — the DoD's "mixed text/binary columns".
+    #[tokio::test]
+    async fn mixed_text_and_binary_result_columns() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+        run_simple(&mut client, "INSERT INTO account VALUES (1, 100)").await;
+
+        send_parse(&mut client, "", "SELECT id, balance FROM account", &[]).await;
+        // Per-column: id text, balance binary.
+        send_bind_raw(&mut client, "", "", &[], &[], &[FORMAT_TEXT, FORMAT_BINARY]).await;
+        send_describe(&mut client, b'P', "").await;
+        send_execute(&mut client, "", 0).await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        let rd = msgs
+            .iter()
+            .find(|(k, _)| *k == MSG_ROW_DESCRIPTION)
+            .unwrap();
+        assert_eq!(
+            parse_row_description_formats(&rd.1),
+            vec![FORMAT_TEXT, FORMAT_BINARY]
+        );
+        let dr = msgs.iter().find(|(k, _)| *k == MSG_DATA_ROW).unwrap();
+        assert_eq!(
+            parse_data_row(&dr.1),
+            vec![Some(b"1".to_vec()), Some(100i32.to_be_bytes().to_vec())],
+            "column 0 is text, column 1 is binary"
+        );
+        terminate(server, client).await;
+    }
+
+    /// A binary-format `INSERT` parameter is decoded under its declared type and
+    /// the row lands — the parameter half of the binary round-trip.
+    #[tokio::test]
+    async fn binary_parameters_insert_round_trips() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+
+        send_parse(
+            &mut client,
+            "",
+            "INSERT INTO account VALUES ($1, $2)",
+            &[OID_INT4, OID_INT4],
+        )
+        .await;
+        // Both parameters in binary (a single broadcast `1`), 4-byte big-endian.
+        send_bind_raw(
+            &mut client,
+            "",
+            "",
+            &[FORMAT_BINARY],
+            &[Some(&7i32.to_be_bytes()), Some(&700i32.to_be_bytes())],
+            &[],
+        )
+        .await;
+        send_execute(&mut client, "", 0).await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        assert_eq!(command_tag(&msgs.last().unwrap().1), "INSERT 0 1");
+
+        // The binary-bound values read back through the text path unchanged.
+        let rows = run_simple(&mut client, "SELECT id, balance FROM account").await;
+        assert_eq!(data_row_text(&rows), vec![vec!["7", "700"]]);
+        terminate(server, client).await;
+    }
+
+    /// A malformed binary parameter (an int4 of the wrong byte length) is the
+    /// Postgres `invalid_binary_representation` (`22P03`) error, and the connection
+    /// recovers at the next Sync.
+    #[tokio::test]
+    async fn malformed_binary_parameter_is_invalid_binary_representation() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+
+        send_parse(
+            &mut client,
+            "",
+            "INSERT INTO account VALUES ($1, $2)",
+            &[OID_INT4, OID_INT4],
+        )
+        .await;
+        // First parameter claims binary int4 but carries only 3 bytes.
+        send_bind_raw(
+            &mut client,
+            "",
+            "",
+            &[FORMAT_BINARY],
+            &[Some(&[0, 0, 1]), Some(&700i32.to_be_bytes())],
+            &[],
+        )
+        .await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        assert!(
+            error_has_sqlstate(&msgs, SQLSTATE_INVALID_BINARY_REPRESENTATION),
+            "ErrorResponse carries SQLSTATE 22P03"
+        );
+        terminate(server, client).await;
+    }
+
+    /// Whether the batch's `ErrorResponse` carries `sqlstate` (the `S`-prefixed
+    /// `C…` field is a NUL-delimited cstring in the payload).
+    fn error_has_sqlstate(msgs: &[(u8, Vec<u8>)], sqlstate: &str) -> bool {
+        msgs.iter().any(|(k, p)| {
+            *k == MSG_ERROR_RESPONSE && p.windows(sqlstate.len()).any(|w| w == sqlstate.as_bytes())
+        })
+    }
+
+    /// A parameter format code other than 0/1 is a protocol violation (`08P01`),
+    /// caught at Bind before any decode.
+    #[tokio::test]
+    async fn invalid_parameter_format_code_is_a_protocol_violation() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+
+        send_parse(
+            &mut client,
+            "",
+            "INSERT INTO account VALUES ($1, $2)",
+            &[OID_INT4, OID_INT4],
+        )
+        .await;
+        // Format code 2 is neither text (0) nor binary (1).
+        send_bind_raw(
+            &mut client,
+            "",
+            "",
+            &[2],
+            &[Some(&7i32.to_be_bytes()), Some(&700i32.to_be_bytes())],
+            &[],
+        )
+        .await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        assert!(
+            error_has_sqlstate(&msgs, SQLSTATE_PROTOCOL_VIOLATION),
+            "bad format code is 08P01: {msgs:?}"
+        );
+        terminate(server, client).await;
+    }
+
+    /// A result format-code array whose length is neither 0, 1, nor the column
+    /// count is a protocol violation (`08P01`), caught against the real column
+    /// count at Describe.
+    #[tokio::test]
+    async fn wrong_length_result_format_array_is_a_protocol_violation() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+        run_simple(&mut client, "INSERT INTO account VALUES (1, 100)").await;
+
+        send_parse(&mut client, "", "SELECT id, balance FROM account", &[]).await;
+        // Three result format codes for a two-column result.
+        send_bind_raw(
+            &mut client,
+            "",
+            "",
+            &[],
+            &[],
+            &[FORMAT_TEXT, FORMAT_BINARY, FORMAT_TEXT],
+        )
+        .await;
+        send_describe(&mut client, b'P', "").await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        assert!(
+            error_has_sqlstate(&msgs, SQLSTATE_PROTOCOL_VIOLATION),
+            "mismatched result-format count is 08P01: {msgs:?}"
         );
         terminate(server, client).await;
     }
