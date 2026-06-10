@@ -6,8 +6,10 @@
 //! deliberately stops short of wire serialization — turning a [`ScalarValue`]
 //! into the bytes a `DataRow` carries is the wire front end's job, and this is
 //! where it lives. The simple-query loop sends every value in **text format**
-//! (format code `0`); binary format rides in with Extended Query in v0.2, so
-//! there is exactly one rendering per type here.
+//! (format code `0`); the extended-query loop may negotiate **binary format**
+//! (format code `1`) per column / parameter, rendered by the sibling
+//! [`binary_format`](super::binary_format) module ([STL-183]). This module owns
+//! the text rendering — one per type.
 //!
 //! The contract is *bug-for-bug* Postgres text output, because the whole point
 //! of the wire protocol is that a stock `psql` / driver displays a Stele value

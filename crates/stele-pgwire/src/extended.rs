@@ -14,8 +14,11 @@
 //!
 //! A prepared statement carries `$1 … $n` placeholders, which `sqlparser` parses
 //! as [`Value::Placeholder`]. On `Bind`, each placeholder is replaced in-place
-//! with a literal [`Value`] built from the wire parameter's **text** bytes
-//! (binary format is [STL-77] \[G23\], not this ticket). The literal's *variant*
+//! with a literal [`Value`] built from the wire parameter's bytes. A
+//! **binary-format** parameter ([STL-183]) is first decoded under its declared
+//! type OID ([`binary_format::decode_binary`]) and re-rendered to the canonical
+//! text the equivalent text parameter would have carried, so both formats funnel
+//! through one literal-building path. The literal's *variant*
 //! is chosen so the column-directed binder folds it correctly — the binder wants
 //! a numeric literal for an `int` column, a string literal for `text`, a boolean
 //! for `bool` — keyed off the parameter type OID the client declared in `Parse`:
@@ -42,6 +45,8 @@ use stele_sql::Statement;
 use stele_sql::sqlparser::ast::{
     Expr, Query, SelectItem, SetExpr, Statement as SqlStatement, Value,
 };
+
+use crate::{binary_format, text_format};
 
 // ---------------------------------------------------------------------------
 // Decoded message bodies
@@ -235,15 +240,53 @@ pub(crate) enum ParamError {
 
     #[error("invalid input syntax for type boolean: {0:?}")]
     BadBool(String),
+
+    /// A binary-format parameter was sent without a declared type OID — there is
+    /// no text form to fall back on, so the type must be known to decode the bytes.
+    #[error("binary-format parameter has no declared type (OID 0)")]
+    BinaryUntyped,
+
+    /// A binary-format parameter's bytes did not decode under its declared type.
+    #[error(transparent)]
+    Binary(#[from] binary_format::BinaryError),
 }
 
-/// Build the AST literal a text-format wire parameter substitutes for, choosing
-/// the [`Value`] variant from the declared type `oid` (see the module docs).
-pub(crate) fn param_to_value(oid: u32, bytes: Option<&[u8]>) -> Result<Value, ParamError> {
+impl ParamError {
+    /// Whether this error came from the binary-format decode path — the caller
+    /// reports `invalid_binary_representation` (`22P03`) for these and
+    /// `invalid_text_representation` (`22P02`) for the rest.
+    pub(crate) const fn is_binary(&self) -> bool {
+        matches!(self, Self::BinaryUntyped | Self::Binary(_))
+    }
+}
+
+/// Build the AST literal a wire parameter substitutes for, choosing the [`Value`]
+/// variant from the declared type `oid` (see the module docs).
+///
+/// A `binary` parameter is decoded under its declared type
+/// ([`binary_format::decode_binary`]) and re-rendered to the canonical text form
+/// ([`text_format::encode_text`]), so a binary `int4` of `42` becomes the same
+/// `Value::Number("42")` a text `42` would, and the binder folds it identically.
+/// A binary parameter therefore requires a declared type — there is no text to
+/// infer from (`oid == 0` is [`ParamError::BinaryUntyped`]).
+pub(crate) fn param_to_value(
+    oid: u32,
+    binary: bool,
+    bytes: Option<&[u8]>,
+) -> Result<Value, ParamError> {
     let Some(bytes) = bytes else {
         return Ok(Value::Null);
     };
-    let text = std::str::from_utf8(bytes).map_err(|_| ParamError::NotUtf8)?;
+    // Both formats converge on `text`: text params are the bytes verbatim; binary
+    // params are decoded to a value and rendered to their canonical text.
+    let owned;
+    let text: &str = if binary {
+        let ty = LogicalType::from_pg_oid(oid).ok_or(ParamError::BinaryUntyped)?;
+        owned = text_format::encode_text(&binary_format::decode_binary(ty, bytes)?);
+        &owned
+    } else {
+        std::str::from_utf8(bytes).map_err(|_| ParamError::NotUtf8)?
+    };
     let value = match LogicalType::from_pg_oid(oid) {
         // The numeric types substitute as a numeric literal. `float8` ([STL-209])
         // has no column or DML codec yet, so a float8 param has nowhere to fold —
@@ -260,7 +303,7 @@ pub(crate) fn param_to_value(oid: u32, bytes: Option<&[u8]>) -> Result<Value, Pa
         // (zone offset → UTC) fold to a value, while the zone-less `timestamp` /
         // `date` / `period` have no DML codec yet and surface the binder's
         // documented "unsupported" error. Either way this layer never guesses a
-        // calendar/range encoding. (Binary-format params ride in with STL-183.)
+        // calendar/range encoding.
         Some(
             LogicalType::Text
             | LogicalType::Uuid
@@ -536,40 +579,99 @@ mod tests {
     fn oid_drives_the_literal_variant() {
         // int4 / int8 → numeric literal; text → string; bool → boolean.
         assert_eq!(
-            param_to_value(23, Some(b"42")),
+            param_to_value(23, false, Some(b"42")),
             Ok(Value::Number("42".to_owned(), false))
         );
         assert_eq!(
-            param_to_value(20, Some(b"-5")),
+            param_to_value(20, false, Some(b"-5")),
             Ok(Value::Number("-5".to_owned(), false))
         );
         assert_eq!(
-            param_to_value(25, Some(b"hi")),
+            param_to_value(25, false, Some(b"hi")),
             Ok(Value::SingleQuotedString("hi".to_owned()))
         );
-        assert_eq!(param_to_value(16, Some(b"t")), Ok(Value::Boolean(true)));
         assert_eq!(
-            param_to_value(16, Some(b"FALSE")),
+            param_to_value(16, false, Some(b"t")),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            param_to_value(16, false, Some(b"FALSE")),
             Ok(Value::Boolean(false))
         );
         assert_eq!(
-            param_to_value(16, Some(b"maybe")),
+            param_to_value(16, false, Some(b"maybe")),
             Err(ParamError::BadBool("maybe".to_owned()))
         );
         // NULL regardless of type.
-        assert_eq!(param_to_value(23, None), Ok(Value::Null));
+        assert_eq!(param_to_value(23, false, None), Ok(Value::Null));
     }
 
     #[test]
     fn unspecified_oid_infers_number_or_string() {
         assert_eq!(
-            param_to_value(0, Some(b"123")),
+            param_to_value(0, false, Some(b"123")),
             Ok(Value::Number("123".to_owned(), false))
         );
         assert_eq!(
-            param_to_value(0, Some(b"abc")),
+            param_to_value(0, false, Some(b"abc")),
             Ok(Value::SingleQuotedString("abc".to_owned()))
         );
+    }
+
+    #[test]
+    fn binary_parameter_decodes_to_the_same_literal_as_text() {
+        // A binary int4 of 42 folds to the same numeric literal as text "42".
+        assert_eq!(
+            param_to_value(23, true, Some(&42i32.to_be_bytes())),
+            Ok(Value::Number("42".to_owned(), false))
+        );
+        // A binary int8.
+        assert_eq!(
+            param_to_value(20, true, Some(&(-5i64).to_be_bytes())),
+            Ok(Value::Number("-5".to_owned(), false))
+        );
+        // A binary bool (one byte) folds via its canonical text "t" / "f".
+        assert_eq!(
+            param_to_value(16, true, Some(&[1])),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            param_to_value(16, true, Some(&[0])),
+            Ok(Value::Boolean(false))
+        );
+        // A binary uuid renders to its canonical text for the binder to fold.
+        let uuid = [
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ];
+        assert_eq!(
+            param_to_value(2950, true, Some(&uuid)),
+            Ok(Value::SingleQuotedString(
+                "550e8400-e29b-41d4-a716-446655440000".to_owned()
+            ))
+        );
+        // NULL is still the bytes-absent sentinel, regardless of format.
+        assert_eq!(param_to_value(23, true, None), Ok(Value::Null));
+    }
+
+    #[test]
+    fn binary_parameter_errors_surface_cleanly() {
+        // A binary parameter with no declared type cannot be decoded.
+        assert_eq!(
+            param_to_value(0, true, Some(&[0, 0, 0, 1])),
+            Err(ParamError::BinaryUntyped)
+        );
+        assert!(
+            param_to_value(0, true, Some(&[0, 0, 0, 1]))
+                .unwrap_err()
+                .is_binary()
+        );
+        // A binary int4 of the wrong length is an invalid-binary error.
+        let err = param_to_value(23, true, Some(&[0, 0, 1])).unwrap_err();
+        assert!(matches!(err, ParamError::Binary(_)));
+        assert!(err.is_binary());
+        // A text error is not classified as binary.
+        assert!(!ParamError::NotUtf8.is_binary());
     }
 
     #[test]
