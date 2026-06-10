@@ -236,32 +236,38 @@ pub struct Filter<C: Operator> {
     child: C,
     predicate: Expr,
     schema: Vec<LogicalType>,
+    /// The columns `predicate` references, ascending — computed once at
+    /// construction so each pull decodes only these and allocates no per-batch
+    /// reference set.
+    referenced: Vec<usize>,
 }
 
 impl<C: Operator> Filter<C> {
     /// Filter `child`'s batches by `predicate`, decoding referenced columns with
     /// `schema` (one [`LogicalType`] per child column, positional).
     #[must_use]
-    pub const fn new(child: C, predicate: Expr, schema: Vec<LogicalType>) -> Self {
+    pub fn new(child: C, predicate: Expr, schema: Vec<LogicalType>) -> Self {
+        let mut referenced = BTreeSet::new();
+        collect_columns(&predicate, &mut referenced);
         Self {
             child,
             predicate,
             schema,
+            referenced: referenced.into_iter().collect(),
         }
     }
 
     /// The row indices of `batch` the predicate keeps (its `TRUE` rows).
     fn kept_rows(&self, batch: &Batch) -> Result<Vec<usize>, ScanError> {
-        // Decode only the columns the predicate references — an unreferenced
-        // column (an opaque payload, a provenance scalar) is never touched, so a
-        // filter on one column does not force the whole batch through the bridge.
-        // Unreferenced slots hold an empty placeholder the evaluator never reads.
-        let mut referenced = BTreeSet::new();
-        collect_columns(&self.predicate, &mut referenced);
+        // Decode only the columns the predicate references (precomputed in
+        // `new`) — an unreferenced column (an opaque payload, a provenance
+        // scalar) is never touched, so a filter on one column does not force the
+        // whole batch through the bridge. Unreferenced slots hold an empty
+        // placeholder the evaluator never reads.
         let mut columns: Vec<Vector> = (0..batch.columns.len())
             .map(|_| Vector::Bool(Vec::new()))
             .collect();
-        for index in referenced {
+        for &index in &self.referenced {
             let (_, column) =
                 batch
                     .columns
@@ -274,9 +280,9 @@ impl<C: Operator> Filter<C> {
                 *self
                     .schema
                     .get(index)
-                    .ok_or(ScanError::Eval(ExprError::ColumnOutOfRange {
+                    .ok_or(ScanError::Eval(ExprError::ColumnTypeMissing {
                         index,
-                        columns: self.schema.len(),
+                        schema_len: self.schema.len(),
                     }))?;
             columns[index] = Vector::from_column(ty, column)?;
         }

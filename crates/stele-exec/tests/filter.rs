@@ -14,7 +14,7 @@
 //!   surviving row sets are identical, value columns and NULLs included.
 
 use stele_common::types::{LogicalType, ScalarValue};
-use stele_exec::{Batch, CmpOp, Column, Expr, Filter, Operator, ScanError};
+use stele_exec::{Batch, CmpOp, Column, Expr, ExprError, Filter, Operator, ScanError};
 use stele_storage::segment::ColumnId;
 
 // --- a queue-backed source operator ----------------------------------------
@@ -135,6 +135,35 @@ fn filter_passes_through_unreferenced_columns() {
     assert_eq!(out.columns[1].1, Column::Bytes(vec![Some(b"two".to_vec())]));
 }
 
+#[test]
+fn a_referenced_column_with_no_schema_type_is_a_distinct_error() {
+    // The predicate references column 1, but the schema gives only one type —
+    // a schema/type-vector gap, reported distinctly from a missing batch column.
+    let batch = Batch {
+        columns: vec![
+            (
+                ColumnId::BusinessKey,
+                Column::Bytes(vec![cell(&ScalarValue::Int4(1))]),
+            ),
+            (ColumnId::Payload, Column::Bytes(vec![Some(b"x".to_vec())])),
+        ],
+        rows: 1,
+    };
+    let predicate = Expr::col(1).compare(CmpOp::Eq, Expr::lit(ScalarValue::Int4(0)));
+    let mut filter = Filter::new(
+        VecSource::new(vec![batch]),
+        predicate,
+        vec![LogicalType::Int4],
+    );
+    match filter.next() {
+        Err(ScanError::Eval(ExprError::ColumnTypeMissing {
+            index: 1,
+            schema_len: 1,
+        })) => {}
+        other => panic!("expected ColumnTypeMissing, got {other:?}"),
+    }
+}
+
 // --- row-at-a-time equivalence (the second DoD bullet) ---------------------
 
 /// One test row: an int4 key plus a nullable int4 and a nullable text value
@@ -199,7 +228,10 @@ fn vectorized(rows: &[Row], column_index: usize, literal: &ScalarValue) -> Vec<i
             let bytes = c.as_ref().expect("a key is never null");
             match ScalarValue::decode(LogicalType::Int4, bytes).expect("decode key") {
                 ScalarValue::Int4(k) => keys.push(k),
-                other => panic!("key decoded as {other:?}"),
+                // Unreachable: an int4 column always decodes to int4. The arm
+                // names no value (a ScalarValue Debug trips CodeQL's
+                // cleartext-logging taint, and there is nothing to print here).
+                _ => panic!("key column did not decode as int4"),
             }
         }
     }

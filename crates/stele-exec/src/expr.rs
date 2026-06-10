@@ -273,10 +273,11 @@ impl Vector {
     /// Bridge a storage [`Column`] into the typed, nullable evaluation form,
     /// decoding by the column's `ty`.
     ///
-    /// A fixed-width [`Column::I64`] carries the i64-width logical types
-    /// directly; a [`Column::Bytes`] column decodes each present cell from the
-    /// canonical [`ScalarValue`] byte layout
-    /// ([`ScalarValue::decode`]) and a `None` cell stays NULL.
+    /// A fixed-width [`Column::I64`] is read as [`LogicalType::Int8`] directly —
+    /// the only i64-width type the evaluator reads from it at this scope (the
+    /// temporal i64 types are the STL-207 follow-up). A [`Column::Bytes`] column
+    /// decodes each present cell from the canonical [`ScalarValue`] byte layout
+    /// ([`ScalarValue::decode`]), and a `None` cell stays NULL.
     ///
     /// # Errors
     ///
@@ -285,7 +286,8 @@ impl Vector {
     /// a byte cell is not a valid encoding of `ty`.
     pub fn from_column(ty: LogicalType, column: &Column) -> Result<Self, ExprError> {
         match (ty, column) {
-            // i64-width logical types live in the fixed-width column directly.
+            // The fixed-width column carries `int8` directly (the only i64-width
+            // type read here at this scope; temporal i64 types are STL-207).
             (LogicalType::Int8, Column::I64(v)) => {
                 Ok(Self::Int8(v.iter().copied().map(Some).collect()))
             }
@@ -329,6 +331,19 @@ pub enum ExprError {
         index: usize,
         /// How many columns the batch actually has.
         columns: usize,
+    },
+
+    /// A referenced column has no entry in the filter's column-type schema —
+    /// the schema vector is shorter than the position the predicate names.
+    /// Distinct from [`ColumnOutOfRange`](Self::ColumnOutOfRange) (the *batch*
+    /// lacks the column): here the batch has it but no type was supplied to
+    /// decode it.
+    #[error("column {index} has no type in the filter schema of {schema_len} column(s)")]
+    ColumnTypeMissing {
+        /// The referenced index with no schema entry.
+        index: usize,
+        /// How many type entries the filter schema carries.
+        schema_len: usize,
     },
 
     /// A column's value count disagrees with the batch's row count.
