@@ -18,13 +18,18 @@
 //! buffered writes as a **single redo record group-committed with one fsync** in
 //! that DML WAL — the record boundary *is* the transaction boundary there, so the
 //! writes recover all-or-none — rather than by unifying the two logs under one
-//! format. Folding this commit-boundary log into that path (replaying commit
-//! records on restart to rebuild the manager's commit high-water mark, and binding
-//! the redo set to its commit record) remains future work; the
+//! format. Atomicity *across* a transaction's per-table WALs ([STL-215]) is in
+//! turn provided by a separate session-level commit-marker log
+//! ([ADR-0029], owned by `stele-engine`), not by this chain. Folding this
+//! commit-boundary log into either path — replaying commit records on restart to
+//! rebuild the manager's commit high-water mark, and binding the redo set to its
+//! commit record — remains future work (the tamper-evident audit side); the
 //! [`TxnManager`](crate::TxnManager)'s own recovery rebuilds its cursors from this
 //! chain ([`chain`](crate::chain)).
 //!
 //! [STL-192]: https://allegromusic.atlassian.net/browse/STL-192
+//! [STL-215]: https://allegromusic.atlassian.net/browse/STL-215
+//! [ADR-0029]: ../../../docs/adr/0029-cross-table-commit-marker.md
 //!
 //! ## Frame layout
 //!

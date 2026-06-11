@@ -49,6 +49,7 @@
 //! [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
 
 mod catalog_log;
+mod commit_log;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -82,7 +83,7 @@ use stele_sql::{
 };
 use stele_storage::backend::Disk;
 use stele_storage::delta::{BusinessKey, Snapshot};
-use stele_storage::dml::DmlOutcome;
+use stele_storage::dml::{CommittedTxns, DmlOutcome};
 use stele_storage::engine::{Engine, EngineError as StorageError};
 use stele_storage::segment::{ColumnId, Predicate, ZoneBound};
 use stele_storage::validtime::{ValidInterval, unframe_payload};
@@ -545,6 +546,16 @@ pub enum EngineError {
     #[error("catalog log: {0}")]
     CatalogLog(#[source] io::Error),
 
+    /// The durable commit-marker log ([STL-215]) could not be appended (the
+    /// multi-table `COMMIT` is refused — its per-table legs were made durable but
+    /// the marker that vouches them was not, so recovery discards them and the
+    /// transaction is all-or-none = none) or replayed at recovery (the log could
+    /// not be read, or an acknowledged marker is corrupt — recovery fails closed).
+    ///
+    /// [STL-215]: https://allegromusic.atlassian.net/browse/STL-215
+    #[error("commit log: {0}")]
+    CommitLog(#[source] io::Error),
+
     /// Executing the snapshot scan failed.
     #[error(transparent)]
     Scan(#[from] ScanError),
@@ -718,11 +729,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     ///    schema-version chains — so an `AS OF` read in the past still resolves
     ///    the schema live *then*, across restarts — and the `SchemaId`
     ///    allocation order, exactly.
-    /// 2. **Reopen every recorded namespace** through [`Engine::recover`]
+    /// 2. **Reopen every recorded namespace** through
+    ///    [`Engine::recover_with_commits`](stele_storage::engine::Engine::recover_with_commits)
     ///    (segment checksums + checkpoint + WAL tail replay, [STL-102]/
     ///    [STL-177]) — dropped names included: their retained history must keep
     ///    answering `AS OF` reads, and a re-create must reuse the same tier so
-    ///    that history is neither duplicated nor orphaned.
+    ///    that history is neither duplicated nor orphaned. The replayed
+    ///    **commit-marker log** ([STL-215]) gates each table's two-phase legs: a
+    ///    multi-table transaction's writes are replayed only if its marker is
+    ///    durable, so a crash between the per-table commits and the marker recovers
+    ///    the transaction all-or-none across every table.
     /// 3. **Reposition the allocators.** The shared commit clock's high-water
     ///    mark is raised past every recovered commit instant and DDL instant —
     ///    without this, the default read snapshot would sit at the origin and a
@@ -739,16 +755,24 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// [STL-102]: https://allegromusic.atlassian.net/browse/STL-102
     /// [STL-177]: https://allegromusic.atlassian.net/browse/STL-177
     /// [STL-210]: https://allegromusic.atlassian.net/browse/STL-210
+    /// [STL-215]: https://allegromusic.atlassian.net/browse/STL-215
     /// [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
     ///
     /// # Errors
     ///
     /// [`EngineError::CatalogLog`] if the catalog log cannot be read or holds a
-    /// corrupt acknowledged record; [`EngineError::Catalog`] if replaying a
-    /// record is refused (a log/catalog invariant break — fails closed);
-    /// [`EngineError::Storage`] if a table's tiers cannot be recovered.
+    /// corrupt acknowledged record; [`EngineError::CommitLog`] if the commit-marker
+    /// log cannot be read or holds a corrupt acknowledged marker; [`EngineError::Catalog`]
+    /// if replaying a record is refused (a log/catalog invariant break — fails
+    /// closed); [`EngineError::Storage`] if a table's tiers cannot be recovered.
     pub fn recover(disk: D, clock: C) -> Result<Self, EngineError> {
         let records = catalog_log::replay(&disk).map_err(EngineError::CatalogLog)?;
+        // The transactions whose multi-table commit marker is durable ([STL-215]):
+        // recovery replays a table's two-phase leg only if its transaction committed,
+        // so a crash between the per-table commits and the marker recovers the whole
+        // transaction all-or-none across every table it wrote.
+        let committed =
+            CommittedTxns::Only(commit_log::replay(&disk).map_err(EngineError::CommitLog)?);
         let clock = MonotonicClock::new(clock);
 
         // 1. Rebuild the catalog by replaying the DDL history, tracking per
@@ -787,7 +811,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let mut max_txn_id = 0u64;
         for (name, (namespace, valid_time)) in tiers {
             let tier_disk = NamespacedDisk::new(disk.clone(), namespace);
-            let engine = Engine::recover(tier_disk, clock.clone(), valid_time)?;
+            let engine =
+                Engine::recover_with_commits(tier_disk, clock.clone(), valid_time, &committed)?;
             let marks = engine.recovery_marks()?;
             max_commit = max_commit.max(marks.max_commit);
             max_txn_id = max_txn_id.max(marks.max_txn_id);
@@ -2056,26 +2081,28 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
     /// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
     ///
-    /// ## Crash-atomic group commit ([STL-192])
+    /// ## Crash-atomic group commit ([STL-192], [STL-215])
     ///
     /// The buffered writes are not replayed one WAL record at a time. Each table the
     /// transaction touches is put in **group-commit** mode
     /// ([`Engine::begin_group`](stele_storage::engine::Engine::begin_group)): its
     /// writes apply to the delta/index in staged order (so a later write sees an
-    /// earlier one) but their redos accumulate, and a single
-    /// [`commit_group`](stele_storage::engine::Engine::commit_group) then writes the
-    /// whole table's portion as **one** WAL record group-committed with **one** fsync
-    /// — the only durability point (invariant 2). That record is the atomic unit:
-    /// recovery replays it whole or, if a crash tears it, drops it at the durable
-    /// fence — so the transaction's writes recover all-or-none, never a partial
-    /// prefix. If applying a write fails, every touched table's buffer is discarded
-    /// ([`abort_group`](stele_storage::engine::Engine::abort_group)) so nothing is
-    /// made durable.
+    /// earlier one) but their redos accumulate into one WAL record per table — the
+    /// atomic unit recovery replays whole or, if a crash tears it, drops at the
+    /// durable fence. If applying a write fails, every touched table's buffer is
+    /// discarded ([`abort_group`](stele_storage::engine::Engine::abort_group)) so
+    /// nothing is made durable.
     ///
-    /// A transaction spanning **multiple tables** writes one record + one fsync *per
-    /// table* (each table owns its WAL), so each table's portion is crash-atomic;
-    /// cross-table all-or-none would need a transaction commit marker across the
-    /// per-table logs and is a follow-up.
+    /// A **single-table** transaction commits that one record with a single fsync —
+    /// the record boundary *is* the transaction boundary, so it recovers all-or-none
+    /// with no extra coordination. A transaction spanning **multiple tables** writes
+    /// one record per table (each table owns its WAL), so a crash *between* two
+    /// tables' commits could otherwise leave one durable and the other not. To make
+    /// the whole transaction atomic, each table's record is committed as a
+    /// **two-phase** leg ([STL-215]) — durable but inert — and a single commit marker
+    /// naming the transaction is fsynced to the engine commit log only after every
+    /// leg is durable. Recovery replays a leg only if that marker is present, so the
+    /// transaction recovers all-or-none across **every** table it wrote.
     ///
     /// # Errors
     ///
@@ -2115,7 +2142,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // touched so they can be group-committed (success) or discarded (failure).
         let mut touched: Vec<String> = Vec::new();
         let result = match self.apply_group(writes, txn_id, &principal, &mut touched) {
-            Ok(()) => self.finish_group_commit(&touched),
+            Ok(()) => self.finish_group_commit(txn_id, &touched),
             Err(e) => {
                 // Discard every buffered (un-logged) write so nothing is made durable
                 // and no table is left stuck in group-commit mode.
@@ -2134,23 +2161,58 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         result
     }
 
-    /// Group-commit every `touched` table — one WAL record + one fsync each — and
-    /// report the first failure, if any ([`commit`](Self::commit), [STL-192]).
+    /// Durably commit every `touched` table, atomically across **all** of them
+    /// ([`commit`](Self::commit), [STL-215]).
     ///
-    /// Every touched table is taken out of group-commit mode here: the ones up to a
-    /// failure are committed (durable), and any after it are discarded
+    /// **Single-table (or empty) fast path.** With at most one table touched, that
+    /// table's group-commit record boundary is already the transaction's atomic
+    /// commit point ([STL-192]), so it takes the plain
+    /// [`commit_group`](stele_storage::engine::Engine::commit_group) — one WAL
+    /// record + one fsync, no marker. This keeps the common case at exactly one
+    /// fsync per `COMMIT`.
+    ///
+    /// **Multi-table two-phase path.** Across several tables a single record per
+    /// table is *not* atomic — a crash between two tables' commits would leave one
+    /// durable and the other not. So each table's writes are committed as a
+    /// **two-phase** record ([`commit_group_two_phase`](stele_storage::engine::Engine::commit_group_two_phase)),
+    /// durable but inert, and once **every** leg is durable a single commit marker
+    /// naming `txn_id` is fsynced to the engine commit log. That marker's fsync is
+    /// the commit point: on recovery a leg is replayed only if the marker is present
+    /// ([`recover`](Self::recover)), so a crash *before* the marker discards every
+    /// leg and the transaction recovers all-or-none across tables.
+    ///
+    /// On a mid-sequence failure no marker is written, so the transaction is durably
+    /// uncommitted (recovery discards whatever legs reached disk); the remaining
+    /// tables' buffers are discarded
     /// ([`abort_group`](stele_storage::engine::Engine::abort_group)) so none is left
-    /// buffering — which would otherwise silently swallow a later auto-commit write.
-    /// A mid-sequence failure can thus leave earlier tables durable and later ones
-    /// not — the cross-table atomicity limitation noted on [`commit`](Self::commit).
+    /// buffering. The already-applied in-memory tier state is not rolled back here
+    /// ([STL-216]).
     ///
-    /// One caveat on the failing table: if its `commit_group` failed *after* the WAL
-    /// append (a failed fsync, not a torn write), its staged record's durability is
-    /// indeterminate — returning `Err` reports the commit as failed, but the record
-    /// may still flush on a later `tick`. Per the WAL contract that case is a crash,
-    /// not a clean abort; enforcing it (poisoning the engine on fsync failure) is
-    /// [STL-217].
-    fn finish_group_commit(&mut self, touched: &[String]) -> Result<(), EngineError> {
+    /// One caveat on a failing leg: if its commit failed *after* the WAL append (a
+    /// failed fsync, not a torn write), its staged record's durability is
+    /// indeterminate — and likewise a marker append that succeeds but whose fsync
+    /// fails. Per the WAL contract those are crashes, not clean aborts; enforcing it
+    /// (poisoning the engine on fsync failure) is [STL-217].
+    ///
+    /// [STL-215]: https://allegromusic.atlassian.net/browse/STL-215
+    fn finish_group_commit(
+        &mut self,
+        txn_id: TxnId,
+        touched: &[String],
+    ) -> Result<(), EngineError> {
+        // Fast path: zero or one table — no cross-table coordination needed, so the
+        // plain single-record commit stands as the atomic boundary (one fsync, no
+        // marker). Recovery applies a plain record unconditionally.
+        if touched.len() <= 1 {
+            if let Some(table) = touched.first() {
+                if let Ok(state) = self.table_mut(table) {
+                    state.engine.commit_group()?;
+                }
+            }
+            return Ok(());
+        }
+
+        // Multi-table: make every leg durable as a two-phase record first.
         let mut error: Option<EngineError> = None;
         for table in touched {
             let Ok(state) = self.table_mut(table) else {
@@ -2158,11 +2220,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             };
             if error.is_some() {
                 state.engine.abort_group();
-            } else if let Err(e) = state.engine.commit_group() {
+            } else if let Err(e) = state.engine.commit_group_two_phase(txn_id) {
                 error = Some(EngineError::from(e));
             }
         }
-        error.map_or(Ok(()), Err)
+        if let Some(e) = error {
+            // A leg failed: no marker, so recovery discards every leg — all-or-none.
+            return Err(e);
+        }
+
+        // Every per-table leg is durable; the marker's fsync is the commit point.
+        commit_log::append(&self.disk, txn_id).map_err(EngineError::CommitLog)?;
+        Ok(())
     }
 
     /// Apply a transaction's buffered writes into per-table group-commit buffers, in
@@ -6061,6 +6130,252 @@ mod tests {
             "the AS OF read answers as the live session did"
         );
         assert_eq!(live_as_of, vec![vec![i4(1), i4(100)]]);
+    }
+
+    // ---- cross-table crash-atomic commit (STL-215) ----
+    //
+    // A multi-table COMMIT makes each table's writes a durable-but-inert two-phase
+    // record, then fsyncs one commit marker after every leg is durable. On recovery
+    // a leg is replayed only if its marker is present, so a crash between the
+    // per-table commits and the marker recovers the whole transaction all-or-none
+    // across every table. A single-table COMMIT skips the marker (one fsync). The
+    // cross-table coordination lives in `SessionEngine`, which stele-sim cannot
+    // depend on (the per-table sims cover the storage half), so the seed-reproducible
+    // crash coverage is this in-process FaultDisk/MemDisk sweep — the same pattern
+    // STL-210 used for session-level kill coverage.
+
+    /// Create two system-versioned tables `a` and `b`, then auto-commit a baseline
+    /// row into each (a plain WAL record per table — always durable on recovery).
+    fn two_tables_with_baseline(engine: &mut SessionEngine<ZeroClock, MemDisk>) {
+        for ddl in [
+            "CREATE TABLE a (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE b (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+        ] {
+            engine.execute(&parse_one(ddl)).expect("create");
+        }
+        engine
+            .execute(&parse_one("INSERT INTO a VALUES (1, 100)"))
+            .expect("a baseline");
+        engine
+            .execute(&parse_one("INSERT INTO b VALUES (1, 10)"))
+            .expect("b baseline");
+    }
+
+    /// Stage and commit a two-table transaction inserting `id = 2` into both tables.
+    fn commit_two_table_txn(
+        engine: &mut SessionEngine<ZeroClock, MemDisk>,
+    ) -> Result<(), EngineError> {
+        let mut txn = engine.begin();
+        engine
+            .stage_dml(&parse_one("INSERT INTO a VALUES (2, 200)"), &mut txn)
+            .expect("stage a");
+        engine
+            .stage_dml(&parse_one("INSERT INTO b VALUES (2, 20)"), &mut txn)
+            .expect("stage b");
+        engine.commit(txn)
+    }
+
+    /// The sorted `id` cells of every current row in `table`.
+    fn ids(engine: &mut SessionEngine<ZeroClock, MemDisk>, table: &str) -> Vec<Option<Vec<u8>>> {
+        sorted(select(engine, &format!("SELECT id FROM {table}")).rows)
+            .into_iter()
+            .map(|mut row| row.remove(0))
+            .collect()
+    }
+
+    #[test]
+    fn a_multi_table_commit_is_durable_when_its_marker_lands() {
+        // The happy path: every leg and the marker reach disk, so after a restart
+        // both tables show the transaction's row.
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        two_tables_with_baseline(&mut engine);
+        commit_two_table_txn(&mut engine).expect("commit");
+        // A multi-table commit is not the fast path: it writes a marker.
+        assert!(
+            disk.open(crate::commit_log::COMMIT_LOG_FILENAME).is_ok(),
+            "a multi-table commit writes a commit marker",
+        );
+        drop(engine);
+
+        let mut engine = recover_session(&disk);
+        assert_eq!(
+            ids(&mut engine, "a"),
+            vec![i4(1), i4(2)],
+            "a recovers both rows",
+        );
+        assert_eq!(
+            ids(&mut engine, "b"),
+            vec![i4(1), i4(2)],
+            "b recovers both rows",
+        );
+    }
+
+    #[test]
+    fn a_lost_commit_marker_discards_every_table_leg() {
+        // The crash STL-215 closes: every per-table leg reached disk, but the marker
+        // that vouches them did not (modelled by removing it). Recovery must discard
+        // *both* legs — all-or-none = none — not leave one table's write durable (the
+        // partial commit the per-table-WAL design would otherwise allow).
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        two_tables_with_baseline(&mut engine);
+        commit_two_table_txn(&mut engine).expect("commit");
+        drop(engine);
+
+        // The marker's fsync never completed: drop it, keeping every leg on disk.
+        disk.remove(crate::commit_log::COMMIT_LOG_FILENAME)
+            .expect("remove marker");
+
+        let mut engine = recover_session(&disk);
+        assert_eq!(
+            ids(&mut engine, "a"),
+            vec![i4(1)],
+            "a's two-phase leg is discarded without the marker — only the baseline survives",
+        );
+        assert_eq!(
+            ids(&mut engine, "b"),
+            vec![i4(1)],
+            "b's leg is discarded too — the transaction recovers all-or-none = none",
+        );
+    }
+
+    #[test]
+    fn a_torn_commit_marker_is_ignored_on_recovery() {
+        // A marker whose append was sheared by a crash (a partial trailing frame) is
+        // not acknowledged, so the transaction recovers as uncommitted.
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        two_tables_with_baseline(&mut engine);
+        commit_two_table_txn(&mut engine).expect("commit");
+        drop(engine);
+
+        // Re-write the marker file truncated to a partial frame (MemDisk files are
+        // append-only, so rebuild it with the shear).
+        let name = crate::commit_log::COMMIT_LOG_FILENAME;
+        let file = disk.open(name).expect("open marker");
+        let len = usize::try_from(file.len()).expect("small file");
+        let mut bytes = vec![0u8; len];
+        file.read_at(0, &mut bytes).expect("read");
+        disk.remove(name).expect("remove");
+        let mut torn = disk.create(name).expect("create");
+        torn.append(&bytes[..len - 3]).expect("append torn");
+
+        let mut engine = recover_session(&disk);
+        assert_eq!(
+            ids(&mut engine, "a"),
+            vec![i4(1)],
+            "a torn marker leaves a's leg uncommitted",
+        );
+        assert_eq!(
+            ids(&mut engine, "b"),
+            vec![i4(1)],
+            "a torn marker leaves b's leg uncommitted",
+        );
+    }
+
+    #[test]
+    fn the_single_table_fast_path_writes_no_commit_marker() {
+        // A single-table COMMIT keeps the STL-192 fast path: one record + one fsync,
+        // no marker (the DoD's "single-table fast path keeps one fsync per COMMIT").
+        // Observable proxy: no commit-marker file is created, and the writes recover.
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create account");
+        let mut txn = engine.begin();
+        engine
+            .stage_dml(&parse_one("INSERT INTO account VALUES (1, 100)"), &mut txn)
+            .expect("stage 1");
+        engine
+            .stage_dml(&parse_one("INSERT INTO account VALUES (2, 200)"), &mut txn)
+            .expect("stage 2");
+        engine.commit(txn).expect("commit");
+        assert!(
+            matches!(
+                disk.open(crate::commit_log::COMMIT_LOG_FILENAME),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound,
+            ),
+            "a single-table commit writes no commit marker",
+        );
+        drop(engine);
+
+        let mut engine = recover_session(&disk);
+        assert_eq!(
+            ids(&mut engine, "account"),
+            vec![i4(1), i4(2)],
+            "the single-table commit recovers whole",
+        );
+    }
+
+    #[test]
+    fn a_multi_table_commit_under_injected_faults_recovers_all_or_none() {
+        // Seed-reproducible: across crash models — a lost marker, an fsync fault on
+        // the first leg, an append fault on the first leg, and a clean commit — a
+        // multi-table commit never recovers a partial subset. Either both tables show
+        // the transaction's row (marker durable) or neither does (marker absent);
+        // never one. A fixed seed always drives the same model, so a failure
+        // reproduces exactly.
+        for seed in 0..48u64 {
+            let disk = MemDisk::new();
+            let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+            two_tables_with_baseline(&mut engine);
+
+            let model = seed % 4;
+            let expect_committed = match model {
+                // All legs + marker durable, then the marker is lost.
+                0 => {
+                    commit_two_table_txn(&mut engine).expect("commit");
+                    disk.remove(crate::commit_log::COMMIT_LOG_FILENAME)
+                        .expect("remove marker");
+                    false
+                }
+                // The first leg's fsync fails — commit aborts before the marker.
+                1 => {
+                    disk.faults()
+                        .schedule(FaultOp::Sync, std::io::ErrorKind::Other);
+                    assert!(
+                        commit_two_table_txn(&mut engine).is_err(),
+                        "seed {seed}: an fsync fault must fail the commit",
+                    );
+                    false
+                }
+                // The first leg's append fails — nothing of the txn is durable.
+                2 => {
+                    disk.faults()
+                        .schedule(FaultOp::Append, std::io::ErrorKind::Other);
+                    assert!(
+                        commit_two_table_txn(&mut engine).is_err(),
+                        "seed {seed}: an append fault must fail the commit",
+                    );
+                    false
+                }
+                // A clean commit: the marker lands, the transaction is durable.
+                _ => {
+                    commit_two_table_txn(&mut engine).expect("commit");
+                    true
+                }
+            };
+            drop(engine);
+
+            let mut engine = recover_session(&disk);
+            let a = ids(&mut engine, "a");
+            let b = ids(&mut engine, "b");
+            if expect_committed {
+                assert_eq!(a, vec![i4(1), i4(2)], "seed {seed}: a committed whole");
+                assert_eq!(b, vec![i4(1), i4(2)], "seed {seed}: b committed whole");
+            } else {
+                assert_eq!(
+                    a,
+                    vec![i4(1)],
+                    "seed {seed} (model {model}): a recovers baseline only",
+                );
+                assert_eq!(
+                    b,
+                    vec![i4(1)],
+                    "seed {seed} (model {model}): b recovers baseline only — never a partial subset",
+                );
+            }
+        }
     }
 
     // ---- manual flush / checkpoint (STL-195) ----
