@@ -347,18 +347,21 @@ struct Seed {
 
 /// Apply one seed's random `INSERT`/`UPDATE`/`DELETE` history to a valid-time
 /// table **entirely over SQL**, mirroring each committed op into the DuckDB model
-/// at the engine's own commit tick. Half the seeds (a coin flip on the seed's own
-/// RNG) then **seal the whole delta into segments before any read**, so the grid
-/// resolves either entirely from the delta tier or entirely from sealed segments —
-/// exercising both halves of the SnapshotScan read path through the SQL surface.
-/// `duck` is wiped before use.
+/// at the engine's own commit tick. `duck` is wiped before use.
 ///
-/// The seal happens *after* the last write, never between writes: a mid-history
-/// flush followed by a valid-time `UPDATE` trips a real engine bug (the
-/// read-modify-write reads the prior version back from a sealed segment unframed
-/// but tries to strip the interval prefix anyway — `RowCodecError::TrailingBytes`),
-/// filed as STL-226. Once that lands, this oracle can flush mid-history and cover
-/// the *mixed* delta+sealed read too.
+/// Each seed picks one of three seal schedules (a `rng.range(3)` draw), so the
+/// sweep covers every tier regime the SnapshotScan read path can face:
+///   * **delta-only** — never seal; every read resolves from the delta tier.
+///   * **fully sealed** — seal the whole delta once *after* the last write; every
+///     read resolves from sealed segments.
+///   * **mixed** — seal *between* writes (a 1-in-3 per-op draw), so a prior version lands
+///     in a sealed segment and a later valid-time `UPDATE` reads it back from
+///     there. That read-modify-write across the tier boundary is the path STL-226
+///     fixed: a sealed prior version stores its payload bare (the interval rides
+///     its own `valid_from`/`valid_to` columns), so the RMW must not strip a
+///     framed prefix that is only present on a delta row. Before the fix this seed
+///     tripped `RowCodecError::TrailingBytes`, which is why the seal used to be
+///     restricted to end-of-history.
 fn run_seed(seed: u64, duck: &DuckModel) -> Seed {
     duck.reset();
     let mut rng = Rng::new(seed);
@@ -374,6 +377,10 @@ fn run_seed(seed: u64, duck: &DuckModel) -> Seed {
     let mut alive = vec![false; KEY_POOL as usize];
     let mut hi = create_c;
     let mut dml_ops = 0u64;
+
+    // This seed's seal schedule (see the function note): 0 = delta-only, 1 = seal
+    // once after the last write, 2 = seal between writes mid-history.
+    let seal_mode = rng.range(3);
 
     let ops = 16 + rng.range(32);
     for op in 0..ops {
@@ -428,12 +435,19 @@ fn run_seed(seed: u64, duck: &DuckModel) -> Seed {
             hi = hi.max(c);
         }
         dml_ops += 1;
+
+        // Mixed schedule: seal between writes on a 1-in-3 per-op draw, so a prior
+        // version lands in a sealed segment and a later UPDATE/DELETE of that key
+        // reads it back across the tier boundary (STL-226). A seal on an empty
+        // delta is an idempotent no-op, so a draw right after a seal is harmless.
+        if seal_mode == 2 && rng.range(3) == 0 {
+            engine.flush().expect("seal the delta mid-history");
+        }
     }
 
-    // Once the whole history is written, half the seeds seal it so the grid reads
-    // resolve from sealed segments rather than the delta (see the note above on why
-    // this is end-of-history, not interleaved).
-    if rng.range(2) == 0 {
+    // Fully-sealed schedule: seal the whole delta once after the last write so the
+    // grid resolves entirely from sealed segments.
+    if seal_mode == 1 {
         engine.flush().expect("seal the delta into segments");
     }
 
