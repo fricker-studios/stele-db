@@ -974,6 +974,21 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         &self.catalog
     }
 
+    /// The commit clock's current high-water mark — the system instant the most
+    /// recently committed write was stamped with, and the default read snapshot
+    /// ([`MonotonicClock::current`]). After a single auto-committed
+    /// [`execute`](Self::execute) of an `INSERT` / `UPDATE` / `DELETE`, this is
+    /// exactly that statement's commit instant (the engine assigns commit time
+    /// internally, so a caller cannot otherwise observe it). The differential
+    /// correctness oracle uses it to align an independent reference's timeline with
+    /// the engine's own commit ticks ([STL-167]).
+    ///
+    /// [STL-167]: https://allegromusic.atlassian.net/browse/STL-167
+    #[must_use]
+    pub fn commit_clock(&self) -> SystemTimeMicros {
+        self.clock.current()
+    }
+
     /// The live tables and their columns at the current read snapshot.
     ///
     /// "Live" means the catalog resolves the name at the commit clock's current
