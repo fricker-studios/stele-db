@@ -86,7 +86,7 @@ pub use parser::parse;
 pub use select::{
     AsOfError, BindContext, BoundJoin, BoundJoinSide, BoundPeriod, BoundPeriodPredicate,
     BoundPredicate, BoundSelect, JoinColumnRef, JoinType, PeriodEndpoint, Projection, SelectError,
-    bind_select, resolve_as_of,
+    bind_select, resolve_as_of, without_filter,
 };
 pub use types::logical_type;
 

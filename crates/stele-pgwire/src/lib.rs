@@ -237,6 +237,27 @@ pub trait SessionHandle: Send {
     /// `pg_catalog` `\d` shim — see [`SessionEngine::describe_live_tables`].
     fn describe_live_tables(&self) -> Vec<TableDescription>;
 
+    /// Resolve a prepared statement's `RowDescription` columns without running it,
+    /// for statement-level `Describe` at the current committed snapshot — see
+    /// [`SessionEngine::describe`] ([STL-212]). `None` for a statement that returns
+    /// no rows.
+    ///
+    /// [STL-212]: https://allegromusic.atlassian.net/browse/STL-212
+    fn describe(&self, stmt: &Statement)
+    -> Result<Option<Vec<(String, LogicalType)>>, EngineError>;
+
+    /// As [`describe`](Self::describe), but resolving at an open transaction's
+    /// pinned snapshot — see [`SessionEngine::describe_in_txn`]. The statement-arm
+    /// of `Describe` uses this inside a `BEGIN` block so the advertised shape
+    /// matches the rows the portal `Execute` returns ([STL-175]).
+    ///
+    /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+    fn describe_in_txn(
+        &self,
+        stmt: &Statement,
+        txn: &SessionTransaction,
+    ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError>;
+
     /// Open a multi-statement transaction, **pinning its read snapshot now** — see
     /// [`SessionEngine::begin`] ([STL-174], [STL-175]).
     ///
@@ -283,6 +304,21 @@ where
 
     fn describe_live_tables(&self) -> Vec<TableDescription> {
         Self::describe_live_tables(self)
+    }
+
+    fn describe(
+        &self,
+        stmt: &Statement,
+    ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError> {
+        Self::describe(self, stmt)
+    }
+
+    fn describe_in_txn(
+        &self,
+        stmt: &Statement,
+        txn: &SessionTransaction,
+    ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError> {
+        Self::describe_in_txn(self, stmt, txn)
     }
 
     fn begin(&self) -> SessionTransaction {
@@ -1904,9 +1940,56 @@ async fn handle_bind(
     Ok(())
 }
 
+/// Resolve a prepared statement's result columns for statement-level `Describe`
+/// ('S'), mirroring the row-returning dispatch of [`returns_rows`] /
+/// [`execute_stmt`] but **without running anything**: a `pg_catalog` introspection
+/// query and a constant `SELECT` have a fixed shape, and a table `SELECT`'s columns
+/// come from the engine's parameter-free describe ([`SessionHandle::describe`],
+/// STL-212). Returns `None` for a statement that produces no result columns
+/// (DDL / DML / admin), which the caller answers with `NoData`.
+///
+/// Unlike the portal arm this never executes the read — tokio-postgres / JDBC
+/// issue `Describe('S')` at prepare time, before any `Bind`, so there are no
+/// parameter values to run with; the column shape does not need them.
+///
+/// `txn` selects the snapshot the engine resolves the shape at: an open `BEGIN`
+/// block's pinned snapshot (so the description agrees with the rows the portal
+/// `Execute` later returns under snapshot isolation), else the current committed
+/// one — mirroring [`run_query`]'s dispatch.
+fn describe_statement_columns(
+    session: &SharedSession,
+    stmt: &Statement,
+    txn: &ConnTxn,
+) -> Result<Option<Vec<ResultColumn>>, ExecError> {
+    if let Some(intro) = pg_catalog::classify(stmt) {
+        return Ok(Some(introspection_reply(&intro, session).0));
+    }
+    if let Some(columns) = constant_select(stmt) {
+        return Ok(Some(columns.iter().map(|c| field(&c.name, c.ty)).collect()));
+    }
+    let described = {
+        let engine = session.lock().unwrap_or_else(PoisonError::into_inner);
+        match txn {
+            // Inside a transaction block — open or aborted ([STL-205] retains the
+            // pinned snapshot on `Failed`) — describe at the block's pinned snapshot
+            // so the shape agrees with the rows a portal `Execute` would read.
+            ConnTxn::Active(buffered) | ConnTxn::Failed(buffered) => {
+                engine.describe_in_txn(stmt, buffered)
+            }
+            // No transaction open: describe against committed state.
+            ConnTxn::Idle => engine.describe(stmt),
+        }
+    }
+    .map_err(|e| ExecError {
+        sqlstate: sqlstate_for_query(&e),
+        message: e.to_string(),
+    })?;
+    Ok(described.map(|cols| cols.iter().map(|(name, ty)| field(name, *ty)).collect()))
+}
+
 /// `Describe` ('D'): report the shape of a prepared statement (its parameter
-/// types, then `NoData`) or a portal (its `RowDescription`, or `NoData` for a
-/// write / empty portal).
+/// types, then its `RowDescription` — or `NoData` for a non-row statement) or a
+/// portal (its `RowDescription`, or `NoData` for a write / empty portal).
 async fn handle_describe(
     stream: &mut TcpStream,
     state: &mut ConnState,
@@ -1924,12 +2007,30 @@ async fn handle_describe(
                 return fail_extended(stream, state, SQLSTATE_INVALID_PSTATEMENT_NAME, &m).await;
             };
             let oids = prepared.param_oids.clone();
+            // Clone the statement so the prepared-cache borrow is released before we
+            // resolve its shape (which may lock the session) and write the wire reply.
+            let stmt = prepared.stmt.clone();
+            // Resolve the row shape *before* writing anything, so a describe failure
+            // (e.g. an unknown table) surfaces as a clean `ErrorResponse` rather
+            // than a `ParameterDescription` followed by an error. An empty-query
+            // statement (`None`) has no rows.
+            let header = match &stmt {
+                None => None,
+                Some(stmt) => match describe_statement_columns(session, stmt, txn) {
+                    Ok(header) => header,
+                    Err(e) => return fail_extended(stream, state, e.sqlstate, &e.message).await,
+                },
+            };
             write_parameter_description(stream, &oids).await?;
-            // The row shape of an unbound statement needs its parameters resolved;
-            // we report NoData and surface the real RowDescription from a
-            // Describe-portal after Bind. Statement-level row description (the
-            // tokio-postgres / JDBC prepared-SELECT path) is the STL-212 follow-up.
-            write_no_data(stream).await?;
+            // The tokio-postgres / JDBC prepared-SELECT path (STL-212): a
+            // row-returning statement reports its `RowDescription` so the driver
+            // builds its result-column list; everything else reports `NoData`. The
+            // per-column result formats are negotiated later, in `Bind`, so the
+            // statement-level description advertises text (the empty `formats`).
+            match header {
+                Some(header) => write_row_description(stream, &header, &[]).await?,
+                None => write_no_data(stream).await?,
+            }
             Ok(())
         }
         extended::Target::Portal(name) => {
@@ -4054,17 +4155,19 @@ mod tests {
         terminate(server, client).await;
     }
 
-    /// Describe on a *statement* reports its parameter types (`ParameterDescription`)
-    /// followed by `NoData` (statement-level row description is deferred).
+    /// Describe on a *statement* reports its parameter types
+    /// (`ParameterDescription`) then the real `RowDescription` of a row-returning
+    /// prepared `SELECT` — the tokio-postgres / JDBC prepared-SELECT path
+    /// (STL-212). The row shape is resolved with the `$1` parameter still unbound.
     #[tokio::test]
-    async fn describe_statement_reports_parameter_types() {
+    async fn describe_statement_reports_parameter_types_and_row_description() {
         let (server, mut client) = connect_past_handshake().await;
         run_simple(&mut client, CREATE_ACCOUNT).await;
 
         send_parse(
             &mut client,
             "s",
-            "SELECT id FROM account WHERE id = $1",
+            "SELECT id, balance FROM account WHERE id = $1",
             &[OID_INT4],
         )
         .await;
@@ -4080,7 +4183,63 @@ mod tests {
             u32::from_be_bytes(msgs[1].1[2..6].try_into().unwrap()),
             OID_INT4
         );
+        // The statement-level RowDescription names the projected columns, resolved
+        // without the parameter bound — the loop STL-183's oracle stood in for.
+        assert_eq!(msgs[2].0, MSG_ROW_DESCRIPTION);
+        assert_eq!(
+            parse_row_description_names(&msgs[2].1),
+            vec!["id", "balance"]
+        );
+        terminate(server, client).await;
+    }
+
+    /// Describe on a statement that returns no rows (a DML `INSERT`) still reports
+    /// its parameter types, then `NoData` — there is no result-set to describe.
+    #[tokio::test]
+    async fn describe_statement_without_rows_is_no_data() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+
+        send_parse(
+            &mut client,
+            "ins",
+            "INSERT INTO account VALUES ($1, $2)",
+            &[OID_INT4, OID_INT4],
+        )
+        .await;
+        send_describe(&mut client, b'S', "ins").await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        assert_eq!(msgs[0].0, MSG_PARSE_COMPLETE);
+        assert_eq!(msgs[1].0, MSG_PARAMETER_DESCRIPTION);
         assert_eq!(msgs[2].0, MSG_NO_DATA);
+        terminate(server, client).await;
+    }
+
+    /// Statement-level Describe inside an open `BEGIN` block resolves the shape at
+    /// the transaction's pinned snapshot (not the current one) and still returns the
+    /// RowDescription — exercising the in-transaction dispatch (STL-212 / STL-175).
+    #[tokio::test]
+    async fn describe_statement_inside_a_transaction_returns_row_description() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+        run_simple(&mut client, "BEGIN").await;
+
+        send_parse(&mut client, "s", "SELECT id, balance FROM account", &[]).await;
+        send_describe(&mut client, b'S', "s").await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        assert_eq!(msgs[0].0, MSG_PARSE_COMPLETE);
+        assert_eq!(msgs[1].0, MSG_PARAMETER_DESCRIPTION);
+        assert_eq!(msgs[2].0, MSG_ROW_DESCRIPTION);
+        assert_eq!(
+            parse_row_description_names(&msgs[2].1),
+            vec!["id", "balance"]
+        );
+
+        run_simple(&mut client, "COMMIT").await;
         terminate(server, client).await;
     }
 
