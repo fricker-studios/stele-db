@@ -324,7 +324,7 @@ pub enum Vector {
 impl Vector {
     /// The number of cells.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         match self {
             Self::Bool(v) => v.len(),
             Self::Int4(v) | Self::Date(v) => v.len(),
@@ -339,7 +339,7 @@ impl Vector {
 
     /// Whether the vector has no cells.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 

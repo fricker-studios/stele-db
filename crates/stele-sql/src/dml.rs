@@ -641,16 +641,16 @@ fn bind_update(update: &Update, ctx: &BindContext) -> Result<BoundDml, DmlError>
 
     // The end bound defaults to an open period when the SET omits it — synthesize
     // the cell so the row codec payload and the framed interval agree.
-    if let Some(period) = period {
-        if to.is_none() {
-            if let Some(to_idx) = value_cols
-                .iter()
-                .position(|c| c.name() == period.to_column())
-            {
-                assignments.push((to_idx, Some(ScalarValue::Timestamp(VALID_TIME_OPEN.0))));
-            }
-            to = Some(VALID_TIME_OPEN.0);
+    if let Some(period) = period
+        && to.is_none()
+    {
+        if let Some(to_idx) = value_cols
+            .iter()
+            .position(|c| c.name() == period.to_column())
+        {
+            assignments.push((to_idx, Some(ScalarValue::Timestamp(VALID_TIME_OPEN.0))));
         }
+        to = Some(VALID_TIME_OPEN.0);
     }
     let valid = build_interval(&table, period, from, to)?;
 

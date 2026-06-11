@@ -1304,7 +1304,7 @@ fn locate(locator: &BTreeMap<VersionId, (usize, usize)>, v: &Version) -> (usize,
 /// The number of values in a [`ColumnData`], independent of its element type —
 /// used to assert a late-materialized column agrees with the segment's identity
 /// row count before any row is indexed.
-fn column_len(data: &ColumnData) -> usize {
+const fn column_len(data: &ColumnData) -> usize {
     match data {
         ColumnData::Bytes(v) => v.len(),
         ColumnData::NullableBytes(v) => v.len(),

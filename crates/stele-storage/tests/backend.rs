@@ -40,7 +40,7 @@ impl TempDir {
                 std::env::temp_dir().join(format!("stele-backend-{}-{n}", std::process::id()));
             match std::fs::create_dir(&path) {
                 Ok(()) => return Self { path },
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(e) => panic!("create temp dir: {e}"),
             }
         }

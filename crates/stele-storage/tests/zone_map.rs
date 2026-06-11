@@ -370,7 +370,7 @@ fn zone_map_records_per_column_min_max() {
 /// (ADR-0010): every seed replays the same workload bit-for-bit.
 struct Lcg(u64);
 impl Lcg {
-    fn next_u64(&mut self) -> u64 {
+    const fn next_u64(&mut self) -> u64 {
         // Numerical Recipes constants.
         self.0 = self
             .0
@@ -378,7 +378,7 @@ impl Lcg {
             .wrapping_add(1_442_695_040_888_963_407);
         self.0
     }
-    fn below(&mut self, n: u64) -> u64 {
+    const fn below(&mut self, n: u64) -> u64 {
         self.next_u64() % n
     }
 }

@@ -910,15 +910,15 @@ fn zone_map_from_metas<'a>(metas: impl IntoIterator<Item = &'a ColumnChunkMeta>)
             // open end dominates: `Unbounded` is −∞ for a min (least) and +∞ for
             // a max (greatest). Concrete ends compare same-variant — every chunk
             // for one column shares that column's type.
-            if let Some(m) = &c.stat_min {
-                if end_is_smaller(m, min.as_ref()) {
-                    min = Some(m.clone());
-                }
+            if let Some(m) = &c.stat_min
+                && end_is_smaller(m, min.as_ref())
+            {
+                min = Some(m.clone());
             }
-            if let Some(m) = &c.stat_max {
-                if end_is_larger(m, max.as_ref()) {
-                    max = Some(m.clone());
-                }
+            if let Some(m) = &c.stat_max
+                && end_is_larger(m, max.as_ref())
+            {
+                max = Some(m.clone());
             }
         }
         (col, min, max)

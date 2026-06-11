@@ -566,12 +566,12 @@ pub fn recover_replay<D: Disk, I: Disk>(
             Err(other) => return Err(other.into()),
         };
         let (txn_id, redo_bytes) = split_record(&payload)?;
-        if let Some(txn_id) = txn_id {
-            if !committed.admits(txn_id) {
-                // A multi-table leg whose commit marker never became durable —
-                // discard it so the transaction recovers all-or-none (STL-215).
-                continue;
-            }
+        if let Some(txn_id) = txn_id
+            && !committed.admits(txn_id)
+        {
+            // A multi-table leg whose commit marker never became durable —
+            // discard it so the transaction recovers all-or-none (STL-215).
+            continue;
         }
         let redos = decode_redo(redo_bytes)?;
         applied += redos.len();
@@ -790,7 +790,7 @@ mod tests {
             ),
         });
 
-        let record = encode_redo(&[retract.clone()]).expect("encode");
+        let record = encode_redo(std::slice::from_ref(&retract)).expect("encode");
         let decoded = decode_redo(&record).expect("decode");
         assert_eq!(decoded, vec![retract]);
         // The tag must be the retract tag — not the close tag — so the two are

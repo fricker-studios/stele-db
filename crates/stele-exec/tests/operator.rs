@@ -305,8 +305,8 @@ fn slice_shares_the_backing_cells_instead_of_copying() {
 
     // The window's cells are the very same memory as the original's — a slice
     // is a refcount bump over the shared buffer, not a copy of the cells…
-    assert!(std::ptr::eq(&all[1], &sliced[0]));
-    assert!(std::ptr::eq(&all[2], &sliced[1]));
+    assert!(std::ptr::eq(&raw const all[1], &raw const sliced[0]));
+    assert!(std::ptr::eq(&raw const all[2], &raw const sliced[1]));
     // …so a cell's payload bytes stay the same heap allocation, byte pointer
     // and all (a deep copy would re-allocate them).
     assert_eq!(
@@ -331,7 +331,7 @@ fn clone_shares_the_backing_cells_instead_of_copying() {
     let (Column::I64(a), Column::I64(b)) = (&col, &copy) else {
         unreachable!()
     };
-    assert!(std::ptr::eq(&a[0], &b[0]));
+    assert!(std::ptr::eq(&raw const a[0], &raw const b[0]));
 }
 
 #[test]

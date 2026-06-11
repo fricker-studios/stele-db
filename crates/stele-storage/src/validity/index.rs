@@ -584,7 +584,7 @@ impl<D: Disk> ValidityIndex<D> {
     /// Number of live spill files — the read path uses it to choose between a
     /// per-key probe and a full [`Self::materialize`] sweep.
     #[must_use]
-    pub fn spill_count(&self) -> usize {
+    pub const fn spill_count(&self) -> usize {
         self.live_spills.len()
     }
 

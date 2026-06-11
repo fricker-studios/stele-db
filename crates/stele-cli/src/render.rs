@@ -247,6 +247,7 @@ fn json_value(col: &Column, cell: Option<&str>) -> String {
 
 /// Minimal JSON string escaping (quotes, backslash, control characters).
 fn json_string(text: &str) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
     for c in text.chars() {
@@ -256,7 +257,10 @@ fn json_string(text: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => {
+                // Writing to a `String` is infallible.
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             c => out.push(c),
         }
     }

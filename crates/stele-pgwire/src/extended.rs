@@ -432,10 +432,10 @@ fn count_set_expr(set: &SetExpr, required: &mut usize) {
 fn count_expr(expr: &Expr, required: &mut usize) {
     match expr {
         Expr::Value(vws) => {
-            if let Value::Placeholder(name) = &vws.value {
-                if let Some(index) = placeholder_index(name) {
-                    *required = (*required).max(index);
-                }
+            if let Value::Placeholder(name) = &vws.value
+                && let Some(index) = placeholder_index(name)
+            {
+                *required = (*required).max(index);
             }
         }
         Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => count_expr(expr, required),

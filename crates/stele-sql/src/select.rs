@@ -317,7 +317,7 @@ pub enum AggregateFunc {
 impl AggregateFunc {
     /// The aggregate a function name denotes (case-insensitive), or `None` if the
     /// name is not one of the core aggregates.
-    fn from_name(name: &str) -> Option<Self> {
+    const fn from_name(name: &str) -> Option<Self> {
         Some(match () {
             () if name.eq_ignore_ascii_case("count") => Self::Count,
             () if name.eq_ignore_ascii_case("sum") => Self::Sum,
@@ -1331,7 +1331,7 @@ struct TableRef<'a> {
 
 /// Extract the (unqualified) table name and optional alias of a join relation.
 /// A subquery, table function, or schema-qualified name is rejected.
-fn table_ref(factor: &TableFactor) -> Result<TableRef, SelectError> {
+fn table_ref(factor: &TableFactor) -> Result<TableRef<'_>, SelectError> {
     let TableFactor::Table { name, alias, .. } = factor else {
         return Err(SelectError::UnsupportedJoin(
             "a non-table relation (subquery / derived table) in a JOIN".to_owned(),

@@ -34,7 +34,7 @@ If that works on a fresh clone, the dev environment is doing its job.
 
 | Tool | Version source | Purpose |
 |---|---|---|
-| **Rust** | `rust-toolchain.toml` (edition 2024, ≥ 1.85) | The compiler. Auto-installed by rustup on first `cargo` invocation. |
+| **Rust** | `rust-toolchain.toml` (edition 2024, ≥ 1.89) | The compiler. Auto-installed by rustup on first `cargo` invocation. |
 | **Cargo** | bundled with Rust | Build/test/run; workspace. |
 | **rustfmt, clippy** | pinned via toolchain components | Format + lint (match CI). |
 | **cargo-nextest** | pinned in `bootstrap` | Fast, reliable test runner. |
@@ -47,7 +47,7 @@ If that works on a fresh clone, the dev environment is doing its job.
 ```toml
 # rust-toolchain.toml
 [toolchain]
-channel    = "1.85.0"          # bumped deliberately; also Stele's MSRV
+channel    = "1.89.0"          # bumped deliberately; also Stele's MSRV
 components = ["rustfmt", "clippy", "rust-src"]
 profile    = "minimal"
 ```
@@ -184,7 +184,7 @@ The single blessed way to run Stele without a Rust toolchain. Multi-stage, minim
 
 ```dockerfile
 # docker/Dockerfile
-FROM rust:1.85-slim AS build
+FROM rust:1.89-slim AS build
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p stele-server -p stele-cli

@@ -132,7 +132,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
-        with: { toolchain: "1.85.0" }            # pinned MSRV; bump deliberately
+        with: { toolchain: "1.89.0" }            # pinned MSRV; bump deliberately
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-features
 

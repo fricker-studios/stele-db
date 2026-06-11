@@ -80,24 +80,21 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.cmd {
         Cmd::Server(s) => {
-            let cfg = match s.config {
+            let cfg = if let Some(path) = s.config {
                 // The file owns configuration; `--listen` still overrides the
                 // full listen address (host + port). `--dev` has no effect here.
-                Some(path) => {
-                    let mut cfg = stele_server::Config::load(path)?;
-                    if let Some(addr) = s.listen {
-                        cfg.listen = addr;
-                    }
-                    cfg
+                let mut cfg = stele_server::Config::load(path)?;
+                if let Some(addr) = s.listen {
+                    cfg.listen = addr;
                 }
-                None => {
-                    let mut cfg = stele_server::Config::dev();
-                    if let Some(addr) = s.listen {
-                        cfg.listen = addr;
-                    }
-                    cfg.dev = s.dev;
-                    cfg
+                cfg
+            } else {
+                let mut cfg = stele_server::Config::dev();
+                if let Some(addr) = s.listen {
+                    cfg.listen = addr;
                 }
+                cfg.dev = s.dev;
+                cfg
             };
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()

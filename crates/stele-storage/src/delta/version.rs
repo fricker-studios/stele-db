@@ -171,7 +171,7 @@ pub struct Version {
 }
 
 impl Version {
-    /// Build an **open** (unresolved) version: `sys_to = `[`SYSTEM_TIME_OPEN`],
+    /// Build an **open** (unresolved) version: <code>sys_to = [SYSTEM_TIME_OPEN]</code>,
     /// `closed_by = None`. The shape every raw decode / segment read produces;
     /// the validity-index overlay supplies the end at read time.
     #[must_use]
@@ -290,7 +290,7 @@ impl Version {
     /// number of bytes consumed. Callers that read concatenated records (e.g.
     /// spill reload) drive a loop on the returned cursor.
     ///
-    /// The decoded version is **open** (`sys_to = `[`SYSTEM_TIME_OPEN`],
+    /// The decoded version is **open** (<code>sys_to = [SYSTEM_TIME_OPEN]</code>,
     /// `closed_by = None`): the frame carries no end, so resolution is left to
     /// the validity-index overlay ([ADR-0023]).
     ///

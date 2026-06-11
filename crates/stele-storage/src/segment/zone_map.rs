@@ -202,10 +202,10 @@ impl ZoneMap {
             // `sys_from` is a fixed-width i64 column — its bounds are always
             // concrete (only bounded-prefix *bytes* columns ever go open), so a
             // non-`Value` min here is not reachable and simply skips the prune.
-            if let ZoneEnd::Value(ZoneBound::I64(min_sys_from)) = &zone.min {
-                if SystemTimeMicros(*min_sys_from) > s {
-                    return false;
-                }
+            if let ZoneEnd::Value(ZoneBound::I64(min_sys_from)) = &zone.min
+                && SystemTimeMicros(*min_sys_from) > s
+            {
+                return false;
             }
         }
         true

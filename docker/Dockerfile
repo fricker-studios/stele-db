@@ -4,9 +4,9 @@
 #
 # Multi-stage: a full Rust toolchain builds the release binaries, then they are
 # copied into a distroless runtime — no shell, no package manager, minimal attack
-# surface. The build stage pins Rust 1.85 (== rust-toolchain.toml / the MSRV).
+# surface. The build stage pins Rust 1.89 (== rust-toolchain.toml / the MSRV).
 
-FROM rust:1.85-slim AS build
+FROM rust:1.89-slim AS build
 WORKDIR /src
 COPY . .
 # `--locked` builds the committed Cargo.lock exactly, so the image is

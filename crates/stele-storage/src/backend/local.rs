@@ -70,10 +70,10 @@ impl Disk for LocalDisk {
         let mut names = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
-            if entry.file_type()?.is_file() {
-                if let Some(name) = entry.file_name().to_str() {
-                    names.push(name.to_owned());
-                }
+            if entry.file_type()?.is_file()
+                && let Some(name) = entry.file_name().to_str()
+            {
+                names.push(name.to_owned());
             }
         }
         Ok(names)
