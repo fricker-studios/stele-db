@@ -1660,6 +1660,153 @@ pub fn run_wal_fsync_poison_seed(seed: u64) -> u64 {
     digest
 }
 
+/// In-memory rollback of a group commit that fails partway ([STL-216]).
+///
+/// A multi-statement transaction applies its writes front-to-back into the live
+/// delta/index, then a later write fails (here a duplicate-key `INSERT`), so the
+/// transaction aborts. The live engine must then show **none** of the
+/// transaction's writes — exactly the committed baseline — identical to what a
+/// restart reconstructs from the log (the aborted group logged no record).
+///
+/// The seed varies the baseline, the successful prefix (updates/deletes of live
+/// keys plus inserts of brand-new keys), and the chosen victim key, so the abort
+/// rolls back every redo flavour. The property checked is the triple equality
+/// `live-before-group == live-after-abort == recovered`, read by `as_of` at a
+/// fixed instant — the recovery-equivalence the rollback owes, with no disk fault
+/// involved (a fsync fault is a crash, not a clean abort — [STL-217]).
+///
+/// # Panics
+///
+/// Panics (seed in the message) if any of the three observable states diverge —
+/// the live engine kept an aborted transaction's writes, or recovery disagreed.
+#[must_use]
+#[allow(clippy::too_many_lines)] // baseline + chained txn + abort + recover reads as one scenario
+pub fn run_group_commit_abort_rollback_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+
+    let mut rng = Rng::new(seed);
+    let principal = Principal::new(b"sim".to_vec());
+
+    // A handful of baseline keys, all inserted live, plus a disjoint pool of
+    // brand-new keys the transaction inserts (and the abort must roll back).
+    let base_count = 2 + rng.below_usize(4);
+    let base_keys: Vec<BusinessKey> = (0..base_count)
+        .map(|i| BusinessKey::new(format!("base-{i:04}").into_bytes()))
+        .collect();
+    let new_count = 1 + rng.below_usize(3);
+    let new_keys: Vec<BusinessKey> = (0..new_count)
+        .map(|i| BusinessKey::new(format!("new-{i:04}").into_bytes()))
+        .collect();
+    // Every key the fingerprint observes, baseline then brand-new.
+    let all_keys: Vec<BusinessKey> = base_keys.iter().chain(&new_keys).cloned().collect();
+
+    let disk = FaultDisk::new(seed, FaultProfile::none());
+    let mut engine = Engine::open(disk.clone(), StepClock::new(1), false).expect("open engine");
+
+    // Commit the baseline (auto-commit, one record each), tracking the latest
+    // commit instant so the fingerprint reads the live tail of every chain.
+    let mut live_at = SystemTimeMicros(0);
+    for key in &base_keys {
+        let payload = format!("base-v-{}", String::from_utf8_lossy(key.as_bytes())).into_bytes();
+        let outcome = engine
+            .insert(
+                key.clone(),
+                None,
+                Some(payload),
+                0,
+                TxnId(1),
+                principal.clone(),
+            )
+            .expect("baseline insert");
+        live_at = live_at.max(outcome.commit);
+    }
+    engine.checkpoint().expect("baseline checkpoint");
+
+    // Read at a fixed instant past the baseline — the version live at `probe` for
+    // every key. `base-0` is reserved as the doomed victim and never touched by the
+    // successful prefix, so it stays live for the duplicate-key INSERT below.
+    let probe = Snapshot(live_at);
+    let fingerprint = |engine: &Engine<StepClock, FaultDisk>| -> Vec<Option<Vec<u8>>> {
+        all_keys
+            .iter()
+            .map(|key| engine.as_of_payload(key, probe).expect("as_of").flatten())
+            .collect()
+    };
+    let baseline_fp = fingerprint(&engine);
+
+    // A multi-statement transaction: a successful prefix over `base-1..` and the
+    // brand-new keys, then a duplicate-key INSERT of the still-live `base-0` that
+    // fails at apply time and aborts the whole COMMIT.
+    engine.begin_group();
+    let txn = TxnId(2);
+    for key in &base_keys[1..] {
+        let payload = format!("txn-v-{}", String::from_utf8_lossy(key.as_bytes())).into_bytes();
+        let res = if rng.below(2) == 0 {
+            engine.delete(key, txn, principal.clone())
+        } else {
+            engine.update(key.clone(), None, Some(payload), 0, txn, principal.clone())
+        };
+        res.expect("successful update/delete of a live key");
+    }
+    for key in &new_keys {
+        engine
+            .insert(
+                key.clone(),
+                None,
+                Some(b"txn-new".to_vec()),
+                0,
+                txn,
+                principal.clone(),
+            )
+            .expect("successful insert of a brand-new key");
+    }
+    // The doomed write: `base-0` is live, so re-inserting it is a duplicate key.
+    assert!(
+        engine
+            .insert(
+                base_keys[0].clone(),
+                None,
+                Some(b"dup".to_vec()),
+                0,
+                txn,
+                principal
+            )
+            .is_err(),
+        "seed {seed}: re-inserting a live key must fail the COMMIT",
+    );
+    engine.abort_group();
+
+    // The live engine shows none of the aborted transaction's writes.
+    let after_abort_fp = fingerprint(&engine);
+    assert_eq!(
+        after_abort_fp, baseline_fp,
+        "seed {seed}: a failed COMMIT left writes visible in the live engine",
+    );
+
+    // … and that matches a fresh recovery from the same disk (the aborted group
+    // logged no record, so recovery reconstructs the baseline alone).
+    drop(engine);
+    let recovered =
+        Engine::recover(disk, StepClock::new(1_000_000), false).expect("recover after abort");
+    let recovered_fp = fingerprint(&recovered);
+    assert_eq!(
+        recovered_fp, baseline_fp,
+        "seed {seed}: recovery diverged from the rolled-back live state",
+    );
+
+    let mut digest = FNV_OFFSET;
+    for entry in &baseline_fp {
+        match entry {
+            Some(payload) => {
+                digest = fnv1a(digest, &[1]);
+                digest = fnv1a(digest, payload);
+            }
+            None => digest = fnv1a(digest, &[0]),
+        }
+    }
+    digest
+}
+
 /// Close any open version of `key` at `commit`, then open a fresh `[commit, +∞)`
 /// version — the version a committed writer stages with the manager-assigned
 /// commit timestamp as its `sys_from`. Keeps exactly one open version per key, so
@@ -2662,6 +2809,10 @@ pub fn registry() -> Vec<Box<dyn Scenario>> {
             run_group_commit_recover_faults_seed,
         ),
         FnScenario::fault("wal-fsync-poison", run_wal_fsync_poison_seed),
+        FnScenario::boxed(
+            "group-commit-abort-rollback",
+            run_group_commit_abort_rollback_seed,
+        ),
         FnScenario::boxed("schedule", run_schedule_seed_digest),
         FnScenario::fault("fault-disk", run_fault_seed),
     ]

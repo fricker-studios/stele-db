@@ -565,10 +565,13 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     }
 
     /// Discard the open group buffer without logging it — the transaction aborted
-    /// ([`DmlWriter::abort_group`], [STL-192]). The applied (non-durable) delta/index
-    /// state is rebuilt from the log on recovery, so the aborted writes do not survive.
+    /// ([`DmlWriter::abort_group`], [STL-192], [STL-216]). The buffered writes were
+    /// applied to the delta/index as they were staged, so this **rolls them back in
+    /// place**: with no WAL record the aborted writes are never durable, and undoing
+    /// them in memory leaves the live engine matching what a crash recovery would
+    /// reconstruct — none of the transaction's writes — without a restart.
     pub fn abort_group(&mut self) {
-        self.writer.abort_group();
+        self.writer.abort_group(&mut self.delta, &mut self.index);
     }
 
     /// Whether the engine's WAL is **poisoned** — a prior fsync

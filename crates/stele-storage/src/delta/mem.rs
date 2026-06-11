@@ -50,6 +50,33 @@ impl MemTier {
         self.byte_size = self.byte_size.saturating_add(added);
     }
 
+    /// Remove the version `(business_key, sys_from, seq)` if present, returning
+    /// `true` when one was removed. The byte counter is decremented by the removed
+    /// row's contribution and an emptied chain is dropped so range scans stay tight.
+    ///
+    /// This is the in-memory inverse of [`insert`](Self::insert): it undoes a
+    /// version an aborted group-commit transaction staged ([STL-216]). Removing a
+    /// version that is not present is a no-op (`false`) — undo never has to assume
+    /// the row is still resident.
+    pub(super) fn remove(
+        &mut self,
+        business_key: &BusinessKey,
+        sys_from: SystemTimeMicros,
+        seq: u64,
+    ) -> bool {
+        let Some(chain) = self.rows.get_mut(business_key) else {
+            return false;
+        };
+        let Some(removed) = chain.remove(&(sys_from, seq)) else {
+            return false;
+        };
+        self.byte_size = self.byte_size.saturating_sub(removed.encoded_size() as u64);
+        if chain.is_empty() {
+            self.rows.remove(business_key);
+        }
+        true
+    }
+
     /// Total encoded bytes currently held in memory.
     pub(super) const fn byte_size(&self) -> u64 {
         self.byte_size

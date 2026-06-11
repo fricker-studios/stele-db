@@ -661,6 +661,78 @@ pub(crate) fn apply<D: Disk, I: Disk>(
     Ok(())
 }
 
+/// Apply a resolved redo set **resident** — identical to [`apply`] but the
+/// versions and closes never spill to disk ([STL-216]).
+///
+/// This is the group-commit apply step ([`crate::dml::DmlWriter`]): a
+/// multi-statement transaction's writes apply to the delta/index as they go (so a
+/// later write resolves against an earlier one), but they stay in memory so the
+/// whole set can be rolled back with [`undo`] if the commit aborts before its WAL
+/// record is durable — a spilled row/close is on disk and not removable in place.
+/// The deferred spill is harmless: resident bytes are a soft bound and the next
+/// auto-commit [`apply`] reconciles the over-threshold tier.
+///
+/// # Errors
+///
+/// As [`apply`]: [`SysTimeError::Delta`] from a delta apply; [`SysTimeError::Validity`]
+/// from an index close (e.g. a write-once conflict).
+pub(crate) fn apply_resident<D: Disk, I: Disk>(
+    delta: &mut Delta<D>,
+    index: &mut ValidityIndex<I>,
+    redos: Vec<Redo>,
+) -> Result<(), SysTimeError> {
+    for redo in redos {
+        match redo {
+            Redo::Insert(version) => delta.insert_resident(version)?,
+            Redo::Close(close) => index.insert_close_resident(close)?,
+            Redo::Retract(close) => {
+                index.insert_close_resident(close.clone())?;
+                delta.stage_retraction(close);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Undo a redo set previously staged with [`apply_resident`] — the in-memory
+/// inverse of [`apply`] ([STL-216]).
+///
+/// Reverses each entry by its `(business_key, sys_from, seq)`: an [`Redo::Insert`]
+/// removes the staged version, a [`Redo::Close`] removes the materialized close
+/// (re-opening the version it ended), and a [`Redo::Retract`] removes both its
+/// tombstone and its close. The set is the group-commit buffer ([`crate::dml`]) —
+/// every redo the transaction *staged*, which the writer records before applying —
+/// so removing each entry by key restores the tiers to their pre-transaction
+/// state, identical to what a crash (which finds no durable record for the aborted
+/// transaction) reconstructs on recovery.
+///
+/// Infallible, and tolerant of a redo whose entry is **not** resident — it is
+/// simply skipped. That covers a statement that failed *after* a partial apply
+/// (an `UPDATE`'s close materialized but its over-large new version was rejected):
+/// the buffer holds both redos, [`undo`] removes the close that landed and no-ops
+/// the version that did not. Apply order does not matter — each entry is keyed
+/// independently — but the set is walked in reverse for symmetry with [`apply`].
+pub(crate) fn undo<D: Disk, I: Disk>(
+    delta: &mut Delta<D>,
+    index: &mut ValidityIndex<I>,
+    redos: Vec<Redo>,
+) {
+    for redo in redos.into_iter().rev() {
+        match redo {
+            Redo::Insert(version) => {
+                delta.remove_version(&version.business_key, version.sys_from, version.seq);
+            }
+            Redo::Close(close) => {
+                index.remove_close(&close.business_key, close.sys_from, close.seq);
+            }
+            Redo::Retract(close) => {
+                delta.remove_retraction(&close.business_key, close.sys_from, close.seq);
+                index.remove_close(&close.business_key, close.sys_from, close.seq);
+            }
+        }
+    }
+}
+
 /// Build the [`Close`] that materializes `prior`'s end at `commit`, stamping the
 /// closing transaction's provenance.
 ///

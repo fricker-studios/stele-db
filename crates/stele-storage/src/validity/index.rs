@@ -355,6 +355,28 @@ impl<D: Disk> ValidityIndex<D> {
     /// [`ValidityError::TooLarge`] / [`ValidityError::Corrupt`] / [`ValidityError::Io`]
     /// from the encode/spill path.
     pub fn insert_close(&mut self, close: Close) -> Result<(), ValidityError> {
+        self.insert_close_inner(close, true)
+    }
+
+    /// Materialize a close **without spilling**, keeping it resident regardless of
+    /// the byte threshold — otherwise identical to [`insert_close`](Self::insert_close)
+    /// (same write-once contract) ([STL-216]).
+    ///
+    /// The group-commit apply path uses this so every close a multi-statement
+    /// transaction materializes stays in the in-memory map until the transaction
+    /// resolves; an aborted commit then rolls back with
+    /// [`remove_close`](Self::remove_close) (a spilled close is on disk and not
+    /// removable in place). Like the delta tier's
+    /// [`insert_resident`](crate::delta::Delta::insert_resident), the deferred spill
+    /// is harmless: resident bytes are a soft bound and the next spilling
+    /// [`insert_close`](Self::insert_close) reconciles the tier.
+    pub fn insert_close_resident(&mut self, close: Close) -> Result<(), ValidityError> {
+        self.insert_close_inner(close, false)
+    }
+
+    /// Shared body of [`insert_close`](Self::insert_close) (spilling) and
+    /// [`insert_close_resident`](Self::insert_close_resident) (never spills).
+    fn insert_close_inner(&mut self, close: Close, allow_spill: bool) -> Result<(), ValidityError> {
         close.check_encodable()?;
         if let Some(existing) = self.close_of(&close.business_key, close.sys_from, close.seq)? {
             return if existing == close.interval() {
@@ -365,7 +387,7 @@ impl<D: Disk> ValidityIndex<D> {
         }
         let incoming = close.encoded_size() as u64;
         let projected = self.byte_size.saturating_add(incoming);
-        if projected > self.config.spill_threshold_bytes && !self.mem.is_empty() {
+        if allow_spill && projected > self.config.spill_threshold_bytes && !self.mem.is_empty() {
             self.spill_in_memory()?;
         }
         self.byte_size = self.byte_size.saturating_add(incoming);
@@ -383,6 +405,44 @@ impl<D: Disk> ValidityIndex<D> {
             ClosedInterval { sys_to, closed_by },
         );
         Ok(())
+    }
+
+    /// Remove the resident close materialized for version `(business_key, sys_from,
+    /// seq)`, returning `true` if one was removed — the inverse of
+    /// [`insert_close_resident`](Self::insert_close_resident) used to roll an
+    /// aborted group-commit transaction's closes back out of the live index
+    /// ([STL-216]).
+    ///
+    /// Only the in-memory map is touched: group closes are materialized with
+    /// [`insert_close_resident`](Self::insert_close_resident) and so never spill, so
+    /// every close an aborted transaction staged is still resident here. A spill
+    /// file is never rewritten (it is append-only); removing a close that is not
+    /// resident is a no-op. Re-opening the version (dropping its end) is exactly
+    /// what undoing a supersession/deletion requires — the version the close
+    /// referred to was either re-staged by the same transaction (and removed
+    /// alongside) or a prior committed version that this transaction's close turned
+    /// from open to closed, so dropping the close restores it to open.
+    pub fn remove_close(
+        &mut self,
+        business_key: &BusinessKey,
+        sys_from: SystemTimeMicros,
+        seq: u64,
+    ) -> bool {
+        let Some(interval) = self.mem.remove(&(business_key.clone(), sys_from, seq)) else {
+            return false;
+        };
+        // Mirror the byte accounting `insert_close_inner` added — recompute the
+        // removed close's encoded size from its parts (the same formula
+        // `Close::encoded_size` uses: header + key bytes + principal bytes).
+        let removed = Close {
+            business_key: business_key.clone(),
+            sys_from,
+            seq,
+            sys_to: interval.sys_to,
+            closed_by: interval.closed_by,
+        };
+        self.byte_size = self.byte_size.saturating_sub(removed.encoded_size() as u64);
+        true
     }
 
     /// The materialized end of the version `(key, sys_from, seq)`, or `None` while
