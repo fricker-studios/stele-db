@@ -569,10 +569,10 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
             // version now (skipped); a key opened in a re-created era resolves to
             // `sys_from > at` (preserved). `delete` then closes exactly this
             // resolved version, so the two snapshots stay consistent.
-            if let Some(cur) = self.as_of(&key, now)? {
-                if cur.sys_from <= at.0 {
-                    stale.push(key);
-                }
+            if let Some(cur) = self.as_of(&key, now)?
+                && cur.sys_from <= at.0
+            {
+                stale.push(key);
             }
         }
         for key in &stale {

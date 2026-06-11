@@ -110,7 +110,7 @@ impl Rng {
     const fn new(seed: u64) -> Self {
         Self(seed ^ 0x9E37_79B9_7F4A_7C15)
     }
-    fn next_u64(&mut self) -> u64 {
+    const fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -118,7 +118,7 @@ impl Rng {
         self.0 = x;
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
-    fn range(&mut self, n: u64) -> u64 {
+    const fn range(&mut self, n: u64) -> u64 {
         self.next_u64() % n
     }
 }
@@ -442,10 +442,10 @@ fn bitemporal_as_of_is_differential_equal_across_both_axes_and_recovery() {
                         rgot, expected,
                         "seed {seed} @ (s={s}, v={v}) key {k}: recovered engine vs reference",
                     );
-                    if let Some(m) = &mutated {
-                        if got != buggy_as_of(m, k, s, v) {
-                            caught = true;
-                        }
+                    if let Some(m) = &mutated
+                        && got != buggy_as_of(m, k, s, v)
+                    {
+                        caught = true;
                     }
                 }
             }
@@ -798,16 +798,15 @@ fn split_valid(model: &[Tuple]) -> Vec<Tuple> {
 fn coalesce_valid(model: &[Tuple]) -> Vec<Tuple> {
     let mut out: Vec<Tuple> = Vec::new();
     for t in model {
-        if let Some(last) = out.last_mut() {
-            if last.key == t.key
-                && last.sys_from == t.sys_from
-                && last.sys_to == t.sys_to
-                && last.value == t.value
-                && last.valid_to == t.valid_from
-            {
-                last.valid_to = t.valid_to;
-                continue;
-            }
+        if let Some(last) = out.last_mut()
+            && last.key == t.key
+            && last.sys_from == t.sys_from
+            && last.sys_to == t.sys_to
+            && last.value == t.value
+            && last.valid_to == t.valid_from
+        {
+            last.valid_to = t.valid_to;
+            continue;
         }
         out.push(t.clone());
     }

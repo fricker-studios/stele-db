@@ -85,7 +85,7 @@ impl Rng {
     const fn new(seed: u64) -> Self {
         Self(seed ^ 0x9E37_79B9_7F4A_7C15)
     }
-    fn next_u64(&mut self) -> u64 {
+    const fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -93,7 +93,7 @@ impl Rng {
         self.0 = x;
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
-    fn range(&mut self, n: u64) -> u64 {
+    const fn range(&mut self, n: u64) -> u64 {
         self.next_u64() % n
     }
 }
@@ -251,7 +251,7 @@ fn resurrection_gap_survives_full_index_rebuild_byte_identical() {
     );
 
     // Probe the gap and its boundaries *before* rebuild (the live index).
-    let gap_mid = SystemTimeMicros((t3.0 + t4.0) / 2);
+    let gap_mid = SystemTimeMicros(i64::midpoint(t3.0, t4.0));
     let probes = [
         (SystemTimeMicros(t2.0), Some(b"v2".to_vec())), // last live before delete
         (SystemTimeMicros(t3.0 - 1), Some(b"v2".to_vec())), // half-open: live up to t3

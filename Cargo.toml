@@ -38,7 +38,7 @@ default-members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85.0"
+rust-version = "1.89.0"
 license = "BUSL-1.1"
 repository = "https://github.com/fricker-studios/stele-db"
 homepage = "https://steledb.com"
@@ -64,16 +64,16 @@ anyhow             = "1.0"
 bytes              = "1.7"
 clap               = { version = "4.5", features = ["derive"] }
 serde              = { version = "1.0", features = ["derive"] }
-# `recursive-protection` (a default feature) pulls `stacker` → a build-dep that
-# needs a newer toolchain than our pinned 1.85; we drop it and keep just `std`.
+# `recursive-protection` (a default feature) pulls `stacker` → a build-dep and
+# extra supply-chain surface we don't need; we drop it and keep just `std`.
 sqlparser          = { version = "0.62", default-features = false, features = ["std"] }
 # Line editing for `stele shell` (STL-198): ↑/↓ history, Emacs keys, ⌃L. MIT;
-# default features off — no fuzzy matcher, no dirs probe. NB STL-202 persists
-# history to `~/.stele_history` *without* the `with-file-history` feature: in
-# rustyline 18 that feature locks the file via `std::fs::File::lock`, which is
-# unstable before Rust 1.89 and so will not build on our 1.85 MSRV (it no longer
-# pulls `fd-lock`). The shell serializes its own history instead — zero new
-# deps. CLI-only: never a dependency of the server or the runtime-agnostic core.
+# default features off — no fuzzy matcher, no dirs probe. The `with-file-history`
+# feature (rustyline 18 locks the history via `std::fs::File::lock`, the
+# `file_lock` std API stabilized in Rust 1.89) now clears our MSRV but stays off
+# here: STL-221 adopts it and drops the hand-rolled `~/.stele_history`
+# serialization STL-202 added. CLI-only: never a dependency of the server or the
+# runtime-agnostic core.
 rustyline          = { version = "18.0", default-features = false }
 # Terminal display width (CJK/emoji are 2 columns) for the shell's table
 # alignment. Already in the tree as rustyline's own width dep — zero new surface.
@@ -89,7 +89,7 @@ tokio-postgres     = "0.7"
 # test needs no system library. Default features are empty (no polars/extensions),
 # but `duckdb` depends on `arrow` non-optionally — there is no feature to opt out —
 # so the dev-tree pulls the arrow stack regardless (all MIT/Apache-2.0; cargo-deny
-# green, see deny.toml). Pinned to 1.4.x — its MSRV (1.84.1) clears our 1.85
+# green, see deny.toml). Pinned to 1.4.x — its MSRV (1.84.1) clears our 1.89
 # toolchain. Wired only into the test-only `stele-exec-oracle` crate's dev-deps; it
 # never links into any shipped crate or the runtime-agnostic storage/txn core
 # ([ADR-0010]). That crate is held off the per-PR CI path so this multi-minute

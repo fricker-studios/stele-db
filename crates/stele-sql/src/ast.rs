@@ -36,6 +36,12 @@ pub struct Statement {
 /// `sqlparser` AST node ([STL-219]).
 ///
 /// [STL-219]: https://allegromusic.atlassian.net/browse/STL-219
+// `Sql` is the overwhelmingly common variant and wraps `sqlparser`'s already-large
+// `Statement` AST; boxing it to shrink the rare 1-byte `Admin` case would add a
+// heap allocation to every parsed statement on the hot path — and break the
+// `const fn sql()` accessor, since `Box` deref is not const. The envelope is
+// short-lived (parsed, bound, dropped), so the stack size is not a concern.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum StatementBody {
     /// A standard-SQL statement. Stele's non-standard temporal clauses have been
@@ -84,7 +90,7 @@ impl Statement {
     /// The standard-SQL body for an in-place rewrite (extended-protocol parameter
     /// substitution), or `None` for an admin command.
     #[must_use]
-    pub fn sql_mut(&mut self) -> Option<&mut SqlStatement> {
+    pub const fn sql_mut(&mut self) -> Option<&mut SqlStatement> {
         match &mut self.body {
             StatementBody::Sql(body) => Some(body),
             StatementBody::Admin(_) => None,

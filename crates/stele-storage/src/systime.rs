@@ -2,7 +2,7 @@
 //!
 //! Every logical row carries a system-time interval `[sys_from, sys_to)`: when
 //! the *database* held this version ([architecture §2](../../../docs/02-architecture.md#2-the-bitemporal-record-model)).
-//! `sys_to = `[`SYSTEM_TIME_OPEN`] (`+∞`) marks the current version. System time
+//! `sys_to =` [`SYSTEM_TIME_OPEN`] (`+∞`) marks the current version. System time
 //! is **always present** — invariant 4 of [architecture §12](../../../docs/02-architecture.md#12-cross-cutting-architectural-invariants)
 //! and [assumption O3](../../../docs/assumptions.md).
 //!

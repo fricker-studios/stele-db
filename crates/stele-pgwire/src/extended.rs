@@ -432,10 +432,10 @@ fn count_set_expr(set: &SetExpr, required: &mut usize) {
 fn count_expr(expr: &Expr, required: &mut usize) {
     match expr {
         Expr::Value(vws) => {
-            if let Value::Placeholder(name) = &vws.value {
-                if let Some(index) = placeholder_index(name) {
-                    *required = (*required).max(index);
-                }
+            if let Value::Placeholder(name) = &vws.value
+                && let Some(index) = placeholder_index(name)
+            {
+                *required = (*required).max(index);
             }
         }
         Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => count_expr(expr, required),
@@ -537,12 +537,12 @@ fn walk_set_expr(set: &mut SetExpr, params: &[Value]) {
 fn walk_expr(expr: &mut Expr, params: &[Value]) {
     match expr {
         Expr::Value(vws) => {
-            if let Value::Placeholder(name) = &vws.value {
-                if let Some(index) = placeholder_index(name) {
-                    // Keep the placeholder's span; only its value changes.
-                    if let Some(value) = params.get(index - 1) {
-                        vws.value = value.clone();
-                    }
+            if let Value::Placeholder(name) = &vws.value
+                && let Some(index) = placeholder_index(name)
+            {
+                // Keep the placeholder's span; only its value changes.
+                if let Some(value) = params.get(index - 1) {
+                    vws.value = value.clone();
                 }
             }
         }

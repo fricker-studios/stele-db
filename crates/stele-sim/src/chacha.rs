@@ -22,7 +22,7 @@ const CONSTANTS: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574]
 /// The single-letter indices `a`/`b`/`c`/`d` mirror RFC 8439's own notation.
 #[inline]
 #[allow(clippy::many_single_char_names)]
-fn quarter_round(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+const fn quarter_round(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
     s[a] = s[a].wrapping_add(s[b]);
     s[d] = (s[d] ^ s[a]).rotate_left(16);
     s[c] = s[c].wrapping_add(s[d]);

@@ -378,7 +378,7 @@ fn deletion_gap_is_absent_across_the_whole_valid_axis_after_rebuild() {
 
     // The (system × valid) probe grid: system snapshots straddling every commit and
     // the gap interior, valid points on both sides of each window boundary.
-    let gap_mid = (t3.0 + t4.0) / 2;
+    let gap_mid = i64::midpoint(t3.0, t4.0);
     let sys_points = [
         t2.0,     // last live before the delete
         t3.0 - 1, // half-open: still live up to t3
@@ -464,7 +464,7 @@ impl Rng {
     const fn new(seed: u64) -> Self {
         Self(seed ^ 0x9E37_79B9_7F4A_7C15)
     }
-    fn next_u64(&mut self) -> u64 {
+    const fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -472,7 +472,7 @@ impl Rng {
         self.0 = x;
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
-    fn range(&mut self, n: u64) -> u64 {
+    const fn range(&mut self, n: u64) -> u64 {
         self.next_u64() % n
     }
 }
@@ -579,11 +579,11 @@ fn run_seed(seed: u64) -> SeedRun {
         hi = hi.max(commit.0);
 
         // Occasionally seal so deletes/closes span the columnar flush boundary.
-        if rng.range(4) == 0 {
-            if let Some(reader) = flush_valid(&seg_disk, flushes, &mut delta) {
-                segments.push(reader);
-                flushes += 1;
-            }
+        if rng.range(4) == 0
+            && let Some(reader) = flush_valid(&seg_disk, flushes, &mut delta)
+        {
+            segments.push(reader);
+            flushes += 1;
         }
     }
 

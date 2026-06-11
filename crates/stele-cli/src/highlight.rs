@@ -142,11 +142,11 @@ pub fn tokenize(line: &str) -> Vec<Seg> {
             return;
         }
         // Merge adjacent same-role runs so plain output stays compact.
-        if let Some((last_role, last)) = segs.last_mut() {
-            if *last_role == role {
-                last.push_str(text);
-                return;
-            }
+        if let Some((last_role, last)) = segs.last_mut()
+            && *last_role == role
+        {
+            last.push_str(text);
+            return;
         }
         segs.push((role, text.to_owned()));
     };

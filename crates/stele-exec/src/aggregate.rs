@@ -359,10 +359,10 @@ fn update_extreme(row: &mut Option<usize>, arg: Option<&Vector>, r: usize, want:
         Some(best) => {
             // The tracked best row is always non-NULL (only non-NULL rows are
             // ever stored), so its value is present.
-            if let Some(incumbent) = arg.get(best) {
-                if scalar_cmp(&candidate, &incumbent) == want {
-                    *row = Some(r);
-                }
+            if let Some(incumbent) = arg.get(best)
+                && scalar_cmp(&candidate, &incumbent) == want
+            {
+                *row = Some(r);
             }
         }
     }

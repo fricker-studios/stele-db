@@ -39,7 +39,7 @@ impl Rng {
         Self(seed ^ 0x9E37_79B9_7F4A_7C15)
     }
 
-    fn next_u64(&mut self) -> u64 {
+    const fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;

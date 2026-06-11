@@ -5126,6 +5126,9 @@ mod tests {
 
     /// A row cell's expected encoding: `Some(value)` → its canonical bytes,
     /// `None` → a SQL `NULL` cell — matching what a `SelectResult` row carries.
+    // Inlining the `.map` at every expected-row literal (what `single_option_map`
+    // asks for) would only duplicate it; this test helper reads better as-is.
+    #[allow(clippy::single_option_map)]
     fn cell(value: Option<ScalarValue>) -> Option<Vec<u8>> {
         value.map(|v| encode_value(&v))
     }

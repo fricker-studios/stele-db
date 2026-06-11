@@ -129,7 +129,7 @@ impl Prob {
 
     /// Decide whether this class fires, consuming one `rng` draw when active so
     /// the stream advances identically whether or not a `Chance` lands.
-    fn fires(self, rng: &mut Rng) -> bool {
+    const fn fires(self, rng: &mut Rng) -> bool {
         match self {
             Self::Never => false,
             Self::Always => {
@@ -186,7 +186,7 @@ impl FaultProfile {
         }
     }
 
-    fn slot_mut(&mut self, class: FaultKind) -> &mut Prob {
+    const fn slot_mut(&mut self, class: FaultKind) -> &mut Prob {
         match class {
             FaultKind::BitFlip => &mut self.bit_flip,
             FaultKind::ShortRead => &mut self.short_read,
@@ -204,7 +204,7 @@ impl FaultProfile {
     }
 
     /// Disable `class` — equivalent to [`set`](Self::set) with `p == 0`.
-    pub fn disable(&mut self, class: FaultKind) {
+    pub const fn disable(&mut self, class: FaultKind) {
         *self.slot_mut(class) = Prob::Never;
     }
 
@@ -279,7 +279,7 @@ struct FaultState {
 
 impl FaultState {
     /// Decide whether `class` fires now, drawing from the shared stream.
-    fn fires(&mut self, class: FaultKind) -> bool {
+    const fn fires(&mut self, class: FaultKind) -> bool {
         self.profile.prob(class).fires(&mut self.rng)
     }
 

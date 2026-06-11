@@ -771,6 +771,11 @@ struct ResultColumn {
 /// block auto-commits at once and is not undone by a later `ROLLBACK` (only DML is
 /// buffered). Drivers' transaction blocks are DML in practice; rolling back DDL is
 /// a later concern.
+// 1.89's clippy scores this simple-query dispatcher at 33/25; splitting the
+// batch's parse → route → reply step sequence into helpers would scatter its
+// control flow without making it clearer — a readability follow-up, not an
+// MSRV-bump concern.
+#[allow(clippy::cognitive_complexity)]
 async fn handle_simple_query(
     stream: &mut TcpStream,
     sql: &str,
@@ -2236,12 +2241,10 @@ async fn read_startup(stream: &mut TcpStream) -> Result<StartupMessage, WireErro
                 // and resend a StartupMessage.
                 stream.write_all(b"N").await?;
                 stream.flush().await?;
-                continue;
             }
             GSS_ENC_REQUEST_CODE => {
                 stream.write_all(b"N").await?;
                 stream.flush().await?;
-                continue;
             }
             CANCEL_REQUEST_CODE => {
                 // CancelRequest is fire-and-forget — drain and close.

@@ -208,10 +208,10 @@ fn interactive_loop(
                     // the catalog, so re-read the identifiers ⇥ completes
                     // against. Best-effort: a dead connection resurfaces on the
                     // next real query rather than here.
-                    if let Ok(identifiers) = fetch_identifiers(client) {
-                        if let Some(helper) = rl.helper_mut() {
-                            helper.identifiers = identifiers;
-                        }
+                    if let Ok(identifiers) = fetch_identifiers(client)
+                        && let Some(helper) = rl.helper_mut()
+                    {
+                        helper.identifiers = identifiers;
                     }
                 }
                 if matches!(flow, Flow::Quit) {
@@ -254,10 +254,10 @@ fn handle_line(
     line: &str,
 ) -> anyhow::Result<Flow> {
     // Meta-commands are lines of their own, between statements.
-    if buffer.trim().is_empty() {
-        if let Some(meta) = parse_meta(line) {
-            return dispatch_meta(client, session, out, &meta);
-        }
+    if buffer.trim().is_empty()
+        && let Some(meta) = parse_meta(line)
+    {
+        return dispatch_meta(client, session, out, &meta);
     }
     buffer.push_str(line);
     buffer.push('\n');
@@ -1081,10 +1081,10 @@ fn save_history_file(rl: &ShellEditor, path: &std::path::Path) {
         .truncate(true)
         .mode(0o600)
         .open(path);
-    if let Ok(mut file) = opened {
-        if file.write_all(buf.as_bytes()).is_ok() {
-            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-        }
+    if let Ok(mut file) = opened
+        && file.write_all(buf.as_bytes()).is_ok()
+    {
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
     }
 }
 

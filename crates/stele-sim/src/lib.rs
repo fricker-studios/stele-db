@@ -117,7 +117,7 @@ impl Rng {
     }
 
     /// Next pseudo-random `u64`.
-    pub fn next_u64(&mut self) -> u64 {
+    pub const fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -127,7 +127,7 @@ impl Rng {
     }
 
     /// Uniform-ish integer in `0..bound` (`bound` must be non-zero).
-    pub fn below(&mut self, bound: u64) -> u64 {
+    pub const fn below(&mut self, bound: u64) -> u64 {
         self.next_u64() % bound
     }
 
