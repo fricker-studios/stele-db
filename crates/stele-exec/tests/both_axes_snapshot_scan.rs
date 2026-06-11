@@ -239,6 +239,85 @@ fn both_axes_resolves_across_sealed_and_delta_tiers() {
     assert_eq!(cell(125), BTreeMap::from([(2, b"delta".to_vec())]));
 }
 
+// --- 2b. no-valid-pin read of a valid-time table (STL-218) ------------------
+
+#[test]
+fn no_valid_pin_strips_delta_frames_and_keeps_every_system_live_row() {
+    // A plain `SELECT` over a valid-time table — `valid_time(true)` with no
+    // `valid_as_of` pin — must strip the delta tier's framed prefix and return
+    // EVERY system-live version, with NO valid-axis filter (STL-218). Spans both
+    // tiers: a sealed segment already stores bare payloads; a delta row is framed
+    // and must be unframed. The two keys have *disjoint* valid windows, so a
+    // valid-pinned scan would drop one — proving the no-pin read does not filter.
+    let seg_disk = MemDisk::new();
+    let (wal, mut delta, mut index) = new_tiers();
+    let mut dml = DmlWriter::new(wal, StepClock::new(1_000), true);
+
+    // key 1 valid [0, 100) "sealed" → flushed to a sealed segment (bare payload).
+    dml.insert(
+        &mut delta,
+        &mut index,
+        &EmptySealed,
+        key_of(1),
+        Some(iv(0, 100)),
+        Some(b"sealed".to_vec()),
+        0,
+        TxnId(1),
+        who(),
+    )
+    .expect("insert key 1");
+    let segments = vec![flush_valid(&seg_disk, 0, &mut delta).expect("seal")];
+
+    // key 2 valid [200, 300) "delta" → stays in the delta tier (framed payload).
+    let c2 = dml
+        .insert(
+            &mut delta,
+            &mut index,
+            &SealedSegments::new(&segments),
+            key_of(2),
+            Some(iv(200, 300)),
+            Some(b"delta".to_vec()),
+            0,
+            TxnId(2),
+            who(),
+        )
+        .expect("insert key 2")
+        .commit;
+
+    let scan = || {
+        SnapshotScan::new(&delta, &index, &segments, Snapshot(c2))
+            .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+    };
+    let collect = |out: &stele_exec::ScanOutput| -> BTreeMap<u8, Vec<u8>> {
+        let keys = bytes_column(out, ColumnId::BusinessKey);
+        let payloads = bytes_column(out, ColumnId::Payload);
+        keys.iter().map(|k| k[1]).zip(payloads).collect()
+    };
+
+    // No-pin valid-time read: both rows, payloads bare, windows ignored.
+    let got = collect(&scan().valid_time(true).execute().expect("no-pin scan"));
+    assert_eq!(
+        got,
+        BTreeMap::from([(1, b"sealed".to_vec()), (2, b"delta".to_vec())]),
+        "every system-live row returns with its bare payload, no valid filter",
+    );
+
+    // Teeth: a *system-only* scan (`valid_time` unset) leaves the delta row's
+    // payload FRAMED — the 16-byte prefix is still attached — so the flag is what
+    // strips it. The sealed row is bare regardless (stored that way at flush).
+    let unframed = collect(&scan().execute().expect("system-only scan"));
+    assert_eq!(
+        unframed[&1], b"sealed",
+        "the sealed payload is bare either way"
+    );
+    assert_eq!(
+        unframed[&2].len(),
+        16 + b"delta".len(),
+        "without the valid-time flag the delta payload keeps its framed prefix",
+    );
+    assert!(unframed[&2].ends_with(b"delta"));
+}
+
 // --- 3. the two axes are independent ---------------------------------------
 
 #[test]
