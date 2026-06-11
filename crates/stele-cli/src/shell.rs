@@ -132,17 +132,21 @@ fn repl_scripted(
     Ok(())
 }
 
-/// Editor type alias — `DefaultHistory` is `MemHistory` (the crate does not
-/// enable `with-file-history`; see the rustyline note in the workspace
-/// `Cargo.toml`). Cross-session persistence is layered on by hand in
-/// [`load_history_file`] / [`save_history_file`].
+/// Editor type alias. With the `with-file-history` feature on (STL-221),
+/// `DefaultHistory` is rustyline's `FileHistory`, so cross-session persistence —
+/// file-locked load + append-on-exit, native `0600` file mode — comes straight
+/// from [`Editor::load_history`](rustyline::Editor::load_history) /
+/// [`Editor::append_history`](rustyline::Editor::append_history); no hand-rolled
+/// serialization.
 type ShellEditor = rustyline::Editor<ShellHelper, rustyline::history::DefaultHistory>;
 
 /// The interactive loop: rustyline editing + history + live highlighting.
 ///
-/// History persists across sessions in `~/.stele_history` — loaded before the
-/// loop, saved after it (on `\q`, ⌃D, and even a mid-session transport error),
-/// so the file always reflects the last 100 (deduped) statements.
+/// History persists across sessions in `~/.stele_history` — a file-locked load
+/// before the loop, append-on-exit after it (on `\q`, ⌃D, and even a mid-session
+/// transport error), so concurrent shells merge rather than clobber and the file
+/// keeps the last 100 (deduped) statements. Both are best-effort: a missing file
+/// (first run) or an I/O error never derails the session.
 fn repl_interactive(client: &mut Client, session: &mut Session) -> anyhow::Result<()> {
     let config = rustyline::Config::builder()
         .max_history_size(100)
@@ -155,7 +159,8 @@ fn repl_interactive(client: &mut Client, session: &mut Session) -> anyhow::Resul
         rustyline::Editor::with_config(config).context("initializing line editor")?;
     let history_path = history_file_path();
     if let Some(path) = &history_path {
-        load_history_file(&mut rl, path);
+        // First run: no file yet → `load_history` errs with NotFound, ignored.
+        let _ = rl.load_history(path);
     }
     rl.set_helper(Some(ShellHelper {
         theme: session.theme,
@@ -167,7 +172,9 @@ fn repl_interactive(client: &mut Client, session: &mut Session) -> anyhow::Resul
     let outcome = interactive_loop(client, session, &mut rl);
 
     if let Some(path) = &history_path {
-        save_history_file(&rl, path);
+        // Append this session's new entries under a file lock, so a concurrent
+        // shell exiting at the same time keeps its own entries too (STL-221).
+        let _ = rl.append_history(path);
     }
     outcome
 }
@@ -1037,87 +1044,6 @@ fn history_file_path() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".stele_history"))
 }
 
-/// Load `~/.stele_history` into the editor so ↑/↓ recall spans sessions. One
-/// entry per line, newlines un-escaped (a multi-line statement is one entry).
-/// `add_history_entry` re-applies the configured dedupe + 100-cap. A missing
-/// file (first run) or any read error is silently ignored — history is a
-/// convenience, never load-bearing.
-fn load_history_file(rl: &mut ShellEditor, path: &std::path::Path) {
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return;
-    };
-    for line in contents.lines() {
-        if !line.is_empty() {
-            let _ = rl.add_history_entry(unescape_entry(line));
-        }
-    }
-}
-
-/// Persist the in-memory history (already deduped + capped at 100) to
-/// `~/.stele_history`, oldest first. Embedded newlines are escaped so each
-/// entry occupies exactly one line. Best-effort: a write failure must not mask
-/// the session's own outcome.
-///
-/// The file is created user-only (`0600`), like `~/.psql_history`: history can
-/// carry sensitive SQL (credentials in a literal, say), so it must not be
-/// world-readable. `mode` only bites on creation, so a pre-existing `0644` file
-/// is re-tightened after the write.
-fn save_history_file(rl: &ShellEditor, path: &std::path::Path) {
-    use rustyline::history::{History as _, SearchDirection};
-    use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-
-    let history = rl.history();
-    let mut buf = String::new();
-    for i in 0..history.len() {
-        if let Ok(Some(found)) = history.get(i, SearchDirection::Forward) {
-            buf.push_str(&escape_entry(&found.entry));
-            buf.push('\n');
-        }
-    }
-    let opened = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path);
-    if let Ok(mut file) = opened
-        && file.write_all(buf.as_bytes()).is_ok()
-    {
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-    }
-}
-
-/// Escape an entry to one physical line: `\` → `\\`, newline → `\n` (matching
-/// rustyline's own history-file convention). [`unescape_entry`] is the inverse.
-fn escape_entry(entry: &str) -> String {
-    entry.replace('\\', r"\\").replace('\n', r"\n")
-}
-
-/// Inverse of [`escape_entry`] — turn `\\` back into `\` and `\n` back into a
-/// newline. An unrecognized escape is kept verbatim (backslash + char).
-fn unescape_entry(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                // An escaped backslash, or a stray trailing one (malformed, but
-                // we keep it) both decode to a single backslash.
-                Some('\\') | None => out.push('\\'),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
 // ---------------------------------------------------------------------------
 // rustyline glue
 // ---------------------------------------------------------------------------
@@ -1486,23 +1412,48 @@ mod tests {
     }
 
     #[test]
-    fn history_entry_escaping_round_trips_multiline_and_backslashes() {
-        // A multi-line statement is ONE entry; backslashes (e.g. a `\d` recalled
-        // into the buffer, or a regex literal) must survive the file round-trip.
-        for entry in [
-            "SELECT 1;",
-            "SELECT id, balance\n  FROM account;",
-            r"SELECT '\n' AS lit;",
-            "trailing backslash \\",
-            "",
-        ] {
-            let escaped = escape_entry(entry);
-            // The on-disk form is always a single physical line.
-            assert!(
-                !escaped.contains('\n'),
-                "escaped form has a newline: {escaped:?}"
-            );
-            assert_eq!(unescape_entry(&escaped), entry, "round-trip failed");
-        }
+    fn history_persists_across_sessions_at_0600_via_file_history() {
+        // STL-221: `with-file-history` makes `DefaultHistory` a `FileHistory`,
+        // which appends-on-exit (file-locked) and creates the file `0600`. This
+        // also guards the feature staying enabled: with it off, `DefaultHistory`
+        // is `MemHistory` whose save/append/load are no-ops, so the file would
+        // never appear (0600 check fails) and the reload would recall nothing.
+        use rustyline::history::{DefaultHistory, History as _, SearchDirection};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // A throwaway path under the temp dir — never the real ~/.stele_history.
+        let dir = std::env::temp_dir().join(format!(".stele-hist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("history");
+
+        let config = rustyline::Config::builder()
+            .max_history_size(100)
+            .expect("history size")
+            .history_ignore_dups(true)
+            .expect("history dedupe")
+            .build();
+
+        // Session one: record two statements (one multi-line) and append on exit.
+        let mut first = DefaultHistory::with_config(&config);
+        first.add("SELECT 1;").expect("add");
+        first.add("SELECT id\n  FROM account;").expect("add");
+        first.append(&path).expect("append");
+
+        // History can carry a credential in a literal — it must be owner-only.
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "history mode {mode:o}, expected 0600");
+
+        // Session two: a fresh history loads the prior session's entries, the
+        // multi-line statement intact as one entry.
+        let mut second = DefaultHistory::with_config(&config);
+        second.load(&path).expect("load");
+        assert_eq!(second.len(), 2, "expected both statements recalled");
+        let last = second
+            .get(1, SearchDirection::Forward)
+            .expect("get")
+            .expect("entry present");
+        assert_eq!(last.entry.as_ref(), "SELECT id\n  FROM account;");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
