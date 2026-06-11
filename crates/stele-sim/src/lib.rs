@@ -800,10 +800,11 @@ pub fn run_engine_flush_recover_seed(seed: u64) -> u64 {
         .collect();
 
     let before_index = {
-        // Seed a small per-seed row-group bound so every flush seals a *multi*-
-        // row-group segment ([STL-197]); recovery must still rebuild the exact
-        // validity index across the finer split — the engine-level analogue of the
-        // 1–3-row bound the SnapshotScan oracle seeds at the segment layer
+        // Seed a small per-seed row-group bound so a flush of more than the bound's
+        // rows seals a *multi*-row-group segment ([STL-197]) — a narrower flush
+        // still stays one row-group. Recovery must rebuild the exact validity index
+        // across the finer split either way; this is the engine-level analogue of
+        // the 1–3-row bound the SnapshotScan oracle seeds at the segment layer
         // ([STL-155]).
         let row_group_rows = 1 + rng.below_usize(3);
         let mut engine = Engine::open(disk.clone(), StepClock::new(1), false)
