@@ -64,15 +64,17 @@ use stele_common::row_codec::{self, RowCodecError};
 use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
 use stele_common::types::{LogicalType, ScalarValue};
 use stele_exec::{
-    AggregateFunc as ExecAggregateFunc, Aggregator, Batch, CmpOp, Column, DEFAULT_BATCH_SIZE,
-    ExplodePayload, Expr, Filter, JoinType as ExecJoinType, Operator, ScanError, ScanSource,
-    SnapshotScan, Vector, evaluate, hash_aggregate, hash_join,
+    AggregateFunc as ExecAggregateFunc, Aggregator, ArithOp as ExecArithOp, Batch, CmpOp, Column,
+    DEFAULT_BATCH_SIZE, ExplodePayload, Expr, ExprError, Filter, JoinType as ExecJoinType,
+    Operator, ScanError, ScanSource, SnapshotScan, Vector, eval_expr, evaluate, hash_aggregate,
+    hash_join,
 };
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::dml::{BoundDml, DmlError};
 use stele_sql::select::{
-    AggregateFunc, BoundAggregate, BoundJoin, BoundPeriod, BoundPeriodPredicate, BoundPredicate,
-    BoundSelect, JoinColumnRef, JoinType, OutputItem, PeriodEndpoint, Projection, SelectError,
+    AggregateFunc, ArithOp, BoundAggregate, BoundJoin, BoundPeriod, BoundPeriodPredicate,
+    BoundPredicate, BoundScalar, BoundSelect, CompareOp, JoinColumnRef, JoinType, OutputItem,
+    PeriodEndpoint, Projection, SelectError,
 };
 use stele_sql::{
     AdminCommand, BindContext, BindError, Statement, StatementBody, bind_ddl, bind_dml,
@@ -1479,33 +1481,32 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         schema_columns: &[(String, LogicalType)],
         value_count: usize,
     ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
-        // A period predicate ([STL-165], [STL-193]) is one of two shapes. A
-        // fully-constant one folds to a single truth value: a `false` excludes
-        // every row, so skip the scan entirely (never a silently-unfiltered read).
-        // One built from value columns ([STL-193]) cannot be decided until the
-        // rows are decoded, so it is evaluated per row in the collection loop
-        // below; `per_row_period` carries it there.
-        let per_row_period = match &bound.period_filter {
-            Some(p) => match const_period_truth(p) {
-                Some(false) => return Ok(Vec::new()),
-                Some(true) => None,
-                None => Some(p),
-            },
-            None => None,
+        // Resolve the `WHERE` to a single vectorized predicate ([STL-213]): a
+        // `<col> <cmp> <scalar>` comparison ([STL-151]) or a per-row period
+        // predicate lowered to `Expr::Period` over `MakePeriod` operands
+        // ([STL-193]). A fully-constant period predicate ([STL-165]) folds to a
+        // truth value instead — a `false` excludes every row, so skip the scan
+        // entirely (never a silently-unfiltered read).
+        let filter_expr = match filter_plan(bound) {
+            FilterPlan::Empty => return Ok(Vec::new()),
+            FilterPlan::KeepAll => None,
+            FilterPlan::Predicate(expr) => Some(expr),
         };
 
-        // Push a key-equality predicate down to the scan for zone-map pruning; a
-        // filter on a value column lives inside the opaque payload, which a zone
-        // map cannot reason about, so the vectorized `Filter` below is where it is
-        // applied. The pushed-down key predicate is re-applied by that same
-        // `Filter`, so the answer is exact regardless of what the prune could prove.
-        let predicate = match &bound.filter {
-            Some(p) if p.column_index == 0 => Predicate::Eq {
+        // Push a business-key equality down to the scan for zone-map pruning; any
+        // richer predicate (a value-column compare, an arithmetic, a period) lives
+        // inside the opaque payload, which a zone map cannot reason about, so the
+        // vectorized `Filter` below is where it is applied. The pushed-down key
+        // predicate is re-applied by that same `Filter`, so the answer is exact
+        // regardless of what the prune could prove.
+        let predicate = bound
+            .filter
+            .as_ref()
+            .and_then(BoundPredicate::key_equality)
+            .map_or(Predicate::All, |value| Predicate::Eq {
                 column: ColumnId::BusinessKey,
-                value: ZoneBound::Bytes(encode_value(&p.value)),
-            },
-            _ => Predicate::All,
-        };
+                value: ZoneBound::Bytes(encode_value(value)),
+            });
 
         let readers = state.engine.open_segment_readers()?;
         let mut scan = SnapshotScan::new(
@@ -1533,10 +1534,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // columns have no `ColumnId`, so the full row is read positionally.
         let source = ScanSource::new(scan, DEFAULT_BATCH_SIZE);
         let exploded = ExplodePayload::new(source, value_count);
-        let mut pipeline: Box<dyn Operator + '_> = match &bound.filter {
-            Some(p) => {
+        let mut pipeline: Box<dyn Operator + '_> = match filter_expr {
+            Some(expr) => {
                 let schema_types = schema_columns.iter().map(|(_, ty)| *ty).collect();
-                Box::new(Filter::new(exploded, lower_predicate(p), schema_types))
+                Box::new(Filter::new(exploded, expr, schema_types))
             }
             None => Box::new(exploded),
         };
@@ -1545,16 +1546,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
         while let Some(batch) = pipeline.next()? {
             for r in 0..batch.rows {
-                let row: Vec<Option<Vec<u8>>> =
-                    (0..ncols).map(|i| batch_cell(&batch, i, r)).collect();
-                // A per-row period predicate ([STL-193]) builds each operand's
-                // `[from, to)` from the row's cells and drops the rows it excludes.
-                if let Some(p) = per_row_period {
-                    if !period_keeps_row(p, &row, schema_columns) {
-                        continue;
-                    }
-                }
-                rows.push(row);
+                rows.push((0..ncols).map(|i| batch_cell(&batch, i, r)).collect());
             }
         }
         Ok(rows)
@@ -1581,7 +1573,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
         let base = Self::scan_all_rows(state, bound.snapshot, value_count)?;
         let overlaid = overlay_table_writes(base, overlay, bound.table.as_str(), value_count);
-        Ok(filter_rows(bound, schema_columns, overlaid))
+        filter_rows(bound, schema_columns, overlaid)
     }
 
     /// Run a bound two-table `JOIN` ([STL-172]).
@@ -2351,20 +2343,97 @@ fn column_cell(batch: &Batch, id: ColumnId, row: usize) -> Option<Vec<u8>> {
     })
 }
 
-/// Lower a bound `WHERE <column> = <literal>` predicate ([STL-151]) to the
-/// vectorized [`Expr`] the [`Filter`] operator evaluates over a whole batch
-/// ([STL-206]). The column is referenced by its schema position — the same index
-/// [`ExplodePayload`] puts it at — and the literal is broadcast as a constant. A
-/// typed equality over the decoded values is equivalent to the byte-equality the
-/// old loop applied, since the encoding is canonical and a NULL cell decodes to a
-/// NULL that the comparison (and `Filter`'s "keep TRUE only") drops.
+/// Lower a bound `WHERE <scalar> <cmp> <scalar>` predicate ([STL-151], [STL-213])
+/// to the vectorized [`Expr`] the [`Filter`] operator evaluates over a whole batch
+/// ([STL-206]). The comparison maps to [`Expr::Compare`], and each [`BoundScalar`]
+/// side lowers straight to its evaluator node — a column to its schema position
+/// (the same index [`ExplodePayload`] puts it at), a literal broadcast as a
+/// constant, arithmetic to [`Expr::Arith`]. A typed comparison over the decoded
+/// values is equivalent to the byte-equality the original `=`-only loop applied,
+/// since the encoding is canonical and a NULL cell decodes to a NULL the comparison
+/// (and `Filter`'s "keep TRUE only") drops.
 fn lower_predicate(predicate: &BoundPredicate) -> Expr {
-    Expr::col(predicate.column_index).compare(CmpOp::Eq, Expr::lit(predicate.value.clone()))
+    Expr::Compare {
+        op: lower_compare_op(predicate.op),
+        left: Box::new(lower_scalar(&predicate.left)),
+        right: Box::new(lower_scalar(&predicate.right)),
+    }
+}
+
+/// Lower a [`BoundScalar`] WHERE operand to its [`Expr`] node ([STL-213]).
+fn lower_scalar(scalar: &BoundScalar) -> Expr {
+    match scalar {
+        BoundScalar::Column(index) => Expr::col(*index),
+        BoundScalar::Literal(value) => Expr::lit(value.clone()),
+        BoundScalar::Arith { op, left, right } => Expr::Arith {
+            op: lower_arith_op(*op),
+            left: Box::new(lower_scalar(left)),
+            right: Box::new(lower_scalar(right)),
+        },
+    }
+}
+
+/// Map the binder's [`CompareOp`] to the executor's `CmpOp`. The two enums are
+/// parallel; stele-sql and stele-exec do not depend on each other, so the engine is
+/// the lowering point (the same split [`lower_join_type`] / [`lower_arith_op`] draw).
+const fn lower_compare_op(op: CompareOp) -> CmpOp {
+    match op {
+        CompareOp::Eq => CmpOp::Eq,
+        CompareOp::Ne => CmpOp::Ne,
+        CompareOp::Lt => CmpOp::Lt,
+        CompareOp::Le => CmpOp::Le,
+        CompareOp::Gt => CmpOp::Gt,
+        CompareOp::Ge => CmpOp::Ge,
+    }
+}
+
+/// Map the binder's [`ArithOp`] to the executor's `ExecArithOp` ([STL-213]).
+const fn lower_arith_op(op: ArithOp) -> ExecArithOp {
+    match op {
+        ArithOp::Add => ExecArithOp::Add,
+        ArithOp::Sub => ExecArithOp::Sub,
+        ArithOp::Mul => ExecArithOp::Mul,
+        ArithOp::Div => ExecArithOp::Div,
+        ArithOp::Mod => ExecArithOp::Mod,
+    }
+}
+
+/// Lower a per-row period predicate ([STL-193]) to an [`Expr::Period`] over two
+/// `MakePeriod` operands ([STL-213]). Each `PERIOD(from, to)` becomes the evaluator
+/// node that builds the `[from, to)` interval per row from its endpoint instants,
+/// so the predicate runs through the same vectorized [`Filter`] as a `<col> <cmp>`
+/// comparison rather than a bespoke row loop. A fully-constant predicate never
+/// reaches here — [`const_period_truth`] folds it to a single truth value instead.
+fn lower_period_predicate(predicate: &BoundPeriodPredicate) -> Expr {
+    Expr::Period {
+        pred: predicate.predicate,
+        left: Box::new(lower_period_operand(&predicate.left)),
+        right: Box::new(lower_period_operand(&predicate.right)),
+    }
+}
+
+/// Lower one `PERIOD(from, to)` operand to an [`Expr::MakePeriod`] over its two
+/// endpoint instants ([STL-213]).
+fn lower_period_operand(operand: &BoundPeriod) -> Expr {
+    Expr::make_period(
+        lower_period_endpoint(operand.from),
+        lower_period_endpoint(operand.to),
+    )
+}
+
+/// Lower one period endpoint to its instant [`Expr`]: a constant to an `int8` µs
+/// literal, a column to its schema-position reference (the binder already proved
+/// it is a `BIGINT`/`TIMESTAMP`/`TIMESTAMPTZ` instant the evaluator reads as `i64`).
+const fn lower_period_endpoint(endpoint: PeriodEndpoint) -> Expr {
+    match endpoint {
+        PeriodEndpoint::Const(micros) => Expr::lit(ScalarValue::Int8(micros)),
+        PeriodEndpoint::Column(index) => Expr::col(index),
+    }
 }
 
 /// The single truth value of a fully-constant period predicate ([STL-165]), or
-/// `None` when any endpoint references a value column (then it must be evaluated
-/// per row — [STL-193]).
+/// `None` when any endpoint references a value column (then it is lowered to a
+/// per-row [`Expr::Period`] — [STL-193], [STL-213]).
 fn const_period_truth(predicate: &BoundPeriodPredicate) -> Option<bool> {
     let left = const_period_interval(&predicate.left)?;
     let right = const_period_interval(&predicate.right)?;
@@ -2381,60 +2450,37 @@ fn const_period_interval(operand: &BoundPeriod) -> Option<Interval> {
     }
 }
 
-/// Whether a decoded row satisfies a per-row period predicate ([STL-193]).
+/// What a bound `SELECT`'s `WHERE` resolves to over the row set ([STL-213]).
 ///
-/// Each operand's `[from, to)` is rebuilt from the row's cells (a constant
-/// endpoint is its folded instant; a column endpoint is that cell's µs value). A
-/// NULL cell or an empty/reversed `[from, to)` makes the operand *unknown*, and
-/// an unknown operand excludes the row — the three-valued-logic stance the
-/// `WHERE` filter takes everywhere else (only a TRUE keeps the row).
-fn period_keeps_row(
-    predicate: &BoundPeriodPredicate,
-    row: &[Option<Vec<u8>>],
-    schema_columns: &[(String, LogicalType)],
-) -> bool {
-    match (
-        row_period_interval(&predicate.left, row, schema_columns),
-        row_period_interval(&predicate.right, row, schema_columns),
-    ) {
-        (Some(left), Some(right)) => evaluate(predicate.predicate, left, right),
-        _ => false,
+/// Both the committed-only fused scan ([`scan_rows`](SessionEngine::scan_rows)) and
+/// the read-your-own-writes overlay ([`filter_rows`]) read the same plan, so a
+/// `WHERE` filters identically whether or not the transaction has buffered writes.
+enum FilterPlan {
+    /// No predicate — keep every row.
+    KeepAll,
+    /// A fully-constant period predicate ([STL-165]) that folds false — keep none.
+    Empty,
+    /// A vectorized predicate to evaluate per row: a `<col> <cmp> <scalar>`
+    /// comparison ([STL-151], [STL-213]) or a per-row period predicate lowered to
+    /// `Expr::Period` ([STL-193], [STL-213]).
+    Predicate(Expr),
+}
+
+/// Resolve a bound `SELECT`'s mutually-exclusive `WHERE` shapes to a [`FilterPlan`].
+fn filter_plan(bound: &BoundSelect) -> FilterPlan {
+    if let Some(predicate) = &bound.filter {
+        return FilterPlan::Predicate(lower_predicate(predicate));
     }
-}
-
-/// Build one operand's `[from, to)` interval for a single row, or `None` when an
-/// endpoint cell is NULL or the resulting period is empty/reversed.
-fn row_period_interval(
-    operand: &BoundPeriod,
-    row: &[Option<Vec<u8>>],
-    schema_columns: &[(String, LogicalType)],
-) -> Option<Interval> {
-    let from = period_endpoint_micros(operand.from, row, schema_columns)?;
-    let to = period_endpoint_micros(operand.to, row, schema_columns)?;
-    Interval::new(from, to).ok()
-}
-
-/// Resolve one period endpoint to its microsecond instant for a single row: a
-/// constant is itself; a column is its cell decoded as a µs instant
-/// (`BIGINT`/`TIMESTAMP`/`TIMESTAMPTZ` — the binder already enforced the type).
-/// `None` for a NULL cell or a cell that does not decode to an instant.
-fn period_endpoint_micros(
-    endpoint: PeriodEndpoint,
-    row: &[Option<Vec<u8>>],
-    schema_columns: &[(String, LogicalType)],
-) -> Option<i64> {
-    match endpoint {
-        PeriodEndpoint::Const(micros) => Some(micros),
-        PeriodEndpoint::Column(index) => {
-            let bytes = row[index].as_ref()?;
-            match ScalarValue::decode(schema_columns[index].1, bytes).ok()? {
-                ScalarValue::Int8(v) | ScalarValue::Timestamp(v) | ScalarValue::TimestampTz(v) => {
-                    Some(v)
-                }
-                _ => None,
+    bound
+        .period_filter
+        .as_ref()
+        .map_or(FilterPlan::KeepAll, |period| {
+            match const_period_truth(period) {
+                Some(false) => FilterPlan::Empty,
+                Some(true) => FilterPlan::KeepAll,
+                None => FilterPlan::Predicate(lower_period_predicate(period)),
             }
-        }
-    }
+        })
 }
 
 /// Overlay a transaction's buffered writes for `table` onto the snapshot-resolved
@@ -2517,42 +2563,72 @@ fn overlay_row(
     row
 }
 
-/// Apply a bound `SELECT`'s `WHERE` and period predicates to already-materialized
-/// rows — the overlaid read-your-own-writes path ([STL-203]), where the buffer was
-/// layered on *after* the scan so the filter cannot be fused into it. Mirrors the
-/// committed-only path's filtering: a fully-constant period predicate that folds
-/// false drops every row; a per-row one ([STL-193]) is evaluated against each row;
-/// and a `WHERE <col> = <lit>` keeps a row iff the cell's canonical bytes equal the
-/// literal's — exactly the typed `=` the vectorized [`Filter`] applies (the encoding
-/// is canonical, and a `NULL` cell never equals a present literal).
+/// Apply a bound `SELECT`'s `WHERE` to already-materialized rows — the overlaid
+/// read-your-own-writes path ([STL-203]), where the buffer was layered on *after*
+/// the scan so the filter cannot be fused into it. The same [`FilterPlan`] the
+/// committed-only path runs is evaluated here ([STL-213]): a fully-constant period
+/// predicate that folds false drops every row, and any vectorized predicate is run
+/// over the materialized rows by [`rows_passing_filter`] — so the two paths agree
+/// on which rows survive, whatever the predicate's shape.
 fn filter_rows(
     bound: &BoundSelect,
     schema_columns: &[(String, LogicalType)],
     rows: Vec<Vec<Option<Vec<u8>>>>,
-) -> Vec<Vec<Option<Vec<u8>>>> {
-    let per_row_period = match &bound.period_filter {
-        Some(p) => match const_period_truth(p) {
-            Some(false) => return Vec::new(),
-            Some(true) => None,
-            None => Some(p),
-        },
-        None => None,
+) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+    match filter_plan(bound) {
+        FilterPlan::Empty => Ok(Vec::new()),
+        FilterPlan::KeepAll => Ok(rows),
+        FilterPlan::Predicate(predicate) => rows_passing_filter(&predicate, schema_columns, rows),
+    }
+}
+
+/// Evaluate a vectorized `WHERE` predicate over already-materialized rows, keeping
+/// the rows it reports TRUE ([STL-213]).
+///
+/// Bridges the row-major encoded cells into one typed column [`Vector`] per schema
+/// position — the same form the streaming [`Filter`] decodes from a batch — then
+/// runs the predicate through [`eval_expr`]. The overlay row set is a transaction's
+/// own buffered writes (small), so decoding every column is cheap and keeps the
+/// semantics identical to the committed-only `Filter`: a `FALSE` *or* `NULL` row is
+/// dropped (only a `TRUE` keeps a row).
+fn rows_passing_filter(
+    predicate: &Expr,
+    schema_columns: &[(String, LogicalType)],
+    rows: Vec<Vec<Option<Vec<u8>>>>,
+) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+    let row_count = rows.len();
+    if row_count == 0 {
+        return Ok(rows);
+    }
+    let mut columns: Vec<Vector> = Vec::with_capacity(schema_columns.len());
+    for (position, (_, ty)) in schema_columns.iter().enumerate() {
+        let cells: Vec<Option<Vec<u8>>> = rows
+            .iter()
+            .map(|row| row.get(position).cloned().flatten())
+            .collect();
+        let column = Column::Bytes(cells.into());
+        let vector = Vector::from_column(*ty, &column)
+            .map_err(|err| EngineError::Scan(ScanError::Eval(err)))?;
+        columns.push(vector);
+    }
+    let mask = match eval_expr(predicate, &columns, row_count)
+        .map_err(|err| EngineError::Scan(ScanError::Eval(err)))?
+    {
+        Vector::Bool(mask) => mask,
+        // The binder types every predicate as boolean, so a non-boolean result is
+        // a plan break rather than a data error — surface it, do not silently keep.
+        other => {
+            return Err(EngineError::Scan(ScanError::Eval(ExprError::NotBoolean {
+                op: "WHERE",
+                found: other.logical_type(),
+            })));
+        }
     };
-    let key_filter = bound
-        .filter
-        .as_ref()
-        .map(|p| (p.column_index, encode_value(&p.value)));
-    rows.into_iter()
-        .filter(|row| {
-            // `WHERE <col> = <lit>`: byte-equality on the canonical encoding.
-            let where_ok = key_filter.as_ref().is_none_or(|(col, bytes)| {
-                row.get(*col).and_then(|c| c.as_deref()) == Some(bytes.as_slice())
-            });
-            // Per-row period predicate ([STL-193]), if any.
-            let period_ok = per_row_period.is_none_or(|p| period_keeps_row(p, row, schema_columns));
-            where_ok && period_ok
-        })
-        .collect()
+    Ok(rows
+        .into_iter()
+        .zip(mask)
+        .filter_map(|(row, keep)| (keep == Some(true)).then_some(row))
+        .collect())
 }
 
 /// Map a bound [`JoinType`] to the executor's `ExecJoinType`. The two enums are
@@ -5201,6 +5277,143 @@ mod tests {
                 assert_eq!(got, expected, "predicate {kw} probe [{lo}, {hi})");
             }
         }
+    }
+
+    /// A `WHERE <timestamptz> <cmp> <literal>` now reaches the vectorized evaluator
+    /// ([STL-213], closing the [STL-206] `UnsupportedColumn` gap for the new types)
+    /// and orders by the underlying UTC instant. The reference is the same instant
+    /// comparison computed directly from `parse_timestamptz` — the dumb oracle the
+    /// testing strategy asks for the temporal case. A probe literal in a different
+    /// zone is normalized first, so a row whose `ts` is one instant written two ways
+    /// compares equal regardless of spelling.
+    #[test]
+    fn timestamptz_comparison_filters_by_the_instant() {
+        use stele_common::datetime::parse_timestamptz;
+
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE ev (id INT PRIMARY KEY, ts TIMESTAMP WITH TIME ZONE) \
+                 WITH SYSTEM VERSIONING",
+            ))
+            .expect("create");
+
+        // Distinct ids over assorted zones; row 3 is a `+05` spelling of row 2's
+        // exact instant, so an equality probe at that instant must match both.
+        let rows = [
+            (1, "2024-01-15 00:00:00Z"),
+            (2, "2024-01-15 07:00:00+00"),
+            (3, "2024-01-15 12:00:00+05"),
+            (4, "2024-06-01 12:30:00-04"),
+            (5, "2023-12-31 23:59:59.5Z"),
+        ];
+        for (id, literal) in rows {
+            engine
+                .execute(&parse_one(&format!(
+                    "INSERT INTO ev VALUES ({id}, '{literal}')"
+                )))
+                .expect("insert ts row");
+        }
+        let instant = |literal: &str| parse_timestamptz(literal).expect("probe literal parses");
+        let row_instants: Vec<(i32, i64)> =
+            rows.iter().map(|&(id, lit)| (id, instant(lit))).collect();
+
+        let holds = |op: CmpOp, a: i64, b: i64| match op {
+            CmpOp::Eq => a == b,
+            CmpOp::Ne => a != b,
+            CmpOp::Lt => a < b,
+            CmpOp::Le => a <= b,
+            CmpOp::Gt => a > b,
+            CmpOp::Ge => a >= b,
+        };
+        let comparisons = [
+            ("=", CmpOp::Eq),
+            ("<>", CmpOp::Ne),
+            ("<", CmpOp::Lt),
+            ("<=", CmpOp::Le),
+            (">", CmpOp::Gt),
+            (">=", CmpOp::Ge),
+        ];
+        // Probes: one equals rows 2/3's instant (a third zone spelling of it), one
+        // sits mid-set, one is past every row.
+        let probes = [
+            "2024-01-15 07:00:00Z",
+            "2024-01-15 02:00:00-05",
+            "2024-03-01 00:00:00Z",
+        ];
+        for &(sym, op) in &comparisons {
+            for &probe in &probes {
+                let pin = instant(probe);
+                let sql = format!("SELECT id FROM ev WHERE ts {sym} '{probe}'");
+                let mut got: Vec<i32> = select(&mut engine, &sql)
+                    .rows
+                    .into_iter()
+                    .map(|row| {
+                        let bytes = row[0].clone().expect("id is never NULL");
+                        match ScalarValue::decode(LogicalType::Int4, &bytes).expect("decode id") {
+                            ScalarValue::Int4(id) => id,
+                            _ => panic!("id column is declared INT"),
+                        }
+                    })
+                    .collect();
+                got.sort_unstable();
+                let mut want: Vec<i32> = row_instants
+                    .iter()
+                    .filter(|&&(_, t)| holds(op, t, pin))
+                    .map(|&(id, _)| id)
+                    .collect();
+                want.sort_unstable();
+                assert_eq!(got, want, "ts {sym} '{probe}'");
+            }
+        }
+    }
+
+    /// Integer `/` and `%` in a `WHERE` reach the evaluator over the live SQL path
+    /// ([STL-213]). Truncating division and a remainder that follows the dividend's
+    /// sign select exactly the expected keys.
+    #[test]
+    fn integer_division_and_modulo_filter_over_sql() {
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE n (id INT PRIMARY KEY, v INT) WITH SYSTEM VERSIONING",
+            ))
+            .expect("create");
+        for (id, v) in [(1, 0), (2, 3), (3, 4), (4, 7), (5, -7)] {
+            engine
+                .execute(&parse_one(&format!("INSERT INTO n VALUES ({id}, {v})")))
+                .expect("insert");
+        }
+        let ids = |engine: &mut SessionEngine<ZeroClock, MemDisk>, sql: &str| -> Vec<i32> {
+            let mut out: Vec<i32> = select(engine, sql)
+                .rows
+                .into_iter()
+                .map(|row| {
+                    let bytes = row[0].clone().expect("id never NULL");
+                    match ScalarValue::decode(LogicalType::Int4, &bytes).expect("decode id") {
+                        ScalarValue::Int4(id) => id,
+                        _ => panic!("id is INT"),
+                    }
+                })
+                .collect();
+            out.sort_unstable();
+            out
+        };
+        // v % 2 = 0 → even v: 0, 4 (ids 1, 3). -7 % 2 = -1, 3 % 2 = 1, 7 % 2 = 1.
+        assert_eq!(
+            ids(&mut engine, "SELECT id FROM n WHERE v % 2 = 0"),
+            vec![1, 3]
+        );
+        // v / 2 = 2 → trunc-toward-zero: 4/2 = 2 (id 3) only (7/2 = 3, 3/2 = 1).
+        assert_eq!(
+            ids(&mut engine, "SELECT id FROM n WHERE v / 2 = 2"),
+            vec![3]
+        );
+        // v % 2 = -1 → remainder takes the dividend's sign, so only -7 (id 5).
+        assert_eq!(
+            ids(&mut engine, "SELECT id FROM n WHERE v % 2 = -1"),
+            vec![5]
+        );
     }
 
     #[test]

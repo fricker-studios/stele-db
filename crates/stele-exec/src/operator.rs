@@ -447,5 +447,9 @@ fn collect_columns(expr: &Expr, out: &mut BTreeSet<usize>) {
             collect_columns(left, out);
             collect_columns(right, out);
         }
+        Expr::MakePeriod { from, to } => {
+            collect_columns(from, out);
+            collect_columns(to, out);
+        }
     }
 }

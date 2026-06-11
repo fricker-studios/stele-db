@@ -83,23 +83,110 @@ pub enum Projection {
     Columns(Vec<String>),
 }
 
-/// A bound `WHERE <column> = <literal>` predicate ([STL-151]).
+/// A comparison operator a `WHERE` predicate lowers ([STL-213]).
 ///
-/// The one filter shape v0.2 lowers: a single column compared for equality
-/// against a folded literal. The executor applies it after resolving the row's
-/// cells, and pushes it down to segment zone-map pruning when the column is the
-/// business key (the only column a zone map can currently reason about). Richer
-/// comparisons (`<`, `>`, ranges, conjunctions) are a deferred follow-up.
+/// Mirrors the executor's `stele_exec::CmpOp`; the engine maps between them when
+/// it lowers the bound plan (the two crates do not depend on each other — the same
+/// split [`AggregateFunc`] / [`JoinType`] draw).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    /// `=` — equal.
+    Eq,
+    /// `<>` / `!=` — not equal.
+    Ne,
+    /// `<` — strictly less.
+    Lt,
+    /// `<=` — less or equal.
+    Le,
+    /// `>` — strictly greater.
+    Gt,
+    /// `>=` — greater or equal.
+    Ge,
+}
+
+/// An integer arithmetic operator a `WHERE` scalar lowers ([STL-213]).
+///
+/// Mirrors the executor's `stele_exec::ArithOp` (same crate-split reason as
+/// [`CompareOp`]). `/` and `%` divide-by-zero to a NULL cell in the evaluator, so
+/// a `WHERE` over them is total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    /// `+` — addition.
+    Add,
+    /// `-` — subtraction.
+    Sub,
+    /// `*` — multiplication.
+    Mul,
+    /// `/` — truncating integer division.
+    Div,
+    /// `%` — remainder (sign follows the dividend).
+    Mod,
+}
+
+/// One side of a bound `WHERE` comparison: a value column, a folded literal, or an
+/// integer arithmetic combination of them ([STL-213]).
+///
+/// Columns are referenced by **schema index** (`0` is the business key, the rest
+/// value columns) — the same positional convention [`BoundPredicate`] and
+/// [`BoundAggregate`] use. The executor lowers this straight to a vectorized
+/// `stele_exec::Expr` over the reconstructed row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundScalar {
+    /// The value column at this schema index.
+    Column(usize),
+    /// A constant, folded to the predicate's anchor-column type.
+    Literal(ScalarValue),
+    /// `left <op> right` — integer arithmetic over two scalars.
+    Arith {
+        /// The arithmetic operator.
+        op: ArithOp,
+        /// The left operand.
+        left: Box<BoundScalar>,
+        /// The right operand.
+        right: Box<BoundScalar>,
+    },
+}
+
+/// A bound `WHERE <scalar> <compare> <scalar>` predicate ([STL-151], [STL-213]).
+///
+/// v0.2 lowers a single comparison over exactly one column — `<column> = <literal>`
+/// to start with ([STL-151]), now any of the six [comparison operators](CompareOp)
+/// with either side an integer arithmetic expression of that column ([STL-213],
+/// e.g. `qty % 2 = 0`, `price > 100`). The column anchors the literal folding, so
+/// both sides share its type and the executor's typed comparison is well-formed.
+///
+/// The executor applies it after resolving the row's cells, and pushes it down to
+/// segment zone-map pruning when it is a business-key equality
+/// ([`key_equality`](Self::key_equality) — the only shape a zone map can reason
+/// about). Column-to-column comparisons, `AND`/`OR` chains, and `BETWEEN`/`IN`
+/// remain deferred follow-ups.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundPredicate {
-    /// The column the predicate compares (its name, for diagnostics).
-    pub column: String,
-    /// The column's position in the resolved schema — `0` is the business key,
-    /// the rest are value columns. The executor projects this column out of the
-    /// resolved row to test it.
-    pub column_index: usize,
-    /// The literal the column must equal, folded to the column's type.
-    pub value: ScalarValue,
+    /// The comparison's left operand.
+    pub left: BoundScalar,
+    /// The comparison operator.
+    pub op: CompareOp,
+    /// The comparison's right operand.
+    pub right: BoundScalar,
+}
+
+impl BoundPredicate {
+    /// The literal this predicate equates the **business key** (schema column `0`)
+    /// to, if it is exactly `<key> = <literal>` (in either operand order) — the one
+    /// shape the scan pushes down to zone-map pruning. `None` for every richer
+    /// predicate (a non-equality, a value-column compare, an arithmetic side),
+    /// which the vectorized filter still applies exactly.
+    #[must_use]
+    pub const fn key_equality(&self) -> Option<&ScalarValue> {
+        if !matches!(self.op, CompareOp::Eq) {
+            return None;
+        }
+        match (&self.left, &self.right) {
+            (BoundScalar::Column(0), BoundScalar::Literal(value))
+            | (BoundScalar::Literal(value), BoundScalar::Column(0)) => Some(value),
+            _ => None,
+        }
+    }
 }
 
 /// A bound `SELECT … [FOR SYSTEM_TIME AS OF …]`, ready to lower to a
@@ -128,7 +215,9 @@ pub struct BoundSelect {
     /// The columns the query projects.
     pub projection: Projection,
     /// The lowered `WHERE` predicate, or `None` for an unfiltered read. v0.2
-    /// lowers `<column> = <literal>` only ([STL-151]).
+    /// lowers a single comparison over one column — `<column> = <literal>`
+    /// ([STL-151]) through any comparison operator with an integer-arithmetic side
+    /// ([STL-213]).
     pub filter: Option<BoundPredicate>,
     /// A bound `WHERE PERIOD(a, b) <pred> PERIOD(c, d)` period predicate, or
     /// `None` when the `WHERE` is not one ([STL-165], [STL-193]). When every
@@ -433,12 +522,13 @@ pub enum SelectError {
         column: String,
     },
 
-    /// The `WHERE` clause is not the one shape v0.2 lowers — `<column> =
-    /// <literal>` ([STL-151]). A join predicate, a non-equality comparison, a
-    /// column-to-column compare, an `AND`/`OR` chain, or a literal that cannot
-    /// fold to the column's type all surface here rather than being silently
-    /// dropped (which would return unfiltered rows — a wrong answer).
-    #[error("v0.2 supports only a `<column> = <literal>` WHERE ({0})")]
+    /// The `WHERE` clause is not a shape v0.2 lowers — a single comparison over
+    /// one column, either side optionally an integer arithmetic of it ([STL-151],
+    /// [STL-213]). A join predicate, a column-to-column compare, an `AND`/`OR`
+    /// chain, `BETWEEN`/`IN`, arithmetic over a non-integer column, or a literal
+    /// that cannot fold to the column's type all surface here rather than being
+    /// silently dropped (which would return unfiltered rows — a wrong answer).
+    #[error("unsupported WHERE predicate ({0})")]
     UnsupportedPredicate(String),
 
     /// A `SELECT` item in an aggregate query is a bare column that is **not** in
@@ -1580,10 +1670,14 @@ fn bind_period_endpoint(
 
 /// Lower a `WHERE` clause to a [`BoundPredicate`], or `None` when there is none.
 ///
-/// v0.2 lowers exactly `<column> = <literal>` (the column on either side): the
-/// column must exist in the schema and the literal must fold to its type. Every
-/// other shape is [`SelectError::UnsupportedPredicate`] — never silently dropped,
-/// since dropping a filter returns rows the query excluded.
+/// v0.2 lowers a single comparison over exactly one column ([STL-151], [STL-213]):
+/// any of the six [comparison operators](CompareOp), with either side optionally an
+/// integer arithmetic expression of that column (`qty % 2 = 0`, `price > 100`,
+/// either order). The one column anchors the literal folding, so both sides share
+/// its type. Every other shape — a column-to-column compare, an `AND`/`OR` chain,
+/// `BETWEEN`/`IN`, arithmetic over a non-integer column — is
+/// [`SelectError::UnsupportedPredicate`], never silently dropped (which would
+/// return rows the query excluded).
 fn bind_filter(
     select: &Select,
     schema: &TableSchema,
@@ -1593,45 +1687,164 @@ fn bind_filter(
         return Ok(None);
     };
     // Peel parentheses around the whole predicate so `WHERE (id = 1)` binds like
-    // `WHERE id = 1` — the column/comparand sides are unwrapped the same way.
-    let Expr::BinaryOp {
-        left,
-        op: BinaryOperator::Eq,
-        right,
-    } = unwrap_nested(expr)
-    else {
+    // `WHERE id = 1`. The top level must be a comparison; its operands are bound as
+    // scalars below.
+    let Expr::BinaryOp { left, op, right } = unwrap_nested(expr) else {
         return Err(SelectError::UnsupportedPredicate(
-            "the WHERE is not an equality".to_owned(),
+            "the WHERE is not a comparison".to_owned(),
         ));
     };
-    // The column may be on either side: `col = <lit>` or `<lit> = col`. A bare
-    // identifier is a column; anything else (a literal, a qualified name, an
-    // expression) is the comparand side.
-    let (column, value_expr) = match (where_column(left), where_column(right)) {
-        (Some(column), None) => (column, right.as_ref()),
-        (None, Some(column)) => (column, left.as_ref()),
-        _ => {
-            return Err(SelectError::UnsupportedPredicate(
-                "the WHERE is not `<column> = <literal>`".to_owned(),
-            ));
-        }
+    let Some(compare) = compare_op(op) else {
+        return Err(SelectError::UnsupportedPredicate(format!(
+            "operator `{op}` is not a comparison"
+        )));
     };
-    let column_index = schema
-        .columns()
-        .iter()
-        .position(|c| c.name() == column)
-        .ok_or_else(|| SelectError::UnknownColumn {
-            table: table.to_owned(),
-            column: column.to_owned(),
-        })?;
-    let ty = schema.columns()[column_index].ty();
-    let value = fold::fold_scalar(value_expr, ty)
-        .map_err(|err| SelectError::UnsupportedPredicate(predicate_reason(&err, column, ty)))?;
+    // Exactly one column may appear across the whole predicate; it anchors the type
+    // every literal folds to (and the type any arithmetic computes in).
+    let anchor = filter_anchor(left, right, schema, table)?;
     Ok(Some(BoundPredicate {
-        column: column.to_owned(),
-        column_index,
-        value,
+        left: bind_scalar(left, &anchor, schema, table)?,
+        op: compare,
+        right: bind_scalar(right, &anchor, schema, table)?,
     }))
+}
+
+/// The single column a `WHERE` predicate filters on, resolved to its schema index
+/// and type — the anchor every literal in the predicate folds against.
+struct FilterAnchor<'a> {
+    /// The column's name, for fold diagnostics.
+    name: &'a str,
+    /// The column's schema index (`0` is the business key).
+    index: usize,
+    /// The column's type.
+    ty: LogicalType,
+}
+
+/// Resolve the one column a comparison references to a [`FilterAnchor`].
+///
+/// A predicate with no column has no type to anchor (a constant `WHERE` v0.2 does
+/// not lower); one referencing two distinct columns is a column-to-column compare
+/// (a deferred follow-up). Both are [`SelectError::UnsupportedPredicate`]; an
+/// unknown single column is [`SelectError::UnknownColumn`].
+fn filter_anchor<'a>(
+    left: &'a Expr,
+    right: &'a Expr,
+    schema: &TableSchema,
+    table: &str,
+) -> Result<FilterAnchor<'a>, SelectError> {
+    let mut names: Vec<&str> = Vec::new();
+    collect_where_columns(left, &mut names);
+    collect_where_columns(right, &mut names);
+    names.sort_unstable();
+    names.dedup();
+    match names.as_slice() {
+        [name] => {
+            let index = column_index(schema, name).ok_or_else(|| SelectError::UnknownColumn {
+                table: table.to_owned(),
+                column: (*name).to_owned(),
+            })?;
+            Ok(FilterAnchor {
+                name,
+                index,
+                ty: schema.columns()[index].ty(),
+            })
+        }
+        [] => Err(SelectError::UnsupportedPredicate(
+            "the WHERE references no column".to_owned(),
+        )),
+        _ => Err(SelectError::UnsupportedPredicate(
+            "a column-to-column comparison is not supported".to_owned(),
+        )),
+    }
+}
+
+/// Collect the bare column names a `WHERE` operand references, descending through
+/// parentheses and arithmetic. A non-identifier leaf (a literal) contributes none.
+fn collect_where_columns<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
+    match expr {
+        Expr::Identifier(id) => out.push(id.value.as_str()),
+        Expr::Nested(inner) => collect_where_columns(inner, out),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_where_columns(left, out);
+            collect_where_columns(right, out);
+        }
+        _ => {}
+    }
+}
+
+/// Bind one side of a `WHERE` comparison to a [`BoundScalar`]: the anchor column,
+/// an integer arithmetic of it, or a literal folded to the anchor's type.
+///
+/// Arithmetic is integer-only (the evaluator computes `+ - * / %` over
+/// `int4`/`int8`); over a non-integer anchor it is rejected at bind time rather
+/// than erroring per row.
+fn bind_scalar(
+    expr: &Expr,
+    anchor: &FilterAnchor<'_>,
+    schema: &TableSchema,
+    table: &str,
+) -> Result<BoundScalar, SelectError> {
+    match unwrap_nested(expr) {
+        Expr::Identifier(id) => {
+            let index =
+                column_index(schema, &id.value).ok_or_else(|| SelectError::UnknownColumn {
+                    table: table.to_owned(),
+                    column: id.value.clone(),
+                })?;
+            Ok(BoundScalar::Column(index))
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let Some(arith) = arith_op(op) else {
+                return Err(SelectError::UnsupportedPredicate(format!(
+                    "operator `{op}` is not supported in a WHERE comparand"
+                )));
+            };
+            if !matches!(anchor.ty, LogicalType::Int4 | LogicalType::Int8) {
+                return Err(SelectError::UnsupportedPredicate(format!(
+                    "arithmetic in a WHERE needs an integer column, but `{}` is {}",
+                    anchor.name, anchor.ty
+                )));
+            }
+            Ok(BoundScalar::Arith {
+                op: arith,
+                left: Box::new(bind_scalar(left, anchor, schema, table)?),
+                right: Box::new(bind_scalar(right, anchor, schema, table)?),
+            })
+        }
+        leaf => {
+            let value = fold::fold_scalar(leaf, anchor.ty).map_err(|err| {
+                SelectError::UnsupportedPredicate(predicate_reason(&err, anchor.name, anchor.ty))
+            })?;
+            Ok(BoundScalar::Literal(value))
+        }
+    }
+}
+
+/// Map a parsed comparison [`BinaryOperator`] to a [`CompareOp`], or `None` if it
+/// is not a comparison (a connective, an arithmetic, a string/regex operator).
+const fn compare_op(op: &BinaryOperator) -> Option<CompareOp> {
+    Some(match op {
+        BinaryOperator::Eq => CompareOp::Eq,
+        BinaryOperator::NotEq => CompareOp::Ne,
+        BinaryOperator::Lt => CompareOp::Lt,
+        BinaryOperator::LtEq => CompareOp::Le,
+        BinaryOperator::Gt => CompareOp::Gt,
+        BinaryOperator::GtEq => CompareOp::Ge,
+        _ => return None,
+    })
+}
+
+/// Map a parsed arithmetic [`BinaryOperator`] to an [`ArithOp`], or `None` if it is
+/// not one of the integer arithmetic operators.
+const fn arith_op(op: &BinaryOperator) -> Option<ArithOp> {
+    Some(match op {
+        BinaryOperator::Plus => ArithOp::Add,
+        BinaryOperator::Minus => ArithOp::Sub,
+        BinaryOperator::Multiply => ArithOp::Mul,
+        BinaryOperator::Divide => ArithOp::Div,
+        BinaryOperator::Modulo => ArithOp::Mod,
+        _ => return None,
+    })
 }
 
 /// Peel any number of parentheses (`Expr::Nested`) wrapping `expr`, returning the
@@ -2571,41 +2784,118 @@ mod tests {
     #[test]
     fn where_on_the_key_binds_to_column_zero() {
         // `id` is the business key — column index 0 — so the executor can push it
-        // down to zone-map pruning.
+        // down to zone-map pruning (a [`BoundPredicate::key_equality`]).
         let catalog = catalog_with_account(1_000);
+        let bound = bind("SELECT balance FROM account WHERE id = 7", &catalog)
+            .unwrap()
+            .filter
+            .unwrap();
         assert_eq!(
-            bind("SELECT balance FROM account WHERE id = 7", &catalog)
-                .unwrap()
-                .filter,
-            Some(BoundPredicate {
-                column: "id".to_owned(),
-                column_index: 0,
-                value: ScalarValue::Int4(7),
-            })
+            bound,
+            BoundPredicate {
+                left: BoundScalar::Column(0),
+                op: CompareOp::Eq,
+                right: BoundScalar::Literal(ScalarValue::Int4(7)),
+            }
         );
+        assert_eq!(bound.key_equality(), Some(&ScalarValue::Int4(7)));
     }
 
     #[test]
     fn where_on_a_value_column_binds_to_its_index() {
         // `balance` is a value column — index 1 — folded against its int4 type.
-        // The column may sit on either side of the `=`.
+        // The column may sit on either side of the `=`; the bound predicate mirrors
+        // the operand order, and neither is a business-key equality.
         let catalog = catalog_with_account(1_000);
-        let want = Some(BoundPredicate {
-            column: "balance".to_owned(),
-            column_index: 1,
-            value: ScalarValue::Int4(100),
-        });
+        let lit = || BoundScalar::Literal(ScalarValue::Int4(100));
+        let col = || BoundScalar::Column(1);
+        let column_first = bind("SELECT id FROM account WHERE balance = 100", &catalog)
+            .unwrap()
+            .filter
+            .unwrap();
         assert_eq!(
-            bind("SELECT id FROM account WHERE balance = 100", &catalog)
-                .unwrap()
-                .filter,
-            want
+            column_first,
+            BoundPredicate {
+                left: col(),
+                op: CompareOp::Eq,
+                right: lit(),
+            }
         );
         assert_eq!(
             bind("SELECT id FROM account WHERE 100 = balance", &catalog)
                 .unwrap()
                 .filter,
-            want
+            Some(BoundPredicate {
+                left: lit(),
+                op: CompareOp::Eq,
+                right: col(),
+            })
+        );
+        // A value-column equality is not pushed down to the key zone map.
+        assert_eq!(column_first.key_equality(), None);
+    }
+
+    #[test]
+    fn each_comparison_operator_binds() {
+        // All six comparisons over a value column reach the evaluator (STL-213) —
+        // the non-equalities were rejected before.
+        let catalog = catalog_with_account(1_000);
+        let cases = [
+            ("=", CompareOp::Eq),
+            ("<>", CompareOp::Ne),
+            ("!=", CompareOp::Ne),
+            ("<", CompareOp::Lt),
+            ("<=", CompareOp::Le),
+            (">", CompareOp::Gt),
+            (">=", CompareOp::Ge),
+        ];
+        for (sym, op) in cases {
+            let sql = format!("SELECT id FROM account WHERE balance {sym} 100");
+            assert_eq!(
+                bind(&sql, &catalog).unwrap().filter,
+                Some(BoundPredicate {
+                    left: BoundScalar::Column(1),
+                    op,
+                    right: BoundScalar::Literal(ScalarValue::Int4(100)),
+                }),
+                "binding `{sym}`"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_arithmetic_in_a_where_binds_div_and_mod() {
+        // `/` and `%` (and the other integer ops) bind to a nested arithmetic
+        // scalar over the column (STL-213).
+        let catalog = catalog_with_account(1_000);
+        assert_eq!(
+            bind("SELECT id FROM account WHERE balance % 2 = 0", &catalog)
+                .unwrap()
+                .filter,
+            Some(BoundPredicate {
+                left: BoundScalar::Arith {
+                    op: ArithOp::Mod,
+                    left: Box::new(BoundScalar::Column(1)),
+                    right: Box::new(BoundScalar::Literal(ScalarValue::Int4(2))),
+                },
+                op: CompareOp::Eq,
+                right: BoundScalar::Literal(ScalarValue::Int4(0)),
+            })
+        );
+        // Arithmetic may sit on the literal side too, and `/` binds the same way.
+        assert_eq!(
+            bind("SELECT id FROM account WHERE 5 = balance / 10", &catalog)
+                .unwrap()
+                .filter,
+            Some(BoundPredicate {
+                left: BoundScalar::Literal(ScalarValue::Int4(5)),
+                op: CompareOp::Eq,
+                right: BoundScalar::Arith {
+                    op: ArithOp::Div,
+                    left: Box::new(BoundScalar::Column(1)),
+                    right: Box::new(BoundScalar::Literal(ScalarValue::Int4(10))),
+                },
+            })
         );
     }
 
@@ -2617,9 +2907,9 @@ mod tests {
                 .unwrap()
                 .filter,
             Some(BoundPredicate {
-                column: "id".to_owned(),
-                column_index: 0,
-                value: ScalarValue::Int4(7),
+                left: BoundScalar::Column(0),
+                op: CompareOp::Eq,
+                right: BoundScalar::Literal(ScalarValue::Int4(7)),
             })
         );
     }
@@ -2642,11 +2932,11 @@ mod tests {
         // so each unsupported shape is a bind error.
         let catalog = catalog_with_account(1_000);
         for sql in [
-            "SELECT id FROM account WHERE balance > 100", // non-equality
-            "SELECT id FROM account WHERE id = balance",  // column = column
+            "SELECT id FROM account WHERE id = balance", // column = column
             "SELECT id FROM account WHERE balance = 'x'", // type mismatch
             "SELECT id FROM account WHERE balance = NULL", // NULL comparand
             "SELECT id FROM account WHERE id = 1 AND balance = 2", // conjunction
+            "SELECT id FROM account WHERE id % 2 = balance", // arithmetic vs a 2nd column
         ] {
             assert!(
                 matches!(
@@ -2656,6 +2946,17 @@ mod tests {
                 "expected UnsupportedPredicate for: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn arithmetic_over_a_non_integer_column_is_rejected() {
+        // The evaluator computes arithmetic over int4/int8 only; `vf` is TIMESTAMP,
+        // so `vf / 2` is a bind error rather than a per-row evaluator failure.
+        let catalog = catalog_with_booking(1_000);
+        assert!(matches!(
+            bind("SELECT id FROM booking WHERE vf / 2 = 0", &catalog),
+            Err(SelectError::UnsupportedPredicate(_))
+        ));
     }
 
     // ---- period predicates (STL-165) ----
@@ -3087,9 +3388,9 @@ mod tests {
         assert_eq!(
             bound.filter,
             Some(BoundPredicate {
-                column: "id".to_owned(),
-                column_index: 0,
-                value: ScalarValue::Int4(1),
+                left: BoundScalar::Column(0),
+                op: CompareOp::Eq,
+                right: BoundScalar::Literal(ScalarValue::Int4(1)),
             })
         );
     }

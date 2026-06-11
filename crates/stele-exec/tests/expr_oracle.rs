@@ -235,15 +235,25 @@ fn gen_expr(rng: &mut Rng, ty: Ty, budget: u32) -> Expr {
                 gen_expr(rng, ty, budget - 1).arith(op, gen_expr(rng, ty, budget - 1))
             }
         }
-        // The non-numeric, non-boolean types are leaves — they enter expressions
-        // only as comparison / period-predicate operands.
-        Ty::Text
-        | Ty::Timestamp
-        | Ty::TimestampTz
-        | Ty::Date
-        | Ty::Uuid
-        | Ty::Bytea
-        | Ty::Period => leaf(rng),
+        // The non-numeric, non-boolean scalar types are leaves — they enter
+        // expressions only as comparison / period-predicate operands.
+        Ty::Text | Ty::Timestamp | Ty::TimestampTz | Ty::Date | Ty::Uuid | Ty::Bytea => leaf(rng),
+        Ty::Period => {
+            if rng.one_in(2) {
+                leaf(rng)
+            } else {
+                // Build a PERIOD from two instant operands — the `MakePeriod` node
+                // STL-213 lowers a per-row `PERIOD(from, to)` to. Endpoints may be
+                // any of the three µs-instant types (mixed allowed); a reversed or
+                // equal pair yields a NULL period both sides must agree on.
+                let instants = [Ty::Int8, Ty::Timestamp, Ty::TimestampTz];
+                let from_ty = instants[rng.below(3) as usize];
+                let from = gen_expr(rng, from_ty, budget - 1);
+                let to_ty = instants[rng.below(3) as usize];
+                let to = gen_expr(rng, to_ty, budget - 1);
+                Expr::make_period(from, to)
+            }
+        }
         Ty::Bool => match rng.below(6) {
             0 => leaf(rng),
             1 => {
@@ -341,7 +351,28 @@ fn eval_scalar(expr: &Expr, row: &[Option<ScalarValue>]) -> Result<Option<Scalar
                 _ => None,
             }
         }
+        Expr::MakePeriod { from, to } => {
+            let from = eval_scalar(from, row)?;
+            let to = eval_scalar(to, row)?;
+            match (from, to) {
+                // A NULL endpoint, or an empty/reversed pair, makes the period NULL
+                // — the same "unknown ⇒ NULL" the vectorized `make_period` returns.
+                (Some(from), Some(to)) => Interval::new(scalar_instant(&from), scalar_instant(&to))
+                    .ok()
+                    .map(ScalarValue::Period),
+                _ => None,
+            }
+        }
     })
+}
+
+/// The microsecond instant of an `int8` / `timestamp` / `timestamptz` scalar — the
+/// three types a `MakePeriod` endpoint may be (the generator produces only those).
+fn scalar_instant(value: &ScalarValue) -> i64 {
+    match value {
+        ScalarValue::Int8(v) | ScalarValue::Timestamp(v) | ScalarValue::TimestampTz(v) => *v,
+        _ => panic!("a period endpoint must be an int8/timestamp/timestamptz instant"),
+    }
 }
 
 /// Pull a boolean out of an optional scalar, erroring on a non-boolean — the

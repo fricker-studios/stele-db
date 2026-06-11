@@ -11,13 +11,16 @@
 //! filter, and projection lowering.
 //!
 //! A seeded random multi-column history (inserts + partial updates, NULLs
-//! included) is applied to both; then a fixed matrix of `(projection, WHERE col =
-//! value)` probes is swept and the engine's rows are asserted byte-for-byte equal
-//! to the reference's. The [teeth test](#tests) injects a *documented intentional
-//! bug* (a reference that ignores the `WHERE`) and proves the very same
-//! differential check catches it.
+//! included) is applied to both; then a fixed matrix of `(projection, WHERE)`
+//! probes is swept and the engine's rows are asserted byte-for-byte equal to the
+//! reference's. The `WHERE` probes span every comparison operator and integer
+//! `/` / `%` arithmetic ([STL-213]), not just the original `<col> = <literal>`
+//! ([STL-151]). The [teeth test](#tests) injects a *documented intentional bug* (a
+//! reference that ignores the `WHERE`) and proves the very same differential check
+//! catches it.
 //!
 //! [STL-151]: https://allegromusic.atlassian.net/browse/STL-151
+//! [STL-213]: https://allegromusic.atlassian.net/browse/STL-213
 
 use stele_common::time::{Clock, SystemTimeMicros};
 use stele_common::types::{LogicalType, ScalarValue};
@@ -98,13 +101,95 @@ impl Row {
     }
 }
 
-/// One `WHERE col = value` predicate, or `None` for an unfiltered read.
-type Filter = Option<(usize, ScalarValue)>;
+/// One `WHERE <col> [<arith> k] <cmp> <literal>` predicate, or `None` for an
+/// unfiltered read — the STL-151 / STL-213 WHERE surface the oracle sweeps.
+type Filter = Option<Where>;
 
-/// The reference answer: filter by `==` on the cell's encoding (a NULL cell never
-/// matches), order by the encoded business key (the engine's `BTreeMap` order),
-/// then project the requested columns. `ignore_filter` is the seam for the teeth
-/// test — the *correct* reference passes `false`.
+/// A swept `WHERE` predicate: a column, optionally wrapped in an integer `% k` /
+/// `/ k` ([STL-213]), compared against a literal.
+#[derive(Clone)]
+struct Where {
+    /// The column the predicate reads.
+    col: usize,
+    /// An optional integer arithmetic applied to the (int) column first.
+    arith: Option<(Arith, i32)>,
+    /// The comparison operator.
+    cmp: Cmp,
+    /// The literal compared against (`Int4` for an int column, `Text` for col 3).
+    value: ScalarValue,
+}
+
+/// The six comparison operators ([STL-213] broadens the binder past `=`).
+#[derive(Clone, Copy)]
+enum Cmp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// The two integer arithmetic operators STL-213's Definition of Done names.
+#[derive(Clone, Copy)]
+enum Arith {
+    Div,
+    Mod,
+}
+
+impl Cmp {
+    /// The SQL spelling.
+    const fn sql(self) -> &'static str {
+        match self {
+            Self::Eq => "=",
+            Self::Ne => "<>",
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Gt => ">",
+            Self::Ge => ">=",
+        }
+    }
+
+    /// Whether `a <cmp> b` holds — the deliberately-dumb truth, straight off the
+    /// ordering.
+    fn holds<T: Ord + ?Sized>(self, a: &T, b: &T) -> bool {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        matches!(
+            (self, a.cmp(b)),
+            (Self::Eq, Equal)
+                | (Self::Ne, Less | Greater)
+                | (Self::Lt, Less)
+                | (Self::Le, Less | Equal)
+                | (Self::Gt, Greater)
+                | (Self::Ge, Greater | Equal)
+        )
+    }
+}
+
+impl Arith {
+    /// The SQL spelling.
+    const fn sql(self) -> &'static str {
+        match self {
+            Self::Div => "/",
+            Self::Mod => "%",
+        }
+    }
+
+    /// Truncating division / remainder, matching the evaluator's checked ops (a
+    /// zero divisor would be `None`; the probes never use one).
+    const fn apply(self, value: i32, k: i32) -> Option<i32> {
+        match self {
+            Self::Div => value.checked_div(k),
+            Self::Mod => value.checked_rem(k),
+        }
+    }
+}
+
+/// The reference answer: filter by evaluating the predicate in plain Rust (a NULL
+/// cell, or a `None` arithmetic, never matches — the engine's 3VL stance), order by
+/// the encoded business key (the engine's `BTreeMap` order), then project the
+/// requested columns. `ignore_filter` is the seam for the teeth test — the *correct*
+/// reference passes `false`.
 fn reference(
     rows: &[Row],
     projection: &[usize],
@@ -114,12 +199,10 @@ fn reference(
     let mut matched: Vec<&Row> = rows
         .iter()
         .filter(|row| {
-            let (Some((col, value)), false) = (filter, ignore_filter) else {
+            let (Some(predicate), false) = (filter, ignore_filter) else {
                 return true;
             };
-            let mut want = Vec::new();
-            value.encode(&mut want);
-            row.cell(*col).as_deref() == Some(want.as_slice())
+            where_keeps(row, predicate)
         })
         .collect();
     matched.sort_by_key(|row| row.cell(0));
@@ -129,20 +212,53 @@ fn reference(
         .collect()
 }
 
-/// Render `WHERE col = value` (or empty) as SQL — the comparand literal in the
-/// column's lexical form.
-fn where_sql(filter: &Filter) -> String {
-    match filter {
-        None => String::new(),
-        Some((col, value)) => {
-            let literal = match value {
-                ScalarValue::Int4(v) => v.to_string(),
-                ScalarValue::Text(s) => format!("'{s}'"),
-                _ => unreachable!("the oracle only filters int4 / text columns"),
+/// Whether a row passes a `WHERE` predicate: decode the cell, apply any integer
+/// arithmetic, then compare. A NULL cell (or a `None` arithmetic result) is never
+/// kept — only a TRUE keeps the row, the same three-valued rule the engine's
+/// `Filter` applies.
+fn where_keeps(row: &Row, predicate: &Where) -> bool {
+    match &predicate.value {
+        // The text column (index 3) is compared lexicographically; no arithmetic.
+        ScalarValue::Text(want) => row
+            .c
+            .as_deref()
+            .is_some_and(|s| predicate.cmp.holds(s, want.as_str())),
+        // The int columns (0 = id, 1 = a, 2 = b), optionally wrapped in arithmetic.
+        ScalarValue::Int4(want) => {
+            let cell = match predicate.col {
+                0 => Some(row.id),
+                1 => row.a,
+                2 => row.b,
+                _ => unreachable!("only columns 0..=2 are int4"),
             };
-            format!(" WHERE {} = {literal}", COLUMNS[*col].0)
+            let value = match (cell, predicate.arith) {
+                (Some(v), Some((arith, k))) => arith.apply(v, k),
+                (Some(v), None) => Some(v),
+                (None, _) => None,
+            };
+            value.is_some_and(|v| predicate.cmp.holds(&v, want))
         }
+        _ => unreachable!("the oracle filters int4 / text columns only"),
     }
+}
+
+/// Render a `WHERE` predicate (or empty) as SQL — the column, any arithmetic, the
+/// operator, and the comparand literal in the column's lexical form.
+fn where_sql(filter: &Filter) -> String {
+    let Some(predicate) = filter else {
+        return String::new();
+    };
+    let column = COLUMNS[predicate.col].0;
+    let lhs = match predicate.arith {
+        Some((arith, k)) => format!("{column} {} {k}", arith.sql()),
+        None => column.to_owned(),
+    };
+    let literal = match &predicate.value {
+        ScalarValue::Int4(v) => v.to_string(),
+        ScalarValue::Text(s) => format!("'{s}'"),
+        _ => unreachable!("the oracle only filters int4 / text columns"),
+    };
+    format!(" WHERE {lhs} {} {literal}", predicate.cmp.sql())
 }
 
 /// The projection list as SQL: `*` for all columns, else the names in order.
@@ -281,18 +397,58 @@ fn probes() -> Vec<(Vec<usize>, bool, Filter)> {
         (vec![2, 3, 0], false),
         (vec![0, 1, 2, 3], false),
     ];
-    let filters: [Filter; 11] = [
+    // `i`: `col <cmp> int`; `t`: `c <cmp> 'text'`; `arith`: `col <op> k <cmp> int`.
+    let i = |col, cmp, v| {
+        Some(Where {
+            col,
+            arith: None,
+            cmp,
+            value: ScalarValue::Int4(v),
+        })
+    };
+    let t = |cmp, s: &str| {
+        Some(Where {
+            col: 3,
+            arith: None,
+            cmp,
+            value: ScalarValue::Text(s.to_owned()),
+        })
+    };
+    let arith = |col, op, k, cmp, v| {
+        Some(Where {
+            col,
+            arith: Some((op, k)),
+            cmp,
+            value: ScalarValue::Int4(v),
+        })
+    };
+    let filters: Vec<Filter> = vec![
         None,
-        Some((0, ScalarValue::Int4(1))),
-        Some((0, ScalarValue::Int4(3))),
-        Some((0, ScalarValue::Int4(999))), // matches nothing
-        Some((1, ScalarValue::Int4(1))),
-        Some((1, ScalarValue::Int4(2))),
-        Some((2, ScalarValue::Int4(10))),
-        Some((2, ScalarValue::Int4(20))),
-        Some((3, ScalarValue::Text("x".to_owned()))),
-        Some((3, ScalarValue::Text("y".to_owned()))),
-        Some((3, ScalarValue::Text("absent".to_owned()))), // matches nothing
+        // Equalities — the STL-151 surface (key push-down + value columns + text).
+        i(0, Cmp::Eq, 1),
+        i(0, Cmp::Eq, 999), // matches nothing
+        i(1, Cmp::Eq, 1),
+        i(2, Cmp::Eq, 10),
+        t(Cmp::Eq, "x"),
+        t(Cmp::Eq, "absent"), // matches nothing
+        // Inequalities and ordering across every operator (STL-213).
+        i(0, Cmp::Ge, 3),
+        i(0, Cmp::Lt, 4),
+        i(1, Cmp::Ne, 1),
+        i(1, Cmp::Lt, 2),
+        i(1, Cmp::Gt, 1),
+        i(1, Cmp::Le, 2),
+        i(2, Cmp::Gt, 10),
+        t(Cmp::Lt, "y"),
+        t(Cmp::Ge, "y"),
+        t(Cmp::Ne, "x"),
+        // Integer division / modulo on either int value column (STL-213).
+        arith(1, Arith::Mod, 2, Cmp::Eq, 0),
+        arith(1, Arith::Mod, 2, Cmp::Eq, 1),
+        arith(1, Arith::Div, 2, Cmp::Eq, 1),
+        arith(2, Arith::Div, 10, Cmp::Eq, 1),
+        arith(2, Arith::Div, 10, Cmp::Gt, 1),
+        arith(2, Arith::Mod, 10, Cmp::Ne, 0),
     ];
     let mut out = Vec::new();
     for (projection, all) in projections {
