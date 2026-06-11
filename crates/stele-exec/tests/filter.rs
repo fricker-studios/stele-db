@@ -47,6 +47,9 @@ fn drain_bytes(mut op: impl Operator, index: usize) -> Vec<Option<Vec<u8>>> {
     let mut out = Vec::new();
     while let Some(batch) = op.next().expect("filter pull") {
         assert!(batch.rows > 0, "operators never emit an empty batch");
+        // Filter emits a zero-copy selection over the full columns ([STL-214]);
+        // materialize to read just the surviving rows in order.
+        let batch = batch.into_dense();
         let (_, column) = &batch.columns[index];
         match column {
             Column::Bytes(cells) => out.extend(cells.iter().cloned()),
@@ -80,10 +83,7 @@ fn filter_keeps_true_rows_and_skips_fully_filtered_batches() {
                 .collect(),
         )
     };
-    let batch = |vals: &[&str]| Batch {
-        columns: vec![(ColumnId::Payload, col(vals))],
-        rows: vals.len(),
-    };
+    let batch = |vals: &[&str]| Batch::new(vec![(ColumnId::Payload, col(vals))], vals.len());
     let source = VecSource::new(vec![
         batch(&["v1", "v2"]),
         batch(&["v3", "v4"]),
@@ -119,10 +119,10 @@ fn filter_passes_through_unreferenced_columns() {
         ]
         .into(),
     );
-    let batch = Batch {
-        columns: vec![(ColumnId::BusinessKey, keys), (ColumnId::Payload, payloads)],
-        rows: 3,
-    };
+    let batch = Batch::new(
+        vec![(ColumnId::BusinessKey, keys), (ColumnId::Payload, payloads)],
+        3,
+    );
     let predicate = Expr::col(0).compare(CmpOp::Eq, Expr::lit(ScalarValue::Int4(2)));
     // The unreferenced column 1 is given an out-of-scope type on purpose: a
     // correct Filter never decodes it, so this must not error.
@@ -133,6 +133,9 @@ fn filter_passes_through_unreferenced_columns() {
     );
     let out = filter.next().expect("pull").expect("one batch");
     assert_eq!(out.rows, 1);
+    // Filter emits a zero-copy selection over the full columns ([STL-214]);
+    // materialize it to compare the surviving row's cells by value.
+    let out = out.into_dense();
     // The surviving row carries both columns, aligned: key 2 and payload "two".
     assert_eq!(
         out.columns[0].1,
@@ -148,8 +151,8 @@ fn filter_passes_through_unreferenced_columns() {
 fn a_referenced_column_with_no_schema_type_is_a_distinct_error() {
     // The predicate references column 1, but the schema gives only one type —
     // a schema/type-vector gap, reported distinctly from a missing batch column.
-    let batch = Batch {
-        columns: vec![
+    let batch = Batch::new(
+        vec![
             (
                 ColumnId::BusinessKey,
                 Column::Bytes(vec![cell(&ScalarValue::Int4(1))].into()),
@@ -159,8 +162,8 @@ fn a_referenced_column_with_no_schema_type_is_a_distinct_error() {
                 Column::Bytes(vec![Some(b"x".to_vec())].into()),
             ),
         ],
-        rows: 1,
-    };
+        1,
+    );
     let predicate = Expr::col(1).compare(CmpOp::Eq, Expr::lit(ScalarValue::Int4(0)));
     let mut filter = Filter::new(
         VecSource::new(vec![batch]),
@@ -174,6 +177,91 @@ fn a_referenced_column_with_no_schema_type_is_a_distinct_error() {
         })) => {}
         other => panic!("expected ColumnTypeMissing, got {other:?}"),
     }
+}
+
+// --- zero-copy row selection (STL-214) -------------------------------------
+
+#[test]
+fn filter_selects_surviving_rows_without_copying_payload_cells() {
+    // Two columns — an int4 key and a text payload — over three rows; the
+    // predicate keeps only key == 2 (physical row 1). A pre-STL-214 `Filter`
+    // gathered the survivors into a fresh buffer, deep-copying each surviving
+    // cell; the selection-vector form keeps the child's buffers and carries the
+    // kept indices, so the surviving payload bytes are never re-allocated.
+    let keys = Column::Bytes(
+        vec![
+            cell(&ScalarValue::Int4(1)),
+            cell(&ScalarValue::Int4(2)),
+            cell(&ScalarValue::Int4(3)),
+        ]
+        .into(),
+    );
+    let payloads = Column::Bytes(
+        vec![
+            Some(b"one".to_vec()),
+            Some(b"two".to_vec()),
+            Some(b"three".to_vec()),
+        ]
+        .into(),
+    );
+    // Record the surviving cell's byte-buffer address *before* the batch is moved
+    // into the source — `Filter` must hand back this very heap allocation.
+    let Column::Bytes(payload_in) = &payloads else {
+        unreachable!("payload is bytes")
+    };
+    let survivor_ptr = payload_in[1].as_ref().map(Vec::as_ptr);
+
+    let batch = Batch::new(
+        vec![(ColumnId::BusinessKey, keys), (ColumnId::Payload, payloads)],
+        3,
+    );
+    let predicate = Expr::col(0).compare(CmpOp::Eq, Expr::lit(ScalarValue::Int4(2)));
+    let mut filter = Filter::new(
+        VecSource::new(vec![batch]),
+        predicate,
+        vec![LogicalType::Int4, LogicalType::Text],
+    );
+
+    let out = filter.next().expect("pull").expect("one surviving row");
+
+    // One logical row survives, carried as a selection over the shared columns —
+    // not a gathered copy: the columns still hold all three physical rows.
+    assert_eq!(out.rows, 1);
+    let selection = out
+        .selection
+        .as_ref()
+        .expect("Filter emits a selection vector, not a gathered batch");
+    assert_eq!(
+        selection.to_vec(),
+        vec![1usize],
+        "the surviving row is physical row 1"
+    );
+    let physical = out.physical_row(0);
+
+    let Column::Bytes(payload_out) = &out.columns[1].1 else {
+        panic!("payload is bytes")
+    };
+    assert_eq!(
+        payload_out.len(),
+        3,
+        "the shared column keeps every physical row — the selection narrows it"
+    );
+    // The surviving payload cell is the same heap allocation as the input: a deep
+    // copy would have re-allocated its bytes at a different address.
+    assert_eq!(
+        payload_out[physical].as_ref().map(Vec::as_ptr),
+        survivor_ptr,
+        "Filter copied the surviving payload bytes instead of selecting them",
+    );
+
+    // Materializing the selection yields exactly the gather it replaces.
+    let dense = out.into_dense();
+    assert_eq!(dense.selection, None);
+    assert_eq!(dense.rows, 1);
+    assert_eq!(
+        dense.columns[1].1,
+        Column::Bytes(vec![Some(b"two".to_vec())].into()),
+    );
 }
 
 // --- row-at-a-time equivalence (the second DoD bullet) ---------------------
@@ -218,21 +306,23 @@ fn vectorized(rows: &[Row], column_index: usize, literal: &ScalarValue) -> Vec<i
     // Columns are tagged with arbitrary distinct ids — `Filter` addresses them
     // by position, and `ColumnId` has no value-column variants — so any three
     // distinct tags serve.
-    let batch = Batch {
-        columns: vec![
+    let batch = Batch::new(
+        vec![
             (ColumnId::BusinessKey, column(&|r| r.cells()[0].clone())),
             (ColumnId::Payload, column(&|r| r.cells()[1].clone())),
             (ColumnId::Principal, column(&|r| r.cells()[2].clone())),
         ],
-        rows: rows.len(),
-    };
+        rows.len(),
+    );
     let schema = vec![LogicalType::Int4, LogicalType::Int4, LogicalType::Text];
     let predicate = Expr::col(column_index).compare(CmpOp::Eq, Expr::lit(literal.clone()));
     let mut filter = Filter::new(VecSource::new(vec![batch]), predicate, schema);
 
-    // Read the surviving keys back out of column 0.
+    // Read the surviving keys back out of column 0. Filter emits a zero-copy
+    // selection ([STL-214]); materialize each batch to read the surviving cells.
     let mut keys = Vec::new();
     while let Some(out) = filter.next().expect("pull") {
+        let out = out.into_dense();
         let Column::Bytes(cells) = &out.columns[0].1 else {
             panic!("key column is bytes");
         };

@@ -25,16 +25,16 @@ impl Operator for VecSource {
 /// A `[BusinessKey, Payload]` batch — the shape `run_select`'s scan emits.
 fn scan_batch(keys: &[&[u8]], payloads: Vec<Option<Vec<u8>>>) -> Batch {
     assert_eq!(keys.len(), payloads.len(), "one payload per key");
-    Batch {
-        columns: vec![
+    Batch::new(
+        vec![
             (
                 ColumnId::BusinessKey,
                 Column::Bytes(keys.iter().map(|k| Some(k.to_vec())).collect()),
             ),
             (ColumnId::Payload, Column::Bytes(payloads.into())),
         ],
-        rows: keys.len(),
-    }
+        keys.len(),
+    )
 }
 
 fn source(batches: Vec<Batch>) -> VecSource {

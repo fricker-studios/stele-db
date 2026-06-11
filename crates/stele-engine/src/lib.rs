@@ -2407,11 +2407,15 @@ fn dml_business_key(dml: &BoundDml) -> BusinessKey {
     business_key(key)
 }
 
-/// The cell of bytes column `id` at `row`, or `None` if the column is absent,
-/// not a bytes column, or its cell is a SQL `NULL` ([STL-154]). The scan only
-/// ever projects [`ColumnId::BusinessKey`] / [`ColumnId::Payload`], both bytes
-/// columns; the business key is always present, the payload may be `None`.
+/// The cell of bytes column `id` at logical `row`, or `None` if the column is
+/// absent, not a bytes column, or its cell is a SQL `NULL` ([STL-154]). The scan
+/// only ever projects [`ColumnId::BusinessKey`] / [`ColumnId::Payload`], both
+/// bytes columns; the business key is always present, the payload may be `None`.
+///
+/// `row` is a *logical* index: a selection-vector batch ([STL-214]) is honored by
+/// resolving it to the physical row the selection names before indexing.
 fn column_cell(batch: &Batch, id: ColumnId, row: usize) -> Option<Vec<u8>> {
+    let row = batch.physical_row(row);
     batch.columns.iter().find_map(|(cid, col)| match col {
         Column::Bytes(v) if *cid == id => v.get(row).cloned().flatten(),
         _ => None,
@@ -2740,13 +2744,19 @@ fn decode_key_column(
     Ok(cols)
 }
 
-/// Read the cell at `position`/`row` of an exploded pipeline batch as the
+/// Read the cell at `position`/logical `row` of an exploded pipeline batch as the
 /// [`SelectResult`]'s raw-bytes form ([STL-206]). Every column the pipeline
 /// projects — the business key and the [`ExplodePayload`]-produced value columns —
 /// is a [`Column::Bytes`] carrying each cell's canonical encoding (`None` for a
 /// SQL `NULL`); a fixed-width column never reaches a projected position, but is
 /// reinterpreted losslessly rather than panicking if one ever did.
+///
+/// The [`Filter`] feeding this sink emits a selection-vector batch ([STL-214]):
+/// its columns are the full upstream buffers and `row` is a logical index, so
+/// resolve it through the selection — reading only the surviving cell, never
+/// materializing the whole filtered column.
 fn batch_cell(batch: &Batch, position: usize, row: usize) -> Option<Vec<u8>> {
+    let row = batch.physical_row(row);
     match &batch.columns[position].1 {
         Column::Bytes(cells) => cells[row].clone(),
         Column::I64(values) => Some(values[row].to_le_bytes().to_vec()),
