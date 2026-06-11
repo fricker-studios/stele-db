@@ -78,8 +78,8 @@ use stele_sql::select::{
     PeriodEndpoint, Projection, SelectError,
 };
 use stele_sql::{
-    AdminCommand, BindContext, BindError, Statement, StatementBody, bind_ddl, bind_dml,
-    bind_select, without_filter,
+    AdminCommand, BindContext, BindError, Statement, StatementBody, TimeDimension, bind_ddl,
+    bind_dml, bind_select, without_filter,
 };
 use stele_storage::backend::Disk;
 use stele_storage::delta::{BusinessKey, Snapshot};
@@ -310,12 +310,13 @@ pub enum DmlSummary {
 /// transaction — matching what a crash recovery (which finds no durable record)
 /// reconstructs, without a restart.
 ///
-/// What this deliberately does *not* yet do:
-/// * **Read-your-own-writes on a *valid-time* table.** The overlay ([STL-203])
-///   models the system-time row set — one current version per business key — so it
-///   applies only to system-only tables; a valid-time table's buffered writes are
-///   not yet overlaid period-by-period inside the block (its no-pin read can span
-///   several valid periods per key). [STL-223] is the follow-up.
+/// Read-your-own-writes covers **valid-time** tables too ([STL-223]): a write
+/// supersedes one live version per business key (the storage path closes the prior
+/// system period and opens a new one carrying the new valid interval), so the same
+/// business-key overlay the system-time row set uses applies, and a `FOR VALID_TIME
+/// AS OF v` read re-filters the overlaid rows on their `[valid_from, valid_to)`
+/// bounds. A `FOR SYSTEM_TIME AS OF` read still reads committed history only — the
+/// uncommitted buffer is not part of any past system state.
 ///
 /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
 /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
@@ -626,6 +627,20 @@ pub enum EngineError {
          after its snapshot; retry the transaction"
     )]
     Conflict,
+
+    /// A `FOR VALID_TIME AS OF` pin of a transaction's overlaid rows
+    /// (read-your-own-writes — [STL-223]) could not be applied: either the table's
+    /// period columns could not be resolved to positions, or a period bound
+    /// (`valid_from` / `valid_to`) cell was missing or not a well-formed eight-byte
+    /// timestamp. The binder routes a valid pin only to a valid-time table and always
+    /// writes both bounds as concrete instants, so this signals an internal contract
+    /// break (a corrupt buffered write or scanned row, or a schema/temporal
+    /// mismatch), never user input — surfaced rather than silently returning rows
+    /// outside the pin.
+    ///
+    /// [STL-223]: https://allegromusic.atlassian.net/browse/STL-223
+    #[error("valid-time period information for an overlaid AS OF read could not be resolved")]
+    MalformedValidBound,
 }
 
 /// One table's live state inside a session.
@@ -1191,13 +1206,17 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// then `SELECT`, then `INSERT` / `UPDATE` / `DELETE`.
     ///
     /// `overlay` is the transaction's buffered writes for **read-your-own-writes**
-    /// ([STL-203]) — empty on the auto-commit path. A `SELECT` overlays them on its
-    /// resolved rows, but only for a *plain current* read: any explicit `AS OF`
-    /// qualifier (`stmt.temporal.as_of` non-empty) — including `FOR SYSTEM_TIME AS OF
-    /// now()`, which folds to the pinned snapshot — reads history and must show only
-    /// committed state, so the overlay is dropped for it.
+    /// ([STL-203], extended to valid-time tables by [STL-223]) — empty on the
+    /// auto-commit path. A `SELECT` overlays them on its resolved rows unless it
+    /// time-travels the **system** axis: a `FOR SYSTEM_TIME AS OF` qualifier —
+    /// including `FOR SYSTEM_TIME AS OF now()`, which folds to the pinned snapshot —
+    /// reads system history and must show only committed state, so the overlay is
+    /// dropped for it. A `FOR VALID_TIME AS OF` qualifier does *not* drop it: it
+    /// filters the valid axis of the *current* (uncommitted) system state, so the
+    /// transaction's own writes still participate ([STL-223]).
     ///
     /// [STL-203]: https://allegromusic.atlassian.net/browse/STL-203
+    /// [STL-223]: https://allegromusic.atlassian.net/browse/STL-223
     fn execute_at(
         &mut self,
         stmt: &Statement,
@@ -1229,18 +1248,23 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             };
             match bind_select(stmt, &ctx) {
                 Ok(bound) => {
-                    // Read-your-own-writes ([STL-203]): a plain current read in the
-                    // transaction overlays its buffered writes. Any explicit `AS OF`
-                    // qualifier drops the overlay — it reads history and must show
-                    // only committed state. Gating on the *qualifier*, not on
-                    // `bound.snapshot == read_snapshot`: `FOR SYSTEM_TIME AS OF now()`
-                    // folds to the pinned snapshot, so snapshot equality would wrongly
-                    // overlay an explicit time-travel read.
-                    let live: &[BoundDml] = if stmt.temporal.as_of.is_empty() {
-                        overlay
-                    } else {
-                        &[]
-                    };
+                    // Read-your-own-writes ([STL-203], [STL-223]): a current read in
+                    // the transaction overlays its buffered writes. A `FOR SYSTEM_TIME
+                    // AS OF` qualifier drops the overlay — it time-travels the system
+                    // axis and must show only committed history, and the uncommitted
+                    // buffer belongs to the current system state, not a past one. A
+                    // `FOR VALID_TIME AS OF` qualifier keeps it: that filters the valid
+                    // axis of the *current* (read-your-own-writes) system state, so the
+                    // buffer still participates ([STL-223]). Gating on the qualifier's
+                    // *dimension*, not on `bound.snapshot == read_snapshot`: `FOR
+                    // SYSTEM_TIME AS OF now()` folds to the pinned snapshot, so snapshot
+                    // equality would wrongly overlay a system time-travel read.
+                    let system_time_travel = stmt
+                        .temporal
+                        .as_of
+                        .iter()
+                        .any(|a| a.dimension == TimeDimension::System);
+                    let live: &[BoundDml] = if system_time_travel { &[] } else { overlay };
                     return self.run_select(&bound, live);
                 }
                 // Not a SELECT either ⇒ try the DML router below.
@@ -1522,15 +1546,33 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .collect();
         let value_count = schema_columns.len().saturating_sub(1);
 
+        // The valid-time period columns' positions in the schema (`(from, to)`, each
+        // an index into `schema_columns` — and so into a reconstructed row, which is
+        // key-then-values in the same order), used to pin the valid axis of overlaid
+        // rows for a `FOR VALID_TIME AS OF` read ([STL-223]); `None` for a
+        // system-only table.
+        let valid_cols = schema.temporal().valid_time().and_then(|spec| {
+            let idx = |name: &str| schema_columns.iter().position(|(n, _)| n == name);
+            Some((idx(spec.from_column())?, idx(spec.to_column())?))
+        });
+
         // Reconstruct the full rows [key, value cells…] live at the snapshot, after
-        // the `WHERE` filter. Read-your-own-writes ([STL-203]): when this read sits
-        // inside a transaction that has buffered writes for this table, overlay their
-        // effect on the pinned-snapshot rows before filtering/projecting; otherwise
-        // take the committed-only fused scan+filter fast path ([STL-206]). Valid-time
-        // tables are not yet overlaid (a no-pin read spans multiple periods per key —
-        // a follow-up), so they always read the committed snapshot.
-        let rows = if !state.valid_time && overlay.iter().any(|d| d.table() == table) {
-            Self::overlaid_rows(bound, state, &schema_columns, value_count, overlay)?
+        // the `WHERE` filter. Read-your-own-writes ([STL-203], [STL-223]): when this
+        // read sits inside a transaction that has buffered writes for this table,
+        // overlay their effect on the pinned-snapshot rows before filtering/projecting;
+        // otherwise take the committed-only fused scan+filter fast path ([STL-206]). A
+        // valid-time table is overlaid too — its writes supersede one version per
+        // business key like a system-only table, and a `FOR VALID_TIME AS OF` pin is
+        // re-applied to the overlaid rows ([STL-223]).
+        let rows = if overlay.iter().any(|d| d.table() == table) {
+            Self::overlaid_rows(
+                bound,
+                state,
+                &schema_columns,
+                value_count,
+                overlay,
+                valid_cols,
+            )?
         } else {
             Self::scan_rows(bound, state, &schema_columns, value_count)?
         };
@@ -1661,16 +1703,37 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// ([`filter_rows`]) rather than fused into the scan as on the committed-only
     /// path. Byte-equality on the canonical encoding is exactly the typed `=` the
     /// fused [`Filter`] applies, so the two paths agree on which rows survive.
+    ///
+    /// On a **valid-time** table ([STL-223]) the unfiltered base also leaves the valid
+    /// axis open (`scan_all_rows` pins no valid instant), so a `FOR VALID_TIME AS OF v`
+    /// read filters the overlaid rows to those whose `[valid_from, valid_to)` contains
+    /// `v` ([`filter_overlaid_valid`]) — the same half-open cut the committed-only scan
+    /// makes with [`SnapshotScan::valid_as_of`] ([STL-164]) — before the `WHERE`.
+    /// `valid_cols` is the `(from, to)` period-column positions, `None` for a
+    /// system-only table (which never carries a valid pin).
     fn overlaid_rows(
         bound: &BoundSelect,
         state: &TableState<C, D>,
         schema_columns: &[(String, LogicalType)],
         value_count: usize,
         overlay: &[BoundDml],
+        valid_cols: Option<(usize, usize)>,
     ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
         let base = Self::scan_all_rows(state, bound.snapshot, value_count)?;
         let overlaid = overlay_table_writes(base, overlay, bound.table.as_str(), value_count);
-        filter_rows(bound, schema_columns, overlaid)
+        // Pin the valid axis when the read carries `FOR VALID_TIME AS OF v`. The pin
+        // only ever reaches a valid-time table (`bind_select` rejects it otherwise),
+        // so the period columns are present whenever `valid_snapshot` is set — but if
+        // they cannot be resolved, fail closed (`MalformedValidBound`) rather than
+        // silently skip the filter and return rows outside the pin.
+        let pinned = match bound.valid_snapshot {
+            Some(v) => {
+                let (from_idx, to_idx) = valid_cols.ok_or(EngineError::MalformedValidBound)?;
+                filter_overlaid_valid(overlaid, from_idx, to_idx, v.0)?
+            }
+            None => overlaid,
+        };
+        filter_rows(bound, schema_columns, pinned)
     }
 
     /// Run a bound two-table `JOIN` ([STL-172]).
@@ -2738,9 +2801,18 @@ fn filter_plan(bound: &BoundSelect) -> FilterPlan {
 /// `INSERT` sets the key's row to the inserted values; `UPDATE` is a read-modify-
 /// write merging the `SET` overrides onto the key's current row (an absent key
 /// starts all-`NULL`, mirroring [`live_value_cells`](SessionEngine::live_value_cells));
-/// `DELETE` removes the key. Keying by business key models the system-time row set
-/// — one current version per key — which is why the caller restricts the overlay to
-/// system-only tables.
+/// `DELETE` removes the key. Keying by business key models the row set both a
+/// system-only and a valid-time table resolve at a system snapshot: each write
+/// supersedes one live version per key (the storage write path closes the prior
+/// system period and opens a new one — [`ValidTimeWriter::update`] / `insert`), so a
+/// snapshot resolves at most one live version per key on the system axis. A
+/// valid-time table carries its `[valid_from, valid_to)` bounds in the row's own
+/// value cells ([STL-194]); a `FOR VALID_TIME AS OF` read filters on them *after*
+/// this overlay ([`filter_overlaid_valid`], [STL-223]).
+///
+/// [STL-194]: https://allegromusic.atlassian.net/browse/STL-194
+/// [STL-223]: https://allegromusic.atlassian.net/browse/STL-223
+/// [`ValidTimeWriter::update`]: stele_storage::validtime::ValidTimeWriter::update
 fn overlay_table_writes(
     base: Vec<Vec<Option<Vec<u8>>>>,
     overlay: &[BoundDml],
@@ -2806,6 +2878,50 @@ fn overlay_row(
         row.push(values.get(i).and_then(|v| v.as_ref().map(encode_value)));
     }
     row
+}
+
+/// Keep the overlaid rows whose valid-time period `[valid_from, valid_to)` contains
+/// `point` — the post-overlay valid-axis pin a `FOR VALID_TIME AS OF v`
+/// read-your-own-writes read applies ([STL-223]).
+///
+/// The overlay base ([`scan_all_rows`](SessionEngine::scan_all_rows)) leaves the
+/// valid axis open, so every system-live period is present with its bounds in the
+/// row's own value cells (`from_idx` / `to_idx`, the row codec carries them —
+/// [STL-194]). This reproduces the half-open `from ≤ point < to` cut the
+/// committed-only scan makes with [`SnapshotScan::valid_as_of`] ([STL-164]), so the
+/// overlay and committed paths agree on which periods a valid pin admits.
+fn filter_overlaid_valid(
+    rows: Vec<Vec<Option<Vec<u8>>>>,
+    from_idx: usize,
+    to_idx: usize,
+    point: i64,
+) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in rows {
+        let from = valid_bound_micros(&row, from_idx)?;
+        let to = valid_bound_micros(&row, to_idx)?;
+        if from <= point && point < to {
+            kept.push(row);
+        }
+    }
+    Ok(kept)
+}
+
+/// Read one valid-time period bound (`valid_from` / `valid_to`) out of an overlaid
+/// row as raw microseconds. The bound is one of the row's value cells, stored as a
+/// little-endian `i64` — a `TIMESTAMP` / `TIMESTAMPTZ` / `BIGINT` cell, all of which
+/// encode to the same eight bytes ([`ScalarValue::encode`]). The binder always
+/// writes both bounds as concrete instants (an omitted upper bound becomes
+/// `VALID_TIME_OPEN`, [STL-194]), so a missing or wrong-width cell is a corrupt
+/// buffered write or scanned row rather than user input — surfaced, never silently
+/// admitted or dropped.
+fn valid_bound_micros(row: &[Option<Vec<u8>>], idx: usize) -> Result<i64, EngineError> {
+    let bytes: [u8; 8] = row
+        .get(idx)
+        .and_then(Option::as_deref)
+        .and_then(|cell| cell.try_into().ok())
+        .ok_or(EngineError::MalformedValidBound)?;
+    Ok(i64::from_le_bytes(bytes))
 }
 
 /// Apply a bound `SELECT`'s `WHERE` to already-materialized rows — the overlaid
@@ -4723,6 +4839,373 @@ mod tests {
             payload_column(&as_of),
             vec![encode_value(&ScalarValue::Int4(100))],
             "an explicit AS OF read ignores the transaction's buffered writes",
+        );
+    }
+
+    // --- STL-223: read-your-own-writes on a valid-time table ----------------
+
+    /// The four-column plain read of the valid-time oracle table `acct`.
+    const VALID_PLAIN: &str = "SELECT id, balance, vf, vt FROM acct";
+
+    /// Run a `FOR VALID_TIME AS OF v` read of `acct` inside `txn` (the overlay
+    /// path — [STL-223]).
+    fn read_acct_in_txn_as_of(
+        engine: &mut SessionEngine<ZeroClock, MemDisk>,
+        txn: &mut SessionTransaction,
+        v: i64,
+    ) -> StatementOutcome {
+        let sql = format!("SELECT id, balance FROM acct FOR VALID_TIME AS OF {v}");
+        engine
+            .execute_in_txn(&parse_one(&sql), txn)
+            .expect("valid-time AS OF read inside the transaction")
+    }
+
+    /// A `SELECT`'s rows keyed by their (never-NULL) `id` cell, asserting the
+    /// at-most-one-live-version-per-key invariant a valid-time table resolves at a
+    /// snapshot — so a collapsed overlay or a duplicated reference row is caught.
+    fn rows_by_id(out: StatementOutcome) -> BTreeMap<Vec<u8>, Vec<Option<Vec<u8>>>> {
+        let StatementOutcome::Rows(r) = out else {
+            panic!("a SELECT must return rows");
+        };
+        let mut by_id = BTreeMap::new();
+        for row in r.rows {
+            let id = row
+                .first()
+                .and_then(Clone::clone)
+                .expect("the id key is never NULL");
+            assert!(
+                by_id.insert(id, row).is_none(),
+                "one system-live version per key broke",
+            );
+        }
+        by_id
+    }
+
+    /// Generate one well-formed valid-time DML statement against `acct`, advancing
+    /// `alive` (which keys currently hold a live version) so the workload never
+    /// updates/deletes an absent key (the apply path would `KeyNotFound`) nor
+    /// re-inserts a live one (`KeyExists`). `tick` distinguishes successive
+    /// balances; a fraction of updates keep the prior balance (`SET` only the
+    /// period) to exercise the read-modify-write carry-over through the overlay.
+    fn gen_valid_stmt(
+        rng: &mut ValidOracleRng,
+        alive: &mut [bool],
+        tick: i64,
+        key_pool: i64,
+        vmax: i64,
+    ) -> String {
+        let k = rng.below(key_pool);
+        let ku = usize::try_from(k).expect("fits");
+        let ki = i32::try_from(k).expect("key fits i32");
+        let balance = i32::try_from(tick + 1).expect("balance fits i32");
+        let from = rng.below(vmax);
+        let open = rng.below(4) == 0;
+        let to = if open {
+            i64::MAX
+        } else {
+            from + 1 + rng.below(vmax - from)
+        };
+
+        if alive[ku] && rng.below(2) == 0 {
+            alive[ku] = false;
+            format!("DELETE FROM acct WHERE id = {ki}")
+        } else if alive[ku] {
+            let keep_balance = rng.below(3) == 0;
+            let set = if keep_balance && open {
+                format!("SET vf = {from}")
+            } else if keep_balance {
+                format!("SET vf = {from}, vt = {to}")
+            } else if open {
+                format!("SET balance = {balance}, vf = {from}")
+            } else {
+                format!("SET balance = {balance}, vf = {from}, vt = {to}")
+            };
+            format!("UPDATE acct {set} WHERE id = {ki}")
+        } else {
+            alive[ku] = true;
+            if open {
+                format!("INSERT INTO acct (id, balance, vf) VALUES ({ki}, {balance}, {from})")
+            } else {
+                format!("INSERT INTO acct VALUES ({ki}, {balance}, {from}, {to})")
+            }
+        }
+    }
+
+    #[test]
+    fn a_valid_time_transaction_reads_its_own_writes_period_by_period() {
+        // STL-223: read-your-own-writes on a *valid-time* table. A plain read and a
+        // `FOR VALID_TIME AS OF v` read inside the block both reflect the buffered
+        // INSERT/UPDATE/DELETE at the correct valid periods; another connection sees
+        // nothing until COMMIT; ROLLBACK discards. The general differential against
+        // committing the same buffer is the sibling oracle below; this pins the exact
+        // period semantics readably.
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE acct (id INT PRIMARY KEY, balance INT, vf TIMESTAMP, vt TIMESTAMP) \
+                 WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+            ))
+            .expect("create valid-time table");
+        // A committed base: key 1 valid over [10, 20).
+        engine
+            .execute(&parse_one("INSERT INTO acct VALUES (1, 100, 10, 20)"))
+            .expect("seed committed base");
+
+        // The sorted (id, balance) cells a read returns, in canonical-byte space.
+        // A surviving row's id and balance are never NULL in this workload.
+        let kv = |id: i32, bal: i32| {
+            (
+                encode_value(&ScalarValue::Int4(id)),
+                encode_value(&ScalarValue::Int4(bal)),
+            )
+        };
+        let pairs = |out: StatementOutcome| -> Vec<(Vec<u8>, Vec<u8>)> {
+            let StatementOutcome::Rows(r) = out else {
+                panic!("rows");
+            };
+            let mut v: Vec<(Vec<u8>, Vec<u8>)> = r
+                .rows
+                .into_iter()
+                .map(|row| {
+                    (
+                        row[0].clone().expect("id is never NULL"),
+                        row[1].clone().expect("balance is never NULL"),
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+
+        let mut txn = engine.begin();
+        // Stage a second key valid over [30, 40).
+        engine
+            .stage_dml(
+                &parse_one("INSERT INTO acct VALUES (2, 200, 30, 40)"),
+                &mut txn,
+            )
+            .expect("stage insert key 2");
+
+        // Plain read: both the committed and the buffered key are visible.
+        assert_eq!(
+            pairs(
+                engine
+                    .execute_in_txn(&parse_one("SELECT id, balance FROM acct"), &mut txn)
+                    .expect("plain read")
+            ),
+            vec![kv(1, 100), kv(2, 200)],
+            "the buffered INSERT is visible alongside the committed row",
+        );
+        // FOR VALID_TIME AS OF picks each key only inside its own period.
+        assert_eq!(
+            pairs(read_acct_in_txn_as_of(&mut engine, &mut txn, 15)),
+            vec![kv(1, 100)],
+            "valid 15 lands in key 1's [10,20) only",
+        );
+        assert_eq!(
+            pairs(read_acct_in_txn_as_of(&mut engine, &mut txn, 35)),
+            vec![kv(2, 200)],
+            "valid 35 lands in the buffered key 2's [30,40) only",
+        );
+
+        // A buffered UPDATE widens key 2's period to [30, 50) and changes balance —
+        // closing the prior [30,40) and opening the new one, period-by-period.
+        engine
+            .stage_dml(
+                &parse_one("UPDATE acct SET balance = 250, vf = 30, vt = 50 WHERE id = 2"),
+                &mut txn,
+            )
+            .expect("stage update key 2");
+        assert_eq!(
+            pairs(read_acct_in_txn_as_of(&mut engine, &mut txn, 45)),
+            vec![kv(2, 250)],
+            "valid 45 now lands in key 2's widened [30,50) with the updated balance",
+        );
+        assert!(
+            pairs(read_acct_in_txn_as_of(&mut engine, &mut txn, 25)).is_empty(),
+            "valid 25 is in neither key's period (key 2 starts at 30)",
+        );
+
+        // A buffered DELETE of key 1 removes it for the transaction at every instant.
+        engine
+            .stage_dml(&parse_one("DELETE FROM acct WHERE id = 1"), &mut txn)
+            .expect("stage delete key 1");
+        assert!(
+            pairs(read_acct_in_txn_as_of(&mut engine, &mut txn, 15)).is_empty(),
+            "the buffered DELETE hides key 1 even at its own valid instant",
+        );
+
+        // Another connection (auto-commit, its own snapshot) still sees only the
+        // committed base — none of the buffer.
+        assert_eq!(
+            pairs(
+                engine
+                    .execute(&parse_one("SELECT id, balance FROM acct"))
+                    .expect("auto-commit read")
+            ),
+            vec![kv(1, 100)],
+            "buffered valid-time writes are invisible to other readers until COMMIT",
+        );
+
+        // ROLLBACK (drop the buffer): nothing reached storage.
+        drop(txn);
+        assert_eq!(
+            pairs(
+                engine
+                    .execute(&parse_one("SELECT id, balance FROM acct"))
+                    .expect("after rollback")
+            ),
+            vec![kv(1, 100)],
+            "rolled back: only the committed base remains",
+        );
+    }
+
+    /// Run one seed of the STL-223 differential, returning `(valid_probes,
+    /// rows_seen, overlay_changed_a_plain_read)`. A random committed base is applied
+    /// identically to a staging engine and a reference; a random buffer is then
+    /// STAGED on the staging engine (the overlay path) and COMMITTED on the reference
+    /// (the durable apply + committed-read path). A swept valid grid plus the plain
+    /// read must agree across the two; another (auto-commit) reader on the staging
+    /// engine sees only the committed base, and dropping the transaction (ROLLBACK)
+    /// leaves it unchanged.
+    fn run_valid_ryow_seed(seed: u64, key_pool: i64, vmax: i64, create: &str) -> (u64, u64, bool) {
+        let mut rng = ValidOracleRng::new(seed);
+        let mut sut = session();
+        let mut reference = session();
+        sut.execute(&parse_one(create)).expect("create sut");
+        reference
+            .execute(&parse_one(create))
+            .expect("create reference");
+
+        // A committed base both engines share, applied identically (auto-commit).
+        let mut alive = vec![false; usize::try_from(key_pool).expect("fits")];
+        let mut tick: i64 = 0;
+        let base_ops = 2 + rng.below(4);
+        for _ in 0..base_ops {
+            let sql = gen_valid_stmt(&mut rng, &mut alive, tick, key_pool, vmax);
+            tick += 1;
+            sut.execute(&parse_one(&sql)).expect("base op on sut");
+            reference
+                .execute(&parse_one(&sql))
+                .expect("base op on reference");
+        }
+        // The committed base another (auto-commit) reader must keep seeing while the
+        // transaction is open and after it rolls back.
+        let base_plain = rows_by_id(sut.execute(&parse_one(VALID_PLAIN)).expect("base plain"));
+
+        // Build a random buffer: STAGE it on `sut`, COMMIT it on `reference`.
+        let mut txn = sut.begin();
+        let buffer_ops = 3 + rng.below(7);
+        for _ in 0..buffer_ops {
+            let sql = gen_valid_stmt(&mut rng, &mut alive, tick, key_pool, vmax);
+            tick += 1;
+            sut.stage_dml(&parse_one(&sql), &mut txn)
+                .expect("stage on sut");
+            reference
+                .execute(&parse_one(&sql))
+                .expect("commit on reference");
+        }
+
+        // The differential: a swept valid grid, then the plain read, agree.
+        let mut probes = 0;
+        let mut rows_seen = 0;
+        for v in 0..=(vmax + 1) {
+            let sql = format!("{VALID_PLAIN} FOR VALID_TIME AS OF {v}");
+            let got = rows_by_id(
+                sut.execute_in_txn(&parse_one(&sql), &mut txn)
+                    .expect("overlay AS OF read"),
+            );
+            let want = rows_by_id(
+                reference
+                    .execute(&parse_one(&sql))
+                    .expect("committed AS OF read"),
+            );
+            assert_eq!(
+                got, want,
+                "seed {seed}: overlay vs commit diverged at valid v={v}"
+            );
+            rows_seen += u64::try_from(got.len()).expect("fits");
+            probes += 1;
+        }
+        let got_plain = rows_by_id(
+            sut.execute_in_txn(&parse_one(VALID_PLAIN), &mut txn)
+                .expect("overlay plain read"),
+        );
+        let want_plain = rows_by_id(
+            reference
+                .execute(&parse_one(VALID_PLAIN))
+                .expect("committed plain"),
+        );
+        assert_eq!(
+            got_plain, want_plain,
+            "seed {seed}: plain overlay vs commit diverged"
+        );
+        let overlay_changed = got_plain != base_plain;
+
+        // Other-reader invisibility, then ROLLBACK discards.
+        assert_eq!(
+            rows_by_id(
+                sut.execute(&parse_one(VALID_PLAIN))
+                    .expect("auto-commit mid-txn")
+            ),
+            base_plain,
+            "seed {seed}: the open transaction's buffer leaked to another reader",
+        );
+        drop(txn);
+        assert_eq!(
+            rows_by_id(
+                sut.execute(&parse_one(VALID_PLAIN))
+                    .expect("after rollback")
+            ),
+            base_plain,
+            "seed {seed}: a rolled-back valid-time buffer left a trace",
+        );
+        (probes, rows_seen, overlay_changed)
+    }
+
+    #[test]
+    fn valid_time_read_your_own_writes_matches_committing_the_buffer() {
+        // STL-223's correctness oracle. A transaction's mid-flight reads of a
+        // valid-time table — plain and `FOR VALID_TIME AS OF v` across a swept grid —
+        // must match committing the *same* buffer in a second engine and reading it
+        // back. One engine STAGES a random INSERT/UPDATE/DELETE buffer in an open
+        // transaction (the overlay path); the reference engine COMMITS the identical
+        // buffer via auto-commit (the durable apply + committed-read path). Agreement
+        // proves the period-by-period overlay reproduces exactly what COMMIT makes
+        // durable, including the half-open valid boundary (the reference's scan
+        // applies the same `from ≤ v < to` cut). Two checks ride along: another
+        // (auto-commit) reader on the staging engine never sees the buffer, and
+        // dropping the transaction (ROLLBACK) leaves only the committed base. The
+        // teeth assert proves the buffer actually moved a read.
+        const KEY_POOL: i64 = 3;
+        const VMAX: i64 = 10;
+        const SEEDS: u64 = 64;
+
+        let create = "CREATE TABLE acct (id INT PRIMARY KEY, balance INT, vf TIMESTAMP, vt TIMESTAMP) \
+                      WITH SYSTEM VERSIONING VALID TIME (vf, vt)";
+
+        let mut probes: u64 = 0;
+        let mut rows_seen: u64 = 0;
+        let mut overlay_diverged_from_base = false;
+
+        for seed in 0..SEEDS {
+            let (p, r, changed) = run_valid_ryow_seed(seed, KEY_POOL, VMAX, create);
+            probes += p;
+            rows_seen += r;
+            overlay_diverged_from_base |= changed;
+        }
+
+        assert!(
+            rows_seen > 0,
+            "every probe was empty — the workload resolved nothing"
+        );
+        assert!(
+            probes > 700,
+            "differential probed only {probes} valid cells — widen the sweep"
+        );
+        assert!(
+            overlay_diverged_from_base,
+            "the buffer never changed a plain read — the differential never exercised the overlay",
         );
     }
 

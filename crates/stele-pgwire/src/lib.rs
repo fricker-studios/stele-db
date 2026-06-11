@@ -1351,7 +1351,8 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
         | EngineError::CommitLog(_)
         | EngineError::Scan(_)
         | EngineError::RowCodec(_)
-        | EngineError::SchemaChanged { .. } => SQLSTATE_INTERNAL_ERROR,
+        | EngineError::SchemaChanged { .. }
+        | EngineError::MalformedValidBound => SQLSTATE_INTERNAL_ERROR,
         // A write-write conflict at COMMIT — the retryable serialization failure.
         EngineError::Conflict => SQLSTATE_SERIALIZATION_FAILURE,
     }
