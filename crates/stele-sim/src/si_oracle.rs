@@ -96,7 +96,7 @@ impl Bug {
 /// One committed period in the reference model's per-key timeline: the
 /// system-time half-open span `[sys_from, sys_to)` over which `payload` (written
 /// by transaction `txn_id`) was the live value. The latest period of a key is
-/// *open* (`sys_to == `[`SYSTEM_TIME_OPEN`]) until a later commit closes it.
+/// *open* — its `sys_to` is [`SYSTEM_TIME_OPEN`] — until a later commit closes it.
 #[derive(Debug, Clone)]
 struct RefPeriod {
     sys_from: SystemTimeMicros,
