@@ -84,9 +84,9 @@ pub use dml::{BoundDml, DmlError, bind_dml};
 pub use error::ParseError;
 pub use parser::parse;
 pub use select::{
-    AsOfError, BindContext, BoundJoin, BoundJoinSide, BoundPeriod, BoundPeriodPredicate,
-    BoundPredicate, BoundSelect, JoinColumnRef, JoinType, PeriodEndpoint, Projection, SelectError,
-    bind_select, resolve_as_of,
+    ArithOp, AsOfError, BindContext, BoundJoin, BoundJoinSide, BoundPeriod, BoundPeriodPredicate,
+    BoundPredicate, BoundScalar, BoundSelect, CompareOp, JoinColumnRef, JoinType, PeriodEndpoint,
+    Projection, SelectError, bind_select, resolve_as_of,
 };
 pub use types::logical_type;
 

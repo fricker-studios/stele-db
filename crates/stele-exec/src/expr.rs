@@ -182,6 +182,22 @@ pub enum Expr {
         /// Right period operand.
         right: Box<Expr>,
     },
+    /// `PERIOD(from, to)` — build a half-open `[from, to)` [`LogicalType::Period`]
+    /// per row from two instant operands, so a SQL `PERIOD(from_col, to_col)`
+    /// written over two separate microsecond-instant columns becomes a single
+    /// PERIOD operand an [`Expr::Period`] predicate can range over ([STL-213]).
+    ///
+    /// Each operand evaluates to a microsecond-instant vector (`int8` /
+    /// `timestamp` / `timestamptz`, which need not match each other — both are
+    /// read as their `i64` µs). A row's period is NULL when either endpoint cell
+    /// is NULL or the pair is empty/reversed (`from >= to`) — the same
+    /// "unknown ⇒ excluded" stance the row-level period filter takes.
+    MakePeriod {
+        /// The inclusive start instant.
+        from: Box<Expr>,
+        /// The exclusive end instant.
+        to: Box<Expr>,
+    },
 }
 
 impl Expr {
@@ -234,6 +250,16 @@ impl Expr {
             pred,
             left: Box::new(self),
             right: Box::new(other),
+        }
+    }
+
+    /// `PERIOD(from, to)` — a node building a PERIOD per row from two instant
+    /// operands ([`Expr::MakePeriod`]).
+    #[must_use]
+    pub fn make_period(from: Self, to: Self) -> Self {
+        Self::MakePeriod {
+            from: Box::new(from),
+            to: Box::new(to),
         }
     }
 
@@ -551,6 +577,16 @@ pub enum ExprError {
         found: LogicalType,
     },
 
+    /// A [`Expr::MakePeriod`] endpoint was not a microsecond-instant vector
+    /// (`int8` / `timestamp` / `timestamptz`). The binder restricts a
+    /// `PERIOD(from, to)` endpoint to those types, so anything else is a plan
+    /// error.
+    #[error("a period endpoint must be an int8/timestamp/timestamptz instant, got {found}")]
+    PeriodEndpointType {
+        /// The offending endpoint's type.
+        found: LogicalType,
+    },
+
     /// A column whose logical type is out of scope, or does not match its
     /// physical (`i64` / bytes) shape.
     #[error("the vectorized evaluator cannot read a {logical} value from a {physical} column")]
@@ -618,6 +654,11 @@ pub fn eval_expr(expr: &Expr, columns: &[Vector], rows: usize) -> Result<Vector,
             let l = eval_expr(left, columns, rows)?;
             let r = eval_expr(right, columns, rows)?;
             period(*pred, &l, &r)
+        }
+        Expr::MakePeriod { from, to } => {
+            let f = eval_expr(from, columns, rows)?;
+            let t = eval_expr(to, columns, rows)?;
+            make_period(&f, &t)
         }
     }
 }
@@ -715,6 +756,37 @@ fn period(pred: PeriodPredicate, left: &Vector, right: &Vector) -> Result<Vector
         })
         .collect();
     Ok(Vector::Bool(out))
+}
+
+/// Build a [`Vector::Period`] per row from two instant operands ([`Expr::MakePeriod`]).
+///
+/// Each row's `[from, to)` is formed from the two endpoint cells; a NULL endpoint
+/// or an empty/reversed pair (`from >= to`, which [`Interval::new`] rejects) yields
+/// a NULL period — the unknown an [`Expr::Period`] predicate then never keeps.
+fn make_period(from: &Vector, to: &Vector) -> Result<Vector, ExprError> {
+    let f = instant_cells(from)?;
+    let t = instant_cells(to)?;
+    let out = f
+        .iter()
+        .zip(t)
+        .map(|(a, b)| match (a, b) {
+            (Some(a), Some(b)) => Interval::new(*a, *b).ok(),
+            _ => None,
+        })
+        .collect();
+    Ok(Vector::Period(out))
+}
+
+/// The microsecond-instant cells of an `int8` / `timestamp` / `timestamptz`
+/// vector — the three i64-wide instant types a period endpoint may be. Any other
+/// type is a plan error ([`ExprError::PeriodEndpointType`]).
+fn instant_cells(vector: &Vector) -> Result<&[Option<i64>], ExprError> {
+    match vector {
+        Vector::Int8(cells) | Vector::Timestamp(cells) | Vector::TimestampTz(cells) => Ok(cells),
+        other => Err(ExprError::PeriodEndpointType {
+            found: other.logical_type(),
+        }),
+    }
 }
 
 /// Three-valued `AND` / `OR` over two boolean vectors.
@@ -1263,6 +1335,58 @@ mod tests {
             ),
             Err(ExprError::PeriodOperand {
                 found: LogicalType::Int4,
+            })
+        );
+    }
+
+    /// `MakePeriod` zips two instant columns into a PERIOD per row — NULL on an
+    /// absent endpoint or an empty/reversed pair — so a `PERIOD(from, to)` over
+    /// two value columns reaches an [`Expr::Period`] predicate ([STL-213]). The
+    /// rows mirror the engine's per-row period filter: only a TRUE keeps a row.
+    #[test]
+    fn make_period_builds_periods_from_instant_columns() {
+        // Columns: from = [10, 10, NULL, 30], to = [40, 5(reversed), 20, 30(empty)].
+        let cols = vec![
+            Vector::Int8(vec![Some(10), Some(10), None, Some(30)]),
+            Vector::Int8(vec![Some(40), Some(5), Some(20), Some(30)]),
+        ];
+        // The constructed period is [10,40) for row 0 and NULL for rows 1..=3
+        // (reversed, NULL endpoint, empty).
+        let made = eval_expr(&Expr::make_period(Expr::col(0), Expr::col(1)), &cols, 4)
+            .expect("make_period");
+        let iv = |from, to| Interval::new(from, to).expect("interval");
+        assert_eq!(
+            made,
+            Vector::Period(vec![Some(iv(10, 40)), None, None, None])
+        );
+
+        // Lower a full `PERIOD(from, to) CONTAINS PERIOD(20, 30)` per row: row 0's
+        // [10,40) contains [20,30) → TRUE; every NULL period → NULL → dropped.
+        let predicate = Expr::make_period(Expr::col(0), Expr::col(1)).period(
+            PeriodPredicate::Contains,
+            Expr::make_period(
+                Expr::lit(ScalarValue::Int8(20)),
+                Expr::lit(ScalarValue::Int8(30)),
+            ),
+        );
+        assert_eq!(
+            eval_expr(&predicate, &cols, 4).expect("period over made"),
+            Vector::Bool(vec![Some(true), None, None, None])
+        );
+    }
+
+    /// A `MakePeriod` endpoint of a non-instant type is a plan error — the binder
+    /// only forms a period endpoint from an int8/timestamp/timestamptz.
+    #[test]
+    fn make_period_rejects_a_non_instant_endpoint() {
+        let cols = vec![
+            Vector::Int8(vec![Some(1)]),
+            Vector::Text(vec![Some("x".to_owned())]),
+        ];
+        assert_eq!(
+            eval_expr(&Expr::make_period(Expr::col(0), Expr::col(1)), &cols, 1),
+            Err(ExprError::PeriodEndpointType {
+                found: LogicalType::Text,
             })
         );
     }
