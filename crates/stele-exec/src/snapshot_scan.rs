@@ -89,17 +89,17 @@
 //! scheduler like the rest of the storage/txn core
 //! ([architecture §12 invariant 7](../../../docs/02-architecture.md#12-cross-cutting-architectural-invariants)).
 //!
-//! ## Granularity (STL-146 → STL-155)
+//! ## Granularity (STL-146 → STL-155 → STL-197)
 //!
 //! Late materialization is per *column* (STL-146) **and** per *row-group*
 //! (STL-155): a survivor reads only the projected columns, and within each
 //! column only the chunks of row-groups that hold a live row. A chunk is the
 //! format's I/O unit, so row-group granularity is the finest skipping the
-//! on-disk layout admits — a one-row-group segment (the default the engine's
-//! flush writes today) degenerates to the STL-146 behavior, and the gain
-//! appears once a writer bounds its row-groups
+//! on-disk layout admits — a one-row-group segment degenerates to the STL-146
+//! behavior, and the gain appears once a writer bounds its row-groups
 //! ([`SegmentWriter::with_max_row_group_rows`](stele_storage::segment::SegmentWriter::with_max_row_group_rows)).
-//! Wiring a row-group bound into the engine's flush policy is a follow-up.
+//! `Engine::flush` now bounds them by default (STL-197), so production segments
+//! split into skippable row-groups rather than sealing as one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
