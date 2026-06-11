@@ -458,6 +458,76 @@ impl Batch {
     }
 }
 
+/// A **zero-copy gathered view** of one join side's output columns ([STL-224]).
+///
+/// This is the keep-the-buffer-carry-indices row selection a
+/// [`Filter`](crate::Filter) emits ([STL-214]), generalized to the hash join's
+/// output assembly. It holds the side's full columns as shared [`Cells`] buffers
+/// (constructing one is a
+/// refcount bump per column, no payload byte copied) paired with a **nullable
+/// selection**: output row `i` draws physical row `selection[i]` from every column,
+/// or a SQL `NULL` cell when `selection[i]` is `None`. The two extra degrees of
+/// freedom over a [`Batch::selection`] are exactly what a join needs and a `Filter`
+/// does not — an index may **repeat** (a one-to-many match emits the same left row
+/// more than once) and may be **absent** (`None` is a `LEFT` join's `NULL`-extended
+/// right side).
+///
+/// Reading a surviving cell ([`bytes`](Self::bytes)) borrows straight from the
+/// shared buffer, so the join references each matched row's cells by index rather
+/// than re-allocating them; the single owning copy happens once downstream when the
+/// engine materializes the wire `SelectResult`, the same place the `Filter` path
+/// materializes ([STL-214]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatheredColumns {
+    /// The side's columns, full height — shared [`Cells`] buffers addressed through
+    /// [`selection`](Self::selection).
+    columns: Vec<Column>,
+    /// One entry per output row: the physical row each column is read at, or `None`
+    /// for a `NULL`-extended (`LEFT` join unmatched) output row.
+    selection: Vec<Option<usize>>,
+}
+
+impl GatheredColumns {
+    /// A gathered view over `columns` (shared, full-height buffers) restricted and
+    /// reordered by `selection` — output row `i` is physical row `selection[i]`, a
+    /// `None` naming a `NULL` cell. The cells themselves are never copied.
+    #[must_use]
+    pub const fn new(columns: Vec<Column>, selection: Vec<Option<usize>>) -> Self {
+        Self { columns, selection }
+    }
+
+    /// The number of output (logical) rows — the selection length, not the columns'
+    /// physical height.
+    #[must_use]
+    pub const fn rows(&self) -> usize {
+        self.selection.len()
+    }
+
+    /// Whether the gather names no output rows.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.selection.is_empty()
+    }
+
+    /// The bytes of column `col` at output `row`, **borrowed** from the shared
+    /// buffer — `None` for a `NULL` cell (a `NULL`-extended output row, or a stored
+    /// `NULL` payload). No payload byte is copied: the returned slice points into
+    /// the same allocation as the source cell.
+    ///
+    /// # Panics
+    ///
+    /// If `row` is out of range, the named physical row is out of the column's
+    /// height, or `col` is not a [`Column::Bytes`] — the join only ever gathers the
+    /// opaque bytes columns its scan produced, at indices its own row counts bound.
+    #[must_use]
+    pub fn bytes(&self, col: usize, row: usize) -> Option<&[u8]> {
+        self.selection[row].and_then(|physical| match &self.columns[col] {
+            Column::Bytes(cells) => cells[physical].as_deref(),
+            Column::I64(_) => panic!("join gather over a non-bytes column {col}"),
+        })
+    }
+}
+
 /// Per-scan statistics — chiefly the segment-pruning accounting.
 ///
 /// A segment reaches the scan in one of three states, and the counts partition

@@ -66,9 +66,9 @@ use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
 use stele_common::types::{LogicalType, ScalarValue};
 use stele_exec::{
     AggregateFunc as ExecAggregateFunc, Aggregator, ArithOp as ExecArithOp, Batch, CmpOp, Column,
-    DEFAULT_BATCH_SIZE, ExplodePayload, Expr, ExprError, Filter, JoinType as ExecJoinType,
-    Operator, ScanError, ScanSource, SnapshotScan, Vector, eval_expr, evaluate, hash_aggregate,
-    hash_join,
+    DEFAULT_BATCH_SIZE, ExplodePayload, Expr, ExprError, Filter, GatheredColumns,
+    JoinType as ExecJoinType, Operator, ScanError, ScanSource, SnapshotScan, Vector, eval_expr,
+    evaluate, hash_aggregate, hash_join,
 };
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::dml::{BoundDml, DmlError};
@@ -1675,14 +1675,17 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
 
     /// Run a bound two-table `JOIN` ([STL-172]).
     ///
-    /// Both sides are scanned to their reconstructed rows at `snapshot`
-    /// ([`scan_all_rows`](Self::scan_all_rows)); the join key column of each side is
-    /// decoded into a typed [`Vector`] and handed to the [`hash_join`] operator,
-    /// which returns the surviving rows as input-row indices. The output rows are
-    /// then assembled by gathering each side's raw cells per the bound
-    /// [`output`](BoundJoin::output) references — a `LEFT` join's unmatched row
-    /// drawing `NULL` for every right column. Non-key columns are never decoded;
-    /// they pass through as the opaque canonical bytes the scan produced.
+    /// Both sides are scanned at `snapshot` into the executor's columnar shape
+    /// ([`scan_all_columns`](Self::scan_all_columns)) — shared [`Cells`](stele_exec::Cells)
+    /// buffers, not a row-major copy; the join key column of each side is decoded
+    /// into a typed [`Vector`] and handed to the [`hash_join`] operator, which
+    /// returns the surviving rows as input-row indices. The output rows are then
+    /// assembled by a zero-copy [`GatheredColumns`] view per side — each keeps its
+    /// full buffers and names its matched rows by index per the bound
+    /// [`output`](BoundJoin::output) references, never re-allocating a surviving cell
+    /// ([STL-224]) — a `LEFT` join's unmatched row drawing `NULL` for every right
+    /// column. Non-key columns are never decoded; they pass through as the opaque
+    /// canonical bytes the scan produced.
     fn run_join(
         &self,
         join: &BoundJoin,
@@ -1699,54 +1702,61 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let left_value_count = join.left.columns.len().saturating_sub(1);
         let right_value_count = join.right.columns.len().saturating_sub(1);
 
-        let left_rows = Self::scan_all_rows(left_state, snapshot, left_value_count)?;
-        let right_rows = Self::scan_all_rows(right_state, snapshot, right_value_count)?;
+        // Scan each side into its columns as shared `Cells` buffers (not the
+        // row-major copy `scan_all_rows` makes), so the output assembly can name a
+        // side's matched rows by index without re-allocating a surviving cell
+        // ([STL-224]).
+        let left_cols = Self::scan_all_columns(left_state, snapshot, left_value_count)?;
+        let right_cols = Self::scan_all_columns(right_state, snapshot, right_value_count)?;
+        let left_rows = left_cols[0].len();
+        let right_rows = right_cols[0].len();
 
         // Decode only the join-key column of each side into a typed vector; every
         // other column stays opaque bytes (gathered by index below), so a column
         // the join merely carries through is never forced through the evaluator.
-        let left_keys = decode_key_column(&left_rows, &join.left.columns, join.left_key)?;
-        let right_keys = decode_key_column(&right_rows, &join.right.columns, join.right_key)?;
+        let left_keys = decode_key_column(&left_cols, &join.left.columns, join.left_key)?;
+        let right_keys = decode_key_column(&right_cols, &join.right.columns, join.right_key)?;
 
         let join_type = lower_join_type(join.join_type);
         let indices = hash_join(
             join_type,
             &left_keys,
-            left_rows.len(),
+            left_rows,
             &Expr::col(join.left_key),
             &right_keys,
-            right_rows.len(),
+            right_rows,
             &Expr::col(join.right_key),
         )
         .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
 
-        // Gather each output row's cells per the bound output references. A
-        // right-keeping join reads both sides (a `None` right index — a LEFT join's
-        // unmatched row — yields NULL right cells); SEMI/ANTI read the left alone.
+        // Gather each output row's cells per the bound output references, by index
+        // over each side's shared columns ([STL-224], the join counterpart of the
+        // STL-214 `Filter` selection): a side keeps its full buffers and names its
+        // matched rows, so a surviving cell is copied exactly once — here, when the
+        // wire `SelectResult` is materialized. A right-keeping join reads both sides
+        // (a `None` right index — a LEFT join's unmatched row — yields NULL right
+        // cells); SEMI/ANTI read the left alone.
+        let left = GatheredColumns::new(left_cols, indices.left.iter().map(|&l| Some(l)).collect());
         let rows: Vec<Vec<Option<Vec<u8>>>> = if join_type.keeps_right() {
-            indices
-                .left
-                .iter()
-                .zip(&indices.right)
-                .map(|(&l, &r)| {
+            let right = GatheredColumns::new(right_cols, indices.right);
+            (0..left.rows())
+                .map(|t| {
                     join.output
                         .iter()
                         .map(|col| match col {
-                            JoinColumnRef::Left(i) => left_rows[l][*i].clone(),
-                            JoinColumnRef::Right(j) => r.and_then(|rr| right_rows[rr][*j].clone()),
+                            JoinColumnRef::Left(i) => left.bytes(*i, t).map(<[u8]>::to_vec),
+                            JoinColumnRef::Right(j) => right.bytes(*j, t).map(<[u8]>::to_vec),
                         })
                         .collect()
                 })
                 .collect()
         } else {
-            indices
-                .left
-                .iter()
-                .map(|&l| {
+            (0..left.rows())
+                .map(|t| {
                     join.output
                         .iter()
                         .map(|col| match col {
-                            JoinColumnRef::Left(i) => left_rows[l][*i].clone(),
+                            JoinColumnRef::Left(i) => left.bytes(*i, t).map(<[u8]>::to_vec),
                             // The binder proves a SEMI/ANTI output is left-only.
                             JoinColumnRef::Right(_) => {
                                 unreachable!("SEMI/ANTI output references only the left side")
@@ -1798,6 +1808,83 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             }
         }
         Ok(rows)
+    }
+
+    /// Scan a table's reconstructed rows at `snapshot` into **columns** — the join's
+    /// per-side input in the executor's columnar shape ([STL-224]).
+    ///
+    /// The same unfiltered `ScanSource → ExplodePayload` pipeline as
+    /// [`scan_all_rows`](Self::scan_all_rows) (same valid-time stripping, [STL-218]),
+    /// but the result is kept columnar: one [`Column`] per output column — the
+    /// business key, then each value column — every one a shared
+    /// [`Cells`](stele_exec::Cells) buffer. Keeping the buffers (rather than the
+    /// row-major copy `scan_all_rows` makes) is what lets the join's output assembly
+    /// name matched rows by index instead of cloning each surviving cell.
+    ///
+    /// A single emitted batch is handed back as-is — its buffers shared, nothing
+    /// copied. Multiple batches are concatenated per column into one buffer, since
+    /// the hash join must address every row of a side at once; that per-cell copy is
+    /// no more than [`scan_all_rows`](Self::scan_all_rows) already pays, and the
+    /// later per-matched-row clone is gone either way.
+    fn scan_all_columns(
+        state: &TableState<C, D>,
+        snapshot: SystemTimeMicros,
+        value_count: usize,
+    ) -> Result<Vec<Column>, EngineError> {
+        let readers = state.engine.open_segment_readers()?;
+        let scan = SnapshotScan::new(
+            state.engine.delta(),
+            state.engine.index(),
+            &readers,
+            Snapshot(snapshot),
+        )
+        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .valid_time(state.valid_time);
+        let source = ScanSource::new(scan, DEFAULT_BATCH_SIZE);
+        let mut exploded = ExplodePayload::new(source, value_count);
+
+        let ncols = value_count + 1;
+        let mut batches: Vec<Batch> = Vec::new();
+        while let Some(batch) = exploded.next()? {
+            // ExplodePayload emits dense batches; `into_dense` is a no-op that makes
+            // the shape explicit so a column read below never has to honor a selection.
+            batches.push(batch.into_dense());
+        }
+
+        // No rows: `ncols` empty columns the join scans as a zero-height side.
+        if batches.is_empty() {
+            return Ok((0..ncols)
+                .map(|_| Column::Bytes(Vec::new().into()))
+                .collect());
+        }
+        // One batch: its columns are already the shared buffers — hand them back
+        // untouched (zero-copy), dropping the per-column `ColumnId` tag the join
+        // addresses positionally.
+        if batches.len() == 1 {
+            return Ok(batches
+                .pop()
+                .expect("one batch")
+                .columns
+                .into_iter()
+                .map(|(_, col)| col)
+                .collect());
+        }
+        // Several batches: concatenate each column's cells into one buffer.
+        let mut columns: Vec<Vec<Option<Vec<u8>>>> = (0..ncols).map(|_| Vec::new()).collect();
+        for batch in &batches {
+            for (i, slot) in columns.iter_mut().enumerate() {
+                match &batch.columns[i].1 {
+                    Column::Bytes(cells) => slot.extend(cells.iter().cloned()),
+                    Column::I64(values) => {
+                        slot.extend(values.iter().map(|v| Some(v.to_le_bytes().to_vec())));
+                    }
+                }
+            }
+        }
+        Ok(columns
+            .into_iter()
+            .map(|cells| Column::Bytes(cells.into()))
+            .collect())
     }
 
     /// Apply a bound DML statement to the table's tiers under fresh provenance,
@@ -2809,15 +2896,18 @@ const fn lower_join_type(join_type: JoinType) -> ExecJoinType {
 /// evaluator. The vector is one slot per side column so `Expr::col(key)` addresses
 /// the key by its schema index.
 fn decode_key_column(
-    rows: &[Vec<Option<Vec<u8>>>],
-    columns: &[(String, LogicalType)],
+    columns: &[Column],
+    schema: &[(String, LogicalType)],
     key: usize,
 ) -> Result<Vec<Vector>, EngineError> {
-    let mut cols: Vec<Vector> = (0..columns.len())
+    // Only the key position is decoded; every other slot is an empty placeholder the
+    // evaluator never reads (the join carries non-key columns through as opaque
+    // bytes). Decoding straight from the shared key column avoids re-collecting the
+    // cells the row-major path used to ([STL-224]).
+    let mut cols: Vec<Vector> = (0..schema.len())
         .map(|_| Vector::Bool(Vec::new()))
         .collect();
-    let cells: Vec<Option<Vec<u8>>> = rows.iter().map(|r| r[key].clone()).collect();
-    cols[key] = Vector::from_column(columns[key].1, &Column::Bytes(cells.into()))
+    cols[key] = Vector::from_column(schema[key].1, &columns[key])
         .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
     Ok(cols)
 }
