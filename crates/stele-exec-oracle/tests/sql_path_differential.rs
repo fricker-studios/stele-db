@@ -108,14 +108,18 @@ impl Rng {
     }
 }
 
-/// Parse exactly one SQL statement (the oracle never feeds a multi-statement
-/// string).
+/// Parse exactly one SQL statement, asserting the input was a single statement —
+/// the oracle only ever feeds one, and silently dropping a stray second statement
+/// could mask a malformed query.
 fn parse_one(sql: &str) -> Statement {
-    stele_sql::parse(sql)
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("exactly one statement")
+    let mut stmts = stele_sql::parse(sql).expect("parse");
+    assert_eq!(
+        stmts.len(),
+        1,
+        "the oracle feeds exactly one statement, got {}",
+        stmts.len(),
+    );
+    stmts.pop().expect("exactly one statement")
 }
 
 /// The `(id, balance)` cells of a both-axes table, in the engine's canonical
@@ -190,7 +194,7 @@ impl DuckModel {
     fn reset(&self) {
         self.conn
             .execute_batch("DELETE FROM versions;")
-            .expect("truncate versions");
+            .expect("clear the versions table between seeds");
     }
 
     /// `INSERT`: append a new open system period for `k` at the engine's commit
@@ -574,9 +578,11 @@ fn period_predicate_gates_the_bitemporal_read_vs_duckdb() {
         (10, 20, 30, 40),
     ];
 
-    let mut saw_pass = false;
-    let mut saw_fail = false;
     for pred in predicates {
+        // Each predicate must flip across both branches *on its own*, so a later
+        // edit to `quads` that makes one vacuously always-true/false is caught.
+        let mut saw_pass = false;
+        let mut saw_fail = false;
         for (a, b, c, d) in quads {
             let truth_expr = match pred {
                 "CONTAINS" => format!("{a} <= {c} AND {d} <= {b}"),
@@ -610,12 +616,12 @@ fn period_predicate_gates_the_bitemporal_read_vs_duckdb() {
             saw_pass |= truth;
             saw_fail |= !truth;
         }
+        assert!(
+            saw_pass && saw_fail,
+            "predicate `{pred}` was never exercised on both branches — its operand \
+             quads went vacuous",
+        );
     }
-
-    assert!(
-        saw_pass && saw_fail,
-        "period-predicate coverage never exercised both a passing and a failing gate",
-    );
 }
 
 // --- 3. the harness can actually fail ---------------------------------------
