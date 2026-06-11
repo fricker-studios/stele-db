@@ -141,6 +141,8 @@ jobs:
         run: docker run -d --name stele -p 5454:5454 stele:ci --dev
       - name: Run the identity demo and assert the AS OF query time-travels
         run: ci/identity-demo-smoke.sh localhost 5454
+      - name: Run the valid-time demo and assert FOR VALID_TIME AS OF resolves
+        run: ci/valid-time-demo-smoke.sh localhost 5454
       - name: Engine logs
         if: always()
         run: docker logs stele || true

@@ -80,7 +80,7 @@ use stele_storage::delta::{BusinessKey, Snapshot};
 use stele_storage::dml::DmlOutcome;
 use stele_storage::engine::{Engine, EngineError as StorageError};
 use stele_storage::segment::{ColumnId, Predicate, ZoneBound};
-use stele_storage::validtime::ValidInterval;
+use stele_storage::validtime::{ValidInterval, unframe_payload};
 
 /// A monotonic, globally-shared commit clock.
 ///
@@ -1305,6 +1305,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// re-packs, so columns the `SET` did not name keep their prior value. `seq`
     /// is `0`: the commit clock hands each write a distinct `sys_from`, so the
     /// per-commit tiebreak never decides between two versions.
+    ///
+    /// On a valid-time table the bound `[from, to)` interval ([STL-194]) rides
+    /// down to the storage writer, which frames it onto the stored payload; the
+    /// period columns also sit in the row codec as their `Timestamp` cells. An
+    /// `UPDATE`'s read-modify-write therefore reads the prior row through
+    /// [`live_value_cells`](Self::live_value_cells), which strips that frame before
+    /// decoding.
     fn apply_bound_dml(
         &mut self,
         dml: BoundDml,
@@ -1317,7 +1324,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let committed = (dml.table().to_owned(), dml_business_key(&dml));
         let summary = match dml {
             BoundDml::Insert {
-                table, key, values, ..
+                table,
+                key,
+                values,
+                valid,
+                ..
             } => {
                 // The bound row width must still match the live schema — DDL could
                 // have changed it since binding (drop/re-create between staging and
@@ -1338,7 +1349,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 self.insert(
                     &table,
                     business_key(&key),
-                    None,
+                    valid.map(to_valid_interval),
                     row_codec::encode_payload(&cells),
                     0,
                     txn_id,
@@ -1350,6 +1361,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 table,
                 key,
                 assignments,
+                valid,
                 ..
             } => {
                 // Read-modify-write: merge the SET overrides onto the live row's
@@ -1377,7 +1389,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 self.update(
                     &table,
                     key,
-                    None,
+                    valid.map(to_valid_interval),
                     row_codec::encode_payload(&cells),
                     0,
                     txn_id,
@@ -1416,6 +1428,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// row when `key` is not live (so an `UPDATE` of an absent key opens a fresh
     /// row whose unset columns are `NULL`). The starting point for an `UPDATE`'s
     /// read-modify-write merge.
+    ///
+    /// On a valid-time table the scanned payload is *framed* (a system-only scan
+    /// leaves the 16-byte interval prefix in place), so the prefix is stripped with
+    /// [`unframe_payload`] before the row codec decodes the value cells — otherwise
+    /// the merge would read the interval bytes as row data ([STL-194]).
     fn live_value_cells(
         &self,
         table: &str,
@@ -1450,7 +1467,19 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 column_cell(&out.batch, ColumnId::BusinessKey, r).as_deref() == Some(key.as_bytes())
             })
             .and_then(|r| column_cell(&out.batch, ColumnId::Payload, r));
-        Ok(row_codec::decode_payload(value_count, payload.as_deref())?)
+        // A valid-time row's payload still carries the framed interval prefix here
+        // (this scan does not pin the valid axis); strip it to the bare user
+        // payload the row codec expects. Consume `payload` so the system-only arm
+        // hands its bytes straight back without a move-out-of-borrow.
+        let bare = match payload {
+            Some(stored) if state.valid_time => {
+                let (_interval, user) = unframe_payload(true, &stored)
+                    .map_err(|e| EngineError::Scan(ScanError::ValidTime(e)))?;
+                Some(user.to_vec())
+            }
+            other => other,
+        };
+        Ok(row_codec::decode_payload(value_count, bare.as_deref())?)
     }
 
     /// Begin a multi-statement transaction — an empty write buffer the caller
@@ -1781,6 +1810,17 @@ fn encode_value(value: &ScalarValue) -> Vec<u8> {
 /// key matches across operations.
 fn business_key(value: &ScalarValue) -> BusinessKey {
     BusinessKey::new(encode_value(value))
+}
+
+/// Lower the binder's [`Interval`] (the `stele-sql` layer does not depend on
+/// storage) into the storage [`ValidInterval`] the write path takes ([STL-194]).
+///
+/// Total: the binder built the interval through
+/// [`Interval::new`](stele_common::period::Interval::new), which already rejects
+/// `from >= to`, so the storage constructor's same check cannot fail here.
+fn to_valid_interval(interval: Interval) -> ValidInterval {
+    ValidInterval::new(ValidTimeMicros(interval.from), ValidTimeMicros(interval.to))
+        .expect("the binder validated from < to")
 }
 
 /// The [`BusinessKey`] a bound DML writes — the unit of write-write conflict
@@ -2441,6 +2481,357 @@ mod tests {
         // window `[10, 20)` excludes 25. (Only the system axis differs from the 100
         // case — so the system instant is load-bearing.)
         assert_eq!(balance(c1.0, 25), None);
+    }
+
+    #[test]
+    fn valid_time_dml_round_trips_over_sql() {
+        // STL-194: the same both-axes scenario as above, but the *write* side now
+        // runs entirely through the SQL DML path — `INSERT`/`UPDATE` naming the
+        // period columns, the binder lifting their bounds into the framed interval
+        // — instead of the typed in-process `insert`/`update` with a hand-built
+        // payload. This is the round-trip the ticket's Definition of Done demands:
+        // a valid interval written over SQL, read back at a `FOR VALID_TIME AS OF`
+        // point.
+        //
+        //   INSERT id=1, balance=100, valid [10, 20)
+        //   UPDATE id=1, balance=250, valid [20, 30)   (a valid-time RMW)
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE account (id INT PRIMARY KEY, balance INT, vf TIMESTAMP, vt TIMESTAMP) \
+                 WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+            ))
+            .expect("create valid-time table");
+
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100, 10, 20)"))
+            .expect("insert over SQL");
+        // The write advanced the commit clock to its `sys_from`; read it back as
+        // the insert's commit instant (no public DML-commit accessor at v0.2).
+        let c1 = engine.clock.current().0;
+        engine
+            .execute(&parse_one(
+                "UPDATE account SET balance = 250, vf = 20, vt = 30 WHERE id = 1",
+            ))
+            .expect("update over SQL");
+        let c2 = engine.clock.current().0;
+        assert!(c1 < c2, "the update commits strictly after the insert");
+
+        let mut balance = |sys: i64, valid: i64| -> Option<Vec<u8>> {
+            let sql = format!(
+                "SELECT balance FROM account \
+                 FOR SYSTEM_TIME AS OF {sys} FOR VALID_TIME AS OF {valid}"
+            );
+            let StatementOutcome::Rows(r) = engine.execute(&parse_one(&sql)).expect("select")
+            else {
+                panic!("SELECT must return rows");
+            };
+            // Static assert message — interpolating the result here trips CodeQL's
+            // (false) cleartext-logging taint on the row payloads.
+            assert!(
+                r.rows.len() <= 1,
+                "one key resolves to at most one live version"
+            );
+            r.rows
+                .into_iter()
+                .next()
+                .and_then(|row| row.into_iter().next().expect("the projected balance cell"))
+        };
+
+        // The four corners: each cell needs *both* axes to agree, proving the SQL
+        // INSERT and the SQL UPDATE each wrote a distinct, correct valid interval.
+        assert_eq!(balance(c1, 15), cell(Some(ScalarValue::Int4(100))));
+        assert_eq!(balance(c2, 25), cell(Some(ScalarValue::Int4(250))));
+        assert_eq!(balance(c2, 15), None);
+        assert_eq!(balance(c1, 25), None);
+    }
+
+    #[test]
+    fn insert_opens_a_valid_period_to_infinity_over_sql() {
+        // The open-period default: an INSERT naming only the start bound opens
+        // `[from, +∞)`, so the fact is valid at every instant at or after `from`.
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE account (id INT PRIMARY KEY, balance INT, vf TIMESTAMP, vt TIMESTAMP) \
+                 WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+            ))
+            .expect("create valid-time table");
+        engine
+            .execute(&parse_one(
+                "INSERT INTO account (id, balance, vf) VALUES (1, 100, 50)",
+            ))
+            .expect("insert open-ended period");
+        let c = engine.clock.current().0;
+
+        let mut balance = |valid: i64| -> Option<Vec<u8>> {
+            let sql = format!(
+                "SELECT balance FROM account FOR SYSTEM_TIME AS OF {c} FOR VALID_TIME AS OF {valid}"
+            );
+            let StatementOutcome::Rows(r) = engine.execute(&parse_one(&sql)).expect("select")
+            else {
+                panic!("rows");
+            };
+            r.rows
+                .into_iter()
+                .next()
+                .and_then(|row| row.into_iter().next().expect("balance cell"))
+        };
+
+        assert_eq!(balance(49), None, "before the open period's start");
+        assert_eq!(
+            balance(50),
+            cell(Some(ScalarValue::Int4(100))),
+            "at the start"
+        );
+        assert_eq!(
+            balance(1_000_000),
+            cell(Some(ScalarValue::Int4(100))),
+            "far past the start — the period never closes"
+        );
+    }
+
+    // --- STL-194: the SQL valid-time DML correctness oracle ------------------
+
+    /// A deterministic splitmix64 — a seed replays an identical workload, with no
+    /// dependency on the sim crate (this oracle drives the SQL path, not storage).
+    struct ValidOracleRng(u64);
+    impl ValidOracleRng {
+        const fn new(seed: u64) -> Self {
+            Self(seed.wrapping_add(0x9E37_79B9_7F4A_7C15))
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        /// A uniform value in `0..n` (`n > 0`), no `as` casts so the pedantic
+        /// truncation lints stay clean.
+        fn below(&mut self, n: i64) -> i64 {
+            let n = u64::try_from(n).expect("positive bound");
+            i64::try_from(self.next() % n).expect("fits i64")
+        }
+    }
+
+    /// One naïve, obviously-correct version tuple: both axes as half-open
+    /// intervals plus the value. `sys_to == i64::MAX` is an open system period;
+    /// `vto == i64::MAX` an open valid period.
+    #[derive(Clone)]
+    struct ValidRefVersion {
+        sys_from: i64,
+        sys_to: i64,
+        vfrom: i64,
+        vto: i64,
+        balance: i32,
+    }
+
+    /// The naïve bitemporal reference ([STL-163]'s, re-expressed for the SQL
+    /// path): per key, an append-only list of version tuples maintained by the
+    /// same INSERT/UPDATE/DELETE semantics the engine uses. Far too simple to be
+    /// wrong, which is the point — an independent check on the binder's interval
+    /// lift and the engine's framed-payload write.
+    #[derive(Default)]
+    struct ValidRefModel {
+        versions: BTreeMap<i32, Vec<ValidRefVersion>>,
+    }
+    impl ValidRefModel {
+        fn open_idx(&self, k: i32) -> Option<usize> {
+            self.versions
+                .get(&k)
+                .and_then(|vs| vs.iter().position(|v| v.sys_to == i64::MAX))
+        }
+        fn close(&mut self, k: i32, commit: i64) {
+            let i = self.open_idx(k).expect("a live key has one open period");
+            self.versions.get_mut(&k).expect("key present")[i].sys_to = commit;
+        }
+        fn insert(&mut self, k: i32, commit: i64, vfrom: i64, vto: i64, balance: i32) {
+            self.versions.entry(k).or_default().push(ValidRefVersion {
+                sys_from: commit,
+                sys_to: i64::MAX,
+                vfrom,
+                vto,
+                balance,
+            });
+        }
+        fn update(&mut self, k: i32, commit: i64, vfrom: i64, vto: i64, balance: i32) {
+            self.close(k, commit);
+            self.insert(k, commit, vfrom, vto, balance);
+        }
+
+        /// The per-key `(id bytes → balance bytes)` map live on both axes at
+        /// `(s, v)`, encoded the way a `SELECT id, balance` returns them.
+        /// `inclusive_vto` flips the valid upper bound to inclusive — the
+        /// deliberately-wrong variant that proves the differential has teeth.
+        fn cell(&self, s: i64, v: i64, inclusive_vto: bool) -> BTreeMap<Vec<u8>, Vec<u8>> {
+            let mut out = BTreeMap::new();
+            for (k, vs) in &self.versions {
+                for ver in vs {
+                    let sys_ok = ver.sys_from <= s && s < ver.sys_to;
+                    let valid_ok = ver.vfrom <= v
+                        && (if inclusive_vto {
+                            v <= ver.vto
+                        } else {
+                            v < ver.vto
+                        });
+                    if sys_ok && valid_ok {
+                        let id = encode_value(&ScalarValue::Int4(*k));
+                        let balance = encode_value(&ScalarValue::Int4(ver.balance));
+                        assert!(out.insert(id, balance).is_none(), "one row per (s,v,k)");
+                    }
+                }
+            }
+            out
+        }
+    }
+
+    /// The engine's `(id bytes → balance bytes)` map at `(s, v)`, read entirely
+    /// over SQL with both axes pinned by literal-microsecond `AS OF` instants.
+    fn read_valid_cells(
+        engine: &mut SessionEngine<ZeroClock, MemDisk>,
+        s: i64,
+        v: i64,
+    ) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        let sql = format!(
+            "SELECT id, balance FROM acct \
+             FOR SYSTEM_TIME AS OF {s} FOR VALID_TIME AS OF {v}"
+        );
+        let StatementOutcome::Rows(r) = engine.execute(&parse_one(&sql)).expect("select") else {
+            panic!("SELECT must return rows");
+        };
+        let mut out = BTreeMap::new();
+        for row in r.rows {
+            let id = row[0].clone().expect("the id key is never NULL");
+            let balance = row[1]
+                .clone()
+                .expect("the balance is never NULL in this workload");
+            assert!(
+                out.insert(id, balance).is_none(),
+                "@ (s={s}, v={v}): two live versions for one key — the at-most-one-live invariant broke",
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn sql_valid_time_dml_matches_a_naive_reference() {
+        // STL-194's correctness oracle. A random INSERT/UPDATE/DELETE history is
+        // applied to a valid-time table **entirely over SQL**, with each write's
+        // interval named in the statement and lifted by the binder onto the framed
+        // payload. An exhaustive `(system, valid)` AS OF grid is then swept and the
+        // engine's rows are diffed against the naïve reference. Because the
+        // *resolution* is STL-163's already-oracled logic, agreement here isolates
+        // the new code: the binder's interval lift and the engine's interval write
+        // (including the valid-time UPDATE read-modify-write and the open-period
+        // default). The teeth check (an inclusive-`vto` reference that must diverge
+        // at least once) proves the half-open valid boundary is really probed.
+        const KEY_POOL: i64 = 3;
+        const VMAX: i64 = 10;
+        const SEEDS: u64 = 48;
+
+        let mut total_probes: u64 = 0;
+        let mut rows_seen: u64 = 0;
+        let mut teeth = false;
+
+        for seed in 0..SEEDS {
+            let mut rng = ValidOracleRng::new(seed);
+            let mut engine = session();
+            engine
+                .execute(&parse_one(
+                    "CREATE TABLE acct (id INT PRIMARY KEY, balance INT, vf TIMESTAMP, vt TIMESTAMP) \
+                     WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+                ))
+                .expect("create valid-time table");
+            let create_c = engine.clock.current().0;
+
+            let mut model = ValidRefModel::default();
+            let mut alive = vec![false; usize::try_from(KEY_POOL).expect("fits")];
+            let mut hi = create_c;
+
+            let ops = 8 + rng.below(12);
+            for op in 0..ops {
+                let k = rng.below(KEY_POOL);
+                let ku = usize::try_from(k).expect("fits");
+                let ki = i32::try_from(k).expect("key fits i32");
+                let balance = i32::try_from(op + 1).expect("balance fits i32");
+                // A well-formed valid window inside `[0, VMAX]`, sometimes open to
+                // exercise the `+∞` sentinel and the open-period default.
+                let from = rng.below(VMAX);
+                let open = rng.below(4) == 0;
+                let to = if open {
+                    i64::MAX
+                } else {
+                    from + 1 + rng.below(VMAX - from)
+                };
+
+                if alive[ku] && rng.below(2) == 0 {
+                    engine
+                        .execute(&parse_one(&format!("DELETE FROM acct WHERE id = {ki}")))
+                        .expect("delete");
+                    let c = engine.clock.current().0;
+                    model.close(ki, c);
+                    alive[ku] = false;
+                    hi = hi.max(c);
+                } else if alive[ku] {
+                    let set = if open {
+                        format!("SET balance = {balance}, vf = {from}")
+                    } else {
+                        format!("SET balance = {balance}, vf = {from}, vt = {to}")
+                    };
+                    engine
+                        .execute(&parse_one(&format!("UPDATE acct {set} WHERE id = {ki}")))
+                        .expect("update");
+                    let c = engine.clock.current().0;
+                    model.update(ki, c, from, to, balance);
+                    hi = hi.max(c);
+                } else {
+                    let stmt = if open {
+                        format!(
+                            "INSERT INTO acct (id, balance, vf) VALUES ({ki}, {balance}, {from})"
+                        )
+                    } else {
+                        format!("INSERT INTO acct VALUES ({ki}, {balance}, {from}, {to})")
+                    };
+                    engine.execute(&parse_one(&stmt)).expect("insert");
+                    let c = engine.clock.current().0;
+                    model.insert(ki, c, from, to, balance);
+                    alive[ku] = true;
+                    hi = hi.max(c);
+                }
+            }
+
+            // Sweep both axes: system from the table's creation through one past the
+            // last commit; valid across `[0, VMAX]` and one past each end.
+            for s in create_c..=(hi + 1) {
+                for v in 0..=(VMAX + 1) {
+                    let got = read_valid_cells(&mut engine, s, v);
+                    let want = model.cell(s, v, false);
+                    assert_eq!(
+                        got, want,
+                        "seed {seed}: engine diverged from the reference at (s={s}, v={v})"
+                    );
+                    if got != model.cell(s, v, true) {
+                        teeth = true;
+                    }
+                    rows_seen += u64::try_from(got.len()).expect("fits");
+                    total_probes += 1;
+                }
+            }
+        }
+
+        assert!(
+            rows_seen > 0,
+            "every probe was empty — the workload resolved nothing"
+        );
+        assert!(
+            teeth,
+            "the differential never hit a half-open valid boundary — it cannot detect an off-by-one"
+        );
+        assert!(
+            total_probes > 5_000,
+            "differential probed only {total_probes} (s,v) cells — widen the sweep"
+        );
     }
 
     #[test]
