@@ -296,14 +296,22 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
         redos: Vec<Redo>,
     ) -> Result<DmlOutcome, DmlError> {
         if self.group.is_some() {
-            // Apply before buffering so a same-transaction successor sees this
-            // write; the WAL record is deferred to `commit_group`. Applied
-            // *resident* (never spilled) so the buffered set stays removable —
-            // `abort_group` rolls the whole transaction back out of the in-memory
-            // tiers if the commit aborts before its record is durable ([STL-216]).
-            crate::systime::apply_resident(delta, index, redos.clone())?;
             let wal = self.wal.durable_end();
-            self.group.as_mut().expect("group is open").extend(redos);
+            // Buffer the redos *before* applying them, so abort_group's undo can
+            // reverse this statement even if it fails after a partial apply — an
+            // `UPDATE` resolves to `[Close, Insert]` and the new version can be
+            // rejected (e.g. `DeltaError::TooLarge`) *after* the close already
+            // materialized. Recording first means the applied prefix is in the
+            // buffer; `undo` removes what landed and skips what did not ([STL-216]).
+            // A failed statement always aborts (the caller propagates the error to
+            // `abort_group`), so a not-fully-applied set is never logged by
+            // `commit_group`. Applied *resident* (never spilled) so every buffered
+            // row stays removable — the WAL record is deferred to `commit_group`.
+            self.group
+                .as_mut()
+                .expect("group is open")
+                .extend(redos.clone());
+            crate::systime::apply_resident(delta, index, redos)?;
             return Ok(DmlOutcome { commit, wal });
         }
         let record = encode_redo(&redos)?;
@@ -1223,6 +1231,88 @@ mod tests {
             index.materialize().expect("live index"),
             rec_index.materialize().expect("recovered index"),
             "live index matches the recovered index exactly",
+        );
+    }
+
+    /// A group statement that fails **after a partial apply** must still roll back
+    /// fully on abort ([STL-216]; regression for the Copilot review of PR #130). An
+    /// `UPDATE` resolves to `[Close, Insert]`: in group mode the close materializes
+    /// first, then the new version is rejected as over-large. Because the writer
+    /// records the redos *before* applying them, `abort_group` undoes the orphaned
+    /// close — so a *failed* `UPDATE` leaves the committed row live, not deleted.
+    #[test]
+    fn abort_undoes_a_statement_that_failed_after_a_partial_apply() {
+        use stele_common::provenance::Principal;
+
+        use crate::backend::MemDisk;
+        use crate::delta::{Delta, DeltaConfig, MAX_VERSION_FRAME_LEN};
+        use crate::systime::EmptySealed;
+        use crate::validity::{ValidityConfig, ValidityIndex};
+        use crate::wal::{Wal, WalConfig};
+
+        let wal = Wal::open(MemDisk::new(), WalConfig::default()).expect("wal");
+        let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
+        let mut index =
+            ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+        let mut writer =
+            DmlWriter::new(wal, StepClock(std::sync::atomic::AtomicI64::new(0)), false);
+        let principal = Principal::new(b"p".to_vec());
+        let key = BusinessKey::new(b"k".to_vec());
+
+        // A committed baseline row (auto-commit).
+        writer
+            .insert(
+                &mut delta,
+                &mut index,
+                &EmptySealed,
+                key.clone(),
+                None,
+                Some(b"v0".to_vec()),
+                0,
+                TxnId(1),
+                principal.clone(),
+            )
+            .expect("baseline insert");
+        let base_versions = delta.candidate_versions(&key).expect("base candidates");
+        let base_index = index.materialize().expect("base index");
+        let base_bytes = delta.byte_size();
+
+        // A group UPDATE whose new version exceeds the per-frame ceiling: the close
+        // materializes, then the insert is rejected — a partial apply.
+        writer.begin_group();
+        let too_large = vec![0u8; MAX_VERSION_FRAME_LEN + 1];
+        let result = writer.update(
+            &mut delta,
+            &mut index,
+            &EmptySealed,
+            key.clone(),
+            None,
+            Some(too_large),
+            0,
+            TxnId(2),
+            principal,
+        );
+        assert!(
+            matches!(result, Err(DmlError::Apply(_))),
+            "the over-large new version is rejected mid-apply, after the close landed",
+        );
+
+        writer.abort_group(&mut delta, &mut index);
+
+        assert_eq!(
+            delta.candidate_versions(&key).expect("after"),
+            base_versions,
+            "the committed row's version is untouched by the failed UPDATE",
+        );
+        assert_eq!(
+            index.materialize().expect("after index"),
+            base_index,
+            "the orphaned close from the partial apply was rolled back — the row is not left deleted",
+        );
+        assert_eq!(
+            delta.byte_size(),
+            base_bytes,
+            "resident byte accounting returned to the baseline",
         );
     }
 

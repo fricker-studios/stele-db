@@ -701,13 +701,16 @@ pub(crate) fn apply_resident<D: Disk, I: Disk>(
 /// removes the staged version, a [`Redo::Close`] removes the materialized close
 /// (re-opening the version it ended), and a [`Redo::Retract`] removes both its
 /// tombstone and its close. The set is the group-commit buffer ([`crate::dml`]) —
-/// exactly what this transaction applied — so removing each entry by key restores
-/// the tiers to their pre-transaction state, identical to what a crash (which
-/// finds no durable record for the aborted transaction) reconstructs on recovery.
+/// every redo the transaction *staged*, which the writer records before applying —
+/// so removing each entry by key restores the tiers to their pre-transaction
+/// state, identical to what a crash (which finds no durable record for the aborted
+/// transaction) reconstructs on recovery.
 ///
-/// Infallible: every removal is an in-memory map operation, and a redo whose entry
-/// is already absent (it was superseded within the same transaction, or never
-/// landed) is simply skipped. Apply order does not matter — each entry is keyed
+/// Infallible, and tolerant of a redo whose entry is **not** resident — it is
+/// simply skipped. That covers a statement that failed *after* a partial apply
+/// (an `UPDATE`'s close materialized but its over-large new version was rejected):
+/// the buffer holds both redos, [`undo`] removes the close that landed and no-ops
+/// the version that did not. Apply order does not matter — each entry is keyed
 /// independently — but the set is walked in reverse for symmetry with [`apply`].
 pub(crate) fn undo<D: Disk, I: Disk>(
     delta: &mut Delta<D>,
