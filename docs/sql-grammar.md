@@ -217,7 +217,7 @@ parser and the catalog (STL-98) / executor / pgwire encoder. The set:
 |----------------------------------------|---------------|--------------|
 | `INT`, `INTEGER`                       | `Int4`        | 23           |
 | `BIGINT`                               | `Int8`        | 20           |
-| `TEXT`, `VARCHAR[(n)]`, `CHARACTER VARYING[(n)]`, `NVARCHAR[(n)]` | `Text` | 25 |
+| `TEXT`, `VARCHAR[(n)]`, `CHARACTER VARYING[(n)]`, `CHAR VARYING[(n)]`, `NVARCHAR[(n)]` | `Text` | 25 |
 | `BOOL`, `BOOLEAN`                      | `Bool`        | 16           |
 | `TIMESTAMP` (no time zone)             | `Timestamp`   | 1114         |
 | `TIMESTAMP WITH TIME ZONE`, `TIMESTAMPTZ` | `TimestampTz` | 1184      |
@@ -237,8 +237,9 @@ zone offset is normalized to UTC on input and rendered back with a `+00` offset
 explicit zone offset rather than Postgres-style silently ignoring it (dropping
 an offset the user wrote would change the instant they named); `DATE` is the
 pure `YYYY-MM-DD` form. Typed-string literals (`TIMESTAMP '…'`, `DATE '…'`,
-`UUID '…'`) fold when the declared type matches the column; a mismatch is a
-type error, never an implicit cast.
+`UUID '…'`) fold when the declared type **lowers to the column's
+`LogicalType`** — so `VARCHAR '…'` folds into a `TEXT` column, since both lower
+to `Text`; a mismatch after lowering is a type error, never an implicit cast.
 
 Anything else — the blank-padding `CHAR(n)`, `REAL`, … — is rejected
 (`ParseError::UnsupportedType`, with the supported vocabulary in the message)

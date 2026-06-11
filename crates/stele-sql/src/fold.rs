@@ -264,17 +264,19 @@ pub(crate) fn signed_number(expr: &Expr) -> Option<String> {
 
 /// A short label for an expression, for the type-mismatch diagnostics.
 pub(crate) fn describe(expr: &Expr) -> &'static str {
-    if matches!(expr, Expr::TypedString(_)) {
+    match expr {
+        // Peel parentheses so `(DATE '…')` describes like `DATE '…'`.
+        Expr::Nested(inner) => describe(inner),
         // A typed string of the *wrong* type lands here — `string_literal`
         // already matched the right-typed ones.
-        return "a typed literal of a different type";
-    }
-    match literal(expr) {
-        Some(Value::SingleQuotedString(_)) => "a string literal",
-        Some(Value::Boolean(_)) => "a boolean literal",
-        Some(Value::Number(..)) => "a numeric literal",
-        Some(Value::Null) => "NULL",
-        _ => "a non-literal expression",
+        Expr::TypedString(_) => "a typed literal of a different type",
+        _ => match literal(expr) {
+            Some(Value::SingleQuotedString(_)) => "a string literal",
+            Some(Value::Boolean(_)) => "a boolean literal",
+            Some(Value::Number(..)) => "a numeric literal",
+            Some(Value::Null) => "NULL",
+            _ => "a non-literal expression",
+        },
     }
 }
 
@@ -415,16 +417,25 @@ mod tests {
             ),
             Ok(ScalarValue::Uuid(SAMPLE))
         );
-        // …but a typed string of a DIFFERENT type is a mismatch, not a cast.
-        assert!(matches!(
-            fold_scalar(
-                &typed_lit(DataType::Date, "2023-11-14"),
-                LogicalType::Timestamp
-            ),
-            Err(FoldError::TypeMismatch {
-                found: "a typed literal of a different type"
-            })
-        ));
+        // The match is on the LOWERED type: VARCHAR '…' folds into a TEXT
+        // column because both lower to `Text`.
+        assert_eq!(
+            fold_scalar(&typed_lit(DataType::Varchar(None), "hi"), LogicalType::Text),
+            Ok(ScalarValue::Text("hi".to_owned()))
+        );
+        // …but a typed string of a DIFFERENT type is a mismatch, not a cast —
+        // and parentheses don't blunt the diagnostic.
+        for expr in [
+            typed_lit(DataType::Date, "2023-11-14"),
+            Expr::Nested(Box::new(typed_lit(DataType::Date, "2023-11-14"))),
+        ] {
+            assert!(matches!(
+                fold_scalar(&expr, LogicalType::Timestamp),
+                Err(FoldError::TypeMismatch {
+                    found: "a typed literal of a different type"
+                })
+            ));
+        }
     }
 
     #[test]

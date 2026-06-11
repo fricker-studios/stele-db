@@ -25,8 +25,9 @@ pub enum ParseError {
 
     /// A column declared a SQL type outside Stele's type vocabulary.
     #[error(
-        "unsupported column type {0} — supported: INT, BIGINT, TEXT, VARCHAR, NVARCHAR, \
-         BOOL, TIMESTAMP, TIMESTAMPTZ, DATE, UUID, BYTEA"
+        "unsupported column type {0} — supported: INT/INTEGER, BIGINT, \
+         TEXT/VARCHAR/NVARCHAR/CHARACTER VARYING, BOOL/BOOLEAN, \
+         TIMESTAMP [WITH TIME ZONE], TIMESTAMPTZ, DATE, UUID, BYTEA"
     )]
     UnsupportedType(String),
 }

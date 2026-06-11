@@ -825,9 +825,10 @@ fn conninfo(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Send one buffered statement (or batch) and render every reply. With timing
-/// on, the round-trip rides the result trailer (`(N rows · X.XXX ms)`); a
-/// statement that returns no rows to carry it (DML/DDL tags, `\json` output, an
-/// error) gets the psql-style `Time:` line instead.
+/// on, the round-trip rides the result trailer (`(N rows · X.XXX ms)`) when the
+/// batch yields exactly one row set; otherwise — DML/DDL tags, `\json` output,
+/// errors, or a multi-statement batch (one measurement cannot be attributed to
+/// any single set) — the batch gets one psql-style `Time:` line at the end.
 fn run_statement(
     client: &mut Client,
     session: &Session,
@@ -837,18 +838,25 @@ fn run_statement(
     let started = Instant::now();
     let replies = client.simple_query(sql)?;
     let timed = session.timing.then(|| started.elapsed());
-    let mut trailer_shown = false;
+    // The whole round-trip is measured once, so the trailer may carry it only
+    // when there is exactly one row set to pin it to (and the table/expanded
+    // renderers will actually draw a trailer — JSON output has none).
+    let sole_row_set = !session.json
+        && replies
+            .iter()
+            .filter(|r| matches!(r, Reply::Rows(_)))
+            .count()
+            == 1;
+    let trailer_time = if sole_row_set { timed } else { None };
     for reply in replies {
         match reply {
             Reply::Rows(set) => {
                 let lines = if session.json {
                     render::json_lines(&set.columns, &set.rows)
                 } else if session.expanded {
-                    trailer_shown = true;
-                    render::expanded_lines(&set.columns, &set.rows, timed)
+                    render::expanded_lines(&set.columns, &set.rows, trailer_time)
                 } else {
-                    trailer_shown = true;
-                    render::table_lines(&set.columns, &set.rows, session.result_opts(timed))
+                    render::table_lines(&set.columns, &set.rows, session.result_opts(trailer_time))
                 };
                 write_lines(session, out, &lines)?;
             }
@@ -858,7 +866,7 @@ fn run_statement(
         }
     }
     if let Some(elapsed) = timed
-        && !trailer_shown
+        && !sole_row_set
     {
         write_segs(
             session,
