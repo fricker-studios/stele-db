@@ -86,7 +86,7 @@ use stele_storage::delta::{BusinessKey, Snapshot};
 use stele_storage::dml::{CommittedTxns, DmlOutcome};
 use stele_storage::engine::{Engine, EngineError as StorageError};
 use stele_storage::segment::{ColumnId, Predicate, ZoneBound};
-use stele_storage::validtime::{ValidInterval, unframe_payload};
+use stele_storage::validtime::ValidInterval;
 
 /// A monotonic, globally-shared commit clock.
 ///
@@ -2007,10 +2007,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// row whose unset columns are `NULL`). The starting point for an `UPDATE`'s
     /// read-modify-write merge.
     ///
-    /// On a valid-time table the scanned payload is *framed* (a system-only scan
-    /// leaves the 16-byte interval prefix in place), so the prefix is stripped with
-    /// [`unframe_payload`] before the row codec decodes the value cells — otherwise
-    /// the merge would read the interval bytes as row data ([STL-194]).
+    /// On a valid-time table the prior version's stored payload framing depends on
+    /// which tier resolves it: a delta row carries the 16-byte interval prefix on
+    /// its payload ([`frame_payload`](stele_storage::validtime::frame_payload),
+    /// [STL-194]), whereas a sealed segment stores the payload **bare** with the
+    /// interval lifted into its own `valid_from` / `valid_to` columns ([STL-163]).
+    /// The scan therefore runs with [`valid_time`](SnapshotScan::valid_time) set to
+    /// the table's policy, which strips the delta frame and reads the sealed payload
+    /// bare, emitting the bare user payload uniformly across tiers ([STL-218]); the
+    /// row codec then decodes it directly. Stripping a fixed prefix here instead
+    /// would corrupt a sealed prior version's real row data ([STL-226]).
     fn live_value_cells(
         &self,
         table: &str,
@@ -2032,32 +2038,27 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             &readers,
             Snapshot(snapshot),
         )
+        // Emit the bare user payload regardless of which tier resolves the prior
+        // version: with the table's valid-time policy set, the scan strips the
+        // delta tier's framed interval prefix and reads the sealed tier's
+        // already-bare payload, so the row codec below decodes one consistent shape
+        // ([STL-218], [STL-226]). For a system-only table this is `false` and the
+        // payload (already bare) is untouched.
+        .valid_time(state.valid_time)
         .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
         .filter(Predicate::Eq {
             column: ColumnId::BusinessKey,
             value: ZoneBound::Bytes(key.as_bytes().to_vec()),
         })
         .execute()?;
-        // The key resolves to at most one live version; take its payload (the Eq
-        // predicate narrows the scan, but re-match the key defensively).
+        // The key resolves to at most one live version; take its (now bare) payload
+        // (the Eq predicate narrows the scan, but re-match the key defensively).
         let payload = (0..out.batch.rows)
             .find(|&r| {
                 column_cell(&out.batch, ColumnId::BusinessKey, r).as_deref() == Some(key.as_bytes())
             })
             .and_then(|r| column_cell(&out.batch, ColumnId::Payload, r));
-        // A valid-time row's payload still carries the framed interval prefix here
-        // (this scan does not pin the valid axis); strip it to the bare user
-        // payload the row codec expects. Consume `payload` so the system-only arm
-        // hands its bytes straight back without a move-out-of-borrow.
-        let bare = match payload {
-            Some(stored) if state.valid_time => {
-                let (_interval, user) = unframe_payload(true, &stored)
-                    .map_err(|e| EngineError::Scan(ScanError::ValidTime(e)))?;
-                Some(user.to_vec())
-            }
-            other => other,
-        };
-        Ok(row_codec::decode_payload(value_count, bare.as_deref())?)
+        Ok(row_codec::decode_payload(value_count, payload.as_deref())?)
     }
 
     /// Begin a multi-statement transaction — an empty write buffer the caller
@@ -3552,6 +3553,135 @@ mod tests {
             balance(1_000_000),
             cell(Some(ScalarValue::Int4(100))),
             "far past the start — the period never closes"
+        );
+    }
+
+    // --- STL-226: valid-time UPDATE RMW reads its prior version across tiers --
+
+    /// A fresh session holding an empty valid-time `acct(id, balance, vf, vt)`.
+    fn valid_acct() -> SessionEngine<ZeroClock, MemDisk> {
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE acct (id INT PRIMARY KEY, balance INT, vf TIMESTAMP, vt TIMESTAMP) \
+                 WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+            ))
+            .expect("create valid-time table");
+        engine
+    }
+
+    /// `acct`'s `balance` for `id = 1`, read over SQL at the latest system time and
+    /// the given valid instant — `None` when no version is live there.
+    fn read_balance(engine: &mut SessionEngine<ZeroClock, MemDisk>, valid: i64) -> Option<Vec<u8>> {
+        let c = engine.clock.current().0;
+        let sql = format!(
+            "SELECT balance FROM acct FOR SYSTEM_TIME AS OF {c} FOR VALID_TIME AS OF {valid}"
+        );
+        let StatementOutcome::Rows(r) = engine.execute(&parse_one(&sql)).expect("select") else {
+            panic!("SELECT must return rows");
+        };
+        r.rows
+            .into_iter()
+            .next()
+            .and_then(|row| row.into_iter().next().expect("balance cell"))
+    }
+
+    #[test]
+    fn valid_time_update_after_flush_reads_prior_version_from_a_sealed_segment() {
+        // STL-226: a valid-time UPDATE is a read-modify-write — it reads the prior
+        // live row's value cells so columns the SET does not name keep their prior
+        // value. When that prior version has been sealed into a segment (after a
+        // CHECKPOINT / FLUSH, or once the delta spilled), its payload is stored
+        // *bare* with the interval in the segment's own ValidFrom/ValidTo columns
+        // ([STL-163]) — unlike a delta prior version, whose payload is framed
+        // ([STL-194]). The RMW read must strip the frame only where one exists; the
+        // pre-fix code stripped a fixed 16-byte prefix unconditionally, so a sealed
+        // payload's real row bytes were drained as a phantom prefix and the row
+        // codec rejected the remainder (`RowCodecError::TrailingBytes`). Each
+        // sub-case writes a prior version, flushes to seal it, then updates the key.
+
+        // (a) bounded prior period — the literal repro.
+        {
+            let mut engine = valid_acct();
+            engine
+                .execute(&parse_one("INSERT INTO acct VALUES (1, 10, 0, 20)"))
+                .expect("insert bounded period");
+            engine.flush().expect("seal the delta into a segment");
+            engine
+                .execute(&parse_one(
+                    "UPDATE acct SET balance = 11, vf = 0, vt = 20 WHERE id = 1",
+                ))
+                .expect("UPDATE reads the prior version from the sealed segment");
+            assert_eq!(
+                read_balance(&mut engine, 5),
+                cell(Some(ScalarValue::Int4(11))),
+                "the updated balance is live across the new [0, 20) period",
+            );
+        }
+
+        // (b) open-ended prior period — the interval frames the +∞ sentinel, a
+        // distinct payload shape from the bounded case.
+        {
+            let mut engine = valid_acct();
+            engine
+                .execute(&parse_one(
+                    "INSERT INTO acct (id, balance, vf) VALUES (1, 10, 0)",
+                ))
+                .expect("insert open period");
+            engine.flush().expect("seal the delta into a segment");
+            engine
+                .execute(&parse_one(
+                    "UPDATE acct SET balance = 11, vf = 0 WHERE id = 1",
+                ))
+                .expect("UPDATE reads the prior open-period version from the sealed segment");
+            assert_eq!(
+                read_balance(&mut engine, 1_000_000),
+                cell(Some(ScalarValue::Int4(11))),
+                "the updated balance is live across the re-opened [0, +∞) period",
+            );
+        }
+
+        // (c) DELETE never decodes the prior payload, so it was unaffected — assert
+        // it still closes the period after a flush (control).
+        {
+            let mut engine = valid_acct();
+            engine
+                .execute(&parse_one("INSERT INTO acct VALUES (1, 10, 0, 20)"))
+                .expect("insert");
+            engine.flush().expect("seal");
+            engine
+                .execute(&parse_one("DELETE FROM acct WHERE id = 1"))
+                .expect("DELETE closes the prior period without decoding its payload");
+            assert_eq!(read_balance(&mut engine, 5), None, "the period is closed");
+        }
+    }
+
+    #[test]
+    fn valid_time_update_after_flush_preserves_unset_columns_from_the_sealed_read() {
+        // STL-226 (RMW correctness): an UPDATE naming only the period columns keeps
+        // `balance` at its prior value, read back from the *sealed* segment. This
+        // proves the prior payload decodes correctly across the tier boundary — not
+        // merely that the UPDATE no longer errors.
+        let mut engine = valid_acct();
+        engine
+            .execute(&parse_one("INSERT INTO acct VALUES (1, 42, 0, 20)"))
+            .expect("insert balance=42 over [0, 20)");
+        engine.flush().expect("seal the delta into a segment");
+        // Move the valid window to [5, 20) without naming balance; the RMW must
+        // carry balance=42 over from the sealed prior version.
+        engine
+            .execute(&parse_one("UPDATE acct SET vf = 5, vt = 20 WHERE id = 1"))
+            .expect("period-only UPDATE reads balance from the sealed segment");
+
+        assert_eq!(
+            read_balance(&mut engine, 10),
+            cell(Some(ScalarValue::Int4(42))),
+            "balance is preserved from the sealed prior version across the new window",
+        );
+        assert_eq!(
+            read_balance(&mut engine, 1),
+            None,
+            "before the new window's start the row is not valid",
         );
     }
 
