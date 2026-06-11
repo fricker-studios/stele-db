@@ -521,10 +521,13 @@ impl GatheredColumns {
     /// opaque bytes columns its scan produced, at indices its own row counts bound.
     #[must_use]
     pub fn bytes(&self, col: usize, row: usize) -> Option<&[u8]> {
-        self.selection[row].and_then(|physical| match &self.columns[col] {
-            Column::Bytes(cells) => cells[physical].as_deref(),
-            Column::I64(_) => panic!("join gather over a non-bytes column {col}"),
-        })
+        // Resolve the column's type *before* the nullable selection, so a non-bytes
+        // column is a contract break regardless of whether `row` is NULL-extended (a
+        // type check inside the `and_then` would silently pass for a `None` slot).
+        let Column::Bytes(cells) = &self.columns[col] else {
+            panic!("join gather over a non-bytes column {col}");
+        };
+        self.selection[row].and_then(|physical| cells[physical].as_deref())
     }
 }
 

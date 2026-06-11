@@ -100,3 +100,14 @@ fn join_gather_distinguishes_a_stored_null_from_a_null_extension() {
     assert_eq!(gather.bytes(0, 1), None, "an absent index reads back NULL");
     assert_eq!(gather.bytes(0, 2), cell(&ScalarValue::Int4(7)).as_deref());
 }
+
+#[test]
+#[should_panic(expected = "non-bytes column")]
+fn join_gather_rejects_a_non_bytes_column_even_when_null_extended() {
+    // The column-type check is independent of the nullable selection: gathering a
+    // non-bytes (`I64`) column is a contract break whether or not the read lands on a
+    // NULL-extended (`None`) output row. Row 0's index is `None`, so a type check
+    // nested inside the selection would have silently returned NULL instead.
+    let gather = GatheredColumns::new(vec![Column::I64(vec![1, 2].into())], vec![None, Some(0)]);
+    let _ = gather.bytes(0, 0);
+}
