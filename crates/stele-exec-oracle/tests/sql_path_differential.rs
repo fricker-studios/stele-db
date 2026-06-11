@@ -140,9 +140,13 @@ fn int4_bytes(v: i64) -> Vec<u8> {
 /// Decode an `INT` cell back to its value — used only to render a readable repro
 /// on divergence.
 fn decode_int4(bytes: &[u8]) -> i32 {
+    // `decode(Int4, …)` only ever yields an `Int4`, so the other arm is
+    // unreachable; it deliberately does not `{:?}`-format the `ScalarValue`
+    // (CodeQL's cleartext-logging query taints the enum's `Uuid` variant —
+    // a false positive in this Int4-only test, cf. STL-170 / STL-207).
     match ScalarValue::decode(LogicalType::Int4, bytes).expect("decode int4") {
         ScalarValue::Int4(v) => v,
-        other => panic!("expected an Int4 cell, got {other:?}"),
+        _ => panic!("decode(Int4, …) must yield an Int4 cell"),
     }
 }
 
