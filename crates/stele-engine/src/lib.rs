@@ -952,30 +952,62 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// parameters have no values. But a `SELECT`'s output column shape is a
     /// function of its projection and the schema only — never of the `WHERE`
     /// filter or any parameter *value* — so the filter is stripped
-    /// ([`without_filter`]) and the columns resolve
-    /// straight from the schema live at the current committed snapshot, with no
-    /// scan. Returns `Some(columns)` for a row-returning `SELECT`, or `None` for a
-    /// statement that returns no rows (DDL / DML / admin / empty), which the wire
+    /// ([`without_filter`]) and the columns resolve straight from the schema, with
+    /// no scan. Returns `Some(columns)` for a row-returning `SELECT`, or `None` for
+    /// a statement that returns no rows (DDL / DML / admin / empty), which the wire
     /// front end answers with `NoData`.
     ///
-    /// Binds at the current committed snapshot rather than any open transaction's
-    /// pinned one: a `Describe` reports the statement's *current* shape, and the
-    /// schema rarely differs across a transaction.
+    /// Binds at the current committed snapshot — the auto-commit / no-transaction
+    /// case. Inside an open `BEGIN` block use [`describe_in_txn`](Self::describe_in_txn),
+    /// which resolves at the transaction's pinned snapshot so the advertised shape
+    /// matches the rows the portal `Execute` will return under snapshot isolation.
     ///
     /// # Errors
     ///
-    /// A `SELECT` whose table or projected columns do not resolve at the current
-    /// snapshot surfaces the binder's [`SelectError`], the same error the read path
-    /// would raise.
+    /// A `SELECT` whose table or projected columns do not resolve at the snapshot
+    /// surfaces the binder's [`SelectError`], the same error the read path would
+    /// raise.
     ///
     /// [STL-212]: https://allegromusic.atlassian.net/browse/STL-212
     pub fn describe(
         &self,
         stmt: &Statement,
     ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError> {
+        self.describe_at(self.clock.current(), stmt)
+    }
+
+    /// As [`describe`](Self::describe), but resolving the row shape at an open
+    /// transaction's **pinned snapshot** ([STL-175]) rather than the current
+    /// committed one.
+    ///
+    /// A statement-level `Describe('S')` issued inside a `BEGIN` block must
+    /// advertise the same columns the portal `Execute` will return, and that read
+    /// runs at the transaction's pinned snapshot ([`execute_in_txn`](Self::execute_in_txn)).
+    /// Resolving at `clock.current()` instead could disagree if a concurrent
+    /// session committed a DDL after the snapshot was pinned (e.g. a `SELECT *`
+    /// whose column set changed). Binding here at `txn.snapshot` keeps the
+    /// description and the rows consistent.
+    ///
+    /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+    pub fn describe_in_txn(
+        &self,
+        stmt: &Statement,
+        txn: &SessionTransaction,
+    ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError> {
+        self.describe_at(txn.snapshot, stmt)
+    }
+
+    /// The shared resolver behind [`describe`](Self::describe) and
+    /// [`describe_in_txn`](Self::describe_in_txn): strip the `WHERE` filter and bind
+    /// the row shape at `read_snapshot`, with no scan.
+    fn describe_at(
+        &self,
+        read_snapshot: SystemTimeMicros,
+        stmt: &Statement,
+    ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError> {
         let stripped = without_filter(stmt);
         let ctx = BindContext {
-            snapshot: self.clock.current(),
+            snapshot: read_snapshot,
             catalog: &self.catalog,
         };
         match bind_select(&stripped, &ctx) {
@@ -2833,6 +2865,33 @@ mod tests {
         assert!(
             matches!(err, EngineError::Select(SelectError::UnknownTable(_))),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn describe_in_txn_resolves_at_the_transactions_pinned_snapshot() {
+        // A statement-level Describe inside a BEGIN block must resolve the shape at
+        // the transaction's pinned snapshot, not the current committed one, so it
+        // agrees with the rows the portal Execute returns under snapshot isolation.
+        let mut engine = session();
+        // Pin a snapshot *before* the table exists.
+        let txn = engine.begin();
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        // At the current snapshot the table resolves and describes...
+        let now = engine
+            .describe(&parse_one("SELECT id, balance FROM account"))
+            .expect("describe")
+            .expect("rows");
+        assert_eq!(now.len(), 2);
+        // ...but the transaction's pinned snapshot predates the CREATE, so the same
+        // statement resolves against a catalog where `account` is not yet live —
+        // the description tracks the snapshot the portal Execute reads at.
+        assert!(
+            engine
+                .describe_in_txn(&parse_one("SELECT id, balance FROM account"), &txn)
+                .is_err(),
+            "account is not live at the pinned snapshot"
         );
     }
 

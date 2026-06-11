@@ -2133,7 +2133,8 @@ mod tests {
         }
     }
 
-    /// The `WHERE` of a (possibly nested) top-level `SELECT`, or `None`.
+    /// The `WHERE` of a bare top-level `SELECT` (`SetExpr::Select`), or `None` for
+    /// any other shape — enough for these single-`SELECT` describe tests.
     fn selection_of(stmt: &Statement) -> Option<&Expr> {
         let SqlStatement::Query(query) = stmt.sql()? else {
             return None;

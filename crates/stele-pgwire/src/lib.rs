@@ -238,12 +238,25 @@ pub trait SessionHandle: Send {
     fn describe_live_tables(&self) -> Vec<TableDescription>;
 
     /// Resolve a prepared statement's `RowDescription` columns without running it,
-    /// for statement-level `Describe` — see [`SessionEngine::describe`] ([STL-212]).
-    /// `None` for a statement that returns no rows.
+    /// for statement-level `Describe` at the current committed snapshot — see
+    /// [`SessionEngine::describe`] ([STL-212]). `None` for a statement that returns
+    /// no rows.
     ///
     /// [STL-212]: https://allegromusic.atlassian.net/browse/STL-212
     fn describe(&self, stmt: &Statement)
     -> Result<Option<Vec<(String, LogicalType)>>, EngineError>;
+
+    /// As [`describe`](Self::describe), but resolving at an open transaction's
+    /// pinned snapshot — see [`SessionEngine::describe_in_txn`]. The statement-arm
+    /// of `Describe` uses this inside a `BEGIN` block so the advertised shape
+    /// matches the rows the portal `Execute` returns ([STL-175]).
+    ///
+    /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+    fn describe_in_txn(
+        &self,
+        stmt: &Statement,
+        txn: &SessionTransaction,
+    ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError>;
 
     /// Open a multi-statement transaction, **pinning its read snapshot now** — see
     /// [`SessionEngine::begin`] ([STL-174], [STL-175]).
@@ -298,6 +311,14 @@ where
         stmt: &Statement,
     ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError> {
         Self::describe(self, stmt)
+    }
+
+    fn describe_in_txn(
+        &self,
+        stmt: &Statement,
+        txn: &SessionTransaction,
+    ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError> {
+        Self::describe_in_txn(self, stmt, txn)
     }
 
     fn begin(&self) -> SessionTransaction {
@@ -1930,9 +1951,15 @@ async fn handle_bind(
 /// Unlike the portal arm this never executes the read — tokio-postgres / JDBC
 /// issue `Describe('S')` at prepare time, before any `Bind`, so there are no
 /// parameter values to run with; the column shape does not need them.
+///
+/// `txn` selects the snapshot the engine resolves the shape at: an open `BEGIN`
+/// block's pinned snapshot (so the description agrees with the rows the portal
+/// `Execute` later returns under snapshot isolation), else the current committed
+/// one — mirroring [`run_query`]'s dispatch.
 fn describe_statement_columns(
     session: &SharedSession,
     stmt: &Statement,
+    txn: &ConnTxn,
 ) -> Result<Option<Vec<ResultColumn>>, ExecError> {
     if let Some(intro) = pg_catalog::classify(stmt) {
         return Ok(Some(introspection_reply(&intro, session).0));
@@ -1940,14 +1967,23 @@ fn describe_statement_columns(
     if let Some(columns) = constant_select(stmt) {
         return Ok(Some(columns.iter().map(|c| field(&c.name, c.ty)).collect()));
     }
-    let described = session
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .describe(stmt)
-        .map_err(|e| ExecError {
-            sqlstate: sqlstate_for_query(&e),
-            message: e.to_string(),
-        })?;
+    let described = {
+        let engine = session.lock().unwrap_or_else(PoisonError::into_inner);
+        match txn {
+            // Inside a transaction block — open or aborted ([STL-205] retains the
+            // pinned snapshot on `Failed`) — describe at the block's pinned snapshot
+            // so the shape agrees with the rows a portal `Execute` would read.
+            ConnTxn::Active(buffered) | ConnTxn::Failed(buffered) => {
+                engine.describe_in_txn(stmt, buffered)
+            }
+            // No transaction open: describe against committed state.
+            ConnTxn::Idle => engine.describe(stmt),
+        }
+    }
+    .map_err(|e| ExecError {
+        sqlstate: sqlstate_for_query(&e),
+        message: e.to_string(),
+    })?;
     Ok(described.map(|cols| cols.iter().map(|(name, ty)| field(name, *ty)).collect()))
 }
 
@@ -1980,7 +2016,7 @@ async fn handle_describe(
             // statement (`None`) has no rows.
             let header = match &stmt {
                 None => None,
-                Some(stmt) => match describe_statement_columns(session, stmt) {
+                Some(stmt) => match describe_statement_columns(session, stmt, txn) {
                     Ok(header) => header,
                     Err(e) => return fail_extended(stream, state, e.sqlstate, &e.message).await,
                 },
@@ -4178,6 +4214,32 @@ mod tests {
         assert_eq!(msgs[0].0, MSG_PARSE_COMPLETE);
         assert_eq!(msgs[1].0, MSG_PARAMETER_DESCRIPTION);
         assert_eq!(msgs[2].0, MSG_NO_DATA);
+        terminate(server, client).await;
+    }
+
+    /// Statement-level Describe inside an open `BEGIN` block resolves the shape at
+    /// the transaction's pinned snapshot (not the current one) and still returns the
+    /// RowDescription — exercising the in-transaction dispatch (STL-212 / STL-175).
+    #[tokio::test]
+    async fn describe_statement_inside_a_transaction_returns_row_description() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+        run_simple(&mut client, "BEGIN").await;
+
+        send_parse(&mut client, "s", "SELECT id, balance FROM account", &[]).await;
+        send_describe(&mut client, b'S', "s").await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        assert_eq!(msgs[0].0, MSG_PARSE_COMPLETE);
+        assert_eq!(msgs[1].0, MSG_PARAMETER_DESCRIPTION);
+        assert_eq!(msgs[2].0, MSG_ROW_DESCRIPTION);
+        assert_eq!(
+            parse_row_description_names(&msgs[2].1),
+            vec!["id", "balance"]
+        );
+
+        run_simple(&mut client, "COMMIT").await;
         terminate(server, client).await;
     }
 
