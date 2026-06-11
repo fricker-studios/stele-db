@@ -68,8 +68,12 @@ serde              = { version = "1.0", features = ["derive"] }
 # needs a newer toolchain than our pinned 1.85; we drop it and keep just `std`.
 sqlparser          = { version = "0.62", default-features = false, features = ["std"] }
 # Line editing for `stele shell` (STL-198): ↑/↓ history, Emacs keys, ⌃L. MIT;
-# default features off — no file/sqlite history, no fuzzy matcher, no dirs probe.
-# CLI-only: never a dependency of the server or the runtime-agnostic core.
+# default features off — no fuzzy matcher, no dirs probe. NB STL-202 persists
+# history to `~/.stele_history` *without* the `with-file-history` feature: in
+# rustyline 18 that feature locks the file via `std::fs::File::lock`, which is
+# unstable before Rust 1.89 and so will not build on our 1.85 MSRV (it no longer
+# pulls `fd-lock`). The shell serializes its own history instead — zero new
+# deps. CLI-only: never a dependency of the server or the runtime-agnostic core.
 rustyline          = { version = "18.0", default-features = false }
 # Terminal display width (CJK/emoji are 2 columns) for the shell's table
 # alignment. Already in the tree as rustyline's own width dep — zero new surface.
