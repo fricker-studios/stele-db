@@ -1,5 +1,6 @@
-//! Civil-time text → epoch-microseconds parsing, for the time-zone-aware
-//! `timestamptz` type ([STL-189]).
+//! Civil-time text → epoch parsing for the three civil-time literal types:
+//! the time-zone-aware `timestamptz` ([STL-189]), the zone-less `timestamp`,
+//! and `date`.
 //!
 //! Stele stores every instant as microseconds since the Unix epoch in **UTC**
 //! ([ADR-0024](../../../docs/adr/0024-time-representation.md)). A `timestamptz`
@@ -16,17 +17,23 @@
 //! ## What is accepted
 //!
 //! ```text
-//! YYYY-MM-DD<sep>HH:MM[:SS][.ffffff][zone]
+//! timestamptz  YYYY-MM-DD<sep>HH:MM[:SS][.ffffff][zone]
+//! timestamp    YYYY-MM-DD<sep>HH:MM[:SS][.ffffff]        (a zone REJECTS)
+//! date         YYYY-MM-DD
 //!   <sep>  one ASCII space or `T`/`t`
 //!   zone   `Z`/`z`, `±HH`, `±HH:MM`, `±HHMM`, `±HH:MM:SS`, or absent (= UTC)
 //! ```
 //!
 //! Calendar fields are fully range-checked (months, days-in-month with the
 //! proleptic-Gregorian leap rule, clock fields); sub-microsecond fractional
-//! digits are truncated, the µs floor [ADR-0024] makes load-bearing. A literal
-//! with no zone is read as UTC — the engine is UTC-internal and exposes no
-//! session zone to default to, so this is a *defined* choice, not Postgres's
-//! session-relative one (documented in [16 §10]).
+//! digits are truncated, the µs floor [ADR-0024] makes load-bearing. A
+//! `timestamptz` literal with no zone is read as UTC — the engine is
+//! UTC-internal and exposes no session zone to default to, so this is a
+//! *defined* choice, not Postgres's session-relative one (documented in
+//! [16 §10]). A `timestamp` literal *with* a zone is rejected rather than
+//! Postgres-style silently ignored: dropping an offset the user wrote changes
+//! the instant they named, and the fix (`TIMESTAMPTZ`, or removing the offset)
+//! is one token away.
 //!
 //! [STL-189]: https://allegromusic.atlassian.net/browse/STL-189
 
@@ -38,12 +45,15 @@ const MICROS_PER_DAY: i64 = 86_400 * MICROS_PER_SEC;
 /// Seconds in one hour, for offset arithmetic.
 const SECS_PER_HOUR: i64 = 3_600;
 
-/// Why a `timestamptz` literal could not be parsed. Carries the offending text
+/// Why a civil-time literal could not be parsed. Carries the offending text
 /// and a short, stable reason for diagnostics; the SQL binder re-wraps this with
 /// the column name it knows.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("invalid input syntax for type timestamp with time zone: \"{literal}\" ({reason})")]
-pub struct TimestamptzParseError {
+#[error("invalid input syntax for type {type_name}: \"{literal}\" ({reason})")]
+pub struct DatetimeParseError {
+    /// The SQL type the literal was parsed as (`timestamp with time zone`,
+    /// `timestamp`, `date`) — the Postgres spelling, for the wire diagnostic.
+    pub type_name: &'static str,
     /// The literal text that failed to parse.
     pub literal: String,
     /// A short, stable explanation of what was wrong.
@@ -59,7 +69,7 @@ pub struct TimestamptzParseError {
 ///
 /// # Errors
 ///
-/// [`TimestamptzParseError`] if the text is not a well-formed civil timestamp
+/// [`DatetimeParseError`] if the text is not a well-formed civil timestamp
 /// with an optional zone, if any calendar/clock field is out of range, or if the
 /// instant overflows `i64` microseconds.
 ///
@@ -73,8 +83,78 @@ pub struct TimestamptzParseError {
 /// // …which is 2024-01-15 07:00:00 UTC.
 /// assert_eq!(a, parse_timestamptz("2024-01-15 07:00:00Z").unwrap());
 /// ```
-pub fn parse_timestamptz(input: &str) -> Result<i64, TimestamptzParseError> {
-    let err = |reason: &'static str| TimestamptzParseError {
+pub fn parse_timestamptz(input: &str) -> Result<i64, DatetimeParseError> {
+    parse_instant(input, "timestamp with time zone", true)
+}
+
+/// Parse a zone-less `timestamp` literal into microseconds since the Unix
+/// epoch — the same grammar as [`parse_timestamptz`] *minus* the zone suffix.
+///
+/// The stored scale is identical (a bare UTC instant, [ADR-0024]); the type
+/// difference is at the literal/render boundary only.
+///
+/// # Errors
+///
+/// [`DatetimeParseError`] on the malformations [`parse_timestamptz`] rejects,
+/// **plus** any explicit zone suffix (`Z`, `+05`, …) — silently dropping an
+/// offset the user wrote would change the instant they named (module docs).
+///
+/// ```
+/// use stele_common::datetime::{parse_timestamp, parse_timestamptz};
+///
+/// assert_eq!(
+///     parse_timestamp("2024-01-15 07:00:00").unwrap(),
+///     parse_timestamptz("2024-01-15 07:00:00Z").unwrap(),
+/// );
+/// // An offset on a zone-less timestamp is an error, not silently ignored.
+/// assert!(parse_timestamp("2024-01-15 07:00:00+05").is_err());
+/// ```
+pub fn parse_timestamp(input: &str) -> Result<i64, DatetimeParseError> {
+    parse_instant(input, "timestamp", false)
+}
+
+/// Parse a `date` literal (`YYYY-MM-DD`) into days since the Unix epoch.
+///
+/// # Errors
+///
+/// [`DatetimeParseError`] if the text is not a pure `YYYY-MM-DD` date (a
+/// trailing time-of-day rejects — that is a timestamp), if a calendar field is
+/// out of range, or if the day count overflows `i32`.
+///
+/// ```
+/// use stele_common::datetime::parse_date;
+///
+/// assert_eq!(parse_date("1970-01-01").unwrap(), 0);
+/// assert_eq!(parse_date("2023-11-14").unwrap(), 19_675);
+/// assert!(parse_date("2024-01-15 12:00:00").is_err());
+/// ```
+pub fn parse_date(input: &str) -> Result<i32, DatetimeParseError> {
+    let err = |reason: &'static str| DatetimeParseError {
+        type_name: "date",
+        literal: input.to_owned(),
+        reason,
+    };
+    let s = input.trim();
+    let (year, month, day) = parse_date_fields(s).ok_or_else(|| err("malformed date"))?;
+    if !(1..=12).contains(&month) {
+        return Err(err("month out of range"));
+    }
+    if !(1..=days_in_month(year, month)).contains(&day) {
+        return Err(err("day out of range for month"));
+    }
+    let days = days_from_civil(year, month, day).ok_or_else(|| err("date out of range"))?;
+    i32::try_from(days).map_err(|_| err("date out of range"))
+}
+
+/// The shared timestamp body: grammar per the module docs, with the zone suffix
+/// allowed (`timestamptz`) or rejected (`timestamp`) per `allow_zone`.
+fn parse_instant(
+    input: &str,
+    type_name: &'static str,
+    allow_zone: bool,
+) -> Result<i64, DatetimeParseError> {
+    let err = |reason: &'static str| DatetimeParseError {
+        type_name,
         literal: input.to_owned(),
         reason,
     };
@@ -94,8 +174,13 @@ pub fn parse_timestamptz(input: &str) -> Result<i64, TimestamptzParseError> {
     let (clock_str, zone_str) = rest
         .find(['+', '-', 'Z', 'z'])
         .map_or((rest, ""), |i| (&rest[..i], &rest[i..]));
+    if !allow_zone && !zone_str.is_empty() {
+        return Err(err(
+            "a zone offset is not allowed on a zone-less timestamp — use TIMESTAMPTZ",
+        ));
+    }
 
-    let (year, month, day) = parse_date(date_str).ok_or_else(|| err("malformed date"))?;
+    let (year, month, day) = parse_date_fields(date_str).ok_or_else(|| err("malformed date"))?;
     if !(1..=12).contains(&month) {
         return Err(err("month out of range"));
     }
@@ -130,7 +215,7 @@ pub fn parse_timestamptz(input: &str) -> Result<i64, TimestamptzParseError> {
 /// Parse a `YYYY-MM-DD` date into `(year, month, day)` with a non-negative,
 /// at-least-4-digit year (proleptic BC dates are out of scope on input). `None`
 /// on any structural problem; field-range checks are the caller's.
-fn parse_date(s: &str) -> Option<(i64, u32, u32)> {
+fn parse_date_fields(s: &str) -> Option<(i64, u32, u32)> {
     let mut parts = s.split('-');
     let y = parts.next()?;
     let m = parts.next()?;
@@ -415,6 +500,58 @@ mod tests {
                 Some(days),
                 "round-trip failed at {days}"
             );
+        }
+    }
+
+    #[test]
+    fn zone_less_timestamp_shares_the_grammar_but_rejects_zones() {
+        // Same instant as the UTC-read timestamptz form.
+        assert_eq!(
+            parse_timestamp("2024-01-15 07:00:00").unwrap(),
+            parse_timestamptz("2024-01-15 07:00:00Z").unwrap()
+        );
+        // T separator, missing seconds, fractional µs all carry over.
+        assert_eq!(
+            parse_timestamp("2024-01-15T07:00").unwrap(),
+            parse_timestamp("2024-01-15 07:00:00").unwrap()
+        );
+        assert_eq!(
+            parse_timestamp("2023-11-14 22:13:20.123456").unwrap(),
+            1_700_000_000_000_000 + 123_456
+        );
+        // Any explicit zone is rejected, not silently dropped (module docs).
+        for bad in [
+            "2024-01-15 07:00:00Z",
+            "2024-01-15 07:00:00+05",
+            "2024-01-15 07:00:00-08:00",
+        ] {
+            let e = parse_timestamp(bad).unwrap_err();
+            assert_eq!(e.type_name, "timestamp", "`{bad}`");
+        }
+    }
+
+    #[test]
+    fn dates_parse_to_epoch_days() {
+        assert_eq!(parse_date("1970-01-01").unwrap(), 0);
+        assert_eq!(parse_date("1969-12-31").unwrap(), -1);
+        // 2023-11-14 is day 19_675 — the text encoder's known vector, inverted.
+        assert_eq!(parse_date("2023-11-14").unwrap(), 19_675);
+        // Leap day on a ÷400 century.
+        assert_eq!(parse_date("2000-02-29").unwrap(), 11_016);
+        assert_eq!(parse_date("  2023-11-14  ").unwrap(), 19_675);
+    }
+
+    #[test]
+    fn malformed_dates_reject() {
+        for bad in [
+            "",
+            "2024-01-15 12:00:00", // a timestamp is not a date
+            "2024-13-01",          // month 13
+            "2023-02-29",          // not a leap year
+            "24-01-15",            // two-digit year is ambiguous
+            "not-a-date",
+        ] {
+            assert!(parse_date(bad).is_err(), "`{bad}` should be rejected");
         }
     }
 

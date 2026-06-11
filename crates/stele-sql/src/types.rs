@@ -12,8 +12,13 @@
 //! Vocabulary: `INT`/`INTEGER` → `Int4`, `BIGINT` → `Int8`, `TEXT` → `Text`,
 //! `BOOL`/`BOOLEAN` → `Bool`, `TIMESTAMP` (no time zone) → `Timestamp`,
 //! `TIMESTAMP WITH TIME ZONE` / `TIMESTAMPTZ` → `TimestampTz` ([STL-189]),
-//! `DATE` → `Date`, `UUID` → `Uuid`, `BYTEA` → `Bytea` ([STL-181]). Anything
-//! else — `VARCHAR`, `CHAR`, … — is rejected as
+//! `DATE` → `Date`, `UUID` → `Uuid`, `BYTEA` → `Bytea` ([STL-181]). The
+//! character-*varying* family — `VARCHAR`, `CHARACTER VARYING`, `CHAR VARYING`,
+//! `NVARCHAR`, each with or without a length — also lowers to `Text`, the way
+//! Postgres treats an unconstrained `varchar`; a declared length is accepted as
+//! documentation but **not enforced** (no typmod machinery yet — enforcement is
+//! a later ticket). Anything else — notably the blank-padding `CHAR(n)`, whose
+//! semantics `Text` cannot honor — is rejected as
 //! [`ParseError::UnsupportedType`]; those are deliberate later additions, not
 //! silent re-labellings (see [`LogicalType::Timestamp`]).
 //!
@@ -29,7 +34,7 @@ use crate::error::ParseError;
 ///
 /// # Errors
 ///
-/// Returns [`ParseError::UnsupportedType`] if the SQL type is outside the v0.1
+/// Returns [`ParseError::UnsupportedType`] if the SQL type is outside the
 /// vocabulary.
 ///
 /// ```
@@ -39,13 +44,22 @@ use crate::error::ParseError;
 ///
 /// assert_eq!(logical_type(&DataType::Int(None)).unwrap(), LogicalType::Int4);
 /// assert_eq!(logical_type(&DataType::Text).unwrap(), LogicalType::Text);
-/// assert!(logical_type(&DataType::Varchar(None)).is_err());
+/// // The varying family is TEXT under the hood (length unenforced)…
+/// assert_eq!(logical_type(&DataType::Varchar(None)).unwrap(), LogicalType::Text);
+/// // …but blank-padded CHAR(n) stays out of the vocabulary.
+/// assert!(logical_type(&DataType::Char(None)).is_err());
 /// ```
 pub fn logical_type(data_type: &DataType) -> Result<LogicalType, ParseError> {
     match data_type {
         DataType::Int(_) | DataType::Integer(_) | DataType::Int4(_) => Ok(LogicalType::Int4),
         DataType::BigInt(_) | DataType::Int8(_) => Ok(LogicalType::Int8),
-        DataType::Text => Ok(LogicalType::Text),
+        // The character-varying spellings are all `Text` storage-side; an
+        // optional declared length is accepted but not enforced (module docs).
+        DataType::Text
+        | DataType::Varchar(_)
+        | DataType::CharacterVarying(_)
+        | DataType::CharVarying(_)
+        | DataType::Nvarchar(_) => Ok(LogicalType::Text),
         DataType::Bool | DataType::Boolean => Ok(LogicalType::Bool),
         // Bare `TIMESTAMP` (no zone) stores a UTC instant with no offset on the
         // wire; `TIMESTAMP WITH TIME ZONE` / `TIMESTAMPTZ` normalizes the offset to
@@ -96,9 +110,29 @@ mod tests {
     }
 
     #[test]
+    fn varying_character_spellings_lower_to_text() {
+        use sqlparser::ast::CharacterLength;
+        // With and without a declared length — the length is documentation only.
+        let fifty = Some(CharacterLength::IntegerLength {
+            length: 50,
+            unit: None,
+        });
+        for dt in [
+            DataType::Varchar(None),
+            DataType::Varchar(fifty),
+            DataType::CharacterVarying(fifty),
+            DataType::CharVarying(None),
+            DataType::Nvarchar(fifty),
+        ] {
+            assert_eq!(logical_type(&dt).unwrap(), LogicalType::Text, "{dt}");
+        }
+    }
+
+    #[test]
     fn rejects_types_outside_the_vocabulary() {
-        // Still rejected after the additions — these are deliberate non-mappings.
-        assert!(logical_type(&DataType::Varchar(None)).is_err());
+        // Deliberate non-mappings: CHAR(n) blank-pads (Text cannot honor that)
+        // and BLOB is not the Postgres spelling (BYTEA is).
+        assert!(logical_type(&DataType::Char(None)).is_err());
         assert!(logical_type(&DataType::Blob(None)).is_err());
     }
 }

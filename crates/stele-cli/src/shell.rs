@@ -92,7 +92,11 @@ pub fn run(opts: &Opts) -> anyhow::Result<()> {
         },
         border: opts.border,
         row_nums: opts.row_nums,
-        timing: false,
+        // Interactive sessions time every statement out of the box — the
+        // round-trip lands in the result trailer (`(N rows · X.XXX ms)`).
+        // Scripted runs default off so piped output stays deterministic and
+        // byte-clean; `\timing` overrides either way.
+        timing: interactive,
         expanded: false,
         json: false,
         interactive,
@@ -570,7 +574,8 @@ fn help(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
     write_lines(session, out, &lines)
 }
 
-/// The `\h` SQL crib — the four statement shapes plus the thesis line.
+/// The `\h` SQL crib — the statement shapes the binder accepts today, plus the
+/// thesis line.
 fn sql_help(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
     let lines: Vec<Vec<Seg>> = vec![
         vec![(
@@ -581,19 +586,60 @@ fn sql_help(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
             (Role::Kw, "  CREATE TABLE".to_owned()),
             (Role::Mut, " t (...) ".to_owned()),
             (Role::Kw, "WITH SYSTEM VERSIONING".to_owned()),
+            (Role::Mut, " [, ".to_owned()),
+            (Role::Kw, "VALID TIME".to_owned()),
+            (Role::Mut, " (vf, vt)]".to_owned()),
             (Role::Dim, ";".to_owned()),
+        ],
+        vec![
+            (Role::Mut, "    column types: ".to_owned()),
+            (
+                Role::Kw,
+                "INT BIGINT TEXT/VARCHAR BOOL TIMESTAMP[TZ] DATE UUID BYTEA".to_owned(),
+            ),
         ],
         vec![
             (Role::Kw, "  INSERT".to_owned()),
             (Role::Mut, " INTO t VALUES (...);   ".to_owned()),
             (Role::Kw, "UPDATE".to_owned()),
-            (Role::Mut, " t SET c = v WHERE ...;".to_owned()),
+            (Role::Mut, " t SET c = v WHERE ...;   ".to_owned()),
+            (Role::Kw, "DELETE".to_owned()),
+            (Role::Mut, " FROM t WHERE ...;".to_owned()),
         ],
         vec![
             (Role::Kw, "  SELECT".to_owned()),
             (Role::Mut, " ... FROM t ".to_owned()),
             (Role::Kw, "FOR SYSTEM_TIME AS OF".to_owned()),
             (Role::Mut, " (now() - interval '1 second')".to_owned()),
+            (Role::Dim, ";".to_owned()),
+            (Role::Mut, "   (also ".to_owned()),
+            (Role::Kw, "FOR VALID_TIME AS OF".to_owned()),
+            (Role::Mut, ")".to_owned()),
+        ],
+        vec![
+            (Role::Mut, "    with ".to_owned()),
+            (Role::Kw, "GROUP BY".to_owned()),
+            (Role::Mut, " + COUNT/SUM/MIN/MAX/AVG, ".to_owned()),
+            (Role::Kw, "JOIN".to_owned()),
+            (Role::Mut, " ... ON a.x = b.y, ".to_owned()),
+            (Role::Kw, "WHERE PERIOD".to_owned()),
+            (Role::Mut, "(...) OVERLAPS/CONTAINS/...".to_owned()),
+        ],
+        vec![
+            (Role::Kw, "  BEGIN".to_owned()),
+            (Role::Mut, "; ...; ".to_owned()),
+            (Role::Kw, "COMMIT".to_owned()),
+            (Role::Mut, "/".to_owned()),
+            (Role::Kw, "ROLLBACK".to_owned()),
+            (Role::Mut, ";   savepoints: ".to_owned()),
+            (Role::Kw, "SAVEPOINT".to_owned()),
+            (Role::Mut, " s / ROLLBACK TO s / RELEASE s".to_owned()),
+        ],
+        vec![
+            (Role::Mut, "  admin: ".to_owned()),
+            (Role::Kw, "CHECKPOINT".to_owned()),
+            (Role::Mut, ";   ".to_owned()),
+            (Role::Kw, "FLUSH".to_owned()),
             (Role::Dim, ";".to_owned()),
         ],
         vec![(
@@ -778,7 +824,11 @@ fn conninfo(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
 // SQL execution + rendering
 // ---------------------------------------------------------------------------
 
-/// Send one buffered statement (or batch) and render every reply.
+/// Send one buffered statement (or batch) and render every reply. With timing
+/// on, the round-trip rides the result trailer (`(N rows · X.XXX ms)`) when the
+/// batch yields exactly one row set; otherwise — DML/DDL tags, `\json` output,
+/// errors, or a multi-statement batch (one measurement cannot be attributed to
+/// any single set) — the batch gets one psql-style `Time:` line at the end.
 fn run_statement(
     client: &mut Client,
     session: &Session,
@@ -787,16 +837,26 @@ fn run_statement(
 ) -> anyhow::Result<()> {
     let started = Instant::now();
     let replies = client.simple_query(sql)?;
-    let elapsed = started.elapsed();
+    let timed = session.timing.then(|| started.elapsed());
+    // The whole round-trip is measured once, so the trailer may carry it only
+    // when there is exactly one row set to pin it to (and the table/expanded
+    // renderers will actually draw a trailer — JSON output has none).
+    let sole_row_set = !session.json
+        && replies
+            .iter()
+            .filter(|r| matches!(r, Reply::Rows(_)))
+            .count()
+            == 1;
+    let trailer_time = if sole_row_set { timed } else { None };
     for reply in replies {
         match reply {
             Reply::Rows(set) => {
                 let lines = if session.json {
                     render::json_lines(&set.columns, &set.rows)
                 } else if session.expanded {
-                    render::expanded_lines(&set.columns, &set.rows)
+                    render::expanded_lines(&set.columns, &set.rows, trailer_time)
                 } else {
-                    render::table_lines(&set.columns, &set.rows, session.table_opts(true))
+                    render::table_lines(&set.columns, &set.rows, session.result_opts(trailer_time))
                 };
                 write_lines(session, out, &lines)?;
             }
@@ -805,9 +865,14 @@ fn run_statement(
             Reply::Empty => {}
         }
     }
-    if session.timing {
-        let ms = elapsed.as_secs_f64() * 1000.0;
-        write_segs(session, out, &[(Role::Mut, format!("Time: {ms:.3} ms"))])?;
+    if let Some(elapsed) = timed
+        && !sole_row_set
+    {
+        write_segs(
+            session,
+            out,
+            &[(Role::Mut, format!("Time: {}", render::fmt_elapsed(elapsed)))],
+        )?;
     }
     Ok(())
 }
@@ -943,12 +1008,25 @@ fn first_error(replies: &[Reply]) -> Option<&ServerError> {
 }
 
 impl Session {
-    /// Table options for the current toggles.
+    /// Table options for the current toggles — meta-command tables (`\dt`,
+    /// `\l`), which measure no round-trip.
     const fn table_opts(&self, count: bool) -> TableOpts {
         TableOpts {
             style: self.border,
             row_nums: self.row_nums,
             count,
+            elapsed: None,
+        }
+    }
+
+    /// Table options for a measured query result: the count trailer, carrying
+    /// the round-trip when timing is on.
+    const fn result_opts(&self, elapsed: Option<std::time::Duration>) -> TableOpts {
+        TableOpts {
+            style: self.border,
+            row_nums: self.row_nums,
+            count: true,
+            elapsed,
         }
     }
 }
@@ -1086,9 +1164,12 @@ const META_NAMES: &[&str] = &[
     r"\q",
 ];
 
-/// SQL keywords ⇥ completes against. Identifiers (table / column names) come
-/// live from the catalog ([`fetch_identifiers`]) — this list deliberately drops
-/// the prototype's hardcoded demo names (`account`, `balance`, …).
+/// SQL keywords ⇥ completes against — the statement surface the binder
+/// actually accepts today (no `ORDER BY`/`LIMIT`: those are still rejected
+/// clauses, and completion must not suggest syntax the server bounces).
+/// Identifiers (table / column names) come live from the catalog
+/// ([`fetch_identifiers`]) — this list deliberately drops the prototype's
+/// hardcoded demo names (`account`, `balance`, …).
 const SQL_KEYWORDS: &[&str] = &[
     "SELECT",
     "FROM",
@@ -1097,13 +1178,25 @@ const SQL_KEYWORDS: &[&str] = &[
     "VALUES",
     "UPDATE",
     "SET",
+    "DELETE FROM",
     "CREATE TABLE",
+    "DROP TABLE",
     "WITH SYSTEM VERSIONING",
+    "VALID TIME",
     "FOR SYSTEM_TIME AS OF",
+    "FOR VALID_TIME AS OF",
+    "GROUP BY",
+    "JOIN",
+    "LEFT JOIN",
+    "BEGIN",
+    "COMMIT",
+    "ROLLBACK",
+    "SAVEPOINT",
+    "CHECKPOINT",
+    "FLUSH",
+    "PERIOD",
     "now()",
     "interval",
-    "ORDER BY",
-    "LIMIT",
 ];
 
 /// Characters that make up a SQL completion token — letters, `_`, and the

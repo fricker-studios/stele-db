@@ -50,6 +50,10 @@ pub struct TableOpts {
     pub row_nums: bool,
     /// Append the `(N rows)` trailer.
     pub count: bool,
+    /// Round-trip time folded into the trailer — `(N rows · X.XXX ms)`, the
+    /// prototype's compact query-stats footer. `None` (timing off, or a
+    /// meta-command table that measured nothing) keeps the plain `(N rows)`.
+    pub elapsed: Option<std::time::Duration>,
 }
 
 /// A rendered line: styled segments, no trailing newline.
@@ -164,14 +168,19 @@ pub fn table_lines(columns: &[Column], rows: &[Vec<Option<String>>], opts: Table
         }
     }
     if opts.count {
-        lines.push(vec![(Role::Mut, count_line(rows.len()))]);
+        lines.push(vec![(Role::Mut, count_line(rows.len(), opts.elapsed))]);
     }
     lines
 }
 
 /// psql-style expanded records (`\x`): one `-[ RECORD N ]…` divider per row,
-/// then `name | value` per field.
-pub fn expanded_lines(columns: &[Column], rows: &[Vec<Option<String>>]) -> Vec<Line> {
+/// then `name | value` per field. `elapsed` folds into the count trailer the
+/// same way as [`table_lines`].
+pub fn expanded_lines(
+    columns: &[Column],
+    rows: &[Vec<Option<String>>],
+    elapsed: Option<std::time::Duration>,
+) -> Vec<Line> {
     let w = columns.iter().map(|c| width_of(&c.name)).max().unwrap_or(0);
     let mut lines: Vec<Line> = Vec::new();
     for (ri, row) in rows.iter().enumerate() {
@@ -196,7 +205,7 @@ pub fn expanded_lines(columns: &[Column], rows: &[Vec<Option<String>>]) -> Vec<L
             ]);
         }
     }
-    lines.push(vec![(Role::Mut, count_line(rows.len()))]);
+    lines.push(vec![(Role::Mut, count_line(rows.len(), elapsed))]);
     lines
 }
 
@@ -268,9 +277,20 @@ fn json_string(text: &str) -> String {
     out
 }
 
-/// The `(N rows)` trailer, singular for one row.
-fn count_line(n: usize) -> String {
-    format!("({n} row{})", if n == 1 { "" } else { "s" })
+/// The `(N rows)` trailer, singular for one row; with a measured round-trip,
+/// `(N rows · X.XXX ms)`.
+fn count_line(n: usize, elapsed: Option<std::time::Duration>) -> String {
+    let s = if n == 1 { "" } else { "s" };
+    elapsed.map_or_else(
+        || format!("({n} row{s})"),
+        |d| format!("({n} row{s} · {})", fmt_elapsed(d)),
+    )
+}
+
+/// Milliseconds with microsecond precision (`1.234 ms`) — the unit psql's
+/// `\timing` reports in, shared by the trailer and the bare `Time:` line.
+pub fn fmt_elapsed(elapsed: std::time::Duration) -> String {
+    format!("{:.3} ms", elapsed.as_secs_f64() * 1000.0)
 }
 
 /// Terminal display width — CJK/emoji occupy two columns, combining marks
@@ -332,6 +352,7 @@ mod tests {
             style,
             row_nums: false,
             count: true,
+            elapsed: None,
         }
     }
 
@@ -381,6 +402,7 @@ mod tests {
                 style: BorderStyle::Psql,
                 row_nums: true,
                 count: true,
+                elapsed: None,
             },
         ));
         assert!(rendered.starts_with(" # | id | name  \n"), "{rendered}");
@@ -395,9 +417,28 @@ mod tests {
     }
 
     #[test]
+    fn elapsed_rides_the_count_trailer() {
+        let (c, r) = sample();
+        let timed = TableOpts {
+            elapsed: Some(std::time::Duration::from_micros(1_234)),
+            ..opts(BorderStyle::Psql)
+        };
+        assert!(text(&table_lines(&c, &r, timed)).ends_with("(2 rows · 1.234 ms)"));
+        // Expanded records carry it on the same trailer.
+        assert!(
+            text(&expanded_lines(
+                &c,
+                &r,
+                Some(std::time::Duration::from_micros(500))
+            ))
+            .ends_with("(2 rows · 0.500 ms)")
+        );
+    }
+
+    #[test]
     fn expanded_records_match_psql_shape() {
         let (c, r) = sample();
-        let rendered = text(&expanded_lines(&c, &r));
+        let rendered = text(&expanded_lines(&c, &r, None));
         assert_eq!(
             rendered,
             "-[ RECORD 1 ]+----------------------\nid   | 1\nname | alice\n-[ RECORD 2 ]+----------------------\nid   | 20\nname | \n(2 rows)"
@@ -410,7 +451,7 @@ mod tests {
         // w+1 — exactly over the `|` of the field lines (psql geometry).
         let cols = vec![col("system_time_col", 25)];
         let rows = vec![vec![Some("x".to_owned())]];
-        let rendered = text(&expanded_lines(&cols, &rows));
+        let rendered = text(&expanded_lines(&cols, &rows, None));
         let lines: Vec<&str> = rendered.lines().collect();
         let plus = lines[0].find('+').expect("divider has +");
         let pipe = lines[1].find('|').expect("field has |");
