@@ -782,6 +782,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         //    resident for history, exactly as in a live session.)
         let mut catalog = Catalog::new();
         let mut tiers: BTreeMap<String, (u64, bool)> = BTreeMap::new();
+        // The instant of each name's *latest* drop, if any ([STL-220]). After the
+        // tiers are reopened, recovery re-derives that drop's storage closes from
+        // this durable catalog record, closing the cross-log window in which the
+        // drop was acknowledged but the tier's auto-commit closes never reached
+        // its WAL. The latest drop suffices (the WAL is append-only, so at most
+        // one era is open at recovery — see [`Engine::close_dropped_era`]).
+        let mut latest_drop: BTreeMap<String, SystemTimeMicros> = BTreeMap::new();
         let mut next_namespace = 0u64;
         let mut max_commit = SystemTimeMicros(0);
         for record in records {
@@ -801,6 +808,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 }
                 CatalogRecord::DropTable { at, name } => {
                     catalog.drop_table(&name, at)?;
+                    // Records are in log order, so the last drop for a name wins.
+                    latest_drop.insert(name, at);
                     max_commit = max_commit.max(at);
                 }
             }
@@ -831,13 +840,44 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         //    recovered id at the u64 ceiling must not wrap the allocator back
         //    into recovered provenance.
         clock.advance_to(max_commit);
+        let mut next_txn = max_txn_id.saturating_add(1);
+
+        // 4. Re-derive each dropped era's storage closes from the durable catalog
+        //    drop record ([STL-220]). With the clock now at the recovered
+        //    high-water, `close_dropped_era` resolves each key's *current* open
+        //    version there and closes only the ones that predate the drop —
+        //    idempotent if the live closes already reached the WAL, and leaving a
+        //    re-created era untouched. This makes the drop's row cleanup a pure
+        //    function of the fsynced catalog log, so a crash between the drop's
+        //    acknowledgement and its (auto-commit) closes recovers the rows
+        //    retired rather than leaked. Each close commits strictly past
+        //    `max_commit`, so it never re-selects a row resolved at that snapshot.
+        let now = Snapshot(clock.current());
+        let principal = Principal::new(WIRE_PRINCIPAL.to_vec());
+        for (name, drop_at) in latest_drop {
+            if let Some(state) = tables.get_mut(&name) {
+                let closed = state.engine.close_dropped_era(
+                    Snapshot(drop_at),
+                    now,
+                    TxnId(next_txn),
+                    &principal,
+                )?;
+                // Only a drop that actually retired rows consumed the id; a no-op
+                // re-derivation leaves the allocator untouched, so a clean restart
+                // positions it exactly as before ([STL-210] parity).
+                if closed > 0 {
+                    next_txn = next_txn.saturating_add(1);
+                }
+            }
+        }
+
         Ok(Self {
             catalog,
             clock,
             disk,
             tables,
             next_namespace,
-            next_txn: max_txn_id.saturating_add(1),
+            next_txn,
             write_index: BTreeMap::new(),
             open_snapshots: OpenSnapshots::default(),
             pruned_below: SystemTimeMicros(0),
@@ -1309,12 +1349,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     // Ordering is deliberate: the fsynced catalog record above is
                     // the DROP's commit point ([ADR-0028]), so the storage half
                     // runs *after* it. If `close_all_open` then fails (an I/O
-                    // fault), the DROP is already durably committed and only its
-                    // row cleanup is incomplete — the pre-existing leak, scoped to
-                    // that fault window, never a half-applied close on a table the
-                    // catalog still shows as live. Making the two logs commit
-                    // atomically (or re-deriving the closes from the durable drop
-                    // record at recovery) is the filed follow-up [STL-220].
+                    // fault) — or a crash lands in the window before these
+                    // auto-commit closes reach the WAL — the DROP is already
+                    // durably committed and only its row cleanup is outstanding,
+                    // never a half-applied close on a table the catalog still
+                    // shows as live. Recovery re-derives the cleanup from the
+                    // durable drop record (`Engine::close_dropped_era`, [STL-220]),
+                    // so the dropped era is retired, not leaked, across that window.
                     if let Some(state) = self.tables.get_mut(&name) {
                         let txn_id = TxnId(self.next_txn);
                         self.next_txn += 1;
@@ -6748,6 +6789,145 @@ mod tests {
         let state = engine.tables.get("t").expect("tier resident");
         assert_eq!(state.namespace, 0, "the re-create reused the namespace");
         assert_eq!(engine.next_namespace, 1, "no second namespace was burned");
+    }
+
+    // ---- DROP closes crash-atomic with the catalog drop record (STL-220) ----
+    //
+    // A DROP's catalog record is fsynced (ADR-0028) but its storage closes are
+    // auto-commit WAL appends — durability-deferred. A crash after that fsync but
+    // before the closes reach the tier WAL would recover the name dropped yet the
+    // rows still open, re-opening the STL-211 leak on a later re-create. Recovery
+    // re-derives the closes from the durable drop record, so a crash-window
+    // restart converges to the same retired state as a clean kill.
+    //
+    // The crash is modelled by rewinding the dropped tier's namespace-0 files to
+    // their pre-DROP bytes — the un-fsynced closes vanish — while leaving the
+    // fsynced shared catalog log intact. stele-sim cannot depend on stele-engine,
+    // so this session-level crash coverage is in-process (the STL-210 / STL-215
+    // pattern), not a sim scenario.
+
+    /// The fixed-width namespace prefix [`NamespacedDisk`] gives the first table.
+    const NS0: &str = "t00000000000000000000-";
+
+    /// Snapshot the bytes of every file under tier-namespace prefix `ns` — the
+    /// durable image to roll back to when modelling a crash before a tier's
+    /// auto-commit writes were fsynced ([STL-220]).
+    fn snapshot_ns(disk: &MemDisk, ns: &str) -> Vec<(String, Vec<u8>)> {
+        disk.list()
+            .expect("list")
+            .into_iter()
+            .filter(|name| name.starts_with(ns))
+            .map(|name| {
+                let file = disk.open(&name).expect("open tier file");
+                let len = usize::try_from(file.len()).expect("small file");
+                let mut bytes = vec![0u8; len];
+                file.read_at(0, &mut bytes).expect("read tier file");
+                (name, bytes)
+            })
+            .collect()
+    }
+
+    /// Roll every tier-namespace-`ns` file back to `snapshot`, discarding anything
+    /// appended since — the un-fsynced closes a crash would lose. Files created
+    /// after the snapshot are removed; the fsynced shared catalog log is untouched.
+    fn rewind_ns(disk: &MemDisk, ns: &str, snapshot: &[(String, Vec<u8>)]) {
+        for name in disk.list().expect("list") {
+            if name.starts_with(ns) {
+                disk.remove(&name).expect("remove tier file");
+            }
+        }
+        for (name, bytes) in snapshot {
+            let mut file = disk.create(name).expect("recreate tier file");
+            file.append(bytes).expect("rewrite tier file");
+        }
+    }
+
+    #[test]
+    fn recovery_re_derives_a_dropped_eras_closes_after_a_crash_in_the_commit_window() {
+        // Drive a system-versioned table to the brink of DROP, returning the disk,
+        // the pre-DROP image of its tier files, and a snapshot instant inside the
+        // dropped era. ZeroClock is deterministic, so every run is byte-identical.
+        let build = || -> (MemDisk, Vec<(String, Vec<u8>)>, SystemTimeMicros) {
+            let disk = MemDisk::new();
+            let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+            engine
+                .execute(&parse_one(
+                    "CREATE TABLE t (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+                ))
+                .expect("create");
+            for dml in [
+                "INSERT INTO t VALUES (1, 100)",
+                "INSERT INTO t VALUES (2, 7)",
+            ] {
+                engine.execute(&parse_one(dml)).expect("insert");
+            }
+            let s1 = engine.clock.current();
+            let image = snapshot_ns(&disk, NS0);
+            engine.execute(&parse_one("DROP TABLE t")).expect("drop");
+            // Dropping the engine is the kill — no checkpoint, no flush.
+            drop(engine);
+            (disk, image, s1)
+        };
+
+        // After recovery, re-create the name on the reused tier and report what a
+        // client observes: the current read (must not leak the dropped era), a
+        // re-insert of a dropped business key (must not be refused as a duplicate),
+        // the read after it, and the AS-OF-the-old-era read under the old schema.
+        let observe = |disk: &MemDisk, s1: SystemTimeMicros| {
+            let mut engine = recover_session(disk);
+            engine
+                .execute(&parse_one(
+                    "CREATE TABLE t (id INT PRIMARY KEY, amount INT) WITH SYSTEM VERSIONING",
+                ))
+                .expect("re-create");
+            let leaked = sorted(select(&mut engine, "SELECT id, amount FROM t").rows);
+            let reinsert = engine
+                .execute(&parse_one("INSERT INTO t VALUES (1, 9)"))
+                .is_ok();
+            let after = sorted(select(&mut engine, "SELECT id, amount FROM t").rows);
+            let as_of = format!("SELECT id, balance FROM t FOR SYSTEM_TIME AS OF {}", s1.0);
+            let dropped_era = sorted(select(&mut engine, &as_of).rows);
+            (leaked, reinsert, after, dropped_era)
+        };
+
+        // Clean kill: the closes reached the WAL (MemDisk retains them), so
+        // recovery retires the era by replay — the re-derivation is a verified
+        // no-op there. Crash: same run, but the tier's auto-commit closes never
+        // became durable, so namespace 0 is rewound to its pre-DROP image.
+        let (clean_disk, _, s1) = build();
+        let (crash_disk, pre_drop, _) = build();
+        rewind_ns(&crash_disk, NS0, &pre_drop);
+
+        let clean = observe(&clean_disk, s1);
+        let crash = observe(&crash_disk, s1);
+
+        // The oracle: re-deriving the drop's closes from the durable catalog
+        // record makes the crash-window restart identical to the clean kill.
+        assert_eq!(
+            crash, clean,
+            "the crash-window recovery converges to the clean-kill recovery",
+        );
+
+        // And both retire the dropped era rather than leaking it.
+        let (leaked, reinsert, after, dropped_era) = crash;
+        assert!(
+            leaked.is_empty(),
+            "the reused tier shows no dropped-era row in the current read",
+        );
+        assert!(
+            reinsert,
+            "a business key the dropped era used re-inserts — its old version is closed",
+        );
+        assert_eq!(
+            after,
+            vec![vec![i4(1), i4(9)]],
+            "only the new era's row is current"
+        );
+        assert_eq!(
+            dropped_era,
+            vec![vec![i4(1), i4(100)], vec![i4(2), i4(7)]],
+            "AS OF inside the dropped era still resolves both rows under the old schema",
+        );
     }
 
     #[test]
