@@ -1901,6 +1901,23 @@ async fn handle_bind(
         return fail_extended(stream, state, SQLSTATE_PROTOCOL_VIOLATION, &m).await;
     }
 
+    // The supplied parameter count must match the prepared statement's `$n`
+    // placeholder count, as Postgres requires; surplus parameters used to be
+    // silently dropped (STL-222). Check it against the statement's parse tree
+    // *before* decoding any value — a zero-placeholder statement (an admin command,
+    // `SELECT 1`, a `CREATE TABLE`) bound with parameters is the concrete case, and
+    // rejecting up front avoids decoding parameters a mismatch would discard.
+    let required = pstmt.as_ref().map_or(0, extended::placeholder_count);
+    if msg.params.len() != required {
+        let m = format!(
+            "bind message supplies {} parameters, but prepared statement \"{}\" requires {}",
+            msg.params.len(),
+            msg.statement,
+            required,
+        );
+        return fail_extended(stream, state, SQLSTATE_PROTOCOL_VIOLATION, &m).await;
+    }
+
     let mut values = Vec::with_capacity(msg.params.len());
     for (i, raw) in msg.params.iter().enumerate() {
         let oid = param_oids.get(i).copied().unwrap_or(0);
@@ -1920,16 +1937,10 @@ async fn handle_bind(
         }
     }
 
-    let bound = match pstmt {
-        None => None,
-        Some(stmt) => match extended::substitute(&stmt, &values) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                return fail_extended(stream, state, SQLSTATE_PROTOCOL_VIOLATION, &e.to_string())
-                    .await;
-            }
-        },
-    };
+    // An empty-query prepared statement has no SQL body, so there is nothing to
+    // substitute into; otherwise the count check above guarantees every `$n` has a
+    // value.
+    let bound = pstmt.map(|stmt| extended::substitute(&stmt, &values));
     state.portals.insert(
         msg.portal,
         PortalEntry {
