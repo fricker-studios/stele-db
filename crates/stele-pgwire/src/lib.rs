@@ -237,6 +237,27 @@ pub trait SessionHandle: Send {
     /// `pg_catalog` `\d` shim — see [`SessionEngine::describe_live_tables`].
     fn describe_live_tables(&self) -> Vec<TableDescription>;
 
+    /// Resolve a prepared statement's `RowDescription` columns without running it,
+    /// for statement-level `Describe` at the current committed snapshot — see
+    /// [`SessionEngine::describe`] ([STL-212]). `None` for a statement that returns
+    /// no rows.
+    ///
+    /// [STL-212]: https://allegromusic.atlassian.net/browse/STL-212
+    fn describe(&self, stmt: &Statement)
+    -> Result<Option<Vec<(String, LogicalType)>>, EngineError>;
+
+    /// As [`describe`](Self::describe), but resolving at an open transaction's
+    /// pinned snapshot — see [`SessionEngine::describe_in_txn`]. The statement-arm
+    /// of `Describe` uses this inside a `BEGIN` block so the advertised shape
+    /// matches the rows the portal `Execute` returns ([STL-175]).
+    ///
+    /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+    fn describe_in_txn(
+        &self,
+        stmt: &Statement,
+        txn: &SessionTransaction,
+    ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError>;
+
     /// Open a multi-statement transaction, **pinning its read snapshot now** — see
     /// [`SessionEngine::begin`] ([STL-174], [STL-175]).
     ///
@@ -283,6 +304,21 @@ where
 
     fn describe_live_tables(&self) -> Vec<TableDescription> {
         Self::describe_live_tables(self)
+    }
+
+    fn describe(
+        &self,
+        stmt: &Statement,
+    ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError> {
+        Self::describe(self, stmt)
+    }
+
+    fn describe_in_txn(
+        &self,
+        stmt: &Statement,
+        txn: &SessionTransaction,
+    ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError> {
+        Self::describe_in_txn(self, stmt, txn)
     }
 
     fn begin(&self) -> SessionTransaction {
@@ -442,7 +478,8 @@ pub enum WireError {
 /// A connection is either auto-committing each statement ([`Idle`](Self::Idle)),
 /// inside an explicit `BEGIN` block buffering writes ([`Active`](Self::Active)),
 /// or inside one that hit an error and is now aborted ([`Failed`](Self::Failed),
-/// rejecting everything until `COMMIT`/`ROLLBACK` ends the block). The state lives
+/// rejecting everything until the block ends — though a `ROLLBACK TO SAVEPOINT`
+/// can recover it, [STL-205]). The state lives
 /// on the connection task's stack, not the shared engine, so each connection's
 /// transaction is independent. The variant maps directly to the Postgres
 /// `ReadyForQuery` byte — `I` / `T` / `E` — that closes out every message.
@@ -451,9 +488,13 @@ enum ConnTxn {
     Idle,
     /// Inside `BEGIN`, buffering writes until `COMMIT`. `ReadyForQuery` = `T`.
     Active(SessionTransaction),
-    /// Inside a transaction that errored; statements are refused until the block
-    /// ends. `ReadyForQuery` = `E`.
-    Failed,
+    /// Inside a transaction that errored. Every statement is refused until the
+    /// block ends — **except** `ROLLBACK TO SAVEPOINT`, which can recover the
+    /// transaction by rewinding to a savepoint established before the error
+    /// (Postgres's `in_failed_sql_transaction` escape hatch, [STL-205]). The
+    /// buffered write set and savepoint stack are therefore **retained** here, not
+    /// discarded. `ReadyForQuery` = `E`.
+    Failed(SessionTransaction),
 }
 
 impl ConnTxn {
@@ -462,18 +503,21 @@ impl ConnTxn {
         match self {
             Self::Idle => b'I',
             Self::Active(_) => b'T',
-            Self::Failed => b'E',
+            Self::Failed(_) => b'E',
         }
     }
 
-    /// Move an open (non-failed) transaction into the aborted state, discarding
-    /// its buffered writes; a no-op when idle (an auto-commit statement error does
-    /// not open a transaction). Called when a statement errors so the trailing
-    /// `ReadyForQuery` reports `E`.
+    /// Move an open transaction into the aborted state, **retaining** its buffered
+    /// writes and savepoint stack so a later `ROLLBACK TO` a pre-error savepoint
+    /// can recover it ([STL-205]). A no-op when idle (an auto-commit statement
+    /// error does not open a transaction) or already failed. Called when a
+    /// statement errors so the trailing `ReadyForQuery` reports `E`.
     fn mark_failed(&mut self) {
-        if matches!(self, Self::Active(_)) {
-            *self = Self::Failed;
-        }
+        *self = match std::mem::replace(self, Self::Idle) {
+            Self::Active(buffered) => Self::Failed(buffered),
+            // Idle (auto-commit error) and already-`Failed` are left unchanged.
+            other => other,
+        };
     }
 }
 
@@ -795,10 +839,12 @@ async fn handle_simple_query(
         }
 
         // (0b) Inside an aborted transaction every other statement is refused
-        // until the block ends — Postgres's `in_failed_sql_transaction`. The batch
-        // stops here, leaving the transaction aborted for the trailing
+        // until the block ends — Postgres's `in_failed_sql_transaction`. (The one
+        // exception, `ROLLBACK TO SAVEPOINT`, is transaction control and was
+        // already handled in (0) above, where it can recover the block, [STL-205].)
+        // The batch stops here, leaving the transaction aborted for the trailing
         // ReadyForQuery to report (`E`).
-        if matches!(txn, ConnTxn::Failed) {
+        if matches!(txn, ConnTxn::Failed(_)) {
             write_error_response(
                 stream,
                 "ERROR",
@@ -931,8 +977,9 @@ async fn run_commit(
                 return Ok(false);
             }
         },
-        // Postgres rolls a failed transaction back on COMMIT and reports ROLLBACK.
-        ConnTxn::Failed => write_command_complete_tag(stream, "ROLLBACK").await?,
+        // Postgres rolls a failed transaction back on COMMIT and reports ROLLBACK;
+        // the retained buffer (and its snapshot lease) is dropped here unapplied.
+        ConnTxn::Failed(_) => write_command_complete_tag(stream, "ROLLBACK").await?,
         // No open transaction — a warning-only no-op that still reports COMMIT.
         ConnTxn::Idle => write_command_complete_tag(stream, "COMMIT").await?,
     }
@@ -970,7 +1017,9 @@ async fn run_savepoint(
             Ok(true)
         }
         ConnTxn::Idle => savepoint_not_in_txn(stream, "SAVEPOINT").await,
-        ConnTxn::Failed => savepoint_in_aborted_txn(stream).await,
+        // SAVEPOINT stays refused in an aborted block — only ROLLBACK TO can
+        // recover it (Postgres parity, [STL-205]).
+        ConnTxn::Failed(_) => savepoint_in_aborted_txn(stream).await,
     }
 }
 
@@ -989,7 +1038,8 @@ async fn run_release(
     let released = match txn {
         ConnTxn::Active(buffered) => buffered.release(name),
         ConnTxn::Idle => return savepoint_not_in_txn(stream, "RELEASE SAVEPOINT").await,
-        ConnTxn::Failed => return savepoint_in_aborted_txn(stream).await,
+        // RELEASE stays refused in an aborted block (Postgres parity, [STL-205]).
+        ConnTxn::Failed(_) => return savepoint_in_aborted_txn(stream).await,
     };
     if released {
         write_command_complete_tag(stream, "RELEASE").await?;
@@ -1003,27 +1053,40 @@ async fn run_release(
 /// the transaction continuing ([STL-176]).
 ///
 /// The named savepoint survives (it can be rolled back to again) while savepoints
-/// nested inside it are destroyed. Errors mirror [`run_release`]. Returns whether
-/// the batch may continue.
+/// nested inside it are destroyed. With no open transaction this is `25P01`;
+/// naming a savepoint that does not exist is `3B001` and leaves the block aborted.
 ///
-/// Recovering an *aborted* transaction via `ROLLBACK TO` (Postgres's
-/// `in_failed_sql_transaction` escape hatch) is not modelled: the [`ConnTxn::Failed`]
-/// state discards the buffer, so there is nothing to roll back to. It is refused
-/// like any statement in an aborted block, the deferred follow-up.
+/// Unlike `SAVEPOINT` / `RELEASE`, this works on an **aborted** transaction too:
+/// rolling back to a savepoint established *before* the error recovers the block
+/// and returns it to the active state — Postgres's `in_failed_sql_transaction`
+/// escape hatch ([STL-205]). The truncation also undoes anything the failed
+/// statement managed to stage (in practice nothing — a write is buffered only
+/// once its bind fully succeeds — but the rewind is robust either way). The
+/// [`ConnTxn::Failed`] state retains the buffer precisely so this can find it.
 async fn run_rollback_to(
     stream: &mut TcpStream,
     txn: &mut ConnTxn,
     name: &str,
 ) -> Result<bool, WireError> {
-    let rolled_back = match txn {
-        ConnTxn::Active(buffered) => buffered.rollback_to(name),
+    // Both `Active` and `Failed` carry the buffer; take it out so a successful
+    // rollback can hand it back as `Active` — recovering the block if it was
+    // failed. `Idle` has no transaction at all.
+    let mut buffered = match std::mem::replace(txn, ConnTxn::Idle) {
+        ConnTxn::Active(b) | ConnTxn::Failed(b) => b,
+        // `txn` is already `Idle` from the replace, which is what we want.
         ConnTxn::Idle => return savepoint_not_in_txn(stream, "ROLLBACK TO SAVEPOINT").await,
-        ConnTxn::Failed => return savepoint_in_aborted_txn(stream).await,
     };
-    if rolled_back {
+    if buffered.rollback_to(name) {
+        // Rewound (and recovered, if it had been failed): the transaction is
+        // active again and the batch continues.
+        *txn = ConnTxn::Active(buffered);
         write_command_complete_tag(stream, "ROLLBACK").await?;
         Ok(true)
     } else {
+        // No such savepoint. The block is aborted either way — an active block's
+        // error aborts it, a failed block stays failed — so park the retained
+        // buffer back in `Failed` and report 3B001.
+        *txn = ConnTxn::Failed(buffered);
         no_such_savepoint(stream, txn, name).await
     }
 }
@@ -1196,7 +1259,7 @@ fn run_query(
         ConnTxn::Active(buffered) => engine.execute_in_txn(stmt, buffered),
         // `Idle` auto-commits; `Failed` never reaches here (the dispatch refuses
         // statements in an aborted block before routing).
-        ConnTxn::Idle | ConnTxn::Failed => engine.execute(stmt),
+        ConnTxn::Idle | ConnTxn::Failed(_) => engine.execute(stmt),
     }
 }
 
@@ -1877,9 +1940,56 @@ async fn handle_bind(
     Ok(())
 }
 
+/// Resolve a prepared statement's result columns for statement-level `Describe`
+/// ('S'), mirroring the row-returning dispatch of [`returns_rows`] /
+/// [`execute_stmt`] but **without running anything**: a `pg_catalog` introspection
+/// query and a constant `SELECT` have a fixed shape, and a table `SELECT`'s columns
+/// come from the engine's parameter-free describe ([`SessionHandle::describe`],
+/// STL-212). Returns `None` for a statement that produces no result columns
+/// (DDL / DML / admin), which the caller answers with `NoData`.
+///
+/// Unlike the portal arm this never executes the read — tokio-postgres / JDBC
+/// issue `Describe('S')` at prepare time, before any `Bind`, so there are no
+/// parameter values to run with; the column shape does not need them.
+///
+/// `txn` selects the snapshot the engine resolves the shape at: an open `BEGIN`
+/// block's pinned snapshot (so the description agrees with the rows the portal
+/// `Execute` later returns under snapshot isolation), else the current committed
+/// one — mirroring [`run_query`]'s dispatch.
+fn describe_statement_columns(
+    session: &SharedSession,
+    stmt: &Statement,
+    txn: &ConnTxn,
+) -> Result<Option<Vec<ResultColumn>>, ExecError> {
+    if let Some(intro) = pg_catalog::classify(stmt) {
+        return Ok(Some(introspection_reply(&intro, session).0));
+    }
+    if let Some(columns) = constant_select(stmt) {
+        return Ok(Some(columns.iter().map(|c| field(&c.name, c.ty)).collect()));
+    }
+    let described = {
+        let engine = session.lock().unwrap_or_else(PoisonError::into_inner);
+        match txn {
+            // Inside a transaction block — open or aborted ([STL-205] retains the
+            // pinned snapshot on `Failed`) — describe at the block's pinned snapshot
+            // so the shape agrees with the rows a portal `Execute` would read.
+            ConnTxn::Active(buffered) | ConnTxn::Failed(buffered) => {
+                engine.describe_in_txn(stmt, buffered)
+            }
+            // No transaction open: describe against committed state.
+            ConnTxn::Idle => engine.describe(stmt),
+        }
+    }
+    .map_err(|e| ExecError {
+        sqlstate: sqlstate_for_query(&e),
+        message: e.to_string(),
+    })?;
+    Ok(described.map(|cols| cols.iter().map(|(name, ty)| field(name, *ty)).collect()))
+}
+
 /// `Describe` ('D'): report the shape of a prepared statement (its parameter
-/// types, then `NoData`) or a portal (its `RowDescription`, or `NoData` for a
-/// write / empty portal).
+/// types, then its `RowDescription` — or `NoData` for a non-row statement) or a
+/// portal (its `RowDescription`, or `NoData` for a write / empty portal).
 async fn handle_describe(
     stream: &mut TcpStream,
     state: &mut ConnState,
@@ -1897,12 +2007,30 @@ async fn handle_describe(
                 return fail_extended(stream, state, SQLSTATE_INVALID_PSTATEMENT_NAME, &m).await;
             };
             let oids = prepared.param_oids.clone();
+            // Clone the statement so the prepared-cache borrow is released before we
+            // resolve its shape (which may lock the session) and write the wire reply.
+            let stmt = prepared.stmt.clone();
+            // Resolve the row shape *before* writing anything, so a describe failure
+            // (e.g. an unknown table) surfaces as a clean `ErrorResponse` rather
+            // than a `ParameterDescription` followed by an error. An empty-query
+            // statement (`None`) has no rows.
+            let header = match &stmt {
+                None => None,
+                Some(stmt) => match describe_statement_columns(session, stmt, txn) {
+                    Ok(header) => header,
+                    Err(e) => return fail_extended(stream, state, e.sqlstate, &e.message).await,
+                },
+            };
             write_parameter_description(stream, &oids).await?;
-            // The row shape of an unbound statement needs its parameters resolved;
-            // we report NoData and surface the real RowDescription from a
-            // Describe-portal after Bind. Statement-level row description (the
-            // tokio-postgres / JDBC prepared-SELECT path) is the STL-212 follow-up.
-            write_no_data(stream).await?;
+            // The tokio-postgres / JDBC prepared-SELECT path (STL-212): a
+            // row-returning statement reports its `RowDescription` so the driver
+            // builds its result-column list; everything else reports `NoData`. The
+            // per-column result formats are negotiated later, in `Bind`, so the
+            // statement-level description advertises text (the empty `formats`).
+            match header {
+                Some(header) => write_row_description(stream, &header, &[]).await?,
+                None => write_no_data(stream).await?,
+            }
             Ok(())
         }
         extended::Target::Portal(name) => {
@@ -1973,7 +2101,9 @@ async fn handle_execute(
     };
     // Inside an aborted transaction block, every statement is refused until
     // COMMIT/ROLLBACK ends it — same rule the simple-query path enforces (STL-174).
-    if matches!(txn, ConnTxn::Failed) {
+    // (The extended-query path does not handle transaction control, so it has no
+    // ROLLBACK TO recovery; a client recovers via a simple-query `Q`, [STL-205].)
+    if matches!(txn, ConnTxn::Failed(_)) {
         return fail_extended(
             stream,
             state,
@@ -2751,6 +2881,67 @@ mod tests {
         let (rolled_back, status) = run_simple_with_status(&mut client, "ROLLBACK").await;
         assert_eq!(reply_tag(&rolled_back).as_deref(), Some("ROLLBACK"));
         assert_eq!(status, b'I', "idle again after ROLLBACK");
+
+        terminate(server, client).await;
+    }
+
+    #[tokio::test]
+    async fn rollback_to_savepoint_recovers_an_aborted_block() {
+        // STL-205: ROLLBACK TO a pre-error savepoint recovers an aborted block —
+        // Postgres's `in_failed_sql_transaction` escape hatch. The ReadyForQuery
+        // status walks `E` (aborted) → `T` (recovered, active again) → `I`
+        // (committed), and only the pre-savepoint write and the one staged after
+        // recovery survive: the write staged after the savepoint and the failed
+        // statement are undone by the rewind.
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(
+            &mut client,
+            "CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+        )
+        .await;
+
+        run_simple(&mut client, "BEGIN").await;
+        run_simple(&mut client, "INSERT INTO account VALUES (1, 100)").await;
+        run_simple(&mut client, "SAVEPOINT sp").await;
+        run_simple(&mut client, "INSERT INTO account VALUES (2, 200)").await;
+
+        // A write against an unknown table errors and aborts the block.
+        let (errored, status) =
+            run_simple_with_status(&mut client, "INSERT INTO nope VALUES (9, 9)").await;
+        assert!(
+            errored.iter().any(|(k, _)| *k == MSG_ERROR_RESPONSE),
+            "the bad write reports an error"
+        );
+        assert_eq!(status, b'E', "the block is aborted");
+
+        // SAVEPOINT stays refused while aborted — only ROLLBACK TO can recover it.
+        let (refused, status) = run_simple_with_status(&mut client, "SAVEPOINT sp2").await;
+        assert!(
+            refused.iter().any(|(k, _)| *k == MSG_ERROR_RESPONSE),
+            "SAVEPOINT is refused in an aborted block"
+        );
+        assert_eq!(status, b'E', "still aborted after the refused SAVEPOINT");
+
+        // ROLLBACK TO the pre-error savepoint recovers the block: active again.
+        let (recovered, status) =
+            run_simple_with_status(&mut client, "ROLLBACK TO SAVEPOINT sp").await;
+        assert_eq!(reply_tag(&recovered).as_deref(), Some("ROLLBACK"));
+        assert_eq!(status, b'T', "the transaction is active again");
+
+        // It continues to a clean COMMIT, back to idle.
+        run_simple(&mut client, "INSERT INTO account VALUES (3, 300)").await;
+        let (committed, status) = run_simple_with_status(&mut client, "COMMIT").await;
+        assert_eq!(reply_tag(&committed).as_deref(), Some("COMMIT"));
+        assert_eq!(status, b'I', "idle again after COMMIT");
+
+        // Only the pre-savepoint row (1) and the post-recovery row (3) commit; the
+        // post-savepoint row (2) was undone by the recovery.
+        let rows = run_simple(&mut client, "SELECT id FROM account").await;
+        let data_rows = rows.iter().filter(|(k, _)| *k == MSG_DATA_ROW).count();
+        assert_eq!(
+            data_rows, 2,
+            "the recovered transaction commits exactly {{1, 3}}"
+        );
 
         terminate(server, client).await;
     }
@@ -3964,17 +4155,19 @@ mod tests {
         terminate(server, client).await;
     }
 
-    /// Describe on a *statement* reports its parameter types (`ParameterDescription`)
-    /// followed by `NoData` (statement-level row description is deferred).
+    /// Describe on a *statement* reports its parameter types
+    /// (`ParameterDescription`) then the real `RowDescription` of a row-returning
+    /// prepared `SELECT` — the tokio-postgres / JDBC prepared-SELECT path
+    /// (STL-212). The row shape is resolved with the `$1` parameter still unbound.
     #[tokio::test]
-    async fn describe_statement_reports_parameter_types() {
+    async fn describe_statement_reports_parameter_types_and_row_description() {
         let (server, mut client) = connect_past_handshake().await;
         run_simple(&mut client, CREATE_ACCOUNT).await;
 
         send_parse(
             &mut client,
             "s",
-            "SELECT id FROM account WHERE id = $1",
+            "SELECT id, balance FROM account WHERE id = $1",
             &[OID_INT4],
         )
         .await;
@@ -3990,7 +4183,63 @@ mod tests {
             u32::from_be_bytes(msgs[1].1[2..6].try_into().unwrap()),
             OID_INT4
         );
+        // The statement-level RowDescription names the projected columns, resolved
+        // without the parameter bound — the loop STL-183's oracle stood in for.
+        assert_eq!(msgs[2].0, MSG_ROW_DESCRIPTION);
+        assert_eq!(
+            parse_row_description_names(&msgs[2].1),
+            vec!["id", "balance"]
+        );
+        terminate(server, client).await;
+    }
+
+    /// Describe on a statement that returns no rows (a DML `INSERT`) still reports
+    /// its parameter types, then `NoData` — there is no result-set to describe.
+    #[tokio::test]
+    async fn describe_statement_without_rows_is_no_data() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+
+        send_parse(
+            &mut client,
+            "ins",
+            "INSERT INTO account VALUES ($1, $2)",
+            &[OID_INT4, OID_INT4],
+        )
+        .await;
+        send_describe(&mut client, b'S', "ins").await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        assert_eq!(msgs[0].0, MSG_PARSE_COMPLETE);
+        assert_eq!(msgs[1].0, MSG_PARAMETER_DESCRIPTION);
         assert_eq!(msgs[2].0, MSG_NO_DATA);
+        terminate(server, client).await;
+    }
+
+    /// Statement-level Describe inside an open `BEGIN` block resolves the shape at
+    /// the transaction's pinned snapshot (not the current one) and still returns the
+    /// RowDescription — exercising the in-transaction dispatch (STL-212 / STL-175).
+    #[tokio::test]
+    async fn describe_statement_inside_a_transaction_returns_row_description() {
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+        run_simple(&mut client, "BEGIN").await;
+
+        send_parse(&mut client, "s", "SELECT id, balance FROM account", &[]).await;
+        send_describe(&mut client, b'S', "s").await;
+        send_sync(&mut client).await;
+
+        let msgs = drain_to_ready(&mut client).await;
+        assert_eq!(msgs[0].0, MSG_PARSE_COMPLETE);
+        assert_eq!(msgs[1].0, MSG_PARAMETER_DESCRIPTION);
+        assert_eq!(msgs[2].0, MSG_ROW_DESCRIPTION);
+        assert_eq!(
+            parse_row_description_names(&msgs[2].1),
+            vec!["id", "balance"]
+        );
+
+        run_simple(&mut client, "COMMIT").await;
         terminate(server, client).await;
     }
 

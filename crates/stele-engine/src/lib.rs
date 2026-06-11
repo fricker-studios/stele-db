@@ -77,7 +77,8 @@ use stele_sql::select::{
     PeriodEndpoint, Projection, SelectError,
 };
 use stele_sql::{
-    AdminCommand, BindContext, BindError, Statement, StatementBody, bind_ddl, bind_dml, bind_select,
+    AdminCommand, BindContext, BindError, Statement, StatementBody, bind_ddl, bind_dml,
+    bind_select, without_filter,
 };
 use stele_storage::backend::Disk;
 use stele_storage::delta::{BusinessKey, Snapshot};
@@ -945,6 +946,80 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         self.execute_at(stmt, self.clock.current(), &[])
     }
 
+    /// Resolve a row-returning statement's `RowDescription` columns **without
+    /// running it** — the statement-level `Describe` the extended-query protocol
+    /// takes for a prepared `SELECT` ([STL-212]).
+    ///
+    /// A prepared statement is described *before* `Bind`, so its `$1 … $n`
+    /// parameters have no values. But a `SELECT`'s output column shape is a
+    /// function of its projection and the schema only — never of the `WHERE`
+    /// filter or any parameter *value* — so the filter is stripped
+    /// ([`without_filter`]) and the columns resolve straight from the schema, with
+    /// no scan. Returns `Some(columns)` for a row-returning `SELECT`, or `None` for
+    /// a statement that returns no rows (DDL / DML / admin / empty), which the wire
+    /// front end answers with `NoData`.
+    ///
+    /// Binds at the current committed snapshot — the auto-commit / no-transaction
+    /// case. Inside an open `BEGIN` block use [`describe_in_txn`](Self::describe_in_txn),
+    /// which resolves at the transaction's pinned snapshot so the advertised shape
+    /// matches the rows the portal `Execute` will return under snapshot isolation.
+    ///
+    /// # Errors
+    ///
+    /// A `SELECT` whose table or projected columns do not resolve at the snapshot
+    /// surfaces the binder's [`SelectError`], the same error the read path would
+    /// raise.
+    ///
+    /// [STL-212]: https://allegromusic.atlassian.net/browse/STL-212
+    pub fn describe(
+        &self,
+        stmt: &Statement,
+    ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError> {
+        self.describe_at(self.clock.current(), stmt)
+    }
+
+    /// As [`describe`](Self::describe), but resolving the row shape at an open
+    /// transaction's **pinned snapshot** ([STL-175]) rather than the current
+    /// committed one.
+    ///
+    /// A statement-level `Describe('S')` issued inside a `BEGIN` block must
+    /// advertise the same columns the portal `Execute` will return, and that read
+    /// runs at the transaction's pinned snapshot ([`execute_in_txn`](Self::execute_in_txn)).
+    /// Resolving at `clock.current()` instead could disagree if a concurrent
+    /// session committed a DDL after the snapshot was pinned (e.g. a `SELECT *`
+    /// whose column set changed). Binding here at `txn.snapshot` keeps the
+    /// description and the rows consistent.
+    ///
+    /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+    pub fn describe_in_txn(
+        &self,
+        stmt: &Statement,
+        txn: &SessionTransaction,
+    ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError> {
+        self.describe_at(txn.snapshot, stmt)
+    }
+
+    /// The shared resolver behind [`describe`](Self::describe) and
+    /// [`describe_in_txn`](Self::describe_in_txn): strip the `WHERE` filter and bind
+    /// the row shape at `read_snapshot`, with no scan.
+    fn describe_at(
+        &self,
+        read_snapshot: SystemTimeMicros,
+        stmt: &Statement,
+    ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError> {
+        let stripped = without_filter(stmt);
+        let ctx = BindContext {
+            snapshot: read_snapshot,
+            catalog: &self.catalog,
+        };
+        match bind_select(&stripped, &ctx) {
+            Ok(bound) => Ok(Some(self.output_columns(&bound)?)),
+            // Not a SELECT (DDL / DML / admin / empty) ⇒ no row description.
+            Err(SelectError::NotSelect) => Ok(None),
+            Err(e) => Err(EngineError::Select(e)),
+        }
+    }
+
     /// Execute one statement inside an open multi-statement transaction, under
     /// **snapshot isolation** ([ADR-0008], [STL-175]).
     ///
@@ -1261,6 +1336,39 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         })
     }
 
+    /// The `(name, type)` output columns a bound `SELECT` produces, resolved
+    /// **without scanning** — the `RowDescription` shape both the streaming read
+    /// (`run_select`) and the statement-level `Describe` ([STL-212]) report.
+    ///
+    /// A `JOIN` and an aggregate plan carry their output columns directly (the
+    /// binder computed them); a plain projection resolves them from the schema live
+    /// at the bound snapshot. The shape is a function of the projection and schema
+    /// only, so this never touches storage.
+    ///
+    /// [STL-212]: https://allegromusic.atlassian.net/browse/STL-212
+    fn output_columns(
+        &self,
+        bound: &BoundSelect,
+    ) -> Result<Vec<(String, LogicalType)>, EngineError> {
+        if let Some(join) = &bound.join {
+            return Ok(join.columns.clone());
+        }
+        if let Some(agg) = &bound.aggregate {
+            return Ok(agg.columns.clone());
+        }
+        let table = bound.table.as_str();
+        let schema = self
+            .catalog
+            .resolve(table, bound.snapshot)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
+        let schema_columns: Vec<(String, LogicalType)> = schema
+            .columns()
+            .iter()
+            .map(|c| (c.name().to_owned(), c.ty()))
+            .collect();
+        Ok(projected_columns(&bound.projection, &schema_columns))
+    }
+
     /// Run a snapshot scan for a bound `SELECT`, honoring its projection list and
     /// `WHERE` filter through the vectorized operator pipeline ([STL-151], [STL-206]).
     ///
@@ -1341,10 +1449,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         }
 
         let projection = projection_indices(&bound.projection, &schema_columns);
-        let columns = projection
-            .iter()
-            .map(|&i| schema_columns[i].clone())
-            .collect();
+        let columns = projected_columns(&bound.projection, &schema_columns);
         let out_rows: Vec<Vec<Option<Vec<u8>>>> = rows
             .iter()
             .map(|full| projection.iter().map(|&i| full[i].clone()).collect())
@@ -2238,14 +2343,15 @@ fn column_cell(batch: &Batch, id: ColumnId, row: usize) -> Option<Vec<u8>> {
     })
 }
 
-/// Lower a bound `WHERE <column> = <literal>` predicate ([STL-151]) to the
-/// vectorized [`Expr`] the [`Filter`] operator evaluates over a whole batch
-/// ([STL-206], [STL-213]). Each [`BoundScalar`] lowers straight to its evaluator
-/// node — a column to its schema position (the same index [`ExplodePayload`] puts
-/// it at), a literal broadcast as a constant, arithmetic to [`Expr::Arith`]. A
-/// typed comparison over the decoded values is equivalent to the byte-equality the
-/// original `=`-only loop applied, since the encoding is canonical and a NULL cell
-/// decodes to a NULL the comparison (and `Filter`'s "keep TRUE only") drops.
+/// Lower a bound `WHERE <scalar> <cmp> <scalar>` predicate ([STL-151], [STL-213])
+/// to the vectorized [`Expr`] the [`Filter`] operator evaluates over a whole batch
+/// ([STL-206]). The comparison maps to [`Expr::Compare`], and each [`BoundScalar`]
+/// side lowers straight to its evaluator node — a column to its schema position
+/// (the same index [`ExplodePayload`] puts it at), a literal broadcast as a
+/// constant, arithmetic to [`Expr::Arith`]. A typed comparison over the decoded
+/// values is equivalent to the byte-equality the original `=`-only loop applied,
+/// since the encoding is canonical and a NULL cell decodes to a NULL the comparison
+/// (and `Filter`'s "keep TRUE only") drops.
 fn lower_predicate(predicate: &BoundPredicate) -> Expr {
     Expr::Compare {
         op: lower_compare_op(predicate.op),
@@ -2592,6 +2698,21 @@ fn projection_indices(projection: &Projection, columns: &[(String, LogicalType)]
     }
 }
 
+/// The `(name, type)` output columns a projection selects from a table's schema
+/// columns — the projected slice of `schema_columns`, in projection order. Shared
+/// by the streaming read (`run_select`) and the parameter-free statement
+/// `Describe` (`SessionEngine::describe`), so both agree on a plain `SELECT`'s
+/// `RowDescription` shape.
+fn projected_columns(
+    projection: &Projection,
+    schema_columns: &[(String, LogicalType)],
+) -> Vec<(String, LogicalType)> {
+    projection_indices(projection, schema_columns)
+        .iter()
+        .map(|&i| schema_columns[i].clone())
+        .collect()
+}
+
 /// Fold reconstructed rows into grouped aggregate output ([STL-171]).
 ///
 /// Decodes the schema columns the plan references into typed, nullable
@@ -2760,6 +2881,93 @@ mod tests {
             payload_column(&result),
             vec![b"100".to_vec()],
             "the inserted balance reads back"
+        );
+    }
+
+    #[test]
+    fn describe_resolves_a_parameterized_select_without_its_parameters() {
+        // The statement-level Describe path (STL-212): a prepared `SELECT … WHERE
+        // id = $1` is described *before* Bind, so its parameter has no value. The
+        // output shape is the projection over the schema — independent of the
+        // filter — so describe resolves it with the placeholder still present and
+        // without scanning (no INSERT needed).
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        let columns = engine
+            .describe(&parse_one("SELECT id, balance FROM account WHERE id = $1"))
+            .expect("describe")
+            .expect("a SELECT returns a row description");
+        assert_eq!(
+            columns,
+            vec![
+                ("id".to_owned(), LogicalType::Int4),
+                ("balance".to_owned(), LogicalType::Int4),
+            ]
+        );
+
+        // A named single-column projection narrows the description to that column.
+        let one = engine
+            .describe(&parse_one("SELECT balance FROM account"))
+            .expect("describe")
+            .expect("rows");
+        assert_eq!(one, vec![("balance".to_owned(), LogicalType::Int4)]);
+    }
+
+    #[test]
+    fn describe_returns_none_for_a_statement_with_no_rows() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        // DML, DDL, and an admin command all return no result columns — the wire
+        // front end answers `Describe` on these with `NoData`.
+        for sql in ["INSERT INTO account VALUES (1, 100)", CREATE, "CHECKPOINT"] {
+            assert_eq!(
+                engine.describe(&parse_one(sql)).expect("describe"),
+                None,
+                "{sql} returns no rows"
+            );
+        }
+    }
+
+    #[test]
+    fn describe_surfaces_an_unknown_table() {
+        let engine = session();
+        // No `account` created — describing a read of it is the same undefined-table
+        // error the read path raises, not a silent empty description.
+        let err = engine
+            .describe(&parse_one("SELECT id FROM account WHERE id = $1"))
+            .expect_err("unknown table");
+        assert!(
+            matches!(err, EngineError::Select(SelectError::UnknownTable(_))),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn describe_in_txn_resolves_at_the_transactions_pinned_snapshot() {
+        // A statement-level Describe inside a BEGIN block must resolve the shape at
+        // the transaction's pinned snapshot, not the current committed one, so it
+        // agrees with the rows the portal Execute returns under snapshot isolation.
+        let mut engine = session();
+        // Pin a snapshot *before* the table exists.
+        let txn = engine.begin();
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        // At the current snapshot the table resolves and describes...
+        let now = engine
+            .describe(&parse_one("SELECT id, balance FROM account"))
+            .expect("describe")
+            .expect("rows");
+        assert_eq!(now.len(), 2);
+        // ...but the transaction's pinned snapshot predates the CREATE, so the same
+        // statement resolves against a catalog where `account` is not yet live —
+        // the description tracks the snapshot the portal Execute reads at.
+        assert!(
+            engine
+                .describe_in_txn(&parse_one("SELECT id, balance FROM account"), &txn)
+                .is_err(),
+            "account is not live at the pinned snapshot"
         );
     }
 

@@ -825,6 +825,46 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
     })
 }
 
+/// Strip a statement's `WHERE` filter, for statement-level `Describe` ([STL-212]).
+///
+/// A prepared `SELECT` is described *before* `Bind`, so its `$1 … $n` parameters
+/// have no values yet — and a parameter most often lives in the `WHERE`
+/// (`… WHERE k = $1`), which the `WHERE` binder would try (and fail) to fold
+/// against the column type. But a query's output column shape is a function of its
+/// projection and the schema *only*; the filter cannot add, remove, or retype a
+/// result column. So the Describe path binds a copy with every `WHERE` removed —
+/// both the executor-glue `<column> = <literal>` predicate (a [`Select`]'s
+/// `selection`) and a lifted `PERIOD(...)` predicate
+/// ([`Temporal::period_predicate`](crate::Temporal::period_predicate)) — letting a
+/// parameterized read describe its row shape with no bound values. The
+/// `FOR … AS OF` qualifiers are kept: they select the *schema version* the columns
+/// resolve under, which the shape does depend on.
+#[must_use]
+pub fn without_filter(stmt: &Statement) -> Statement {
+    let mut out = stmt.clone();
+    out.temporal.period_predicate = None;
+    if let Some(SqlStatement::Query(query)) = out.sql_mut() {
+        strip_where(&mut query.body);
+    }
+    out
+}
+
+/// Clear the `WHERE` selection of every `SELECT` reached from a set expression —
+/// the top-level query, a parenthesized inner query, and each arm of a set
+/// operation. The projection and `FROM` are untouched, so the bound shape is
+/// unchanged.
+fn strip_where(set: &mut SetExpr) {
+    match set {
+        SetExpr::Select(select) => select.selection = None,
+        SetExpr::Query(inner) => strip_where(&mut inner.body),
+        SetExpr::SetOperation { left, right, .. } => {
+            strip_where(left);
+            strip_where(right);
+        }
+        _ => {}
+    }
+}
+
 /// Whether a `SELECT` is an aggregate query — it carries a non-empty `GROUP BY`,
 /// or any projected item is an aggregate function call. Purely syntactic (no
 /// catalog), so it gates binding before name resolution.
@@ -1761,7 +1801,7 @@ fn bind_scalar(
             };
             if !matches!(anchor.ty, LogicalType::Int4 | LogicalType::Int8) {
                 return Err(SelectError::UnsupportedPredicate(format!(
-                    "arithmetic in a WHERE needs an integer column, but {:?} is {}",
+                    "arithmetic in a WHERE needs an integer column, but `{}` is {}",
                     anchor.name, anchor.ty
                 )));
             }
@@ -2304,6 +2344,72 @@ mod tests {
             from: PeriodEndpoint::Const(from),
             to: PeriodEndpoint::Const(to),
         }
+    }
+
+    /// The `WHERE` of a bare top-level `SELECT` (`SetExpr::Select`), or `None` for
+    /// any other shape — enough for these single-`SELECT` describe tests.
+    fn selection_of(stmt: &Statement) -> Option<&Expr> {
+        let SqlStatement::Query(query) = stmt.sql()? else {
+            return None;
+        };
+        match query.body.as_ref() {
+            SetExpr::Select(select) => select.selection.as_ref(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn without_filter_lets_a_parameterized_select_describe() {
+        // A `$1` in the WHERE makes `bind_select` fail to fold the comparand, so a
+        // prepared `SELECT … WHERE k = $1` cannot bind before its parameter is
+        // bound. Stripping the filter for statement-level Describe lets it bind —
+        // and the projected output columns are the same regardless of the (absent)
+        // parameter value, which is the whole point.
+        let stmt = parse_one("SELECT id, balance FROM account WHERE id = $1");
+        let catalog = catalog_with_account(1_000);
+        let ctx = BindContext {
+            snapshot: NOW,
+            catalog: &catalog,
+        };
+        assert!(
+            selection_of(&stmt).is_some(),
+            "the parsed query has a WHERE"
+        );
+        assert!(
+            bind_select(&stmt, &ctx).is_err(),
+            "a placeholder WHERE cannot bind"
+        );
+
+        let described = without_filter(&stmt);
+        assert!(selection_of(&described).is_none(), "the WHERE is stripped");
+        let bound = bind_select(&described, &ctx).expect("the stripped copy binds");
+        assert_eq!(
+            bound.projection,
+            Projection::Columns(vec!["id".to_owned(), "balance".to_owned()])
+        );
+        assert!(bound.filter.is_none(), "no filter survives the strip");
+    }
+
+    #[test]
+    fn without_filter_clears_a_period_predicate_but_keeps_as_of() {
+        // A lifted `WHERE PERIOD(...) <pred> PERIOD(...)` is removed too — its
+        // endpoints can carry parameters just like an equality WHERE — while the
+        // `AS OF` qualifier, which selects the schema version the columns resolve
+        // under, is preserved.
+        let stmt = parse_one(
+            "SELECT balance FROM account FOR SYSTEM_TIME AS OF 1700000000000000 \
+             WHERE PERIOD(10, 20) CONTAINS PERIOD(30, 40)",
+        );
+        assert!(stmt.temporal.period_predicate.is_some());
+        let described = without_filter(&stmt);
+        assert!(
+            described.temporal.period_predicate.is_none(),
+            "the period predicate is cleared"
+        );
+        assert_eq!(
+            described.temporal.as_of, stmt.temporal.as_of,
+            "the AS OF qualifier is preserved"
+        );
     }
 
     #[test]

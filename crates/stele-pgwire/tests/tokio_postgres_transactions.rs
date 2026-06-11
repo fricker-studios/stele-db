@@ -14,8 +14,11 @@
 //! (STL-176) extend the same loop: `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` /
 //! `RELEASE SAVEPOINT` carve nested rollback points out of the one buffered write
 //! set, and `ROLLBACK TO` undoes only the writes staged after the savepoint while
-//! the transaction continues. Both paths ride the `Q` loop the v0.1 front end
-//! speaks; the extended protocol is a v0.2 concern.
+//! the transaction continues. After an error inside the block, `ROLLBACK TO` a
+//! pre-error savepoint **recovers** the aborted transaction rather than losing the
+//! whole block — Postgres's `in_failed_sql_transaction` escape hatch (STL-205) —
+//! while `SAVEPOINT` / `RELEASE` stay refused there. Both paths ride the `Q` loop
+//! the v0.1 front end speaks; the extended protocol is a v0.2 concern.
 
 use std::sync::{Arc, Mutex};
 
@@ -507,6 +510,87 @@ async fn savepoint_error_paths_report_postgres_sqlstates() {
         .simple_query("SELECT id FROM account")
         .await
         .expect("the connection works after the block ends");
+
+    drop(client);
+    let _ = driver.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollback_to_savepoint_recovers_an_aborted_transaction() {
+    // The DoD of STL-205 — Postgres's `in_failed_sql_transaction` escape hatch. An
+    // error inside a BEGIN block aborts it, but a ROLLBACK TO a savepoint that
+    // predates the error recovers the transaction instead of losing the whole
+    // block: the pre-savepoint write survives, the post-savepoint write (and the
+    // failed statement's effect) are undone, and the transaction continues to a
+    // clean COMMIT.
+    //
+    //   BEGIN; INSERT 1; SAVEPOINT sp; INSERT 2; <error>;
+    //   ROLLBACK TO sp; INSERT 3; COMMIT  →  commits {1, 3}.
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+    let (client, driver) = account_client(addr).await;
+
+    client.simple_query("BEGIN").await.expect("begin");
+    client
+        .simple_query("INSERT INTO account VALUES (1, 100)")
+        .await
+        .expect("insert 1 (before the savepoint)");
+    client
+        .simple_query("SAVEPOINT sp")
+        .await
+        .expect("savepoint");
+    client
+        .simple_query("INSERT INTO account VALUES (2, 200)")
+        .await
+        .expect("insert 2 (after the savepoint — to be undone by the recovery)");
+
+    // A write against an unknown table errors and aborts the block.
+    let err = client
+        .simple_query("INSERT INTO nope VALUES (9, 9)")
+        .await
+        .expect_err("the bad write aborts the transaction");
+    assert_eq!(
+        sqlstate(&err),
+        Some("42P01"),
+        "unknown table reported as undefined_table"
+    );
+
+    // SAVEPOINT and RELEASE stay refused in the aborted block (Postgres parity) —
+    // only ROLLBACK TO can recover it.
+    let err = client
+        .simple_query("SAVEPOINT sp2")
+        .await
+        .expect_err("SAVEPOINT is refused in an aborted block");
+    assert_eq!(sqlstate(&err), Some("25P02"), "SAVEPOINT while aborted");
+    let err = client
+        .simple_query("RELEASE SAVEPOINT sp")
+        .await
+        .expect_err("RELEASE is refused in an aborted block");
+    assert_eq!(sqlstate(&err), Some("25P02"), "RELEASE while aborted");
+
+    // ROLLBACK TO the pre-error savepoint recovers the block: it is active again.
+    client
+        .simple_query("ROLLBACK TO SAVEPOINT sp")
+        .await
+        .expect("rollback to a pre-error savepoint recovers the aborted transaction");
+    client
+        .simple_query("INSERT INTO account VALUES (3, 300)")
+        .await
+        .expect("insert 3 (the recovered transaction continues)");
+    client.simple_query("COMMIT").await.expect("commit");
+
+    let after = client
+        .simple_query("SELECT id FROM account")
+        .await
+        .expect("select after commit");
+    assert_eq!(
+        ids(&after),
+        vec!["1", "3"],
+        "the pre-savepoint insert and the post-recovery insert commit; the write staged \
+         after the savepoint and the failed statement are undone — the error was recovered, \
+         not the whole transaction lost"
+    );
 
     drop(client);
     let _ = driver.await;
