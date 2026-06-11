@@ -653,7 +653,7 @@ pub struct SessionEngine<C: Clock + Clone, D: Disk + Clone> {
     /// (a later write overwrites the instant). [`prune_write_index`](Self::prune_write_index)
     /// bounds it: an entry committed strictly below the oldest live snapshot can
     /// never satisfy a conflict again, so it is dropped — and when no transaction
-    /// is open, the whole index is ([STL-204]).
+    /// is open, the whole index is cleared ([STL-204]).
     ///
     /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
     /// [STL-204]: https://allegromusic.atlassian.net/browse/STL-204
@@ -1495,11 +1495,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// bounding the index on a long-lived server ([STL-204], [ADR-0008]).
     ///
     /// A conflict requires a write committed *strictly after* some open
-    /// transaction's pinned snapshot (`committed_at > snapshot`), so an entry at or
+    /// transaction's pinned snapshot (`committed_at > snapshot`), so any entry at or
     /// below the **oldest** live snapshot can never conflict with that transaction —
-    /// nor any newer one, whose snapshot is at least as high — and is dropped. When
-    /// no transaction is open the whole index goes: every future transaction pins at
-    /// or past the current instant, which is at or past every recorded write.
+    /// nor any newer one, whose snapshot is at least as high. This drops every entry
+    /// committed *strictly below* that snapshot (`retain(committed_at >= floor)`);
+    /// the at-most-one-instant's worth sitting exactly at it is kept — harmless, and
+    /// matching the ticket's "strictly below" wording. When no transaction is open
+    /// the whole index goes: every future transaction pins at or past the current
+    /// instant, which is at or past every recorded write.
     ///
     /// The `pruned_below` guard skips the (O(index)) scan when the floor has not
     /// risen since the last prune, so steady auto-commit traffic under a single
