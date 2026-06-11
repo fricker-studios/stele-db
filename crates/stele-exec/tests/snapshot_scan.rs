@@ -25,6 +25,7 @@ use stele_exec::{Column, SnapshotScan};
 use stele_storage::backend::{MemDisk, MemFile};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
 use stele_storage::dml::DmlWriter;
+use stele_storage::engine::Engine;
 use stele_storage::segment::{ColumnId, Predicate, SegmentReader, SegmentWriter, ZoneBound};
 use stele_storage::systime::{EmptySealed, SealedSegments};
 use stele_storage::validity::{ValidityConfig, ValidityIndex};
@@ -785,6 +786,97 @@ fn scan_reads_only_the_live_rows_row_group_chunks() {
     assert!(
         read >= FAT as u64,
         "the live row's payload chunk must be materialized, but only {read} bytes were read",
+    );
+}
+
+/// STL-197 DoD: the same read-accounting proof one layer up — a wide segment
+/// sealed by [`Engine::flush`] (the production path), not a hand-built
+/// `SegmentWriter`, with a single live row materializes only that row's
+/// row-group payload chunk. The engine is configured with a one-row flush bound,
+/// so the flush splits into four one-row row-groups that the scan can skip
+/// independently; before STL-197 `flush` sealed one unbounded row-group and the
+/// chunk skipping degenerated to STL-146 per-column, reading every row's fat
+/// payload. The companion `scan_reads_only_the_live_rows_row_group_chunks` proves
+/// the same at the segment layer; this proves the engine's flush policy delivers
+/// it end-to-end.
+#[test]
+fn engine_flush_bounds_row_groups_so_scans_skip_dead_chunks() {
+    const FAT: usize = 64 * 1024;
+    let disk = CountingDisk::new();
+    let mut engine = Engine::open(disk.clone(), StepClock::new(1_000), false)
+        .expect("open engine")
+        .with_flush_row_group_rows(1);
+
+    // Four fat rows, then flush through the engine: the one-row bound seals four
+    // one-row row-groups, each independently skippable.
+    for id in 1..=4i64 {
+        engine
+            .insert(
+                key_of(id),
+                None,
+                Some(vec![b'0' + u8::try_from(id).unwrap(); FAT]),
+                0,
+                TxnId(u64::try_from(id).unwrap()),
+                who(),
+            )
+            .expect("insert");
+    }
+    engine.flush().expect("flush");
+
+    // Supersede keys 1–3 in the delta across the flush boundary; only key 4's
+    // sealed fat row stays live, in the last row-group.
+    let mut last = SystemTimeMicros(0);
+    for id in 1..=3i64 {
+        last = engine
+            .update(
+                key_of(id),
+                None,
+                Some(format!("small-{id}").into_bytes()),
+                0,
+                TxnId(10 + u64::try_from(id).unwrap()),
+                who(),
+            )
+            .expect("update")
+            .commit;
+    }
+
+    // The engine actually split the flush — the wiring under test.
+    let segments = engine.open_segment_readers().expect("open readers");
+    assert_eq!(
+        segments[0].row_group_row_counts(),
+        vec![1, 1, 1, 1],
+        "Engine::flush must split a wide flush into one-row row-groups",
+    );
+
+    disk.reset();
+    let out = SnapshotScan::new(engine.delta(), engine.index(), &segments, Snapshot(last))
+        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .execute()
+        .expect("scan");
+
+    // Result first: all four keys resolve, key 4 to its fat sealed payload.
+    assert_eq!(out.batch.rows, 4);
+    assert_eq!(out.stats.segments_scanned, 1);
+    let payloads: Vec<Vec<u8>> = match &out.batch.columns[1].1 {
+        Column::Bytes(rows) => rows.iter().map(|c| c.clone().unwrap()).collect(),
+        Column::I64(_) => panic!("payload is a bytes column"),
+    };
+    assert_eq!(payloads[0], b"small-1");
+    assert_eq!(payloads[3], vec![b'4'; FAT]);
+
+    // Read accounting (the DoD assertion): one fat payload chunk plus the narrow
+    // identity columns — reading even a second row-group's payload would push past
+    // two rows' worth, which is exactly what the unbounded one-row-group flush did.
+    let read = disk.bytes_read();
+    assert!(
+        read < 2 * FAT as u64,
+        "an engine-flushed wide segment with one live row must read only that \
+         row-group's payload chunk (~{FAT} bytes + narrow identity columns), \
+         but read {read} bytes",
+    );
+    assert!(
+        read >= FAT as u64,
+        "the one live row's payload chunk must be materialized, but only {read} bytes were read",
     );
 }
 

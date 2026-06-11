@@ -800,7 +800,15 @@ pub fn run_engine_flush_recover_seed(seed: u64) -> u64 {
         .collect();
 
     let before_index = {
-        let mut engine = Engine::open(disk.clone(), StepClock::new(1), false).expect("open engine");
+        // Seed a small per-seed row-group bound so every flush seals a *multi*-
+        // row-group segment ([STL-197]); recovery must still rebuild the exact
+        // validity index across the finer split — the engine-level analogue of the
+        // 1–3-row bound the SnapshotScan oracle seeds at the segment layer
+        // ([STL-155]).
+        let row_group_rows = 1 + rng.below_usize(3);
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1), false)
+            .expect("open engine")
+            .with_flush_row_group_rows(row_group_rows);
         let mut live = vec![false; key_count];
         let ops = 8 + rng.below(24);
         for op in 0..ops {
@@ -1194,7 +1202,13 @@ pub fn run_engine_flush_recover_faults_seed(seed: u64) -> u64 {
 
     let disk = FaultDisk::new(seed, FaultProfile::none());
     {
-        let mut engine = Engine::open(disk.clone(), StepClock::new(1), false).expect("open engine");
+        // Seed a small per-seed row-group bound so a mid-flush fault can tear a
+        // *multi*-row-group segment ([STL-197]) — the orphan / torn-flush recovery
+        // paths must survive the finer split too ([STL-155]).
+        let row_group_rows = 1 + rng.below_usize(3);
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1), false)
+            .expect("open engine")
+            .with_flush_row_group_rows(row_group_rows);
         disk.enable(FaultKind::TornWrite, p_torn);
         disk.enable(FaultKind::FullDisk, p_full);
         disk.enable(FaultKind::SlowSync, p_slow);

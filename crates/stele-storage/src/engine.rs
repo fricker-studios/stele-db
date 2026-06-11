@@ -80,6 +80,20 @@ const SEGMENT_FILENAME_PREFIX: &str = "seg-";
 /// Filename suffix for sealed segments.
 const SEGMENT_FILENAME_SUFFIX: &str = ".seg";
 
+/// Default upper bound on rows per row-group when [`Engine::flush`] seals the
+/// delta tier into a segment ([STL-197]). A flush wider than this splits into
+/// several row-groups at this granularity, so a later scan can skip the chunks
+/// of the row-groups holding no live row ([STL-155],
+/// [`SegmentReader::read_column_in_row_groups`]) instead of materializing the
+/// whole column. Sized off the vectorized batch size ([ADR-0027]: 1024 rows) —
+/// large enough to amortize the per-chunk header + zone-map overhead a finer
+/// split adds, small enough that a selective scan reads only a few row-groups'
+/// worth of payload. Override per engine with
+/// [`Engine::with_flush_row_group_rows`].
+///
+/// [ADR-0027]: ../../../docs/adr/0027-vectorized-execution-model.md
+const DEFAULT_FLUSH_ROW_GROUP_ROWS: usize = 1024;
+
 /// The highest commit instant and transaction id an engine's recovered state
 /// contains — see [`Engine::recovery_marks`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +177,11 @@ pub struct Engine<C: Clock, D: Disk + Clone> {
     /// [`Self::checkpoint`] or [`Self::flush`]. [`None`] means no checkpoint has
     /// been taken — replay covers the whole log and no segment is trusted.
     checkpoint: Option<LogOffset>,
+    /// Upper bound on rows per row-group a [`Self::flush`] seals segments with
+    /// ([STL-197]). Defaults to [`DEFAULT_FLUSH_ROW_GROUP_ROWS`]; override with
+    /// [`Self::with_flush_row_group_rows`]. A flush wider than this splits into
+    /// several independently skippable row-groups ([STL-155]).
+    flush_row_group_rows: usize,
 }
 
 impl<C: Clock, D: Disk + Clone> Engine<C, D> {
@@ -193,6 +212,7 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
             next_segment_index: 0,
             replay_floor: LogOffset::ZERO,
             checkpoint: None,
+            flush_row_group_rows: DEFAULT_FLUSH_ROW_GROUP_ROWS,
         })
     }
 
@@ -296,7 +316,23 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
             next_segment_index: segment_count,
             replay_floor: floor,
             checkpoint: recovery.map(|p| p.durable_fence),
+            flush_row_group_rows: DEFAULT_FLUSH_ROW_GROUP_ROWS,
         })
+    }
+
+    /// Override the rows-per-row-group bound [`Self::flush`] seals segments with
+    /// ([STL-197]), replacing the `DEFAULT_FLUSH_ROW_GROUP_ROWS` default. A
+    /// smaller bound splits a flush into more, finer row-groups — each
+    /// independently skippable by the read path ([STL-155]) — at the cost of more
+    /// per-chunk overhead; `0` is clamped to `1`, the same clamp
+    /// [`SegmentWriter::with_max_row_group_rows`] applies. Builder-style so the
+    /// many [`open`](Self::open) / [`recover`](Self::recover) call sites that want
+    /// the default stay untouched; the flush-recovery sim sweeps and the
+    /// read-accounting tests seed a small bound through it.
+    #[must_use]
+    pub fn with_flush_row_group_rows(mut self, rows: usize) -> Self {
+        self.flush_row_group_rows = rows.max(1);
+        self
     }
 
     /// `INSERT` `key` through the WAL → delta path ([`DmlWriter::insert`]),
@@ -493,11 +529,17 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         let idx = self.next_segment_index;
         let name = segment_name(idx);
         let _ = self.disk.remove(&name);
+        // Bound each row-group so a wide flush splits into several skippable
+        // row-groups ([STL-197]) — the same `with_max_row_group_rows` knob the
+        // segment tests and the SnapshotScan oracle drive, now sourced from the
+        // engine's flush policy. The default ([`DEFAULT_FLUSH_ROW_GROUP_ROWS`])
+        // keeps narrow flushes a single row-group, byte-identical to before.
         let mut writer = if self.valid_time {
             SegmentWriter::create_valid_time(&self.disk, &name)?
         } else {
             SegmentWriter::create(&self.disk, &name)?
-        };
+        }
+        .with_max_row_group_rows(self.flush_row_group_rows);
         for v in &versions {
             writer.push(v.clone())?;
         }
