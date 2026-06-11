@@ -3920,7 +3920,9 @@ mod tests {
         match ScalarValue::decode(ty, bytes).expect("decode") {
             ScalarValue::Int4(v) => i64::from(v),
             ScalarValue::Timestamp(v) => v,
-            other => panic!("unexpected cell type {other:?}"),
+            // Static message: interpolating the decoded ScalarValue here trips
+            // CodeQL's (false) cleartext-logging taint on its Debug.
+            _ => panic!("expected an int4/timestamp result column"),
         }
     }
 
@@ -4006,10 +4008,10 @@ mod tests {
                     decode_int(row[2].as_ref(), LogicalType::Timestamp),
                     decode_int(row[3].as_ref(), LogicalType::Timestamp),
                 );
-                assert!(
-                    got.insert(id, cells).is_none(),
-                    "one system-live row per key, got a duplicate for id {id}",
-                );
+                let fresh = got.insert(id, cells).is_none();
+                // Static message — a decode-derived value in the message trips
+                // CodeQL's (false) cleartext-logging taint.
+                assert!(fresh, "the plain read returned two rows for one key");
             }
             assert_eq!(got, model, "plain read diverged from the naïve reference");
             rows_seen += u64::try_from(got.len()).expect("fits");
