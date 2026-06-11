@@ -41,7 +41,9 @@ pub use expr::{ArithOp, CmpOp, Expr, ExprError, LogicOp, Vector, eval_expr};
 pub use join::{JoinIndices, JoinType, hash_join};
 pub use operator::{DEFAULT_BATCH_SIZE, ExplodePayload, Filter, Operator, Project, ScanSource};
 pub use period::evaluate;
-pub use snapshot_scan::{Batch, Cells, Column, ScanError, ScanOutput, ScanStats, SnapshotScan};
+pub use snapshot_scan::{
+    Batch, Cells, Column, GatheredColumns, ScanError, ScanOutput, ScanStats, SnapshotScan,
+};
 // Re-exported so consumers (the binder's bound predicate, the oracle) name the
 // same period vocabulary the evaluator works in ([STL-165]).
 pub use stele_common::period::{Interval, IntervalError, PeriodPredicate};
