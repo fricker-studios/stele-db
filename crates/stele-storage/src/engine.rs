@@ -63,7 +63,7 @@ use stele_common::time::{Clock, SystemTimeMicros};
 use crate::backend::Disk;
 use crate::checkpoint::{self, RecoveryPoint};
 use crate::delta::{BusinessKey, Delta, DeltaConfig, DeltaError, Snapshot, Version};
-use crate::dml::{self, DmlError, DmlOutcome, DmlWriter};
+use crate::dml::{self, CommittedTxns, DmlError, DmlOutcome, DmlWriter};
 use crate::merge;
 use crate::rebuild::rebuild_index_from_segments;
 use crate::segment::{SegmentError, SegmentReader, SegmentWriter};
@@ -239,6 +239,33 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     /// [`EngineError::Wal`] / [`EngineError::Dml`] if the log cannot be replayed;
     /// [`EngineError`] for any other tier-open or I/O failure.
     pub fn recover(disk: D, clock: C, valid_time: bool) -> Result<Self, EngineError> {
+        // A single table's WAL has no cross-table commit to gate on, so every record
+        // applies — the per-table sims/tests that drive this never write two-phase
+        // records ([STL-215]). The session recovery driver, which *does* coordinate
+        // across tables, uses `recover_with_commits` instead.
+        Self::recover_with_commits(disk, clock, valid_time, &CommittedTxns::All)
+    }
+
+    /// [`recover`](Self::recover), but gating **two-phase** WAL records on the set of
+    /// transactions whose commit marker is durable ([STL-215]). A record tagged as a
+    /// leg of a multi-table `COMMIT` is replayed only if `committed` admits its
+    /// transaction; otherwise the marker never became durable and the leg is
+    /// discarded, so the transaction recovers all-or-none across every table it
+    /// wrote. Plain (single-table / auto-commit) records always apply. The session
+    /// recovery driver builds `committed` from the engine commit log and passes it to
+    /// every table's recover.
+    ///
+    /// [STL-215]: https://allegromusic.atlassian.net/browse/STL-215
+    ///
+    /// # Errors
+    ///
+    /// As [`recover`](Self::recover).
+    pub fn recover_with_commits(
+        disk: D,
+        clock: C,
+        valid_time: bool,
+        committed: &CommittedTxns,
+    ) -> Result<Self, EngineError> {
         // 1. Load the durable recovery point: where replay resumes (`floor`), the
         //    torn-tail boundary (`fence`), and how many sealed segments committed
         //    flushes vouched (`segment_count`). No record ⇒ no flush ever
@@ -301,7 +328,14 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         //    `fence` (the unsynced tail of a mid-write crash) while treating
         //    corruption *before* the fence — a committed-but-unflushed record — as
         //    a fatal fault ([`dml::recover_replay`], [STL-177]).
-        dml::recover_replay(&wal, &mut delta, &mut index, Checkpoint(floor), fence)?;
+        dml::recover_replay(
+            &wal,
+            &mut delta,
+            &mut index,
+            Checkpoint(floor),
+            fence,
+            committed,
+        )?;
 
         let writer = DmlWriter::new(wal.clone(), clock, valid_time);
         Ok(Self {
@@ -508,6 +542,23 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     /// see [`DmlWriter::commit_group`] and [STL-217].
     pub fn commit_group(&mut self) -> Result<LogOffset, EngineError> {
         Ok(self.writer.commit_group()?)
+    }
+
+    /// Group-commit the open buffer as **one leg of a multi-table transaction**
+    /// ([`DmlWriter::commit_group_two_phase`], [STL-215]): append the writes as a
+    /// single two-phase WAL record tagged with `txn_id` and fsync once. The leg is
+    /// durable but inert until the session driver appends `txn_id`'s commit marker
+    /// after every table's leg is durable; recovery replays it only if that marker
+    /// is present, so the transaction recovers all-or-none across tables. Returns the
+    /// durable end after the fsync.
+    ///
+    /// [STL-215]: https://allegromusic.atlassian.net/browse/STL-215
+    ///
+    /// # Errors
+    ///
+    /// As [`commit_group`](Self::commit_group).
+    pub fn commit_group_two_phase(&mut self, txn_id: TxnId) -> Result<LogOffset, EngineError> {
+        Ok(self.writer.commit_group_two_phase(txn_id)?)
     }
 
     /// Discard the open group buffer without logging it — the transaction aborted

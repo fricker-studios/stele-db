@@ -1337,11 +1337,13 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
         // map cleanly rather than panicking if the contract ever shifts. A row
         // codec failure is corrupt stored bytes — an internal error, like storage.
         EngineError::Catalog(_) | EngineError::ValidTimePolicyChange { .. } => sqlstate_for(err),
-        // Internal faults: storage tiers, the catalog-log durability point
-        // (ADR-0028), the scan, corrupt stored bytes (row codec), and a schema
-        // that changed under a bound write (concurrent-ish schema drift).
+        // Internal faults: storage tiers, the catalog-log (ADR-0028) and
+        // commit-marker-log (ADR-0029) durability points, the scan, corrupt stored
+        // bytes (row codec), and a schema that changed under a bound write
+        // (concurrent-ish schema drift).
         EngineError::Storage(_)
         | EngineError::CatalogLog(_)
+        | EngineError::CommitLog(_)
         | EngineError::Scan(_)
         | EngineError::RowCodec(_)
         | EngineError::SchemaChanged { .. } => SQLSTATE_INTERNAL_ERROR,

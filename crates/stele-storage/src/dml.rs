@@ -64,6 +64,8 @@
 //! is the per-key *timeline reconstruction* (no gaps, no overlaps) exercised in
 //! `tests/dml.rs`.
 
+use std::collections::BTreeSet;
+
 use stele_common::provenance::{Principal, TxnId};
 use stele_common::time::{Clock, SystemTimeMicros};
 
@@ -350,11 +352,62 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     ///
     /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
     pub fn commit_group(&mut self) -> Result<LogOffset, DmlError> {
+        self.finish_group(None)
+    }
+
+    /// Group-commit the open buffer as **one leg of a multi-table transaction**
+    /// ([STL-215]): append the transaction's writes as a single **two-phase** WAL
+    /// record — tagged with `txn_id` so recovery can recognize it — and fsync once.
+    ///
+    /// A two-phase record is durable but **inert** until vouched: recovery replays
+    /// it only if `txn_id`'s commit marker is durable in the engine commit log
+    /// ([`recover_replay`]'s [`CommittedTxns`] gate). The session driver writes one
+    /// marker after every table's leg is durable, so a crash between the per-table
+    /// commits and the marker discards every leg and the transaction recovers
+    /// all-or-none across tables. A **single-table** transaction needs no marker and
+    /// takes the plain [`commit_group`](Self::commit_group) fast path instead.
+    ///
+    /// Clears the group buffer, returning the writer to auto-commit mode. The
+    /// fsync-failure caveat is identical to [`commit_group`](Self::commit_group)
+    /// ([STL-217]).
+    ///
+    /// [STL-215]: https://allegromusic.atlassian.net/browse/STL-215
+    ///
+    /// # Errors
+    ///
+    /// [`DmlError::Wal`] if the append or fsync fails.
+    pub fn commit_group_two_phase(&mut self, txn_id: TxnId) -> Result<LogOffset, DmlError> {
+        self.finish_group(Some(txn_id))
+    }
+
+    /// Append the buffered transaction as one WAL record and fsync once — the
+    /// shared body of [`commit_group`](Self::commit_group) (plain, `txn_id` =
+    /// [`None`]) and [`commit_group_two_phase`](Self::commit_group_two_phase)
+    /// (`txn_id` = [`Some`]). A plain record is byte-for-byte what the single-record
+    /// path always wrote; a two-phase record prepends the
+    /// [`TWO_PHASE_RECORD_TAG`] envelope. An empty buffer writes no record and skips
+    /// the fsync.
+    fn finish_group(&mut self, txn_id: Option<TxnId>) -> Result<LogOffset, DmlError> {
         let redos = self.group.take().unwrap_or_default();
         if redos.is_empty() {
             return Ok(self.wal.durable_end());
         }
-        let record = encode_redo(&redos)?;
+        let record = match txn_id {
+            // Single-table / auto-commit: the record boundary alone is the atomic
+            // commit point, so it stays the pre-STL-215 framing — recovery applies
+            // it unconditionally.
+            None => encode_redo(&redos)?,
+            // A leg of a multi-table transaction: tag the record with the committing
+            // transaction so recovery can gate it on the commit marker (STL-215).
+            Some(txn_id) => {
+                let redos = encode_redo(&redos)?;
+                let mut record = Vec::with_capacity(1 + 8 + redos.len());
+                record.push(TWO_PHASE_RECORD_TAG);
+                record.extend_from_slice(&txn_id.0.to_le_bytes());
+                record.extend_from_slice(&redos);
+                record
+            }
+        };
         self.wal.append(&record)?;
         // The single group-commit fsync — the transaction's durability point. If it
         // fails after the append above, the staged record's durability is
@@ -404,7 +457,11 @@ pub fn replay<D: Disk, I: Disk>(
     let mut applied = 0;
     for record in wal.replay_from(checkpoint) {
         let payload = record?;
-        let redos = decode_redo(&payload)?;
+        // Strip the optional two-phase envelope (STL-215). Plain verification does
+        // not commit-gate — that is [`recover_replay`]'s job — so a two-phase leg is
+        // applied like any other record; this path is for single-table / intact logs.
+        let (_txn_id, redo_bytes) = split_record(&payload)?;
+        let redos = decode_redo(redo_bytes)?;
         applied += redos.len();
         // The same application point the forward DmlWriter path uses.
         crate::systime::apply(delta, index, redos)?;
@@ -438,9 +495,20 @@ pub fn replay<D: Disk, I: Disk>(
 /// bug, not a torn write), always propagates. Returns the number of redo entries
 /// applied from the surviving prefix.
 ///
+/// `committed` gates **two-phase** records — the legs of a multi-table `COMMIT`
+/// ([STL-215]). A record tagged with a transaction id is replayed only if that
+/// transaction is in [`committed`](CommittedTxns) (its commit marker is durable);
+/// otherwise it is skipped, so a crash between the per-table commits and the marker
+/// recovers the transaction all-or-none across every table. Plain (single-table /
+/// auto-commit) records carry no tag and always apply. A single table's bare
+/// [`Engine::recover`](crate::engine::Engine::recover) passes [`CommittedTxns::All`]
+/// (no cross-table coordination to gate on).
+///
 /// v0.1 replays from [`Checkpoint::BEGIN`] (the full log) and rebuilds the validity
 /// index from it per [ADR-0023]; `fence` here is the *durability boundary*, not yet a
 /// replay-*skip* — that realignment rides STL-133 / STL-136.
+///
+/// [STL-215]: https://allegromusic.atlassian.net/browse/STL-215
 ///
 /// # Errors
 ///
@@ -453,6 +521,7 @@ pub fn recover_replay<D: Disk, I: Disk>(
     index: &mut ValidityIndex<I>,
     from: Checkpoint,
     fence: LogOffset,
+    committed: &CommittedTxns,
 ) -> Result<usize, DmlError> {
     let mut applied = 0;
     let mut replay = wal.replay_from(from);
@@ -471,11 +540,56 @@ pub fn recover_replay<D: Disk, I: Disk>(
             }
             Err(other) => return Err(other.into()),
         };
-        let redos = decode_redo(&payload)?;
+        let (txn_id, redo_bytes) = split_record(&payload)?;
+        if let Some(txn_id) = txn_id {
+            if !committed.admits(txn_id) {
+                // A multi-table leg whose commit marker never became durable —
+                // discard it so the transaction recovers all-or-none (STL-215).
+                continue;
+            }
+        }
+        let redos = decode_redo(redo_bytes)?;
         applied += redos.len();
         crate::systime::apply(delta, index, redos)?;
     }
     Ok(applied)
+}
+
+/// The set of multi-table transactions whose commit marker is durable — the gate
+/// [`recover_replay`] applies to **two-phase** WAL redo records ([STL-215]).
+///
+/// A multi-table `COMMIT` writes each table's writes as a two-phase record (tagged
+/// with the transaction id, [`DmlWriter::commit_group_two_phase`]) and is committed
+/// only once a single marker — "transaction T committed" — is fsynced *after* every
+/// per-table record is durable. On recovery a two-phase record is replayed **iff**
+/// its transaction is in this set; otherwise the marker never became durable (a
+/// crash between the per-table commits and the marker) and the leg is discarded, so
+/// the transaction recovers all-or-none across every table it wrote. A plain record
+/// (auto-commit or the single-table fast path) carries no transaction id and always
+/// applies.
+///
+/// [STL-215]: https://allegromusic.atlassian.net/browse/STL-215
+#[derive(Debug, Clone)]
+pub enum CommittedTxns {
+    /// Apply every record regardless of commit mode — the default for a bare
+    /// [`Engine::recover`](crate::engine::Engine::recover). A single table's WAL has
+    /// no cross-table coordination to gate on, and the per-table sims/tests that
+    /// drive it never write two-phase records.
+    All,
+    /// Apply a two-phase record only if its transaction id is in this set — built by
+    /// the session recovery driver from the durable engine commit log.
+    Only(BTreeSet<TxnId>),
+}
+
+impl CommittedTxns {
+    /// Whether a two-phase record committed by `txn_id` should be replayed.
+    #[must_use]
+    fn admits(&self, txn_id: TxnId) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(set) => set.contains(&txn_id),
+        }
+    }
 }
 
 /// Tag byte for a [`Redo::Insert`] frame in a WAL redo record.
@@ -550,6 +664,40 @@ fn decode_redo(bytes: &[u8]) -> Result<Vec<Redo>, DmlError> {
         }
     }
     Ok(redos)
+}
+
+/// Leading byte marking a **two-phase** WAL redo record ([STL-215]): one leg of a
+/// multi-table `COMMIT`. The byte is followed by the committing transaction's id
+/// (`u64` LE) and then the redo entries ([`encode_redo`]). A single-table or
+/// auto-commit record carries **no** such prefix — it begins directly with a redo
+/// tag (`0`/`1`/`2`, [`REDO_TAG_INSERT`]…) — so the two framings can never collide,
+/// every record the single-record path writes reads back byte-for-byte unchanged,
+/// and recovery tells a gated leg from a plain record by this one byte.
+///
+/// [STL-215]: https://allegromusic.atlassian.net/browse/STL-215
+const TWO_PHASE_RECORD_TAG: u8 = 0xFF;
+
+/// Split a WAL redo record into its optional two-phase transaction id and the
+/// trailing redo-entry bytes ([`decode_redo`] consumes the latter). A record that
+/// begins with [`TWO_PHASE_RECORD_TAG`] is one leg of a multi-table transaction
+/// (gated on the commit marker, [`CommittedTxns`]); any other record — the common
+/// single-record path — is plain, so the whole payload is redo entries.
+///
+/// # Errors
+///
+/// [`DmlError::Delta`] if a two-phase record is truncated before its 8-byte
+/// transaction id.
+fn split_record(payload: &[u8]) -> Result<(Option<TxnId>, &[u8]), DmlError> {
+    match payload.split_first() {
+        Some((&TWO_PHASE_RECORD_TAG, rest)) => {
+            let id = rest.get(..8).ok_or(DmlError::Delta(DeltaError::Corrupt(
+                "two-phase redo record truncated before its transaction id",
+            )))?;
+            let txn_id = TxnId(u64::from_le_bytes(id.try_into().expect("8 bytes")));
+            Ok((Some(txn_id), &rest[8..]))
+        }
+        _ => Ok((None, payload)),
+    }
 }
 
 #[cfg(test)]
@@ -704,8 +852,15 @@ mod tests {
         //    one durable record.
         let mut d = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
         let mut i = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
-        let applied = recover_replay(&wal, &mut d, &mut i, Checkpoint::BEGIN, fence)
-            .expect("recover tolerates a tail at/after the fence");
+        let applied = recover_replay(
+            &wal,
+            &mut d,
+            &mut i,
+            Checkpoint::BEGIN,
+            fence,
+            &CommittedTxns::All,
+        )
+        .expect("recover tolerates a tail at/after the fence");
         assert_eq!(
             applied, 1,
             "the durable prefix is applied, the torn tail dropped"
@@ -721,7 +876,14 @@ mod tests {
         let mut i = ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
         assert!(
             matches!(
-                recover_replay(&wal, &mut d, &mut i, Checkpoint::BEGIN, beyond),
+                recover_replay(
+                    &wal,
+                    &mut d,
+                    &mut i,
+                    Checkpoint::BEGIN,
+                    beyond,
+                    &CommittedTxns::All,
+                ),
                 Err(DmlError::Wal(_)),
             ),
             "corruption before the fence is fatal, not a tolerated tail",
@@ -855,5 +1017,149 @@ mod tests {
             0,
             "an aborted group leaves no durable record"
         );
+    }
+
+    /// A plain (single-table / auto-commit) group commit writes the pre-STL-215
+    /// framing: the record begins with a redo tag, not the two-phase tag, and
+    /// [`split_record`] reports no transaction — so recovery applies it
+    /// unconditionally and records written before STL-215 read back unchanged.
+    #[test]
+    fn a_plain_group_commit_writes_an_ungated_record() {
+        use stele_common::provenance::Principal;
+
+        use crate::backend::MemDisk;
+        use crate::delta::{Delta, DeltaConfig};
+        use crate::systime::EmptySealed;
+        use crate::validity::{ValidityConfig, ValidityIndex};
+        use crate::wal::{Wal, WalConfig};
+
+        let disk = MemDisk::new();
+        let wal = Wal::open(disk, WalConfig::default()).expect("wal");
+        let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
+        let mut index =
+            ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+        let mut writer = DmlWriter::new(
+            wal.clone(),
+            StepClock(std::sync::atomic::AtomicI64::new(0)),
+            false,
+        );
+
+        writer.begin_group();
+        writer
+            .insert(
+                &mut delta,
+                &mut index,
+                &EmptySealed,
+                BusinessKey::new(b"k".to_vec()),
+                None,
+                Some(b"v".to_vec()),
+                0,
+                TxnId(7),
+                Principal::new(b"p".to_vec()),
+            )
+            .expect("buffered insert");
+        writer.commit_group().expect("plain group commit");
+
+        let records: Vec<Vec<u8>> = wal
+            .replay_from(Checkpoint::BEGIN)
+            .collect::<Result<_, _>>()
+            .expect("replay");
+        assert_eq!(records.len(), 1, "one record for the transaction");
+        assert_eq!(
+            records[0].first(),
+            Some(&REDO_TAG_INSERT),
+            "a plain record begins with a redo tag, not the two-phase tag",
+        );
+        let (txn_id, redos) = split_record(&records[0]).expect("split");
+        assert_eq!(txn_id, None, "a plain record is ungated");
+        assert_eq!(decode_redo(redos).expect("decode").len(), 1);
+    }
+
+    /// A multi-table leg writes a **two-phase** record tagged with its transaction,
+    /// and [`recover_replay`] applies it only when the [`CommittedTxns`] gate admits
+    /// that transaction — the cross-table all-or-none mechanism ([STL-215]). The
+    /// same record recovers to *nothing* without the marker and to the whole leg
+    /// with it.
+    #[test]
+    fn recover_replay_gates_a_two_phase_record_on_its_commit_marker() {
+        use stele_common::provenance::Principal;
+
+        use crate::backend::MemDisk;
+        use crate::delta::{Delta, DeltaConfig};
+        use crate::systime::EmptySealed;
+        use crate::validity::{ValidityConfig, ValidityIndex};
+        use crate::wal::{Wal, WalConfig};
+
+        let disk = MemDisk::new();
+        let wal = Wal::open(disk, WalConfig::default()).expect("wal");
+        let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
+        let mut index =
+            ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+        let mut writer = DmlWriter::new(
+            wal.clone(),
+            StepClock(std::sync::atomic::AtomicI64::new(0)),
+            false,
+        );
+        let principal = Principal::new(b"p".to_vec());
+
+        let txn = TxnId(9);
+        writer.begin_group();
+        for i in 0..2 {
+            writer
+                .insert(
+                    &mut delta,
+                    &mut index,
+                    &EmptySealed,
+                    BusinessKey::new(format!("k{i}").into_bytes()),
+                    None,
+                    Some(vec![i]),
+                    0,
+                    txn,
+                    principal.clone(),
+                )
+                .expect("buffered insert");
+        }
+        writer
+            .commit_group_two_phase(txn)
+            .expect("two-phase group commit");
+        let fence = wal.durable_end();
+
+        // The record is tagged two-phase and names the committing transaction.
+        let records: Vec<Vec<u8>> = wal
+            .replay_from(Checkpoint::BEGIN)
+            .collect::<Result<_, _>>()
+            .expect("replay");
+        assert_eq!(records.len(), 1, "the whole leg is one record");
+        assert_eq!(
+            records[0].first(),
+            Some(&TWO_PHASE_RECORD_TAG),
+            "a multi-table leg is tagged two-phase",
+        );
+        assert_eq!(split_record(&records[0]).expect("split").0, Some(txn));
+
+        // Helper: recover the leg under a given gate, returning the redo count applied.
+        let recover_under = |committed: &CommittedTxns| {
+            let mut d = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
+            let mut i =
+                ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+            recover_replay(&wal, &mut d, &mut i, Checkpoint::BEGIN, fence, committed)
+                .expect("recover")
+        };
+
+        // No marker ⇒ the leg is uncommitted ⇒ discarded entirely (all-or-none).
+        assert_eq!(
+            recover_under(&CommittedTxns::Only(BTreeSet::new())),
+            0,
+            "a two-phase leg with no commit marker recovers to nothing",
+        );
+        // Marker present ⇒ both writes apply.
+        let committed = CommittedTxns::Only(std::iter::once(txn).collect());
+        assert_eq!(
+            recover_under(&committed),
+            2,
+            "a two-phase leg whose marker is durable recovers whole",
+        );
+        // `All` ignores the gate (a single table's bare recover).
+        assert_eq!(recover_under(&CommittedTxns::All), 2);
     }
 }
