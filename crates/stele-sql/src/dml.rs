@@ -390,7 +390,11 @@ pub enum DmlError {
 /// otherwise a [`DmlError`] variant naming the unknown table / column,
 /// unsupported shape, or bad literal.
 pub fn bind_dml(stmt: &Statement, ctx: &BindContext) -> Result<BoundDml, DmlError> {
-    match &stmt.body {
+    // An admin command (CHECKPOINT / FLUSH) has no SQL body, so it is "not DML".
+    let Some(body) = stmt.sql() else {
+        return Err(DmlError::NotDml);
+    };
+    match body {
         SqlStatement::Insert(insert) => bind_insert(insert, ctx),
         SqlStatement::Update(update) => bind_update(update, ctx),
         SqlStatement::Delete(delete) => bind_delete(delete, ctx),

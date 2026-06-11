@@ -501,7 +501,9 @@ enum TxnControl<'a> {
 /// Classify a statement as transaction control, or `None` for anything the engine
 /// routes.
 fn txn_control(stmt: &Statement) -> Option<TxnControl<'_>> {
-    match &stmt.body {
+    // An admin command (CHECKPOINT / FLUSH) has no SQL body and is not txn
+    // control — `sql()` is `None`, so it falls through to the engine route.
+    match stmt.sql()? {
         SqlStatement::StartTransaction { .. } => Some(TxnControl::Begin),
         SqlStatement::Commit { .. } => Some(TxnControl::Commit),
         SqlStatement::Rollback {
@@ -1436,7 +1438,7 @@ const fn sqlstate_for(err: &EngineError) -> &'static str {
 /// routing tickets add; only deliberately-specified constants — integer literals
 /// and the portable `hash` key ([`hash_key`]) — are answered here.
 fn constant_select(stmt: &Statement) -> Option<Vec<ResultColumn>> {
-    let SqlStatement::Query(query) = &stmt.body else {
+    let Some(SqlStatement::Query(query)) = stmt.sql() else {
         return None;
     };
     let SetExpr::Select(select) = query.body.as_ref() else {
@@ -1647,7 +1649,7 @@ struct ExecError {
 fn returns_rows(stmt: &Statement) -> bool {
     pg_catalog::classify(stmt).is_some()
         || constant_select(stmt).is_some()
-        || matches!(stmt.body, SqlStatement::Query(_))
+        || matches!(stmt.sql(), Some(SqlStatement::Query(_)))
 }
 
 /// Parse a prepared-statement query string into its single [`Statement`], or

@@ -637,7 +637,10 @@ pub enum AsOfError {
 /// no valid axis, or the table is unknown / not live (including the
 /// [before-history](SelectError::BeforeHistory) case) at the resolved snapshot.
 pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, SelectError> {
-    let select = single_select(&stmt.body)?;
+    // An admin command (CHECKPOINT / FLUSH) has no SQL body, so it is "not a
+    // SELECT" — the binder cleanly defers it to the engine's admin route.
+    let body = stmt.sql().ok_or(SelectError::NotSelect)?;
+    let select = single_select(body)?;
     // A two-table `JOIN` binds to a wholly different shape (two sides, a join
     // condition, a combined header), so it is routed before the single-table path.
     if let Some(join) = detect_join(select)? {

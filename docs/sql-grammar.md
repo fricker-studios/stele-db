@@ -236,7 +236,9 @@ deliberate later additions.
 
 ```text
 Statement
-├── body: sqlparser::ast::Statement     // standard SQL, clauses stripped
+├── body: StatementBody
+│   ├── Sql(sqlparser::ast::Statement)   // standard SQL, clauses stripped
+│   └── Admin(AdminCommand)              // CHECKPOINT | FLUSH — no sqlparser grammar
 └── temporal: Temporal
     ├── system_versioning: bool         // WITH SYSTEM VERSIONING
     ├── valid_time: Option<ValidTimePeriod>   // VALID TIME (from, to)
@@ -250,7 +252,23 @@ Statement
 ```
 
 A statement with no temporal grammar carries `Temporal::default()` (all empty);
-`Statement::is_temporal()` reports the difference.
+`Statement::is_temporal()` reports the difference. `Statement::sql()` returns the
+standard-SQL body, or `None` for an admin command — the seam the binders and the
+wire layer read so an admin command cleanly classifies as "none of the SQL routes".
+
+## Admin commands (STL-219)
+
+Operator-facing storage durability commands. `sqlparser` has no grammar for them,
+so they are recognized at the token level — the same lift the temporal clauses use
+— and represented as a `StatementBody::Admin` body rather than a `sqlparser` node.
+Both take no arguments; a trailing token is an error. The engine routes each to the
+matching session-wide durability operation and replies with the command's own
+`CommandComplete` tag.
+
+| Command | Engine op | Effect |
+|---|---|---|
+| `CHECKPOINT` | `SessionEngine::checkpoint` | Lightweight WAL fence over every table — fsync + record the fence, no seal. |
+| `FLUSH` | `SessionEngine::flush` | Seal every table's delta into a segment and advance its replay floor (bounded recovery — STL-177 / STL-195). |
 
 ## Not yet supported (deferred)
 

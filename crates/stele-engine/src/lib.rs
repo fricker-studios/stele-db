@@ -74,7 +74,9 @@ use stele_sql::select::{
     AggregateFunc, BoundAggregate, BoundJoin, BoundPeriod, BoundPeriodPredicate, BoundPredicate,
     BoundSelect, JoinColumnRef, JoinType, OutputItem, PeriodEndpoint, Projection, SelectError,
 };
-use stele_sql::{BindContext, BindError, Statement, bind_ddl, bind_dml, bind_select};
+use stele_sql::{
+    AdminCommand, BindContext, BindError, Statement, StatementBody, bind_ddl, bind_dml, bind_select,
+};
 use stele_storage::backend::Disk;
 use stele_storage::delta::{BusinessKey, Snapshot};
 use stele_storage::dml::DmlOutcome;
@@ -893,13 +895,19 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// The shared statement router, resolving **reads** — a `SELECT`, and the
     /// table/literal binding of an auto-committed DML — at `read_snapshot`. DDL
     /// always takes effect at the commit clock's next instant, independent of the
-    /// read snapshot. Routes by binding, in order: DDL, then `SELECT`, then
-    /// `INSERT` / `UPDATE` / `DELETE`.
+    /// read snapshot. Routes, in order: an admin command, then by binding DDL,
+    /// then `SELECT`, then `INSERT` / `UPDATE` / `DELETE`.
     fn execute_at(
         &mut self,
         stmt: &Statement,
         read_snapshot: SystemTimeMicros,
     ) -> Result<StatementOutcome, EngineError> {
+        // Admin commands (CHECKPOINT / FLUSH) have no SQL body, so they are routed
+        // before the binders, which all assume one ([STL-219]).
+        if let StatementBody::Admin(cmd) = &stmt.body {
+            return self.apply_admin(*cmd);
+        }
+
         // DDL first: `bind_ddl` cleanly rejects non-DDL with `NotDdl`, which we
         // treat as "try the next router".
         match bind_ddl(stmt) {
@@ -1060,6 +1068,34 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 })
             }
         }
+    }
+
+    /// Apply an operator-facing admin command ([STL-219]): drive the matching
+    /// session-wide durability operation over every resident table, and report it
+    /// with the command's `CommandComplete` tag.
+    ///
+    /// `CHECKPOINT` → [`checkpoint`](Self::checkpoint) (the lightweight WAL fence);
+    /// `FLUSH` → [`flush`](Self::flush) (seal each delta into a segment + bound
+    /// recovery). The outcome reuses [`StatementOutcome::Ddl`] purely to carry the
+    /// static tag the wire layer renders — no catalog change happens.
+    ///
+    /// [STL-219]: https://allegromusic.atlassian.net/browse/STL-219
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Storage`] if a table's checkpoint or flush fails.
+    fn apply_admin(&mut self, cmd: AdminCommand) -> Result<StatementOutcome, EngineError> {
+        let tag = match cmd {
+            AdminCommand::Checkpoint => {
+                self.checkpoint()?;
+                "CHECKPOINT"
+            }
+            AdminCommand::Flush => {
+                self.flush()?;
+                "FLUSH"
+            }
+        };
+        Ok(StatementOutcome::Ddl { tag })
     }
 
     /// Open a fresh storage tier on the next namespace, advancing the namespace
@@ -5088,6 +5124,45 @@ mod tests {
         assert!(
             st.engine.replay_floor() > LogOffset::ZERO,
             "and its recovery floor advanced off the origin",
+        );
+    }
+
+    #[test]
+    fn execute_routes_checkpoint_and_flush_admin_commands() {
+        // STL-219: the SQL admin commands route through `execute` to the same
+        // session-wide durability ops, returning the wire `CommandComplete` tag.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+
+        // CHECKPOINT fences without sealing.
+        let outcome = engine
+            .execute(&parse_one("CHECKPOINT"))
+            .expect("checkpoint");
+        assert_eq!(outcome, StatementOutcome::Ddl { tag: "CHECKPOINT" });
+        let st = engine.tables.get("account").expect("tier resident");
+        assert!(
+            st.engine.durable_fence().is_some(),
+            "CHECKPOINT fenced the WAL"
+        );
+        assert!(
+            st.engine.segment_names().is_empty(),
+            "CHECKPOINT seals no segment",
+        );
+
+        // FLUSH seals the delta into a segment and advances the recovery floor.
+        let outcome = engine.execute(&parse_one("FLUSH")).expect("flush");
+        assert_eq!(outcome, StatementOutcome::Ddl { tag: "FLUSH" });
+        let st = engine.tables.get("account").expect("tier resident");
+        assert!(
+            !st.engine.segment_names().is_empty(),
+            "FLUSH sealed a segment",
+        );
+        assert!(
+            st.engine.replay_floor() > LogOffset::ZERO,
+            "FLUSH advanced the recovery floor off the origin",
         );
     }
 

@@ -16,21 +16,79 @@ use stele_common::period::PeriodPredicate;
 /// One parsed top-level SQL statement.
 #[derive(Debug, Clone)]
 pub struct Statement {
-    /// The underlying `sqlparser-rs` statement. Stele's non-standard temporal
-    /// clauses have been stripped from the token stream before this was parsed,
-    /// so it is always a clean, standard-SQL AST.
-    pub body: SqlStatement,
+    /// The statement body — standard SQL, or a Stele admin command that has no
+    /// `sqlparser` grammar. See [`StatementBody`].
+    pub body: StatementBody,
     /// Temporal grammar captured from the clauses that were stripped — including
     /// every `FOR { SYSTEM_TIME | VALID_TIME } AS OF` qualifier, lifted off the
-    /// token stream with its time dimension for the binder to act on. `body`
-    /// itself is always clean standard SQL with no version qualifier.
+    /// token stream with its time dimension for the binder to act on. The SQL
+    /// `body` itself is always clean standard SQL with no version qualifier; an
+    /// admin command carries the [`Default`] (empty) temporal.
     pub temporal: Temporal,
+}
+
+/// The body of a parsed [`Statement`].
+///
+/// Almost every statement is standard SQL parsed by `sqlparser`. The exception is
+/// a Stele **admin command** (`CHECKPOINT` / `FLUSH`): `sqlparser` has no grammar
+/// for it, so it is recognized at the token level — the same lift discipline the
+/// temporal clauses use — and represented here as its own variant rather than a
+/// `sqlparser` AST node ([STL-219]).
+///
+/// [STL-219]: https://allegromusic.atlassian.net/browse/STL-219
+#[derive(Debug, Clone)]
+pub enum StatementBody {
+    /// A standard-SQL statement. Stele's non-standard temporal clauses have been
+    /// stripped from the token stream before this was parsed, so it is always a
+    /// clean, standard-SQL AST.
+    Sql(SqlStatement),
+    /// A Stele admin command lifted off the token stream before `sqlparser`.
+    Admin(AdminCommand),
+}
+
+/// An operator-facing storage durability command, triggered over the wire.
+///
+/// Recognized at the token level (no `sqlparser` grammar) and routed by the
+/// engine to the matching `SessionEngine` durability operation ([STL-219]).
+///
+/// [STL-219]: https://allegromusic.atlassian.net/browse/STL-219
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminCommand {
+    /// `CHECKPOINT` — the lightweight durability fence: fsync every table's WAL
+    /// and record its fence, without sealing the delta. Maps to
+    /// `SessionEngine::checkpoint`.
+    Checkpoint,
+    /// `FLUSH` — seal every table's delta into a segment and advance its replay
+    /// floor, bounding recovery. Maps to `SessionEngine::flush`.
+    Flush,
 }
 
 impl Statement {
     /// Whether this statement carried any Stele temporal grammar.
     pub fn is_temporal(&self) -> bool {
         self.temporal != Temporal::default()
+    }
+
+    /// The standard-SQL body, or `None` if this is an admin command
+    /// ([`StatementBody::Admin`]) with no `sqlparser` AST. The binders and the
+    /// wire layer's statement-shape checks read the body through this, so an admin
+    /// command cleanly classifies as "none of the SQL routes".
+    #[must_use]
+    pub const fn sql(&self) -> Option<&SqlStatement> {
+        match &self.body {
+            StatementBody::Sql(body) => Some(body),
+            StatementBody::Admin(_) => None,
+        }
+    }
+
+    /// The standard-SQL body for an in-place rewrite (extended-protocol parameter
+    /// substitution), or `None` for an admin command.
+    #[must_use]
+    pub fn sql_mut(&mut self) -> Option<&mut SqlStatement> {
+        match &mut self.body {
+            StatementBody::Sql(body) => Some(body),
+            StatementBody::Admin(_) => None,
+        }
     }
 }
 
