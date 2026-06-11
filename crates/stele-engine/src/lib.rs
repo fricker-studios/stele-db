@@ -1441,14 +1441,15 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .and_then(|r| column_cell(&out.batch, ColumnId::Payload, r));
         // A valid-time row's payload still carries the framed interval prefix here
         // (this scan does not pin the valid axis); strip it to the bare user
-        // payload the row codec expects.
-        let bare = match &payload {
+        // payload the row codec expects. Consume `payload` so the system-only arm
+        // hands its bytes straight back without a move-out-of-borrow.
+        let bare = match payload {
             Some(stored) if state.valid_time => {
-                let (_interval, user) = unframe_payload(true, stored)
+                let (_interval, user) = unframe_payload(true, &stored)
                     .map_err(|e| EngineError::Scan(ScanError::ValidTime(e)))?;
                 Some(user.to_vec())
             }
-            _ => payload,
+            other => other,
         };
         Ok(row_codec::decode_payload(value_count, bare.as_deref())?)
     }
