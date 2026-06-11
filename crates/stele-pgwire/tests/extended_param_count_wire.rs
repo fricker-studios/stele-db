@@ -13,6 +13,7 @@
 //! * the same statement bound with zero parameters still binds and executes.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -133,17 +134,24 @@ async fn read_frame(stream: &mut TcpStream) -> Frame {
     }
 }
 
-/// Drain frames up to and including the next `ReadyForQuery` ('Z').
+/// Drain frames up to and including the next `ReadyForQuery` ('Z'), bounded by a
+/// timeout so a server that never replies (or replies with an unexpected sequence)
+/// fails the test fast instead of hanging CI.
 async fn drain_until_ready(stream: &mut TcpStream) -> Vec<Frame> {
-    let mut frames = Vec::new();
-    loop {
-        let f = read_frame(stream).await;
-        let done = f.kind == b'Z';
-        frames.push(f);
-        if done {
-            return frames;
+    let drain = async {
+        let mut frames = Vec::new();
+        loop {
+            let f = read_frame(stream).await;
+            let done = f.kind == b'Z';
+            frames.push(f);
+            if done {
+                return frames;
+            }
         }
-    }
+    };
+    tokio::time::timeout(Duration::from_secs(10), drain)
+        .await
+        .expect("server replies with ReadyForQuery within the timeout")
 }
 
 /// The `SQLSTATE` ('C' field) carried by an `ErrorResponse` payload, if present.

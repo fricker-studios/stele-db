@@ -354,122 +354,215 @@ fn parse_bool(text: &str) -> Option<bool> {
 // Placeholder substitution
 // ---------------------------------------------------------------------------
 
-/// Substitute bound parameter values into a parsed statement's `$1 … $n`
-/// placeholders, returning the rewritten [`Statement`] together with the number of
-/// `$n` parameters it **requires** — the highest placeholder index reached.
-///
-/// Only the expression positions the engine reads are visited — `INSERT … VALUES`
-/// rows, `UPDATE … SET` values and `WHERE`, `DELETE … WHERE`, and a `SELECT`'s
-/// projection + `WHERE`. An admin command (`CHECKPOINT` / `FLUSH`) has no SQL body
-/// and so requires zero. The caller compares the required count against the number
-/// of supplied parameters and rejects a mismatch as a protocol violation, the way
-/// Postgres does ([STL-222]) — surplus parameters were silently dropped before.
-///
-/// A placeholder the walk does not reach is left in place: it is not counted, so a
-/// supplied value for it makes the counts disagree (rejected by the caller), and a
-/// `$k` past the supplied parameters likewise fails the count check rather than
-/// folding to a silently-wrong literal.
+/// The number of `$n` parameters a prepared statement **requires**: the highest
+/// placeholder index reached in the expression positions the engine reads — the
+/// same positions [`substitute`] fills (`INSERT … VALUES` rows, `UPDATE … SET`
+/// values and `WHERE`, `DELETE … WHERE`, and a `SELECT`'s projection + `WHERE`).
+/// This mirrors how Postgres derives a prepared statement's parameter count from
+/// its parse tree, so the `Bind` handler can reject a disagreeing supplied count as
+/// a protocol violation *before* decoding any parameter value ([STL-222]). An admin
+/// command (`CHECKPOINT` / `FLUSH`) has no SQL body, and a placeholder-free
+/// statement reaches no placeholder, so both require zero.
 ///
 /// [STL-222]: https://allegromusic.atlassian.net/browse/STL-222
-pub(crate) fn substitute(stmt: &Statement, params: &[Value]) -> (Statement, usize) {
-    let mut out = stmt.clone();
+pub(crate) fn placeholder_count(stmt: &Statement) -> usize {
     let mut required = 0;
-    if let Some(body) = out.sql_mut() {
-        walk_statement(body, params, &mut required);
+    if let Some(body) = stmt.sql() {
+        count_statement(body, &mut required);
     }
-    (out, required)
+    required
 }
 
-fn walk_statement(stmt: &mut SqlStatement, params: &[Value], required: &mut usize) {
+fn count_statement(stmt: &SqlStatement, required: &mut usize) {
     match stmt {
-        SqlStatement::Query(query) => walk_query(query, params, required),
+        SqlStatement::Query(query) => count_query(query, required),
         SqlStatement::Insert(insert) => {
-            if let Some(source) = insert.source.as_deref_mut() {
-                walk_query(source, params, required);
+            if let Some(source) = insert.source.as_deref() {
+                count_query(source, required);
             }
         }
         SqlStatement::Update(update) => {
-            for assignment in &mut update.assignments {
-                walk_expr(&mut assignment.value, params, required);
+            for assignment in &update.assignments {
+                count_expr(&assignment.value, required);
             }
-            if let Some(selection) = &mut update.selection {
-                walk_expr(selection, params, required);
+            if let Some(selection) = &update.selection {
+                count_expr(selection, required);
             }
         }
         SqlStatement::Delete(delete) => {
-            if let Some(selection) = &mut delete.selection {
-                walk_expr(selection, params, required);
+            if let Some(selection) = &delete.selection {
+                count_expr(selection, required);
             }
         }
         _ => {}
     }
 }
 
-fn walk_query(query: &mut Query, params: &[Value], required: &mut usize) {
-    walk_set_expr(&mut query.body, params, required);
+fn count_query(query: &Query, required: &mut usize) {
+    count_set_expr(&query.body, required);
 }
 
-fn walk_set_expr(set: &mut SetExpr, params: &[Value], required: &mut usize) {
+fn count_set_expr(set: &SetExpr, required: &mut usize) {
+    match set {
+        SetExpr::Select(select) => {
+            for item in &select.projection {
+                match item {
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                        count_expr(expr, required);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(selection) = &select.selection {
+                count_expr(selection, required);
+            }
+        }
+        SetExpr::Values(values) => {
+            for row in &values.rows {
+                for expr in &row.content {
+                    count_expr(expr, required);
+                }
+            }
+        }
+        SetExpr::Query(inner) => count_query(inner, required),
+        _ => {}
+    }
+}
+
+fn count_expr(expr: &Expr, required: &mut usize) {
+    match expr {
+        Expr::Value(vws) => {
+            if let Value::Placeholder(name) = &vws.value {
+                if let Some(index) = placeholder_index(name) {
+                    *required = (*required).max(index);
+                }
+            }
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => count_expr(expr, required),
+        Expr::BinaryOp { left, right, .. } => {
+            count_expr(left, required);
+            count_expr(right, required);
+        }
+        Expr::InList { expr, list, .. } => {
+            count_expr(expr, required);
+            for item in list {
+                count_expr(item, required);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            count_expr(expr, required);
+            count_expr(low, required);
+            count_expr(high, required);
+        }
+        _ => {}
+    }
+}
+
+/// Substitute bound parameter values into a parsed statement's `$1 … $n`
+/// placeholders, returning a fresh [`Statement`] ready to bind + execute.
+///
+/// Only the expression positions [`placeholder_count`] counts are visited. The
+/// caller checks the supplied count against [`placeholder_count`] first, so every
+/// reachable placeholder has a value by the time we get here; a placeholder the
+/// walk does not reach is left in place and surfaces as a binder error rather than
+/// a silently-wrong literal.
+pub(crate) fn substitute(stmt: &Statement, params: &[Value]) -> Statement {
+    let mut out = stmt.clone();
+    // An admin command (CHECKPOINT / FLUSH) has no SQL body and no placeholders,
+    // so there is nothing to substitute — `sql_mut()` is `None`.
+    if let Some(body) = out.sql_mut() {
+        walk_statement(body, params);
+    }
+    out
+}
+
+fn walk_statement(stmt: &mut SqlStatement, params: &[Value]) {
+    match stmt {
+        SqlStatement::Query(query) => walk_query(query, params),
+        SqlStatement::Insert(insert) => {
+            if let Some(source) = insert.source.as_deref_mut() {
+                walk_query(source, params);
+            }
+        }
+        SqlStatement::Update(update) => {
+            for assignment in &mut update.assignments {
+                walk_expr(&mut assignment.value, params);
+            }
+            if let Some(selection) = &mut update.selection {
+                walk_expr(selection, params);
+            }
+        }
+        SqlStatement::Delete(delete) => {
+            if let Some(selection) = &mut delete.selection {
+                walk_expr(selection, params);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn walk_query(query: &mut Query, params: &[Value]) {
+    walk_set_expr(&mut query.body, params);
+}
+
+fn walk_set_expr(set: &mut SetExpr, params: &[Value]) {
     match set {
         SetExpr::Select(select) => {
             for item in &mut select.projection {
                 match item {
                     SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        walk_expr(expr, params, required);
+                        walk_expr(expr, params);
                     }
                     _ => {}
                 }
             }
             if let Some(selection) = &mut select.selection {
-                walk_expr(selection, params, required);
+                walk_expr(selection, params);
             }
         }
         SetExpr::Values(values) => {
             for row in &mut values.rows {
                 for expr in &mut row.content {
-                    walk_expr(expr, params, required);
+                    walk_expr(expr, params);
                 }
             }
         }
-        SetExpr::Query(inner) => walk_query(inner, params, required),
+        SetExpr::Query(inner) => walk_query(inner, params),
         _ => {}
     }
 }
 
-fn walk_expr(expr: &mut Expr, params: &[Value], required: &mut usize) {
+fn walk_expr(expr: &mut Expr, params: &[Value]) {
     match expr {
         Expr::Value(vws) => {
             if let Value::Placeholder(name) = &vws.value {
                 if let Some(index) = placeholder_index(name) {
-                    // Track the highest placeholder index so the caller can check
-                    // the supplied parameter count against what the statement needs.
-                    *required = (*required).max(index);
-                    // Keep the placeholder's span; only its value changes. An
-                    // unsupplied index is left as a placeholder — the count check
-                    // rejects it before it can reach the binder.
+                    // Keep the placeholder's span; only its value changes.
                     if let Some(value) = params.get(index - 1) {
                         vws.value = value.clone();
                     }
                 }
             }
         }
-        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => walk_expr(expr, params, required),
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => walk_expr(expr, params),
         Expr::BinaryOp { left, right, .. } => {
-            walk_expr(left, params, required);
-            walk_expr(right, params, required);
+            walk_expr(left, params);
+            walk_expr(right, params);
         }
         Expr::InList { expr, list, .. } => {
-            walk_expr(expr, params, required);
+            walk_expr(expr, params);
             for item in list {
-                walk_expr(item, params, required);
+                walk_expr(item, params);
             }
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            walk_expr(expr, params, required);
-            walk_expr(low, params, required);
-            walk_expr(high, params, required);
+            walk_expr(expr, params);
+            walk_expr(low, params);
+            walk_expr(high, params);
         }
         _ => {}
     }
@@ -695,8 +788,7 @@ mod tests {
     fn substitute_fills_insert_values() {
         let stmt = parse_one("INSERT INTO account VALUES ($1, $2)");
         let params = vec![Value::Number("1".to_owned(), false), Value::Null];
-        let (bound, required) = substitute(&stmt, &params);
-        assert_eq!(required, 2);
+        let bound = substitute(&stmt, &params);
         let Some(SqlStatement::Insert(insert)) = bound.sql() else {
             panic!("insert");
         };
@@ -716,8 +808,7 @@ mod tests {
             Value::Number("250".to_owned(), false),
             Value::Number("1".to_owned(), false),
         ];
-        let (bound, required) = substitute(&stmt, &params);
-        assert_eq!(required, 2);
+        let bound = substitute(&stmt, &params);
         let Some(SqlStatement::Update(update)) = bound.sql() else {
             panic!("update");
         };
@@ -732,31 +823,44 @@ mod tests {
     }
 
     #[test]
-    fn substitute_reports_the_required_placeholder_count() {
-        // The required count is the highest `$n` index, independent of how many
-        // values are supplied — the Bind handler compares the two.
-        let two = parse_one("INSERT INTO account VALUES ($1, $2)");
-        // A statement with no placeholders requires zero, so a non-empty Bind
-        // would be rejected by the caller.
-        let zero = parse_one("SELECT 1");
+    fn placeholder_count_is_the_highest_index_reached() {
+        // The required count is the highest `$n` index in the positions the engine
+        // reads — the Bind handler checks the supplied count against it.
+        assert_eq!(
+            placeholder_count(&parse_one("INSERT INTO account VALUES ($1, $2)")),
+            2
+        );
+        assert_eq!(
+            placeholder_count(&parse_one("UPDATE account SET balance = $1 WHERE id = $2")),
+            2
+        );
+        // A placeholder-free statement requires zero, so a non-empty Bind of it is
+        // rejected by the caller.
+        assert_eq!(placeholder_count(&parse_one("SELECT 1")), 0);
         // A repeated placeholder still requires only its single value; a gap is
         // counted to the highest index, matching Postgres's parameter numbering.
-        let repeat = parse_one("INSERT INTO account VALUES ($1, $1)");
-        let gap = parse_one("INSERT INTO account VALUES ($1, $3)");
-        assert_eq!(substitute(&two, &[]).1, 2);
-        assert_eq!(substitute(&zero, &[]).1, 0);
-        assert_eq!(substitute(&repeat, &[]).1, 1);
-        assert_eq!(substitute(&gap, &[]).1, 3);
+        assert_eq!(
+            placeholder_count(&parse_one("INSERT INTO account VALUES ($1, $1)")),
+            1
+        );
+        assert_eq!(
+            placeholder_count(&parse_one("INSERT INTO account VALUES ($1, $3)")),
+            3
+        );
+    }
 
-        // A partial Bind leaves the unsupplied placeholder in place rather than
-        // folding a wrong literal; the caller's count check is what rejects it.
-        let (bound, required) = substitute(&two, &[Value::Number("1".to_owned(), false)]);
-        assert_eq!(required, 2);
+    #[test]
+    fn substitute_leaves_an_unsupplied_placeholder_in_place() {
+        // `substitute` runs only after the caller's count check, but if it is ever
+        // handed too few values it leaves the placeholder rather than folding a
+        // wrong literal (it surfaces as a binder error, never a silent miswrite).
+        let stmt = parse_one("INSERT INTO account VALUES ($1, $2)");
+        let bound = substitute(&stmt, &[Value::Number("1".to_owned(), false)]);
         let Some(SqlStatement::Insert(insert)) = bound.sql() else {
             panic!("insert");
         };
-        let row = &insert.source.as_deref().expect("source");
-        let SetExpr::Values(values) = row.body.as_ref() else {
+        let SetExpr::Values(values) = insert.source.as_deref().expect("source").body.as_ref()
+        else {
             panic!("values");
         };
         let cells = &values.rows[0].content;
