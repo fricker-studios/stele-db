@@ -66,6 +66,19 @@ pub enum WalError {
 
     #[error("i/o error: {0}")]
     Io(#[from] io::Error),
+
+    /// The WAL is **poisoned**: a prior fsync ([`tick`](Wal::tick) or the
+    /// segment-boundary sync in rotation) failed, so its staged record's
+    /// durability is indeterminate. Per the WAL contract (invariant 2) a failed
+    /// fsync is a crash, not a clean abort — every subsequent
+    /// [`append`](Wal::append) / [`tick`](Wal::tick) refuses with this error so a
+    /// later successful `tick` can never flush the staged record under the guise
+    /// of an aborted op ([STL-217]). The engine must stop and restart into
+    /// recovery, which opens a fresh, unpoisoned WAL.
+    ///
+    /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
+    #[error("WAL is poisoned: a prior fsync failed; the engine must recover")]
+    Poisoned,
 }
 
 /// The WAL handle. Cheap to clone — internal state is shared.
@@ -96,6 +109,13 @@ pub(super) struct Inner<D: Disk> {
     /// every waiter whose target is now durable (the *order* of waking is
     /// unspecified — `swap_remove` is used internally).
     waiters: Vec<Waiter>,
+    /// Set once an fsync fails inside [`drain_tick`] or [`rotate`]. A failed
+    /// fsync leaves the just-appended record *staged* but of indeterminate
+    /// durability, so the WAL refuses every further [`append`](Wal::append) /
+    /// [`tick`](Wal::tick) ([`WalError::Poisoned`]) rather than let a later
+    /// successful `tick` flush it ([STL-217]). Reads (replay) stay available so
+    /// recovery can run; recovery opens a fresh WAL, which starts unpoisoned.
+    poisoned: bool,
 }
 
 /// One distinct `LogOffset` target shared by 1..N pending `Commit` futures.
@@ -135,6 +155,7 @@ impl<D: Disk> Wal<D> {
                 staged_end: end,
                 durable_end: end,
                 waiters: Vec::new(),
+                poisoned: false,
             })),
         })
     }
@@ -145,6 +166,15 @@ impl<D: Disk> Wal<D> {
     /// The record is visible to subsequent reads on the same `Disk`
     /// immediately, but is not durable until an fsync covers it (via either
     /// [`tick`](Self::tick) or the segment-boundary sync inside rotation).
+    ///
+    /// # Errors
+    ///
+    /// [`WalError::PayloadTooLarge`] if `payload` exceeds the record limit;
+    /// [`WalError::Poisoned`] if a prior fsync failed (the WAL refuses further
+    /// writes until recovery, [STL-217]); [`WalError::Io`] on a backing write
+    /// failure.
+    ///
+    /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
     pub fn append(&self, payload: &[u8]) -> Result<LogOffset, WalError> {
         if payload.len() > MAX_PAYLOAD_LEN as usize {
             return Err(WalError::PayloadTooLarge(payload.len()));
@@ -154,6 +184,12 @@ impl<D: Disk> Wal<D> {
         let mut rotation_wakers = Vec::new();
         let result = {
             let mut g = self.inner.lock().expect("wal mutex poisoned");
+
+            // A poisoned WAL (a prior fsync failed) refuses every write, so a
+            // later `tick` can never flush a staged record as a clean op ([STL-217]).
+            if g.poisoned {
+                return Err(WalError::Poisoned);
+            }
 
             // Rotate if appending this record would overflow the current
             // segment. A record is never split across segments.
@@ -196,6 +232,15 @@ impl<D: Disk> Wal<D> {
     /// covered.
     ///
     /// Returns the number of commit waiters woken.
+    ///
+    /// # Errors
+    ///
+    /// [`WalError::Poisoned`] if a prior fsync already failed. If *this* fsync
+    /// fails, the WAL is poisoned (so the staged record can never be flushed by a
+    /// later `tick`) and the underlying [`WalError::Io`] is returned — the caller
+    /// must treat it as a crash and recover, not as a clean abort ([STL-217]).
+    ///
+    /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
     pub fn tick(&self) -> Result<usize, WalError> {
         // Collect ready wakers under the lock, then drop the guard before waking
         // them — waking a waker may re-acquire the same mutex (the woken task
@@ -223,6 +268,16 @@ impl<D: Disk> Wal<D> {
     pub fn durable_end(&self) -> LogOffset {
         self.inner.lock().expect("wal mutex poisoned").durable_end
     }
+
+    /// Whether the WAL is **poisoned** — a prior fsync ([`tick`](Self::tick) or
+    /// the segment-boundary sync in rotation) failed, so every further
+    /// [`append`](Self::append) / [`tick`](Self::tick) is refused with
+    /// [`WalError::Poisoned`] until the engine restarts into recovery ([STL-217]).
+    ///
+    /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
+    pub fn is_poisoned(&self) -> bool {
+        self.inner.lock().expect("wal mutex poisoned").poisoned
+    }
 }
 
 // The whole drain needs to happen under the lock — every loop iteration both
@@ -231,7 +286,18 @@ impl<D: Disk> Wal<D> {
 #[allow(clippy::significant_drop_tightening)]
 fn drain_tick<D: Disk>(inner: &Mutex<Inner<D>>) -> Result<Vec<Waker>, WalError> {
     let mut g = inner.lock().expect("wal mutex poisoned");
-    g.current.sync()?;
+    if g.poisoned {
+        return Err(WalError::Poisoned);
+    }
+    // A failed fsync leaves the staged tail of indeterminate durability — poison
+    // the WAL *before* surfacing the error so no later `tick` advances
+    // `durable_end` past it (which would flush the staged record under the guise
+    // of an aborted op, [STL-217]). The first failure still returns the concrete
+    // I/O error; subsequent calls get `WalError::Poisoned`.
+    if let Err(e) = g.current.sync() {
+        g.poisoned = true;
+        return Err(WalError::Io(e));
+    }
     g.durable_end = g.staged_end;
     Ok(drain_waiters(&mut g))
 }
@@ -261,7 +327,15 @@ fn rotate<D: Disk>(g: &mut Inner<D>, wakers: &mut Vec<Waker>) -> Result<(), WalE
     // failed, we'd leave an orphan empty segment with a higher index — a later
     // `Wal::open` would pick that index as the head and silently skip past the
     // closing segment's unsynced tail, breaking recovery.
-    g.current.sync()?;
+    //
+    // A failed boundary fsync is the same crash the group-commit `tick` faces:
+    // poison the WAL so no further write proceeds ([STL-217]). Poison before
+    // returning, so the staged-but-unsynced closing segment is never advanced
+    // past by a later `tick`.
+    if let Err(e) = g.current.sync() {
+        g.poisoned = true;
+        return Err(WalError::Io(e));
+    }
     let new_idx = g.current_segment_index + 1;
     let new_file = g.disk.create(&segment::name_for(new_idx))?;
 
@@ -306,6 +380,13 @@ impl<D: Disk> Future for Commit<D> {
         let mut g = me.inner.lock().expect("wal mutex poisoned");
         if me.target <= g.durable_end {
             return Poll::Ready(Ok(()));
+        }
+        // A poisoned WAL will never advance `durable_end` again, so a record not
+        // already durable can never become durable on this instance — resolve the
+        // wait with an error rather than parking forever ([STL-217]). A record
+        // *already* past the fence resolved `Ok` above, even after poison.
+        if g.poisoned {
+            return Poll::Ready(Err(WalError::Poisoned));
         }
         // Park ourselves. Multiple `Commit` futures may share the same
         // `target` (e.g. two consumers awaiting the same boundary); we store
@@ -363,4 +444,134 @@ pub(crate) fn segment_len<D: Disk>(inner: &Mutex<Inner<D>>, segment_index: u64) 
 pub(crate) fn known_segments<D: Disk>(inner: &Mutex<Inner<D>>) -> io::Result<Vec<u64>> {
     let g = inner.lock().expect("wal mutex poisoned");
     list_segments(&g.disk)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::pin;
+    use std::task::{Context, Waker};
+
+    use super::*;
+    use crate::backend::{FaultOp, Faults, MemDisk};
+
+    /// A failed group-commit fsync poisons the WAL: the staged record is **not**
+    /// flushed by a later `tick` (the durability hazard [STL-217] closes), and
+    /// every further write is refused. The first failure surfaces the concrete
+    /// I/O error; subsequent calls report [`WalError::Poisoned`].
+    #[test]
+    fn a_failed_fsync_poisons_and_refuses_further_writes() {
+        let faults = Faults::new();
+        // Exactly the *next* sync fails — the group-commit `tick` below.
+        faults.schedule(FaultOp::Sync, io::ErrorKind::Other);
+        let wal = Wal::open(MemDisk::with_faults(faults), WalConfig::default()).expect("open");
+
+        let staged = wal
+            .append(b"committed-but-unsynced")
+            .expect("append stages");
+        assert!(
+            staged > LogOffset::ZERO,
+            "the record is staged past the origin"
+        );
+
+        // The fsync fails: the first failure is the concrete I/O error, and the WAL
+        // is now poisoned with nothing made durable.
+        let err = wal
+            .tick()
+            .expect_err("the injected fsync fault fails the tick");
+        assert!(
+            matches!(err, WalError::Io(_)),
+            "first failure is the io error"
+        );
+        assert!(wal.is_poisoned(), "a failed fsync poisons the WAL");
+        assert_eq!(wal.durable_end(), LogOffset::ZERO, "nothing became durable",);
+
+        // The crux: a *later* tick must not flush the staged record. The scheduled
+        // fault was consumed by the first sync, so without poison this second tick
+        // would succeed and advance `durable_end` past the staged record — exactly
+        // the "aborted op silently becomes durable" hazard. Poison refuses it.
+        let err = wal.tick().expect_err("a poisoned tick is refused");
+        assert!(matches!(err, WalError::Poisoned));
+        assert_eq!(
+            wal.durable_end(),
+            LogOffset::ZERO,
+            "the poisoned tick did not flush the staged record",
+        );
+
+        // Appends are refused too, so no new record stacks on the staged one.
+        let err = wal
+            .append(b"after poison")
+            .expect_err("a poisoned append is refused");
+        assert!(matches!(err, WalError::Poisoned));
+    }
+
+    /// A failed *segment-boundary* fsync (inside rotation) poisons just like the
+    /// group-commit `tick` — the same crash, a different sync site.
+    #[test]
+    fn a_failed_rotation_fsync_poisons() {
+        let faults = Faults::new();
+        faults.schedule(FaultOp::Sync, io::ErrorKind::Other);
+        // A 1-byte segment bound forces the second append to rotate first.
+        let config = WalConfig {
+            segment_size_bytes: 1,
+        };
+        let wal = Wal::open(MemDisk::with_faults(faults), config).expect("open");
+
+        // First append never rotates (the segment is empty); it just stages.
+        wal.append(b"first").expect("first append stages");
+        // Second append would overflow the 1-byte segment, so it rotates — and the
+        // closing segment's fsync hits the scheduled fault.
+        let err = wal
+            .append(b"second")
+            .expect_err("rotation fsync fails the append");
+        assert!(matches!(err, WalError::Io(_)));
+        assert!(wal.is_poisoned(), "a failed rotation fsync poisons the WAL");
+
+        let err = wal
+            .append(b"third")
+            .expect_err("a poisoned append is refused");
+        assert!(matches!(err, WalError::Poisoned));
+    }
+
+    /// A durability future for a record that never became durable resolves with an
+    /// error once the WAL is poisoned, rather than parking forever; a record already
+    /// past the durable fence still resolves `Ok` even after poison.
+    #[test]
+    fn commit_future_after_poison_errors_for_unsynced_and_ok_for_durable() {
+        let faults = Faults::new();
+        let wal =
+            Wal::open(MemDisk::with_faults(faults.clone()), WalConfig::default()).expect("open");
+
+        // One durable record establishes a fence to test the "already durable" arm.
+        let durable = wal.append(b"durable").expect("append");
+        wal.tick().expect("clean fsync");
+        assert_eq!(wal.durable_end(), durable);
+
+        // A second record is staged, then its fsync fails and poisons the WAL.
+        let staged = wal.append(b"staged").expect("append");
+        faults.schedule(FaultOp::Sync, io::ErrorKind::Other);
+        wal.tick().expect_err("the fsync fault poisons");
+        assert!(wal.is_poisoned());
+
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        // The already-durable target resolves Ok even after poison.
+        let fut = wal.commit(durable);
+        let mut fut = pin!(fut);
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(()))),
+            "a record past the fence is durable regardless of poison",
+        );
+
+        // The unsynced target can never become durable on this instance — error, not hang.
+        let fut = wal.commit(staged);
+        let mut fut = pin!(fut);
+        assert!(
+            matches!(
+                fut.as_mut().poll(&mut cx),
+                Poll::Ready(Err(WalError::Poisoned))
+            ),
+            "an unsynced record's durability wait resolves Poisoned",
+        );
+    }
 }

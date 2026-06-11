@@ -537,9 +537,12 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     ///
     /// [`EngineError::Dml`] if the append or fsync fails. A torn or unwritten append
     /// recovers to nothing; but if the append succeeds and only the fsync fails the
-    /// staged record's durability is **indeterminate** (a later `tick` may still
-    /// flush it), so that case must be treated as a crash rather than a clean abort —
-    /// see [`DmlWriter::commit_group`] and [STL-217].
+    /// staged record's durability is **indeterminate** (a later `tick` could
+    /// otherwise still flush it). That fsync failure now **poisons** the shared WAL
+    /// ([STL-217]): every subsequent write through this engine is refused
+    /// ([`is_poisoned`](Self::is_poisoned)) until the operator restarts into
+    /// [`recover`](Self::recover), so the staged record can never be flushed as a
+    /// clean op — see [`DmlWriter::commit_group`].
     pub fn commit_group(&mut self) -> Result<LogOffset, EngineError> {
         Ok(self.writer.commit_group()?)
     }
@@ -566,6 +569,21 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     /// state is rebuilt from the log on recovery, so the aborted writes do not survive.
     pub fn abort_group(&mut self) {
         self.writer.abort_group();
+    }
+
+    /// Whether the engine's WAL is **poisoned** — a prior fsync
+    /// ([`commit_group`](Self::commit_group), [`checkpoint`](Self::checkpoint), or
+    /// [`flush`](Self::flush)) failed, so its staged record's durability is
+    /// indeterminate. Per the WAL contract (invariant 2) that is a crash, not a
+    /// clean abort: every subsequent write is refused with [`WalError::Poisoned`]
+    /// until the operator restarts into [`recover`](Self::recover), which opens a
+    /// fresh, unpoisoned WAL ([STL-217]). An operator — or the session engine that
+    /// wraps a set of these tables — observing a poisoned engine must stop serving
+    /// and recover.
+    ///
+    /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
+    pub fn is_poisoned(&self) -> bool {
+        self.wal.is_poisoned()
     }
 
     /// Take a **checkpoint**: group-commit fsync the WAL, then record the new
@@ -912,5 +930,90 @@ mod tests {
         assert_eq!(segment_index_of("wal-00000000000000000000.log"), None);
         assert_eq!(segment_index_of(checkpoint::CHECKPOINT_FILENAME), None);
         assert_eq!(segment_index_of("seg-not-a-number.seg"), None);
+    }
+
+    /// A monotonic step clock — each reading is one µs past the last, so successive
+    /// writes get distinct, increasing `sys_from`s.
+    struct StepClock(std::sync::atomic::AtomicI64);
+    impl Clock for StepClock {
+        fn now(&self) -> SystemTimeMicros {
+            SystemTimeMicros(self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1)
+        }
+    }
+
+    /// A failed WAL fsync inside [`Engine::checkpoint`] poisons the engine
+    /// ([STL-217]): it then refuses every further write, and recovery from the same
+    /// disk reconstructs the committed prefix that *was* written before the failure.
+    #[test]
+    fn a_failed_fsync_poisons_the_engine_and_recovery_is_sound() {
+        use crate::backend::{FaultOp, Faults, MemDisk};
+
+        let faults = Faults::new();
+        let disk = MemDisk::with_faults(faults.clone());
+        let principal = Principal::new(b"op".to_vec());
+        let key = BusinessKey::new(b"k".to_vec());
+
+        let mut engine = Engine::open(
+            disk.clone(),
+            StepClock(std::sync::atomic::AtomicI64::new(0)),
+            false,
+        )
+        .expect("open");
+        // One auto-commit insert reaches the WAL (append-only, not yet fsynced).
+        let inserted = engine
+            .insert(
+                key.clone(),
+                None,
+                Some(b"v1".to_vec()),
+                0,
+                TxnId(1),
+                principal.clone(),
+            )
+            .expect("insert");
+
+        // The next fsync fails: the durability point of a `checkpoint`.
+        faults.schedule(FaultOp::Sync, io::ErrorKind::Other);
+        assert!(
+            engine.checkpoint().is_err(),
+            "the injected fsync fault fails the checkpoint"
+        );
+        assert!(engine.is_poisoned(), "a failed fsync poisons the engine");
+
+        // Further writes are refused at the WAL append — even though the scheduled
+        // fault was already consumed, the poison stands until recovery. (A fresh
+        // key, so resolution succeeds and the write actually reaches the log.)
+        let key2 = BusinessKey::new(b"k2".to_vec());
+        let err = engine
+            .insert(key2, None, Some(b"v2".to_vec()), 0, TxnId(2), principal)
+            .expect_err("a poisoned engine refuses writes");
+        assert!(matches!(
+            err,
+            EngineError::Dml(DmlError::Wal(WalError::Poisoned))
+        ));
+        assert!(
+            engine.checkpoint().is_err(),
+            "a poisoned checkpoint is refused"
+        );
+        drop(engine);
+
+        // Recovery opens a fresh, unpoisoned WAL and replays the log. The first
+        // insert's record was appended before the failed fsync, so the recovered
+        // engine serves it; the refused second insert never reached the log.
+        let recovered = Engine::recover(
+            disk,
+            StepClock(std::sync::atomic::AtomicI64::new(1_000_000)),
+            false,
+        )
+        .expect("recover");
+        assert!(!recovered.is_poisoned(), "recovery starts unpoisoned");
+        assert_eq!(
+            recovered
+                .as_of_payload(&key, Snapshot(inserted.commit))
+                .expect("as_of")
+                .flatten()
+                .as_deref(),
+            Some(b"v1".as_slice()),
+            "the committed-before-failure write survives recovery",
+        );
     }
 }

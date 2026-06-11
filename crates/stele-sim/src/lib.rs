@@ -1503,6 +1503,163 @@ pub fn run_group_commit_recover_faults_seed(seed: u64) -> u64 {
     digest
 }
 
+/// Drive a seeded [`Engine`] workload into a **failed WAL fsync** and assert the
+/// WAL/engine **poisons** — the [STL-217] DoD, seed-reproducibly.
+///
+/// The WAL durability contract is "append then fsync; the fsync is the only
+/// durability point." If an `append` succeeds but its fsync ([`Wal::tick`]) fails,
+/// the staged record's durability is *indeterminate* — a later successful `tick`
+/// (a [`checkpoint`](stele_storage::engine::Engine::checkpoint), `flush`, or
+/// another commit) could otherwise flush it under the guise of an aborted op. The
+/// standard response is to treat the failed fsync as a *crash*: poison the WAL so
+/// it refuses every further write until recovery.
+///
+/// This scenario isolates that path. A handful of auto-commit writes append to the
+/// WAL (append-only; not yet fsynced), then a [`checkpoint`](stele_storage::engine::Engine::checkpoint)
+/// drives the group-commit fsync through a [`FaultDisk`] whose only armed class is
+/// [`FailSync`](FaultKind::FailSync). The checkpoint's fsync fails, so the harness
+/// asserts:
+///
+/// * the engine is [`poisoned`](stele_storage::engine::Engine::is_poisoned);
+/// * a subsequent write is **refused** (the poison stops the same instance from
+///   serving — so the staged record can never be flushed by a later `tick`); and
+/// * a subsequent checkpoint is refused too.
+///
+/// Then [`FailSync`](FaultKind::FailSync) is disabled and [`Engine::recover`] opens
+/// a fresh, unpoisoned WAL and replays the durable log. Recovery's outcome is asserted
+/// **sound** via `verify_recovered_prefix`: the recovered state is a consistent
+/// committed prefix of the reference oracle (here the full timeline of confirmed
+/// writes — none was torn). The digest folds the recovered answers and the disk's
+/// seed-keyed fault-event log. Same seed ⇒ same digest.
+///
+/// # Panics
+///
+/// Panics if a failed fsync does *not* poison the engine, if a poisoned engine
+/// accepts a write or checkpoint, or if recovery returns a state that is not a
+/// consistent committed prefix of the oracle.
+#[must_use]
+pub fn run_wal_fsync_poison_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+
+    let mut rng = Rng::new(seed);
+
+    let mut oracle: BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Option<Vec<u8>>>> =
+        BTreeMap::new();
+    let mut committed: Vec<SystemTimeMicros> = Vec::new();
+
+    let key_count = 1 + rng.below_usize(5);
+    let keys: Vec<BusinessKey> = (0..key_count)
+        .map(|i| BusinessKey::new(format!("k-{i:04}").into_bytes()))
+        .collect();
+
+    // The only armed class is FailSync: the failure is *exactly* a failed fsync, so
+    // the path under test is isolated from torn writes / full disks / read rot.
+    let disk = FaultDisk::new(seed, FaultProfile::none());
+    {
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1), false).expect("open engine");
+
+        // A short prelude of auto-commit writes. These append to the WAL but do not
+        // fsync (the engine ticks only at checkpoint/flush/group-commit), so they all
+        // succeed and become the confirmed timeline the oracle records.
+        let mut live = vec![false; key_count];
+        let prelude = 1 + rng.below(6);
+        for op in 0..prelude {
+            let k = rng.below_usize(key_count);
+            let key = keys[k].clone();
+            let txn = TxnId(op);
+            let principal = Principal::new(b"sim".to_vec());
+            let payload = format!("op{op}").into_bytes();
+            let outcome = if live[k] {
+                engine.update(key.clone(), None, Some(payload.clone()), 0, txn, principal)
+            } else {
+                engine.insert(key.clone(), None, Some(payload.clone()), 0, txn, principal)
+            };
+            let o = outcome.expect("an auto-commit write does not fsync, so it cannot fail here");
+            oracle
+                .entry(key)
+                .or_default()
+                .insert(o.commit, Some(payload));
+            committed.push(o.commit);
+            live[k] = true;
+        }
+
+        // Now arm the failed fsync and drive the group-commit fsync via a checkpoint.
+        disk.enable(FaultKind::FailSync, 1.0);
+        assert!(
+            engine.checkpoint().is_err(),
+            "seed {seed}: the failed fsync must fail the checkpoint",
+        );
+
+        // The heart of STL-217: a failed fsync is a crash, so the engine poisons and
+        // refuses to keep serving — a write reported failed can never be flushed by a
+        // later tick on this instance.
+        assert!(
+            engine.is_poisoned(),
+            "seed {seed}: a failed fsync must poison the engine",
+        );
+        let fresh = BusinessKey::new(b"after-poison".to_vec());
+        assert!(
+            engine
+                .insert(
+                    fresh,
+                    None,
+                    Some(b"x".to_vec()),
+                    0,
+                    TxnId(u64::MAX),
+                    Principal::new(b"sim".to_vec())
+                )
+                .is_err(),
+            "seed {seed}: a poisoned engine must refuse further writes",
+        );
+        assert!(
+            engine.checkpoint().is_err(),
+            "seed {seed}: a poisoned engine must refuse further checkpoints",
+        );
+    }
+
+    // Recover into a fresh, unpoisoned WAL with the fault silenced. Recovery is
+    // read-only, so it never fsyncs — but disable the class anyway to keep the
+    // recovery path clean and the assertion unambiguous.
+    disk.disable(FaultKind::FailSync);
+    let recovered = Engine::recover(disk.clone(), StepClock::new(1_000_000), false)
+        .expect("recover after a poisoned engine must succeed");
+    assert!(
+        !recovered.is_poisoned(),
+        "seed {seed}: recovery opens a fresh, unpoisoned WAL",
+    );
+
+    // The recovered state must be a consistent committed prefix of the oracle. No
+    // record was torn (FailSync fails the fsync, it does not shear the append), so
+    // every confirmed write recovers — the full timeline.
+    let (k, recovered_fp) = verify_recovered_prefix(seed, &recovered, &oracle, &committed, &keys);
+    assert_eq!(
+        k,
+        committed.len(),
+        "seed {seed}: a failed fsync tears nothing, so recovery is the full timeline",
+    );
+
+    let mut digest = FNV_OFFSET;
+    digest = fnv1a(
+        digest,
+        &u64::try_from(k).expect("prefix len fits u64").to_le_bytes(),
+    );
+    for entry in &recovered_fp {
+        match entry {
+            Some(payload) => {
+                digest = fnv1a(digest, &[1]);
+                digest = fnv1a(digest, payload);
+            }
+            None => digest = fnv1a(digest, &[0]),
+        }
+    }
+    for ev in disk.events() {
+        digest = fnv1a(digest, &ev.seq.to_le_bytes());
+        digest = fnv1a(digest, &[fault_op_tag(ev.op), fault_kind_tag(ev.kind)]);
+        digest = fnv1a(digest, &ev.detail.to_le_bytes());
+    }
+    digest
+}
+
 /// Close any open version of `key` at `commit`, then open a fresh `[commit, +∞)`
 /// version — the version a committed writer stages with the manager-assigned
 /// commit timestamp as its `sys_from`. Keeps exactly one open version per key, so
@@ -1869,6 +2026,7 @@ const fn fault_kind_tag(kind: FaultKind) -> u8 {
         FaultKind::TornWrite => 2,
         FaultKind::SlowSync => 3,
         FaultKind::FullDisk => 4,
+        FaultKind::FailSync => 5,
     }
 }
 
@@ -2503,6 +2661,7 @@ pub fn registry() -> Vec<Box<dyn Scenario>> {
             "group-commit-recover-faults",
             run_group_commit_recover_faults_seed,
         ),
+        FnScenario::fault("wal-fsync-poison", run_wal_fsync_poison_seed),
         FnScenario::boxed("schedule", run_schedule_seed_digest),
         FnScenario::fault("fault-disk", run_fault_seed),
     ]
@@ -2960,6 +3119,7 @@ mod tests {
                 "engine-recover-faults",
                 "fault-disk",
                 "group-commit-recover-faults",
+                "wal-fsync-poison",
             ],
             "exactly the fault-injected scenarios are fault-gated"
         );
@@ -2994,6 +3154,10 @@ mod tests {
         assert_eq!(
             replayed["group-commit-recover-faults"],
             run_group_commit_recover_faults_seed(seed)
+        );
+        assert_eq!(
+            replayed["wal-fsync-poison"],
+            run_wal_fsync_poison_seed(seed)
         );
         assert_eq!(replayed["schedule"], run_schedule_seed_digest(seed));
         assert_eq!(replayed["fault-disk"], run_fault_seed(seed));

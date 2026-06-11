@@ -345,10 +345,12 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     /// * **the append succeeds but the fsync ([`Wal::tick`]) fails** — the complete
     ///   record is already *staged* in the WAL, so its durability is **indeterminate**:
     ///   a later successful `tick` (e.g. a [`checkpoint`](crate::engine::Engine::checkpoint))
-    ///   could still make it durable. An fsync failure must therefore be treated as a
-    ///   crash (the engine should stop and recover) rather than as a clean abort —
-    ///   hardening the engine to enforce that is [STL-217]. Either way no *new*
-    ///   durability point is introduced: the fsync is the only one.
+    ///   could otherwise still make it durable. An fsync failure is therefore treated as
+    ///   a crash, not a clean abort: the failed `tick` **poisons** the WAL
+    ///   ([`WalError::Poisoned`]), so every later `append`/`tick` is refused and the
+    ///   staged record can never be flushed by a subsequent op — the engine stops and
+    ///   recovers ([STL-217]). Either way no *new* durability point is introduced: the
+    ///   fsync is the only one.
     ///
     /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
     pub fn commit_group(&mut self) -> Result<LogOffset, DmlError> {
