@@ -548,8 +548,16 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
     /// This strips *without* filtering on the valid axis — a no-pin read returns
     /// every system-live version, its period columns readable as ordinary cells.
     /// A [`valid_as_of`](Self::valid_as_of) pin sets this implicitly; call it
-    /// explicitly for the no-pin read of a valid-time table. Harmless (a no-op)
-    /// on a system-only table, whose payload is bare.
+    /// explicitly for the no-pin read of a valid-time table.
+    ///
+    /// **Pass the table's actual policy, not `true` unconditionally.** `enabled`
+    /// must mirror the table's valid-time opt-in: with no pin it decides whether
+    /// the delta payload is unframed. Setting `true` for a **system-only** table —
+    /// whose payload is already bare — makes a no-pin scan drain 16 bytes of real
+    /// row data as a phantom prefix, erroring or returning a corrupt payload;
+    /// setting `false` for a valid-time table leaves the frame on and the row
+    /// codec fails. The engine derives `enabled` from the catalog
+    /// (`TableState::valid_time`), so it is always correct there.
     #[must_use]
     pub const fn valid_time(mut self, enabled: bool) -> Self {
         self.valid_time = enabled;

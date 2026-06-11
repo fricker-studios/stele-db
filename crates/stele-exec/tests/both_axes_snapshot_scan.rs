@@ -305,17 +305,17 @@ fn no_valid_pin_strips_delta_frames_and_keeps_every_system_live_row() {
     // Teeth: a *system-only* scan (`valid_time` unset) leaves the delta row's
     // payload FRAMED — the 16-byte prefix is still attached — so the flag is what
     // strips it. The sealed row is bare regardless (stored that way at flush).
-    let unframed = collect(&scan().execute().expect("system-only scan"));
+    let system_only = collect(&scan().execute().expect("system-only scan"));
     assert_eq!(
-        unframed[&1], b"sealed",
+        system_only[&1], b"sealed",
         "the sealed payload is bare either way"
     );
     assert_eq!(
-        unframed[&2].len(),
+        system_only[&2].len(),
         16 + b"delta".len(),
         "without the valid-time flag the delta payload keeps its framed prefix",
     );
-    assert!(unframed[&2].ends_with(b"delta"));
+    assert!(system_only[&2].ends_with(b"delta"));
 }
 
 // --- 3. the two axes are independent ---------------------------------------
