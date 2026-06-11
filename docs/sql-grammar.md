@@ -211,26 +211,38 @@ live at the resolved system-time snapshot, that `snapshot`, an optional
 Column types in `CREATE TABLE` are parsed as standard `sqlparser` `DataType`
 nodes (syntactic). [`stele_sql::logical_type`] lowers them to the semantic
 `LogicalType` vocabulary owned by `stele-common` (STL-96) — the seam between the
-parser and the catalog (STL-98) / executor / pgwire encoder. The v0.1 set:
+parser and the catalog (STL-98) / executor / pgwire encoder. The set:
 
 | SQL surface type                       | `LogicalType` | Postgres OID |
 |----------------------------------------|---------------|--------------|
 | `INT`, `INTEGER`                       | `Int4`        | 23           |
 | `BIGINT`                               | `Int8`        | 20           |
-| `TEXT`                                 | `Text`        | 25           |
+| `TEXT`, `VARCHAR[(n)]`, `CHARACTER VARYING[(n)]`, `NVARCHAR[(n)]` | `Text` | 25 |
 | `BOOL`, `BOOLEAN`                      | `Bool`        | 16           |
 | `TIMESTAMP` (no time zone)             | `Timestamp`   | 1114         |
 | `TIMESTAMP WITH TIME ZONE`, `TIMESTAMPTZ` | `TimestampTz` | 1184      |
 | `DATE`                                 | `Date`        | 1082         |
+| `UUID`                                 | `Uuid`        | 2950         |
+| `BYTEA`                                | `Bytea`       | 17           |
 
-`TimestampTz` is stored UTC-internal: a literal's zone offset is normalized to
-UTC on input and rendered back with a `+00` offset (STL-189; the codec lives in
-[`stele_common::datetime`]). A `timestamptz` literal *can* be written in DML; the
-zone-less `TIMESTAMP` / `DATE` have no literal codec yet (mirrors `AS OF`).
+The character-*varying* spellings are all `Text` under the hood — a declared
+length (`VARCHAR(50)`) is accepted as documentation but **not enforced** (no
+typmod machinery; enforcement is a later ticket), matching how Postgres treats
+an unconstrained `varchar`.
 
-Anything else — `VARCHAR`, `CHAR`, `REAL`, … — is rejected
-(`ParseError::UnsupportedType`) rather than silently coerced; these are
-deliberate later additions.
+All three civil-time types have DML literal codecs in
+[`stele_common::datetime`]. `TimestampTz` is stored UTC-internal: a literal's
+zone offset is normalized to UTC on input and rendered back with a `+00` offset
+(STL-189). The zone-less `TIMESTAMP` shares the grammar but **rejects** an
+explicit zone offset rather than Postgres-style silently ignoring it (dropping
+an offset the user wrote would change the instant they named); `DATE` is the
+pure `YYYY-MM-DD` form. Typed-string literals (`TIMESTAMP '…'`, `DATE '…'`,
+`UUID '…'`) fold when the declared type matches the column; a mismatch is a
+type error, never an implicit cast.
+
+Anything else — the blank-padding `CHAR(n)`, `REAL`, … — is rejected
+(`ParseError::UnsupportedType`, with the supported vocabulary in the message)
+rather than silently coerced; these are deliberate later additions.
 
 ## AST shape
 

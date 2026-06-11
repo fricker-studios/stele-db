@@ -23,7 +23,10 @@ pub enum ParseError {
     #[error("temporal grammar error: {0}")]
     Temporal(String),
 
-    /// A column declared a SQL type outside Stele's v0.1 type vocabulary.
-    #[error("unsupported type for v0.1: {0}")]
+    /// A column declared a SQL type outside Stele's type vocabulary.
+    #[error(
+        "unsupported column type {0} — supported: INT, BIGINT, TEXT, VARCHAR, NVARCHAR, \
+         BOOL, TIMESTAMP, TIMESTAMPTZ, DATE, UUID, BYTEA"
+    )]
     UnsupportedType(String),
 }

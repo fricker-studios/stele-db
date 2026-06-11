@@ -18,14 +18,14 @@
 //! ## Why the rows are staged in-process
 //!
 //! The *read* — the encoder under test — is over the wire for every type. The
-//! *write* is in-process, because at v0.1 the SQL `INSERT` path cannot express
-//! the full set: [`bind_dml`](stele_sql) folds only int/text/bool literals and
-//! rejects a `TIMESTAMP`/`DATE` literal (no civil-time literal codec — it mirrors
-//! the `AS OF` stance). Staging every row through the typed
-//! [`SessionEngine::insert`] with the value's canonical encoding side-steps that
-//! write-side gap so the test exercises the one thing it is about: the wire
-//! rendering. (`INSERT` over the wire for the types it *does* support is already
-//! covered by the STL-147 CRUD round-trip.)
+//! *write* is in-process: staging every row through the typed
+//! [`SessionEngine::insert`] with the value's canonical encoding keeps the test
+//! about the one thing it pins — the wire rendering — independent of the SQL
+//! literal-fold path. (Historically this also dodged a real gap: `bind_dml`
+//! once rejected `TIMESTAMP`/`DATE` literals. The civil-time codecs have since
+//! landed in `stele_common::datetime`, so SQL `INSERT` covers the full type
+//! set; the staging stays for isolation, and `INSERT` over the wire is covered
+//! by the STL-147 CRUD round-trip.)
 //!
 //! ## NULL cell over the wire (STL-154)
 //!

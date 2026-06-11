@@ -22,6 +22,12 @@ fn v0_1_vocabulary_lowers() {
         ("TIMESTAMP WITH TIME ZONE", LogicalType::TimestampTz),
         ("TIMESTAMPTZ", LogicalType::TimestampTz),
         ("DATE", LogicalType::Date),
+        // The character-varying family is Text under the hood; a declared
+        // length is accepted as documentation, not enforced.
+        ("VARCHAR", LogicalType::Text),
+        ("VARCHAR(10)", LogicalType::Text),
+        ("CHARACTER VARYING(10)", LogicalType::Text),
+        ("NVARCHAR(10)", LogicalType::Text),
     ];
     for (sql_ty, expected) in cases {
         let dt = column_type(sql_ty);
@@ -35,11 +41,12 @@ fn v0_1_vocabulary_lowers() {
 
 #[test]
 fn out_of_vocabulary_types_are_rejected() {
-    for sql_ty in ["VARCHAR(10)", "CHAR(3)", "REAL"] {
+    // CHAR(n) blank-pads (Text cannot honor that); REAL has no column type.
+    for sql_ty in ["CHAR(3)", "REAL"] {
         let dt = column_type(sql_ty);
         assert!(
             matches!(logical_type(&dt), Err(ParseError::UnsupportedType(_))),
-            "{sql_ty} should be unsupported in v0.1"
+            "{sql_ty} should be unsupported"
         );
     }
 }

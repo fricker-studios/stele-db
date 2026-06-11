@@ -12,6 +12,8 @@
 use sqlparser::ast::{Expr, UnaryOperator, Value};
 use stele_common::types::{LogicalType, ScalarValue};
 
+use crate::types::logical_type;
+
 /// Why folding a literal to a typed value failed — without table/column context,
 /// which the calling binder adds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,9 +38,9 @@ pub(crate) enum FoldError {
         /// A short, stable explanation from the type's codec, when it has one.
         reason: Option<&'static str>,
     },
-    /// The column's type has no literal codec (the zone-less `TIMESTAMP` / `DATE`
-    /// — no civil-time literal parsing yet; mirrors the `AS OF` stance).
-    /// `TIMESTAMPTZ` does have one ([`stele_common::datetime`]).
+    /// The column's type has no literal codec: `PERIOD` (period predicates build
+    /// intervals from `PERIOD(a,b)` endpoints, not a folded scalar) and `FLOAT8`
+    /// (an aggregate result type only — there is no float8 column to fold into).
     UnsupportedType(LogicalType),
 }
 
@@ -76,12 +78,14 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
                     reason: None,
                 })
         }
-        LogicalType::Text => match literal(expr) {
-            Some(Value::SingleQuotedString(s)) => Ok(ScalarValue::Text(s.clone())),
-            _ => Err(FoldError::TypeMismatch {
-                found: describe(expr),
-            }),
-        },
+        LogicalType::Text => string_literal(expr, ty).map_or_else(
+            || {
+                Err(FoldError::TypeMismatch {
+                    found: describe(expr),
+                })
+            },
+            |s| Ok(ScalarValue::Text(s.clone())),
+        ),
         LogicalType::Bool => match literal(expr) {
             Some(Value::Boolean(b)) => Ok(ScalarValue::Bool(*b)),
             _ => Err(FoldError::TypeMismatch {
@@ -91,7 +95,7 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
         // UUID and BYTEA take their value from a single-quoted string literal,
         // the way a Postgres client writes them (`'550e…'`, `'\xDEADBEEF'`).
         LogicalType::Uuid => {
-            let s = string_literal(expr).ok_or_else(|| FoldError::TypeMismatch {
+            let s = string_literal(expr, ty).ok_or_else(|| FoldError::TypeMismatch {
                 found: describe(expr),
             })?;
             parse_uuid(s)
@@ -102,7 +106,7 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
                 })
         }
         LogicalType::Bytea => {
-            let s = string_literal(expr).ok_or_else(|| FoldError::TypeMismatch {
+            let s = string_literal(expr, ty).ok_or_else(|| FoldError::TypeMismatch {
                 found: describe(expr),
             })?;
             parse_bytea(s)
@@ -112,39 +116,61 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
                     reason: Some("expected bytea hex: `\\x` then an even number of hex digits"),
                 })
         }
-        // A `timestamptz` literal carries a zone offset that is normalized to the
-        // engine's UTC microsecond scale ([`stele_common::datetime`], STL-189).
-        LogicalType::TimestampTz => match literal(expr) {
-            Some(Value::SingleQuotedString(s)) => stele_common::datetime::parse_timestamptz(s)
-                .map(ScalarValue::TimestampTz)
-                .map_err(|e| FoldError::BadLiteral {
-                    literal: e.literal,
-                    reason: Some(e.reason),
-                }),
-            _ => Err(FoldError::TypeMismatch {
-                found: describe(expr),
-            }),
-        },
-        // No literal codec for the zone-less `TIMESTAMP`/`DATE` or `PERIOD` types
-        // yet (mirrors AS OF); such a column cannot be written or compared against
-        // a literal. `timestamptz` above is the one civil-time type with a codec.
-        // (Period predicates build their intervals from PERIOD(a,b) endpoints, not
-        // from a folded period scalar — see stele-exec.) `FLOAT8` is an aggregate
-        // result type only ([STL-209]) — there is no `float8` column or literal to
-        // fold into, so a float literal also has nowhere to go here (STL-207).
-        ty @ (LogicalType::Timestamp
-        | LogicalType::Date
-        | LogicalType::Period
-        | LogicalType::Float8) => Err(FoldError::UnsupportedType(ty)),
+        // The three civil-time literal codecs ([`stele_common::datetime`]):
+        // `timestamptz` normalizes its zone offset to the engine's UTC
+        // microsecond scale (STL-189); the zone-less `timestamp` shares the
+        // grammar but rejects an explicit offset; `date` is the pure
+        // `YYYY-MM-DD` day count.
+        LogicalType::TimestampTz => fold_civil(expr, ty, |s| {
+            stele_common::datetime::parse_timestamptz(s).map(ScalarValue::TimestampTz)
+        }),
+        LogicalType::Timestamp => fold_civil(expr, ty, |s| {
+            stele_common::datetime::parse_timestamp(s).map(ScalarValue::Timestamp)
+        }),
+        LogicalType::Date => fold_civil(expr, ty, |s| {
+            stele_common::datetime::parse_date(s).map(ScalarValue::Date)
+        }),
+        // No literal codec for PERIOD (predicates build their intervals from
+        // PERIOD(a,b) endpoints, not from a folded period scalar — see
+        // stele-exec) or FLOAT8 (an aggregate result type only, [STL-209] —
+        // there is no `float8` column or literal to fold into, STL-207).
+        ty @ (LogicalType::Period | LogicalType::Float8) => Err(FoldError::UnsupportedType(ty)),
     }
 }
 
-/// The text of a single-quoted string literal, peeling parentheses; `None` for
-/// any other expression.
-fn string_literal(expr: &Expr) -> Option<&String> {
-    match literal(expr) {
-        Some(Value::SingleQuotedString(s)) => Some(s),
-        _ => None,
+/// Fold a civil-time literal through one of the [`stele_common::datetime`]
+/// codecs, mapping its parse error onto [`FoldError::BadLiteral`].
+fn fold_civil(
+    expr: &Expr,
+    ty: LogicalType,
+    parse: impl Fn(&str) -> Result<ScalarValue, stele_common::datetime::DatetimeParseError>,
+) -> Result<ScalarValue, FoldError> {
+    let s = string_literal(expr, ty).ok_or_else(|| FoldError::TypeMismatch {
+        found: describe(expr),
+    })?;
+    parse(s).map_err(|e| FoldError::BadLiteral {
+        literal: e.literal,
+        reason: Some(e.reason),
+    })
+}
+
+/// The text a string-driven literal carries for a column of type `ty`: a bare
+/// single-quoted string (`'…'`, peeling parentheses), or a *typed* string whose
+/// declared type lowers to the same `ty` — so `TIMESTAMP '2024-01-15 12:00'`
+/// and `UUID '550e…'` fold for matching columns, the way Postgres clients
+/// write them. A typed string of a *different* type is `None` (a type
+/// mismatch, never an implicit cast).
+fn string_literal(expr: &Expr, ty: LogicalType) -> Option<&String> {
+    match expr {
+        Expr::Nested(inner) => string_literal(inner, ty),
+        Expr::TypedString(typed) => match (logical_type(&typed.data_type), &typed.value.value) {
+            (Ok(declared), Value::SingleQuotedString(s)) if declared == ty => Some(s),
+            _ => None,
+        },
+        _ => match literal(expr) {
+            Some(Value::SingleQuotedString(s)) => Some(s),
+            _ => None,
+        },
     }
 }
 
@@ -238,6 +264,11 @@ pub(crate) fn signed_number(expr: &Expr) -> Option<String> {
 
 /// A short label for an expression, for the type-mismatch diagnostics.
 pub(crate) fn describe(expr: &Expr) -> &'static str {
+    if matches!(expr, Expr::TypedString(_)) {
+        // A typed string of the *wrong* type lands here — `string_literal`
+        // already matched the right-typed ones.
+        return "a typed literal of a different type";
+    }
     match literal(expr) {
         Some(Value::SingleQuotedString(_)) => "a string literal",
         Some(Value::Boolean(_)) => "a boolean literal",
@@ -331,6 +362,80 @@ mod tests {
                 "expected {bad:?} to be a bad bytea literal"
             );
         }
+    }
+
+    /// A typed-string expression (`TIMESTAMP '…'`), the way the parser yields one.
+    fn typed_lit(sql_type: sqlparser::ast::DataType, s: &str) -> Expr {
+        Expr::TypedString(sqlparser::ast::TypedString {
+            data_type: sql_type,
+            value: Value::SingleQuotedString(s.to_owned()).into(),
+            uses_odbc_syntax: false,
+        })
+    }
+
+    #[test]
+    fn folds_civil_time_literals_from_plain_strings() {
+        // 1_700_000_000 s = 2023-11-14 22:13:20 UTC; day 19_675.
+        assert_eq!(
+            fold_scalar(&str_lit("2023-11-14 22:13:20"), LogicalType::Timestamp),
+            Ok(ScalarValue::Timestamp(1_700_000_000_000_000))
+        );
+        assert_eq!(
+            fold_scalar(&str_lit("2023-11-14 22:13:20Z"), LogicalType::TimestampTz),
+            Ok(ScalarValue::TimestampTz(1_700_000_000_000_000))
+        );
+        assert_eq!(
+            fold_scalar(&str_lit("2023-11-14"), LogicalType::Date),
+            Ok(ScalarValue::Date(19_675))
+        );
+    }
+
+    #[test]
+    fn folds_typed_string_literals_of_the_matching_type() {
+        use sqlparser::ast::{DataType, TimezoneInfo};
+        assert_eq!(
+            fold_scalar(
+                &typed_lit(
+                    DataType::Timestamp(None, TimezoneInfo::None),
+                    "2023-11-14 22:13:20"
+                ),
+                LogicalType::Timestamp
+            ),
+            Ok(ScalarValue::Timestamp(1_700_000_000_000_000))
+        );
+        assert_eq!(
+            fold_scalar(&typed_lit(DataType::Date, "2023-11-14"), LogicalType::Date),
+            Ok(ScalarValue::Date(19_675))
+        );
+        // A typed string also works for the non-temporal string-driven types.
+        assert_eq!(
+            fold_scalar(
+                &typed_lit(DataType::Uuid, "550e8400-e29b-41d4-a716-446655440000"),
+                LogicalType::Uuid
+            ),
+            Ok(ScalarValue::Uuid(SAMPLE))
+        );
+        // …but a typed string of a DIFFERENT type is a mismatch, not a cast.
+        assert!(matches!(
+            fold_scalar(
+                &typed_lit(DataType::Date, "2023-11-14"),
+                LogicalType::Timestamp
+            ),
+            Err(FoldError::TypeMismatch {
+                found: "a typed literal of a different type"
+            })
+        ));
+    }
+
+    #[test]
+    fn zone_on_a_zone_less_timestamp_is_a_bad_literal() {
+        // The codec's explicit-rejection stance surfaces as BadLiteral with the
+        // use-TIMESTAMPTZ reason, not as a silently shifted instant.
+        let err = fold_scalar(&str_lit("2023-11-14 22:13:20+05"), LogicalType::Timestamp);
+        assert!(
+            matches!(err, Err(FoldError::BadLiteral { reason: Some(r), .. }) if r.contains("TIMESTAMPTZ")),
+            "{err:?}"
+        );
     }
 
     /// Folding a UUID/BYTEA literal and re-encoding it returns to the original

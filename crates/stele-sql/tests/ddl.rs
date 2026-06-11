@@ -139,10 +139,31 @@ fn table_level_constraints_and_ctas_and_qualified_names_are_rejected() {
 
 #[test]
 fn an_unsupported_column_type_is_rejected() {
-    assert!(matches!(
-        bind_one("CREATE TABLE t (name VARCHAR) WITH SYSTEM VERSIONING"),
-        Err(BindError::Type(_))
-    ));
+    // CHAR(n) blank-pads, which Text cannot honor — still out of the vocabulary.
+    let err = bind_one("CREATE TABLE t (name CHAR(8)) WITH SYSTEM VERSIONING");
+    assert!(matches!(err, Err(BindError::Type(_))), "{err:?}");
+    // The diagnostic lists the supported vocabulary so the fix is self-evident.
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("TEXT") && msg.contains("VARCHAR"), "{msg}");
+}
+
+#[test]
+fn varchar_family_spellings_bind_as_text_columns() {
+    // The character-varying family lowers to Text; a declared length is
+    // accepted (documentation only — not enforced).
+    for sql in [
+        "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR) WITH SYSTEM VERSIONING",
+        "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(50)) WITH SYSTEM VERSIONING",
+        "CREATE TABLE t (id INT PRIMARY KEY, name NVARCHAR(50)) WITH SYSTEM VERSIONING",
+        "CREATE TABLE t (id INT PRIMARY KEY, name CHARACTER VARYING(50)) WITH SYSTEM VERSIONING",
+    ] {
+        let DdlStatement::CreateTable { columns, .. } =
+            bind_one(sql).unwrap_or_else(|e| panic!("{sql}: {e}"))
+        else {
+            panic!("{sql}: expected CreateTable");
+        };
+        assert_eq!(columns[1].ty(), LogicalType::Text, "{sql}");
+    }
 }
 
 #[test]
