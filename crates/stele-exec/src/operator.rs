@@ -186,8 +186,8 @@ impl<C: Operator> Operator for Project<C> {
         // A selection rides through unchanged: projection reselects + reorders
         // columns but never drops a physical row, so the surviving-row indices
         // address the re-projected columns exactly as they did the child's
-        // (STL-214). Carrying it (a shared-buffer refcount bump) keeps a
-        // `Filter → Project` chain zero-copy instead of forcing a materialize.
+        // (STL-214). It is moved through (the columns below are moved too), so a
+        // `Filter → Project` chain stays zero-copy instead of forcing a materialize.
         let selection = batch.selection;
         // Move the child's columns into takeable slots so a projection that
         // selects + reorders distinct columns (the common case) *moves* each one
@@ -440,10 +440,10 @@ impl<C: Operator> Operator for Filter<C> {
             if kept.is_empty() {
                 continue;
             }
-            // Zero-copy row selection (STL-214): keep the child's column buffers
-            // untouched — a refcount bump apiece, no surviving payload cell copied
-            // — and carry the surviving rows as a selection vector. A downstream
-            // consumer honors it (the engine sink reads `column[selection[i]]`) or
+            // Zero-copy row selection (STL-214): move the child's column buffers
+            // into the output untouched — no surviving payload cell copied — and
+            // carry the surviving rows as a selection vector. A downstream consumer
+            // honors it (the engine sink reads `column[selection[i]]`) or
             // materializes once via `Batch::into_dense`.
             return Ok(Some(Batch::with_selection(batch.columns, kept.into())));
         }

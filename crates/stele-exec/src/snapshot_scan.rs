@@ -372,12 +372,15 @@ impl Column {
 ///
 /// * **Dense** (`selection == None`) — every column holds exactly
 ///   [`rows`](Self::rows) values, aligned row-wise: logical row `i` is physical
-///   row `i` in every column. This is what a scan source and a projection emit.
+///   row `i` in every column. A scan source and [`ExplodePayload`](crate::ExplodePayload)
+///   emit this shape.
 /// * **Selected** (`selection == Some(sel)`) — the columns are the *full* buffers
-///   of some upstream batch (a zero-copy refcount bump, no payload byte copied),
-///   and `sel` names the surviving rows: logical row `i` is physical row `sel[i]`,
-///   with `rows == sel.len()`. A [`Filter`](crate::Filter) emits this so it never
-///   deep-copies a surviving cell.
+///   of some upstream batch, carried by move or a shallow [`Cells`] clone (never a
+///   payload-byte copy), and `sel` names the surviving rows: logical row `i` is
+///   physical row `sel[i]`, with `rows == sel.len()`. A [`Filter`](crate::Filter)
+///   emits this so it never deep-copies a surviving cell; a
+///   [`Project`](crate::Project) passes whichever shape its child emits straight
+///   through.
 ///
 /// A consumer either **honors** the selection — reading cell `(col, i)` as
 /// `column[selection[i]]` via [`physical_row`](Self::physical_row) — or
