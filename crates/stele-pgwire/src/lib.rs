@@ -4163,7 +4163,9 @@ mod tests {
 
     /// An extended-query `INSERT` issued inside a simple-query `BEGIN` block
     /// buffers into the transaction (STL-174 integration): `Sync` reports `T`
-    /// mid-block, `COMMIT` applies the write, and `ROLLBACK` discards it.
+    /// mid-block, a mid-block `SELECT` reads the transaction's own buffered write
+    /// (STL-203 read-your-own-writes), `COMMIT` applies it, and `ROLLBACK` (the
+    /// sibling test) discards it.
     #[tokio::test]
     async fn extended_dml_participates_in_a_begin_block() {
         let (server, mut client) = connect_past_handshake().await;
@@ -4186,11 +4188,13 @@ mod tests {
         let status = drain_capturing_status(&mut client).await;
         assert_eq!(status, b'T', "Sync inside BEGIN reports in-transaction");
 
-        // Not yet visible (still buffered).
+        // Read-your-own-writes (STL-203): the transaction sees its own buffered
+        // INSERT mid-block, before COMMIT.
         let mid = run_simple(&mut client, "SELECT id, balance FROM account").await;
-        assert!(
-            data_row_text(&mid).is_empty(),
-            "write buffered until COMMIT"
+        assert_eq!(
+            data_row_text(&mid),
+            vec![vec!["1", "100"]],
+            "the transaction reads its own buffered write"
         );
 
         // COMMIT applies it.

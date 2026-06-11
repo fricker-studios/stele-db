@@ -274,10 +274,11 @@ pub enum DmlSummary {
 /// Created by [`SessionEngine::begin`], fed bound DML one statement at a time by
 /// [`SessionEngine::stage_dml`], and applied as a unit by
 /// [`SessionEngine::commit`] — or simply **dropped** to roll back. The defining
-/// property is that staged writes are *buffered*, never applied, until commit:
-/// nothing a transaction writes is visible — to it, or to any other connection —
-/// before `COMMIT`, and `ROLLBACK` discards the buffer with no effect ever
-/// reaching storage.
+/// property is that staged writes are *buffered*, never reaching storage until
+/// commit: no *other* connection sees anything a transaction writes before
+/// `COMMIT`, and `ROLLBACK` discards the buffer with no effect ever reaching
+/// storage. The transaction does see its **own** buffered writes when it reads —
+/// read-your-own-writes ([STL-203]), overlaid on its pinned snapshot.
 ///
 /// The transaction reads under **snapshot isolation** ([STL-175], [ADR-0008]): a
 /// single system-time snapshot is pinned at [`begin`](SessionEngine::begin) and
@@ -300,10 +301,11 @@ pub enum DmlSummary {
 /// a partial prefix — and the writes share one transaction id.
 ///
 /// What this deliberately does *not* yet do (each its own follow-up):
-/// * **Read-your-own-writes.** A `SELECT` inside the transaction reads the pinned
-///   snapshot, but does **not** see the transaction's own buffered, not-yet-
-///   committed writes — overlaying the write buffer on the snapshot read is a
-///   follow-up ([STL-203]).
+/// * **Read-your-own-writes on a *valid-time* table.** The overlay ([STL-203])
+///   models the system-time row set — one current version per business key — so it
+///   applies only to system-only tables; a valid-time table's buffered writes are
+///   not yet overlaid period-by-period inside the block (its no-pin read can span
+///   several valid periods per key).
 /// * **Cross-table commit atomicity.** A transaction spanning several tables writes
 ///   one record + one fsync *per table* (each table owns its WAL), so each table's
 ///   portion is crash-atomic but a crash *between* tables can leave some durable and
@@ -936,8 +938,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // An auto-committed statement is its own snapshot: read the latest
         // committed state, then write immediately. (Snapshot isolation pins one
         // snapshot for a whole multi-statement transaction instead — see
-        // [`execute_in_txn`](Self::execute_in_txn).)
-        self.execute_at(stmt, self.clock.current())
+        // [`execute_in_txn`](Self::execute_in_txn).) No write buffer to overlay:
+        // an auto-commit read sees only committed state.
+        self.execute_at(stmt, self.clock.current(), &[])
     }
 
     /// Execute one statement inside an open multi-statement transaction, under
@@ -947,7 +950,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// unit at [`commit`](Self::commit)), bound at the transaction's pinned
     /// snapshot. A `SELECT` runs immediately, with its reads resolved at that
     /// *same* pinned snapshot, so every statement in the block observes one
-    /// consistent system-time snapshot even while other connections commit.
+    /// consistent system-time snapshot even while other connections commit — with
+    /// the transaction's own buffered writes overlaid on it (**read-your-own-writes**,
+    /// [STL-203]): the buffer rides into the read path so a `SELECT` after a staged
+    /// write reflects it, while no other connection sees it until `COMMIT`.
     ///
     /// **DDL inside a transaction** is the one exception. Transactional DDL is not
     /// yet modeled, so a `CREATE` / `DROP` inside a block takes effect at once
@@ -960,6 +966,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     ///
     /// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
     /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+    /// [STL-203]: https://allegromusic.atlassian.net/browse/STL-203
     ///
     /// # Errors
     ///
@@ -973,7 +980,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         if let Some(summary) = self.stage_dml(stmt, txn)? {
             return Ok(StatementOutcome::Dml(summary));
         }
-        let outcome = self.execute_at(stmt, txn.snapshot)?;
+        // A `SELECT` overlays the transaction's own buffered writes on its pinned
+        // snapshot (read-your-own-writes, [STL-203]); the buffer rides into
+        // `execute_at` as the read overlay. A DDL ignores it (it auto-commits).
+        let outcome = self.execute_at(stmt, txn.snapshot, &txn.writes)?;
         // A DDL inside the block auto-committed (see above); advance the pinned
         // snapshot past it so a later statement in the same block can resolve the
         // table it created/dropped.
@@ -1006,10 +1016,20 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// always takes effect at the commit clock's next instant, independent of the
     /// read snapshot. Routes, in order: an admin command, then by binding DDL,
     /// then `SELECT`, then `INSERT` / `UPDATE` / `DELETE`.
+    ///
+    /// `overlay` is the transaction's buffered writes for **read-your-own-writes**
+    /// ([STL-203]) — empty on the auto-commit path. A `SELECT` overlays them on its
+    /// resolved rows, but only for a *plain current* read: any explicit `AS OF`
+    /// qualifier (`stmt.temporal.as_of` non-empty) — including `FOR SYSTEM_TIME AS OF
+    /// now()`, which folds to the pinned snapshot — reads history and must show only
+    /// committed state, so the overlay is dropped for it.
+    ///
+    /// [STL-203]: https://allegromusic.atlassian.net/browse/STL-203
     fn execute_at(
         &mut self,
         stmt: &Statement,
         read_snapshot: SystemTimeMicros,
+        overlay: &[BoundDml],
     ) -> Result<StatementOutcome, EngineError> {
         // Admin commands (CHECKPOINT / FLUSH) have no SQL body, so they are routed
         // before the binders, which all assume one ([STL-219]).
@@ -1035,7 +1055,21 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 catalog: &self.catalog,
             };
             match bind_select(stmt, &ctx) {
-                Ok(bound) => return self.run_select(&bound),
+                Ok(bound) => {
+                    // Read-your-own-writes ([STL-203]): a plain current read in the
+                    // transaction overlays its buffered writes. Any explicit `AS OF`
+                    // qualifier drops the overlay — it reads history and must show
+                    // only committed state. Gating on the *qualifier*, not on
+                    // `bound.snapshot == read_snapshot`: `FOR SYSTEM_TIME AS OF now()`
+                    // folds to the pinned snapshot, so snapshot equality would wrongly
+                    // overlay an explicit time-travel read.
+                    let live: &[BoundDml] = if stmt.temporal.as_of.is_empty() {
+                        overlay
+                    } else {
+                        &[]
+                    };
+                    return self.run_select(&bound, live);
+                }
                 // Not a SELECT either ⇒ try the DML router below.
                 Err(SelectError::NotSelect) => {}
                 Err(e) => return Err(EngineError::Select(e)),
@@ -1246,10 +1280,17 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// A `GROUP BY` / aggregate query ([STL-171]) folds the same reconstructed,
     /// filtered rows into grouped output ([`run_aggregate`]); a plain query
     /// projects them.
-    fn run_select(&self, bound: &BoundSelect) -> Result<StatementOutcome, EngineError> {
+    fn run_select(
+        &self,
+        bound: &BoundSelect,
+        overlay: &[BoundDml],
+    ) -> Result<StatementOutcome, EngineError> {
         // A two-table `JOIN` ([STL-172]) takes a wholly different path: it scans
         // both sides and combines their rows, rather than projecting one table's
-        // reconstructed rows. The single-table fields below are unused for it.
+        // reconstructed rows. The single-table fields below are unused for it. A
+        // join inside a transaction reads the committed snapshot only — the
+        // read-your-own-writes overlay ([STL-203]) is single-table and not yet
+        // threaded through the join path.
         if let Some(join) = &bound.join {
             return self.run_join(join, bound.snapshot);
         }
@@ -1275,8 +1316,17 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let value_count = schema_columns.len().saturating_sub(1);
 
         // Reconstruct the full rows [key, value cells…] live at the snapshot, after
-        // the `WHERE` filter, through the vectorized operator pipeline ([STL-206]).
-        let rows = Self::scan_rows(bound, state, &schema_columns, value_count)?;
+        // the `WHERE` filter. Read-your-own-writes ([STL-203]): when this read sits
+        // inside a transaction that has buffered writes for this table, overlay their
+        // effect on the pinned-snapshot rows before filtering/projecting; otherwise
+        // take the committed-only fused scan+filter fast path ([STL-206]). Valid-time
+        // tables are not yet overlaid (a no-pin read spans multiple periods per key —
+        // a follow-up), so they always read the committed snapshot.
+        let rows = if !state.valid_time && overlay.iter().any(|d| d.table() == table) {
+            Self::overlaid_rows(bound, state, &schema_columns, value_count, overlay)?
+        } else {
+            Self::scan_rows(bound, state, &schema_columns, value_count)?
+        };
 
         // An aggregate query folds those rows into grouped output ([STL-171]); a
         // plain query projects them.
@@ -1403,6 +1453,30 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             }
         }
         Ok(rows)
+    }
+
+    /// The rows a transaction sees under **read-your-own-writes** ([STL-203]): the
+    /// pinned-snapshot rows of this table with the transaction's own buffered writes
+    /// overlaid, then `WHERE`/period-filtered. Storage is never touched — the overlay
+    /// is purely in-memory, so a `ROLLBACK` (dropping the buffer) leaves nothing
+    /// behind.
+    ///
+    /// The base is the *unfiltered* snapshot scan
+    /// ([`scan_all_rows`](Self::scan_all_rows)): a buffered write can flip a row's
+    /// `WHERE` membership, so the filter is applied *after* the overlay
+    /// ([`filter_rows`]) rather than fused into the scan as on the committed-only
+    /// path. Byte-equality on the canonical encoding is exactly the typed `=` the
+    /// fused [`Filter`] applies, so the two paths agree on which rows survive.
+    fn overlaid_rows(
+        bound: &BoundSelect,
+        state: &TableState<C, D>,
+        schema_columns: &[(String, LogicalType)],
+        value_count: usize,
+        overlay: &[BoundDml],
+    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+        let base = Self::scan_all_rows(state, bound.snapshot, value_count)?;
+        let overlaid = overlay_table_writes(base, overlay, bound.table.as_str(), value_count);
+        Ok(filter_rows(bound, schema_columns, overlaid))
     }
 
     /// Run a bound two-table `JOIN` ([STL-172]).
@@ -1675,8 +1749,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 // value cells so unnamed columns keep their prior value, then
                 // re-pack. The base is read at the committed state, which — for a
                 // key that passed `commit`'s write-write conflict check — is
-                // unchanged since this transaction's snapshot. (A transaction does
-                // not yet read its own buffered writes, [STL-203].)
+                // unchanged since this transaction's snapshot. (In a group commit an
+                // earlier staged write of the same key is already applied to the
+                // delta, so a later UPDATE reads it — front-to-back ordering. This is
+                // the apply path; a mid-transaction SELECT reads the buffer via the
+                // overlay instead, [STL-203].)
                 let value_count = self.value_column_count(&table)?;
                 // Guard against a narrowed schema since binding: an assignment
                 // index past the live value columns would otherwise panic on the
@@ -2253,6 +2330,124 @@ fn period_endpoint_micros(
             }
         }
     }
+}
+
+/// Overlay a transaction's buffered writes for `table` onto the snapshot-resolved
+/// `base` rows — **read-your-own-writes** ([STL-203]) — returning the row set the
+/// transaction sees. The writes apply in staged order, keyed by business key, so a
+/// later write to a key supersedes an earlier one — the same effect `COMMIT` would
+/// make durable. Each row is `[business key, value cells…]` (the
+/// [`ExplodePayload`] shape); storage is never touched.
+///
+/// `INSERT` sets the key's row to the inserted values; `UPDATE` is a read-modify-
+/// write merging the `SET` overrides onto the key's current row (an absent key
+/// starts all-`NULL`, mirroring [`live_value_cells`](SessionEngine::live_value_cells));
+/// `DELETE` removes the key. Keying by business key models the system-time row set
+/// — one current version per key — which is why the caller restricts the overlay to
+/// system-only tables.
+fn overlay_table_writes(
+    base: Vec<Vec<Option<Vec<u8>>>>,
+    overlay: &[BoundDml],
+    table: &str,
+    value_count: usize,
+) -> Vec<Vec<Option<Vec<u8>>>> {
+    // Index by business-key bytes (cell 0); a system-time snapshot resolves at most
+    // one live row per key. A `BTreeMap` keeps the output deterministic (ascending
+    // key bytes) independent of scan order.
+    let mut rows: BTreeMap<Vec<u8>, Vec<Option<Vec<u8>>>> = BTreeMap::new();
+    for row in base {
+        if let Some(key) = row.first().and_then(Clone::clone) {
+            rows.insert(key, row);
+        }
+    }
+    for dml in overlay.iter().filter(|d| d.table() == table) {
+        match dml {
+            BoundDml::Insert { key, values, .. } => {
+                let key_bytes = encode_value(key);
+                let row = overlay_row(&key_bytes, values, value_count);
+                rows.insert(key_bytes, row);
+            }
+            BoundDml::Update {
+                key, assignments, ..
+            } => {
+                let key_bytes = encode_value(key);
+                let mut row = rows
+                    .remove(&key_bytes)
+                    .unwrap_or_else(|| overlay_row(&key_bytes, &[], value_count));
+                for (idx, value) in assignments {
+                    // The +1 skips the business key at cell 0; an index past the
+                    // live value columns (a schema narrowed since binding) is
+                    // ignored here — the real apply path rejects it at commit.
+                    if let Some(cell) = row.get_mut(idx + 1) {
+                        *cell = value.as_ref().map(encode_value);
+                    }
+                }
+                rows.insert(key_bytes, row);
+            }
+            BoundDml::Delete { key, .. } => {
+                rows.remove(&encode_value(key));
+            }
+        }
+    }
+    rows.into_values().collect()
+}
+
+/// Build one overlaid row `[business key, value cells…]` of width `value_count + 1`
+/// from a folded key and value list — the in-memory mirror of what
+/// [`apply_bound_dml`](SessionEngine::apply_bound_dml) packs into the stored
+/// payload. Each value is its canonical encoding (`None` for a SQL `NULL`); a value
+/// the list omits (an `UPDATE`'s read-modify-write base passes an empty list) is a
+/// `NULL` cell, matching an absent key under
+/// [`live_value_cells`](SessionEngine::live_value_cells).
+fn overlay_row(
+    key_bytes: &[u8],
+    values: &[Option<ScalarValue>],
+    value_count: usize,
+) -> Vec<Option<Vec<u8>>> {
+    let mut row = Vec::with_capacity(value_count + 1);
+    row.push(Some(key_bytes.to_vec()));
+    for i in 0..value_count {
+        row.push(values.get(i).and_then(|v| v.as_ref().map(encode_value)));
+    }
+    row
+}
+
+/// Apply a bound `SELECT`'s `WHERE` and period predicates to already-materialized
+/// rows — the overlaid read-your-own-writes path ([STL-203]), where the buffer was
+/// layered on *after* the scan so the filter cannot be fused into it. Mirrors the
+/// committed-only path's filtering: a fully-constant period predicate that folds
+/// false drops every row; a per-row one ([STL-193]) is evaluated against each row;
+/// and a `WHERE <col> = <lit>` keeps a row iff the cell's canonical bytes equal the
+/// literal's — exactly the typed `=` the vectorized [`Filter`] applies (the encoding
+/// is canonical, and a `NULL` cell never equals a present literal).
+fn filter_rows(
+    bound: &BoundSelect,
+    schema_columns: &[(String, LogicalType)],
+    rows: Vec<Vec<Option<Vec<u8>>>>,
+) -> Vec<Vec<Option<Vec<u8>>>> {
+    let per_row_period = match &bound.period_filter {
+        Some(p) => match const_period_truth(p) {
+            Some(false) => return Vec::new(),
+            Some(true) => None,
+            None => Some(p),
+        },
+        None => None,
+    };
+    let key_filter = bound
+        .filter
+        .as_ref()
+        .map(|p| (p.column_index, encode_value(&p.value)));
+    rows.into_iter()
+        .filter(|row| {
+            // `WHERE <col> = <lit>`: byte-equality on the canonical encoding.
+            let where_ok = key_filter.as_ref().is_none_or(|(col, bytes)| {
+                row.get(*col).and_then(|c| c.as_deref()) == Some(bytes.as_slice())
+            });
+            // Per-row period predicate ([STL-193]), if any.
+            let period_ok = per_row_period.is_none_or(|p| period_keeps_row(p, row, schema_columns));
+            where_ok && period_ok
+        })
+        .collect()
 }
 
 /// Map a bound [`JoinType`] to the executor's `ExecJoinType`. The two enums are
@@ -3567,6 +3762,235 @@ mod tests {
         };
         assert_eq!(account.rows.len(), 1, "account row committed");
         assert_eq!(ledger.rows.len(), 1, "ledger row committed");
+    }
+
+    // --- Read-your-own-writes (STL-203, ADR-0008) --------------------------
+    //
+    // A SELECT inside an open transaction overlays the transaction's own buffered
+    // INSERT/UPDATE/DELETE on its pinned snapshot, in staged order — while another
+    // connection sees nothing until COMMIT and ROLLBACK discards the buffer.
+
+    #[test]
+    fn a_transaction_reads_its_own_buffered_writes() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        let mut txn = engine.begin();
+        engine
+            .stage_dml(&parse_one("INSERT INTO account VALUES (1, 100)"), &mut txn)
+            .expect("stage insert");
+
+        // The transaction sees its own buffered INSERT.
+        let StatementOutcome::Rows(seen) = engine
+            .execute_in_txn(&parse_one("SELECT id, balance FROM account"), &mut txn)
+            .expect("read-your-own insert")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            seen.rows.len(),
+            1,
+            "the buffered insert is visible to the transaction"
+        );
+        assert_eq!(
+            payload_column(&seen),
+            vec![encode_value(&ScalarValue::Int4(100))],
+            "and carries the inserted value",
+        );
+
+        // Another connection (auto-commit, its own snapshot) sees nothing — the
+        // write is still only buffered.
+        let StatementOutcome::Rows(other) = engine
+            .execute(&parse_one("SELECT id FROM account"))
+            .expect("auto-commit read")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            other.rows.len(),
+            0,
+            "buffered writes are invisible to other readers until COMMIT"
+        );
+
+        // UPDATE-then-read: the SELECT layers the staged UPDATE over the staged
+        // INSERT (repeated writes to the same key, applied front-to-back).
+        engine
+            .stage_dml(
+                &parse_one("UPDATE account SET balance = 250 WHERE id = 1"),
+                &mut txn,
+            )
+            .expect("stage update");
+        let StatementOutcome::Rows(updated) = engine
+            .execute_in_txn(&parse_one("SELECT balance FROM account"), &mut txn)
+            .expect("read-your-own update")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            payload_column(&updated),
+            vec![encode_value(&ScalarValue::Int4(250))],
+            "the SELECT sees the staged UPDATE, not the staged INSERT's value",
+        );
+
+        // DELETE-then-read: the row is gone for the transaction.
+        engine
+            .stage_dml(&parse_one("DELETE FROM account WHERE id = 1"), &mut txn)
+            .expect("stage delete");
+        let StatementOutcome::Rows(deleted) = engine
+            .execute_in_txn(&parse_one("SELECT id FROM account"), &mut txn)
+            .expect("read-your-own delete")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            deleted.rows.len(),
+            0,
+            "the staged DELETE hides the row from the transaction"
+        );
+
+        // ROLLBACK (drop the buffer): nothing ever reached storage.
+        drop(txn);
+        let StatementOutcome::Rows(after) = engine
+            .execute(&parse_one("SELECT id FROM account"))
+            .expect("after rollback")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            after.rows.len(),
+            0,
+            "rolled back: no buffered write reached storage"
+        );
+    }
+
+    #[test]
+    fn a_transaction_overlays_buffered_writes_on_committed_rows() {
+        // The pinned snapshot already holds committed rows; the transaction's
+        // buffered UPDATE overlays only the one it touches — through a key
+        // predicate and in a whole-table read — while the others keep their
+        // committed value.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("seed 1");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (2, 200)"))
+            .expect("seed 2");
+
+        let mut txn = engine.begin();
+        engine
+            .stage_dml(
+                &parse_one("UPDATE account SET balance = 999 WHERE id = 1"),
+                &mut txn,
+            )
+            .expect("stage update");
+
+        // A WHERE on the updated key reads the staged value; the untouched key
+        // reads its committed value.
+        let StatementOutcome::Rows(one) = engine
+            .execute_in_txn(
+                &parse_one("SELECT balance FROM account WHERE id = 1"),
+                &mut txn,
+            )
+            .expect("select id=1")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            payload_column(&one),
+            vec![encode_value(&ScalarValue::Int4(999))],
+            "the buffered UPDATE is visible through a key predicate",
+        );
+        let StatementOutcome::Rows(two) = engine
+            .execute_in_txn(
+                &parse_one("SELECT balance FROM account WHERE id = 2"),
+                &mut txn,
+            )
+            .expect("select id=2")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            payload_column(&two),
+            vec![encode_value(&ScalarValue::Int4(200))],
+            "an untouched committed row reads its committed value inside the transaction",
+        );
+
+        // The whole table for the transaction: id=1 overlaid, id=2 committed.
+        let StatementOutcome::Rows(all) = engine
+            .execute_in_txn(&parse_one("SELECT id, balance FROM account"), &mut txn)
+            .expect("select all")
+        else {
+            panic!("rows");
+        };
+        let mut got = all.rows;
+        got.sort();
+        let mut want = vec![
+            vec![
+                Some(encode_value(&ScalarValue::Int4(1))),
+                Some(encode_value(&ScalarValue::Int4(999))),
+            ],
+            vec![
+                Some(encode_value(&ScalarValue::Int4(2))),
+                Some(encode_value(&ScalarValue::Int4(200))),
+            ],
+        ];
+        want.sort();
+        assert_eq!(
+            got, want,
+            "the overlaid row and the committed row both appear"
+        );
+    }
+
+    #[test]
+    fn an_explicit_as_of_read_inside_a_transaction_ignores_buffered_writes() {
+        // Gating regression: read-your-own-writes overlays a *plain current* read
+        // only. An explicit `FOR SYSTEM_TIME AS OF` — even one that folds to the
+        // pinned snapshot — is a time-travel read and must show committed state
+        // only, never the transaction's uncommitted buffer. (Snapshot equality is
+        // *not* a sufficient gate: `AS OF now()` folds to the pinned snapshot.)
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("seed 100");
+
+        let mut txn = engine.begin();
+        let snap = txn.snapshot.0;
+        engine
+            .stage_dml(
+                &parse_one("UPDATE account SET balance = 999 WHERE id = 1"),
+                &mut txn,
+            )
+            .expect("stage update");
+
+        // A plain read overlays the buffer → 999.
+        let StatementOutcome::Rows(plain) = engine
+            .execute_in_txn(&parse_one("SELECT balance FROM account"), &mut txn)
+            .expect("plain read")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            payload_column(&plain),
+            vec![encode_value(&ScalarValue::Int4(999))],
+            "a plain read sees the buffered UPDATE",
+        );
+
+        // An explicit AS OF at the pinned snapshot reads committed state only → 100.
+        let sql = format!("SELECT balance FROM account FOR SYSTEM_TIME AS OF {snap}");
+        let StatementOutcome::Rows(as_of) = engine
+            .execute_in_txn(&parse_one(&sql), &mut txn)
+            .expect("as-of read")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            payload_column(&as_of),
+            vec![encode_value(&ScalarValue::Int4(100))],
+            "an explicit AS OF read ignores the transaction's buffered writes",
+        );
     }
 
     // --- Snapshot isolation oracle (STL-175, ADR-0008) ---------------------

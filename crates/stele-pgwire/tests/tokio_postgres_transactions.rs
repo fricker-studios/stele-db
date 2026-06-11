@@ -7,7 +7,8 @@
 //! and persists across simple-query messages, so each `BEGIN`/DML/`COMMIT` is
 //! sent as its own `simple_query` to prove the connection carries the state
 //! between messages (not just within one batch). Under **snapshot isolation**
-//! (STL-175) a transaction reads one consistent snapshot pinned at `BEGIN`, and a
+//! (STL-175) a transaction reads one consistent snapshot pinned at `BEGIN` — with
+//! its own buffered writes overlaid on it (STL-203, read-your-own-writes) — and a
 //! write-write conflict surfaces at `COMMIT` as a retryable serialization failure
 //! (SQLSTATE `40001`) — both exercised here across two connections. **Savepoints**
 //! (STL-176) extend the same loop: `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` /
@@ -26,14 +27,6 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
 mod common;
-
-/// The number of rows in a `SELECT … FROM account` reply.
-fn row_count(messages: &[SimpleQueryMessage]) -> usize {
-    messages
-        .iter()
-        .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
-        .count()
-}
 
 /// Every `balance` cell of a `SELECT balance …` reply, in row order.
 fn balances(messages: &[SimpleQueryMessage]) -> Vec<String> {
@@ -119,14 +112,20 @@ async fn commit_is_atomic_and_rollback_discards() {
         .await
         .expect("insert 2");
 
-    // Before COMMIT the rows are buffered, and the transaction reads its pinned
-    // snapshot (taken at BEGIN, before these inserts) — so the read returns
-    // nothing: neither the write buffer nor any newer state is visible (STL-175).
+    // Before COMMIT the rows are still only buffered (nothing has reached storage),
+    // but the transaction reads *its own* buffered writes overlaid on its pinned
+    // snapshot — read-your-own-writes (STL-203). (That other connections still see
+    // nothing until COMMIT is the snapshot isolation asserted in
+    // `a_transaction_reads_a_stable_snapshot_over_the_wire`.)
     let mid_txn = client
         .simple_query("SELECT id FROM account")
         .await
         .expect("select mid-transaction");
-    assert_eq!(row_count(&mid_txn), 0, "buffered writes are invisible");
+    assert_eq!(
+        ids(&mid_txn),
+        vec!["1", "2"],
+        "the transaction reads its own buffered inserts"
+    );
 
     client.simple_query("COMMIT").await.expect("commit");
 
