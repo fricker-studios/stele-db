@@ -238,7 +238,7 @@ deliberate later additions.
 Statement
 ├── body: StatementBody
 │   ├── Sql(sqlparser::ast::Statement)   // standard SQL, clauses stripped
-│   └── Admin(AdminCommand { Checkpoint | Flush })   // no sqlparser grammar
+│   └── Admin(AdminCommand)              // CHECKPOINT | FLUSH — no sqlparser grammar
 └── temporal: Temporal
     ├── system_versioning: bool         // WITH SYSTEM VERSIONING
     ├── valid_time: Option<ValidTimePeriod>   // VALID TIME (from, to)
