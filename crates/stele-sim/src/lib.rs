@@ -1280,6 +1280,214 @@ pub fn run_engine_flush_recover_faults_seed(seed: u64) -> u64 {
     digest
 }
 
+/// Apply one transaction of [`run_group_commit_recover_faults_seed`]: buffer a
+/// distinct-key batch under [`Engine::begin_group`], then [`Engine::commit_group`].
+///
+/// On a durable commit, fold the batch's effects into `oracle`/`boundaries`/`live`
+/// and return `true`; on a torn group commit or a staged-write fault, discard the
+/// buffer and return `false` — the crash, after which the caller stops the workload.
+/// Each write shares `txn` (the multi-statement commit's one transaction id).
+#[allow(clippy::too_many_arguments)] // engine + rng + the oracle/live/boundary model + txn id
+fn apply_group_txn(
+    engine: &mut Engine<StepClock, FaultDisk>,
+    rng: &mut Rng,
+    keys: &[BusinessKey],
+    live: &mut [bool],
+    oracle: &mut BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Option<Vec<u8>>>>,
+    boundaries: &mut Vec<SystemTimeMicros>,
+    txn: TxnId,
+) -> bool {
+    // A distinct-key subset (no intra-group same-key chaining), so each write is an
+    // independent insert/update/delete.
+    let mut pool: Vec<usize> = (0..keys.len()).collect();
+    let take = (1 + rng.below_usize(4)).min(keys.len());
+    for i in 0..take {
+        let j = i + rng.below_usize(pool.len() - i);
+        pool.swap(i, j);
+    }
+    let chosen = &pool[..take];
+
+    // Buffer each write (no WAL record yet). At this scale resolution never touches
+    // the disk, so the only workload fault surface is `commit_group` below.
+    engine.begin_group();
+    let mut staged: Vec<(BusinessKey, SystemTimeMicros, Option<Vec<u8>>, bool)> = Vec::new();
+    for &k in chosen {
+        let key = keys[k].clone();
+        let principal = Principal::new(b"sim".to_vec());
+        let payload = format!("t{}k{k}", txn.0).into_bytes();
+        let want_delete = live[k] && rng.below(2) == 0;
+        let outcome = if live[k] {
+            if want_delete {
+                engine.delete(&key, txn, principal)
+            } else {
+                engine.update(key.clone(), None, Some(payload.clone()), 0, txn, principal)
+            }
+        } else {
+            engine.insert(key.clone(), None, Some(payload.clone()), 0, txn, principal)
+        };
+        let Ok(o) = outcome else {
+            engine.abort_group();
+            return false;
+        };
+        staged.push((
+            key,
+            o.commit,
+            if want_delete { None } else { Some(payload) },
+            want_delete,
+        ));
+    }
+
+    // One record + one fsync. A torn or full-disk fault tears the whole transaction.
+    if engine.commit_group().is_err() {
+        return false;
+    }
+    for (key, commit, effect, _) in &staged {
+        oracle
+            .entry(key.clone())
+            .or_default()
+            .insert(*commit, effect.clone());
+    }
+    for (i, &k) in chosen.iter().enumerate() {
+        live[k] = !staged[i].3;
+    }
+    if let Some((_, last, _, _)) = staged.last() {
+        boundaries.push(*last);
+    }
+    true
+}
+
+/// Kill and `recover` a seeded **multi-statement group-commit** workload through a
+/// [`FaultDisk`] — the crash-atomic-commit DoD of [STL-192].
+///
+/// Each unit of work is a *transaction*: a small batch of writes to distinct keys,
+/// applied under [`Engine::begin_group`] (so every write buffers, applying to the
+/// delta/index but deferring its WAL record) and then made durable by a single
+/// [`Engine::commit_group`] — one WAL record group-committed with one fsync. The
+/// crash surface is therefore that one append/fsync: a torn or full-disk fault tears
+/// the *whole* transaction at once.
+///
+/// The reference oracle records a transaction's effects **only when its
+/// `commit_group` returned `Ok`** — an all-or-nothing unit — and `boundaries` holds
+/// each committed transaction's last commit instant. Recovery must then converge to
+/// a consistent **committed-transaction prefix**: every recovered `AS OF` equals the
+/// oracle truncated at some transaction boundary. A recovery that surfaced a *partial*
+/// transaction (some of its writes present, others not — the old per-write window)
+/// would match no boundary and the membership check (`verify_recovered_prefix`)
+/// would panic. That is the "never a partial prefix" guarantee, seed-reproducible.
+///
+/// The two-phase fault arming (write-path faults during the workload, read corruption
+/// during recovery), the prefix membership check, and the fault-event digest fold are
+/// the same as [`run_engine_recover_faults_seed`]. Same seed ⇒ same digest.
+///
+/// # Panics
+///
+/// Panics if recovery returns `Ok` with a state that is not a consistent
+/// committed-*transaction* prefix of the oracle — a partial commit survived a crash.
+#[must_use]
+pub fn run_group_commit_recover_faults_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+
+    // A distinct profile stream from the workload's, so the op sequence is
+    // independent of the fault mix. Torn/full skew a little higher than the
+    // single-write sweep so a group commit actually gets torn at these scales.
+    let mut prof_rng = Rng::new(seed ^ 0x9E37_79B9_7F4A_7C15);
+    let p_torn = prob_permille(&mut prof_rng, 40, 120);
+    let p_full = prob_permille(&mut prof_rng, 10, 30);
+    let p_slow = prob_permille(&mut prof_rng, 200, 500);
+    let p_bit = prob_permille(&mut prof_rng, 80, 200);
+    let p_short = prob_permille(&mut prof_rng, 80, 200);
+
+    let mut rng = Rng::new(seed);
+
+    let mut oracle: BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Option<Vec<u8>>>> =
+        BTreeMap::new();
+    // The last commit instant of each *durably committed* transaction — the only
+    // cutoffs a consistent recovery may land on.
+    let mut boundaries: Vec<SystemTimeMicros> = Vec::new();
+
+    let key_count = 2 + rng.below_usize(5);
+    let keys: Vec<BusinessKey> = (0..key_count)
+        .map(|i| BusinessKey::new(format!("k-{i:04}").into_bytes()))
+        .collect();
+
+    let disk = FaultDisk::new(seed, FaultProfile::none());
+    {
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1), false).expect("open engine");
+        disk.enable(FaultKind::TornWrite, p_torn);
+        disk.enable(FaultKind::FullDisk, p_full);
+        disk.enable(FaultKind::SlowSync, p_slow);
+
+        let mut live = vec![false; key_count];
+        let txns = 4 + rng.below(12);
+        for t in 0..txns {
+            // Each transaction shares one id across its writes (the multi-statement
+            // commit semantic). `apply_group_txn` returns `false` on the crash — a
+            // torn group commit or a staged-write fault — after which we stop.
+            if !apply_group_txn(
+                &mut engine,
+                &mut rng,
+                &keys,
+                &mut live,
+                &mut oracle,
+                &mut boundaries,
+                TxnId(t),
+            ) {
+                break;
+            }
+            // A periodic durable checkpoint advances the fence; a fault writing it is
+            // also a crash.
+            if rng.below(3) == 0 && engine.checkpoint().is_err() {
+                break;
+            }
+        }
+        let _ = engine.checkpoint();
+    }
+
+    // Re-arm for recovery: silence write faults, arm read corruption.
+    disk.disable(FaultKind::TornWrite);
+    disk.disable(FaultKind::FullDisk);
+    disk.disable(FaultKind::SlowSync);
+    disk.enable(FaultKind::BitFlip, p_bit);
+    disk.enable(FaultKind::ShortRead, p_short);
+
+    let recovered = Engine::recover(disk.clone(), StepClock::new(1_000_000), false);
+
+    disk.disable(FaultKind::BitFlip);
+    disk.disable(FaultKind::ShortRead);
+
+    let mut digest = FNV_OFFSET;
+    match recovered {
+        Err(_) => digest = fnv1a(digest, &[0xE2]),
+        Ok(engine) => {
+            // The recovered state must be a consistent committed-transaction prefix:
+            // the cutoffs are transaction boundaries, so a partial transaction fails.
+            let (k, recovered_fp) =
+                verify_recovered_prefix(seed, &engine, &oracle, &boundaries, &keys);
+            digest = fnv1a(digest, &[0x0C]);
+            digest = fnv1a(
+                digest,
+                &u64::try_from(k).expect("prefix len fits u64").to_le_bytes(),
+            );
+            for entry in &recovered_fp {
+                match entry {
+                    Some(payload) => {
+                        digest = fnv1a(digest, &[1]);
+                        digest = fnv1a(digest, payload);
+                    }
+                    None => digest = fnv1a(digest, &[0]),
+                }
+            }
+        }
+    }
+
+    for ev in disk.events() {
+        digest = fnv1a(digest, &ev.seq.to_le_bytes());
+        digest = fnv1a(digest, &[fault_op_tag(ev.op), fault_kind_tag(ev.kind)]);
+        digest = fnv1a(digest, &ev.detail.to_le_bytes());
+    }
+    digest
+}
+
 /// Close any open version of `key` at `commit`, then open a fresh `[commit, +∞)`
 /// version — the version a committed writer stages with the manager-assigned
 /// commit timestamp as its `sys_from`. Keeps exactly one open version per key, so
@@ -2276,6 +2484,10 @@ pub fn registry() -> Vec<Box<dyn Scenario>> {
             "engine-flush-recover-faults",
             run_engine_flush_recover_faults_seed,
         ),
+        FnScenario::fault(
+            "group-commit-recover-faults",
+            run_group_commit_recover_faults_seed,
+        ),
         FnScenario::boxed("schedule", run_schedule_seed_digest),
         FnScenario::fault("fault-disk", run_fault_seed),
     ]
@@ -2731,7 +2943,8 @@ mod tests {
             [
                 "engine-flush-recover-faults",
                 "engine-recover-faults",
-                "fault-disk"
+                "fault-disk",
+                "group-commit-recover-faults",
             ],
             "exactly the fault-injected scenarios are fault-gated"
         );
@@ -2762,6 +2975,10 @@ mod tests {
         assert_eq!(
             replayed["engine-recover-faults"],
             run_engine_recover_faults_seed(seed)
+        );
+        assert_eq!(
+            replayed["group-commit-recover-faults"],
+            run_group_commit_recover_faults_seed(seed)
         );
         assert_eq!(replayed["schedule"], run_schedule_seed_digest(seed));
         assert_eq!(replayed["fault-disk"], run_fault_seed(seed));

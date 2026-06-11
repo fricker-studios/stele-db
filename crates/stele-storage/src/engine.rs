@@ -379,6 +379,39 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         )?)
     }
 
+    /// Open a **group-commit** buffer ([`DmlWriter::begin_group`], [STL-192]).
+    ///
+    /// Until [`commit_group`](Self::commit_group) or [`abort_group`](Self::abort_group),
+    /// each [`insert`](Self::insert) / [`update`](Self::update) / [`delete`](Self::delete)
+    /// applies to the delta/index but defers its WAL record, so a multi-statement
+    /// transaction can be logged as one record and made durable with one fsync —
+    /// the crash-atomic boundary that recovers all-or-none.
+    pub fn begin_group(&mut self) {
+        self.writer.begin_group();
+    }
+
+    /// Group-commit the open buffer ([`DmlWriter::commit_group`], [STL-192]): append
+    /// the transaction's writes as a single WAL record and fsync once. Returns the
+    /// durable end after the fsync.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Dml`] if the append or fsync fails. A torn or unwritten append
+    /// recovers to nothing; but if the append succeeds and only the fsync fails the
+    /// staged record's durability is **indeterminate** (a later `tick` may still
+    /// flush it), so that case must be treated as a crash rather than a clean abort —
+    /// see [`DmlWriter::commit_group`] and [STL-217].
+    pub fn commit_group(&mut self) -> Result<LogOffset, EngineError> {
+        Ok(self.writer.commit_group()?)
+    }
+
+    /// Discard the open group buffer without logging it — the transaction aborted
+    /// ([`DmlWriter::abort_group`], [STL-192]). The applied (non-durable) delta/index
+    /// state is rebuilt from the log on recovery, so the aborted writes do not survive.
+    pub fn abort_group(&mut self) {
+        self.writer.abort_group();
+    }
+
     /// Take a **checkpoint**: group-commit fsync the WAL, then record the new
     /// durable end as the last fully-flushed offset in the checkpoint file. Leaves
     /// the replay floor and committed-segment count untouched — this is the

@@ -27,6 +27,19 @@
 //! So if the process dies between the two, recovery still reconstructs the delta
 //! by replaying the log — and never the other way around.
 //!
+//! ## Group commit: one record per transaction ([STL-192])
+//!
+//! A multi-statement `COMMIT` opens a [group buffer](DmlWriter::begin_group): each
+//! write then *applies* to the delta/index immediately — so a later write in the
+//! transaction resolves against an earlier one — but its redos are buffered rather
+//! than appended, and [`commit_group`](DmlWriter::commit_group) writes the whole
+//! transaction as **one** record group-committed with **one** fsync. The delta is
+//! non-durable (rebuilt from the log on recovery), so applying before that single
+//! fsync is safe: a crash before `commit_group` leaves no record and recovery
+//! reconstructs *none* of the transaction's writes; a crash that tears the record
+//! drops it whole at the fence. Either way the transaction recovers all-or-none —
+//! the WAL record boundary is the transaction boundary.
+//!
 //! ## One apply path, forward and on recovery
 //!
 //! A redo record is exactly the set of resolved [`Version`]s the operation
@@ -95,9 +108,13 @@ pub struct DmlOutcome {
     /// The system-time `sys_from` stamped on the new version (for `INSERT` /
     /// `UPDATE`), or the `sys_to` the period was closed at (for `DELETE`).
     pub commit: SystemTimeMicros,
-    /// The WAL position immediately after this operation's redo record. Pass it
-    /// to [`Wal::commit`] to await durability — the operation is staged in the
-    /// delta but is only durable once an fsync covers this offset.
+    /// The WAL position to await for durability. On the auto-commit path it is the
+    /// offset immediately *after* this operation's redo record — pass it to
+    /// [`Wal::commit`]; the operation is durable once an fsync covers it. In
+    /// **group-commit** mode the redo record is deferred to
+    /// [`DmlWriter::commit_group`], so this is instead the current durable end (this
+    /// write is not past it yet); the caller awaits the group's durability through
+    /// `commit_group`, not this offset.
     pub wal: LogOffset,
 }
 
@@ -110,6 +127,19 @@ pub struct DmlOutcome {
 pub struct DmlWriter<C: Clock, D: Disk> {
     wal: Wal<D>,
     writer: ValidTimeWriter<C>,
+    /// The open group-commit buffer, if a multi-statement transaction is in
+    /// flight ([`begin_group`](Self::begin_group), [STL-192]).
+    ///
+    /// `None` is the auto-commit default: each write appends and is logged as its
+    /// own WAL record. `Some(buffer)` defers the WAL record: a write *applies* to
+    /// the delta/index immediately (so a later write in the same transaction
+    /// resolves against it, front-to-back) but its redos accumulate here instead of
+    /// being appended, until [`commit_group`](Self::commit_group) writes the whole
+    /// transaction as **one** record group-committed with **one** fsync — the
+    /// durability point (invariant 2). That single record is the atomic unit
+    /// recovery replays whole or, if a crash tears it, drops at the fence — so a
+    /// committed transaction's writes recover all-or-none.
+    group: Option<Vec<Redo>>,
 }
 
 // `Wal` is not `Debug` (it guards a `Disk` handle behind a mutex) and the clock
@@ -120,6 +150,7 @@ impl<C: Clock, D: Disk> std::fmt::Debug for DmlWriter<C, D> {
         f.debug_struct("DmlWriter")
             .field("valid_time", &self.writer.valid_time_enabled())
             .field("last_commit", &self.writer.last_commit())
+            .field("group_buffered", &self.group.as_ref().map(Vec::len))
             .finish_non_exhaustive()
     }
 }
@@ -132,6 +163,7 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
         Self {
             wal,
             writer: ValidTimeWriter::new(clock, valid_time),
+            group: None,
         }
     }
 
@@ -238,21 +270,107 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
         self.log_and_apply(delta, index, commit, redos)
     }
 
-    /// Log the resolved redo set to the WAL, then stage it into the delta tier
-    /// and validity index — in that order, so the record is durable-eligible
-    /// before either structure is touched. The returned [`DmlOutcome::wal`] is
-    /// the post-record offset to await for durability.
+    /// Log the resolved redo set, then stage it into the delta tier and validity
+    /// index.
+    ///
+    /// **Auto-commit (no open group)** is write-ahead: the redos are appended as
+    /// their own WAL record *before* either structure is touched, so the record is
+    /// durable-eligible first. [`DmlOutcome::wal`] is the post-record offset to
+    /// await for durability.
+    ///
+    /// **Group-commit (a transaction is in flight, [STL-192])** defers the WAL
+    /// record to [`commit_group`](Self::commit_group): the redos apply to the
+    /// delta/index now — so a later write in the same transaction resolves against
+    /// this one (front-to-back) — and accumulate in the group buffer. Nothing is
+    /// durable until `commit_group` writes the whole transaction as one record and
+    /// fsyncs once, so a crash before then recovers *none* of the buffered writes.
+    /// [`DmlOutcome::wal`] reports the current durable end (this write is not past
+    /// it yet); the auto-commit callers ignore the offset.
     fn log_and_apply<I: Disk>(
-        &self,
+        &mut self,
         delta: &mut Delta<D>,
         index: &mut ValidityIndex<I>,
         commit: SystemTimeMicros,
         redos: Vec<Redo>,
     ) -> Result<DmlOutcome, DmlError> {
+        if self.group.is_some() {
+            // Apply before buffering so a same-transaction successor sees this
+            // write; the WAL record is deferred to `commit_group`.
+            crate::systime::apply(delta, index, redos.clone())?;
+            let wal = self.wal.durable_end();
+            self.group.as_mut().expect("group is open").extend(redos);
+            return Ok(DmlOutcome { commit, wal });
+        }
         let record = encode_redo(&redos)?;
         let wal = self.wal.append(&record)?;
         crate::systime::apply(delta, index, redos)?;
         Ok(DmlOutcome { commit, wal })
+    }
+
+    /// Open a group-commit buffer: subsequent writes apply to the delta/index but
+    /// defer their WAL record to [`commit_group`](Self::commit_group), so the whole
+    /// transaction lands as one record group-committed with one fsync ([STL-192]).
+    ///
+    /// Call once at the start of a multi-statement transaction's apply phase, paired
+    /// with exactly one [`commit_group`](Self::commit_group) (durable) or
+    /// [`abort_group`](Self::abort_group) (discard). A fresh buffer is installed each
+    /// call — a stray prior buffer (a transaction that was neither committed nor
+    /// aborted) is discarded, never silently appended.
+    pub fn begin_group(&mut self) {
+        self.group = Some(Vec::new());
+    }
+
+    /// Group-commit the open buffer: append every redo the transaction staged as a
+    /// **single** WAL record and fsync once — the one durability point per `COMMIT`
+    /// (invariant 2, [STL-192]). Returns the durable end after the fsync.
+    ///
+    /// The record is the atomic unit: recovery's [`recover_replay`] applies the
+    /// whole redo set or, if a crash tears the record, drops it at the durable
+    /// fence ([`crate::wal`]'s torn-write contract) — so the transaction's writes
+    /// recover all-or-none. An empty buffer (a read-only transaction, or one whose
+    /// writes all went to other tables) writes no record and skips the fsync.
+    ///
+    /// Clears the group buffer, returning the writer to auto-commit mode.
+    ///
+    /// # Errors
+    ///
+    /// [`DmlError::Wal`] if the append or fsync fails. Two cases, per the WAL
+    /// durability contract:
+    ///
+    /// * **the append fails / is torn** — no complete record reaches the log, so
+    ///   recovery finds nothing of the transaction (a torn frame fails its CRC and
+    ///   is dropped at the fence); and
+    /// * **the append succeeds but the fsync ([`Wal::tick`]) fails** — the complete
+    ///   record is already *staged* in the WAL, so its durability is **indeterminate**:
+    ///   a later successful `tick` (e.g. a [`checkpoint`](crate::engine::Engine::checkpoint))
+    ///   could still make it durable. An fsync failure must therefore be treated as a
+    ///   crash (the engine should stop and recover) rather than as a clean abort —
+    ///   hardening the engine to enforce that is [STL-217]. Either way no *new*
+    ///   durability point is introduced: the fsync is the only one.
+    ///
+    /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
+    pub fn commit_group(&mut self) -> Result<LogOffset, DmlError> {
+        let redos = self.group.take().unwrap_or_default();
+        if redos.is_empty() {
+            return Ok(self.wal.durable_end());
+        }
+        let record = encode_redo(&redos)?;
+        self.wal.append(&record)?;
+        // The single group-commit fsync — the transaction's durability point. If it
+        // fails after the append above, the staged record's durability is
+        // indeterminate (a later tick may still flush it); the caller must treat
+        // that as a crash, not a clean abort (STL-217).
+        self.wal.tick()?;
+        Ok(self.wal.durable_end())
+    }
+
+    /// Discard the open group buffer without logging it — the transaction aborted
+    /// ([STL-192]). The buffered redos were already applied to the (non-durable)
+    /// delta/index, but with no WAL record they are never made durable: a recovery
+    /// rebuilds the tiers from the log and so drops them. Returns the writer to
+    /// auto-commit mode.
+    pub fn abort_group(&mut self) {
+        self.group = None;
     }
 }
 
@@ -607,6 +725,135 @@ mod tests {
                 Err(DmlError::Wal(_)),
             ),
             "corruption before the fence is fatal, not a tolerated tail",
+        );
+    }
+
+    /// A monotonic step clock for the group-commit tests: each reading is one µs
+    /// past the last, so the writes in a transaction get distinct `sys_from`s.
+    struct StepClock(std::sync::atomic::AtomicI64);
+    impl stele_common::time::Clock for StepClock {
+        fn now(&self) -> SystemTimeMicros {
+            SystemTimeMicros(self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1)
+        }
+    }
+
+    /// A group commit defers every buffered write to **one** WAL record and **one**
+    /// fsync ([STL-192]): mid-transaction nothing is appended, and `commit_group`
+    /// then writes the whole set as a single record that recovery replays whole.
+    /// This is the property that makes a transaction's writes recover all-or-none.
+    #[test]
+    fn group_commit_writes_one_record_with_one_fsync() {
+        use stele_common::provenance::Principal;
+
+        use crate::backend::MemDisk;
+        use crate::delta::{Delta, DeltaConfig};
+        use crate::systime::EmptySealed;
+        use crate::validity::{ValidityConfig, ValidityIndex};
+        use crate::wal::{Wal, WalConfig};
+
+        let disk = MemDisk::new();
+        let wal = Wal::open(disk, WalConfig::default()).expect("wal");
+        let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
+        let mut index =
+            ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+        let mut writer = DmlWriter::new(
+            wal.clone(),
+            StepClock(std::sync::atomic::AtomicI64::new(0)),
+            false,
+        );
+        let principal = Principal::new(b"p".to_vec());
+
+        writer.begin_group();
+        for (i, payload) in [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+            .into_iter()
+            .enumerate()
+        {
+            writer
+                .insert(
+                    &mut delta,
+                    &mut index,
+                    &EmptySealed,
+                    BusinessKey::new(format!("k{i}").into_bytes()),
+                    None,
+                    Some(payload),
+                    0,
+                    TxnId(7),
+                    principal.clone(),
+                )
+                .expect("buffered insert");
+        }
+
+        // Group mode defers the WAL record: nothing is appended or fsynced yet.
+        assert_eq!(
+            wal.replay_from(Checkpoint::BEGIN).count(),
+            0,
+            "the transaction's writes are buffered, not appended per write"
+        );
+        assert_eq!(
+            wal.durable_end(),
+            LogOffset::ZERO,
+            "no fsync before commit_group"
+        );
+
+        writer.commit_group().expect("group commit");
+
+        // Exactly one record now carries all three inserts' redos, and it is durable.
+        let records: Vec<Vec<u8>> = wal
+            .replay_from(Checkpoint::BEGIN)
+            .collect::<Result<_, _>>()
+            .expect("replay");
+        assert_eq!(records.len(), 1, "the whole transaction is one WAL record");
+        let redos = decode_redo(&records[0]).expect("decode the transaction record");
+        assert_eq!(redos.len(), 3, "all three inserts ride in the one record");
+        assert!(
+            wal.durable_end() > LogOffset::ZERO,
+            "commit_group fsynced the record once",
+        );
+    }
+
+    /// Aborting a group discards the buffered writes: no WAL record is ever written,
+    /// so a recovery finds no trace of the aborted transaction ([STL-192]).
+    #[test]
+    fn abort_group_writes_no_record() {
+        use stele_common::provenance::Principal;
+
+        use crate::backend::MemDisk;
+        use crate::delta::{Delta, DeltaConfig};
+        use crate::systime::EmptySealed;
+        use crate::validity::{ValidityConfig, ValidityIndex};
+        use crate::wal::{Wal, WalConfig};
+
+        let disk = MemDisk::new();
+        let wal = Wal::open(disk, WalConfig::default()).expect("wal");
+        let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
+        let mut index =
+            ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+        let mut writer = DmlWriter::new(
+            wal.clone(),
+            StepClock(std::sync::atomic::AtomicI64::new(0)),
+            false,
+        );
+
+        writer.begin_group();
+        writer
+            .insert(
+                &mut delta,
+                &mut index,
+                &EmptySealed,
+                BusinessKey::new(b"k".to_vec()),
+                None,
+                Some(b"v".to_vec()),
+                0,
+                TxnId(1),
+                Principal::new(b"p".to_vec()),
+            )
+            .expect("buffered insert");
+        writer.abort_group();
+
+        assert_eq!(
+            wal.replay_from(Checkpoint::BEGIN).count(),
+            0,
+            "an aborted group leaves no durable record"
         );
     }
 }
