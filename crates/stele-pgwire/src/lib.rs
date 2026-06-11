@@ -1920,16 +1920,26 @@ async fn handle_bind(
         }
     }
 
-    let bound = match pstmt {
-        None => None,
-        Some(stmt) => match extended::substitute(&stmt, &values) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                return fail_extended(stream, state, SQLSTATE_PROTOCOL_VIOLATION, &e.to_string())
-                    .await;
-            }
-        },
-    };
+    // An empty-query prepared statement has no SQL body and so no placeholders;
+    // otherwise substitution reports how many `$n` the statement requires.
+    let (bound, required) = pstmt.map_or((None, 0), |stmt| {
+        let (substituted, required) = extended::substitute(&stmt, &values);
+        (Some(substituted), required)
+    });
+    // The supplied parameter count must match the prepared statement's `$n`
+    // placeholder count, as Postgres requires; surplus parameters used to be
+    // silently dropped (STL-222). A zero-placeholder statement — an admin command,
+    // `SELECT 1`, a `CREATE TABLE` — bound with any parameters is the concrete case
+    // this rejects.
+    if values.len() != required {
+        let m = format!(
+            "bind message supplies {} parameters, but prepared statement \"{}\" requires {}",
+            values.len(),
+            msg.statement,
+            required,
+        );
+        return fail_extended(stream, state, SQLSTATE_PROTOCOL_VIOLATION, &m).await;
+    }
     state.portals.insert(
         msg.portal,
         PortalEntry {

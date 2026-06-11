@@ -5,6 +5,11 @@
 //! Cargo does not compile it as its own test binary — it is pulled into each
 //! suite with `mod common;`.
 
+// Each suite pulls in the whole module but uses only the helpers it needs (a
+// raw-socket suite spawns a server without `conn_str`, for instance), so an
+// unused helper in some binaries is expected rather than dead code.
+#![allow(dead_code)]
+
 use std::net::SocketAddr;
 
 use stele_pgwire::{Server, SharedSession};
