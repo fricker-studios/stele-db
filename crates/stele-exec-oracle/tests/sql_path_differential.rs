@@ -354,7 +354,7 @@ struct Seed {
 ///   * **delta-only** — never seal; every read resolves from the delta tier.
 ///   * **fully sealed** — seal the whole delta once *after* the last write; every
 ///     read resolves from sealed segments.
-///   * **mixed** — seal *between* writes (a per-op coin), so a prior version lands
+///   * **mixed** — seal *between* writes (a 1-in-3 per-op draw), so a prior version lands
 ///     in a sealed segment and a later valid-time `UPDATE` reads it back from
 ///     there. That read-modify-write across the tier boundary is the path STL-226
 ///     fixed: a sealed prior version stores its payload bare (the interval rides
@@ -436,10 +436,10 @@ fn run_seed(seed: u64, duck: &DuckModel) -> Seed {
         }
         dml_ops += 1;
 
-        // Mixed schedule: seal between writes with a per-op coin, so a prior
-        // version lands in a sealed segment and the next UPDATE/DELETE of that key
+        // Mixed schedule: seal between writes on a 1-in-3 per-op draw, so a prior
+        // version lands in a sealed segment and a later UPDATE/DELETE of that key
         // reads it back across the tier boundary (STL-226). A seal on an empty
-        // delta is an idempotent no-op, so a coin right after a seal is harmless.
+        // delta is an idempotent no-op, so a draw right after a seal is harmless.
         if seal_mode == 2 && rng.range(3) == 0 {
             engine.flush().expect("seal the delta mid-history");
         }

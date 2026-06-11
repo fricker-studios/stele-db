@@ -3580,6 +3580,15 @@ mod tests {
         let StatementOutcome::Rows(r) = engine.execute(&parse_one(&sql)).expect("select") else {
             panic!("SELECT must return rows");
         };
+        // A pinned (sys, valid) point resolves to at most one live version per key;
+        // a duplicate would mean the scan returned two versions for one key, which
+        // these regression cases must catch loudly rather than silently take the
+        // first of.
+        assert!(
+            r.rows.len() <= 1,
+            "at most one version is live at a pinned (sys, valid) point — got {}",
+            r.rows.len(),
+        );
         r.rows
             .into_iter()
             .next()
