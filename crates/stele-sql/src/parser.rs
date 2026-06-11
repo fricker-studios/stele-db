@@ -26,7 +26,8 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 use stele_common::period::PeriodPredicate;
 
 use crate::ast::{
-    AsOf, PeriodExpr, PeriodPredicateClause, Statement, Temporal, TimeDimension, ValidTimePeriod,
+    AdminCommand, AsOf, PeriodExpr, PeriodPredicateClause, Statement, StatementBody, Temporal,
+    TimeDimension, ValidTimePeriod,
 };
 use crate::dialect::SteleDialect;
 use crate::error::ParseError;
@@ -91,6 +92,18 @@ fn split_statements(tokens: Vec<Token>) -> Vec<Vec<Token>> {
 /// and stitch the two back together.
 fn parse_one(mut tokens: Vec<Token>) -> Result<Statement, ParseError> {
     let dialect = SteleDialect::default();
+
+    // Stele admin commands (`CHECKPOINT` / `FLUSH`) have no `sqlparser` grammar,
+    // so recognize them at the token level before handing the remainder to
+    // `sqlparser` — which would reject the bare keyword. Same lift discipline as
+    // the temporal clauses; an admin command carries no body and no temporal.
+    if let Some(admin) = lift_admin_command(&tokens)? {
+        return Ok(Statement {
+            body: StatementBody::Admin(admin),
+            temporal: Temporal::default(),
+        });
+    }
+
     let (system_versioning, valid_time) = extract_create_table_clauses(&mut tokens)?;
     let as_of = lift_as_of(&mut tokens, &dialect)?;
     let period_predicate = lift_period_predicate(&mut tokens, &dialect)?;
@@ -128,7 +141,7 @@ fn parse_one(mut tokens: Vec<Token>) -> Result<Statement, ParseError> {
     }
 
     Ok(Statement {
-        body,
+        body: StatementBody::Sql(body),
         temporal: Temporal {
             system_versioning,
             valid_time,
@@ -136,6 +149,29 @@ fn parse_one(mut tokens: Vec<Token>) -> Result<Statement, ParseError> {
             period_predicate,
         },
     })
+}
+
+/// Recognize a bare Stele admin command (`CHECKPOINT` / `FLUSH`) — a single
+/// keyword that `sqlparser` has no grammar for ([STL-219]). Returns the command,
+/// `None` if the tokens are not an admin command, or an error if the keyword
+/// carries trailing tokens (both commands take no arguments).
+fn lift_admin_command(tokens: &[Token]) -> Result<Option<AdminCommand>, ParseError> {
+    let Some(first) = tokens.first() else {
+        return Ok(None);
+    };
+    let (cmd, name) = if word_is(first, "CHECKPOINT") {
+        (AdminCommand::Checkpoint, "CHECKPOINT")
+    } else if word_is(first, "FLUSH") {
+        (AdminCommand::Flush, "FLUSH")
+    } else {
+        return Ok(None);
+    };
+    if tokens.len() != 1 {
+        return Err(ParseError::Syntax(ParserError::ParserError(format!(
+            "{name} takes no arguments"
+        ))));
+    }
+    Ok(Some(cmd))
 }
 
 /// Whether a token is an (unquoted) word equal to `kw`, case-insensitively.
@@ -527,11 +563,12 @@ mod period_tests {
         let clause = stmt
             .temporal
             .period_predicate
+            .as_ref()
             .expect("period predicate lifted");
         assert_eq!(clause.predicate, PeriodPredicate::Contains);
         // The standard-SQL body is left with a clean, predicate-free WHERE.
-        match &stmt.body {
-            SqlStatement::Query(q) => {
+        match stmt.sql() {
+            Some(SqlStatement::Query(q)) => {
                 if let sqlparser::ast::SetExpr::Select(s) = q.body.as_ref() {
                     assert!(
                         s.selection.is_none(),

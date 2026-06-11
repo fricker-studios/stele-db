@@ -369,7 +369,11 @@ fn parse_bool(text: &str) -> Option<bool> {
 pub(crate) fn substitute(stmt: &Statement, params: &[Value]) -> Result<Statement, ParamError> {
     let mut out = stmt.clone();
     let mut err = None;
-    walk_statement(&mut out.body, params, &mut err);
+    // An admin command (CHECKPOINT / FLUSH) has no SQL body and no placeholders,
+    // so there is nothing to substitute — `sql_mut()` is `None`.
+    if let Some(body) = out.sql_mut() {
+        walk_statement(body, params, &mut err);
+    }
     err.map_or(Ok(out), Err)
 }
 
@@ -686,7 +690,7 @@ mod tests {
         let stmt = parse_one("INSERT INTO account VALUES ($1, $2)");
         let params = vec![Value::Number("1".to_owned(), false), Value::Null];
         let bound = substitute(&stmt, &params).expect("substitute");
-        let SqlStatement::Insert(insert) = &bound.body else {
+        let Some(SqlStatement::Insert(insert)) = bound.sql() else {
             panic!("insert");
         };
         let query = insert.source.as_deref().expect("source");
@@ -706,7 +710,7 @@ mod tests {
             Value::Number("1".to_owned(), false),
         ];
         let bound = substitute(&stmt, &params).expect("substitute");
-        let SqlStatement::Update(update) = &bound.body else {
+        let Some(SqlStatement::Update(update)) = bound.sql() else {
             panic!("update");
         };
         assert_eq!(

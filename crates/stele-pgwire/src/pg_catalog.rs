@@ -58,7 +58,7 @@ pub(crate) enum Introspection {
 /// relation name (regex anchors `^(…)$` stripped, so both `relname = 'account'`
 /// and `relname ~ '^(account)$'` work), an integer for the `attrelid` oid.
 pub(crate) fn classify(stmt: &Statement) -> Option<Introspection> {
-    let SqlStatement::Query(query) = &stmt.body else {
+    let Some(SqlStatement::Query(query)) = stmt.sql() else {
         return None;
     };
     let SetExpr::Select(select) = query.body.as_ref() else {

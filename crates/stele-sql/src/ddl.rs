@@ -160,7 +160,11 @@ impl DdlOutcome {
 /// [`BindError::NotDdl`] if the statement is not a `CREATE TABLE` / `DROP TABLE`;
 /// otherwise a [`BindError`] variant describing the unsupported or malformed DDL.
 pub fn bind_ddl(stmt: &Statement) -> Result<DdlStatement, BindError> {
-    match &stmt.body {
+    // An admin command (CHECKPOINT / FLUSH) has no SQL body, so it is "not DDL".
+    let Some(body) = stmt.sql() else {
+        return Err(BindError::NotDdl);
+    };
+    match body {
         SqlStatement::CreateTable(create) => bind_create_table(create, stmt),
         SqlStatement::Drop {
             object_type: ObjectType::Table,

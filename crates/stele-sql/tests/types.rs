@@ -50,7 +50,7 @@ fn lowers_every_column_of_the_demo_create_table() {
     let stmts =
         parse("CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING")
             .unwrap();
-    let SqlStatement::CreateTable(ct) = &stmts[0].body else {
+    let Some(SqlStatement::CreateTable(ct)) = stmts[0].sql() else {
         panic!("expected CREATE TABLE");
     };
     let resolved: Vec<LogicalType> = ct
@@ -65,7 +65,7 @@ fn lowers_every_column_of_the_demo_create_table() {
 fn column_type(sql_ty: &str) -> DataType {
     let sql = format!("CREATE TABLE t (c {sql_ty})");
     let stmts = parse(&sql).expect("create table should parse");
-    let SqlStatement::CreateTable(ct) = &stmts[0].body else {
+    let Some(SqlStatement::CreateTable(ct)) = stmts[0].sql() else {
         panic!("expected CREATE TABLE");
     };
     ct.columns[0].data_type.clone()

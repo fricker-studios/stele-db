@@ -75,7 +75,8 @@ pub mod select;
 pub mod types;
 
 pub use ast::{
-    AsOf, PeriodExpr, PeriodPredicateClause, Statement, Temporal, TimeDimension, ValidTimePeriod,
+    AdminCommand, AsOf, PeriodExpr, PeriodPredicateClause, Statement, StatementBody, Temporal,
+    TimeDimension, ValidTimePeriod,
 };
 pub use ddl::{BindError, DdlOutcome, DdlStatement, bind_ddl};
 pub use dialect::SteleDialect;

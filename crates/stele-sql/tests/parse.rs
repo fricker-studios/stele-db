@@ -6,7 +6,7 @@
 //! grammar. The negative cases pin what the parser must reject.
 
 use sqlparser::ast::{SetExpr, Statement as SqlStatement, TableFactor};
-use stele_sql::{TimeDimension, parse};
+use stele_sql::{AdminCommand, StatementBody, TimeDimension, parse};
 
 /// The canonical four-statement identity demo.
 const DEMO: &str = "\
@@ -20,10 +20,10 @@ fn identity_demo_round_trips() {
     let stmts = parse(DEMO).expect("identity demo should parse");
     assert_eq!(stmts.len(), 4, "four statements");
 
-    assert!(matches!(stmts[0].body, SqlStatement::CreateTable(_)));
-    assert!(matches!(stmts[1].body, SqlStatement::Insert(_)));
-    assert!(matches!(stmts[2].body, SqlStatement::Update { .. }));
-    assert!(matches!(stmts[3].body, SqlStatement::Query(_)));
+    assert!(matches!(stmts[0].sql(), Some(SqlStatement::CreateTable(_))));
+    assert!(matches!(stmts[1].sql(), Some(SqlStatement::Insert(_))));
+    assert!(matches!(stmts[2].sql(), Some(SqlStatement::Update { .. })));
+    assert!(matches!(stmts[3].sql(), Some(SqlStatement::Query(_))));
 }
 
 #[test]
@@ -35,7 +35,7 @@ fn create_table_captures_system_versioning() {
     assert!(stmts[0].temporal.valid_time.is_none());
 
     // The stripped body is clean, standard CREATE TABLE.
-    let SqlStatement::CreateTable(ct) = &stmts[0].body else {
+    let Some(SqlStatement::CreateTable(ct)) = stmts[0].sql() else {
         panic!("expected CREATE TABLE");
     };
     assert_eq!(ct.name.to_string(), "account");
@@ -102,7 +102,7 @@ fn select_captures_system_time_as_of() {
 
     // The qualifier is lifted off the token stream into `temporal`; the body
     // `sqlparser` parses is clean standard SQL with no native version.
-    assert!(!table_has_version(&stmts[0].body));
+    assert!(!table_has_version(stmts[0].sql().expect("sql body")));
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn select_captures_valid_time_as_of() {
     let as_of = &stmts[0].temporal.as_of;
     assert_eq!(as_of.len(), 1);
     assert_eq!(as_of[0].dimension, TimeDimension::Valid);
-    assert!(!table_has_version(&stmts[0].body));
+    assert!(!table_has_version(stmts[0].sql().expect("sql body")));
 }
 
 #[test]
@@ -135,7 +135,7 @@ fn select_captures_both_axes_as_of_in_source_order() {
         .map(|a| a.dimension)
         .collect();
     assert_eq!(dims, vec![TimeDimension::Valid, TimeDimension::System]);
-    assert!(!table_has_version(&stmts[0].body));
+    assert!(!table_has_version(stmts[0].sql().expect("sql body")));
 }
 
 #[test]
@@ -216,6 +216,53 @@ fn rejects_as_of_on_non_select_statements() {
             "expected a temporal-grammar rejection for: {sql}"
         );
     }
+}
+
+// --- admin commands (STL-219) --------------------------------------------
+
+#[test]
+fn parses_checkpoint_and_flush_as_admin_commands() {
+    // The two storage admin commands have no sqlparser grammar; they are lifted
+    // at the token level into an admin body (case-insensitive, trailing `;` ok).
+    for (sql, want) in [
+        ("CHECKPOINT", AdminCommand::Checkpoint),
+        ("checkpoint;", AdminCommand::Checkpoint),
+        ("FLUSH", AdminCommand::Flush),
+        ("Flush ;", AdminCommand::Flush),
+    ] {
+        let stmts = parse(sql).unwrap_or_else(|e| panic!("parse {sql:?}: {e}"));
+        assert_eq!(stmts.len(), 1, "{sql:?} is one statement");
+        assert!(
+            !stmts[0].is_temporal(),
+            "{sql:?} carries no temporal grammar"
+        );
+        assert!(stmts[0].sql().is_none(), "{sql:?} has no SQL body");
+        match &stmts[0].body {
+            StatementBody::Admin(cmd) => assert_eq!(*cmd, want, "{sql:?}"),
+            StatementBody::Sql(_) => panic!("{sql:?} must be an admin command"),
+        }
+    }
+}
+
+#[test]
+fn admin_commands_take_no_arguments() {
+    // A trailing token after the keyword is a hard error, not a silent strip.
+    assert!(parse("CHECKPOINT 5").is_err());
+    assert!(parse("FLUSH TABLES").is_err());
+}
+
+#[test]
+fn checkpoint_mid_batch_is_one_of_several_statements() {
+    // An admin command composes with ordinary statements in a `;`-separated batch.
+    let stmts = parse("CREATE TABLE t (id INT) WITH SYSTEM VERSIONING; CHECKPOINT; SELECT 1")
+        .expect("batch parses");
+    assert_eq!(stmts.len(), 3);
+    assert!(matches!(stmts[0].sql(), Some(SqlStatement::CreateTable(_))));
+    assert!(matches!(
+        &stmts[1].body,
+        StatementBody::Admin(AdminCommand::Checkpoint)
+    ));
+    assert!(matches!(stmts[2].sql(), Some(SqlStatement::Query(_))));
 }
 
 /// True if the (single) statement is a query whose first table factor carries a
