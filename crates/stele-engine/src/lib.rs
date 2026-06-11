@@ -912,6 +912,21 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         Ok(())
     }
 
+    /// Whether any resident table's WAL is **poisoned** — a prior fsync failed on
+    /// that table, so its staged record's durability is indeterminate and the
+    /// per-table engine now refuses further writes ([`Engine::is_poisoned`],
+    /// [STL-217]). A poisoned session must stop serving and restart into
+    /// [`recover`](Self::recover): a failed fsync is a crash, not a clean abort, and
+    /// recovery resolves the indeterminate record from the durable log while opening
+    /// fresh, unpoisoned WALs. Spans **every** resident tier, including
+    /// dropped-but-retained ones, since each owns its own WAL.
+    ///
+    /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.tables.values().any(|state| state.engine.is_poisoned())
+    }
+
     /// The session's catalog — schemas resolve at a snapshot through it.
     #[must_use]
     pub const fn catalog(&self) -> &Catalog {
@@ -2112,9 +2127,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// dropped between staging and commit) or a group-commit append/fsync fails. A
     /// failure before the fsync makes nothing durable (a torn record is dropped on
     /// recovery); a *failed fsync after a successful append* leaves the staged record's
-    /// durability **indeterminate** and must be treated as a crash, not a clean abort
-    /// (the WAL contract, [STL-217]). A write already applied to the in-memory tiers
-    /// when a *later* one fails is not yet rolled back in memory ([STL-216]).
+    /// durability **indeterminate**, so it is treated as a crash, not a clean abort:
+    /// the WAL poisons and the session refuses further writes
+    /// ([`is_poisoned`](Self::is_poisoned)) until [`recover`](Self::recover) resolves
+    /// it from the log (the WAL contract, [STL-217]). A write already applied to the
+    /// in-memory tiers when a *later* one fails is not yet rolled back in memory
+    /// ([STL-216]).
     pub fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError> {
         // First-committer-wins write-write conflict detection. Checked up front, so
         // a conflict aborts the whole transaction before any write lands.
@@ -2190,9 +2208,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     ///
     /// One caveat on a failing leg: if its commit failed *after* the WAL append (a
     /// failed fsync, not a torn write), its staged record's durability is
-    /// indeterminate — and likewise a marker append that succeeds but whose fsync
-    /// fails. Per the WAL contract those are crashes, not clean aborts; enforcing it
-    /// (poisoning the engine on fsync failure) is [STL-217].
+    /// indeterminate. Per the WAL contract that is a crash, not a clean abort — and
+    /// it is now enforced: the leg's WAL poisons, so the session refuses further
+    /// writes ([`is_poisoned`](Self::is_poisoned)) until [`recover`](Self::recover)
+    /// resolves it from the log ([STL-217]). (The session-level commit *marker* log
+    /// is a separate WAL and not covered by this poison; a marker fsync failure is
+    /// still surfaced as an error.)
     ///
     /// [STL-215]: https://allegromusic.atlassian.net/browse/STL-215
     fn finish_group_commit(
@@ -6831,6 +6852,54 @@ mod tests {
                 .rows
                 .is_empty(),
             "a torn group commit leaves none of the transaction's writes",
+        );
+    }
+
+    #[test]
+    fn a_failed_fsync_poisons_the_session_until_recovery() {
+        // STL-217: a failed WAL fsync (here the checkpoint's group-commit tick) is a
+        // crash, not a clean abort — the table's engine poisons and the session
+        // surfaces it through `is_poisoned`. The session must then refuse further
+        // writes and restart into recovery, which opens fresh, unpoisoned WALs and
+        // still serves everything that committed before the failure.
+        let faults = Faults::new();
+        let disk = MemDisk::with_faults(faults.clone());
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+        assert!(!engine.is_poisoned(), "healthy before the fault");
+
+        // Fail the next fsync — the checkpoint's group-commit tick. (Scheduled
+        // *after* the writes above, so it lands on the checkpoint, whatever the
+        // single-statement path itself fsynced.)
+        faults.schedule(FaultOp::Sync, io::ErrorKind::Other);
+        assert!(
+            engine.checkpoint().is_err(),
+            "the injected fsync fault fails the checkpoint",
+        );
+        assert!(engine.is_poisoned(), "a failed fsync poisons the session");
+
+        // A poisoned session refuses further writes (the WAL append is refused),
+        // even though the scheduled fault was already consumed.
+        assert!(
+            engine
+                .execute(&parse_one("INSERT INTO account VALUES (2, 200)"))
+                .is_err(),
+            "a poisoned session refuses writes",
+        );
+        drop(engine);
+
+        let mut engine = recover_session(&disk);
+        assert!(
+            !engine.is_poisoned(),
+            "recovery opens fresh, unpoisoned WALs"
+        );
+        assert_eq!(
+            select(&mut engine, "SELECT id FROM account").rows,
+            vec![vec![i4(1)]],
+            "the write committed before the failed fsync survives; the refused one never landed",
         );
     }
 

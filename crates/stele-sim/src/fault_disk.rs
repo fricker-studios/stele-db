@@ -15,12 +15,14 @@
 //! | [`ShortRead`]             | `read_at` returns *fewer* bytes than read (never a false EOF)  |
 //! | [`BitFlip`]               | `read_at` flips one bit in the returned window — silent rot    |
 //! | [`SlowSync`]              | `sync` succeeds but logs a latency in virtual ticks           |
+//! | [`FailSync`]              | `sync` *fails* and persists nothing new — a failed fsync       |
 //!
 //! [`FullDisk`]: FaultKind::FullDisk
 //! [`TornWrite`]: FaultKind::TornWrite
 //! [`ShortRead`]: FaultKind::ShortRead
 //! [`BitFlip`]: FaultKind::BitFlip
 //! [`SlowSync`]: FaultKind::SlowSync
+//! [`FailSync`]: FaultKind::FailSync
 //! [`StorageFull`]: std::io::ErrorKind::StorageFull
 //!
 //! ## Determinism is the whole point
@@ -61,6 +63,13 @@ pub enum FaultKind {
     /// `sync` still succeeds, but a latency (in virtual ticks) is recorded — a
     /// slow fsync that, under a scheduler, would reorder concurrent work.
     SlowSync,
+    /// `sync` **fails** and durably persists nothing new — a failed fsync. The
+    /// just-appended record's durability is then indeterminate, the case the WAL
+    /// must treat as a crash and poison on ([STL-217]). Distinct from
+    /// [`SlowSync`](FaultKind::SlowSync), which is slow but still durable.
+    ///
+    /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
+    FailSync,
     /// `create`/`append` fail with [`StorageFull`](io::ErrorKind::StorageFull)
     /// and persist nothing — a full disk.
     FullDisk,
@@ -143,6 +152,7 @@ pub struct FaultProfile {
     short_read: Prob,
     torn_write: Prob,
     slow_sync: Prob,
+    fail_sync: Prob,
     full_disk: Prob,
     max_slow_ticks: u64,
 }
@@ -158,6 +168,7 @@ impl FaultProfile {
             short_read: Prob::Never,
             torn_write: Prob::Never,
             slow_sync: Prob::Never,
+            fail_sync: Prob::Never,
             full_disk: Prob::Never,
             max_slow_ticks: DEFAULT_SLOW_TICKS,
         }
@@ -170,6 +181,7 @@ impl FaultProfile {
             FaultKind::ShortRead => self.short_read,
             FaultKind::TornWrite => self.torn_write,
             FaultKind::SlowSync => self.slow_sync,
+            FaultKind::FailSync => self.fail_sync,
             FaultKind::FullDisk => self.full_disk,
         }
     }
@@ -180,6 +192,7 @@ impl FaultProfile {
             FaultKind::ShortRead => &mut self.short_read,
             FaultKind::TornWrite => &mut self.torn_write,
             FaultKind::SlowSync => &mut self.slow_sync,
+            FaultKind::FailSync => &mut self.fail_sync,
             FaultKind::FullDisk => &mut self.full_disk,
         }
     }
@@ -224,6 +237,12 @@ impl FaultProfile {
     #[must_use]
     pub fn with_slow_sync(self, p: f64) -> Self {
         self.with(FaultKind::SlowSync, p)
+    }
+
+    /// Enable [`FailSync`](FaultKind::FailSync) with probability `p`.
+    #[must_use]
+    pub fn with_fail_sync(self, p: f64) -> Self {
+        self.with(FaultKind::FailSync, p)
     }
 
     /// Enable [`FullDisk`](FaultKind::FullDisk) with probability `p`.
@@ -320,15 +339,34 @@ impl FaultState {
         len
     }
 
-    /// Decide a `sync`: log a latency if a slow fsync fires (the sync still
-    /// succeeds — slow, not lost).
-    fn plan_sync(&mut self) {
+    /// Decide a `sync`: a failed fsync ([`FailSync`](FaultKind::FailSync)) takes
+    /// precedence — it persists nothing and errors — otherwise a slow fsync
+    /// ([`SlowSync`](FaultKind::SlowSync)) logs a latency but still succeeds.
+    ///
+    /// Drawing `FailSync` first keeps the stream stable for the common
+    /// `FailSync`-disabled profiles: a [`Prob::Never`] class draws no randomness,
+    /// so the subsequent `SlowSync` draw lands exactly where it always did.
+    fn plan_sync(&mut self) -> SyncPlan {
+        if self.fires(FaultKind::FailSync) {
+            self.record(FaultOp::Sync, FaultKind::FailSync, 0);
+            return SyncPlan::Fail;
+        }
         if self.fires(FaultKind::SlowSync) {
             let max = self.profile.max_slow_ticks.max(1);
             let ticks = 1 + self.rng.below(max);
             self.record(FaultOp::Sync, FaultKind::SlowSync, ticks);
         }
+        SyncPlan::Clean
     }
+}
+
+/// What a `sync` should do, decided under the state lock and then carried out
+/// without it.
+enum SyncPlan {
+    /// The fsync fails and persists nothing new — a failed fsync.
+    Fail,
+    /// The fsync proceeds (possibly after a recorded `SlowSync` latency).
+    Clean,
 }
 
 /// A seeded, deterministic fault-injecting [`Disk`].
@@ -402,6 +440,11 @@ impl<D> FaultDisk<D> {
 /// disk.
 fn full_disk_error() -> io::Error {
     io::Error::new(io::ErrorKind::StorageFull, "stele-sim: simulated full disk")
+}
+
+/// The error a failed fsync ([`FaultKind::FailSync`]) reports.
+fn fail_sync_error() -> io::Error {
+    io::Error::other("stele-sim: simulated fsync failure")
 }
 
 impl<D: Disk> Disk for FaultDisk<D> {
@@ -494,9 +537,15 @@ impl<F: DiskFile> DiskFile for FaultFile<F> {
     }
 
     fn sync(&mut self) -> io::Result<()> {
-        self.state.lock().unwrap().plan_sync();
-        // `sync` still durably persists — a slow fsync is slow, not lost.
-        self.inner.sync()
+        // Resolve the plan and drop the state lock *before* touching the inner disk.
+        let plan = self.state.lock().unwrap().plan_sync();
+        match plan {
+            // A failed fsync persists nothing new and errors — the caller (the WAL)
+            // must treat it as a crash ([STL-217]).
+            SyncPlan::Fail => Err(fail_sync_error()),
+            // A clean (possibly slow) fsync still durably persists — slow, not lost.
+            SyncPlan::Clean => self.inner.sync(),
+        }
     }
 
     fn len(&self) -> u64 {
@@ -655,6 +704,38 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, FaultKind::SlowSync);
         assert!(events[0].detail >= 1, "latency is at least one tick");
+    }
+
+    #[test]
+    fn fail_sync_errors_and_records_the_fault() {
+        // A failed fsync errors (it does not call the inner sync) and logs a
+        // `FailSync` event — the path STL-217's WAL poison rests on.
+        let disk = FaultDisk::new(13, FaultProfile::none().with_fail_sync(1.0));
+        let mut file = disk.create("x").expect("create");
+        let err = file.sync().expect_err("a failed fsync errors");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        let events = disk.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, FaultKind::FailSync);
+        assert_eq!(events[0].op, FaultOp::Sync);
+    }
+
+    #[test]
+    fn fail_sync_seed_is_reproducible() {
+        // Same seed + profile ⇒ identical fail-sync sequence, the seed-replay
+        // property the fault sweep rests on.
+        let profile = || FaultProfile::none().with_fail_sync(0.25);
+        let a = run(99, profile(), 2_000);
+        let b = run(99, profile(), 2_000);
+        assert_eq!(a, b, "seed 99 must replay the same fail-sync sequence");
+        assert!(
+            a.iter().all(|e| e.kind == FaultKind::FailSync),
+            "only failed fsyncs are enabled",
+        );
+        assert!(
+            !a.is_empty(),
+            "2000 ops at p=0.25 must trip at least one failed fsync",
+        );
     }
 
     #[test]
