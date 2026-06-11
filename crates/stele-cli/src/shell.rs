@@ -5,8 +5,10 @@
 //! Two input paths share one statement handler:
 //!
 //! * **Interactive** (stdin is a TTY): rustyline line editing — ↑/↓ history
-//!   (100 entries, consecutive dups collapsed), live syntax highlighting, ⌃L
-//!   clear, ⌃C cancels the buffered statement, ⌃D quits.
+//!   (100 entries, consecutive dups collapsed, persisted to `~/.stele_history`),
+//!   ⇥ completion of meta-commands / SQL keywords / live table & column names,
+//!   live syntax highlighting, ⌃L clear, ⌃C cancels the buffered statement, ⌃D
+//!   quits.
 //! * **Scripted** (piped): the plain `BufRead` loop. No prompts, no banner, no
 //!   escapes — output stays byte-clean for tests and pipelines.
 //!
@@ -130,10 +132,18 @@ fn repl_scripted(
     Ok(())
 }
 
-/// The interactive loop: rustyline editing + history + live highlighting.
-fn repl_interactive(client: &mut Client, session: &mut Session) -> anyhow::Result<()> {
-    use rustyline::error::ReadlineError;
+/// Editor type alias — `DefaultHistory` is `MemHistory` (the crate does not
+/// enable `with-file-history`; see the rustyline note in the workspace
+/// `Cargo.toml`). Cross-session persistence is layered on by hand in
+/// [`load_history_file`] / [`save_history_file`].
+type ShellEditor = rustyline::Editor<ShellHelper, rustyline::history::DefaultHistory>;
 
+/// The interactive loop: rustyline editing + history + live highlighting.
+///
+/// History persists across sessions in `~/.stele_history` — loaded before the
+/// loop, saved after it (on `\q`, ⌃D, and even a mid-session transport error),
+/// so the file always reflects the last 100 (deduped) statements.
+fn repl_interactive(client: &mut Client, session: &mut Session) -> anyhow::Result<()> {
     let config = rustyline::Config::builder()
         .max_history_size(100)
         .context("configuring history size")?
@@ -141,11 +151,35 @@ fn repl_interactive(client: &mut Client, session: &mut Session) -> anyhow::Resul
         .context("configuring history dedupe")?
         .auto_add_history(false)
         .build();
-    let mut rl: rustyline::Editor<ShellHelper, rustyline::history::DefaultHistory> =
+    let mut rl: ShellEditor =
         rustyline::Editor::with_config(config).context("initializing line editor")?;
+    let history_path = history_file_path();
+    if let Some(path) = &history_path {
+        load_history_file(&mut rl, path);
+    }
     rl.set_helper(Some(ShellHelper {
         theme: session.theme,
+        // ⇥ completion starts knowing the catalog as it stands at connect; the
+        // loop refreshes it after each statement.
+        identifiers: fetch_identifiers(client).unwrap_or_default(),
     }));
+
+    let outcome = interactive_loop(client, session, &mut rl);
+
+    if let Some(path) = &history_path {
+        save_history_file(&rl, path);
+    }
+    outcome
+}
+
+/// The body of [`repl_interactive`], split out so history is saved on every
+/// exit path (the `?`/`return` sites below all unwind back through the caller).
+fn interactive_loop(
+    client: &mut Client,
+    session: &mut Session,
+    rl: &mut ShellEditor,
+) -> anyhow::Result<()> {
+    use rustyline::error::ReadlineError;
 
     let mut out = std::io::stdout();
     let mut buffer = String::new();
@@ -170,6 +204,15 @@ fn repl_interactive(client: &mut Client, session: &mut Session) -> anyhow::Resul
                 if buffer.trim().is_empty() && !pending.is_empty() {
                     let _ = rl.add_history_entry(pending.as_str());
                     pending.clear();
+                    // A statement just ran — CREATE/DROP/ALTER may have moved
+                    // the catalog, so re-read the identifiers ⇥ completes
+                    // against. Best-effort: a dead connection resurfaces on the
+                    // next real query rather than here.
+                    if let Ok(identifiers) = fetch_identifiers(client) {
+                        if let Some(helper) = rl.helper_mut() {
+                            helper.identifiers = identifiers;
+                        }
+                    }
                 }
                 if matches!(flow, Flow::Quit) {
                     return Ok(());
@@ -904,19 +947,321 @@ impl Session {
 }
 
 // ---------------------------------------------------------------------------
+// Completion data + history file
+// ---------------------------------------------------------------------------
+
+/// Every table name and column name currently live in the catalog — the pool
+/// ⇥ completion draws identifiers from. Built from the **same** introspection
+/// queries `\dt` and `\d` issue (STL-198 / STL-131): one `pg_class` scan for
+/// the table list, then the two-step `pg_class` → `pg_attribute` lookup per
+/// table for its columns. Returned sorted and de-duplicated.
+///
+/// Best-effort by design: a SQL-level failure (an unexpected catalog reply)
+/// contributes no names rather than aborting; only a transport failure errs.
+fn fetch_identifiers(client: &mut Client) -> anyhow::Result<Vec<String>> {
+    let mut identifiers = std::collections::BTreeSet::new();
+    for table in catalog_table_names(client)? {
+        for column in table_column_names(client, &table)? {
+            identifiers.insert(column);
+        }
+        identifiers.insert(table);
+    }
+    Ok(identifiers.into_iter().collect())
+}
+
+/// The live table names — the `\dt` query (a `pg_class` scan with no name
+/// filter). An unexpected reply shape yields no names.
+fn catalog_table_names(client: &mut Client) -> anyhow::Result<Vec<String>> {
+    let replies =
+        client.simple_query("SELECT c.relname FROM pg_catalog.pg_class c ORDER BY c.relname")?;
+    if first_error(&replies).is_some() {
+        return Ok(Vec::new());
+    }
+    let Some(set) = first_result_set(&replies) else {
+        return Ok(Vec::new());
+    };
+    // Resolve `relname` by name, never by position — same contract as
+    // `list_tables`: a projection-honoring server contributes nothing rather
+    // than the wrong column.
+    let Some(idx) = set.columns.iter().position(|c| c.name == "relname") else {
+        return Ok(Vec::new());
+    };
+    Ok(set
+        .rows
+        .iter()
+        .filter_map(|row| row.get(idx).cloned().flatten())
+        .collect())
+}
+
+/// One table's column names — the `\d <table>` two-step: resolve the relation's
+/// oid in `pg_class`, then read its `pg_attribute` rows. A miss (no such table,
+/// odd reply) yields no names.
+fn table_column_names(client: &mut Client, name: &str) -> anyhow::Result<Vec<String>> {
+    let escaped = name.replace('\'', "''");
+    let replies = client.simple_query(&format!(
+        "SELECT c.oid, c.relname FROM pg_catalog.pg_class c WHERE c.relname = '{escaped}'"
+    ))?;
+    if first_error(&replies).is_some() {
+        return Ok(Vec::new());
+    }
+    let oid = first_result_set(&replies)
+        .and_then(|set| set.rows.first())
+        .and_then(|row| row.first())
+        .and_then(Option::as_deref)
+        .and_then(|s| s.parse::<u32>().ok());
+    let Some(oid) = oid else {
+        return Ok(Vec::new());
+    };
+    let replies = client.simple_query(&format!(
+        "SELECT a.attname, a.atttypname, a.attnum FROM pg_catalog.pg_attribute a \
+         WHERE a.attrelid = {oid} AND a.attnum > 0"
+    ))?;
+    if first_error(&replies).is_some() {
+        return Ok(Vec::new());
+    }
+    let Some(set) = first_result_set(&replies) else {
+        return Ok(Vec::new());
+    };
+    // `attname` is the first projected column.
+    Ok(set
+        .rows
+        .iter()
+        .filter_map(|row| row.first().cloned().flatten())
+        .collect())
+}
+
+/// `~/.stele_history`, or `None` when `$HOME` is unset (history then lives only
+/// in memory for the session). Stele is Unix-only ([STL-159]), so `$HOME` is
+/// the right resolver and no `dirs`-style probe crate is warranted.
+fn history_file_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".stele_history"))
+}
+
+/// Load `~/.stele_history` into the editor so ↑/↓ recall spans sessions. One
+/// entry per line, newlines un-escaped (a multi-line statement is one entry).
+/// `add_history_entry` re-applies the configured dedupe + 100-cap. A missing
+/// file (first run) or any read error is silently ignored — history is a
+/// convenience, never load-bearing.
+fn load_history_file(rl: &mut ShellEditor, path: &std::path::Path) {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in contents.lines() {
+        if !line.is_empty() {
+            let _ = rl.add_history_entry(unescape_entry(line));
+        }
+    }
+}
+
+/// Persist the in-memory history (already deduped + capped at 100) to
+/// `~/.stele_history`, oldest first. Embedded newlines are escaped so each
+/// entry occupies exactly one line. Best-effort: a write failure must not mask
+/// the session's own outcome.
+///
+/// The file is created user-only (`0600`), like `~/.psql_history`: history can
+/// carry sensitive SQL (credentials in a literal, say), so it must not be
+/// world-readable. `mode` only bites on creation, so a pre-existing `0644` file
+/// is re-tightened after the write.
+fn save_history_file(rl: &ShellEditor, path: &std::path::Path) {
+    use rustyline::history::{History as _, SearchDirection};
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let history = rl.history();
+    let mut buf = String::new();
+    for i in 0..history.len() {
+        if let Ok(Some(found)) = history.get(i, SearchDirection::Forward) {
+            buf.push_str(&escape_entry(&found.entry));
+            buf.push('\n');
+        }
+    }
+    let opened = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path);
+    if let Ok(mut file) = opened {
+        if file.write_all(buf.as_bytes()).is_ok() {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+/// Escape an entry to one physical line: `\` → `\\`, newline → `\n` (matching
+/// rustyline's own history-file convention). [`unescape_entry`] is the inverse.
+fn escape_entry(entry: &str) -> String {
+    entry.replace('\\', r"\\").replace('\n', r"\n")
+}
+
+/// Inverse of [`escape_entry`] — turn `\\` back into `\` and `\n` back into a
+/// newline. An unrecognized escape is kept verbatim (backslash + char).
+fn unescape_entry(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                // An escaped backslash, or a stray trailing one (malformed, but
+                // we keep it) both decode to a single backslash.
+                Some('\\') | None => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // rustyline glue
 // ---------------------------------------------------------------------------
 
-/// Colors the prompt and the live input line; completion/hinting are no-ops
-/// for now (live-catalog completion is a follow-up).
+/// Colors the prompt and the live input line, and completes meta-commands /
+/// SQL keywords / live identifiers on ⇥. Hinting stays a no-op.
 struct ShellHelper {
     theme: Theme,
+    /// Live table + column names ⇥ completion draws on, refreshed from the
+    /// catalog after each statement (see [`fetch_identifiers`]).
+    identifiers: Vec<String>,
 }
 
 impl rustyline::Helper for ShellHelper {}
 
+/// The backslash meta-commands ⇥ completes against — the full designed surface
+/// (the `\?` registry), matching the prototype's completion pool.
+const META_NAMES: &[&str] = &[
+    r"\?",
+    r"\h",
+    r"\d",
+    r"\dt",
+    r"\l",
+    r"\conninfo",
+    r"\asof",
+    r"\history",
+    r"\timeline",
+    r"\lineage",
+    r"\audit",
+    r"\segments",
+    r"\status",
+    r"\backup",
+    r"\restore",
+    r"\pitr",
+    r"\inspect-segment",
+    r"\timing",
+    r"\x",
+    r"\json",
+    r"\clear",
+    r"\q",
+];
+
+/// SQL keywords ⇥ completes against. Identifiers (table / column names) come
+/// live from the catalog ([`fetch_identifiers`]) — this list deliberately drops
+/// the prototype's hardcoded demo names (`account`, `balance`, …).
+const SQL_KEYWORDS: &[&str] = &[
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "INSERT INTO",
+    "VALUES",
+    "UPDATE",
+    "SET",
+    "CREATE TABLE",
+    "WITH SYSTEM VERSIONING",
+    "FOR SYSTEM_TIME AS OF",
+    "now()",
+    "interval",
+    "ORDER BY",
+    "LIMIT",
+];
+
+/// Characters that make up a SQL completion token — letters, `_`, and the
+/// parens of `now()`, matching the prototype's `[A-Za-z_()]` word class.
+const fn is_sql_token_char(c: char) -> bool {
+    c.is_ascii_alphabetic() || matches!(c, '_' | '(' | ')')
+}
+
+/// ⇥ completion, faithful to the prototype: **unique-match only, no menu**.
+/// Returns the byte offset where the replacement begins and at most one
+/// candidate (already suffixed with a space); an empty list leaves the line
+/// untouched (ambiguous or no match — no cycling list).
+///
+/// Two modes, picked by what precedes the cursor:
+/// * a lone backslash word (`\hi`) completes a meta-command name;
+/// * anything else completes the trailing identifier token against the SQL
+///   keywords and the live catalog names — so `\d cust⇥` and `SELECT … accou⇥`
+///   both work.
+fn complete(line: &str, pos: usize, identifiers: &[String]) -> (usize, Vec<String>) {
+    let head = &line[..pos];
+    let trimmed = head.trim_start();
+    if trimmed.starts_with('\\') && !trimmed.contains(char::is_whitespace) {
+        let start = pos - trimmed.len();
+        // Keep exact matches in the pool (unlike the SQL branch): if the input
+        // is already a valid command that is *also* a prefix of a longer one
+        // (`\d` vs `\dt`), that's two candidates → ambiguous → no completion,
+        // so ⇥ never rewrites `\d` and `\d <table>` stays reachable.
+        let matches = META_NAMES
+            .iter()
+            .filter(|name| name.starts_with(trimmed))
+            .map(|name| format!("{name} "))
+            .collect();
+        return unique_completion(start, matches);
+    }
+
+    // Trailing `[A-Za-z_()]+` token before the cursor.
+    let mut start = pos;
+    for (i, c) in head.char_indices().rev() {
+        if is_sql_token_char(c) {
+            start = i;
+        } else {
+            break;
+        }
+    }
+    let token = &head[start..pos];
+    if token.is_empty() {
+        return (pos, Vec::new());
+    }
+    let lower = token.to_ascii_lowercase();
+    let matches = SQL_KEYWORDS
+        .iter()
+        .map(|kw| (*kw).to_owned())
+        .chain(identifiers.iter().cloned())
+        .filter(|cand| {
+            let folded = cand.to_ascii_lowercase();
+            folded.starts_with(&lower) && folded != lower
+        })
+        .map(|cand| format!("{cand} "))
+        .collect();
+    unique_completion(start, matches)
+}
+
+/// Keep a completion only when it is unambiguous: exactly one candidate
+/// replaces the token, otherwise nothing happens (no menu, the prototype's
+/// rule).
+fn unique_completion(start: usize, mut matches: Vec<String>) -> (usize, Vec<String>) {
+    if matches.len() == 1 {
+        (start, vec![matches.remove(0)])
+    } else {
+        (start, Vec::new())
+    }
+}
+
 impl rustyline::completion::Completer for ShellHelper {
     type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        Ok(complete(line, pos, &self.identifiers))
+    }
 }
 
 impl rustyline::hint::Hinter for ShellHelper {
@@ -1049,5 +1394,115 @@ mod tests {
         assert_eq!(err.code, "42601");
         assert_eq!(err.severity, "ERROR");
         assert_eq!(err.hint.as_deref(), Some("Try \\?"));
+    }
+
+    #[test]
+    fn completes_a_unique_meta_command() {
+        // `\au` uniquely prefixes \audit; the candidate carries a trailing space.
+        assert_eq!(complete(r"\au", 3, &[]), (0, vec![r"\audit ".to_owned()]));
+    }
+
+    #[test]
+    fn ambiguous_meta_prefix_does_not_complete() {
+        // `\t` prefixes both \timing and \timeline — no menu, no completion.
+        let (_, cands) = complete(r"\t", 2, &[]);
+        assert!(cands.is_empty(), "{cands:?}");
+    }
+
+    #[test]
+    fn a_meta_command_with_a_longer_sibling_does_not_complete() {
+        // `\d` and `\dt` both match `\d`, so ⇥ stays its hand — `\d <table>`
+        // must remain reachable (regression: don't rewrite `\d` → `\dt`).
+        let (_, cands) = complete(r"\d", 2, &[]);
+        assert!(cands.is_empty(), "{cands:?}");
+    }
+
+    #[test]
+    fn a_complete_meta_command_with_no_sibling_just_gains_a_space() {
+        // `\conninfo` is unique with no longer extension → ⇥ appends a space
+        // (the prototype keeps exact matches in the meta pool).
+        assert_eq!(
+            complete(r"\conninfo", 9, &[]),
+            (0, vec![r"\conninfo ".to_owned()])
+        );
+    }
+
+    #[test]
+    fn completes_a_unique_sql_keyword_case_insensitively() {
+        // Lower-case input completes to the canonical keyword casing.
+        assert_eq!(complete("sel", 3, &[]), (0, vec!["SELECT ".to_owned()]));
+    }
+
+    #[test]
+    fn ambiguous_sql_keyword_prefix_does_not_complete() {
+        // `SE` prefixes both SELECT and SET.
+        let (_, cands) = complete("SE", 2, &[]);
+        assert!(cands.is_empty(), "{cands:?}");
+    }
+
+    #[test]
+    fn an_exact_keyword_token_is_left_alone() {
+        // A token already equal to a keyword has no longer completion.
+        let (_, cands) = complete("SELECT", 6, &[]);
+        assert!(cands.is_empty(), "{cands:?}");
+    }
+
+    #[test]
+    fn completes_a_live_identifier_at_the_cursor() {
+        let ids = vec!["account".to_owned(), "balance".to_owned()];
+        let line = "SELECT * FROM accou";
+        // Only the trailing token is replaced; the offset points at its start.
+        assert_eq!(
+            complete(line, line.len(), &ids),
+            (14, vec!["account ".to_owned()])
+        );
+    }
+
+    #[test]
+    fn completes_a_table_name_after_a_describe() {
+        // `\d cust` has whitespace → not a meta word → identifier completion.
+        let ids = vec!["customer".to_owned()];
+        assert_eq!(
+            complete(r"\d cust", 7, &ids),
+            (3, vec!["customer ".to_owned()])
+        );
+    }
+
+    #[test]
+    fn ambiguous_identifier_prefix_does_not_complete() {
+        let ids = vec!["account".to_owned(), "accrued".to_owned()];
+        let line = "SELECT acc";
+        let (_, cands) = complete(line, line.len(), &ids);
+        assert!(cands.is_empty(), "{cands:?}");
+    }
+
+    #[test]
+    fn history_file_path_is_under_home() {
+        // No env mutation: just assert the shape when $HOME is present (it is in
+        // CI and dev shells alike).
+        if let Some(path) = history_file_path() {
+            assert!(path.ends_with(".stele_history"), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn history_entry_escaping_round_trips_multiline_and_backslashes() {
+        // A multi-line statement is ONE entry; backslashes (e.g. a `\d` recalled
+        // into the buffer, or a regex literal) must survive the file round-trip.
+        for entry in [
+            "SELECT 1;",
+            "SELECT id, balance\n  FROM account;",
+            r"SELECT '\n' AS lit;",
+            "trailing backslash \\",
+            "",
+        ] {
+            let escaped = escape_entry(entry);
+            // The on-disk form is always a single physical line.
+            assert!(
+                !escaped.contains('\n'),
+                "escaped form has a newline: {escaped:?}"
+            );
+            assert_eq!(unescape_entry(&escaped), entry, "round-trip failed");
+        }
     }
 }
