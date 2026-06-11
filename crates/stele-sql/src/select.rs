@@ -35,7 +35,11 @@
 //! ([STL-163]). Valid-time `AS OF` only means something on a table that opts into
 //! a valid-time period: against a system-only table it is the documented
 //! [`SelectError::ValidTimeUnsupported`]. With no valid qualifier,
-//! `valid_snapshot` is `None` — the executor reads the present of the valid axis.
+//! `valid_snapshot` is `None`: the executor reads the valid-time table
+//! *unfiltered* — every system-live version, its period columns readable as
+//! ordinary cells — and the caller filters the valid axis explicitly (a
+//! `FOR VALID_TIME AS OF` or a period predicate). Valid-time is not auto-filtered
+//! to "now" the way the system axis is ([STL-218]).
 //!
 //! ## Scope
 //!
@@ -118,7 +122,8 @@ pub struct BoundSelect {
     /// qualifier, or `None` when the query gave none. `Some(v)` only when the
     /// table opts into a valid-time period (else [`SelectError::ValidTimeUnsupported`]);
     /// the executor resolves the version live at the joint `(snapshot, v)` point
-    /// ([STL-163]). `None` reads the present of the valid axis.
+    /// ([STL-163]). `None` reads the valid-time table unfiltered on the valid
+    /// axis — every system-live version, period columns readable ([STL-218]).
     pub valid_snapshot: Option<SystemTimeMicros>,
     /// The columns the query projects.
     pub projection: Projection,

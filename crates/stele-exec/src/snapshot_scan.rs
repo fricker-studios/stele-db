@@ -72,8 +72,15 @@
 //! `valid_from` / `valid_to` columns ([STL-117]) the filter reads directly —
 //! before bulk materialization, so a row excluded on the valid axis never has
 //! its payload read. On a both-axes scan the emitted payload is the bare user
-//! value, the framing prefix stripped. A scan with no valid instant
-//! (`valid_as_of` unset) is system-only and untouched by any of this.
+//! value, the framing prefix stripped.
+//!
+//! A read of a valid-time table with **no** valid instant — a plain `SELECT`,
+//! declared with [`valid_time(true)`](SnapshotScan::valid_time) — still strips the
+//! delta tier's framing prefix (so the payload decodes), but keeps every
+//! system-live version: the period columns read back as ordinary value cells, no
+//! valid-axis filter applied ([STL-218]). Only a genuinely system-only table
+//! (`valid_time` unset / `false`) is untouched by any of this — its payload is
+//! bare already.
 //!
 //! ## Determinism
 //!
@@ -455,12 +462,20 @@ pub struct SnapshotScan<'a, D: Disk, I: Disk, F: DiskFile> {
     segments: &'a [SegmentReader<F>],
     snapshot: Snapshot,
     /// The valid-time instant to resolve the *second* axis at, set via
-    /// [`valid_as_of`](Self::valid_as_of). `None` is a system-only scan — the
-    /// valid axis is not consulted and the operator behaves exactly as it did
-    /// before STL-163. `Some(v)` turns on both-axes resolution: after the
+    /// [`valid_as_of`](Self::valid_as_of). `None` leaves the valid axis
+    /// unfiltered. `Some(v)` turns on both-axes resolution: after the
     /// system-time live set is resolved, each version is kept only when its
     /// `[valid_from, valid_to)` interval contains `v`.
     valid_snapshot: Option<ValidTimeMicros>,
+    /// Whether the scanned table opts into valid-time, set via
+    /// [`valid_time`](Self::valid_time). It governs the delta tier's framing
+    /// independently of [`valid_snapshot`](Self::valid_snapshot): a valid-time
+    /// table's delta payload is always framed, so even a **no-pin** read (a plain
+    /// `SELECT`, `valid_snapshot == None`) must strip the 16-byte prefix or
+    /// `ExplodePayload` decodes the envelope as row data ([STL-218]). A
+    /// `valid_as_of` pin implies a valid-time table, so it sets this too; a
+    /// system-only table leaves it `false` and its payload is bare already.
+    valid_time: bool,
     projection: Vec<ColumnId>,
     predicate: Predicate,
 }
@@ -484,6 +499,7 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             segments,
             snapshot,
             valid_snapshot: None,
+            valid_time: false,
             projection: ColumnId::ALL.to_vec(),
             predicate: Predicate::All,
         }
@@ -514,6 +530,37 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
     #[must_use]
     pub const fn valid_as_of(mut self, point: ValidTimeMicros) -> Self {
         self.valid_snapshot = Some(point);
+        // A valid pin is only ever supplied for a valid-time table, so the delta
+        // tier's framing is in play regardless — keep the two flags consistent.
+        self.valid_time = true;
+        self
+    }
+
+    /// Declare whether the scanned table opts into valid-time, independently of a
+    /// [`valid_as_of`](Self::valid_as_of) pin.
+    ///
+    /// A valid-time table's delta rows carry the `[valid_from, valid_to)` interval
+    /// framed on the payload ([`frame_payload`](stele_storage::validtime::frame_payload)).
+    /// A scan with no valid pin (`valid_as_of` unset — a plain `SELECT`) still has
+    /// to strip that 16-byte prefix so the emitted [`ColumnId::Payload`] is the
+    /// **bare** user value, matching what a sealed segment already stores;
+    /// otherwise the row codec decodes the temporal envelope as data ([STL-218]).
+    /// This strips *without* filtering on the valid axis — a no-pin read returns
+    /// every system-live version, its period columns readable as ordinary cells.
+    /// A [`valid_as_of`](Self::valid_as_of) pin sets this implicitly; call it
+    /// explicitly for the no-pin read of a valid-time table.
+    ///
+    /// **Pass the table's actual policy, not `true` unconditionally.** `enabled`
+    /// must mirror the table's valid-time opt-in: with no pin it decides whether
+    /// the delta payload is unframed. Setting `true` for a **system-only** table —
+    /// whose payload is already bare — makes a no-pin scan drain 16 bytes of real
+    /// row data as a phantom prefix, erroring or returning a corrupt payload;
+    /// setting `false` for a valid-time table leaves the frame on and the row
+    /// codec fails. The engine derives `enabled` from the catalog
+    /// (`TableState::valid_time`), so it is always correct there.
+    #[must_use]
+    pub const fn valid_time(mut self, enabled: bool) -> Self {
+        self.valid_time = enabled;
         self
     }
 
@@ -671,13 +718,18 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
 
         // Valid axis, delta tier. A valid-time table's delta rows carry the
         // interval framed on the payload ([`frame_payload`]); recover it with
-        // [`unframe_payload`], keep the row only when its `[valid_from,
-        // valid_to)` contains the valid snapshot, and strip the prefix so the
-        // emitted payload is the bare user value (the sealed tier already stores
-        // it bare). System-only scans (`valid_snapshot == None`) skip this and
-        // leave the payload untouched.
+        // [`unframe_payload`] and strip the 16-byte prefix so the emitted payload
+        // is the bare user value (the sealed tier already stores it bare).
+        //  * A valid pin (`valid_as_of`) also keeps only versions whose
+        //    `[valid_from, valid_to)` contains the point.
+        //  * A no-pin read of a valid-time table (a plain `SELECT`) strips the
+        //    prefix from every system-live version without filtering, so the
+        //    period columns read back as ordinary cells ([STL-218]).
+        //  * A system-only table's payload is already bare — leave it untouched.
         if let Some(point) = self.valid_snapshot {
             delta_live = filter_delta_by_valid(delta_live, point)?;
+        } else if self.valid_time {
+            delta_live = strip_delta_frames(delta_live)?;
         }
 
         // The bulk (non-identity) columns a survivor must materialize for this
@@ -926,6 +978,33 @@ fn filter_delta_by_valid(
         }
     }
     Ok(kept)
+}
+
+/// Strip the framed valid-time prefix from every delta row's payload **without**
+/// filtering on the valid axis — the no-valid-pin read of a valid-time table (a
+/// plain `SELECT`, [STL-218]).
+///
+/// Like [`filter_delta_by_valid`] but keeping every system-live version: the
+/// interval is decoded only to validate (and locate) the 16-byte prefix, then
+/// dropped in place so the emitted [`ColumnId::Payload`] is the bare user value
+/// the row codec expects. The period bounds remain available as the row's own
+/// value cells (they ride the codec payload too), so a plain `SELECT vf, vt`
+/// reads them back. A row whose payload is shorter than the prefix (unreachable
+/// from valid-time DML, which always frames) surfaces as [`ScanError::ValidTime`]
+/// rather than corrupting the row.
+fn strip_delta_frames(versions: Vec<Version>) -> Result<Vec<Version>, ScanError> {
+    let mut out = Vec::with_capacity(versions.len());
+    for mut v in versions {
+        // Validate the prefix is present (a clear error on a truncated frame)
+        // before draining it; the drain reuses the row's existing buffer.
+        let stored = v.payload.as_deref().unwrap_or_default();
+        unframe_payload(true, stored)?;
+        if let Some(payload) = v.payload.as_mut() {
+            payload.drain(0..VALID_TIME_PREFIX_LEN);
+        }
+        out.push(v);
+    }
+    Ok(out)
 }
 
 /// Project one `i64` column out of a sealed segment's selected row-groups,

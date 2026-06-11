@@ -1115,9 +1115,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             Snapshot(bound.snapshot),
         )
         .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
-        .filter(predicate);
+        .filter(predicate)
+        // Declare the table's valid-time policy so a no-pin read still strips the
+        // delta tier's framed prefix — otherwise a plain `SELECT` over a
+        // valid-time table decodes the temporal envelope as row data ([STL-218]).
+        .valid_time(state.valid_time);
         // Pin the valid axis too when the bound plan carries a `FOR VALID_TIME
-        // AS OF v` instant ([STL-164]); `None` leaves the scan system-only.
+        // AS OF v` instant ([STL-164]); without one a valid-time table is read
+        // unfiltered (every system-live version, period columns readable).
         if let Some(v) = bound.valid_snapshot {
             scan = scan.valid_as_of(ValidTimeMicros(v.0));
         }
@@ -1249,9 +1254,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// per-side input ([STL-172]).
     ///
     /// The same `ScanSource → ExplodePayload` pipeline [`scan_rows`](Self::scan_rows)
-    /// runs, minus the `WHERE` filter and valid-time pinning (a join carries no
-    /// per-side predicate at v0.2), so each row comes back as its full
-    /// `[business key, value cells…]` canonical bytes.
+    /// runs, minus the `WHERE` filter and a valid-axis *pin* (a join carries no
+    /// per-side predicate or `FOR VALID_TIME AS OF` at v0.2), so each row comes
+    /// back as its full `[business key, value cells…]` canonical bytes. The
+    /// table's valid-time policy is still declared so a valid-time side's delta
+    /// frame is stripped ([STL-218]); full sequenced temporal joins (intersecting
+    /// both axes) stay deferred to [STL-172].
     fn scan_all_rows(
         state: &TableState<C, D>,
         snapshot: SystemTimeMicros,
@@ -1264,7 +1272,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             &readers,
             Snapshot(snapshot),
         )
-        .project(vec![ColumnId::BusinessKey, ColumnId::Payload]);
+        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .valid_time(state.valid_time);
         let source = ScanSource::new(scan, DEFAULT_BATCH_SIZE);
         let mut exploded = ExplodePayload::new(source, value_count);
 
@@ -4119,12 +4128,10 @@ mod tests {
     #[test]
     fn per_row_period_over_a_both_axes_table() {
         // STL-193 on a genuine bitemporal table: the period is built from the
-        // valid-time value columns `vf` / `vt`. Reading those value columns needs
-        // the valid axis resolved — a plain SELECT leaves a delta row's payload
-        // framed (the pre-existing STL-163 rule; tracked as a follow-up), so the
-        // query pins `FOR VALID_TIME AS OF` at an instant inside every row's
-        // window. The valid filter then keeps all rows and the per-row period
-        // predicate alone decides the result.
+        // valid-time value columns `vf` / `vt`. A *plain* SELECT now reads those
+        // value columns correctly — STL-218 strips the delta tier's framed prefix
+        // on a no-valid-pin read, so no `FOR VALID_TIME AS OF` workaround is
+        // needed and the per-row period predicate alone decides the result.
         let mut engine = session();
         engine
             .execute(&parse_one(
@@ -4154,9 +4161,7 @@ mod tests {
         }
 
         let ids = |engine: &mut SessionEngine<ZeroClock, MemDisk>, pred: &str| -> Vec<i32> {
-            let sql = format!(
-                "SELECT id FROM booking FOR VALID_TIME AS OF 25 WHERE PERIOD(vf, vt) {pred}"
-            );
+            let sql = format!("SELECT id FROM booking WHERE PERIOD(vf, vt) {pred}");
             let mut got: Vec<i32> = select(engine, &sql)
                 .rows
                 .into_iter()
@@ -4181,6 +4186,231 @@ mod tests {
         // PRECEDES [40, 50): windows ending at or before 40 — keys 1 and 2, the
         // half-open touch at 40 counting (key 1's `[10, 40)` precedes `[40, 50)`).
         assert_eq!(ids(&mut engine, "PRECEDES PERIOD(40, 50)"), vec![1, 2]);
+    }
+
+    // --- STL-218: plain (no-valid-pin) reads of a both-axes table ------------
+
+    /// A valid-time `acct (id, balance, vf, vt)` table with one typed-inserted
+    /// row per `(id, balance, [vf, vt))`. The interval is framed on the delta
+    /// payload and the period columns also ride the row codec, the same layout
+    /// the SQL DML path (STL-194) writes.
+    fn valid_time_acct(rows: &[(i32, i32, i64, i64)]) -> SessionEngine<ZeroClock, MemDisk> {
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE acct (id INT PRIMARY KEY, balance INT, vf TIMESTAMP, vt TIMESTAMP) \
+                 WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+            ))
+            .expect("create valid-time table");
+        for (i, &(id, balance, vf, vt)) in rows.iter().enumerate() {
+            let payload = row_codec::encode_payload(&[
+                cell(Some(ScalarValue::Int4(balance))),
+                cell(Some(ScalarValue::Timestamp(vf))),
+                cell(Some(ScalarValue::Timestamp(vt))),
+            ]);
+            engine
+                .insert(
+                    "acct",
+                    business_key(&ScalarValue::Int4(id)),
+                    Some(ValidInterval::new(ValidTimeMicros(vf), ValidTimeMicros(vt)).expect("iv")),
+                    payload,
+                    0,
+                    TxnId(u64::try_from(i).unwrap() + 1),
+                    Principal::new(b"demo".to_vec()),
+                )
+                .expect("insert");
+        }
+        engine
+    }
+
+    #[test]
+    fn plain_select_reads_value_columns_on_a_both_axes_table() {
+        // STL-218: a plain SELECT (no FOR VALID_TIME AS OF) on a valid-time table
+        // returns every system-live row with its value columns — including the
+        // period columns — decoded correctly. Before the fix the delta tier's
+        // framed payload made ExplodePayload fail with an InvalidTag. The three
+        // windows are *disjoint* (one open-ended), so no single valid instant
+        // could keep them all: the plain read applies no valid filter.
+        let mut engine = valid_time_acct(&[
+            (1, 100, 10, 20),
+            (2, 200, 30, 40),
+            (3, 300, 50, i64::MAX), // open-ended valid period
+        ]);
+
+        // Project every column — the period columns read back as their stored
+        // Timestamp cells, proving the frame is stripped.
+        let mut r = select(&mut engine, "SELECT id, balance, vf, vt FROM acct");
+        r.rows.sort_by(|a, b| a[0].cmp(&b[0]));
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![
+                    cell(Some(ScalarValue::Int4(1))),
+                    cell(Some(ScalarValue::Int4(100))),
+                    cell(Some(ScalarValue::Timestamp(10))),
+                    cell(Some(ScalarValue::Timestamp(20))),
+                ],
+                vec![
+                    cell(Some(ScalarValue::Int4(2))),
+                    cell(Some(ScalarValue::Int4(200))),
+                    cell(Some(ScalarValue::Timestamp(30))),
+                    cell(Some(ScalarValue::Timestamp(40))),
+                ],
+                vec![
+                    cell(Some(ScalarValue::Int4(3))),
+                    cell(Some(ScalarValue::Int4(300))),
+                    cell(Some(ScalarValue::Timestamp(50))),
+                    cell(Some(ScalarValue::Timestamp(i64::MAX))),
+                ],
+            ],
+        );
+
+        // A value-column WHERE on a plain read filters correctly.
+        assert_eq!(
+            select(&mut engine, "SELECT id FROM acct WHERE balance = 200").rows,
+            vec![vec![cell(Some(ScalarValue::Int4(2)))]],
+        );
+        // A period-column projection under a key predicate.
+        assert_eq!(
+            select(&mut engine, "SELECT vf, vt FROM acct WHERE id = 3").rows,
+            vec![vec![
+                cell(Some(ScalarValue::Timestamp(50))),
+                cell(Some(ScalarValue::Timestamp(i64::MAX))),
+            ]],
+        );
+        // An aggregate folds the same plain-read rows.
+        assert_eq!(
+            select(&mut engine, "SELECT COUNT(*), SUM(balance) FROM acct").rows,
+            vec![vec![
+                cell(Some(ScalarValue::Int8(3))),
+                cell(Some(ScalarValue::Int8(600))),
+            ]],
+        );
+    }
+
+    /// A deterministic splitmix64 for the STL-218 oracle — a seed replays an
+    /// identical workload, with no dependency on the sim crate.
+    struct PlainOracleRng(u64);
+    impl PlainOracleRng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        /// A uniform value in `0..n` (`n > 0`), no `as` casts.
+        fn below(&mut self, n: i64) -> i64 {
+            i64::try_from(self.next() % u64::try_from(n).expect("positive")).expect("fits")
+        }
+    }
+
+    /// Decode an `int4` / `timestamp` result cell back to its `i64` payload.
+    fn decode_int(value: Option<&Vec<u8>>, ty: LogicalType) -> i64 {
+        let bytes = value.expect("cell is never NULL in this workload");
+        match ScalarValue::decode(ty, bytes).expect("decode") {
+            ScalarValue::Int4(v) => i64::from(v),
+            ScalarValue::Timestamp(v) => v,
+            // Static message: interpolating the decoded ScalarValue here trips
+            // CodeQL's (false) cleartext-logging taint on its Debug.
+            _ => panic!("expected an int4/timestamp result column"),
+        }
+    }
+
+    /// One seed's built history: a valid-time `acct` engine and the naïve
+    /// reference — per key, the present system-live `(balance, vf, vt)`.
+    type HistoryRun = (
+        SessionEngine<ZeroClock, MemDisk>,
+        BTreeMap<i32, (i64, i64, i64)>,
+    );
+
+    /// Apply one seed's random INSERT/UPDATE/DELETE history to a fresh valid-time
+    /// `acct` engine, returning both the engine and the naïve reference: per key,
+    /// the present system-live `(balance, vf, vt)`, absent after a delete.
+    fn build_valid_time_history(rng: &mut PlainOracleRng) -> HistoryRun {
+        const KEY_POOL: i64 = 4;
+        let mut engine = valid_time_acct(&[]);
+        let mut model: BTreeMap<i32, (i64, i64, i64)> = BTreeMap::new();
+        let who = || Principal::new(b"demo".to_vec());
+
+        let ops = 8 + rng.below(12);
+        for op in 0..ops {
+            let id = i32::try_from(rng.below(KEY_POOL)).expect("fits");
+            let key = business_key(&ScalarValue::Int4(id));
+            let txn = TxnId(u64::try_from(op).expect("fits") + 1);
+            let alive = model.contains_key(&id);
+            if alive && rng.below(3) == 0 {
+                engine.delete("acct", &key, txn, who()).expect("delete");
+                model.remove(&id);
+                continue;
+            }
+            let balance = i64::from(i32::try_from(op + 1).expect("fits"));
+            let vf = rng.below(50);
+            let vt = if rng.below(4) == 0 {
+                i64::MAX
+            } else {
+                vf + 1 + rng.below(50)
+            };
+            let payload = row_codec::encode_payload(&[
+                cell(Some(ScalarValue::Int4(
+                    i32::try_from(balance).expect("fits"),
+                ))),
+                cell(Some(ScalarValue::Timestamp(vf))),
+                cell(Some(ScalarValue::Timestamp(vt))),
+            ]);
+            let interval =
+                ValidInterval::new(ValidTimeMicros(vf), ValidTimeMicros(vt)).expect("iv");
+            if alive {
+                engine
+                    .update("acct", key, Some(interval), payload, 0, txn, who())
+                    .expect("update");
+            } else {
+                engine
+                    .insert("acct", key, Some(interval), payload, 0, txn, who())
+                    .expect("insert");
+            }
+            model.insert(id, (balance, vf, vt));
+        }
+        (engine, model)
+    }
+
+    #[test]
+    fn plain_select_both_axes_matches_a_naive_reference() {
+        // STL-218 correctness oracle. A random typed INSERT/UPDATE/DELETE history
+        // on a valid-time table (varied windows, some open-ended) is applied to
+        // both the engine and a naïve reference, then a *plain* SELECT (no valid
+        // pin) is diffed against the reference. The reference keeps, per key, the
+        // latest system-live version's `(balance, vf, vt)` — exactly the
+        // "every system-live row, no valid filter" semantics. The query itself is
+        // the teeth: before the fix a plain read of a framed delta payload errors.
+        const SEEDS: u64 = 48;
+        let mut rng = PlainOracleRng(0x1234_5678);
+        let mut rows_seen: u64 = 0;
+
+        for _seed in 0..SEEDS {
+            let (mut engine, model) = build_valid_time_history(&mut rng);
+
+            let mut got: BTreeMap<i32, (i64, i64, i64)> = BTreeMap::new();
+            for row in select(&mut engine, "SELECT id, balance, vf, vt FROM acct").rows {
+                let id =
+                    i32::try_from(decode_int(row[0].as_ref(), LogicalType::Int4)).expect("id fits");
+                let cells = (
+                    decode_int(row[1].as_ref(), LogicalType::Int4),
+                    decode_int(row[2].as_ref(), LogicalType::Timestamp),
+                    decode_int(row[3].as_ref(), LogicalType::Timestamp),
+                );
+                let fresh = got.insert(id, cells).is_none();
+                // Static message — a decode-derived value in the message trips
+                // CodeQL's (false) cleartext-logging taint.
+                assert!(fresh, "the plain read returned two rows for one key");
+            }
+            assert_eq!(got, model, "plain read diverged from the naïve reference");
+            rows_seen += u64::try_from(got.len()).expect("fits");
+        }
+        assert!(
+            rows_seen > 0,
+            "every seed resolved an empty table — widen the workload"
+        );
     }
 
     #[test]
