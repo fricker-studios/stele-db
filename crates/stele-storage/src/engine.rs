@@ -54,7 +54,7 @@
 //! segment written by a torn flush is an **orphan** recovery ignores, falling
 //! back to the WAL — the atomic-commit seam STL-133 / STL-136 anticipated.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
 use stele_common::provenance::{Principal, TxnId};
@@ -377,6 +377,67 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
             txn_id,
             principal,
         )?)
+    }
+
+    /// Close every business key system-live at `at`, appending a retraction (a
+    /// close with no successor) for each — the storage half of `DROP TABLE`
+    /// ([STL-211]). Returns the number of rows closed.
+    ///
+    /// A `DROP TABLE` is otherwise a catalog-only transition (the schema chain's
+    /// open tail closes); the rows in the tier are never touched. Because the
+    /// session keeps a dropped table's tier resident to preserve history — and
+    /// reuses it if the name is re-created — a name re-created on that tier would
+    /// inherit the dropped era's still-open rows in a *current* read, and
+    /// re-inserting one of their business keys would be refused as a duplicate
+    /// ([`DmlOutcome`]'s `KeyExists`). Closing the rows at the drop instant fixes
+    /// both: they ceased to be asserted the moment the table ceased to exist.
+    ///
+    /// Append-only, per [ADR-0023]: each close stamps a write-once `sys_to` on
+    /// the prior version and mutates no committed record, so an `AS OF` read
+    /// **inside** the dropped era still resolves the row as open then — exactly
+    /// as before the drop. Pass `at` as the drop instant (the commit clock's
+    /// current high-water): every still-open version has `sys_from ≤ at`, so it
+    /// resolves live and is closed; a version opened later (the re-created era)
+    /// has `sys_from > at` and is left untouched.
+    ///
+    /// Each close is an independent auto-commit retraction, mirroring a sequence
+    /// of `DELETE`s; closing one key cannot change another's liveness, so the
+    /// open set resolved up front is stable across the loop.
+    ///
+    /// [ADR-0023]: ../../../docs/adr/0023-append-only-record-model-validity-index.md
+    /// [STL-211]: https://allegromusic.atlassian.net/browse/STL-211
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Delta`] / [`EngineError::Validity`] if enumerating the
+    /// live keys or resolving them fails; [`EngineError::Dml`] if staging a
+    /// close fails.
+    pub fn close_all_open(
+        &mut self,
+        at: Snapshot,
+        txn_id: TxnId,
+        principal: &Principal,
+    ) -> Result<usize, EngineError> {
+        // Every distinct business key across both tiers, narrowed to those with
+        // a version open at `at`. A `delete` needs a live version to close, so
+        // the filter is also what skips a key already retired in a deletion gap.
+        let mut keys: BTreeSet<BusinessKey> = BTreeSet::new();
+        for v in self.delta.staged_versions()? {
+            keys.insert(v.business_key);
+        }
+        for v in self.sealed.versions() {
+            keys.insert(v.business_key.clone());
+        }
+        let mut open: Vec<BusinessKey> = Vec::new();
+        for key in keys {
+            if self.as_of(&key, at)?.is_some() {
+                open.push(key);
+            }
+        }
+        for key in &open {
+            self.delete(key, txn_id, principal.clone())?;
+        }
+        Ok(open.len())
     }
 
     /// Open a **group-commit** buffer ([`DmlWriter::begin_group`], [STL-192]).
