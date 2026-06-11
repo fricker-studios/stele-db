@@ -68,13 +68,13 @@ serde              = { version = "1.0", features = ["derive"] }
 # extra supply-chain surface we don't need; we drop it and keep just `std`.
 sqlparser          = { version = "0.62", default-features = false, features = ["std"] }
 # Line editing for `stele shell` (STL-198): ↑/↓ history, Emacs keys, ⌃L. MIT;
-# default features off — no fuzzy matcher, no dirs probe. The `with-file-history`
-# feature (rustyline 18 locks the history via `std::fs::File::lock`, the
-# `file_lock` std API stabilized in Rust 1.89) now clears our MSRV but stays off
-# here: STL-221 adopts it and drops the hand-rolled `~/.stele_history`
-# serialization STL-202 added. CLI-only: never a dependency of the server or the
-# runtime-agnostic core.
-rustyline          = { version = "18.0", default-features = false }
+# default features off — no fuzzy matcher, no dirs probe. `with-file-history`
+# (STL-221) gives cross-process history locking + append-on-exit via the
+# `file_lock` std API (stable in Rust 1.89, our MSRV) and a native 0600 file mode;
+# the feature pulls **no new crates** — it only activates rustyline's own `log` +
+# `nix` code already in the tree. CLI-only: never a dependency of the server or
+# the runtime-agnostic core.
+rustyline          = { version = "18.0", default-features = false, features = ["with-file-history"] }
 # Terminal display width (CJK/emoji are 2 columns) for the shell's table
 # alignment. Already in the tree as rustyline's own width dep — zero new surface.
 unicode-width      = "0.2"
