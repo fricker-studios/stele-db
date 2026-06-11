@@ -2202,26 +2202,32 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     ) -> Result<(), EngineError> {
         // Fast path: zero or one table — no cross-table coordination needed, so the
         // plain single-record commit stands as the atomic boundary (one fsync, no
-        // marker). Recovery applies a plain record unconditionally.
+        // marker). Recovery applies a plain record unconditionally. A touched table
+        // that no longer resolves is an invariant break (`apply_group` already
+        // resolved and wrote it, and no DDL interleaves a commit) — fail closed via
+        // `?` rather than silently acknowledge a commit that never reached the WAL.
         if touched.len() <= 1 {
             if let Some(table) = touched.first() {
-                if let Ok(state) = self.table_mut(table) {
-                    state.engine.commit_group()?;
-                }
+                self.table_mut(table)?.engine.commit_group()?;
             }
             return Ok(());
         }
 
-        // Multi-table: make every leg durable as a two-phase record first.
+        // Multi-table: make every leg durable as a two-phase record first. Once any
+        // leg fails the rest are discarded and no marker is written, so the
+        // transaction recovers all-or-none. A touched table that no longer resolves
+        // is the same invariant break as above — treat it as a leg failure rather
+        // than skip it and then vouch a marker for a leg that was never committed.
         let mut error: Option<EngineError> = None;
         for table in touched {
-            let Ok(state) = self.table_mut(table) else {
-                continue;
-            };
-            if error.is_some() {
-                state.engine.abort_group();
-            } else if let Err(e) = state.engine.commit_group_two_phase(txn_id) {
-                error = Some(EngineError::from(e));
+            match self.table_mut(table) {
+                Ok(state) if error.is_some() => state.engine.abort_group(),
+                Ok(state) => {
+                    if let Err(e) = state.engine.commit_group_two_phase(txn_id) {
+                        error = Some(EngineError::from(e));
+                    }
+                }
+                Err(e) => error = error.or(Some(e)),
             }
         }
         if let Some(e) = error {

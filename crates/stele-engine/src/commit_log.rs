@@ -150,14 +150,21 @@ pub(crate) fn replay<D: Disk>(disk: &D) -> io::Result<BTreeSet<TxnId>> {
         }
 
         // The frame is complete, so it was acknowledged — from here on, damage is
-        // corruption and fails closed.
+        // corruption and fails closed. A marker payload is the fixed `PAYLOAD_LEN`;
+        // validate the on-disk length against it *before* allocating, so a corrupt
+        // length field cannot drive a large allocation during recovery.
         let payload_bytes = usize::try_from(payload_len)
             .map_err(|_| corrupt("commit log: record too large for this platform"))?;
-        let mut body = vec![0u8; payload_bytes + CRC_LEN];
+        if payload_bytes != PAYLOAD_LEN {
+            return Err(corrupt(
+                "commit log: a complete marker is not the fixed-size payload — corrupt",
+            ));
+        }
+        let mut body = [0u8; PAYLOAD_LEN + CRC_LEN];
         if file.read_at(offset + (HEADER_LEN as u64), &mut body)? < body.len() {
             return Err(corrupt("commit log: short read inside a complete record"));
         }
-        let (payload, crc_bytes) = body.split_at(payload_bytes);
+        let (payload, crc_bytes) = body.split_at(PAYLOAD_LEN);
         let stored = u32::from_le_bytes(crc_bytes.try_into().expect("4 bytes"));
         let mut covered = Vec::with_capacity(HEADER_LEN + payload.len());
         covered.extend_from_slice(&header);
@@ -167,9 +174,7 @@ pub(crate) fn replay<D: Disk>(disk: &D) -> io::Result<BTreeSet<TxnId>> {
                 "commit log: CRC mismatch on a complete record — an acknowledged commit is corrupt",
             ));
         }
-        let id: [u8; PAYLOAD_LEN] = payload
-            .try_into()
-            .map_err(|_| corrupt("commit log: unexpected marker payload length"))?;
+        let id: [u8; PAYLOAD_LEN] = payload.try_into().expect("validated PAYLOAD_LEN bytes");
         committed.insert(TxnId(u64::from_le_bytes(id)));
         offset += frame_len;
     }

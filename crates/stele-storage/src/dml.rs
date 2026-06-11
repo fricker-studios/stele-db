@@ -496,10 +496,10 @@ pub fn replay<D: Disk, I: Disk>(
 /// applied from the surviving prefix.
 ///
 /// `committed` gates **two-phase** records — the legs of a multi-table `COMMIT`
-/// ([STL-215]). A record tagged with a transaction id is replayed only if
-/// [`committed.admits`](CommittedTxns) it (its commit marker is durable); otherwise
-/// it is skipped, so a crash between the per-table commits and the marker recovers
-/// the transaction all-or-none across every table. Plain (single-table /
+/// ([STL-215]). A record tagged with a transaction id is replayed only if that
+/// transaction is in [`committed`](CommittedTxns) (its commit marker is durable);
+/// otherwise it is skipped, so a crash between the per-table commits and the marker
+/// recovers the transaction all-or-none across every table. Plain (single-table /
 /// auto-commit) records carry no tag and always apply. A single table's bare
 /// [`Engine::recover`](crate::engine::Engine::recover) passes [`CommittedTxns::All`]
 /// (no cross-table coordination to gate on).
