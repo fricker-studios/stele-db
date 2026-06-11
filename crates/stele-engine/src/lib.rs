@@ -706,6 +706,75 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         })
     }
 
+    /// Take a lightweight **checkpoint** of every resident table: group-commit
+    /// fsync each table's WAL and record its durable fence, *without* sealing the
+    /// delta tier ([`Engine::checkpoint`]). This is the cheap durability fence —
+    /// recovery still replays each table's log from its floor — and the sibling
+    /// of [`flush`](Self::flush), which additionally bounds that replay.
+    ///
+    /// Drives **every resident tier**, including a dropped table's retained tier:
+    /// its WAL is still replayed on the next [`recover`](Self::recover), so
+    /// fencing it is meaningful even though the catalog no longer resolves the
+    /// name.
+    ///
+    /// This is the operator-facing **manual trigger** [STL-177] deferred
+    /// ([STL-195]). A background *policy* that decides *when* to checkpoint, and a
+    /// SQL/admin `CHECKPOINT` command so a wire client can trigger it, are both
+    /// out of scope here ([STL-219]).
+    ///
+    /// Per-table checkpoints are independently durable and idempotent, so a
+    /// failure part-way leaves the already-fenced tiers fenced; the call returns
+    /// the first error.
+    ///
+    /// [STL-177]: https://allegromusic.atlassian.net/browse/STL-177
+    /// [STL-195]: https://allegromusic.atlassian.net/browse/STL-195
+    /// [STL-219]: https://allegromusic.atlassian.net/browse/STL-219
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Storage`] if any table's checkpoint fails.
+    pub fn checkpoint(&mut self) -> Result<(), EngineError> {
+        for state in self.tables.values_mut() {
+            state.engine.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    /// **Flush** every resident table: seal each delta tier into a fresh sealed
+    /// segment and advance each table's replay floor past the records it now
+    /// covers, so the next [`recover`](Self::recover) replays only each WAL's tail
+    /// rather than its whole log ([`Engine::flush`]). This is the bounded-recovery
+    /// win [STL-177] landed at the storage layer, now reachable from the session
+    /// ([STL-195]).
+    ///
+    /// Drives **every resident tier**, including a dropped table's retained tier:
+    /// recovery reopens and replays that tier's WAL too, so flushing it bounds
+    /// that work even though the catalog no longer resolves the name.
+    ///
+    /// A background *policy* that decides *when* to flush, and a SQL/admin `FLUSH`
+    /// command so a wire client can trigger it, are out of scope here
+    /// ([STL-177] / [STL-219]); history-preserving compaction is v0.3.
+    ///
+    /// Each table's flush is its own crash-atomic, idempotent unit (the new
+    /// segment is adopted only once its checkpoint record is durable —
+    /// [`Engine::flush`]), so a failure part-way leaves the already-flushed tiers
+    /// flushed; the call returns the first error. A re-run re-flushes whatever the
+    /// failure left unsealed.
+    ///
+    /// [STL-177]: https://allegromusic.atlassian.net/browse/STL-177
+    /// [STL-195]: https://allegromusic.atlassian.net/browse/STL-195
+    /// [STL-219]: https://allegromusic.atlassian.net/browse/STL-219
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Storage`] if any table's flush fails.
+    pub fn flush(&mut self) -> Result<(), EngineError> {
+        for state in self.tables.values_mut() {
+            state.engine.flush()?;
+        }
+        Ok(())
+    }
+
     /// The session's catalog — schemas resolve at a snapshot through it.
     #[must_use]
     pub const fn catalog(&self) -> &Catalog {
@@ -4744,6 +4813,179 @@ mod tests {
             "the AS OF read answers as the live session did"
         );
         assert_eq!(live_as_of, vec![vec![i4(1), i4(100)]]);
+    }
+
+    // ---- manual flush / checkpoint (STL-195) ----
+
+    use stele_storage::wal::LogOffset;
+
+    #[test]
+    fn flush_seals_every_table_and_recover_replays_only_the_tail() {
+        // The session-level manual flush ([STL-195]) drives *every* resident
+        // table's storage `Engine`: it seals each delta into a sealed segment and
+        // advances each table's recovery floor, so a later restart replays only
+        // the WAL tail written *after* the flush, not the whole log. Two tables
+        // prove the driver fans out rather than touching just the first.
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        for ddl in [
+            "CREATE TABLE a (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE b (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+        ] {
+            engine.execute(&parse_one(ddl)).expect("create");
+        }
+        // Pre-flush writes — these land in the delta tier + WAL.
+        engine
+            .execute(&parse_one("INSERT INTO a VALUES (1, 100)"))
+            .expect("a1");
+        engine
+            .execute(&parse_one("INSERT INTO b VALUES (1, 10)"))
+            .expect("b1");
+
+        // The manual flush: seals both deltas into segments and advances both
+        // floors past the records those segments now cover.
+        engine.flush().expect("flush");
+        for name in ["a", "b"] {
+            let st = engine.tables.get(name).expect("tier resident");
+            assert!(
+                !st.engine.segment_names().is_empty(),
+                "{name}: flush sealed a segment",
+            );
+            assert!(
+                st.engine.replay_floor() > LogOffset::ZERO,
+                "{name}: flush advanced the recovery floor off the origin",
+            );
+        }
+        let floor_a = engine.tables.get("a").unwrap().engine.replay_floor();
+        let floor_b = engine.tables.get("b").unwrap().engine.replay_floor();
+
+        // Post-flush writes — these stay in the WAL tail, past the floors.
+        engine
+            .execute(&parse_one("INSERT INTO a VALUES (2, 200)"))
+            .expect("a2");
+        engine
+            .execute(&parse_one("UPDATE b SET balance = 20 WHERE id = 1"))
+            .expect("b2");
+        let live_a = sorted(select(&mut engine, "SELECT id, balance FROM a").rows);
+        let live_b = sorted(select(&mut engine, "SELECT id, balance FROM b").rows);
+        drop(engine);
+
+        // Restart: recovery composes each segment prefix with the replayed tail.
+        let mut engine = recover_session(&disk);
+        // The recovered floors are exactly the flushed floors loaded from each
+        // checkpoint manifest — recovery resumed replay from the tail, not the log
+        // origin (a full replay would leave the floor at `ZERO`).
+        assert_eq!(
+            engine.tables.get("a").unwrap().engine.replay_floor(),
+            floor_a,
+            "a resumed from the flushed floor, not the log origin",
+        );
+        assert_eq!(
+            engine.tables.get("b").unwrap().engine.replay_floor(),
+            floor_b,
+            "b resumed from the flushed floor, not the log origin",
+        );
+        for name in ["a", "b"] {
+            assert!(
+                !engine
+                    .tables
+                    .get(name)
+                    .unwrap()
+                    .engine
+                    .segment_names()
+                    .is_empty(),
+                "{name}: the sealed segment is adopted on recovery",
+            );
+        }
+        // …and the data is whole: the pre-flush segment rows and the post-flush
+        // tail rows both survive and compose.
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT id, balance FROM a").rows),
+            live_a,
+        );
+        assert_eq!(live_a, vec![vec![i4(1), i4(100)], vec![i4(2), i4(200)]]);
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT id, balance FROM b").rows),
+            live_b,
+        );
+        assert_eq!(live_b, vec![vec![i4(1), i4(20)]]);
+    }
+
+    #[test]
+    fn checkpoint_fences_every_table_without_sealing() {
+        // A session checkpoint is the *lightweight* durability fence: it
+        // group-commit fsyncs each table's WAL and records the fence, but does
+        // NOT seal the delta into a segment, so recovery still replays each
+        // table's whole log. It is flush's cheaper sibling ([STL-195]/[STL-177]).
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+
+        engine.checkpoint().expect("checkpoint");
+        let st = engine.tables.get("account").expect("tier resident");
+        assert!(
+            st.engine.segment_names().is_empty(),
+            "a checkpoint seals no segment",
+        );
+        assert_eq!(
+            st.engine.replay_floor(),
+            LogOffset::ZERO,
+            "a checkpoint leaves the replay floor at the log origin",
+        );
+        assert!(
+            st.engine.durable_fence().is_some(),
+            "a checkpoint records a durable fence",
+        );
+
+        let live = sorted(select(&mut engine, "SELECT id, balance FROM account").rows);
+        drop(engine);
+        let mut engine = recover_session(&disk);
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT id, balance FROM account").rows),
+            live,
+            "the checkpointed data survives the restart",
+        );
+        assert_eq!(live, vec![vec![i4(1), i4(100)]]);
+    }
+
+    #[test]
+    fn flush_drives_a_dropped_tables_retained_tier() {
+        // A dropped table keeps its tier resident for AS OF history, and that
+        // tier's WAL is replayed on the next recover — so the manual flush must
+        // drive it too, bounding that replay. The driver iterates *every* resident
+        // tier, not just the catalog-live ones; this pins that choice against a
+        // regression to live-only iteration. (No restart here — the bounded
+        // replay across recover is the previous test; this one only proves the
+        // dropped tier is *reached*.)
+        let mut engine = SessionEngine::open(MemDisk::new(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+        engine
+            .execute(&parse_one("DROP TABLE account"))
+            .expect("drop");
+        assert!(
+            engine.describe_live_tables().is_empty(),
+            "the catalog no longer resolves the dropped name",
+        );
+
+        engine.flush().expect("flush drives the dropped tier");
+        let st = engine
+            .tables
+            .get("account")
+            .expect("the dropped table's tier stays resident");
+        assert!(
+            !st.engine.segment_names().is_empty(),
+            "the dropped table's retained tier was flushed",
+        );
+        assert!(
+            st.engine.replay_floor() > LogOffset::ZERO,
+            "and its recovery floor advanced off the origin",
+        );
     }
 
     #[test]
