@@ -52,8 +52,8 @@ mod catalog_log;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::catalog_log::CatalogRecord;
 
@@ -331,6 +331,93 @@ pub struct SessionTransaction {
     /// truncates `writes` back to that marker — undoing exactly the writes staged
     /// after the savepoint, and nothing before it.
     savepoints: Vec<Savepoint>,
+    /// Keeps this transaction's [`snapshot`](Self::snapshot) registered in the
+    /// engine's [`open_snapshots`](SessionEngine::open_snapshots) multiset for as
+    /// long as the transaction is open. Dropping it — on
+    /// [`commit`](SessionEngine::commit), an explicit `ROLLBACK` (the front end
+    /// drops the [`SessionTransaction`]), or a dropped connection — releases the
+    /// registration, so the engine's prune floor rises with no explicit
+    /// end-of-transaction call to miss ([STL-204]).
+    lease: SnapshotLease,
+}
+
+/// The system-time snapshots pinned by currently-open transactions, as a multiset
+/// `instant -> how many open transactions pinned it`. Shared (behind an [`Arc`],
+/// like the commit clock's high-water mark) between the [`SessionEngine`] and every
+/// live [`SnapshotLease`], so a transaction ending on *any* path decrements its
+/// instant without the engine having to observe the end explicitly. The smallest
+/// key is the oldest live snapshot, the floor below which the MVCC write index can
+/// be pruned ([STL-204], [ADR-0008]).
+///
+/// The inner [`Mutex`] guards only this small map and is taken for the duration of
+/// a single increment / decrement / minimum read — never across other work — so it
+/// neither blocks under the single-threaded sim scheduler nor affects any
+/// observable result: it bounds *when* unreachable index entries are dropped, not
+/// *which* (an entry is pruned only once it can never satisfy a conflict). The
+/// engine therefore stays deterministic in every observable behavior ([ADR-0010]).
+type OpenSnapshots = Arc<Mutex<BTreeMap<SystemTimeMicros, usize>>>;
+
+/// An RAII registration of one open transaction's pinned snapshot in the engine's
+/// [`OpenSnapshots`] multiset ([STL-204]).
+///
+/// Held inside the [`SessionTransaction`], so it lives exactly as long as the
+/// transaction: [`begin`](SessionEngine::begin) acquires it, and dropping the
+/// transaction — by `commit`, by `ROLLBACK` (the front end simply drops it), or by
+/// a dropped connection — releases it. That makes the bookkeeping leak-free across
+/// every end-of-transaction path, including the ones the engine never sees as a
+/// method call.
+#[derive(Debug)]
+struct SnapshotLease {
+    open: OpenSnapshots,
+    snapshot: SystemTimeMicros,
+}
+
+impl SnapshotLease {
+    /// Register `snapshot` as pinned by one more open transaction.
+    fn new(open: OpenSnapshots, snapshot: SystemTimeMicros) -> Self {
+        *Self::lock(&open).entry(snapshot).or_insert(0) += 1;
+        Self { open, snapshot }
+    }
+
+    /// Move the registration to a new pinned instant — a DDL inside the block
+    /// advanced the snapshot ([`repin_snapshot`](SessionEngine::repin_snapshot),
+    /// [STL-175]) — releasing the old instant and acquiring the new one.
+    fn repin(&mut self, snapshot: SystemTimeMicros) {
+        if snapshot == self.snapshot {
+            return;
+        }
+        let mut open = Self::lock(&self.open);
+        Self::release(&mut open, self.snapshot);
+        *open.entry(snapshot).or_insert(0) += 1;
+        drop(open);
+        self.snapshot = snapshot;
+    }
+
+    /// Decrement `snapshot`'s refcount, removing the key when it reaches zero so
+    /// the smallest key always names a *currently* live snapshot.
+    fn release(open: &mut BTreeMap<SystemTimeMicros, usize>, snapshot: SystemTimeMicros) {
+        if let std::collections::btree_map::Entry::Occupied(mut e) = open.entry(snapshot) {
+            if *e.get() <= 1 {
+                e.remove();
+            } else {
+                *e.get_mut() -= 1;
+            }
+        }
+    }
+
+    /// Lock the multiset, recovering the guard through a poisoned lock — the only
+    /// thing held under it is integer bookkeeping that cannot leave the map
+    /// inconsistent, and a drop must never panic a second time.
+    fn lock(open: &OpenSnapshots) -> std::sync::MutexGuard<'_, BTreeMap<SystemTimeMicros, usize>> {
+        open.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for SnapshotLease {
+    fn drop(&mut self) {
+        Self::release(&mut Self::lock(&self.open), self.snapshot);
+    }
 }
 
 /// One open savepoint: a name plus the [`SessionTransaction::writes`] length when
@@ -563,14 +650,28 @@ pub struct SessionEngine<C: Clock + Clone, D: Disk + Clone> {
     /// here, and a multi-statement [`commit`](Self::commit) checks its write set
     /// against it for first-committer-wins conflict detection ([STL-175],
     /// [ADR-0008]). Keyed by table name + business key; one entry per distinct key
-    /// (a later write overwrites the instant), so it grows with the number of
-    /// distinct keys ever written, not with the number of writes — pruning entries
-    /// older than the oldest live snapshot is a deferred refinement ([STL-204]).
+    /// (a later write overwrites the instant). [`prune_write_index`](Self::prune_write_index)
+    /// bounds it: an entry committed strictly below the oldest live snapshot can
+    /// never satisfy a conflict again, so it is dropped — and when no transaction
+    /// is open, the whole index is ([STL-204]).
     ///
     /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
     /// [STL-204]: https://allegromusic.atlassian.net/browse/STL-204
     /// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
     write_index: BTreeMap<(String, BusinessKey), SystemTimeMicros>,
+    /// The snapshots pinned by currently-open transactions ([`OpenSnapshots`]).
+    /// Its smallest key is the oldest live snapshot — the floor
+    /// [`prune_write_index`](Self::prune_write_index) keeps the write index above.
+    /// A [`SnapshotLease`] in each [`SessionTransaction`] maintains the counts, so
+    /// a transaction ending on any path (commit, rollback, dropped connection)
+    /// updates it without an explicit engine call ([STL-204]).
+    open_snapshots: OpenSnapshots,
+    /// The floor [`prune_write_index`](Self::prune_write_index) last pruned below:
+    /// no write-index entry below it survives. A cheap monotonic guard so a prune
+    /// re-scans the index only when the oldest live snapshot has actually risen —
+    /// not on every auto-committed write under a long-lived open transaction
+    /// ([STL-204]).
+    pruned_below: SystemTimeMicros,
 }
 
 impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
@@ -592,6 +693,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             next_namespace: 0,
             next_txn: 1,
             write_index: BTreeMap::new(),
+            open_snapshots: OpenSnapshots::default(),
+            pruned_below: SystemTimeMicros(0),
         }
     }
 
@@ -703,6 +806,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             next_namespace,
             next_txn: max_txn_id.saturating_add(1),
             write_index: BTreeMap::new(),
+            open_snapshots: OpenSnapshots::default(),
+            pruned_below: SystemTimeMicros(0),
         })
     }
 
@@ -887,7 +992,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// [`execute_in_txn`](Self::execute_in_txn); the in-process path advances the
     /// snapshot itself.
     pub fn repin_snapshot(&self, txn: &mut SessionTransaction) {
-        txn.snapshot = self.clock.current();
+        let snapshot = self.clock.current();
+        txn.snapshot = snapshot;
+        // Keep the open-snapshot multiset in step with the advanced pin, so the
+        // prune floor reflects where this transaction now reads ([STL-204]).
+        txn.lease.repin(snapshot);
     }
 
     /// The shared statement router, resolving **reads** — a `SELECT`, and the
@@ -1365,7 +1474,57 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         self.next_txn += 1;
         let principal = Principal::new(WIRE_PRINCIPAL.to_vec());
         let summary = self.apply_bound_dml(dml, txn_id, &principal)?;
+        // An auto-committed write pins no snapshot, so this is the steady-state
+        // prune point under auto-commit traffic — without it the index would grow
+        // with distinct keys on a server that never opens a transaction ([STL-204]).
+        self.prune_write_index();
         Ok(StatementOutcome::Dml(summary))
+    }
+
+    /// The oldest system-time snapshot pinned by a currently-open transaction, or
+    /// `None` when none is open. The floor [`prune_write_index`](Self::prune_write_index)
+    /// keeps the write index above ([STL-204]).
+    fn oldest_live_snapshot(&self) -> Option<SystemTimeMicros> {
+        SnapshotLease::lock(&self.open_snapshots)
+            .keys()
+            .next()
+            .copied()
+    }
+
+    /// Drop write-index entries that can no longer produce a write-write conflict,
+    /// bounding the index on a long-lived server ([STL-204], [ADR-0008]).
+    ///
+    /// A conflict requires a write committed *strictly after* some open
+    /// transaction's pinned snapshot (`committed_at > snapshot`), so an entry at or
+    /// below the **oldest** live snapshot can never conflict with that transaction —
+    /// nor any newer one, whose snapshot is at least as high — and is dropped. When
+    /// no transaction is open the whole index goes: every future transaction pins at
+    /// or past the current instant, which is at or past every recorded write.
+    ///
+    /// The `pruned_below` guard skips the (O(index)) scan when the floor has not
+    /// risen since the last prune, so steady auto-commit traffic under a single
+    /// long-lived open transaction stays cheap — the index can only grow with keys
+    /// that *could* still conflict with that transaction, and is reclaimed the
+    /// moment it ends.
+    fn prune_write_index(&mut self) {
+        match self.oldest_live_snapshot() {
+            // No open reader: nothing recorded can ever conflict again.
+            None => {
+                self.write_index.clear();
+                self.pruned_below = self.clock.current();
+            }
+            // The floor rose: drop everything strictly below the oldest live
+            // snapshot. (Entries exactly at it are kept — they cannot conflict with
+            // it, but the conservative `>=` bound matches the ticket's wording and
+            // keeps at most one instant's worth of harmless extra entries.)
+            Some(floor) if floor > self.pruned_below => {
+                self.write_index
+                    .retain(|_, &mut committed_at| committed_at >= floor);
+                self.pruned_below = floor;
+            }
+            // The floor has not advanced since the last prune — nothing new to drop.
+            Some(_) => {}
+        }
     }
 
     /// Apply one already-bound DML operation under the given provenance, reporting
@@ -1580,10 +1739,15 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
     #[must_use]
     pub fn begin(&self) -> SessionTransaction {
+        let snapshot = self.clock.current();
         SessionTransaction {
-            snapshot: self.clock.current(),
+            snapshot,
             writes: Vec::new(),
             savepoints: Vec::new(),
+            // Register the pinned snapshot so it holds the prune floor down for as
+            // long as this transaction is open ([STL-204]). `begin` is `&self`, but
+            // the multiset is behind its own lock, so no `&mut self` is needed.
+            lease: SnapshotLease::new(Arc::clone(&self.open_snapshots), snapshot),
         }
     }
 
@@ -1697,10 +1861,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         self.next_txn += 1;
         let principal = Principal::new(WIRE_PRINCIPAL.to_vec());
 
+        // The conflict window is closed; take the buffered writes and the snapshot
+        // lease out of the transaction. Releasing the lease (below) before pruning
+        // is what lets this transaction's own pinned snapshot stop holding the
+        // floor down, so the index can be pruned below it ([STL-204]).
+        let SessionTransaction { writes, lease, .. } = txn;
+
         // Apply every write into per-table group-commit buffers, tracking the tables
         // touched so they can be group-committed (success) or discarded (failure).
         let mut touched: Vec<String> = Vec::new();
-        match self.apply_group(txn.writes, txn_id, &principal, &mut touched) {
+        let result = match self.apply_group(writes, txn_id, &principal, &mut touched) {
             Ok(()) => self.finish_group_commit(&touched),
             Err(e) => {
                 // Discard every buffered (un-logged) write so nothing is made durable
@@ -1712,7 +1882,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 }
                 Err(e)
             }
-        }
+        };
+        // This transaction no longer pins a snapshot — release the lease, then prune
+        // the write index below the new oldest live snapshot ([STL-204]).
+        drop(lease);
+        self.prune_write_index();
+        result
     }
 
     /// Group-commit every `touched` table — one WAL record + one fsync each — and
@@ -3429,6 +3604,93 @@ mod tests {
         assert_eq!(
             payload_column(&result),
             vec![encode_value(&ScalarValue::Int4(300))]
+        );
+    }
+
+    #[test]
+    fn commit_prunes_write_index_below_the_oldest_live_snapshot() {
+        // The MVCC write index is bounded by the oldest live snapshot ([STL-204]):
+        // an entry committed strictly before it can never produce a conflict, so it
+        // is dropped, while an entry at it (still reachable) survives.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        // `low` stays open across two auto-committed inserts, holding the floor at
+        // its snapshot so both their write-index entries are retained.
+        let low = engine.begin();
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert id=1");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (2, 200)"))
+            .expect("insert id=2");
+
+        // `high` pins a later snapshot: id=1 committed strictly before it, id=2 at
+        // it (the second insert advanced the clock to exactly this instant).
+        let high = engine.begin();
+        let floor = high.snapshot;
+
+        let key1 = ("account".to_owned(), business_key(&ScalarValue::Int4(1)));
+        let key2 = ("account".to_owned(), business_key(&ScalarValue::Int4(2)));
+        assert!(engine.write_index.contains_key(&key1), "id=1 recorded");
+        assert!(engine.write_index.contains_key(&key2), "id=2 recorded");
+        assert!(
+            engine.write_index[&key1] < floor,
+            "id=1 committed strictly below the later snapshot"
+        );
+
+        // `low` ends: the oldest live snapshot rises to `high`'s, and committing
+        // prunes the index below it.
+        engine
+            .commit(low)
+            .expect("read-only commit of the low transaction");
+
+        assert!(
+            !engine.write_index.contains_key(&key1),
+            "the entry below the oldest live snapshot is pruned"
+        );
+        assert!(
+            engine.write_index.contains_key(&key2),
+            "the entry at the oldest live snapshot is retained"
+        );
+        assert!(
+            engine.write_index.values().all(|&at| at >= floor),
+            "no entry remains below the oldest live snapshot"
+        );
+
+        drop(high);
+    }
+
+    #[test]
+    fn rollback_releases_the_snapshot_so_a_later_write_prunes_the_index() {
+        // Rolling a transaction back is just dropping it ([STL-174]); its snapshot
+        // lease is released on drop, so the floor it pinned is gone and the next
+        // write reclaims the index ([STL-204]).
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        let held = engine.begin();
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert id=1");
+        let key1 = ("account".to_owned(), business_key(&ScalarValue::Int4(1)));
+        assert!(
+            engine.write_index.contains_key(&key1),
+            "the open transaction holds the floor, so id=1 is retained"
+        );
+
+        // ROLLBACK: drop the transaction without committing.
+        drop(held);
+
+        // With no live snapshot, the next auto-committed write prunes the whole
+        // index — proving the rolled-back transaction no longer pins the floor (had
+        // its lease leaked, id=1 would still be retained above it).
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (2, 200)"))
+            .expect("insert id=2");
+        assert!(
+            engine.write_index.is_empty(),
+            "no open snapshot ⇒ every entry is unreachable and dropped"
         );
     }
 
