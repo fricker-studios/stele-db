@@ -40,9 +40,11 @@
 
 mod as_of_oracle;
 mod fault_disk;
+mod si_oracle;
 
 pub use as_of_oracle::run_as_of_oracle_seed;
 pub use fault_disk::{FaultDisk, FaultEvent, FaultKind, FaultProfile};
+pub use si_oracle::run_si_oracle_seed;
 
 use std::collections::BTreeMap;
 use std::io;
@@ -2792,6 +2794,7 @@ pub fn registry() -> Vec<Box<dyn Scenario>> {
         FnScenario::boxed("delete-provenance", run_delete_seed),
         FnScenario::boxed("dml-wal-replay", run_dml_seed),
         FnScenario::boxed("mvcc", run_mvcc_seed),
+        FnScenario::boxed("si-provenance", run_si_oracle_seed),
         FnScenario::boxed("chain-recovery", run_chain_recovery_seed),
         FnScenario::boxed("recovery-index", run_recovery_index_seed),
         FnScenario::boxed("snapshot-scan", run_snapshot_scan_seed),
@@ -3297,6 +3300,7 @@ mod tests {
         assert_eq!(replayed["storage"], run_storage_seed(seed));
         assert_eq!(replayed["snapshot-scan"], run_snapshot_scan_seed(seed));
         assert_eq!(replayed["as-of-oracle"], run_as_of_oracle_seed(seed));
+        assert_eq!(replayed["si-provenance"], run_si_oracle_seed(seed));
         assert_eq!(replayed["engine-recover"], run_engine_recover_seed(seed));
         assert_eq!(
             replayed["engine-recover-faults"],
