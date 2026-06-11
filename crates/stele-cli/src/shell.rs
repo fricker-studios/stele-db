@@ -1057,8 +1057,15 @@ fn load_history_file(rl: &mut ShellEditor, path: &std::path::Path) {
 /// `~/.stele_history`, oldest first. Embedded newlines are escaped so each
 /// entry occupies exactly one line. Best-effort: a write failure must not mask
 /// the session's own outcome.
+///
+/// The file is created user-only (`0600`), like `~/.psql_history`: history can
+/// carry sensitive SQL (credentials in a literal, say), so it must not be
+/// world-readable. `mode` only bites on creation, so a pre-existing `0644` file
+/// is re-tightened after the write.
 fn save_history_file(rl: &ShellEditor, path: &std::path::Path) {
     use rustyline::history::{History as _, SearchDirection};
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     let history = rl.history();
     let mut buf = String::new();
@@ -1068,7 +1075,17 @@ fn save_history_file(rl: &ShellEditor, path: &std::path::Path) {
             buf.push('\n');
         }
     }
-    let _ = std::fs::write(path, buf);
+    let opened = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path);
+    if let Ok(mut file) = opened {
+        if file.write_all(buf.as_bytes()).is_ok() {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+    }
 }
 
 /// Escape an entry to one physical line: `\` → `\\`, newline → `\n` (matching
@@ -1184,9 +1201,13 @@ fn complete(line: &str, pos: usize, identifiers: &[String]) -> (usize, Vec<Strin
     let trimmed = head.trim_start();
     if trimmed.starts_with('\\') && !trimmed.contains(char::is_whitespace) {
         let start = pos - trimmed.len();
+        // Keep exact matches in the pool (unlike the SQL branch): if the input
+        // is already a valid command that is *also* a prefix of a longer one
+        // (`\d` vs `\dt`), that's two candidates → ambiguous → no completion,
+        // so ⇥ never rewrites `\d` and `\d <table>` stays reachable.
         let matches = META_NAMES
             .iter()
-            .filter(|name| name.starts_with(trimmed) && **name != trimmed)
+            .filter(|name| name.starts_with(trimmed))
             .map(|name| format!("{name} "))
             .collect();
         return unique_completion(start, matches);
@@ -1389,9 +1410,21 @@ mod tests {
     }
 
     #[test]
-    fn an_already_complete_meta_command_is_left_alone() {
-        // `\q` has no longer extension, so there is nothing to add.
-        assert_eq!(complete(r"\q", 2, &[]), (0, Vec::new()));
+    fn a_meta_command_with_a_longer_sibling_does_not_complete() {
+        // `\d` and `\dt` both match `\d`, so ⇥ stays its hand — `\d <table>`
+        // must remain reachable (regression: don't rewrite `\d` → `\dt`).
+        let (_, cands) = complete(r"\d", 2, &[]);
+        assert!(cands.is_empty(), "{cands:?}");
+    }
+
+    #[test]
+    fn a_complete_meta_command_with_no_sibling_just_gains_a_space() {
+        // `\conninfo` is unique with no longer extension → ⇥ appends a space
+        // (the prototype keeps exact matches in the meta pool).
+        assert_eq!(
+            complete(r"\conninfo", 9, &[]),
+            (0, vec![r"\conninfo ".to_owned()])
+        );
     }
 
     #[test]
