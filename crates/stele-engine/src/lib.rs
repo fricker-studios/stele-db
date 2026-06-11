@@ -628,16 +628,19 @@ pub enum EngineError {
     )]
     Conflict,
 
-    /// A valid-time period bound (`valid_from` / `valid_to`) read back while pinning
-    /// the valid axis of a transaction's overlaid rows (`FOR VALID_TIME AS OF`,
-    /// read-your-own-writes — [STL-223]) was missing or not a well-formed eight-byte
-    /// timestamp. The binder always writes both bounds as concrete instants, so this
-    /// signals a corrupt buffered write or scanned row, never user input. Carries the
-    /// offending period column's position.
+    /// A `FOR VALID_TIME AS OF` pin of a transaction's overlaid rows
+    /// (read-your-own-writes — [STL-223]) could not be applied: either the table's
+    /// period columns could not be resolved to positions, or a period bound
+    /// (`valid_from` / `valid_to`) cell was missing or not a well-formed eight-byte
+    /// timestamp. The binder routes a valid pin only to a valid-time table and always
+    /// writes both bounds as concrete instants, so this signals an internal contract
+    /// break (a corrupt buffered write or scanned row, or a schema/temporal
+    /// mismatch), never user input — surfaced rather than silently returning rows
+    /// outside the pin.
     ///
     /// [STL-223]: https://allegromusic.atlassian.net/browse/STL-223
-    #[error("valid-time period bound in column {0} is not a well-formed timestamp")]
-    MalformedValidBound(usize),
+    #[error("valid-time period information for an overlaid AS OF read could not be resolved")]
+    MalformedValidBound,
 }
 
 /// One table's live state inside a session.
@@ -1720,12 +1723,15 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let overlaid = overlay_table_writes(base, overlay, bound.table.as_str(), value_count);
         // Pin the valid axis when the read carries `FOR VALID_TIME AS OF v`. The pin
         // only ever reaches a valid-time table (`bind_select` rejects it otherwise),
-        // so the period columns are present whenever `valid_snapshot` is set.
-        let pinned = match (bound.valid_snapshot, valid_cols) {
-            (Some(v), Some((from_idx, to_idx))) => {
+        // so the period columns are present whenever `valid_snapshot` is set — but if
+        // they cannot be resolved, fail closed (`MalformedValidBound`) rather than
+        // silently skip the filter and return rows outside the pin.
+        let pinned = match bound.valid_snapshot {
+            Some(v) => {
+                let (from_idx, to_idx) = valid_cols.ok_or(EngineError::MalformedValidBound)?;
                 filter_overlaid_valid(overlaid, from_idx, to_idx, v.0)?
             }
-            _ => overlaid,
+            None => overlaid,
         };
         filter_rows(bound, schema_columns, pinned)
     }
@@ -2826,7 +2832,7 @@ fn valid_bound_micros(row: &[Option<Vec<u8>>], idx: usize) -> Result<i64, Engine
         .get(idx)
         .and_then(Option::as_deref)
         .and_then(|cell| cell.try_into().ok())
-        .ok_or(EngineError::MalformedValidBound(idx))?;
+        .ok_or(EngineError::MalformedValidBound)?;
     Ok(i64::from_le_bytes(bytes))
 }
 
