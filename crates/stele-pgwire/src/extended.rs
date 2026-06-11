@@ -537,12 +537,12 @@ fn walk_set_expr(set: &mut SetExpr, params: &[Value]) {
 fn walk_expr(expr: &mut Expr, params: &[Value]) {
     match expr {
         Expr::Value(vws) => {
-            if let Value::Placeholder(name) = &vws.value {
-                if let Some(index) = placeholder_index(name) {
-                    // Keep the placeholder's span; only its value changes.
-                    if let Some(value) = params.get(index - 1) {
-                        vws.value = value.clone();
-                    }
+            if let Value::Placeholder(name) = &vws.value
+                && let Some(index) = placeholder_index(name)
+            {
+                // Keep the placeholder's span; only its value changes.
+                if let Some(value) = params.get(index - 1) {
+                    vws.value = value.clone();
                 }
             }
         }
