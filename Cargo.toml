@@ -79,7 +79,7 @@ rustyline          = { version = "18.0", default-features = false }
 # alignment. Already in the tree as rustyline's own width dep — zero new surface.
 unicode-width      = "0.2"
 thiserror          = "2.0"
-toml               = "0.8"
+toml               = "1.1"
 tokio              = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
 # Dev-only: a real Postgres client driving the pgwire front end end-to-end in an
 # integration test (STL-147 DoD). Never a runtime dependency of a shipped crate.
