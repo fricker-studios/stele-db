@@ -497,6 +497,94 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         // Every distinct business key across both tiers, narrowed to those with
         // a version open at `at`. A `delete` needs a live version to close, so
         // the filter is also what skips a key already retired in a deletion gap.
+        let mut open: Vec<BusinessKey> = Vec::new();
+        for key in self.resident_keys()? {
+            if self.as_of(&key, at)?.is_some() {
+                open.push(key);
+            }
+        }
+        for key in &open {
+            self.delete(key, txn_id, principal.clone())?;
+        }
+        Ok(open.len())
+    }
+
+    /// **Recovery re-derivation** of a `DROP TABLE`'s storage closes ([STL-220]).
+    ///
+    /// [`close_all_open`](Self::close_all_open) is an *auto-commit* sequence of
+    /// closes — its WAL records are durability-deferred, exactly like any
+    /// `INSERT`/`DELETE` — but the session's catalog `DropTable` record is
+    /// fsynced (the DDL acknowledgement point, [ADR-0028]). A crash in the window
+    /// after that fsync but before the closes reach the WAL would recover the
+    /// catalog name dropped yet the rows still system-live, re-opening the
+    /// [STL-211] leak on a later re-create. This re-applies the drop's closes
+    /// from the durable catalog record at recovery, so the retired state is a
+    /// pure function of the fsynced log and needs no separate durability.
+    ///
+    /// Unlike `close_all_open` — which, called live with `at = now`, selects
+    /// every currently-open row — this is **idempotent and re-created-era safe**,
+    /// because at recovery `at` (the drop instant) is in the *past*:
+    ///
+    /// * It closes a key only if that key's **current** open version (resolved at
+    ///   `now`, the recovered high-water) began at or before the drop
+    ///   (`sys_from <= at`). A row the live close already made durable has no open
+    ///   version now and is skipped — re-running converges to the same state.
+    /// * A row opened in a *re-created* era has `sys_from > at` and is left
+    ///   untouched, so a name re-created before the crash keeps its new era while
+    ///   the dropped era is retired.
+    ///
+    /// Re-deriving only the **latest** drop per name is sufficient: the tier WAL
+    /// is append-only, so a lost close implies every later record (including a
+    /// re-created era's inserts) was lost too — at most one era is ever open at
+    /// recovery, and the `sys_from <= at` guard closes it iff it predates the
+    /// drop. Each close commits at a fresh post-recovery instant drawn from the
+    /// clock (`> now`), an append-only retraction per [ADR-0023]; an `AS OF` read
+    /// inside the dropped era is unaffected. Returns the number of rows closed.
+    ///
+    /// `now` must be the recovered high-water (every open version has
+    /// `sys_from <= now`, so it resolves live there). Pass `at` as the drop
+    /// instant recorded in the catalog log.
+    ///
+    /// [ADR-0023]: ../../../docs/adr/0023-append-only-record-model-validity-index.md
+    /// [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
+    /// [STL-211]: https://allegromusic.atlassian.net/browse/STL-211
+    /// [STL-220]: https://allegromusic.atlassian.net/browse/STL-220
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Delta`] / [`EngineError::Validity`] if enumerating the
+    /// live keys or resolving them fails; [`EngineError::Dml`] if staging a
+    /// close fails.
+    pub fn close_dropped_era(
+        &mut self,
+        at: Snapshot,
+        now: Snapshot,
+        txn_id: TxnId,
+        principal: &Principal,
+    ) -> Result<usize, EngineError> {
+        let mut stale: Vec<BusinessKey> = Vec::new();
+        for key in self.resident_keys()? {
+            // Close the key only if its *current* open version belongs to the
+            // dropped era. A key already retired by the live close has no open
+            // version now (skipped); a key opened in a re-created era resolves to
+            // `sys_from > at` (preserved). `delete` then closes exactly this
+            // resolved version, so the two snapshots stay consistent.
+            if let Some(cur) = self.as_of(&key, now)? {
+                if cur.sys_from <= at.0 {
+                    stale.push(key);
+                }
+            }
+        }
+        for key in &stale {
+            self.delete(key, txn_id, principal.clone())?;
+        }
+        Ok(stale.len())
+    }
+
+    /// Every distinct business key resident across both tiers (delta + sealed) —
+    /// the shared key enumeration of [`close_all_open`](Self::close_all_open) and
+    /// [`close_dropped_era`](Self::close_dropped_era).
+    fn resident_keys(&self) -> Result<BTreeSet<BusinessKey>, EngineError> {
         let mut keys: BTreeSet<BusinessKey> = BTreeSet::new();
         // `staged_versions` hands back owned `Version`s, so the key moves out;
         // `sealed.versions` borrows the resident set, so its key is cloned.
@@ -506,16 +594,7 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         for v in self.sealed.versions() {
             keys.insert(v.business_key.clone());
         }
-        let mut open: Vec<BusinessKey> = Vec::new();
-        for key in keys {
-            if self.as_of(&key, at)?.is_some() {
-                open.push(key);
-            }
-        }
-        for key in &open {
-            self.delete(key, txn_id, principal.clone())?;
-        }
-        Ok(open.len())
+        Ok(keys)
     }
 
     /// Open a **group-commit** buffer ([`DmlWriter::begin_group`], [STL-192]).
