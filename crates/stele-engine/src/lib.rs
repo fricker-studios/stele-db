@@ -302,27 +302,28 @@ pub enum DmlSummary {
 /// [`commit`](SessionEngine::commit) is **crash-atomic** ([STL-192]): a
 /// transaction's writes to each table are group-committed as one WAL record with one
 /// fsync, so a crash mid-commit recovers all of that table's writes or none — never
-/// a partial prefix — and the writes share one transaction id.
+/// a partial prefix — and the writes share one transaction id. A transaction
+/// spanning several tables is made atomic *across* them by a commit marker fsynced
+/// only after every per-table leg is durable ([STL-215]). And if applying a buffered
+/// write fails partway, the writes already applied to the in-memory tiers are rolled
+/// back in place ([STL-216]) so the live engine shows none of the failed
+/// transaction — matching what a crash recovery (which finds no durable record)
+/// reconstructs, without a restart.
 ///
-/// What this deliberately does *not* yet do (each its own follow-up):
+/// What this deliberately does *not* yet do:
 /// * **Read-your-own-writes on a *valid-time* table.** The overlay ([STL-203])
 ///   models the system-time row set — one current version per business key — so it
 ///   applies only to system-only tables; a valid-time table's buffered writes are
 ///   not yet overlaid period-by-period inside the block (its no-pin read can span
-///   several valid periods per key).
-/// * **Cross-table commit atomicity.** A transaction spanning several tables writes
-///   one record + one fsync *per table* (each table owns its WAL), so each table's
-///   portion is crash-atomic but a crash *between* tables can leave some durable and
-///   some not; a transaction commit marker across the per-table logs is the follow-up.
-/// * **In-memory rollback of an aborted commit.** If applying a buffered write
-///   fails, nothing is made durable, but writes already applied to the in-memory
-///   tiers are not yet rolled back in place (recovery would drop them); targeted
-///   in-memory rollback is the follow-up.
+///   several valid periods per key). [STL-223] is the follow-up.
 ///
 /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
 /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
 /// [STL-176]: https://allegromusic.atlassian.net/browse/STL-176
 /// [STL-203]: https://allegromusic.atlassian.net/browse/STL-203
+/// [STL-215]: https://allegromusic.atlassian.net/browse/STL-215
+/// [STL-216]: https://allegromusic.atlassian.net/browse/STL-216
+/// [STL-223]: https://allegromusic.atlassian.net/browse/STL-223
 /// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
 #[derive(Debug)]
 pub struct SessionTransaction {
@@ -4113,6 +4114,64 @@ mod tests {
             payload_column(&result),
             vec![encode_value(&ScalarValue::Int4(200))],
             "the UPDATE saw the INSERT staged before it",
+        );
+    }
+
+    #[test]
+    fn a_commit_that_fails_partway_shows_none_of_its_writes_matching_recovery() {
+        // STL-216: a multi-statement COMMIT applies its buffered writes front-to-back
+        // into the live tiers, then fails on a later write (here a duplicate-key
+        // INSERT). The transaction is reported failed and *nothing* is made durable —
+        // so the live engine must show none of its writes, identical to a post-crash
+        // recovery (which finds no record for the aborted transaction), without a
+        // restart. Before STL-216 the already-applied id=2 writes lingered in memory.
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        // Committed baseline (durable, auto-commit) — pins the txn snapshot below.
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("baseline insert");
+
+        // A transaction that stages a fresh key front-to-back, then an INSERT of the
+        // already-live id=1 — which only fails when applied at commit (KeyExists),
+        // after id=2's insert+update have already landed in the live tiers.
+        let mut txn = engine.begin();
+        engine
+            .stage_dml(&parse_one("INSERT INTO account VALUES (2, 200)"), &mut txn)
+            .expect("stage insert 2");
+        engine
+            .stage_dml(
+                &parse_one("UPDATE account SET balance = 222 WHERE id = 2"),
+                &mut txn,
+            )
+            .expect("stage update of the just-staged key");
+        engine
+            .stage_dml(&parse_one("INSERT INTO account VALUES (1, 999)"), &mut txn)
+            .expect("stage the doomed duplicate-key insert");
+        let outcome = engine.commit(txn);
+        assert!(
+            outcome.is_err(),
+            "the duplicate-key INSERT aborts the whole COMMIT",
+        );
+
+        // The live engine shows only the committed baseline: id=2's applied
+        // insert+update were rolled back out of the in-memory tiers.
+        let now_sql = "SELECT id, balance FROM account";
+        let live_now = sorted(select(&mut engine, now_sql).rows);
+        assert_eq!(
+            live_now,
+            vec![vec![i4(1), i4(100)]],
+            "none of the failed transaction's writes are visible after the abort",
+        );
+
+        // … and that is exactly what a restart reconstructs from the durable log.
+        drop(engine);
+        let mut engine = recover_session(&disk);
+        assert_eq!(
+            sorted(select(&mut engine, now_sql).rows),
+            live_now,
+            "the live post-abort state matches a from-the-WAL recovery",
         );
     }
 

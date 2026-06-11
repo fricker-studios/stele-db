@@ -165,6 +165,26 @@ impl<D: Disk> Delta<D> {
     /// the current contents spill first and `version` lands in a fresh
     /// in-memory store.
     pub fn insert(&mut self, version: Version) -> Result<(), DeltaError> {
+        self.insert_inner(version, true)
+    }
+
+    /// Insert `version` **without spilling**, keeping it resident in memory
+    /// regardless of the byte threshold ([STL-216]).
+    ///
+    /// The group-commit apply path uses this so every version a multi-statement
+    /// transaction stages stays in the in-memory tier until the transaction
+    /// resolves: an aborted commit can then be rolled back with
+    /// [`remove_version`](Self::remove_version) (a spilled row is on disk and not
+    /// removable in place). The deferred spill is harmless — resident bytes are
+    /// already a *soft* bound (see [`insert`](Self::insert)) and the next
+    /// auto-commit [`insert`](Self::insert) reconciles the now-over-threshold tier.
+    pub fn insert_resident(&mut self, version: Version) -> Result<(), DeltaError> {
+        self.insert_inner(version, false)
+    }
+
+    /// Shared body of [`insert`](Self::insert) (spilling) and
+    /// [`insert_resident`](Self::insert_resident) (never spills).
+    fn insert_inner(&mut self, version: Version, allow_spill: bool) -> Result<(), DeltaError> {
         version.check_encodable()?;
         let incoming = version.encoded_size() as u64;
         let projected = self.mem.byte_size().saturating_add(incoming);
@@ -179,11 +199,48 @@ impl<D: Disk> Delta<D> {
         //   then. The threshold is a steady-state soft bound on resident
         //   bytes, not a hard per-insert ceiling — which matches the
         //   row-oriented LSM convention and the WAL's group-commit spirit.
-        if projected > self.config.spill_threshold_bytes && self.mem.byte_size() > 0 {
+        if allow_spill && projected > self.config.spill_threshold_bytes && self.mem.byte_size() > 0
+        {
             self.spill_in_memory()?;
         }
         self.mem.insert(version);
         Ok(())
+    }
+
+    /// Remove the in-memory version `(business_key, sys_from, seq)`, returning
+    /// `true` if one was removed — the inverse of [`insert_resident`](Self::insert_resident)
+    /// used to roll an aborted group-commit transaction's staged versions back out
+    /// of the live tier ([STL-216]).
+    ///
+    /// Only the in-memory store is touched: group writes are applied with
+    /// [`insert_resident`](Self::insert_resident) and so never spill, so every row
+    /// an aborted transaction staged is still resident here. A spill file is never
+    /// rewritten (it is append-only, [architecture §12]); removing a row that is
+    /// not resident is a no-op.
+    pub fn remove_version(
+        &mut self,
+        business_key: &BusinessKey,
+        sys_from: SystemTimeMicros,
+        seq: u64,
+    ) -> bool {
+        self.mem.remove(business_key, sys_from, seq)
+    }
+
+    /// Remove the staged retraction tombstone `(business_key, sys_from, seq)`,
+    /// returning `true` if one was removed — the inverse of
+    /// [`stage_retraction`](Self::stage_retraction) used to roll an aborted
+    /// group-commit transaction's deletes back out of the live tier ([STL-216]).
+    ///
+    /// Retractions are always resident (never spilled), so the removal is exact.
+    pub fn remove_retraction(
+        &mut self,
+        business_key: &BusinessKey,
+        sys_from: SystemTimeMicros,
+        seq: u64,
+    ) -> bool {
+        self.retractions
+            .remove(&(business_key.clone(), sys_from, seq))
+            .is_some()
     }
 
     /// Total encoded bytes currently held in memory (not counting spills).

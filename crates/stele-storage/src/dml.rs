@@ -297,8 +297,11 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     ) -> Result<DmlOutcome, DmlError> {
         if self.group.is_some() {
             // Apply before buffering so a same-transaction successor sees this
-            // write; the WAL record is deferred to `commit_group`.
-            crate::systime::apply(delta, index, redos.clone())?;
+            // write; the WAL record is deferred to `commit_group`. Applied
+            // *resident* (never spilled) so the buffered set stays removable —
+            // `abort_group` rolls the whole transaction back out of the in-memory
+            // tiers if the commit aborts before its record is durable ([STL-216]).
+            crate::systime::apply_resident(delta, index, redos.clone())?;
             let wal = self.wal.durable_end();
             self.group.as_mut().expect("group is open").extend(redos);
             return Ok(DmlOutcome { commit, wal });
@@ -420,12 +423,24 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     }
 
     /// Discard the open group buffer without logging it — the transaction aborted
-    /// ([STL-192]). The buffered redos were already applied to the (non-durable)
-    /// delta/index, but with no WAL record they are never made durable: a recovery
-    /// rebuilds the tiers from the log and so drops them. Returns the writer to
-    /// auto-commit mode.
-    pub fn abort_group(&mut self) {
-        self.group = None;
+    /// ([STL-192], [STL-216]). The buffered redos were already applied to the
+    /// (non-durable) delta/index by `systime::apply_resident`, so with no WAL record
+    /// this **rolls them back in memory too** (`systime::undo`): every staged
+    /// version, materialized close, and retraction tombstone is removed by its
+    /// `(business_key, sys_from, seq)`, restoring `delta`/`index` to their
+    /// pre-transaction state. The live engine therefore matches what a crash
+    /// recovery — which finds no durable record for the aborted transaction — would
+    /// reconstruct, without a restart. Returns the writer to auto-commit mode.
+    ///
+    /// Resident application is what makes the rollback exact: the buffered rows
+    /// never spilled, so each is still in the in-memory tier and removable in place
+    /// (a spill file is append-only). A *fsync*-failed `commit_group` is **not** a
+    /// clean abort — its record's durability is indeterminate — so that path
+    /// poisons the engine and recovers rather than calling this ([STL-217]).
+    pub fn abort_group<I: Disk>(&mut self, delta: &mut Delta<D>, index: &mut ValidityIndex<I>) {
+        if let Some(redos) = self.group.take() {
+            crate::systime::undo(delta, index, redos);
+        }
     }
 }
 
@@ -976,9 +991,11 @@ mod tests {
     }
 
     /// Aborting a group discards the buffered writes: no WAL record is ever written,
-    /// so a recovery finds no trace of the aborted transaction ([STL-192]).
+    /// so a recovery finds no trace of the aborted transaction ([STL-192]) — **and**
+    /// the writes already applied to the in-memory tiers are rolled back, so the
+    /// live engine shows none of them without a restart ([STL-216]).
     #[test]
-    fn abort_group_writes_no_record() {
+    fn abort_group_writes_no_record_and_rolls_back_memory() {
         use stele_common::provenance::Principal;
 
         use crate::backend::MemDisk;
@@ -997,6 +1014,7 @@ mod tests {
             StepClock(std::sync::atomic::AtomicI64::new(0)),
             false,
         );
+        let key = BusinessKey::new(b"k".to_vec());
 
         writer.begin_group();
         writer
@@ -1004,7 +1022,7 @@ mod tests {
                 &mut delta,
                 &mut index,
                 &EmptySealed,
-                BusinessKey::new(b"k".to_vec()),
+                key.clone(),
                 None,
                 Some(b"v".to_vec()),
                 0,
@@ -1012,12 +1030,199 @@ mod tests {
                 Principal::new(b"p".to_vec()),
             )
             .expect("buffered insert");
-        writer.abort_group();
+        assert_eq!(
+            delta.candidate_versions(&key).expect("candidates").len(),
+            1,
+            "the buffered insert applied to the in-memory delta tier",
+        );
+
+        writer.abort_group(&mut delta, &mut index);
 
         assert_eq!(
             wal.replay_from(Checkpoint::BEGIN).count(),
             0,
             "an aborted group leaves no durable record"
+        );
+        assert!(
+            delta
+                .candidate_versions(&key)
+                .expect("candidates")
+                .is_empty(),
+            "abort_group rolled the staged version back out of the in-memory tier",
+        );
+        assert_eq!(
+            delta.byte_size(),
+            0,
+            "the rolled-back version's bytes are no longer counted resident",
+        );
+    }
+
+    /// Recovery-equivalence oracle for the in-memory rollback ([STL-216]): a
+    /// multi-statement transaction that chains writes front-to-back (an `INSERT`
+    /// then an `UPDATE` of the same key, plus a `DELETE` of a *previously
+    /// committed* key) and then aborts must leave the live delta/index **identical
+    /// to what a from-the-WAL recovery reconstructs** — which is the committed
+    /// baseline alone, since the aborted group logged no record.
+    ///
+    /// This exercises every redo flavour the undo path must reverse: the chained
+    /// `Insert`s, the supersession `Close`, and the delete's `Retract` (tombstone +
+    /// close). Comparing the post-abort live tiers against a fresh replay of the
+    /// same WAL is the strongest form of "matches a restart without restarting."
+    #[test]
+    #[allow(clippy::too_many_lines)] // a staged-vs-recovered oracle reads long but stays one scenario
+    fn abort_after_a_chained_group_matches_a_fresh_recovery() {
+        use stele_common::provenance::Principal;
+
+        use crate::backend::MemDisk;
+        use crate::delta::{Delta, DeltaConfig};
+        use crate::systime::EmptySealed;
+        use crate::validity::{ValidityConfig, ValidityIndex};
+        use crate::wal::{Wal, WalConfig};
+
+        let wal = Wal::open(MemDisk::new(), WalConfig::default()).expect("wal");
+        let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
+        let mut index =
+            ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+        let mut writer = DmlWriter::new(
+            wal.clone(),
+            StepClock(std::sync::atomic::AtomicI64::new(0)),
+            false,
+        );
+        let principal = Principal::new(b"p".to_vec());
+        let k_base = BusinessKey::new(b"base".to_vec());
+        let k_new = BusinessKey::new(b"new".to_vec());
+
+        // Committed baseline: one auto-commit INSERT, logged as its own record.
+        writer
+            .insert(
+                &mut delta,
+                &mut index,
+                &EmptySealed,
+                k_base.clone(),
+                None,
+                Some(b"base-v0".to_vec()),
+                0,
+                TxnId(1),
+                principal.clone(),
+            )
+            .expect("baseline insert");
+        let base_bytes = delta.byte_size();
+        let base_base_versions = delta.candidate_versions(&k_base).expect("base candidates");
+        let base_index = index.materialize().expect("base index");
+
+        // A multi-statement transaction: INSERT new, UPDATE new (resolves against
+        // the just-inserted version — front-to-back), DELETE the committed base.
+        writer.begin_group();
+        writer
+            .insert(
+                &mut delta,
+                &mut index,
+                &EmptySealed,
+                k_new.clone(),
+                None,
+                Some(b"new-v0".to_vec()),
+                0,
+                TxnId(2),
+                principal.clone(),
+            )
+            .expect("group insert");
+        writer
+            .update(
+                &mut delta,
+                &mut index,
+                &EmptySealed,
+                k_new.clone(),
+                None,
+                Some(b"new-v1".to_vec()),
+                0,
+                TxnId(2),
+                principal.clone(),
+            )
+            .expect("group update sees the buffered insert");
+        writer
+            .delete(
+                &mut delta,
+                &mut index,
+                &EmptySealed,
+                &k_base,
+                TxnId(2),
+                principal,
+            )
+            .expect("group delete of the committed key");
+
+        // Mid-transaction the writes are visible in the live tiers.
+        assert_eq!(
+            delta
+                .candidate_versions(&k_new)
+                .expect("new candidates")
+                .len(),
+            2,
+            "the chained insert+update both staged the new key's versions",
+        );
+        assert!(
+            !delta.staged_retractions().is_empty(),
+            "the delete staged a retraction tombstone",
+        );
+        assert!(
+            index.materialize().expect("mid index").len() > base_index.len(),
+            "the update's supersession and the delete's retraction materialized closes",
+        );
+
+        // Abort: roll the whole transaction back out of memory.
+        writer.abort_group(&mut delta, &mut index);
+
+        // The live tiers are back to the committed baseline …
+        assert!(
+            delta
+                .candidate_versions(&k_new)
+                .expect("new gone")
+                .is_empty(),
+            "the new key's chained versions were rolled back",
+        );
+        assert_eq!(
+            delta.candidate_versions(&k_base).expect("base restored"),
+            base_base_versions,
+            "the deleted-then-rolled-back base key is restored to its committed version",
+        );
+        assert!(
+            delta.staged_retractions().is_empty(),
+            "the delete's retraction tombstone was rolled back",
+        );
+        assert_eq!(
+            index.materialize().expect("index restored"),
+            base_index,
+            "every close the transaction materialized was rolled back",
+        );
+        assert_eq!(
+            delta.byte_size(),
+            base_bytes,
+            "resident byte accounting returned to the baseline",
+        );
+
+        // … and identical to what replaying the WAL into fresh tiers reconstructs:
+        // the baseline record alone (the aborted group logged nothing).
+        let mut rec_delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("rec delta");
+        let mut rec_index =
+            ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("rec index");
+        replay(&wal, &mut rec_delta, &mut rec_index, Checkpoint::BEGIN).expect("replay");
+        assert_eq!(
+            delta.candidate_versions(&k_base).expect("live base"),
+            rec_delta
+                .candidate_versions(&k_base)
+                .expect("recovered base"),
+            "live base key matches the recovered base key",
+        );
+        assert!(
+            rec_delta
+                .candidate_versions(&k_new)
+                .expect("recovered new")
+                .is_empty(),
+            "recovery reconstructs none of the aborted transaction's new key",
+        );
+        assert_eq!(
+            index.materialize().expect("live index"),
+            rec_index.materialize().expect("recovered index"),
+            "live index matches the recovered index exactly",
         );
     }
 
