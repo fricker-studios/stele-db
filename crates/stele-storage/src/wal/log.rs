@@ -175,6 +175,11 @@ impl<D: Disk> Wal<D> {
     /// failure.
     ///
     /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
+    // The guard is held across rotate + append + the `staged_end` bump and dropped
+    // at the block's end *before* the wakers fire (waking can re-enter the mutex) —
+    // the tightening clippy suggests would break that ordering. Same shape, and
+    // same allow, as `drain_tick`.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn append(&self, payload: &[u8]) -> Result<LogOffset, WalError> {
         if payload.len() > MAX_PAYLOAD_LEN as usize {
             return Err(WalError::PayloadTooLarge(payload.len()));
@@ -188,28 +193,37 @@ impl<D: Disk> Wal<D> {
             // A poisoned WAL (a prior fsync failed) refuses every write, so a
             // later `tick` can never flush a staged record as a clean op ([STL-217]).
             if g.poisoned {
-                return Err(WalError::Poisoned);
+                Err(WalError::Poisoned)
+            } else {
+                // Rotate if appending this record would overflow the current
+                // segment. A record is never split across segments. A rotation
+                // fsync failure poisons and drains its parked waiters into
+                // `rotation_wakers`, which the post-lock loop still fires.
+                let projected = g.staged_end.byte_offset + record_len;
+                let rotated =
+                    if projected > g.config.segment_size_bytes && g.staged_end.byte_offset > 0 {
+                        rotate(&mut g, &mut rotation_wakers)
+                    } else {
+                        Ok(())
+                    };
+                // Append the frame only if the rotation (if any) succeeded.
+                rotated.and_then(|()| {
+                    let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
+                    encode(payload, &mut frame);
+                    g.current.append(&frame).map_err(WalError::Io)?;
+                    g.staged_end.byte_offset += record_len;
+                    Ok(g.staged_end)
+                })
             }
-
-            // Rotate if appending this record would overflow the current
-            // segment. A record is never split across segments.
-            let projected = g.staged_end.byte_offset + record_len;
-            if projected > g.config.segment_size_bytes && g.staged_end.byte_offset > 0 {
-                rotate(&mut g, &mut rotation_wakers)?;
-            }
-
-            let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
-            encode(payload, &mut frame);
-            g.current.append(&frame)?;
-            g.staged_end.byte_offset += record_len;
-            g.staged_end
         };
-        // Wake any commit futures the rotation's fsync just made durable —
-        // outside the lock, since `wake` can re-enter the same mutex.
+        // Wake any commit futures the rotation touched — outside the lock, since
+        // `wake` can re-enter the same mutex. A successful rotation made them
+        // durable; a poisoning rotation hands them here so they re-poll and observe
+        // the poison instead of hanging.
         for w in rotation_wakers {
             w.wake();
         }
-        Ok(result)
+        result
     }
 
     /// Return a future that resolves once every record appended **before** or
@@ -242,15 +256,17 @@ impl<D: Disk> Wal<D> {
     ///
     /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
     pub fn tick(&self) -> Result<usize, WalError> {
-        // Collect ready wakers under the lock, then drop the guard before waking
-        // them — waking a waker may re-acquire the same mutex (the woken task
-        // can race to re-poll its Commit future).
-        let wakers = drain_tick(&self.inner)?;
+        // Collect wakers under the lock, then drop the guard before waking them —
+        // waking a waker may re-acquire the same mutex (the woken task can race to
+        // re-poll its Commit future). A failed fsync wakes the parked waiters too
+        // (it hands them back here), so each re-polls and observes the poison
+        // instead of hanging — no later `tick` would ever wake them ([STL-217]).
+        let (wakers, result) = drain_tick(&self.inner);
         let woken = wakers.len();
         for w in wakers {
             w.wake();
         }
-        Ok(woken)
+        result.map(|()| woken)
     }
 
     /// Replay records from `checkpoint` forward. Yields each record's payload
@@ -283,23 +299,30 @@ impl<D: Disk> Wal<D> {
 // The whole drain needs to happen under the lock — every loop iteration both
 // reads `g.waiters.len()` and may swap-remove. The clippy hint to drop the
 // guard mid-loop is a false positive on this shape.
+//
+// Returns the wakers to fire **alongside** the result, rather than `?`-ing the
+// error out, so the caller still wakes every parked waiter on a poison failure —
+// otherwise a durability future parked before the failed fsync would hang
+// forever (no later `tick` runs to wake it, [STL-217]).
 #[allow(clippy::significant_drop_tightening)]
-fn drain_tick<D: Disk>(inner: &Mutex<Inner<D>>) -> Result<Vec<Waker>, WalError> {
+fn drain_tick<D: Disk>(inner: &Mutex<Inner<D>>) -> (Vec<Waker>, Result<(), WalError>) {
     let mut g = inner.lock().expect("wal mutex poisoned");
     if g.poisoned {
-        return Err(WalError::Poisoned);
+        return (Vec::new(), Err(WalError::Poisoned));
     }
     // A failed fsync leaves the staged tail of indeterminate durability — poison
     // the WAL *before* surfacing the error so no later `tick` advances
     // `durable_end` past it (which would flush the staged record under the guise
-    // of an aborted op, [STL-217]). The first failure still returns the concrete
-    // I/O error; subsequent calls get `WalError::Poisoned`.
+    // of an aborted op, [STL-217]). Hand back **every** parked waiter so the
+    // caller wakes them and each re-polls to observe the poison (resolving
+    // `Err(Poisoned)`) instead of hanging. The first failure still returns the
+    // concrete I/O error; subsequent calls get `WalError::Poisoned`.
     if let Err(e) = g.current.sync() {
         g.poisoned = true;
-        return Err(WalError::Io(e));
+        return (drain_all_waiters(&mut g), Err(WalError::Io(e)));
     }
     g.durable_end = g.staged_end;
-    Ok(drain_waiters(&mut g))
+    (drain_waiters(&mut g), Ok(()))
 }
 
 /// Remove and return wakers for every waiter whose target is now ≤
@@ -319,6 +342,14 @@ fn drain_waiters<D: Disk>(g: &mut Inner<D>) -> Vec<Waker> {
     wakers
 }
 
+/// Remove and return **every** waiter's wakers, regardless of target — used when
+/// the WAL poisons. Each parked durability future then re-polls and resolves
+/// `Err(Poisoned)` rather than hanging, since no later `tick` or rotation will
+/// ever wake it ([STL-217]).
+fn drain_all_waiters<D: Disk>(g: &mut Inner<D>) -> Vec<Waker> {
+    g.waiters.drain(..).flat_map(|w| w.wakers).collect()
+}
+
 /// Rotate to a fresh segment. The `wakers` out-parameter accumulates any
 /// commit waiters the closing segment's fsync just made durable; the caller is
 /// responsible for waking them *after* releasing the mutex.
@@ -331,9 +362,13 @@ fn rotate<D: Disk>(g: &mut Inner<D>, wakers: &mut Vec<Waker>) -> Result<(), WalE
     // A failed boundary fsync is the same crash the group-commit `tick` faces:
     // poison the WAL so no further write proceeds ([STL-217]). Poison before
     // returning, so the staged-but-unsynced closing segment is never advanced
-    // past by a later `tick`.
+    // past by a later `tick`. Drain every parked waiter into the out-param so the
+    // caller wakes them (this runs inside `append`'s lock scope, whose post-lock
+    // wake loop fires `wakers` on the error path too) — otherwise a durability
+    // future parked before the rotation would hang.
     if let Err(e) = g.current.sync() {
         g.poisoned = true;
+        wakers.extend(drain_all_waiters(g));
         return Err(WalError::Io(e));
     }
     let new_idx = g.current_segment_index + 1;
@@ -572,6 +607,62 @@ mod tests {
                 Poll::Ready(Err(WalError::Poisoned))
             ),
             "an unsynced record's durability wait resolves Poisoned",
+        );
+    }
+
+    /// A durability future **parked before** a failed fsync must be *woken* by the
+    /// poison and then resolve `Err(Poisoned)` — otherwise it would sit Pending
+    /// forever, since no later `tick` runs to wake it. Covers the `tick` and the
+    /// rotation poison sites.
+    #[test]
+    fn poison_wakes_a_waiter_parked_before_the_failed_fsync() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Wake;
+
+        /// A waker that records whether it was woken.
+        struct FlagWaker(AtomicBool);
+        impl Wake for FlagWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        // Park a waiter, fail `target`'s fsync via `tick`, and assert it is woken
+        // and resolves Poisoned. `rotate` shares the same poison-and-drain path.
+        let faults = Faults::new();
+        let wal =
+            Wal::open(MemDisk::with_faults(faults.clone()), WalConfig::default()).expect("open");
+
+        let staged = wal.append(b"staged").expect("append");
+        let flag = Arc::new(FlagWaker(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&flag));
+        let mut cx = Context::from_waker(&waker);
+        let fut = wal.commit(staged);
+        let mut fut = pin!(fut);
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "the unsynced target parks (registering its waker)",
+        );
+
+        // The fsync fails: poisoning must wake the parked waiter.
+        faults.schedule(FaultOp::Sync, io::ErrorKind::Other);
+        wal.tick().expect_err("the fsync fault poisons");
+        assert!(
+            flag.0.load(Ordering::SeqCst),
+            "poisoning wakes the parked durability waiter",
+        );
+
+        // The woken waiter, re-polled, resolves Poisoned rather than hanging.
+        assert!(
+            matches!(
+                fut.as_mut().poll(&mut cx),
+                Poll::Ready(Err(WalError::Poisoned))
+            ),
+            "the woken waiter resolves Poisoned",
         );
     }
 }
