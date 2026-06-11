@@ -23,3 +23,9 @@ duckdb        = { workspace = true }
 stele-common  = { workspace = true }
 stele-storage = { workspace = true }
 stele-exec    = { workspace = true }
+# The SQL-path differential oracle (STL-167) drives the real bind→exec pipeline,
+# so it needs the binder (`stele-sql`) and the session engine (`stele-engine`) on
+# top of the raw executor. Internal workspace crates — no new external supply
+# chain — and still confined to this nightly-only crate (STL-158).
+stele-sql     = { workspace = true }
+stele-engine  = { workspace = true }

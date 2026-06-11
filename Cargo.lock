@@ -2281,7 +2281,9 @@ version = "0.2.0"
 dependencies = [
  "duckdb",
  "stele-common",
+ "stele-engine",
  "stele-exec",
+ "stele-sql",
  "stele-storage",
 ]
 
