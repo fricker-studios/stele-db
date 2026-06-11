@@ -389,16 +389,22 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     /// reuses it if the name is re-created — a name re-created on that tier would
     /// inherit the dropped era's still-open rows in a *current* read, and
     /// re-inserting one of their business keys would be refused as a duplicate
-    /// ([`DmlOutcome`]'s `KeyExists`). Closing the rows at the drop instant fixes
-    /// both: they ceased to be asserted the moment the table ceased to exist.
+    /// ([`DmlOutcome`]'s `KeyExists`). Retracting the live rows fixes both: they
+    /// ceased to be asserted the moment the table ceased to exist.
+    ///
+    /// `at` is the **liveness snapshot**, not the close timestamp. It selects
+    /// which versions to retract — every still-open version has `sys_from ≤ at`,
+    /// so it resolves live; a version opened later (the re-created era) has
+    /// `sys_from > at` and is left untouched. Each retraction then commits at a
+    /// fresh instant drawn from the writer's clock, strictly after `at` under a
+    /// monotonic clock: the closes are *new* post-drop assertions on the system
+    /// axis, not back-dated to `at`. Pass `at` as the drop instant (the commit
+    /// clock's current high-water) so exactly the era's live rows are selected.
     ///
     /// Append-only, per [ADR-0023]: each close stamps a write-once `sys_to` on
     /// the prior version and mutates no committed record, so an `AS OF` read
-    /// **inside** the dropped era still resolves the row as open then — exactly
-    /// as before the drop. Pass `at` as the drop instant (the commit clock's
-    /// current high-water): every still-open version has `sys_from ≤ at`, so it
-    /// resolves live and is closed; a version opened later (the re-created era)
-    /// has `sys_from > at` and is left untouched.
+    /// **inside** the dropped era (any snapshot `< at`) still resolves the row
+    /// as open then — exactly as before the drop.
     ///
     /// Each close is an independent auto-commit retraction, mirroring a sequence
     /// of `DELETE`s; closing one key cannot change another's liveness, so the
@@ -422,6 +428,8 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         // a version open at `at`. A `delete` needs a live version to close, so
         // the filter is also what skips a key already retired in a deletion gap.
         let mut keys: BTreeSet<BusinessKey> = BTreeSet::new();
+        // `staged_versions` hands back owned `Version`s, so the key moves out;
+        // `sealed.versions` borrows the resident set, so its key is cloned.
         for v in self.delta.staged_versions()? {
             keys.insert(v.business_key);
         }

@@ -965,9 +965,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     // name does not inherit them in a current read, and re-using
                     // one of their keys is not refused as a duplicate. Append-only
                     // closes ([ADR-0023]): an AS OF read inside the dropped era is
-                    // unaffected. This is the catalog `DROP`'s storage half, so it
-                    // shares the drop's commit clock; the closes the catalog log
-                    // does not carry are replayed from the tier's own WAL.
+                    // unaffected. The closes the catalog log does not carry are
+                    // replayed from the tier's own WAL.
+                    //
+                    // Ordering is deliberate: the fsynced catalog record above is
+                    // the DROP's commit point ([ADR-0028]), so the storage half
+                    // runs *after* it. If `close_all_open` then fails (an I/O
+                    // fault), the DROP is already durably committed and only its
+                    // row cleanup is incomplete — the pre-existing leak, scoped to
+                    // that fault window, never a half-applied close on a table the
+                    // catalog still shows as live. Making the two logs commit
+                    // atomically (or re-deriving the closes from the durable drop
+                    // record at recovery) is the filed follow-up [STL-220].
                     if let Some(state) = self.tables.get_mut(&name) {
                         let txn_id = TxnId(self.next_txn);
                         self.next_txn += 1;
