@@ -152,7 +152,7 @@ impl<D: Disk, I: Disk, F: DiskFile> Operator for ScanSource<'_, D, I, F> {
             .map(|(id, col)| (*id, col.slice(resolved.cursor, len)))
             .collect();
         resolved.cursor += len;
-        Ok(Some(Batch { columns, rows: len }))
+        Ok(Some(Batch::new(columns, len)))
     }
 }
 
@@ -183,6 +183,12 @@ impl<C: Operator> Operator for Project<C> {
             return Ok(None);
         };
         let rows = batch.rows;
+        // A selection rides through unchanged: projection reselects + reorders
+        // columns but never drops a physical row, so the surviving-row indices
+        // address the re-projected columns exactly as they did the child's
+        // (STL-214). Carrying it (a shared-buffer refcount bump) keeps a
+        // `Filter → Project` chain zero-copy instead of forcing a materialize.
+        let selection = batch.selection;
         // Move the child's columns into takeable slots so a projection that
         // selects + reorders distinct columns (the common case) *moves* each one
         // out of the owned batch. A column projected more than once (degenerate)
@@ -207,7 +213,11 @@ impl<C: Operator> Operator for Project<C> {
             };
             columns.push((want, col));
         }
-        Ok(Some(Batch { columns, rows }))
+        Ok(Some(Batch {
+            columns,
+            rows,
+            selection,
+        }))
     }
 }
 
@@ -262,6 +272,12 @@ impl<C: Operator> Operator for ExplodePayload<C> {
         let Some(batch) = self.child.next()? else {
             return Ok(None);
         };
+        // This operator rebuilds dense value columns by walking every input cell,
+        // so it reads a dense input. Its child is the scan source, which emits
+        // dense batches, so this is a no-op there (STL-214); a selection-carrying
+        // input (a `Filter` placed below an explode — not the live pipeline) is
+        // materialized once here rather than mis-walked.
+        let batch = batch.into_dense();
         let rows = batch.rows;
 
         // The business key passes through unchanged at position 0.
@@ -276,7 +292,7 @@ impl<C: Operator> Operator for ExplodePayload<C> {
 
         // A key-only table stores no value cells: drop the payload, emit the key.
         if self.value_count == 0 {
-            return Ok(Some(Batch { columns, rows }));
+            return Ok(Some(Batch::new(columns, rows)));
         }
 
         let (_, payload) = batch
@@ -310,7 +326,7 @@ impl<C: Operator> Operator for ExplodePayload<C> {
                 .into_iter()
                 .map(|cells| (ColumnId::Payload, Column::Bytes(cells.into()))),
         );
-        Ok(Some(Batch { columns, rows }))
+        Ok(Some(Batch::new(columns, rows)))
     }
 }
 
@@ -415,19 +431,21 @@ impl<C: Operator> Operator for Filter<C> {
             let Some(batch) = self.child.next()? else {
                 return Ok(None);
             };
+            // `kept_rows` reads the columns positionally, so densify a
+            // selection-carrying input first — a no-op for the dense batches the
+            // live pipeline feeds (STL-214) — and the kept indices then address
+            // the columns directly.
+            let batch = batch.into_dense();
             let kept = self.kept_rows(&batch)?;
             if kept.is_empty() {
                 continue;
             }
-            let columns = batch
-                .columns
-                .iter()
-                .map(|(id, col)| (*id, col.take(&kept)))
-                .collect();
-            return Ok(Some(Batch {
-                columns,
-                rows: kept.len(),
-            }));
+            // Zero-copy row selection (STL-214): keep the child's column buffers
+            // untouched — a refcount bump apiece, no surviving payload cell copied
+            // — and carry the surviving rows as a selection vector. A downstream
+            // consumer honors it (the engine sink reads `column[selection[i]]`) or
+            // materializes once via `Batch::into_dense`.
+            return Ok(Some(Batch::with_selection(batch.columns, kept.into())));
         }
     }
 }

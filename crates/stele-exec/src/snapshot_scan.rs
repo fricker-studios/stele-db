@@ -336,11 +336,16 @@ impl Column {
     }
 
     /// Gather the cells at `rows`, in the given order, into a new column — the
-    /// row-selection a [`Filter`](crate::Filter) applies once it knows which
-    /// rows its predicate kept. Unlike [`slice`](Self::slice) a gather is not a
-    /// window — the kept rows are not contiguous — so it materializes a fresh
-    /// buffer, cloning the selected cells (a selection-vector batch form would
-    /// defer even that; out of scope here).
+    /// **materialization** primitive that resolves a selection-vector batch into a
+    /// dense one ([`Batch::into_dense`], STL-214). Unlike [`slice`](Self::slice) a
+    /// gather is not a window — the kept rows are not contiguous — so it does copy
+    /// the selected cells into a fresh buffer.
+    ///
+    /// A [`Filter`](crate::Filter) no longer calls this per batch: it keeps the
+    /// child's column buffers untouched and carries the surviving row indices as a
+    /// [`Batch::selection`] instead, so a downstream consumer that honors the
+    /// selection (the engine sink) never pays for this copy at all. The gather
+    /// happens once, lazily, only when a consumer actually needs a dense column.
     ///
     /// # Panics
     ///
@@ -358,15 +363,96 @@ impl Column {
 /// A vectorized result batch — the executor's Arrow-shaped output unit.
 ///
 /// Columns appear in projection order, each paired with the [`ColumnId`] it
-/// materializes; every column holds exactly [`rows`](Self::rows) values, aligned
-/// row-wise across columns. v0.1 emits a single batch even when it is small
-/// (STL-100 scope); a batch-at-a-time iterator is a later refinement.
+/// materializes. v0.1 emits a single batch even when it is small (STL-100 scope);
+/// a batch-at-a-time iterator is a later refinement.
+///
+/// ## Dense vs. selected ([`selection`](Self::selection), STL-214)
+///
+/// A batch is one of two shapes:
+///
+/// * **Dense** (`selection == None`) — every column holds exactly
+///   [`rows`](Self::rows) values, aligned row-wise: logical row `i` is physical
+///   row `i` in every column. This is what a scan source and a projection emit.
+/// * **Selected** (`selection == Some(sel)`) — the columns are the *full* buffers
+///   of some upstream batch (a zero-copy refcount bump, no payload byte copied),
+///   and `sel` names the surviving rows: logical row `i` is physical row `sel[i]`,
+///   with `rows == sel.len()`. A [`Filter`](crate::Filter) emits this so it never
+///   deep-copies a surviving cell.
+///
+/// A consumer either **honors** the selection — reading cell `(col, i)` as
+/// `column[selection[i]]` via [`physical_row`](Self::physical_row) — or
+/// **materializes** it once with [`into_dense`](Self::into_dense), which gathers
+/// the surviving cells into fresh dense columns. Both yield the same rows; the
+/// difference is only whether the surviving payload bytes are ever copied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Batch {
-    /// The projected columns, in projection order.
+    /// The projected columns, in projection order. In a dense batch each holds
+    /// [`rows`](Self::rows) values; in a selected batch each holds the full
+    /// upstream buffer, addressed through [`selection`](Self::selection).
     pub columns: Vec<(ColumnId, Column)>,
-    /// Row count shared by every column.
+    /// Number of **logical** (output) rows — the count a consumer iterates. In a
+    /// selected batch this is the selection length, not the columns' physical
+    /// height.
     pub rows: usize,
+    /// The surviving rows' physical indices into [`columns`](Self::columns), or
+    /// `None` for a dense batch. When `Some`, `rows == selection.len()` and the
+    /// columns are shared, full-height upstream buffers (STL-214). Held as a
+    /// shared [`Cells`] so propagating it through a [`Project`](crate::Project) is
+    /// itself a refcount bump.
+    pub selection: Option<Cells<usize>>,
+}
+
+impl Batch {
+    /// A dense batch: `columns` are exactly `rows` tall and addressed directly.
+    #[must_use]
+    pub const fn new(columns: Vec<(ColumnId, Column)>, rows: usize) -> Self {
+        Self {
+            columns,
+            rows,
+            selection: None,
+        }
+    }
+
+    /// A selected batch over `columns` (shared, full-height upstream buffers),
+    /// restricted to the rows `selection` names — the zero-copy row selection a
+    /// [`Filter`](crate::Filter) emits. `rows` is taken from the selection length;
+    /// the cells themselves are never copied.
+    #[must_use]
+    pub fn with_selection(columns: Vec<(ColumnId, Column)>, selection: Cells<usize>) -> Self {
+        Self {
+            rows: selection.len(),
+            columns,
+            selection: Some(selection),
+        }
+    }
+
+    /// Map a logical (output) row index to its physical index into
+    /// [`columns`](Self::columns): `selection[logical]` for a selected batch, the
+    /// identity for a dense one. A consumer that honors the selection reads
+    /// cell `(col, logical)` as `column[batch.physical_row(logical)]`.
+    #[must_use]
+    pub fn physical_row(&self, logical: usize) -> usize {
+        self.selection.as_ref().map_or(logical, |sel| sel[logical])
+    }
+
+    /// Resolve a selection into a **dense** batch, gathering each column's
+    /// surviving cells once ([`Column::take`]); a no-op (returns `self`) when the
+    /// batch is already dense, so the common path copies nothing. This is the
+    /// "materialize once at the pipeline sink" form — a consumer that does not
+    /// honor the selection calls this to read columns directly.
+    #[must_use]
+    pub fn into_dense(self) -> Self {
+        match self.selection {
+            None => self,
+            Some(sel) => Self::new(
+                self.columns
+                    .into_iter()
+                    .map(|(id, col)| (id, col.take(&sel)))
+                    .collect(),
+                self.rows,
+            ),
+        }
+    }
 }
 
 /// Per-scan statistics — chiefly the segment-pruning accounting.
@@ -939,10 +1025,7 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             .iter()
             .map(|&col| Ok((col, build_column(col, rows)?)))
             .collect::<Result<Vec<_>, ScanError>>()?;
-        Ok(Batch {
-            columns,
-            rows: rows.len(),
-        })
+        Ok(Batch::new(columns, rows.len()))
     }
 }
 
