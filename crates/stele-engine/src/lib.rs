@@ -1010,8 +1010,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     tag: DdlOutcome::Created(schema_id).command_tag(),
                 })
             }
-            // A drop never opens storage. The `IF EXISTS` no-op writes no
-            // record — nothing changed, so there is nothing to recover.
+            // A drop closes the catalog name (above) and then retires the dropped
+            // era's still-open storage rows ([STL-211]). The `IF EXISTS` no-op
+            // writes no record and touches no storage — nothing changed, so there
+            // is nothing to recover.
             DdlStatement::DropTable { name, if_exists } => {
                 let mut staged = self.catalog.clone();
                 let outcome = match staged.drop_table(&name, at) {
@@ -1020,9 +1022,38 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     Err(e) => return Err(EngineError::Catalog(e)),
                 };
                 if matches!(outcome, DdlOutcome::Dropped(_)) {
-                    let record = CatalogRecord::DropTable { at, name };
+                    let record = CatalogRecord::DropTable {
+                        at,
+                        name: name.clone(),
+                    };
                     catalog_log::append(&self.disk, &record).map_err(EngineError::CatalogLog)?;
                     self.catalog = staged;
+                    // The catalog name is now closed, but the tier stays resident
+                    // (history survives, and a re-create reuses it). Close every
+                    // row still system-live at the drop instant so the re-created
+                    // name does not inherit them in a current read, and re-using
+                    // one of their keys is not refused as a duplicate. Append-only
+                    // closes ([ADR-0023]): an AS OF read inside the dropped era is
+                    // unaffected. The closes the catalog log does not carry are
+                    // replayed from the tier's own WAL.
+                    //
+                    // Ordering is deliberate: the fsynced catalog record above is
+                    // the DROP's commit point ([ADR-0028]), so the storage half
+                    // runs *after* it. If `close_all_open` then fails (an I/O
+                    // fault), the DROP is already durably committed and only its
+                    // row cleanup is incomplete — the pre-existing leak, scoped to
+                    // that fault window, never a half-applied close on a table the
+                    // catalog still shows as live. Making the two logs commit
+                    // atomically (or re-deriving the closes from the durable drop
+                    // record at recovery) is the filed follow-up [STL-220].
+                    if let Some(state) = self.tables.get_mut(&name) {
+                        let txn_id = TxnId(self.next_txn);
+                        self.next_txn += 1;
+                        let principal = Principal::new(WIRE_PRINCIPAL.to_vec());
+                        state
+                            .engine
+                            .close_all_open(Snapshot(at), txn_id, &principal)?;
+                    }
                 }
                 Ok(StatementOutcome::Ddl {
                     tag: outcome.command_tag(),
@@ -2914,37 +2945,109 @@ mod tests {
 
     #[test]
     fn recreate_with_the_same_policy_reuses_the_tier() {
+        // A re-created name reuses the dropped table's resident tier — history is
+        // preserved and no second namespace is burned — but the dropped era's
+        // rows do **not** leak into the re-created table's *current* read: the
+        // `DROP` closed them ([STL-211]). History survives where it belongs (in
+        // the past): an `AS OF` read before the drop still sees the old row.
         let mut engine = session();
         engine.execute(&parse_one(CREATE)).expect("create");
         engine
-            .insert(
-                "account",
-                BusinessKey::new(b"1".to_vec()),
-                None,
-                Some(b"100".to_vec()),
-                0,
-                TxnId(1),
-                Principal::new(b"demo".to_vec()),
-            )
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
             .expect("insert");
+        let s1 = engine.clock.current();
         engine
             .execute(&parse_one("DROP TABLE account"))
             .expect("drop");
-        // Same (system-only) policy on re-create: the tier is reused, so the
-        // pre-drop history is still readable.
         engine
             .execute(&parse_one(CREATE))
             .expect("re-create same policy");
-        let StatementOutcome::Rows(batch) = engine
-            .execute(&parse_one("SELECT balance FROM account"))
-            .expect("select")
-        else {
-            panic!("rows");
-        };
+
+        // The dropped era's row is closed, so a current read of the re-created
+        // table is empty — no leak.
+        assert!(
+            select(&mut engine, "SELECT id, balance FROM account")
+                .rows
+                .is_empty(),
+            "the dropped era's row does not leak into the re-created table"
+        );
+        // But the history is still there in the past.
+        let as_of = format!(
+            "SELECT id, balance FROM account FOR SYSTEM_TIME AS OF {}",
+            s1.0
+        );
         assert_eq!(
-            payload_column(&batch),
-            &[b"100".to_vec()],
-            "history survives"
+            select(&mut engine, &as_of).rows,
+            vec![vec![i4(1), i4(100)]],
+            "the pre-drop history is still readable AS OF"
+        );
+        // Re-using the dropped era's business key is no longer a duplicate.
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 9)"))
+            .expect("re-insert a key the dropped era had used");
+        assert_eq!(
+            select(&mut engine, "SELECT id, balance FROM account").rows,
+            vec![vec![i4(1), i4(9)]],
+            "the re-inserted row is the only current row"
+        );
+
+        // The tier was reused: same namespace, none burned.
+        let state = engine.tables.get("account").expect("tier resident");
+        assert_eq!(state.namespace, 0, "the re-create reused the namespace");
+        assert_eq!(engine.next_namespace, 1, "no second namespace was burned");
+    }
+
+    #[test]
+    fn drop_table_retires_the_dropped_eras_rows() {
+        // The ticket's exact reproduction ([STL-211]), one live session, no
+        // restart: a name dropped and re-created with *different* columns must
+        // not let the dropped era's rows bleed into the new era's current read,
+        // nor block re-using one of their business keys as a duplicate. An AS OF
+        // read inside the dropped era still resolves the old row under the old
+        // schema, because the closes are append-only ([ADR-0023]).
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE t (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+            ))
+            .expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (1, 100)"))
+            .expect("insert");
+        let s1 = engine.clock.current();
+        engine.execute(&parse_one("DROP TABLE t")).expect("drop");
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE t (id INT PRIMARY KEY, amount INT) WITH SYSTEM VERSIONING",
+            ))
+            .expect("re-create with different columns");
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (2, 5)"))
+            .expect("insert into the new era");
+
+        // Symptom 1 — the dropped-era row no longer leaks into the current read.
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT id, amount FROM t").rows),
+            vec![vec![i4(2), i4(5)]],
+            "the current read sees only the new era"
+        );
+        // Symptom 2 — re-inserting a business key the dropped era had used is no
+        // longer refused as a duplicate (its old version is closed).
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (1, 9)"))
+            .expect("re-insert key 1 — the dropped era's open version was closed");
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT id, amount FROM t").rows),
+            vec![vec![i4(1), i4(9)], vec![i4(2), i4(5)]],
+            "both new-era rows are current"
+        );
+        // The dropped era is untouched: AS OF before the drop still resolves the
+        // old row under the *old* schema.
+        let as_of = format!("SELECT id, balance FROM t FOR SYSTEM_TIME AS OF {}", s1.0);
+        assert_eq!(
+            select(&mut engine, &as_of).rows,
+            vec![vec![i4(1), i4(100)]],
+            "the dropped era reads its one row under the old schema"
         );
     }
 
@@ -4995,11 +5098,11 @@ mod tests {
         // resolves the *old* schema — neither duplicated nor orphaned, because
         // the re-create's catalog-log record carries the *same* namespace and
         // recovery reopens that one tier. The recovered session must answer
-        // exactly as the live one did — including the live session's existing
-        // quirk that a reused tier's dropped-era open rows stay visible to
-        // current reads (a DROP closes the catalog name, not the storage rows;
-        // tightening that is the filed follow-up STL-211) — so both reads are
-        // captured live and compared across the kill.
+        // exactly as the live one did — and the live session no longer leaks the
+        // dropped era's rows into the current read: the `DROP` closes the storage
+        // rows alongside the catalog name ([STL-211]), and recovery replays those
+        // closes from the tier's WAL. Both reads are captured live and compared
+        // across the kill, with the corrected current read pinned below.
         let disk = MemDisk::new();
         let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
         engine
@@ -5024,6 +5127,11 @@ mod tests {
         let as_of_sql = format!("SELECT id, balance FROM t FOR SYSTEM_TIME AS OF {}", s1.0);
         let live_now = sorted(select(&mut engine, now_sql).rows);
         let live_as_of = sorted(select(&mut engine, &as_of_sql).rows);
+        assert_eq!(
+            live_now,
+            vec![vec![i4(2), i4(5)]],
+            "the current read sees only the new era — the dropped era's row was closed by the DROP"
+        );
         drop(engine);
 
         let mut engine = recover_session(&disk);

@@ -586,3 +586,81 @@ fn checkpoint_advances_the_persisted_durable_fence() {
         "recovery loads the most recent checkpoint",
     );
 }
+
+// --- close-all-open: the DROP TABLE storage half (STL-211) ------------------
+
+/// `close_all_open` retires every system-live row with an append-only close at
+/// the drop instant — the storage half of `DROP TABLE` ([STL-211]). The closes
+/// must (a) skip a key already in a deletion gap, (b) leave an `AS OF` read
+/// inside the pre-drop era untouched (append-only, [ADR-0023]), and (c) survive
+/// recovery, since the session keeps the tier resident and a re-created name
+/// reuses it.
+#[test]
+fn close_all_open_retires_live_rows_and_survives_recovery() {
+    let disk = MemDisk::new();
+    let a = key(b"a");
+    let b = key(b"b");
+    let c = key(b"c");
+
+    // StepClock ticks one micro per write: a@1, b@2, c@3, delete-c closes at 4.
+    // Instant 4 is the "drop": a and b are open, c is already gone.
+    let drop_at = Snapshot(SystemTimeMicros(4));
+    let now = Snapshot(SystemTimeMicros(100));
+
+    let mut engine = Engine::open(disk.clone(), StepClock::new(1), false).expect("open");
+    engine
+        .insert(a.clone(), None, Some(b"a0".to_vec()), 0, TxnId(1), who())
+        .expect("insert a");
+    engine
+        .insert(b.clone(), None, Some(b"b0".to_vec()), 0, TxnId(2), who())
+        .expect("insert b");
+    engine
+        .insert(c.clone(), None, Some(b"c0".to_vec()), 0, TxnId(3), who())
+        .expect("insert c");
+    engine.delete(&c, TxnId(4), who()).expect("delete c");
+
+    let closed = engine
+        .close_all_open(drop_at, TxnId(9), &who())
+        .expect("close all open");
+    assert_eq!(
+        closed, 2,
+        "only the two open keys (a, b) close; the deleted c is skipped"
+    );
+
+    // After the drop, a current read finds nothing — every row is closed.
+    assert!(engine.as_of(&a, now).expect("a").is_none(), "a is closed");
+    assert!(engine.as_of(&b, now).expect("b").is_none(), "b is closed");
+    assert!(
+        engine.as_of(&c, now).expect("c").is_none(),
+        "c was already deleted"
+    );
+
+    // Append-only: an AS OF read at the drop instant still resolves the rows
+    // open then — the closes added a `sys_to`, they did not erase the versions.
+    assert!(
+        engine.as_of(&a, drop_at).expect("a@drop").is_some(),
+        "a is still open AS OF the drop instant"
+    );
+    assert!(
+        engine.as_of(&b, drop_at).expect("b@drop").is_some(),
+        "b is still open AS OF the drop instant"
+    );
+    assert!(
+        engine.as_of(&c, drop_at).expect("c@drop").is_none(),
+        "c was retracted before the drop, so it is absent there too"
+    );
+
+    // The closes are durable: recovery reconstructs the same answers.
+    engine.checkpoint().expect("checkpoint");
+    drop(engine);
+    let recovered = Engine::recover(disk, StepClock::new(1_000), false).expect("recover");
+    assert!(
+        recovered.as_of(&a, now).expect("a").is_none(),
+        "the close survived recovery"
+    );
+    assert!(recovered.as_of(&b, now).expect("b").is_none());
+    assert!(
+        recovered.as_of(&a, drop_at).expect("a@drop").is_some(),
+        "AS OF still sees the pre-drop open row after recovery"
+    );
+}
