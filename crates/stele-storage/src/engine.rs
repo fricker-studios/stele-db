@@ -653,14 +653,17 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     /// [`EngineError::Dml`] if the append or fsync fails. A torn or unwritten append
     /// recovers to nothing, so the buffered writes — already applied to this engine's
     /// delta/index — are rolled back **in place** before the error is surfaced, leaving
-    /// the live engine matching the recovered state ([STL-295]). But if the append
-    /// succeeds and only the fsync fails the staged record's durability is
+    /// the live engine matching the recovered state ([STL-295]). A *clean* append
+    /// failure leaves the WAL healthy and the engine keeps running; a *torn* append
+    /// (bytes physically landed past the staged end) additionally **poisons** the WAL
+    /// ([STL-299]), since the stray bytes can never be safely built on. And if the
+    /// append succeeds and only the fsync fails the staged record's durability is
     /// **indeterminate** (a later `tick` could otherwise still flush it). That fsync
     /// failure is *not* a clean abort: the resident writes are left in place, and it
-    /// **poisons** the shared WAL ([STL-217]) — every subsequent write through this
-    /// engine is refused ([`is_poisoned`](Self::is_poisoned)) until the operator
-    /// restarts into [`recover`](Self::recover), so the staged record can never be
-    /// flushed as a clean op — see [`DmlWriter::commit_group`].
+    /// **poisons** the shared WAL ([STL-217]). In both poison cases every subsequent
+    /// write through this engine is refused ([`is_poisoned`](Self::is_poisoned)) until
+    /// the operator restarts into [`recover`](Self::recover), so the staged/torn record
+    /// can never be flushed or built on as a clean op — see [`DmlWriter::commit_group`].
     pub fn commit_group(&mut self) -> Result<LogOffset, EngineError> {
         Ok(self.writer.commit_group(&mut self.delta, &mut self.index)?)
     }
@@ -694,17 +697,19 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         self.writer.abort_group(&mut self.delta, &mut self.index);
     }
 
-    /// Whether the engine's WAL is **poisoned** — a prior fsync
+    /// Whether the engine's WAL is **poisoned** — either a prior fsync
     /// ([`commit_group`](Self::commit_group), [`checkpoint`](Self::checkpoint), or
-    /// [`flush`](Self::flush)) failed, so its staged record's durability is
-    /// indeterminate. Per the WAL contract (invariant 2) that is a crash, not a
-    /// clean abort: every subsequent write is refused with [`WalError::Poisoned`]
+    /// [`flush`](Self::flush)) failed, leaving its staged record's durability
+    /// indeterminate ([STL-217]), or a group-commit append *tore* — bytes landed
+    /// past the staged end yet the append failed, leaving stray bytes no later write
+    /// may build on ([STL-299]). Per the WAL contract (invariant 2) both are crashes,
+    /// not clean aborts: every subsequent write is refused with [`WalError::Poisoned`]
     /// until the operator restarts into [`recover`](Self::recover), which opens a
-    /// fresh, unpoisoned WAL ([STL-217]). An operator — or the session engine that
-    /// wraps a set of these tables — observing a poisoned engine must stop serving
-    /// and recover.
+    /// fresh, unpoisoned WAL. An operator — or the session engine that wraps a set of
+    /// these tables — observing a poisoned engine must stop serving and recover.
     ///
     /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
+    /// [STL-299]: https://allegromusic.atlassian.net/browse/STL-299
     pub fn is_poisoned(&self) -> bool {
         self.wal.is_poisoned()
     }
@@ -1298,6 +1303,138 @@ mod tests {
                 .as_deref(),
             Some(b"v1".as_slice()),
             "the committed-before-failure write survives recovery",
+        );
+    }
+
+    /// A **torn** group-commit append — bytes physically land past the staged end,
+    /// yet the append fails — poisons the engine ([STL-299]). Two things must hold,
+    /// together: the resident writes are rolled back **in place** so a read on the
+    /// still-serving (but poisoned) engine sees none of the torn transaction
+    /// ([STL-295] still applies), **and** the WAL is poisoned so every further write
+    /// is refused and the engine must recover. Recovery then converges to the
+    /// committed-transaction prefix written before the tear, dropping the torn frame
+    /// at the durable fence.
+    #[test]
+    #[allow(clippy::too_many_lines)] // a poison-then-recover oracle reads long but stays one scenario
+    fn a_torn_group_append_poisons_the_engine_and_recovery_is_sound() {
+        use crate::backend::{Faults, MemDisk};
+
+        let faults = Faults::new();
+        let disk = MemDisk::with_faults(faults.clone());
+        let principal = Principal::new(b"op".to_vec());
+        let committed = BusinessKey::new(b"committed".to_vec());
+        let torn = BusinessKey::new(b"torn".to_vec());
+        // A snapshot past every commit in this short test, for presence/absence reads.
+        let latest = Snapshot(SystemTimeMicros(1_000_000));
+
+        let mut engine = Engine::open(
+            disk.clone(),
+            StepClock(std::sync::atomic::AtomicI64::new(0)),
+            false,
+        )
+        .expect("open");
+
+        // A committed baseline: one auto-commit insert, made durable + fenced by a
+        // checkpoint, so its WAL record sits below the torn frame's durable fence.
+        let inserted = engine
+            .insert(
+                committed.clone(),
+                None,
+                Some(b"v1".to_vec()),
+                0,
+                TxnId(1),
+                principal.clone(),
+            )
+            .expect("baseline insert");
+        engine
+            .checkpoint()
+            .expect("checkpoint fences the baseline durable");
+
+        // A multi-statement transaction whose single group-commit append is torn:
+        // 4 bytes physically land past the staged end, then the append fails.
+        engine.begin_group();
+        engine
+            .insert(
+                torn.clone(),
+                None,
+                Some(b"v2".to_vec()),
+                0,
+                TxnId(2),
+                principal.clone(),
+            )
+            .expect("buffered insert applies resident");
+        faults.schedule_torn_append(io::ErrorKind::Other, 4);
+        let err = engine
+            .commit_group()
+            .expect_err("the torn append fails the commit");
+        assert!(
+            matches!(err, EngineError::Dml(DmlError::Wal(WalError::Io(_)))),
+            "the torn append surfaces the concrete io error: got {err:?}",
+        );
+
+        // STL-295 still applies: the buffered write is rolled back in place, so the
+        // still-serving (poisoned) engine reads none of the torn transaction …
+        assert!(
+            engine.is_poisoned(),
+            "a torn append poisons the engine (STL-299)",
+        );
+        assert!(
+            engine
+                .as_of(&torn, latest)
+                .expect("read the torn key")
+                .is_none(),
+            "the torn transaction's resident write was rolled back",
+        );
+        assert!(
+            engine
+                .as_of(&committed, latest)
+                .expect("read the committed key")
+                .is_some(),
+            "the committed baseline is untouched",
+        );
+
+        // … and STL-299 stops it: every further write is refused (a fresh key, so
+        // resolution succeeds and the write actually reaches the poisoned WAL).
+        let err = engine
+            .insert(
+                BusinessKey::new(b"after".to_vec()),
+                None,
+                Some(b"v3".to_vec()),
+                0,
+                TxnId(3),
+                principal,
+            )
+            .expect_err("a poisoned engine refuses writes");
+        assert!(matches!(
+            err,
+            EngineError::Dml(DmlError::Wal(WalError::Poisoned))
+        ));
+        drop(engine);
+
+        // Recovery opens a fresh, unpoisoned WAL and replays the committed prefix;
+        // the torn frame past the fence is dropped, so the torn transaction is gone.
+        let recovered = Engine::recover(
+            disk,
+            StepClock(std::sync::atomic::AtomicI64::new(1_000_000)),
+            false,
+        )
+        .expect("recover");
+        assert!(!recovered.is_poisoned(), "recovery starts unpoisoned");
+        assert_eq!(
+            recovered
+                .as_of_payload(&committed, Snapshot(inserted.commit))
+                .expect("as_of")
+                .flatten()
+                .as_deref(),
+            Some(b"v1".as_slice()),
+            "the committed prefix survives the torn-append recovery",
+        );
+        assert!(
+            recovered
+                .as_of(&torn, latest)
+                .expect("read the torn key")
+                .is_none(),
+            "the torn transaction recovered to nothing",
         );
     }
 }
