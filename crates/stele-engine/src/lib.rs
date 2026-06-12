@@ -53,7 +53,7 @@ mod commit_log;
 mod secondary;
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -77,6 +77,7 @@ use stele_exec::{
 };
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::dml::{BoundDml, DmlError};
+use stele_sql::merge::{BoundMerge, MergeSource, MergeValue};
 use stele_sql::select::{
     AggregateFunc, ArithOp, BoundAggregate, BoundJoin, BoundPeriod, BoundPeriodPredicate,
     BoundPredicate, BoundScalar, BoundSelect, CompareOp, JoinColumnRef, JoinType, OutputItem,
@@ -320,6 +321,10 @@ pub enum DmlSummary {
     Update(u64),
     /// `DELETE` affected `n` rows.
     Delete(u64),
+    /// `MERGE` acted on `n` source rows (each an update or an insert) ([STL-230]).
+    ///
+    /// [STL-230]: https://allegromusic.atlassian.net/browse/STL-230
+    Merge(u64),
 }
 
 /// A multi-statement transaction's buffered, not-yet-applied writes ([STL-174]).
@@ -701,6 +706,26 @@ pub enum EngineError {
     /// [STL-229]: https://allegromusic.atlassian.net/browse/STL-229
     #[error("a scanned business key could not be decoded while expanding a predicate DML")]
     MalformedBusinessKey,
+
+    /// Two source rows of one `MERGE` resolved to the same target row — the
+    /// statement would update or insert one business key twice, with an
+    /// order-dependent result. Refused deterministically at expansion (the
+    /// standard's posture, SQLSTATE `21000`), before any write applies, so the
+    /// statement leaves the table unchanged ([STL-230]).
+    ///
+    /// [STL-230]: https://allegromusic.atlassian.net/browse/STL-230
+    #[error("MERGE cannot affect the same target row a second time")]
+    MergeRowTwice,
+
+    /// A `MERGE` source-table row could not be decoded back to its declared
+    /// column types while expanding the plan ([STL-230]). The scan returns the
+    /// canonical cell encodings the binder folds literals to, so this signals
+    /// corruption or a schema disagreement — the statement fails closed rather
+    /// than writing values from a row it cannot read.
+    ///
+    /// [STL-230]: https://allegromusic.atlassian.net/browse/STL-230
+    #[error("a MERGE source row could not be decoded while expanding the plan")]
+    MalformedMergeSource,
 }
 
 /// One table's live state inside a session.
@@ -1496,6 +1521,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                             DmlSummary::Insert(n) => (StatementKind::Insert, *n),
                             DmlSummary::Update(n) => (StatementKind::Update, *n),
                             DmlSummary::Delete(n) => (StatementKind::Delete, *n),
+                            DmlSummary::Merge(n) => (StatementKind::Merge, *n),
                         };
                         m.rows_written.add(n);
                         kind
@@ -1617,6 +1643,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             dml @ (BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. }) => {
                 self.apply_scan_dml(dml, read_snapshot, overlay)
             }
+            // A MERGE expands the same way ([STL-230]): resolve each source row
+            // against the live keys at the read snapshot, then apply the write
+            // set as one atomic group.
+            BoundDml::Merge(merge) => self.apply_merge(&merge, read_snapshot, overlay),
             dml => self.apply_dml(dml),
         }
     }
@@ -2530,6 +2560,48 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         overlay: &[BoundDml],
     ) -> Result<StatementOutcome, EngineError> {
         let (writes, summary) = self.expand_scan_dml(dml, read_snapshot, overlay)?;
+        self.apply_write_group(writes, summary)
+    }
+
+    /// Apply an auto-committed `MERGE` ([STL-230]): resolve each source row
+    /// against the target's live keys at `read_snapshot`
+    /// ([`expand_merge`](Self::expand_merge)) and apply the resulting write set
+    /// as a single atomic group — exactly the scan-then-write machinery
+    /// ([`apply_scan_dml`](Self::apply_scan_dml)), so a failure on any row of
+    /// the set discards the group and the statement leaves the table unchanged
+    /// ([STL-216]).
+    ///
+    /// The reported tag counts the **source rows acted on** (each one update or
+    /// one insert); a row whose arm is absent is skipped and not counted.
+    ///
+    /// [STL-230]: https://allegromusic.atlassian.net/browse/STL-230
+    fn apply_merge(
+        &mut self,
+        merge: &BoundMerge,
+        read_snapshot: SystemTimeMicros,
+        overlay: &[BoundDml],
+    ) -> Result<StatementOutcome, EngineError> {
+        let (writes, summary) = self.expand_merge(merge, read_snapshot, overlay)?;
+        self.apply_write_group(writes, summary)
+    }
+
+    /// Apply an expanded statement's per-key writes as a single **atomic
+    /// group** — the same [`apply_group`](Self::apply_group) →
+    /// [`finish_group_commit`](Self::finish_group_commit) machinery a
+    /// multi-statement `COMMIT` uses ([STL-192]). All writes target one table,
+    /// so the commit is the single-record fast path: one WAL record, one fsync.
+    /// A failure applying any write of the set discards the group
+    /// ([`abort_group`](stele_storage::engine::Engine::abort_group)) — nothing
+    /// is made durable and the in-memory tiers are rolled back ([STL-216]), so
+    /// the statement leaves the table unchanged.
+    ///
+    /// An empty set opens no group and writes no WAL record; the summary is
+    /// reported unchanged.
+    fn apply_write_group(
+        &mut self,
+        writes: Vec<BoundDml>,
+        summary: DmlSummary,
+    ) -> Result<StatementOutcome, EngineError> {
         if !writes.is_empty() {
             let txn_id = TxnId(self.next_txn);
             self.next_txn += 1;
@@ -2697,6 +2769,194 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         Ok((writes, summary))
     }
 
+    /// Expand a `MERGE` plan ([STL-230]) into the per-key point writes it stands
+    /// for, reporting the acted-on-row summary alongside.
+    ///
+    /// The probe and the source read both run through the **same**
+    /// [`run_select`](Self::run_select) path a `SELECT` takes at the statement
+    /// snapshot — committed-only state on the auto-commit path, the buffered-write
+    /// overlay inside a transaction (read-your-own-writes, [STL-203]). Each source
+    /// row resolves its arm against the target's live keys: matched ⇒ one
+    /// [`BoundDml::Update`] from the `WHEN MATCHED` template, unmatched ⇒ one
+    /// [`BoundDml::Insert`] from the `WHEN NOT MATCHED` template (a row whose arm
+    /// is absent is skipped). A `NULL` join key matches nothing — SQL equality —
+    /// and a `NULL` resolving into the **inserted business key** fails the
+    /// statement.
+    ///
+    /// Two source rows resolving to the same target row are refused with
+    /// [`EngineError::MergeRowTwice`] — the standard's deterministic posture —
+    /// *before* any write applies. The writes are keyed (and therefore ordered) by
+    /// the canonical key encoding, so the expansion — and with it the group's WAL
+    /// record — is deterministic regardless of source order.
+    ///
+    /// [STL-230]: https://allegromusic.atlassian.net/browse/STL-230
+    fn expand_merge(
+        &self,
+        merge: &BoundMerge,
+        snapshot: SystemTimeMicros,
+        overlay: &[BoundDml],
+    ) -> Result<(Vec<BoundDml>, DmlSummary), EngineError> {
+        // `bind_merge` already proved the target resolves at this snapshot with at
+        // least the key column — a miss is an internal contract break, surfaced
+        // rather than panicking (the same posture as `expand_scan_dml`).
+        let schema = self
+            .catalog
+            .resolve(&merge.table, snapshot)
+            .ok_or_else(|| EngineError::UnknownTable(merge.table.clone()))?;
+        let key_name = schema
+            .columns()
+            .first()
+            .map(|c| c.name().to_owned())
+            .ok_or_else(|| EngineError::UnknownTable(merge.table.clone()))?;
+
+        // The probe set: the target's live business keys at the statement
+        // snapshot, read exactly as `SELECT <key> FROM t` would be.
+        let probe = BoundSelect {
+            table: merge.table.clone(),
+            schema_id: merge.schema_id,
+            snapshot,
+            valid_snapshot: None,
+            projection: Projection::Columns(vec![key_name.clone()]),
+            filter: None,
+            period_filter: None,
+            aggregate: None,
+            join: None,
+        };
+        let StatementOutcome::Rows(live) = self.run_select(&probe, overlay)? else {
+            return Err(EngineError::Unsupported(
+                "the MERGE probe read returned no row set",
+            ));
+        };
+        let live: HashSet<Vec<u8>> = live
+            .rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .next()
+                    .flatten()
+                    .ok_or(EngineError::MalformedBusinessKey)
+            })
+            .collect::<Result<_, _>>()?;
+
+        let rows = self.merge_source_rows(&merge.source, snapshot, overlay)?;
+
+        // Resolve each source row's arm. Keying the writes by the canonical key
+        // encoding both rejects a second write to one target row and fixes the
+        // apply order deterministically.
+        let mut writes: BTreeMap<Vec<u8>, BoundDml> = BTreeMap::new();
+        for row in &rows {
+            let joined = row
+                .get(merge.on)
+                .ok_or(EngineError::MalformedMergeSource)?
+                .as_ref();
+            // SQL equality: a NULL join key matches nothing — the row is unmatched.
+            let matched = joined.filter(|key| live.contains(&encode_value(key)));
+            let (key, write) = if let Some(key) = matched {
+                let Some(assignments) = &merge.matched else {
+                    continue;
+                };
+                let assignments = assignments
+                    .iter()
+                    .map(|(idx, value)| (*idx, resolve_merge_value(value, row)))
+                    .collect();
+                (
+                    key.clone(),
+                    BoundDml::Update {
+                        table: merge.table.clone(),
+                        schema_id: merge.schema_id,
+                        key: key.clone(),
+                        assignments,
+                        valid: None,
+                    },
+                )
+            } else {
+                let Some(template) = &merge.not_matched else {
+                    continue;
+                };
+                let mut cells = template.iter().map(|value| resolve_merge_value(value, row));
+                // The template is aligned to all target columns, key first; a
+                // NULL resolving into the key can never insert.
+                let key = cells.next().flatten().ok_or_else(|| {
+                    EngineError::Dml(DmlError::NullValue {
+                        table: merge.table.clone(),
+                        column: key_name.clone(),
+                    })
+                })?;
+                let values: Vec<Option<ScalarValue>> = cells.collect();
+                (
+                    key.clone(),
+                    BoundDml::Insert {
+                        table: merge.table.clone(),
+                        schema_id: merge.schema_id,
+                        key,
+                        values,
+                        valid: None,
+                    },
+                )
+            };
+            if writes.insert(encode_value(&key), write).is_some() {
+                return Err(EngineError::MergeRowTwice);
+            }
+        }
+        let count = writes.len() as u64;
+        Ok((writes.into_values().collect(), DmlSummary::Merge(count)))
+    }
+
+    /// Materialize a `MERGE`'s source rows ([STL-230]): a `VALUES` source was
+    /// folded to typed rows at bind; a table source is read here — at the same
+    /// snapshot (+ overlay) the probe uses — and decoded back to typed cells by
+    /// its declared column types.
+    ///
+    /// [STL-230]: https://allegromusic.atlassian.net/browse/STL-230
+    fn merge_source_rows(
+        &self,
+        source: &MergeSource,
+        snapshot: SystemTimeMicros,
+        overlay: &[BoundDml],
+    ) -> Result<Vec<Vec<Option<ScalarValue>>>, EngineError> {
+        match source {
+            MergeSource::Values(rows) => Ok(rows.clone()),
+            MergeSource::Table {
+                name,
+                schema_id,
+                columns,
+            } => {
+                let scan = BoundSelect {
+                    table: name.clone(),
+                    schema_id: *schema_id,
+                    snapshot,
+                    valid_snapshot: None,
+                    projection: Projection::Columns(
+                        columns.iter().map(|(name, _)| name.clone()).collect(),
+                    ),
+                    filter: None,
+                    period_filter: None,
+                    aggregate: None,
+                    join: None,
+                };
+                let StatementOutcome::Rows(result) = self.run_select(&scan, overlay)? else {
+                    return Err(EngineError::Unsupported(
+                        "the MERGE source read returned no row set",
+                    ));
+                };
+                result
+                    .rows
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .zip(columns)
+                            .map(|(cell, (_, ty))| {
+                                cell.map(|bytes| ScalarValue::decode(*ty, &bytes))
+                                    .transpose()
+                                    .map_err(|_| EngineError::MalformedMergeSource)
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .collect()
+            }
+        }
+    }
+
     /// The oldest system-time snapshot pinned by a currently-open transaction, or
     /// `None` when none is open. The floor [`prune_write_index`](Self::prune_write_index)
     /// keeps the write index above ([STL-204]).
@@ -2774,16 +3034,17 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         txn_id: TxnId,
         principal: &Principal,
     ) -> Result<DmlSummary, EngineError> {
-        // A scan-then-write variant ([STL-229]) carries a predicate, not a key —
-        // it is expanded into per-key writes *before* it can reach an apply
-        // (`apply_scan_dml` / `stage_dml`), so one arriving here is an internal
-        // contract break. Refuse it rather than write something wrong.
+        // A scan-then-write variant ([STL-229]) or a MERGE plan ([STL-230])
+        // carries a predicate / source, not a key — it is expanded into per-key
+        // writes *before* it can reach an apply (`apply_scan_dml` / `apply_merge`
+        // / `stage_dml`), so one arriving here is an internal contract break.
+        // Refuse it rather than write something wrong.
         if matches!(
             dml,
-            BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. }
+            BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } | BoundDml::Merge(_)
         ) {
             return Err(EngineError::Unsupported(
-                "a scan-then-write UPDATE/DELETE must be expanded before it is applied",
+                "a scan-then-write UPDATE/DELETE/MERGE must be expanded before it is applied",
             ));
         }
         // The (table, business key) this write commits, captured before the match
@@ -2880,7 +3141,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 self.delete(&table, &business_key(&key), txn_id, principal.clone())?;
                 DmlSummary::Delete(1)
             }
-            BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } => {
+            BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } | BoundDml::Merge(_) => {
                 unreachable!("rejected at the top of apply_bound_dml")
             }
         };
@@ -3091,6 +3352,15 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // only ever sees per-key writes.
             Ok(dml @ (BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. })) => {
                 let (writes, summary) = self.expand_scan_dml(dml, txn.snapshot, &txn.writes)?;
+                txn.writes.extend(writes);
+                Ok(Some(summary))
+            }
+            // A MERGE expands at staging the same way ([STL-230]): the probe and
+            // the source read resolve at the pinned snapshot with the
+            // transaction's own buffered writes overlaid (read-your-own-writes,
+            // [STL-203]), and the buffer only ever holds the per-key writes.
+            Ok(BoundDml::Merge(merge)) => {
+                let (writes, summary) = self.expand_merge(&merge, txn.snapshot, &txn.writes)?;
                 txn.writes.extend(writes);
                 Ok(Some(summary))
             }
@@ -3424,9 +3694,22 @@ fn dml_summary(dml: &BoundDml) -> DmlSummary {
         BoundDml::Insert { .. } => DmlSummary::Insert(1),
         BoundDml::Update { .. } => DmlSummary::Update(1),
         BoundDml::Delete { .. } => DmlSummary::Delete(1),
-        BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } => {
+        BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } | BoundDml::Merge(_) => {
             unreachable!("a scan-then-write DML reports its summary from the expansion")
         }
+    }
+}
+
+/// Resolve one `WHEN`-arm value slot against a concrete source row ([STL-230]):
+/// a literal passes through; a source-column reference takes the row's cell
+/// (`None` = a SQL `NULL` cell). The binder fixed every index against the
+/// source's width, so the lookup is total.
+///
+/// [STL-230]: https://allegromusic.atlassian.net/browse/STL-230
+fn resolve_merge_value(value: &MergeValue, row: &[Option<ScalarValue>]) -> Option<ScalarValue> {
+    match value {
+        MergeValue::Literal(value) => value.clone(),
+        MergeValue::Source(idx) => row.get(*idx).cloned().flatten(),
     }
 }
 
@@ -3464,8 +3747,9 @@ fn dml_business_key(dml: &BoundDml) -> BusinessKey {
         | BoundDml::Update { key, .. }
         | BoundDml::Delete { key, .. } => key,
         // The transaction buffer only ever holds per-key writes: a scan-then-write
-        // statement is expanded at staging ([`SessionEngine::stage_dml`], STL-229).
-        BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } => {
+        // or MERGE statement is expanded at staging ([`SessionEngine::stage_dml`],
+        // STL-229 / STL-230).
+        BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } | BoundDml::Merge(_) => {
             unreachable!("a scan-then-write DML is expanded before it is buffered")
         }
     };
@@ -3691,9 +3975,10 @@ fn overlay_table_writes(
             BoundDml::Delete { key, .. } => {
                 rows.remove(&encode_value(key));
             }
-            // The buffer only ever holds per-key writes: a scan-then-write
-            // statement expands at staging ([`SessionEngine::stage_dml`], STL-229).
-            BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } => {
+            // The buffer only ever holds per-key writes: a scan-then-write or
+            // MERGE statement expands at staging ([`SessionEngine::stage_dml`],
+            // STL-229 / STL-230).
+            BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } | BoundDml::Merge(_) => {
                 unreachable!("a scan-then-write DML is expanded before it is buffered")
             }
         }
@@ -10068,6 +10353,360 @@ mod tests {
                         .collect(),
                     false,
                 )
+            }
+        }
+    }
+
+    // --- STL-230: MERGE — WHEN MATCHED / NOT MATCHED upsert ------------------
+
+    /// The full table as `(id, v)` rows, sorted — the oracle's observable state.
+    fn table_state(engine: &mut SessionEngine<ZeroClock, MemDisk>) -> Vec<Vec<Option<Vec<u8>>>> {
+        sorted(select(engine, "SELECT * FROM o").rows)
+    }
+
+    const CREATE_O: &str = "CREATE TABLE o (id INT PRIMARY KEY, v INT) WITH SYSTEM VERSIONING";
+
+    #[test]
+    fn merge_upserts_a_mixed_values_batch() {
+        // The DoD shape: one statement over a batch where some keys exist
+        // (updated) and some don't (inserted), the tag counting every acted-on
+        // source row.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_O)).expect("create");
+        dml(&mut engine, "INSERT INTO o VALUES (1, 10)");
+        dml(&mut engine, "INSERT INTO o VALUES (2, 20)");
+
+        let got = dml(
+            &mut engine,
+            "MERGE INTO o USING (VALUES (1, 100), (3, 300)) AS s (id, v) ON o.id = s.id \
+             WHEN MATCHED THEN UPDATE SET v = s.v \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+        );
+        assert_eq!(got, DmlSummary::Merge(2));
+        assert_eq!(
+            table_state(&mut engine),
+            sorted(vec![
+                vec![i4(1), i4(100)],
+                vec![i4(2), i4(20)],
+                vec![i4(3), i4(300)],
+            ]),
+            "key 1 updated, key 2 untouched, key 3 inserted"
+        );
+    }
+
+    #[test]
+    fn merge_with_a_single_arm_skips_the_other_rows() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_O)).expect("create");
+        dml(&mut engine, "INSERT INTO o VALUES (1, 10)");
+
+        // Only WHEN MATCHED: the unmatched source row (key 9) is skipped — not
+        // inserted, not counted.
+        let got = dml(
+            &mut engine,
+            "MERGE INTO o USING (VALUES (1, 11), (9, 99)) AS s (id, v) ON o.id = s.id \
+             WHEN MATCHED THEN UPDATE SET v = s.v",
+        );
+        assert_eq!(got, DmlSummary::Merge(1));
+        assert_eq!(table_state(&mut engine), vec![vec![i4(1), i4(11)]]);
+
+        // Only WHEN NOT MATCHED: the matched source row (key 1) is skipped — its
+        // live value stands.
+        let got = dml(
+            &mut engine,
+            "MERGE INTO o USING (VALUES (1, 12), (9, 99)) AS s (id, v) ON o.id = s.id \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+        );
+        assert_eq!(got, DmlSummary::Merge(1));
+        assert_eq!(
+            table_state(&mut engine),
+            sorted(vec![vec![i4(1), i4(11)], vec![i4(9), i4(99)]])
+        );
+    }
+
+    #[test]
+    fn merge_reads_a_table_source_at_the_statement_snapshot() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_O)).expect("create");
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE src (id INT PRIMARY KEY, v INT) WITH SYSTEM VERSIONING",
+            ))
+            .expect("create source");
+        dml(&mut engine, "INSERT INTO o VALUES (1, 10)");
+        dml(&mut engine, "INSERT INTO src VALUES (1, 100)");
+        dml(&mut engine, "INSERT INTO src VALUES (2, 200)");
+        // A NULL source value column rides through both arms as a NULL cell.
+        dml(&mut engine, "INSERT INTO src VALUES (3, NULL)");
+
+        let got = dml(
+            &mut engine,
+            "MERGE INTO o USING src AS s ON o.id = s.id \
+             WHEN MATCHED THEN UPDATE SET v = s.v \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+        );
+        assert_eq!(got, DmlSummary::Merge(3));
+        assert_eq!(
+            table_state(&mut engine),
+            sorted(vec![
+                vec![i4(1), i4(100)],
+                vec![i4(2), i4(200)],
+                vec![i4(3), cell(None)],
+            ])
+        );
+    }
+
+    #[test]
+    fn merge_in_a_transaction_overlays_its_own_writes() {
+        // Read-your-own-writes ([STL-203]): an INSERT staged earlier in the block
+        // is *matched* by a later MERGE in the same block; the buffered MERGE
+        // writes stay invisible to other connections until COMMIT.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_O)).expect("create");
+        dml(&mut engine, "INSERT INTO o VALUES (1, 10)");
+
+        let mut txn = engine.begin();
+        engine
+            .stage_dml(&parse_one("INSERT INTO o VALUES (2, 20)"), &mut txn)
+            .expect("stage insert")
+            .expect("a DML summary");
+        let staged = engine
+            .stage_dml(
+                &parse_one(
+                    "MERGE INTO o USING (VALUES (1, 100), (2, 200), (3, 300)) AS s (id, v) \
+                     ON o.id = s.id \
+                     WHEN MATCHED THEN UPDATE SET v = s.v \
+                     WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+                ),
+                &mut txn,
+            )
+            .expect("stage merge")
+            .expect("a DML summary");
+        // Key 1 (committed) and key 2 (buffered, RYOW) are matched; key 3 inserts.
+        assert_eq!(staged, DmlSummary::Merge(3));
+
+        // Uncommitted: another connection still sees only the pre-txn state.
+        assert_eq!(table_state(&mut engine), vec![vec![i4(1), i4(10)]]);
+
+        engine.commit(txn).expect("commit");
+        assert_eq!(
+            table_state(&mut engine),
+            sorted(vec![
+                vec![i4(1), i4(100)],
+                vec![i4(2), i4(200)],
+                vec![i4(3), i4(300)],
+            ])
+        );
+    }
+
+    #[test]
+    fn merge_affecting_a_row_twice_fails_and_leaves_the_table_unchanged() {
+        // The DoD atomicity oracle: row 3 of the source is a second write to key
+        // 7 — the statement fails (deterministically, the standard's cardinality
+        // posture) and *none* of the batch applies: not the update to key 1, not
+        // the first insert of key 7.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_O)).expect("create");
+        dml(&mut engine, "INSERT INTO o VALUES (1, 10)");
+        let before = table_state(&mut engine);
+
+        let err = engine
+            .execute(&parse_one(
+                "MERGE INTO o USING (VALUES (1, 100), (7, 70), (7, 71)) AS s (id, v) \
+                 ON o.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET v = s.v \
+                 WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+            ))
+            .unwrap_err();
+        assert!(matches!(err, EngineError::MergeRowTwice), "got {err:?}");
+        assert_eq!(
+            table_state(&mut engine),
+            before,
+            "a failed MERGE leaves the table unchanged"
+        );
+
+        // The same failure at staging, inside a transaction: nothing is buffered,
+        // the block's earlier writes are untouched, and the commit applies them.
+        let mut txn = engine.begin();
+        engine
+            .stage_dml(&parse_one("INSERT INTO o VALUES (2, 20)"), &mut txn)
+            .expect("stage insert")
+            .expect("a DML summary");
+        let err = engine
+            .stage_dml(
+                &parse_one(
+                    "MERGE INTO o USING (VALUES (7, 70), (7, 71)) AS s (id, v) ON o.id = s.id \
+                     WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+                ),
+                &mut txn,
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::MergeRowTwice), "got {err:?}");
+        engine.commit(txn).expect("commit");
+        assert_eq!(
+            table_state(&mut engine),
+            sorted(vec![vec![i4(1), i4(10)], vec![i4(2), i4(20)]]),
+            "the failed MERGE staged nothing; the block's other write committed"
+        );
+    }
+
+    #[test]
+    fn a_failing_write_mid_group_aborts_the_whole_merge_set() {
+        // Drive the shared group-apply with a write set whose second write fails
+        // (an UPDATE of a key with no live version — unreachable through a real
+        // MERGE expansion, which is what makes it the right poison here): the
+        // already-applied first insert must be rolled back ([STL-216]), so the
+        // statement-shaped group leaves the table unchanged.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_O)).expect("create");
+        dml(&mut engine, "INSERT INTO o VALUES (1, 10)");
+        let before = table_state(&mut engine);
+
+        let schema_id = stele_catalog::SchemaId(1);
+        let writes = vec![
+            BoundDml::Insert {
+                table: "o".to_owned(),
+                schema_id,
+                key: ScalarValue::Int4(5),
+                values: vec![Some(ScalarValue::Int4(50))],
+                valid: None,
+            },
+            BoundDml::Update {
+                table: "o".to_owned(),
+                schema_id,
+                key: ScalarValue::Int4(999),
+                assignments: vec![(0, Some(ScalarValue::Int4(0)))],
+                valid: None,
+            },
+        ];
+        let err = engine
+            .apply_write_group(writes, DmlSummary::Merge(2))
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Storage(_)), "got {err:?}");
+        assert_eq!(
+            table_state(&mut engine),
+            before,
+            "the applied prefix of a failed group is rolled back in memory"
+        );
+    }
+
+    #[test]
+    fn merge_null_join_keys_never_match_and_a_null_insert_key_fails() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_O)).expect("create");
+        dml(&mut engine, "INSERT INTO o VALUES (1, 10)");
+        let before = table_state(&mut engine);
+
+        // A NULL join key matches nothing; with only a MATCHED arm the row is
+        // skipped — the statement acts on zero rows.
+        let got = dml(
+            &mut engine,
+            "MERGE INTO o USING (VALUES (NULL, 100)) AS s (id, v) ON o.id = s.id \
+             WHEN MATCHED THEN UPDATE SET v = s.v",
+        );
+        assert_eq!(got, DmlSummary::Merge(0));
+        assert_eq!(table_state(&mut engine), before);
+
+        // The same NULL flowing into the *inserted business key* can never
+        // write — the statement fails closed and the table is unchanged.
+        let err = engine
+            .execute(&parse_one(
+                "MERGE INTO o USING (VALUES (NULL, 100)) AS s (id, v) ON o.id = s.id \
+                 WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::Dml(DmlError::NullValue { .. })),
+            "got {err:?}"
+        );
+        assert_eq!(table_state(&mut engine), before);
+    }
+
+    /// The MERGE upsert correctness oracle (testing strategy §4): seeded random
+    /// source batches — mixed matched/not-matched keys, both arms, single arms,
+    /// NULL value cells — run against the engine and an in-process reference
+    /// model. After every statement the tag must count the acted-on source rows
+    /// and the full table must equal the model; a mid-workload flush makes the
+    /// probe also run over sealed segments.
+    #[test]
+    fn merge_matches_a_reference_model_over_seeded_workloads() {
+        const OPS: u64 = 40;
+        for seed in 1..=5u64 {
+            let mut rng = TestRng(seed);
+            let mut engine = session();
+            engine.execute(&parse_one(CREATE_O)).expect("create");
+            let mut model: BTreeMap<i32, Option<i32>> = BTreeMap::new();
+
+            for op in 0..OPS {
+                if op == OPS / 2 {
+                    engine.flush().expect("flush");
+                }
+                // Draw a batch of distinct source keys (a duplicate is the
+                // statement-level error oracled separately).
+                let batch_len = 1 + rng.below(5);
+                let mut batch: Vec<(i32, Option<i32>)> = Vec::new();
+                for _ in 0..batch_len {
+                    let key = i32::try_from(rng.below(25)).expect("small key");
+                    if batch.iter().any(|(k, _)| *k == key) {
+                        continue;
+                    }
+                    let value = (rng.below(5) > 0)
+                        .then(|| i32::try_from(rng.below(100)).expect("small value"));
+                    batch.push((key, value));
+                }
+                let values = batch
+                    .iter()
+                    .map(|(k, v)| {
+                        format!("({k}, {})", v.map_or("NULL".to_owned(), |v| v.to_string()))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                // Both arms, or one — the model mirrors exactly the arms given.
+                let (matched_arm, not_matched_arm) = match rng.below(4) {
+                    0 => (true, false),
+                    1 => (false, true),
+                    _ => (true, true),
+                };
+                let mut sql =
+                    format!("MERGE INTO o USING (VALUES {values}) AS s (id, v) ON o.id = s.id");
+                if matched_arm {
+                    sql.push_str(" WHEN MATCHED THEN UPDATE SET v = s.v");
+                }
+                if not_matched_arm {
+                    sql.push_str(" WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)");
+                }
+
+                let mut acted = 0u64;
+                for (key, value) in &batch {
+                    // A live key takes the MATCHED arm, an absent one the NOT
+                    // MATCHED arm — and either way the upsert lands the value.
+                    let arm = if model.contains_key(key) {
+                        matched_arm
+                    } else {
+                        not_matched_arm
+                    };
+                    if arm {
+                        model.insert(*key, *value);
+                        acted += 1;
+                    }
+                }
+
+                let got = dml(&mut engine, &sql);
+                assert_eq!(
+                    got,
+                    DmlSummary::Merge(acted),
+                    "seed {seed} op {op}: the tag must count acted-on source rows"
+                );
+                let want: Vec<Vec<Option<Vec<u8>>>> = model
+                    .iter()
+                    .map(|(k, v)| vec![i4(*k), cell(v.map(ScalarValue::Int4))])
+                    .collect();
+                assert_eq!(
+                    table_state(&mut engine),
+                    sorted(want),
+                    "seed {seed} op {op}: the table must equal the reference model"
+                );
             }
         }
     }

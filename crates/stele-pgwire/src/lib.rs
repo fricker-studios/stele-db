@@ -195,6 +195,10 @@ const SQLSTATE_IN_FAILED_TRANSACTION: &str = "25P02";
 // A snapshot-isolation write-write conflict (`COMMIT` lost a first-committer-wins
 // race) — Postgres's `serialization_failure`, which stock clients retry (STL-175).
 const SQLSTATE_SERIALIZATION_FAILURE: &str = "40001";
+// A MERGE whose source affects the same target row twice (STL-230) — the
+// standard's `cardinality_violation`, the code Postgres raises for the same
+// refusal ("MERGE command cannot affect row a second time").
+const SQLSTATE_CARDINALITY_VIOLATION: &str = "21000";
 // A `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` issued with no open transaction —
 // Postgres's "can only be used in transaction blocks" (STL-176).
 const SQLSTATE_NO_ACTIVE_TRANSACTION: &str = "25P01";
@@ -911,6 +915,10 @@ pub enum CommandTag {
     Update(u64),
     /// `DELETE n` — `n` rows deleted.
     Delete(u64),
+    /// `MERGE n` — `n` source rows acted on (updated or inserted) ([STL-230]).
+    ///
+    /// [STL-230]: https://allegromusic.atlassian.net/browse/STL-230
+    Merge(u64),
     /// `CREATE TABLE`.
     CreateTable,
     /// `DROP TABLE`.
@@ -926,6 +934,7 @@ impl CommandTag {
             Self::Insert(n) => format!("INSERT 0 {n}"),
             Self::Update(n) => format!("UPDATE {n}"),
             Self::Delete(n) => format!("DELETE {n}"),
+            Self::Merge(n) => format!("MERGE {n}"),
             Self::CreateTable => "CREATE TABLE".to_owned(),
             Self::DropTable => "DROP TABLE".to_owned(),
         }
@@ -1532,6 +1541,7 @@ const fn command_tag_for(summary: DmlSummary) -> CommandTag {
         DmlSummary::Insert(n) => CommandTag::Insert(n),
         DmlSummary::Update(n) => CommandTag::Update(n),
         DmlSummary::Delete(n) => CommandTag::Delete(n),
+        DmlSummary::Merge(n) => CommandTag::Merge(n),
     }
 }
 
@@ -1578,7 +1588,11 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
         | EngineError::RowCodec(_)
         | EngineError::SchemaChanged { .. }
         | EngineError::MalformedValidBound
-        | EngineError::MalformedBusinessKey => SQLSTATE_INTERNAL_ERROR,
+        | EngineError::MalformedBusinessKey
+        | EngineError::MalformedMergeSource => SQLSTATE_INTERNAL_ERROR,
+        // Two MERGE source rows resolving to one target row — the standard's
+        // cardinality violation, refused before any write applies (STL-230).
+        EngineError::MergeRowTwice => SQLSTATE_CARDINALITY_VIOLATION,
         // A write-write conflict at COMMIT — the retryable serialization failure.
         EngineError::Conflict => SQLSTATE_SERIALIZATION_FAILURE,
     }
@@ -3215,6 +3229,7 @@ mod tests {
         assert_eq!(CommandTag::Insert(3).render(), "INSERT 0 3");
         assert_eq!(CommandTag::Update(1).render(), "UPDATE 1");
         assert_eq!(CommandTag::Delete(0).render(), "DELETE 0");
+        assert_eq!(CommandTag::Merge(2).render(), "MERGE 2");
         assert_eq!(CommandTag::CreateTable.render(), "CREATE TABLE");
         assert_eq!(CommandTag::DropTable.render(), "DROP TABLE");
     }
