@@ -476,8 +476,15 @@ impl BoundServer {
             let session = Arc::clone(&self.session);
             let tls = self.tls.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, peer, session, tls).await {
-                    warn!(%peer, error = %e, "connection closed with error");
+                match handle_connection(stream, peer, session, tls).await {
+                    Ok(()) => {}
+                    // Expected, policy- or client-driven closures (a plaintext
+                    // attempt against tls = "required", a CancelRequest): not a
+                    // server-side problem, so don't page anyone over them.
+                    Err(e @ (WireError::TlsRequired | WireError::Cancelled)) => {
+                        debug!(%peer, error = %e, "connection closed");
+                    }
+                    Err(e) => warn!(%peer, error = %e, "connection closed with error"),
                 }
             });
         }
@@ -654,6 +661,11 @@ async fn negotiate_startup(
     loop {
         let (length, code) = read_startup_header(&mut stream).await?;
         match code {
+            // SSLRequest / GSSENCRequest are exactly 8 bytes; any other length
+            // would leave unread bytes that desynchronize the next header read.
+            SSL_REQUEST_CODE | GSS_ENC_REQUEST_CODE if length != 8 => {
+                return Err(WireError::Protocol("encryption request length must be 8"));
+            }
             SSL_REQUEST_CODE => {
                 if let Some(ctx) = tls {
                     stream.write_all(b"S").await?;
@@ -676,9 +688,9 @@ async fn negotiate_startup(
                 stream.flush().await?;
             }
             CANCEL_REQUEST_CODE => {
-                // CancelRequest is fire-and-forget — drain and close.
-                let mut sink = vec![0u8; 8];
-                stream.read_exact(&mut sink).await?;
+                // CancelRequest is fire-and-forget and gets no reply: close
+                // without draining the pid/secret payload (we don't use it, and
+                // a read here could park the task on partial input).
                 return Err(WireError::Cancelled);
             }
             PROTOCOL_3_0 | PROTOCOL_3_2 => {
@@ -2387,14 +2399,18 @@ async fn read_startup<S: Wire>(stream: &mut S) -> Result<StartupMessage, WireErr
     loop {
         let (length, code) = read_startup_header(stream).await?;
         match code {
+            // Exactly 8 bytes, or the unread remainder desyncs the next header.
+            SSL_REQUEST_CODE | GSS_ENC_REQUEST_CODE if length != 8 => {
+                return Err(WireError::Protocol("encryption request length must be 8"));
+            }
             SSL_REQUEST_CODE | GSS_ENC_REQUEST_CODE => {
                 stream.write_all(b"N").await?;
                 stream.flush().await?;
             }
             CANCEL_REQUEST_CODE => {
-                // CancelRequest is fire-and-forget — drain and close.
-                let mut sink = vec![0u8; 8];
-                stream.read_exact(&mut sink).await?;
+                // CancelRequest is fire-and-forget and gets no reply: close
+                // without draining the pid/secret payload (we don't use it, and
+                // a read here could park the task on partial input).
                 return Err(WireError::Cancelled);
             }
             PROTOCOL_3_0 | PROTOCOL_3_2 => {
