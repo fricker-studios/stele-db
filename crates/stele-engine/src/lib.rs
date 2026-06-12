@@ -79,7 +79,7 @@ use stele_exec::{
 };
 use stele_sql::Password;
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
-use stele_sql::dml::{BoundDml, DmlError};
+use stele_sql::dml::{BoundDml, DmlError, InsertRow};
 use stele_sql::merge::{BoundMerge, MergeSource, MergeValue};
 use stele_sql::select::{
     AggregateFunc, ArithOp, BoundAggregate, BoundJoin, BoundPeriod, BoundPeriodPredicate,
@@ -311,11 +311,16 @@ pub struct SelectResult {
     pub rows: Vec<Vec<Option<Vec<u8>>>>,
 }
 
-/// The affected-row count of a committed `INSERT` / `UPDATE` / `DELETE`.
+/// The affected-row count of a committed `INSERT` / `UPDATE` / `DELETE` /
+/// `MERGE`.
 ///
-/// v0.1 DML writes a single row per statement, so the count is always `1` on
-/// success — but the variant is carried so the wire layer can render the right
-/// `CommandComplete` tag (`INSERT 0 n` / `UPDATE n` / `DELETE n`).
+/// A point write reports `1`; a multi-row `INSERT` ([STL-228]), a predicate-driven
+/// `UPDATE` / `DELETE` ([STL-229]), and a `MERGE` ([STL-230]) report the rows they
+/// acted on. The variant is carried so the wire layer renders the right
+/// `CommandComplete` tag (`INSERT 0 n` / `UPDATE n` / `DELETE n` / `MERGE n`).
+///
+/// [STL-228]: https://allegromusic.atlassian.net/browse/STL-228
+/// [STL-229]: https://allegromusic.atlassian.net/browse/STL-229
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DmlSummary {
     /// `INSERT` affected `n` rows.
@@ -1696,6 +1701,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // against the live keys at the read snapshot, then apply the write
             // set as one atomic group.
             BoundDml::Merge(merge) => self.apply_merge(&merge, read_snapshot, overlay),
+            // A multi-row INSERT ([STL-228]) fans out into one point INSERT per
+            // row, applied as one atomic group — the same group-commit machinery,
+            // so a failure on any row leaves zero rows. It needs no snapshot read:
+            // the binder already folded every row.
+            dml @ BoundDml::InsertRows { .. } => self.apply_insert_rows(dml),
             dml => self.apply_dml(dml),
         }
     }
@@ -2726,6 +2736,24 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         self.apply_write_group(writes, summary)
     }
 
+    /// Apply an auto-committed multi-row `INSERT … VALUES (…), (…), …`
+    /// ([STL-228]): fan the bound rows out into one point [`BoundDml::Insert`]
+    /// each ([`expand_insert_rows`]) and apply the whole set as a single atomic
+    /// group — exactly the scan-then-write machinery
+    /// ([`apply_scan_dml`](Self::apply_scan_dml)), so a failure applying any row
+    /// (a duplicate key, a schema drift between binding and applying) discards the
+    /// group and the statement leaves the table unchanged ([STL-216]). It needs no
+    /// snapshot read — the binder already folded every row — so the expansion is a
+    /// pure unpacking.
+    ///
+    /// The reported tag counts the rows inserted: `INSERT 0 N`.
+    ///
+    /// [STL-228]: https://allegromusic.atlassian.net/browse/STL-228
+    fn apply_insert_rows(&mut self, dml: BoundDml) -> Result<StatementOutcome, EngineError> {
+        let (writes, summary) = expand_insert_rows(dml);
+        self.apply_write_group(writes, summary)
+    }
+
     /// Apply an expanded statement's per-key writes as a single **atomic
     /// group** — the same [`apply_group`](Self::apply_group) →
     /// [`finish_group_commit`](Self::finish_group_commit) machinery a
@@ -3192,17 +3220,21 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         txn_id: TxnId,
         principal: &Principal,
     ) -> Result<DmlSummary, EngineError> {
-        // A scan-then-write variant ([STL-229]) or a MERGE plan ([STL-230])
-        // carries a predicate / source, not a key — it is expanded into per-key
-        // writes *before* it can reach an apply (`apply_scan_dml` / `apply_merge`
-        // / `stage_dml`), so one arriving here is an internal contract break.
-        // Refuse it rather than write something wrong.
+        // A multi-row INSERT ([STL-228]), a scan-then-write variant ([STL-229]),
+        // or a MERGE plan ([STL-230]) stands for several writes, not one keyed
+        // write — each is expanded into per-key writes *before* it can reach an
+        // apply (`apply_insert_rows` / `apply_scan_dml` / `apply_merge` /
+        // `stage_dml`), so one arriving here is an internal contract break. Refuse
+        // it rather than write something wrong.
         if matches!(
             dml,
-            BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } | BoundDml::Merge(_)
+            BoundDml::InsertRows { .. }
+                | BoundDml::UpdateScan { .. }
+                | BoundDml::DeleteScan { .. }
+                | BoundDml::Merge(_)
         ) {
             return Err(EngineError::Unsupported(
-                "a scan-then-write UPDATE/DELETE/MERGE must be expanded before it is applied",
+                "a multi-row INSERT / scan-then-write UPDATE/DELETE / MERGE must be expanded before it is applied",
             ));
         }
         // The (table, business key) this write commits, captured before the match
@@ -3299,7 +3331,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 self.delete(&table, &business_key(&key), txn_id, principal.clone())?;
                 DmlSummary::Delete(1)
             }
-            BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } | BoundDml::Merge(_) => {
+            BoundDml::InsertRows { .. }
+            | BoundDml::UpdateScan { .. }
+            | BoundDml::DeleteScan { .. }
+            | BoundDml::Merge(_) => {
                 unreachable!("rejected at the top of apply_bound_dml")
             }
         };
@@ -3519,6 +3554,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // [STL-203]), and the buffer only ever holds the per-key writes.
             Ok(BoundDml::Merge(merge)) => {
                 let (writes, summary) = self.expand_merge(&merge, txn.snapshot, &txn.writes)?;
+                txn.writes.extend(writes);
+                Ok(Some(summary))
+            }
+            // A multi-row INSERT ([STL-228]) expands at staging into one buffered
+            // point INSERT per row, so the buffer only ever holds per-key writes:
+            // read-your-own-writes overlay ([STL-203]), savepoint truncation,
+            // conflict detection, and the group commit each see N inserts and
+            // commit them as one atomic group. The tag reports the row count now.
+            Ok(dml @ BoundDml::InsertRows { .. }) => {
+                let (writes, summary) = expand_insert_rows(dml);
                 txn.writes.extend(writes);
                 Ok(Some(summary))
             }
@@ -3971,10 +4016,43 @@ fn dml_summary(dml: &BoundDml) -> DmlSummary {
         BoundDml::Insert { .. } => DmlSummary::Insert(1),
         BoundDml::Update { .. } => DmlSummary::Update(1),
         BoundDml::Delete { .. } => DmlSummary::Delete(1),
-        BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } | BoundDml::Merge(_) => {
-            unreachable!("a scan-then-write DML reports its summary from the expansion")
+        BoundDml::InsertRows { .. }
+        | BoundDml::UpdateScan { .. }
+        | BoundDml::DeleteScan { .. }
+        | BoundDml::Merge(_) => {
+            unreachable!(
+                "a multi-row INSERT / scan-then-write DML reports its summary from the expansion"
+            )
         }
     }
+}
+
+/// Expand a multi-row `INSERT` ([STL-228]) into the per-row point
+/// [`BoundDml::Insert`]s it stands for, reporting the inserted-row summary
+/// alongside. The rows keep **statement order** (the order the user wrote them);
+/// unlike the scan expansion there is no scan to order, so none is imposed — the
+/// group's WAL record is already deterministic.
+fn expand_insert_rows(dml: BoundDml) -> (Vec<BoundDml>, DmlSummary) {
+    let BoundDml::InsertRows {
+        table,
+        schema_id,
+        rows,
+    } = dml
+    else {
+        unreachable!("expand_insert_rows only receives InsertRows");
+    };
+    let count = rows.len() as u64;
+    let writes = rows
+        .into_iter()
+        .map(|InsertRow { key, values, valid }| BoundDml::Insert {
+            table: table.clone(),
+            schema_id,
+            key,
+            values,
+            valid,
+        })
+        .collect();
+    (writes, DmlSummary::Insert(count))
 }
 
 /// Resolve one `WHEN`-arm value slot against a concrete source row ([STL-230]):
@@ -4023,11 +4101,16 @@ fn dml_business_key(dml: &BoundDml) -> BusinessKey {
         BoundDml::Insert { key, .. }
         | BoundDml::Update { key, .. }
         | BoundDml::Delete { key, .. } => key,
-        // The transaction buffer only ever holds per-key writes: a scan-then-write
-        // or MERGE statement is expanded at staging ([`SessionEngine::stage_dml`],
-        // STL-229 / STL-230).
-        BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } | BoundDml::Merge(_) => {
-            unreachable!("a scan-then-write DML is expanded before it is buffered")
+        // The transaction buffer only ever holds per-key writes: a multi-row
+        // INSERT, a scan-then-write, or a MERGE statement is expanded at staging
+        // ([`SessionEngine::stage_dml`], STL-228 / STL-229 / STL-230).
+        BoundDml::InsertRows { .. }
+        | BoundDml::UpdateScan { .. }
+        | BoundDml::DeleteScan { .. }
+        | BoundDml::Merge(_) => {
+            unreachable!(
+                "a multi-row INSERT / scan-then-write DML is expanded before it is buffered"
+            )
         }
     };
     business_key(key)
@@ -4252,11 +4335,16 @@ fn overlay_table_writes(
             BoundDml::Delete { key, .. } => {
                 rows.remove(&encode_value(key));
             }
-            // The buffer only ever holds per-key writes: a scan-then-write or
-            // MERGE statement expands at staging ([`SessionEngine::stage_dml`],
-            // STL-229 / STL-230).
-            BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } | BoundDml::Merge(_) => {
-                unreachable!("a scan-then-write DML is expanded before it is buffered")
+            // The buffer only ever holds per-key writes: a multi-row INSERT, a
+            // scan-then-write, or a MERGE statement expands at staging
+            // ([`SessionEngine::stage_dml`], STL-228 / STL-229 / STL-230).
+            BoundDml::InsertRows { .. }
+            | BoundDml::UpdateScan { .. }
+            | BoundDml::DeleteScan { .. }
+            | BoundDml::Merge(_) => {
+                unreachable!(
+                    "a multi-row INSERT / scan-then-write DML is expanded before it is buffered"
+                )
             }
         }
     }
@@ -6223,6 +6311,145 @@ mod tests {
             sorted(select(&mut engine, now_sql).rows),
             live_now,
             "the live post-abort state matches a from-the-WAL recovery",
+        );
+    }
+
+    // --- Multi-row INSERT (STL-228) ----------------------------------------
+    //
+    // `INSERT INTO t VALUES (…), (…), …` binds every row and applies them as one
+    // atomic group: all rows commit together (`INSERT 0 N`) or, if any row fails,
+    // none do — the same group-commit / abort-rollback discipline (STL-192,
+    // STL-216) a multi-statement COMMIT uses.
+
+    #[test]
+    fn multi_row_insert_auto_commit_writes_every_row() {
+        // An auto-committed multi-row INSERT reports `INSERT 0 N` and commits all N
+        // rows durably (they survive a from-the-WAL recovery).
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        let outcome = engine
+            .execute(&parse_one(
+                "INSERT INTO account VALUES (1, 100), (2, 200), (3, 300)",
+            ))
+            .expect("multi-row insert");
+        assert_eq!(
+            outcome,
+            StatementOutcome::Dml(DmlSummary::Insert(3)),
+            "the tag counts every inserted row (INSERT 0 3)",
+        );
+
+        let all = "SELECT id, balance FROM account";
+        let expected = vec![
+            vec![i4(1), i4(100)],
+            vec![i4(2), i4(200)],
+            vec![i4(3), i4(300)],
+        ];
+        assert_eq!(sorted(select(&mut engine, all).rows), expected);
+
+        // Durable: a from-the-WAL recovery rebuilds the same three rows.
+        drop(engine);
+        let mut engine = recover_session(&disk);
+        assert_eq!(sorted(select(&mut engine, all).rows), expected);
+    }
+
+    #[test]
+    fn multi_row_insert_inside_a_txn_is_visible_then_committed() {
+        // STL-203 read-your-own-writes: a multi-row INSERT staged in a transaction
+        // reports its count at once, all N rows are visible to a later SELECT in
+        // the same block, and COMMIT applies them as one group (recovers whole).
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        let mut txn = engine.begin();
+        let summary = engine
+            .stage_dml(
+                &parse_one("INSERT INTO account VALUES (1, 100), (2, 200), (3, 300)"),
+                &mut txn,
+            )
+            .expect("stage multi-row insert");
+        assert_eq!(summary, Some(DmlSummary::Insert(3)));
+
+        let StatementOutcome::Rows(seen) = engine
+            .execute_in_txn(&parse_one("SELECT id, balance FROM account"), &mut txn)
+            .expect("ryow select")
+        else {
+            panic!("rows");
+        };
+        let expected = vec![
+            vec![i4(1), i4(100)],
+            vec![i4(2), i4(200)],
+            vec![i4(3), i4(300)],
+        ];
+        assert_eq!(
+            sorted(seen.rows),
+            expected,
+            "all N buffered rows are visible mid-transaction",
+        );
+
+        engine.commit(txn).expect("commit");
+        let all = "SELECT id, balance FROM account";
+        assert_eq!(sorted(select(&mut engine, all).rows), expected);
+
+        drop(engine);
+        let mut engine = recover_session(&disk);
+        assert_eq!(sorted(select(&mut engine, all).rows), expected);
+    }
+
+    #[test]
+    fn multi_row_insert_failing_on_a_row_leaves_zero_rows() {
+        // STL-228 DoD: a failure on a row (here a duplicate of the already-live
+        // id=1) aborts the whole statement — none of its rows are visible, matching
+        // a from-the-WAL recovery. The earlier good row (id=2) must not linger in
+        // the in-memory tiers (the STL-216 abort rollback).
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("baseline");
+
+        // Row 2 duplicates the live id=1: it fails at apply (KeyExists) *after*
+        // id=2 has already landed in the live tiers within the group.
+        let outcome = engine.execute(&parse_one("INSERT INTO account VALUES (2, 200), (1, 999)"));
+        assert!(
+            outcome.is_err(),
+            "the duplicate-key row aborts the statement"
+        );
+
+        let all = "SELECT id, balance FROM account";
+        let only_baseline = vec![vec![i4(1), i4(100)]];
+        assert_eq!(
+            sorted(select(&mut engine, all).rows),
+            only_baseline,
+            "neither the new id=2 nor the doomed id=1 row is visible",
+        );
+
+        drop(engine);
+        let mut engine = recover_session(&disk);
+        assert_eq!(
+            sorted(select(&mut engine, all).rows),
+            only_baseline,
+            "the live post-abort state matches a from-the-WAL recovery",
+        );
+    }
+
+    #[test]
+    fn multi_row_insert_with_a_duplicate_key_within_the_statement_aborts() {
+        // Two rows of one statement sharing a key is an in-statement duplicate: the
+        // second fails against the first (already staged in the group), so the whole
+        // statement leaves zero rows.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        let outcome = engine.execute(&parse_one("INSERT INTO account VALUES (5, 1), (5, 2)"));
+        assert!(outcome.is_err(), "the repeated key aborts the statement");
+        assert!(
+            select(&mut engine, "SELECT id FROM account")
+                .rows
+                .is_empty(),
+            "no row of the aborted statement is visible",
         );
     }
 
