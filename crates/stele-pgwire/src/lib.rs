@@ -1486,9 +1486,13 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
         | EngineError::Dml(DmlError::UnknownTable(_) | DmlError::TableNotLive { .. })
         | EngineError::UnknownTable(_) => SQLSTATE_UNDEFINED_TABLE,
         // A named column the schema does not contain — Postgres's undefined_column,
-        // distinct from undefined_table, so a client can branch on it.
+        // distinct from undefined_table, so a client can branch on it. A DML
+        // WHERE binds through the shared SELECT predicate binder ([STL-229]), so
+        // its unknown column surfaces wrapped and maps the same way.
         EngineError::Select(SelectError::UnknownColumn { .. })
-        | EngineError::Dml(DmlError::UnknownColumn { .. }) => SQLSTATE_UNDEFINED_COLUMN,
+        | EngineError::Dml(
+            DmlError::UnknownColumn { .. } | DmlError::Predicate(SelectError::UnknownColumn { .. }),
+        ) => SQLSTATE_UNDEFINED_COLUMN,
         EngineError::Dml(DmlError::BadLiteral { .. } | DmlError::TypeMismatch { .. }) => {
             SQLSTATE_INVALID_TEXT_REPRESENTATION
         }
@@ -1509,7 +1513,8 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
         | EngineError::Scan(_)
         | EngineError::RowCodec(_)
         | EngineError::SchemaChanged { .. }
-        | EngineError::MalformedValidBound => SQLSTATE_INTERNAL_ERROR,
+        | EngineError::MalformedValidBound
+        | EngineError::MalformedBusinessKey => SQLSTATE_INTERNAL_ERROR,
         // A write-write conflict at COMMIT — the retryable serialization failure.
         EngineError::Conflict => SQLSTATE_SERIALIZATION_FAILURE,
     }
