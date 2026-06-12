@@ -138,10 +138,20 @@ impl<D: Disk> Wal<D> {
     /// callers needing to verify the log should use [`Wal::replay_from`] first.
     pub fn open(disk: D, config: WalConfig) -> Result<Self, WalError> {
         let segments = list_segments(&disk)?;
-        let (current_segment_index, current) = match segments.last().copied() {
-            Some(idx) => (idx, disk.open(&segment::name_for(idx))?),
-            None => (0, disk.create(&segment::name_for(0))?),
+        let (current_segment_index, current) = if let Some(idx) = segments.last().copied() {
+            (idx, disk.open(&segment::name_for(idx))?)
+        } else {
+            (0, disk.create(&segment::name_for(0))?)
         };
+        // Directory fence ([STL-232]), on *both* paths: recovery rediscovers
+        // the log by listing the disk, so every segment's *entry* must be
+        // durable before a record fsync'd into it can count as durable.
+        // Fencing unconditionally (not just after the create) also heals any
+        // entry a previous incarnation created but never fenced — a crash (or
+        // fence failure) between `create` and `sync_dir` in a prior open or
+        // rotation leaves exactly that debris, and this boot-time fence
+        // vouches for it before any new durability claim is made.
+        disk.sync_dir()?;
         let end = LogOffset {
             segment_index: current_segment_index,
             byte_offset: current.len(),
@@ -373,6 +383,18 @@ fn rotate<D: Disk>(g: &mut Inner<D>, wakers: &mut Vec<Waker>) -> Result<(), WalE
     }
     let new_idx = g.current_segment_index + 1;
     let new_file = g.disk.create(&segment::name_for(new_idx))?;
+    // Directory fence ([STL-232]): the new segment's *entry* must be durable
+    // before any record fsync'd into it can count as durable — recovery finds
+    // segments by listing the disk, so a synced record in an unlinked file
+    // would be silently lost. A failed fence is a failed fsync: poison, same
+    // as the closing-segment sync above ([STL-217]). The unfenced file this
+    // leaves behind is healed by [`Wal::open`]'s unconditional fence on the
+    // post-poison restart, before the reopened WAL claims any durability.
+    if let Err(e) = g.disk.sync_dir() {
+        g.poisoned = true;
+        wakers.extend(drain_all_waiters(g));
+        return Err(WalError::Io(e));
+    }
 
     // From here on the rotation is committed. The closing segment is durable,
     // so every record in it is durable — advance `durable_end` past the

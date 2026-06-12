@@ -767,6 +767,12 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
             writer.push_retraction(c)?;
         }
         writer.finish()?; // fsyncs — the segment is now durable
+        // Directory fence ([STL-232]): make the segment's *entry* durable
+        // before the checkpoint vouches for it. Without this, a crash could
+        // keep the (appended, fsync'd) manifest record while losing the
+        // just-created file it names — recovery would then fail to open a
+        // vouched segment instead of ignoring an orphan.
+        self.disk.sync_dir()?;
 
         // 4. Commit: the checkpoint record vouches the segment and advances the
         //    floor past every record it covers.

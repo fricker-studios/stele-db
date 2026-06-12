@@ -49,7 +49,10 @@ data_dir = "/var/lib/stele"
 
 [storage]
 # Which storage backend the engine boots on. (active) One of:
-#   "local"  — durable, rooted at [server] data_dir (the default)
+#   "local"  — durable, rooted at [server] data_dir (the default). What lands
+#              in that directory and the durability discipline behind it
+#              (file + directory fsync, torn-tail tolerance) are documented in
+#              docs/02-architecture.md §3.7.
 #   "memory" — ephemeral, in-process; nothing survives a restart (tests/throwaway)
 # An object-store backend (e.g. "s3") is planned but not yet a valid value —
 # setting it is a clear config error today.

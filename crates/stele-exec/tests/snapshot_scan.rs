@@ -672,6 +672,10 @@ impl stele_storage::backend::Disk for CountingDisk {
     fn remove(&self, name: &str) -> std::io::Result<()> {
         self.inner.remove(name)
     }
+
+    fn sync_dir(&self) -> std::io::Result<()> {
+        self.inner.sync_dir()
+    }
 }
 
 impl stele_storage::backend::DiskFile for CountingFile {

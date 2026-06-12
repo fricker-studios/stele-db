@@ -88,6 +88,24 @@ impl Disk for LocalDisk {
     fn remove(&self, name: &str) -> io::Result<()> {
         fs::remove_file(self.path(name)?)
     }
+
+    #[cfg(unix)]
+    fn sync_dir(&self) -> io::Result<()> {
+        // The directory fence is a real fsync of the root directory: POSIX
+        // separates a file's contents from its directory entry, so a crash
+        // after `DiskFile::sync` can keep the bytes yet lose the name. Opening
+        // a directory read-only for fsync is the standard idiom.
+        File::open(&self.root)?.sync_all()
+    }
+
+    #[cfg(windows)]
+    fn sync_dir(&self) -> io::Result<()> {
+        // Windows has no supported directory-handle flush: `CreateFile` on a
+        // directory needs `FILE_FLAG_BACKUP_SEMANTICS` (std's `File::open`
+        // does not pass it), and NTFS journals metadata operations on its own.
+        // Like SQLite and LevelDB on this platform, the fence is a no-op.
+        Ok(())
+    }
 }
 
 /// A single file within a [`LocalDisk`].

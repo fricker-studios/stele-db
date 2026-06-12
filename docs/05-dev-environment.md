@@ -334,4 +334,6 @@ A ready-to-copy sample lives at [`stele.example.toml`](../stele.example.toml) in
 
 **Secure defaults** ([10 §4](10-security-and-compliance.md#4-data-protection--encryption), STL-251): a config-file (non-dev) run **without `[tls]` may only bind loopback** — the server refuses to start on a non-loopback `listen` rather than silently serve plaintext. Configure `[tls]`, bind `127.0.0.1`, or use `--dev`.
 
+`backend = "local"` — the default, and the fully-realized reference backend (STL-232) — roots everything at `data_dir`; what lands in that directory and the durability discipline behind it (file **and** directory fsync, torn-tail tolerance, fsync-failure poisoning) are documented in [02 — architecture §3.7](02-architecture.md#37-on-disk-layout--durability-discipline-local-backend). `backend = "memory"` runs the identical contract on the heap — nothing survives a restart; both backends (plus the sim's fault disk) pass the shared conformance suite (`stele_storage::backend::conformance`).
+
 Dev mode (`--dev`) supplies safe defaults so a contributor needs **no config file** to get running — config is for operators, not for the five-minute path.
