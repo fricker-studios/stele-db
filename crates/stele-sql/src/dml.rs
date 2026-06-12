@@ -65,9 +65,22 @@
 //! the `valid` field of [`BoundDml::Insert`] / [`BoundDml::Update`]; it is `None` for a
 //! system-only table.
 //!
+//! ## Multi-row `INSERT` ([STL-228])
+//!
+//! `INSERT INTO t VALUES (…), (…), …` binds every row — each through the same
+//! per-row column/codec validation a single-row `INSERT` uses, with a per-row
+//! failure naming the offending row ([`DmlError::RowError`]). One row stays a
+//! point [`BoundDml::Insert`]; two or more bind to [`BoundDml::InsertRows`],
+//! which the engine applies as a single atomic group (all rows or none). The v0.1
+//! single-row restriction ([STL-149]) is lifted now that the row codec
+//! ([STL-151]), group commit ([STL-192]), and abort rollback ([STL-216]) make the
+//! group atomic.
+//!
+//! [STL-228]: https://allegromusic.atlassian.net/browse/STL-228
+//!
 //! ## What this rejects (with a clear bind error, never a wrong write)
 //!
-//! Multi-row `INSERT`, `INSERT … SELECT`, a `WHERE` outside the shared `SELECT`
+//! `INSERT … SELECT`, a `WHERE` outside the shared `SELECT`
 //! predicate vocabulary (an `AND`/`OR` chain, a column-to-column comparison, …),
 //! updating the key column, `RETURNING`, `ON CONFLICT`, `USING`/`FROM` joins,
 //! qualified names, a `NULL` business key, and out-of-range literals. A `NULL`
@@ -92,6 +105,28 @@ use crate::select::{
     AsOfError, BindContext, BoundPredicate, SelectError, TableResolution, bind_where_predicate,
     resolve_as_of, resolve_table_at,
 };
+
+/// One row of a multi-row `INSERT … VALUES (…), (…), …` ([STL-228]).
+///
+/// Holds the already-folded business key, value columns, and (valid-time)
+/// interval a single-row [`BoundDml::Insert`] would carry. The engine expands an
+/// [`InsertRows`](BoundDml::InsertRows) into one [`Insert`](BoundDml::Insert) per
+/// row, applied as one atomic group.
+///
+/// [STL-228]: https://allegromusic.atlassian.net/browse/STL-228
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertRow {
+    /// The business key (the first column's value).
+    pub key: ScalarValue,
+    /// The value columns' values, in schema order, exactly as a single-row
+    /// [`Insert`](BoundDml::Insert) carries them (each `None` for a SQL `NULL`
+    /// cell; period columns kept as [`ScalarValue::Timestamp`] cells on a
+    /// valid-time table).
+    pub values: Vec<Option<ScalarValue>>,
+    /// The `[from, to)` valid-time period, or `None` for a system-only table —
+    /// derived from this row's own period-column bounds.
+    pub valid: Option<Interval>,
+}
 
 /// A bound `INSERT` / `UPDATE` / `DELETE`, ready for the engine to apply.
 ///
@@ -123,6 +158,26 @@ pub enum BoundDml {
         /// it onto the stored payload; `to` is [`VALID_TIME_OPEN`] when the
         /// `INSERT` named only the start bound ([STL-194]).
         valid: Option<Interval>,
+    },
+    /// A multi-row `INSERT … VALUES (…), (…), …` ([STL-228]): every `VALUES` row
+    /// bound to its own key + value columns.
+    ///
+    /// Like the scan variants, this never reaches the per-key write path
+    /// directly: the engine expands it into one [`Insert`](Self::Insert) per row
+    /// and applies the whole set as a single atomic group (one WAL record + one
+    /// fsync), so a failure on any row aborts the statement and leaves **zero**
+    /// rows ([STL-216]). The binder emits this only for **two or more** rows; a
+    /// single-row `INSERT` stays the point [`Insert`](Self::Insert), byte-for-byte
+    /// the pre-STL-228 plan.
+    ///
+    /// [STL-228]: https://allegromusic.atlassian.net/browse/STL-228
+    InsertRows {
+        /// The table written.
+        table: String,
+        /// The schema version `table` resolved to at the bind snapshot.
+        schema_id: SchemaId,
+        /// The rows to insert, in statement order ([`InsertRow`]).
+        rows: Vec<InsertRow>,
     },
     /// `UPDATE`: close `key`'s prior period and open a new one. The `assignments`
     /// overwrite the named value columns; any column the `SET` does not name keeps
@@ -216,6 +271,7 @@ impl BoundDml {
     pub fn table(&self) -> &str {
         match self {
             Self::Insert { table, .. }
+            | Self::InsertRows { table, .. }
             | Self::Update { table, .. }
             | Self::Delete { table, .. }
             | Self::UpdateScan { table, .. }
@@ -292,12 +348,21 @@ pub enum DmlError {
         table: String,
     },
 
-    /// An `INSERT` supplied more than one row of `VALUES`. v0.1 inserts a single
-    /// row per statement.
-    #[error("v0.1 INSERT writes a single row; {rows} rows were given")]
-    MultiRowInsert {
-        /// How many `VALUES` rows the statement carried.
-        rows: usize,
+    /// A row of a multi-row `INSERT … VALUES (…), (…), …` ([STL-228]) failed to
+    /// bind. The wrapped error is exactly the one a single-row `INSERT` of that
+    /// row would give (arity, type mismatch, bad literal, a `NULL` key, …); this
+    /// names which row it occurred on (1-based, in statement order). A malformed
+    /// *column list* is a statement-level error, reported un-wrapped — it is not a
+    /// property of any one row.
+    ///
+    /// [STL-228]: https://allegromusic.atlassian.net/browse/STL-228
+    #[error("INSERT VALUES row {row}: {source}")]
+    RowError {
+        /// The 1-based position of the offending row in the `VALUES` list.
+        row: usize,
+        /// The per-row bind failure, exactly as a single-row `INSERT` reports it.
+        #[source]
+        source: Box<DmlError>,
     },
 
     /// An `INSERT`'s value count does not match the target column count.
@@ -491,8 +556,91 @@ fn bind_insert(insert: &Insert, ctx: &BindContext) -> Result<BoundDml, DmlError>
     let table = bare_name(name)?;
     let (schema, key_col, value_cols) = resolve_shape(ctx, &table)?;
 
-    let row = single_values_row(insert)?;
+    let rows = values_rows(insert)?;
 
+    // The optional column list is row-independent — validate it once (a malformed
+    // list is a statement-level error, not a property of any one row), then bind
+    // every row against it. `None` means positional mapping.
+    let names: Option<Vec<String>> = match insert.columns.as_slice() {
+        [] => None,
+        cols => Some(validated_columns(&table, cols, schema)?),
+    };
+    let schema_id = schema.schema_id();
+
+    match rows.as_slice() {
+        // A single row is the point `INSERT` — and reports its arity/type/literal
+        // errors *unwrapped*, byte-for-byte the pre-STL-228 surface ([STL-149]).
+        [row] => {
+            let (key, values, valid) = bind_insert_row(
+                row,
+                &table,
+                schema,
+                key_col,
+                value_cols,
+                names.as_deref(),
+                ctx,
+            )?;
+            Ok(BoundDml::Insert {
+                table,
+                schema_id,
+                key,
+                values,
+                valid,
+            })
+        }
+        // Two or more rows ([STL-228]): bind each through the same per-row path,
+        // wrapping any failure with its 1-based row position so the diagnostic
+        // names the offending row. The engine applies the set as one atomic group.
+        rows => {
+            let bound = rows
+                .iter()
+                .enumerate()
+                .map(|(i, row)| {
+                    bind_insert_row(
+                        row,
+                        &table,
+                        schema,
+                        key_col,
+                        value_cols,
+                        names.as_deref(),
+                        ctx,
+                    )
+                    .map(|(key, values, valid)| InsertRow { key, values, valid })
+                    .map_err(|source| DmlError::RowError {
+                        row: i + 1,
+                        source: Box::new(source),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(BoundDml::InsertRows {
+                table,
+                schema_id,
+                rows: bound,
+            })
+        }
+    }
+}
+
+/// The folded business key, value columns, and valid-time interval one `VALUES`
+/// row yields — the shared product of [`bind_insert_row`], assembled into a
+/// [`BoundDml::Insert`] or an [`InsertRow`].
+type BoundInsertRow = (ScalarValue, Vec<Option<ScalarValue>>, Option<Interval>);
+
+/// Bind one `VALUES` row against the table's columns: align the row's expressions
+/// to the schema columns (positionally, or by `names` when an explicit column
+/// list was given), fold the business key and value columns, and derive the
+/// valid-time interval. Shared by the single-row [`BoundDml::Insert`] and every
+/// row of a multi-row [`BoundDml::InsertRows`] ([STL-228]), so both paths reject
+/// the same arities, type mismatches, and bad literals identically.
+fn bind_insert_row(
+    row: &[Expr],
+    table: &str,
+    schema: &TableSchema,
+    key_col: &ColumnDef,
+    value_cols: &[ColumnDef],
+    names: Option<&[String]>,
+    ctx: &BindContext,
+) -> Result<BoundInsertRow, DmlError> {
     // Resolve, for every schema column in declaration order, the value expression
     // that supplies it (`None` when omitted). With no explicit column list the
     // values map positionally (and the count must match exactly); with a list,
@@ -500,8 +648,8 @@ fn bind_insert(insert: &Insert, ctx: &BindContext) -> Result<BoundDml, DmlError>
     // is only legal for the valid-time period's *end* bound (which opens the
     // period); every other omission is a `MissingColumn` at the point of use.
     let columns = schema.columns();
-    let exprs: Vec<Option<&Expr>> = match insert.columns.as_slice() {
-        [] => {
+    let exprs: Vec<Option<&Expr>> = match names {
+        None => {
             if row.len() != columns.len() {
                 return Err(DmlError::ColumnCountMismatch {
                     expected: columns.len(),
@@ -510,14 +658,13 @@ fn bind_insert(insert: &Insert, ctx: &BindContext) -> Result<BoundDml, DmlError>
             }
             row.iter().map(Some).collect()
         }
-        cols => {
-            if cols.len() != row.len() {
+        Some(names) => {
+            if names.len() != row.len() {
                 return Err(DmlError::ColumnCountMismatch {
-                    expected: cols.len(),
+                    expected: names.len(),
                     found: row.len(),
                 });
             }
-            let names = validated_columns(&table, cols, schema)?;
             columns
                 .iter()
                 .map(|column| {
@@ -533,25 +680,18 @@ fn bind_insert(insert: &Insert, ctx: &BindContext) -> Result<BoundDml, DmlError>
     // `exprs` is aligned to `columns`: the first is the business key, the rest are
     // the value columns in order.
     let key_expr = exprs[0].ok_or_else(|| DmlError::MissingColumn {
-        table: table.clone(),
+        table: table.to_owned(),
         column: key_col.name().to_owned(),
     })?;
-    let key = fold_value(key_expr, &table, key_col)?;
+    let key = fold_value(key_expr, table, key_col)?;
     let (values, valid) = fold_value_columns(
-        &table,
+        table,
         value_cols,
         &exprs[1..],
         schema.temporal().valid_time(),
         ctx.snapshot,
     )?;
-
-    Ok(BoundDml::Insert {
-        table: table.clone(),
-        schema_id: schema.schema_id(),
-        key,
-        values,
-        valid,
-    })
+    Ok((key, values, valid))
 }
 
 /// Reject the dialect-specific `INSERT` forms outside the v0.1 surface, before
@@ -588,19 +728,30 @@ fn reject_insert_extensions(insert: &Insert) -> Result<(), DmlError> {
     Ok(())
 }
 
-/// The single row of `VALUES` an `INSERT` carries, after rejecting `INSERT …
-/// SELECT` and the multi-row form.
-fn single_values_row(insert: &Insert) -> Result<&[Expr], DmlError> {
+/// Every row of an `INSERT`'s `VALUES`, after rejecting `INSERT … SELECT` and the
+/// value-less form. v0.1 rejected more than one row ([STL-149]); the machinery
+/// that made that the safe choice — the row codec ([STL-151]), group commit
+/// ([STL-192]), and abort rollback ([STL-216]) — has since landed, so a multi-row
+/// list now binds and applies as one atomic group ([STL-228]).
+fn values_rows(insert: &Insert) -> Result<Vec<&[Expr]>, DmlError> {
     let Some(query) = insert.source.as_deref() else {
         return Err(DmlError::Unsupported("INSERT without VALUES".to_owned()));
     };
     let SetExpr::Values(values) = query.body.as_ref() else {
         return Err(DmlError::Unsupported("INSERT … SELECT".to_owned()));
     };
-    match values.rows.as_slice() {
-        [row] => Ok(row.content.as_slice()),
-        rows => Err(DmlError::MultiRowInsert { rows: rows.len() }),
+    if values.rows.is_empty() {
+        // A `VALUES` with no rows is not producible by the parser; guard rather
+        // than emit an empty (no-op) write group.
+        return Err(DmlError::Unsupported(
+            "INSERT with no VALUES rows".to_owned(),
+        ));
     }
+    Ok(values
+        .rows
+        .iter()
+        .map(|row| row.content.as_slice())
+        .collect())
 }
 
 /// Resolve an `INSERT` column list to bare names in positional order, rejecting a
@@ -1263,11 +1414,167 @@ mod tests {
     }
 
     #[test]
-    fn multi_row_insert_is_rejected() {
+    fn multi_row_insert_binds_every_row() {
+        // STL-228: the v0.1 single-row restriction is lifted — two or more rows
+        // bind to `InsertRows`, each folded like its own single-row INSERT.
         let catalog = account_catalog();
         assert_eq!(
-            bind("INSERT INTO account VALUES (1, 100), (2, 200)", &catalog),
-            Err(DmlError::MultiRowInsert { rows: 2 })
+            bind(
+                "INSERT INTO account VALUES (1, 100), (2, 200), (3, 300)",
+                &catalog
+            ),
+            Ok(BoundDml::InsertRows {
+                table: "account".to_owned(),
+                schema_id: SchemaId(1),
+                rows: vec![
+                    InsertRow {
+                        key: ScalarValue::Int4(1),
+                        values: vec![Some(ScalarValue::Int4(100))],
+                        valid: None,
+                    },
+                    InsertRow {
+                        key: ScalarValue::Int4(2),
+                        values: vec![Some(ScalarValue::Int4(200))],
+                        valid: None,
+                    },
+                    InsertRow {
+                        key: ScalarValue::Int4(3),
+                        values: vec![Some(ScalarValue::Int4(300))],
+                        valid: None,
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn single_row_insert_stays_a_point_insert() {
+        // The one-row case is unchanged: it binds the point `Insert`, not
+        // `InsertRows` — the common path is byte-for-byte the pre-STL-228 plan.
+        let catalog = account_catalog();
+        assert!(matches!(
+            bind("INSERT INTO account VALUES (1, 100)", &catalog),
+            Ok(BoundDml::Insert { .. })
+        ));
+    }
+
+    #[test]
+    fn multi_row_insert_reuses_the_column_list_for_every_row() {
+        // STL-228: an explicit column list is validated once and applied to every
+        // row, mapping each value to its column by name (here, reversed).
+        let catalog = account_catalog();
+        assert_eq!(
+            bind(
+                "INSERT INTO account (balance, id) VALUES (100, 1), (200, 2)",
+                &catalog
+            ),
+            Ok(BoundDml::InsertRows {
+                table: "account".to_owned(),
+                schema_id: SchemaId(1),
+                rows: vec![
+                    InsertRow {
+                        key: ScalarValue::Int4(1),
+                        values: vec![Some(ScalarValue::Int4(100))],
+                        valid: None,
+                    },
+                    InsertRow {
+                        key: ScalarValue::Int4(2),
+                        values: vec![Some(ScalarValue::Int4(200))],
+                        valid: None,
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn multi_row_insert_names_the_offending_row() {
+        // STL-228: a per-row failure is wrapped with the 1-based row position, and
+        // its source is exactly the error a single-row INSERT of that row gives.
+        let catalog = account_catalog();
+        // Row 2 has a type-mismatched key.
+        assert_eq!(
+            bind(
+                "INSERT INTO account VALUES (1, 100), ('two', 200)",
+                &catalog
+            ),
+            Err(DmlError::RowError {
+                row: 2,
+                source: Box::new(DmlError::TypeMismatch {
+                    table: "account".to_owned(),
+                    column: "id".to_owned(),
+                    expected: LogicalType::Int4,
+                    found: "a string literal".to_owned(),
+                }),
+            })
+        );
+        // Row 3 has the wrong arity.
+        assert_eq!(
+            bind(
+                "INSERT INTO account VALUES (1, 100), (2, 200), (3)",
+                &catalog
+            ),
+            Err(DmlError::RowError {
+                row: 3,
+                source: Box::new(DmlError::ColumnCountMismatch {
+                    expected: 2,
+                    found: 1,
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn multi_row_insert_with_a_bad_column_list_is_a_statement_error() {
+        // A malformed column list is a statement-level error, reported un-wrapped
+        // (not attributed to any one row).
+        let catalog = account_catalog();
+        assert_eq!(
+            bind(
+                "INSERT INTO account (id, nonesuch) VALUES (1, 2), (3, 4)",
+                &catalog
+            ),
+            Err(DmlError::UnknownColumn {
+                table: "account".to_owned(),
+                column: "nonesuch".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn multi_row_insert_on_a_valid_time_table_lifts_each_rows_interval() {
+        // STL-228 × STL-194: each row derives its own `[from, to)` from its period
+        // columns, kept as Timestamp cells so the row codec stays width-agnostic.
+        let catalog = valid_time_catalog();
+        assert_eq!(
+            bind(
+                "INSERT INTO vt VALUES (1, 100, 10, 20), (2, 200, 30, NULL)",
+                &catalog
+            ),
+            Ok(BoundDml::InsertRows {
+                table: "vt".to_owned(),
+                schema_id: SchemaId(1),
+                rows: vec![
+                    InsertRow {
+                        key: ScalarValue::Int4(1),
+                        values: vec![
+                            Some(ScalarValue::Int4(100)),
+                            Some(ScalarValue::Timestamp(10)),
+                            Some(ScalarValue::Timestamp(20)),
+                        ],
+                        valid: Some(Interval::new(10, 20).expect("interval")),
+                    },
+                    InsertRow {
+                        key: ScalarValue::Int4(2),
+                        values: vec![
+                            Some(ScalarValue::Int4(200)),
+                            Some(ScalarValue::Timestamp(30)),
+                            Some(ScalarValue::Timestamp(VALID_TIME_OPEN.0)),
+                        ],
+                        valid: Some(Interval::new(30, VALID_TIME_OPEN.0).expect("open interval")),
+                    },
+                ],
+            })
         );
     }
 

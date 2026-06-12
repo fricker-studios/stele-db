@@ -347,6 +347,33 @@ join. Bound as `BoundSelect::subquery_filter` (mutually exclusive with the plain
 and period `WHERE` shapes); the engine's `resolve_filter` runs the inner once and
 folds it into the same `FilterPlan` the plain path produces.
 
+## Multi-row INSERT (STL-228)
+
+`INSERT INTO t VALUES (…), (…), …` binds **every** row and applies them as one
+crash-atomic group — all rows commit together or, if any row fails, none do. The
+single-row v0.1 restriction (STL-149) is lifted.
+
+```sql
+INSERT INTO account VALUES (1, 100), (2, 200), (3, 300);  -- INSERT 0 3
+```
+
+- **Per-row binding.** Each row folds exactly like its own single-row `INSERT`
+  (positional, or by an explicit column list reused across every row); an arity,
+  type, or bad-literal failure names the offending row (1-based, in statement
+  order). A malformed *column list* is a statement-level error, not attributed to
+  a row.
+- **One atomic group.** The rows expand into one per-row write applied through the
+  group-commit path (one WAL record, one fsync — the STL-192 discipline): a
+  failure on any row — a duplicate key, or a key repeated within the statement —
+  aborts the whole statement via the STL-216 abort rollback, leaving **zero**
+  rows. Inside a `BEGIN … COMMIT` block the rows buffer like any other write
+  (read-your-own-writes, STL-203) and commit with the transaction.
+- **Command tag.** `INSERT 0 N` counts every inserted row (the leading `0` is the
+  legacy OID field); a single-row `INSERT` is unchanged (`INSERT 0 1`).
+
+`INSERT … SELECT` stays out of scope (a clear bind error, never a wrong write).
+This is the statement-sized stepping stone to v0.3 bulk ingest (`COPY`).
+
 ## DML row selection (STL-229)
 
 `UPDATE` / `DELETE` select the rows they write with the **same `WHERE`
