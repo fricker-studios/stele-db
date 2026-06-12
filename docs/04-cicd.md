@@ -252,7 +252,7 @@ flowchart LR
     verify --> changelog["Generate changelog<br/>(git-cliff from Conventional Commits)"]
     verify --> artifacts["Build release artifacts<br/>(per-target binaries + checksums)"]
     artifacts --> sign["Sign artifacts<br/>(cosign / Sigstore, SLSA provenance)"]
-    artifacts --> docker["Build + push Docker image<br/>(multi-arch, ghcr.io)"]
+    artifacts --> docker["Build + push Docker image<br/>(multi-arch, ghcr.io + Docker Hub)"]
     docker --> signimg["Sign image (cosign)"]
     sign --> ghrel["Create GitHub Release<br/>(attach artifacts + checksums + SBOM)"]
     changelog --> ghrel
@@ -267,7 +267,7 @@ flowchart LR
 | **Artifacts** | `cargo build --release` per target | Static where feasible; SHA-256 checksums. |
 | **Signing** | **cosign / Sigstore** + **SLSA provenance** | Keyless `cosign` signs SHA256SUMS and the image digest; `actions/attest-build-provenance` emits SLSA provenance for both (see below). |
 | **SBOM** | `cargo cyclonedx` + `cyclonedx` (CycloneDX CLI) `merge` | Per-crate BOMs merged into one canonical workspace document `stele-<tag>.cdx.json`, attached to each release. |
-| **Docker** | multi-arch `buildx` → **ghcr.io** | The canonical image ([05](05-dev-environment.md)); signed with cosign. |
+| **Docker** | multi-arch `buildx` → **ghcr.io** + **Docker Hub** | The canonical image ([05](05-dev-environment.md)) plus the `frickerstudios/stele` mirror ([08 §2](08-packaging-distribution-and-releases.md#2-tagged-docker-images)) — one push, identical digests, both cosign-signed; the Hub landing page re-syncs from `docker/README.md`. |
 | **Package registries** | crates.io (libraries), later Homebrew tap + apt/deb | pre-1.0: GitHub Releases + Docker only; registries follow as the API stabilizes. |
 
 Example `release.yml` core:
@@ -311,7 +311,7 @@ jobs:
 Beyond signing, the release attaches **SLSA build provenance** so a third party can verify *what built each artifact* (which workflow, which commit, which runner) — not just that we signed it. Both attestations come from [`actions/attest-build-provenance`](https://github.com/actions/attest-build-provenance), pinned by SHA like every other action ([ADR-0005](adr/0005-reproducible-builds-pinned-toolchain.md)):
 
 - **Binaries** — the `release` job attests `SHA256SUMS` via `subject-checksums`, producing one provenance statement per archive (no re-hashing; it reuses the digests cosign already signed).
-- **Image** — the `docker` job attests the pushed image by digest with `push-to-registry: true`. We deliberately use this over buildx `provenance: true`: buildx folds provenance into the image index, changing the manifest in ways some clients mishandle on multi-arch pulls, whereas attest-build-provenance stores a *separate* OCI artifact under the same digest, leaving `docker pull` untouched.
+- **Image** — the `docker` job attests the pushed image by digest with `push-to-registry: true`, once per registry (ghcr.io and Docker Hub — the digest is the same, but the stored-next-to-the-image copy must exist in each). We deliberately use this over buildx `provenance: true`: buildx folds provenance into the image index, changing the manifest in ways some clients mishandle on multi-arch pulls, whereas attest-build-provenance stores a *separate* OCI artifact under the same digest, leaving `docker pull` untouched.
 
 Both jobs add `attestations: write` to their (otherwise least-privilege) permissions. Verify a release:
 

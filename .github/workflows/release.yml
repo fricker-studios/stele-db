@@ -14,8 +14,8 @@
 # Runners: unlike the per-PR workflows, every job here runs on GitHub-hosted
 # runners (free for this public repo). A release must not depend on the
 # homelab ARC pods being up, needs macOS/Windows cross-targets the ARC pool
-# can't provide, and needs network egress to ghcr.io + Sigstore that the
-# unprivileged ARC pods lack (same reasoning as ci.yml's docker job).
+# can't provide, and needs network egress to ghcr.io/Docker Hub + Sigstore
+# that the unprivileged ARC pods lack (same reasoning as ci.yml's docker job).
 #
 # All `uses:` are pinned to a 40-char commit SHA per ADR-0005 (reproducible
 # builds); the trailing `# vX.Y.Z` is kept in sync when Dependabot bumps them.
@@ -172,9 +172,12 @@ jobs:
           path: ${{ env.ARCHIVE }}
           if-no-files-found: error
 
-  # Multi-arch image → ghcr.io/<owner>/stele, signed by digest with cosign.
+  # Multi-arch image → ghcr.io/<owner>/stele (canonical) + the Docker Hub
+  # mirror docker.io/frickerstudios/stele (docs/08 §2). One buildx push fans
+  # out to both registries, so the image index digest is identical everywhere;
+  # cosign signs that digest in each registry.
   docker:
-    name: docker (ghcr.io)
+    name: docker (ghcr.io + Docker Hub)
     needs: gate
     runs-on: ubuntu-latest
     permissions:
@@ -191,12 +194,28 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Docker Hub login. DOCKERHUB_TOKEN is a personal access token with
+      # read/write/delete scope — `delete` is what the description-sync API at
+      # the bottom of this job requires, not just push.
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
-          images: ghcr.io/${{ github.repository_owner }}/stele
+          # The Docker Hub org is `frickerstudios` (Hub namespaces can't carry
+          # the hyphen), so it's spelled out rather than derived from
+          # github.repository_owner (`fricker-studios`).
+          images: |
+            ghcr.io/${{ github.repository_owner }}/stele
+            docker.io/frickerstudios/stele
+          # Both the v-prefixed and bare minor aliases (v0.2 + 0.2): the bare
+          # form matches the docs/08 tag scheme, the v-form matches the git tag
+          # users see on GitHub Releases.
           tags: |
             type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
       - id: build
@@ -216,13 +235,17 @@ jobs:
         # is the latest v2; keep both cosign steps on it (STL-190).
         with:
           cosign-release: "v2.6.3"
-      - name: Sign the image by digest
+      - name: Sign the images by digest
         env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/stele
           DIGEST: ${{ steps.build.outputs.digest }}
         # Sign the immutable digest, not a tag — this covers every tag that
-        # points at it (v{{version}}, {{major}}.{{minor}}, latest).
-        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+        # points at it (v{{version}}, v{{major}}.{{minor}}, {{major}}.{{minor}},
+        # latest). The digest is the same in both registries (one buildx push),
+        # but cosign stores signatures *next to* the image, so each registry is
+        # signed separately for `cosign verify` to resolve them locally.
+        run: |
+          cosign sign --yes "ghcr.io/${{ github.repository_owner }}/stele@${DIGEST}"
+          cosign sign --yes "docker.io/frickerstudios/stele@${DIGEST}"
       # SLSA build provenance for the image (docs/04-cicd.md → Signing). We
       # attest the digest with actions/attest-build-provenance rather than
       # buildx `provenance: true`: buildx attaches the provenance to the image
@@ -238,6 +261,27 @@ jobs:
           subject-name: ghcr.io/${{ github.repository_owner }}/stele
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+      # Same provenance for the Docker Hub mirror (same digest, second
+      # registry). The fully-qualified `index.docker.io` form is what the
+      # action resolves Docker Hub credentials under for push-to-registry.
+      - name: Attest SLSA build provenance for the Docker Hub image
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: index.docker.io/frickerstudios/stele
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      # Keep the Docker Hub landing page in sync with the repo: docker/README.md
+      # is the page source, re-pushed on every release so it can never drift
+      # from what actually shipped. The short description (≤100 bytes) is the
+      # search-result blurb.
+      - name: Sync the Docker Hub repository description
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: frickerstudios/stele
+          short-description: "Append-only, bitemporal, audit-native analytical database. PostgreSQL wire-compatible."
+          readme-filepath: ./docker/README.md
 
   # Assemble the GitHub Release: checksums (cosign-signed), SBOM, per-target
   # binaries, and the git-cliff notes.

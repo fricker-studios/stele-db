@@ -1,5 +1,12 @@
 # Stele
 
+[![ci](https://github.com/fricker-studios/stele-db/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/fricker-studios/stele-db/actions/workflows/ci.yml)
+[![nightly](https://github.com/fricker-studios/stele-db/actions/workflows/nightly.yml/badge.svg?branch=main)](https://github.com/fricker-studios/stele-db/actions/workflows/nightly.yml)
+[![release](https://img.shields.io/github/v/release/fricker-studios/stele-db?include_prereleases&label=release)](https://github.com/fricker-studios/stele-db/releases)
+[![docker hub](https://img.shields.io/docker/v/frickerstudios/stele/latest?logo=docker&label=docker%20hub)](https://hub.docker.com/r/frickerstudios/stele)
+[![MSRV](https://img.shields.io/badge/MSRV-1.89-orange?logo=rust)](rust-toolchain.toml)
+[![license](https://img.shields.io/badge/license-BSL%201.1-blue)](docs/07-licensing-and-oss.md)
+
 **A from-scratch, append-only, bitemporal, audit-native analytical database engine.**
 
 > A *stele* is an inscribed stone slab that preserves a record permanently — and, in botany, the central column of a plant. Both meanings are the design: **a permanent, append-only record built around a columnar core.**
@@ -18,10 +25,19 @@ SELECT balance FROM account FOR SYSTEM_TIME AS OF (now() - interval '1 second') 
 --   → 100   (time-travel: the value *before* the update — history is never destroyed)
 ```
 
+## Try it
+
+```bash
+docker run --rm -p 5454:5454 frickerstudios/stele:latest --dev   # or ghcr.io/fricker-studios/stele
+psql -h localhost -p 5454 -d stele
+```
+
+Then paste the four statements above — give the engine a beat between the `UPDATE` and the time-travel `SELECT`, so there is a second of history to travel back to. Prebuilt binaries (Linux/macOS/Windows) are on the [releases page](https://github.com/fricker-studios/stele-db/releases), every artifact cosign-signed with SLSA provenance; to build from source, `just build` ([05 — Dev Environment](docs/05-dev-environment.md)).
+
 ## Status
 
-> ⚠️ **Pre-1.0 · planning & design · no code yet · holds no production data.**
-> Stele is a deliberately long-horizon, no-deadline craft project. Correctness and auditability come before speed, and before any real data — see the [trust gate](docs/06-testing-strategy.md#9-what-tested-enough-to-hold-real-data-means-the-trust-gate-operationalized). This repository currently contains the **founding design documentation**.
+> ⚠️ **Pre-1.0 · working engine · API stabilizing · holds no production data.**
+> Stele is a deliberately long-horizon, no-deadline craft project. Correctness and auditability come before speed, and before any real data — see the [trust gate](docs/06-testing-strategy.md#9-what-tested-enough-to-hold-real-data-means-the-trust-gate-operationalized). v0.1.0 and v0.2.0 have shipped: `stele-server` speaking the PostgreSQL wire protocol, the `stele` CLI/REPL, bitemporal `AS OF` on both time axes, multi-statement transactions with snapshot isolation, joins and aggregates, and signed multi-arch Docker images — see the [CHANGELOG](CHANGELOG.md) and [releases](https://github.com/fricker-studios/stele-db/releases).
 
 ## At a glance
 
