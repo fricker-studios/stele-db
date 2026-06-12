@@ -144,6 +144,19 @@ jobs:
         run: ci/identity-demo-smoke.sh localhost 5454
       - name: Run the valid-time demo and assert FOR VALID_TIME AS OF resolves
         run: ci/valid-time-demo-smoke.sh localhost 5454
+      # The v0.2 driver exit gate (STL-184): real Postgres drivers run a
+      # parameterized prepared query against the same running container. The
+      # venv dodges the runner image's externally-managed system Python
+      # (PEP 668); java + python3 are both preinstalled on ubuntu-latest. The
+      # driver versions are pinned — psycopg here, pgjdbc (jar + SHA-256) in
+      # ci/jdbc-smoke.sh — and documented in docs/04-cicd.md.
+      - name: Driver gate — psycopg runs a parameterized prepared query
+        run: |
+          python3 -m venv /tmp/psycopg-venv
+          /tmp/psycopg-venv/bin/pip install --quiet "psycopg[binary]==3.3.4"
+          /tmp/psycopg-venv/bin/python ci/psycopg-smoke.py localhost 5454
+      - name: Driver gate — JDBC (pgjdbc) runs a parameterized prepared query
+        run: ci/jdbc-smoke.sh localhost 5454
       - name: Engine logs
         if: always()
         run: docker logs stele || true

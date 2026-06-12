@@ -25,12 +25,18 @@
 //!
 //! | declared OID            | substituted literal              |
 //! |-------------------------|----------------------------------|
-//! | `int4` / `int8`         | [`Value::Number`]                |
+//! | `int2` / `int4` / `int8` | [`Value::Number`]               |
 //! | `text`                  | [`Value::SingleQuotedString`]    |
 //! | `bool`                  | [`Value::Boolean`]               |
 //! | `timestamptz`           | string (binder parses the zone offset to UTC) |
 //! | `timestamp` / `date`    | string (binder rejects — no DML codec yet) |
 //! | unspecified (`0`) / other | inferred: integer → number, else string |
+//!
+//! `int2` (smallint) has no Stele column type — the narrowest integer is
+//! `INT4` — but it is accepted as a *parameter* type because real drivers
+//! declare it: psycopg 3 dumps a small Python `int` as binary `int2`
+//! ([STL-184]). The value widens losslessly to a numeric literal and the
+//! binder folds it against the actual column type.
 //!
 //! A wrong inference for an unspecified-type parameter can only produce a clean
 //! binder *type error*, never a wrong write, because the binder re-validates the
@@ -47,6 +53,10 @@ use stele_sql::sqlparser::ast::{
 };
 
 use crate::{binary_format, text_format};
+
+/// Postgres `int2` (smallint) — accepted as a *parameter* type only; Stele has
+/// no int2 column type, so it is not in [`LogicalType`] (see the module docs).
+const OID_INT2: u32 = 21;
 
 // ---------------------------------------------------------------------------
 // Decoded message bodies
@@ -238,6 +248,12 @@ pub(crate) enum ParamError {
     #[error("invalid input syntax for type boolean: {0:?}")]
     BadBool(String),
 
+    /// A binary `int2` parameter's payload was not exactly two bytes. `int2` is
+    /// param-only (no [`LogicalType`] variant), so its length check cannot ride
+    /// [`binary_format::BinaryError::WrongLength`].
+    #[error("binary int2 parameter has wrong length: expected 2 bytes, got {actual}")]
+    BadInt2 { actual: usize },
+
     /// A binary-format parameter could not be matched to a Stele type from its
     /// declared OID — either the untyped sentinel `0` (no text form to fall back
     /// on) or an OID outside the supported set. Binary decode needs a known type.
@@ -254,7 +270,10 @@ impl ParamError {
     /// reports `invalid_binary_representation` (`22P03`) for these and
     /// `invalid_text_representation` (`22P02`) for the rest.
     pub(crate) const fn is_binary(&self) -> bool {
-        matches!(self, Self::BinaryUntyped { .. } | Self::Binary(_))
+        matches!(
+            self,
+            Self::BinaryUntyped { .. } | Self::Binary(_) | Self::BadInt2 { .. }
+        )
     }
 }
 
@@ -279,8 +298,17 @@ pub(crate) fn param_to_value(
     // params are decoded to a value and rendered to their canonical text.
     let owned;
     let text: &str = if binary {
-        let ty = LogicalType::from_pg_oid(oid).ok_or(ParamError::BinaryUntyped { oid })?;
-        owned = text_format::encode_text(&binary_format::decode_binary(ty, bytes)?);
+        owned = if oid == OID_INT2 {
+            // Param-only int2 (see the module docs): decode the two-byte
+            // big-endian smallint here, widening to its text form.
+            let arr: [u8; 2] = bytes.try_into().map_err(|_| ParamError::BadInt2 {
+                actual: bytes.len(),
+            })?;
+            i16::from_be_bytes(arr).to_string()
+        } else {
+            let ty = LogicalType::from_pg_oid(oid).ok_or(ParamError::BinaryUntyped { oid })?;
+            text_format::encode_text(&binary_format::decode_binary(ty, bytes)?)
+        };
         &owned
     } else {
         std::str::from_utf8(bytes).map_err(|_| ParamError::NotUtf8)?
@@ -311,11 +339,12 @@ pub(crate) fn param_to_value(
             | LogicalType::Date
             | LogicalType::Period,
         ) => Value::SingleQuotedString(text.to_owned()),
-        // Unspecified (OID 0) or a type outside the set: infer from the text. An
-        // integer-looking value folds to a numeric literal so `WHERE id = $1`
-        // works without a declared type; everything else is a string. The binder
-        // re-checks against the column type, so a wrong guess is a clean type
-        // error, never a wrong write.
+        // Unspecified (OID 0) or a type outside the set — including the
+        // param-only `int2`, whose canonical text is always integer-looking:
+        // infer from the text. An integer-looking value folds to a numeric
+        // literal so `WHERE id = $1` works without a declared type; everything
+        // else is a string. The binder re-checks against the column type, so a
+        // wrong guess is a clean type error, never a wrong write.
         None => {
             if text.parse::<i64>().is_ok() {
                 Value::Number(text.to_owned(), false)
@@ -756,6 +785,31 @@ mod tests {
         );
         // NULL is still the bytes-absent sentinel, regardless of format.
         assert_eq!(param_to_value(23, true, None), Ok(Value::Null));
+    }
+
+    #[test]
+    fn int2_parameter_widens_to_a_numeric_literal() {
+        // psycopg 3 dumps a small Python int as binary int2 (STL-184); the value
+        // widens to the same numeric literal an int4 of that value produces.
+        assert_eq!(
+            param_to_value(OID_INT2, true, Some(&7i16.to_be_bytes())),
+            Ok(Value::Number("7".to_owned(), false))
+        );
+        assert_eq!(
+            param_to_value(OID_INT2, true, Some(&(-300i16).to_be_bytes())),
+            Ok(Value::Number("-300".to_owned(), false))
+        );
+        // The text form (e.g. pgjdbc setShort) infers to a number the same way.
+        assert_eq!(
+            param_to_value(OID_INT2, false, Some(b"7")),
+            Ok(Value::Number("7".to_owned(), false))
+        );
+        // NULL stays the bytes-absent sentinel.
+        assert_eq!(param_to_value(OID_INT2, true, None), Ok(Value::Null));
+        // A wrong-length binary int2 is a clean binary-classified error.
+        let err = param_to_value(OID_INT2, true, Some(&[0, 0, 1])).unwrap_err();
+        assert_eq!(err, ParamError::BadInt2 { actual: 3 });
+        assert!(err.is_binary());
     }
 
     #[test]

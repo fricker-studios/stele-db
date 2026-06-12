@@ -67,6 +67,29 @@ These **must** be green to merge into `main`:
 
 ---
 
+## Driver gate (v0.2 exit criterion)
+
+The `five-minute-path` job in `ci.yml` also runs the **driver gate** (STL-184):
+real Postgres drivers connect to the freshly built Docker image and run a
+**parameterized prepared query** end-to-end, proving the second half of the
+[v0.2 exit criterion](03-roadmap.md) ("a JDBC/psycopg driver can run a
+parameterized query"). Each driver creates a table, inserts through
+placeholders, then executes a prepared `SELECT … WHERE id = ?` and asserts the
+returned value.
+
+| Driver | Version | Pin location | Notes |
+|---|---|---|---|
+| **psycopg** (Python 3) | `psycopg[binary] 3.3.4` | `ci.yml` (pip install) | `prepare=True` forces a named server-side prepared statement; small ints ride as binary `int2` params. Script: `ci/psycopg-smoke.py`. |
+| **pgjdbc** (JDBC) | `org.postgresql:postgresql 42.7.7` | `ci/jdbc-smoke.sh` (jar + SHA-256) | The SELECT re-executes past `prepareThreshold` (5), exercising the named-statement promotion + binary result transfer. Script: `ci/JdbcSmoke.java`. |
+
+This is deliberately **two drivers, one query shape** — the full driver/ORM
+compatibility *matrix* is a v0.5 deliverable
+([09 — ecosystem](09-ecosystem-and-products.md)). Both scripts also run against
+a local dev server: `ci/psycopg-smoke.py localhost 5454` /
+`ci/jdbc-smoke.sh localhost 5454`.
+
+---
+
 ## Cross-platform matrix
 
 | Tier | Targets | When |
