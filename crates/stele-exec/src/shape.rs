@@ -6,9 +6,13 @@
 //! executor currency: a **selection vector** of row indices into the
 //! materialized output columns (the same row-selection idea the
 //! [`Batch::selection`](crate::Batch) carries, [STL-214]). Each operation
-//! permutes, prunes, or slices the *indices* — never the cell values — so
-//! shaping costs no per-row value copies; the caller gathers its final rows
-//! through the surviving indices once, at output time.
+//! permutes, prunes, or slices the *indices*; the caller gathers its final rows
+//! through the surviving indices once, at output time. [`sort_selection`] and
+//! [`limit_selection`] touch no cell values at all (compare-in-place / slice).
+//! [`distinct_selection`] is the one that reads values — it encodes each
+//! projected cell into a key tuple to bucket duplicates (cloning `TEXT`/`BYTEA`
+//! cells exactly as the [`hash_aggregate`](crate::hash_aggregate) it mirrors
+//! does, since `DISTINCT` ≡ `GROUP BY` all projected columns).
 //!
 //! The caller applies them in the Postgres pipeline order:
 //!
@@ -31,7 +35,9 @@
 //!   given input always shapes to one deterministic output (the simulation's
 //!   reproducibility bar; Postgres itself leaves tie order unspecified).
 //!   Comparison covers every [`Vector`] type: integers/booleans/temporals by
-//!   value, `TEXT` by code point, `UUID`/`BYTEA` byte-wise (as Postgres
+//!   value, `TEXT` lexicographically over its UTF-8 bytes (Rust `str` `Ord` —
+//!   equivalently code-point order; Stele applies no collation, matching
+//!   Postgres under the `C` locale), `UUID`/`BYTEA` byte-wise (as Postgres
 //!   orders them), `PERIOD` lexicographically by `(from, to)`, and `FLOAT8`
 //!   (an `AVG` output) by IEEE-754 total order — identical to Postgres over
 //!   everything an integer `AVG` can produce (no NaNs).

@@ -2424,7 +2424,9 @@ fn bind_projection(select: &Select) -> Result<Projection, SelectError> {
 /// [STL-264]: https://allegromusic.atlassian.net/browse/STL-264
 fn reject_shaping_over_join(query: &Query, select: &Select) -> Result<(), SelectError> {
     let reject = |what: &str| Err(SelectError::UnsupportedJoin(format!("{what} over a JOIN")));
-    if select.distinct.is_some() {
+    // `Distinct::All` is the explicit `SELECT ALL` default — not a shaping
+    // clause — so only an actual `DISTINCT` / `DISTINCT ON` is rejected here.
+    if matches!(select.distinct, Some(Distinct::Distinct | Distinct::On(_))) {
         return reject("DISTINCT");
     }
     if query.order_by.is_some() {
@@ -3278,6 +3280,16 @@ mod tests {
                 "expected UnsupportedJoin for: {sql}"
             );
         }
+        // `SELECT ALL` is the explicit default (not DISTINCT), so a join with it
+        // binds — it must not be mistaken for a shaping clause over the join.
+        assert!(
+            bind(
+                "SELECT ALL name FROM users JOIN orders ON users.id = orders.uid",
+                &catalog,
+            )
+            .is_ok(),
+            "explicit ALL is not a shaping clause and must bind over a JOIN"
+        );
     }
 
     #[test]
