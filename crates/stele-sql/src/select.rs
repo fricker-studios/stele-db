@@ -1686,6 +1686,20 @@ fn bind_filter(
     let Some(expr) = select.selection.as_ref() else {
         return Ok(None);
     };
+    bind_where_predicate(expr, schema, table).map(Some)
+}
+
+/// Bind one `WHERE` expression to a [`BoundPredicate`] against `table`'s schema —
+/// the shared predicate vocabulary of a `SELECT`'s filter ([STL-213]) and a
+/// scan-then-write `UPDATE` / `DELETE`'s row selection ([STL-229]), so the two
+/// statement families accept exactly the same `WHERE` shapes.
+///
+/// [STL-229]: https://allegromusic.atlassian.net/browse/STL-229
+pub(crate) fn bind_where_predicate(
+    expr: &Expr,
+    schema: &TableSchema,
+    table: &str,
+) -> Result<BoundPredicate, SelectError> {
     // Peel parentheses around the whole predicate so `WHERE (id = 1)` binds like
     // `WHERE id = 1`. The top level must be a comparison; its operands are bound as
     // scalars below.
@@ -1702,11 +1716,11 @@ fn bind_filter(
     // Exactly one column may appear across the whole predicate; it anchors the type
     // every literal folds to (and the type any arithmetic computes in).
     let anchor = filter_anchor(left, right, schema, table)?;
-    Ok(Some(BoundPredicate {
+    Ok(BoundPredicate {
         left: bind_scalar(left, &anchor, schema, table)?,
         op: compare,
         right: bind_scalar(right, &anchor, schema, table)?,
-    }))
+    })
 }
 
 /// The single column a `WHERE` predicate filters on, resolved to its schema index

@@ -13,17 +13,31 @@
 //! ~hundred lines here double as a second, independent reading of the wire
 //! format the `stele-pgwire` server emits.
 //!
+//! **TLS** ([STL-251]) rides the same `rustls` the server stack already pins
+//! (no new supply-chain surface) through its *blocking* [`rustls::StreamOwned`]
+//! adapter, behind a libpq-style [`SslMode`]: send `SSLRequest`, handshake on
+//! `S`, fall back (or refuse to) on `N`. As in libpq, `require` and below
+//! encrypt **without verifying the server's identity**; only `verify-full`
+//! checks the certificate against a CA (`--tls-ca`) and the host name.
+//!
 //! Errors split deliberately: a *SQL* failure (`ErrorResponse`) is data — it
 //! comes back as [`Reply::Error`] and the connection stays usable — while a
 //! *transport* failure (socket death, malformed frame) is `Err` and the caller
 //! should drop the connection.
 //!
 //! [STL-185]: https://allegromusic.atlassian.net/browse/STL-185
+//! [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
 
-use std::io::{BufReader, Read as _, Write as _};
+use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context as _, bail};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls_pki_types::pem::PemObject as _;
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 
 use crate::render::Column;
 
@@ -41,6 +55,9 @@ const MSG_TERMINATE: u8 = b'X';
 
 /// pg-wire protocol version 3.0, as the `StartupMessage` carries it.
 const PROTOCOL_VERSION: i32 = 196_608;
+
+/// The `SSLRequest` startup-shape code (length 8, no message-type byte).
+const SSL_REQUEST_CODE: i32 = 80_877_103;
 
 /// Upper bound on a single backend message body. The server's replies are
 /// row-at-a-time and small; anything larger means a desynchronized stream.
@@ -86,29 +103,71 @@ pub enum Reply {
     Empty,
 }
 
+/// How (whether) the connection is encrypted — libpq's `sslmode`, as
+/// `stele shell --tls` spells it ([STL-251]).
+///
+/// [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SslMode {
+    /// Plaintext; no `SSLRequest` is sent.
+    Disable,
+    /// Try TLS, fall back to plaintext if the server refuses (libpq's default).
+    #[default]
+    Prefer,
+    /// TLS or fail. Like libpq's `require`, the server's identity is **not**
+    /// verified — this protects against eavesdropping, not impersonation.
+    Require,
+    /// TLS, and verify the server certificate against `--tls-ca` plus the
+    /// host name.
+    VerifyFull,
+}
+
+/// TLS connect options: the mode plus the `verify-full` trust anchor.
+#[derive(Debug, Clone, Default)]
+pub struct TlsOpts {
+    pub mode: SslMode,
+    /// PEM CA bundle for [`SslMode::VerifyFull`].
+    pub ca: Option<PathBuf>,
+}
+
+/// The blocking duplex transport a [`Client`] runs over — plain TCP or the
+/// rustls-wrapped stream. Blanket-implemented; reads are buffered by the
+/// `BufReader` around it, writes pass straight through (`BufReader` does not
+/// buffer writes).
+trait Transport: Read + Write + Send {}
+impl<T: Read + Write + Send> Transport for T {}
+
 /// A live connection running the simple-query protocol.
 pub struct Client {
-    reader: BufReader<TcpStream>,
-    writer: TcpStream,
+    stream: BufReader<Box<dyn Transport>>,
     /// Transaction status byte from the last `ReadyForQuery`:
     /// `I` idle, `T` in a transaction, `E` in a failed transaction.
     txn_status: u8,
 }
 
 impl Client {
-    /// Connect and complete the startup handshake.
+    /// Connect — negotiating TLS per `tls` — and complete the startup handshake.
     ///
     /// # Errors
-    /// Fails if the TCP connect fails, the server demands authentication
-    /// (trust-only for now), or startup itself returns an `ErrorResponse`.
-    pub fn connect(host: &str, port: u16, user: &str, database: &str) -> anyhow::Result<Self> {
+    /// Fails if the TCP connect or TLS negotiation fails, the server demands
+    /// authentication (trust-only for now), or startup itself returns an
+    /// `ErrorResponse`.
+    pub fn connect(
+        host: &str,
+        port: u16,
+        user: &str,
+        database: &str,
+        tls: &TlsOpts,
+    ) -> anyhow::Result<Self> {
         let stream = TcpStream::connect((host, port))
             .with_context(|| format!("connecting to {host}:{port}"))?;
         stream.set_nodelay(true).ok();
-        let reader = BufReader::new(stream.try_clone().context("cloning socket handle")?);
+        let transport = match tls.mode {
+            SslMode::Disable => Box::new(stream) as Box<dyn Transport>,
+            mode => negotiate_tls(stream, host, mode, tls.ca.as_deref())?,
+        };
         let mut client = Self {
-            reader,
-            writer: stream,
+            stream: BufReader::new(transport),
             txn_status: b'I',
         };
 
@@ -197,6 +256,10 @@ impl Client {
 
     /// Write one frontend message. `kind == 0` means the untyped startup shape
     /// (length + payload, no message-type byte).
+    ///
+    /// Writes go through the `BufReader`'s inner transport directly — the
+    /// protocol is strictly request-response, so there is never buffered
+    /// *read* data in flight when we write.
     fn send(&mut self, kind: u8, body: &[u8]) -> anyhow::Result<()> {
         let len = i32::try_from(body.len() + 4).context("message too large")?;
         let mut frame = Vec::with_capacity(body.len() + 5);
@@ -205,13 +268,16 @@ impl Client {
         }
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(body);
-        self.writer.write_all(&frame).context("writing to server")
+        self.stream
+            .get_mut()
+            .write_all(&frame)
+            .context("writing to server")
     }
 
     /// Read one backend message: type byte + length-prefixed payload.
     fn read_message(&mut self) -> anyhow::Result<(u8, Vec<u8>)> {
         let mut head = [0_u8; 5];
-        self.reader
+        self.stream
             .read_exact(&mut head)
             .context("reading from server (connection closed?)")?;
         let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]);
@@ -223,10 +289,133 @@ impl Client {
             bail!("backend message of {body_len} bytes exceeds the sanity limit");
         }
         let mut payload = vec![0_u8; body_len];
-        self.reader
+        self.stream
             .read_exact(&mut payload)
             .context("reading message payload")?;
         Ok((head[0], payload))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TLS negotiation (STL-251)
+// ---------------------------------------------------------------------------
+
+/// Send the `SSLRequest`, and on `S` run the rustls handshake over the socket.
+///
+/// `mode` is never [`SslMode::Disable`] here (the caller short-circuits it).
+fn negotiate_tls(
+    mut stream: TcpStream,
+    host: &str,
+    mode: SslMode,
+    ca: Option<&Path>,
+) -> anyhow::Result<Box<dyn Transport>> {
+    let mut request = [0_u8; 8];
+    request[..4].copy_from_slice(&8_i32.to_be_bytes());
+    request[4..].copy_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
+    stream.write_all(&request).context("sending SSLRequest")?;
+
+    let mut answer = [0_u8; 1];
+    stream
+        .read_exact(&mut answer)
+        .context("reading SSLRequest answer")?;
+    match answer[0] {
+        b'S' => {
+            let config = tls_config(mode, ca)?;
+            let name = ServerName::try_from(host.to_owned())
+                .with_context(|| format!("{host:?} is not a valid TLS server name"))?;
+            let conn = rustls::ClientConnection::new(Arc::new(config), name)
+                .context("initializing TLS")?;
+            // The handshake itself runs lazily on the first read/write; a
+            // failure (e.g. an untrusted certificate under verify-full)
+            // surfaces as the startup round-trip's transport error.
+            Ok(Box::new(rustls::StreamOwned::new(conn, stream)))
+        }
+        b'N' if mode == SslMode::Prefer => Ok(Box::new(stream)),
+        b'N' => bail!(
+            "server refused TLS but --tls {} requires it (configure [tls] on the server, \
+             or connect with --tls prefer/disable)",
+            if mode == SslMode::Require {
+                "require"
+            } else {
+                "verify-full"
+            },
+        ),
+        other => bail!("unexpected SSLRequest answer byte {other:#04x}"),
+    }
+}
+
+/// The rustls client config for `mode`.
+fn tls_config(mode: SslMode, ca: Option<&Path>) -> anyhow::Result<rustls::ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+        .context("selecting TLS protocol versions")?;
+    let config = match mode {
+        SslMode::Disable => unreachable!("disable never negotiates"),
+        // Encrypt-only, exactly libpq's `require`/`prefer`: any certificate is
+        // accepted, so this defeats passive eavesdropping but NOT an active
+        // man-in-the-middle. `verify-full` is the authenticated mode.
+        SslMode::Prefer | SslMode::Require => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(
+                provider.signature_verification_algorithms,
+            )))
+            .with_no_client_auth(),
+        SslMode::VerifyFull => {
+            let ca = ca.context("--tls verify-full requires --tls-ca <ca.pem>")?;
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in CertificateDer::pem_file_iter(ca)
+                .with_context(|| format!("reading CA bundle {}", ca.display()))?
+            {
+                roots
+                    .add(cert.context("parsing CA certificate")?)
+                    .context("adding CA certificate to the trust store")?;
+            }
+            builder.with_root_certificates(roots).with_no_client_auth()
+        }
+    };
+    Ok(config)
+}
+
+/// The `require`-mode verifier: accepts any server certificate (no chain or
+/// host-name check) while still verifying the handshake *signatures*, so the
+/// peer must at least hold the key for the certificate it presented. This is
+/// the standard rustls "danger" pattern and matches libpq `sslmode=require`.
+#[derive(Debug)]
+struct AcceptAnyServerCert(rustls::crypto::WebPkiSupportedAlgorithms);
+
+impl ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_schemes()
     }
 }
 

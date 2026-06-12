@@ -19,15 +19,40 @@
 # pg-wire listen address. (active) Default: "0.0.0.0:5454" — Stele's default
 # Postgres-wire port (ADR-0017). A bare `--listen` flag is ignored when a config
 # file is given; this key wins.
-listen = "0.0.0.0:5454"
+#
+# Secure defaults (STL-251, docs/10 §4): a non-dev server WITHOUT a [tls]
+# section may only bind loopback — it refuses to start on a non-loopback
+# address rather than silently serve plaintext beyond the local machine. To
+# listen on "0.0.0.0:5454", configure the [tls] section below. (In a container
+# the listener must be reachable through the port mapping: use "0.0.0.0:5454"
+# plus [tls], or run the container with `--dev` instead of a config file.)
+listen = "127.0.0.1:5454"
 
 # Directory the `local` backend roots its data at (created if absent). (active)
 # Ignored by the `memory` backend. Default: "/var/lib/stele".
 data_dir = "/var/lib/stele"
 
+# [tls]                          # TLS on pg-wire (active; STL-251)
+# Wire encryption via the standard Postgres SSLRequest negotiation: psql,
+# psycopg, pgjdbc, and `stele shell --tls` all speak it natively
+# (`sslmode=require` / `verify-full`). Uncomment and point at PEM files:
+#
+# mode      = "required"         # "required" (default once [tls] is present):
+#                                #   plaintext startups are refused (FATAL 28000)
+#                                # "optional": TLS offered, plaintext accepted —
+#                                #   the migration posture (warns at boot)
+#                                # "disabled": section kept, TLS off
+# cert      = "/etc/stele/server.crt"   # PEM certificate chain, leaf first
+# key       = "/etc/stele/server.key"   # PEM private key (PKCS#8/PKCS#1/SEC1)
+# client_ca = "/etc/stele/clients.crt"  # optional: require mTLS — every client
+#                                       # must present a cert chaining to this CA
+
 [storage]
 # Which storage backend the engine boots on. (active) One of:
-#   "local"  — durable, rooted at [server] data_dir (the default)
+#   "local"  — durable, rooted at [server] data_dir (the default). What lands
+#              in that directory and the durability discipline behind it
+#              (file + directory fsync, torn-tail tolerance) are documented in
+#              docs/02-architecture.md §3.7.
 #   "memory" — ephemeral, in-process; nothing survives a restart (tests/throwaway)
 # An object-store backend (e.g. "s3") is planned but not yet a valid value —
 # setting it is a clear config error today.
@@ -61,7 +86,7 @@ metrics = "0.0.0.0:9090"
 #                                # logging is env-var-driven — see below)
 
 # ───────────────────────────────────────────────────────────────────────────
-# Logging — environment variables, NOT this file (until [telemetry] is wired):
+# Logging — environment variables, NOT this file (until [telemetry] tracing is wired):
 #   RUST_LOG=info             verbosity (tracing EnvFilter; e.g. RUST_LOG=debug)
 #   STELE_LOG_FORMAT=json     structured JSON output (default is human text)
 # e.g.  STELE_LOG_FORMAT=json RUST_LOG=info stele-server --config stele.toml

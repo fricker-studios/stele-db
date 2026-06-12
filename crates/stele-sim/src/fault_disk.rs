@@ -487,6 +487,14 @@ impl<D: Disk> Disk for FaultDisk<D> {
     fn remove(&self, name: &str) -> io::Result<()> {
         self.inner.remove(name)
     }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        // The fault classes model *file* I/O decay; the namespace fence
+        // passes straight through to the inner backend (whose own hooks —
+        // e.g. [`Faults`](stele_storage::backend::Faults) on `MemDisk` — can
+        // still fail it deterministically).
+        self.inner.sync_dir()
+    }
 }
 
 /// What an `append` should do, decided under the state lock and then carried

@@ -2401,6 +2401,7 @@ const fn fault_op_tag(op: stele_storage::backend::FaultOp) -> u8 {
         FaultOp::Sync => 4,
         FaultOp::List => 5,
         FaultOp::Remove => 6,
+        FaultOp::SyncDir => 7,
     }
 }
 

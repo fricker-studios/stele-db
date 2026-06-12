@@ -254,6 +254,12 @@ impl<D: Disk + Clone> Disk for NamespacedDisk<D> {
     fn remove(&self, name: &str) -> io::Result<()> {
         self.inner.remove(&self.scoped(name))
     }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        // Every namespace view shares the one physical directory — fencing the
+        // view fences it.
+        self.inner.sync_dir()
+    }
 }
 
 /// What [`SessionEngine::execute`] did with one statement.
@@ -680,6 +686,17 @@ pub enum EngineError {
     /// [STL-223]: https://allegromusic.atlassian.net/browse/STL-223
     #[error("valid-time period information for an overlaid AS OF read could not be resolved")]
     MalformedValidBound,
+
+    /// A business key scanned while expanding a scan-then-write `UPDATE` /
+    /// `DELETE` ([STL-229]) was missing or could not be decoded back to the key
+    /// column's type. The scan only returns live rows, whose key is never `NULL`
+    /// and always carries the canonical encoding the binder folds literals to, so
+    /// this signals corruption or a schema disagreement — the statement fails
+    /// closed rather than writing to a wrong key.
+    ///
+    /// [STL-229]: https://allegromusic.atlassian.net/browse/STL-229
+    #[error("a scanned business key could not be decoded while expanding a predicate DML")]
+    MalformedBusinessKey,
 }
 
 /// One table's live state inside a session.
@@ -1439,7 +1456,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 Err(e) => return Err(EngineError::Dml(e)),
             }
         };
-        self.apply_dml(bound)
+        // A predicate-driven (or whole-table) UPDATE / DELETE takes the
+        // scan-then-write plan ([STL-229]): enumerate the matching live keys at
+        // the read snapshot, then apply the per-key writes as one atomic group.
+        // (`overlay` is empty here — an in-transaction DML is intercepted by
+        // `stage_dml` and never reaches this router — but threading it keeps the
+        // expansion correct for any caller.)
+        match bound {
+            dml @ (BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. }) => {
+                self.apply_scan_dml(dml, read_snapshot, overlay)
+            }
+            dml => self.apply_dml(dml),
+        }
     }
 
     /// Apply a bound DDL statement, taking effect at the commit clock's next
@@ -2124,6 +2152,197 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         Ok(StatementOutcome::Dml(summary))
     }
 
+    /// Apply an auto-committed **scan-then-write** `UPDATE` / `DELETE`
+    /// ([STL-229]): expand the predicate into one per-key write per matching live
+    /// row at `read_snapshot` ([`expand_scan_dml`](Self::expand_scan_dml)), then
+    /// apply the whole set as a single **atomic group** — the same
+    /// [`apply_group`](Self::apply_group) → [`finish_group_commit`](Self::finish_group_commit)
+    /// machinery a multi-statement `COMMIT` uses ([STL-192]). All writes target
+    /// one table, so the commit is the single-record fast path: one WAL record,
+    /// one fsync. A failure applying any write of the set discards the group
+    /// ([`abort_group`](stele_storage::engine::Engine::abort_group)) — nothing is
+    /// made durable and the in-memory tiers are rolled back ([STL-216]), so the
+    /// statement leaves the table unchanged.
+    ///
+    /// The reported tag counts the **matched live rows at the snapshot** — `0`
+    /// when nothing matched, in which case no group is opened and no WAL record
+    /// is written.
+    ///
+    /// [STL-229]: https://allegromusic.atlassian.net/browse/STL-229
+    fn apply_scan_dml(
+        &mut self,
+        dml: BoundDml,
+        read_snapshot: SystemTimeMicros,
+        overlay: &[BoundDml],
+    ) -> Result<StatementOutcome, EngineError> {
+        let (writes, summary) = self.expand_scan_dml(dml, read_snapshot, overlay)?;
+        if !writes.is_empty() {
+            let txn_id = TxnId(self.next_txn);
+            self.next_txn += 1;
+            let principal = Principal::new(WIRE_PRINCIPAL.to_vec());
+            let mut touched: Vec<String> = Vec::new();
+            let result = match self.apply_group(writes, txn_id, &principal, &mut touched) {
+                Ok(()) => self.finish_group_commit(txn_id, &touched),
+                Err(e) => {
+                    // Mid-set failure: discard the group so nothing is made
+                    // durable and the already-applied prefix is undone in memory
+                    // — the statement is all-or-none ([STL-216]).
+                    for table in &touched {
+                        if let Ok(state) = self.table_mut(table) {
+                            state.engine.abort_group();
+                        }
+                    }
+                    Err(e)
+                }
+            };
+            // The same steady-state prune point as a single auto-committed write
+            // ([`apply_dml`](Self::apply_dml), [STL-204]).
+            self.prune_write_index();
+            result?;
+        }
+        Ok(StatementOutcome::Dml(summary))
+    }
+
+    /// Expand a scan-then-write `UPDATE` / `DELETE` ([STL-229]) into the per-key
+    /// point writes it stands for, reporting the affected-row summary alongside.
+    ///
+    /// Runs the statement's `WHERE` as a key-projecting snapshot read through the
+    /// **same** [`run_select`](Self::run_select) path a `SELECT` takes — so the
+    /// predicate selects exactly the rows the equivalent `SELECT` returns: the
+    /// fused scan+filter on committed-only state, the buffered-write overlay
+    /// inside a transaction (read-your-own-writes, [STL-203]), and the
+    /// valid-time payload framing ([STL-218]) all behave identically. Each
+    /// matched row's business key is decoded back to its typed value and becomes
+    /// one [`BoundDml::Update`] / [`BoundDml::Delete`]; an `UPDATE`'s matched keys
+    /// all carry the same `SET` assignments (and, on a valid-time table, the same
+    /// new `[from, to)` period — the same posture as the point write, [STL-194]).
+    ///
+    /// The keys are sorted by their canonical encoding, so the expansion — and
+    /// with it the group's WAL record — is deterministic regardless of scan
+    /// order. A system-time snapshot resolves at most one live version per key,
+    /// so the matched keys are distinct; the summary counts them.
+    ///
+    /// [STL-229]: https://allegromusic.atlassian.net/browse/STL-229
+    fn expand_scan_dml(
+        &self,
+        dml: BoundDml,
+        snapshot: SystemTimeMicros,
+        overlay: &[BoundDml],
+    ) -> Result<(Vec<BoundDml>, DmlSummary), EngineError> {
+        let (table, schema_id, filter) = match &dml {
+            BoundDml::UpdateScan {
+                table,
+                schema_id,
+                filter,
+                ..
+            }
+            | BoundDml::DeleteScan {
+                table,
+                schema_id,
+                filter,
+            } => (table.clone(), *schema_id, filter.clone()),
+            // The router and `stage_dml` only pass the scan variants here.
+            _ => {
+                return Err(EngineError::Unsupported(
+                    "only a scan-then-write UPDATE/DELETE expands",
+                ));
+            }
+        };
+
+        // `bind_dml` already proved the table resolves at this snapshot with at
+        // least the key column, so a miss is an internal contract break — surface
+        // it rather than panic (the same posture as `run_select`).
+        let schema = self
+            .catalog
+            .resolve(&table, snapshot)
+            .ok_or_else(|| EngineError::UnknownTable(table.clone()))?;
+        let key_col = schema
+            .columns()
+            .first()
+            .ok_or_else(|| EngineError::UnknownTable(table.clone()))?;
+        let key_ty = key_col.ty();
+
+        // The statement's WHERE, run exactly as a `SELECT <key> FROM t WHERE …`
+        // at the statement snapshot. The filter is evaluated over the full
+        // reconstructed rows before this key-only projection applies, so a
+        // value-column predicate works unchanged.
+        let scan = BoundSelect {
+            table: table.clone(),
+            schema_id,
+            snapshot,
+            valid_snapshot: None,
+            projection: Projection::Columns(vec![key_col.name().to_owned()]),
+            filter,
+            period_filter: None,
+            aggregate: None,
+            join: None,
+        };
+        let StatementOutcome::Rows(matched) = self.run_select(&scan, overlay)? else {
+            return Err(EngineError::Unsupported(
+                "the scan-then-write expansion read returned no row set",
+            ));
+        };
+
+        // One live version per key at a system snapshot, so the matched keys are
+        // distinct; sorting by the canonical encoding makes the apply order (and
+        // the group's WAL record) deterministic regardless of scan order.
+        let mut key_cells: Vec<Vec<u8>> = matched
+            .rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .next()
+                    .flatten()
+                    .ok_or(EngineError::MalformedBusinessKey)
+            })
+            .collect::<Result<_, _>>()?;
+        key_cells.sort_unstable();
+
+        let keys: Vec<ScalarValue> = key_cells
+            .iter()
+            .map(|bytes| {
+                ScalarValue::decode(key_ty, bytes).map_err(|_| EngineError::MalformedBusinessKey)
+            })
+            .collect::<Result<_, _>>()?;
+
+        let count = keys.len() as u64;
+        let (writes, summary) = match dml {
+            BoundDml::UpdateScan {
+                table,
+                schema_id,
+                assignments,
+                valid,
+                ..
+            } => (
+                keys.into_iter()
+                    .map(|key| BoundDml::Update {
+                        table: table.clone(),
+                        schema_id,
+                        key,
+                        assignments: assignments.clone(),
+                        valid,
+                    })
+                    .collect(),
+                DmlSummary::Update(count),
+            ),
+            BoundDml::DeleteScan {
+                table, schema_id, ..
+            } => (
+                keys.into_iter()
+                    .map(|key| BoundDml::Delete {
+                        table: table.clone(),
+                        schema_id,
+                        key,
+                    })
+                    .collect(),
+                DmlSummary::Delete(count),
+            ),
+            // Unreachable: the match above already rejected every other variant.
+            _ => unreachable!("expand_scan_dml only receives the scan variants"),
+        };
+        Ok((writes, summary))
+    }
+
     /// The oldest system-time snapshot pinned by a currently-open transaction, or
     /// `None` when none is open. The floor [`prune_write_index`](Self::prune_write_index)
     /// keeps the write index above ([STL-204]).
@@ -2201,6 +2420,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         txn_id: TxnId,
         principal: &Principal,
     ) -> Result<DmlSummary, EngineError> {
+        // A scan-then-write variant ([STL-229]) carries a predicate, not a key —
+        // it is expanded into per-key writes *before* it can reach an apply
+        // (`apply_scan_dml` / `stage_dml`), so one arriving here is an internal
+        // contract break. Refuse it rather than write something wrong.
+        if matches!(
+            dml,
+            BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. }
+        ) {
+            return Err(EngineError::Unsupported(
+                "a scan-then-write UPDATE/DELETE must be expanded before it is applied",
+            ));
+        }
         // The (table, business key) this write commits, captured before the match
         // consumes `dml`, so its commit instant can be recorded for conflict
         // detection once the write lands.
@@ -2286,6 +2517,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             BoundDml::Delete { table, key, .. } => {
                 self.delete(&table, &business_key(&key), txn_id, principal.clone())?;
                 DmlSummary::Delete(1)
+            }
+            BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } => {
+                unreachable!("rejected at the top of apply_bound_dml")
             }
         };
         // Record this key's commit instant for first-committer-wins conflict
@@ -2434,6 +2668,21 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             catalog: &self.catalog,
         };
         match bind_dml(stmt, &ctx) {
+            // A scan-then-write UPDATE / DELETE ([STL-229]) expands **now**, at
+            // the statement: the matching live keys are enumerated at the pinned
+            // snapshot with the transaction's own buffered writes overlaid
+            // (read-your-own-writes, [STL-203] — an INSERT staged earlier in the
+            // block is matchable), and the resulting per-key writes are what the
+            // buffer holds. So the tag reports the rows matched *at statement
+            // time*, later statements in the block cannot retroactively change
+            // this statement's row set, and everything downstream of the buffer
+            // (overlay reads, savepoint truncation, conflict detection, commit)
+            // only ever sees per-key writes.
+            Ok(dml @ (BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. })) => {
+                let (writes, summary) = self.expand_scan_dml(dml, txn.snapshot, &txn.writes)?;
+                txn.writes.extend(writes);
+                Ok(Some(summary))
+            }
             Ok(dml) => {
                 let summary = dml_summary(&dml);
                 txn.writes.push(dml);
@@ -2753,15 +3002,20 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
 /// invariant — only the identity is a placeholder.
 const WIRE_PRINCIPAL: &[u8] = b"stele";
 
-/// The affected-row summary a bound DML operation reports — always one row per
-/// statement at v0.1, tagged by kind so the wire layer renders the right
+/// The affected-row summary a bound **point** DML operation reports — one row
+/// per statement, tagged by kind so the wire layer renders the right
 /// `CommandComplete` ([`stage_dml`](SessionEngine::stage_dml) reports it before
-/// the write is applied).
-const fn dml_summary(dml: &BoundDml) -> DmlSummary {
+/// the write is applied). A scan-then-write variant's count is only known after
+/// expansion ([`expand_scan_dml`](SessionEngine::expand_scan_dml) reports it),
+/// so it never reaches here.
+fn dml_summary(dml: &BoundDml) -> DmlSummary {
     match dml {
         BoundDml::Insert { .. } => DmlSummary::Insert(1),
         BoundDml::Update { .. } => DmlSummary::Update(1),
         BoundDml::Delete { .. } => DmlSummary::Delete(1),
+        BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } => {
+            unreachable!("a scan-then-write DML reports its summary from the expansion")
+        }
     }
 }
 
@@ -2798,6 +3052,11 @@ fn dml_business_key(dml: &BoundDml) -> BusinessKey {
         BoundDml::Insert { key, .. }
         | BoundDml::Update { key, .. }
         | BoundDml::Delete { key, .. } => key,
+        // The transaction buffer only ever holds per-key writes: a scan-then-write
+        // statement is expanded at staging ([`SessionEngine::stage_dml`], STL-229).
+        BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } => {
+            unreachable!("a scan-then-write DML is expanded before it is buffered")
+        }
     };
     business_key(key)
 }
@@ -3020,6 +3279,11 @@ fn overlay_table_writes(
             }
             BoundDml::Delete { key, .. } => {
                 rows.remove(&encode_value(key));
+            }
+            // The buffer only ever holds per-key writes: a scan-then-write
+            // statement expands at staging ([`SessionEngine::stage_dml`], STL-229).
+            BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } => {
+                unreachable!("a scan-then-write DML is expanded before it is buffered")
             }
         }
     }
@@ -8377,5 +8641,571 @@ mod tests {
             matches!(err, EngineError::ValidTimePolicyChange { .. }),
             "the recovered tier still enforces its valid-time policy, got {err:?}"
         );
+    }
+
+    // ---- predicate-driven UPDATE / DELETE (STL-229) ----
+
+    /// Run a DML statement and return its summary, naming the statement on
+    /// failure (the seeded oracle runs many).
+    fn dml(engine: &mut SessionEngine<ZeroClock, MemDisk>, sql: &str) -> DmlSummary {
+        match engine.execute(&parse_one(sql)) {
+            Ok(StatementOutcome::Dml(summary)) => summary,
+            Ok(_) => panic!("DML {sql:?} must return a summary"),
+            Err(e) => panic!("DML {sql:?} failed: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn predicate_update_affects_exactly_the_matching_rows() {
+        // A value-column predicate selects rows the v0.1 key-equality path never
+        // could; the scan-then-write plan must touch exactly those and report
+        // their count.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_WIDE)).expect("create");
+        for sql in [
+            "INSERT INTO t VALUES (1, 10, 'keep')",
+            "INSERT INTO t VALUES (2, 30, 'hit')",
+            "INSERT INTO t VALUES (3, 40, 'hit')",
+            "INSERT INTO t VALUES (4, 20, 'keep')",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+
+        assert_eq!(
+            dml(&mut engine, "UPDATE t SET b = 'zapped' WHERE a > 20"),
+            DmlSummary::Update(2),
+            "the tag counts the matched live rows at the snapshot"
+        );
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT * FROM t").rows),
+            sorted(vec![
+                vec![i4(1), i4(10), txt("keep")],
+                vec![i4(2), i4(30), txt("zapped")],
+                vec![i4(3), i4(40), txt("zapped")],
+                vec![i4(4), i4(20), txt("keep")],
+            ]),
+            "exactly the matching rows changed; column a kept its value (RMW)"
+        );
+
+        assert_eq!(
+            dml(&mut engine, "DELETE FROM t WHERE b = 'zapped'"),
+            DmlSummary::Delete(2)
+        );
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT id FROM t").rows),
+            sorted(vec![vec![i4(1)], vec![i4(4)]]),
+            "exactly the matching rows were deleted"
+        );
+    }
+
+    #[test]
+    fn whole_table_update_and_delete_affect_every_live_row() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        for sql in [
+            "INSERT INTO account VALUES (1, 100)",
+            "INSERT INTO account VALUES (2, 200)",
+            "INSERT INTO account VALUES (3, 300)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+
+        assert_eq!(
+            dml(&mut engine, "UPDATE account SET balance = 0"),
+            DmlSummary::Update(3),
+            "no WHERE matches every live row"
+        );
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT * FROM account").rows),
+            sorted(vec![
+                vec![i4(1), i4(0)],
+                vec![i4(2), i4(0)],
+                vec![i4(3), i4(0)],
+            ])
+        );
+
+        assert_eq!(
+            dml(&mut engine, "DELETE FROM account"),
+            DmlSummary::Delete(3)
+        );
+        assert!(
+            select(&mut engine, "SELECT id FROM account")
+                .rows
+                .is_empty(),
+            "a whole-table DELETE closes every live row"
+        );
+    }
+
+    #[test]
+    fn predicate_dml_reports_zero_matches_and_changes_nothing() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+
+        assert_eq!(
+            dml(
+                &mut engine,
+                "UPDATE account SET balance = 0 WHERE balance > 500"
+            ),
+            DmlSummary::Update(0)
+        );
+        assert_eq!(
+            dml(&mut engine, "DELETE FROM account WHERE balance > 500"),
+            DmlSummary::Delete(0)
+        );
+        assert_eq!(
+            select(&mut engine, "SELECT * FROM account").rows,
+            vec![vec![i4(1), i4(100)]],
+            "an empty matched set writes nothing"
+        );
+    }
+
+    #[test]
+    fn predicate_dml_leaves_pre_statement_history_readable() {
+        // The append-only contract under a bulk write: a whole-table UPDATE
+        // closes and rewrites every row, but an `AS OF` read pinned before the
+        // statement still answers from the pre-statement versions. With the
+        // synthetic clock the commits land at sys_from 1 (CREATE), 2, 3 (the
+        // two INSERT rows), so `AS OF 3` is the instant just before the bulk
+        // write.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (2, 200)"))
+            .expect("insert");
+
+        assert_eq!(
+            dml(&mut engine, "UPDATE account SET balance = 0"),
+            DmlSummary::Update(2)
+        );
+
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT * FROM account FOR SYSTEM_TIME AS OF 3").rows),
+            sorted(vec![vec![i4(1), i4(100)], vec![i4(2), i4(200)]]),
+            "the pre-statement snapshot still reads the original values"
+        );
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT * FROM account").rows),
+            sorted(vec![vec![i4(1), i4(0)], vec![i4(2), i4(0)]]),
+            "the current snapshot reads the bulk update"
+        );
+    }
+
+    #[test]
+    fn predicate_dml_in_a_transaction_sees_buffered_writes() {
+        // Read-your-own-writes at statement time ([STL-203] × [STL-229]): an
+        // INSERT buffered earlier in the block is matchable by a later predicate
+        // UPDATE, the tag counts it, and the block's SELECT sees the combined
+        // effect — all before anything commits.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+
+        let mut txn = engine.begin();
+        engine
+            .stage_dml(&parse_one("INSERT INTO account VALUES (2, 200)"), &mut txn)
+            .expect("stage insert");
+        let summary = engine
+            .stage_dml(&parse_one("UPDATE account SET balance = 0"), &mut txn)
+            .expect("stage scan update")
+            .expect("dml summary");
+        assert_eq!(
+            summary,
+            DmlSummary::Update(2),
+            "the buffered INSERT joins the committed row in the matched set"
+        );
+
+        let StatementOutcome::Rows(inside) = engine
+            .execute_in_txn(&parse_one("SELECT * FROM account"), &mut txn)
+            .expect("select in txn")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(
+            sorted(inside.rows),
+            sorted(vec![vec![i4(1), i4(0)], vec![i4(2), i4(0)]]),
+            "the block reads its own bulk write"
+        );
+
+        engine.commit(txn).expect("commit");
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT * FROM account").rows),
+            sorted(vec![vec![i4(1), i4(0)], vec![i4(2), i4(0)]]),
+            "the combined effect is durable after COMMIT"
+        );
+    }
+
+    #[test]
+    fn predicate_dml_expands_at_its_statement_not_at_commit() {
+        // The matched set is fixed when the statement runs: a row staged *after*
+        // the predicate UPDATE does not retroactively join it — exactly what the
+        // `UPDATE n` tag promised the client.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+
+        let mut txn = engine.begin();
+        let summary = engine
+            .stage_dml(&parse_one("UPDATE account SET balance = 0"), &mut txn)
+            .expect("stage scan update")
+            .expect("dml summary");
+        assert_eq!(summary, DmlSummary::Update(1));
+        engine
+            .stage_dml(&parse_one("INSERT INTO account VALUES (2, 200)"), &mut txn)
+            .expect("stage later insert");
+        engine.commit(txn).expect("commit");
+
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT * FROM account").rows),
+            sorted(vec![vec![i4(1), i4(0)], vec![i4(2), i4(200)]]),
+            "the later INSERT kept its value — it was not part of the earlier statement"
+        );
+    }
+
+    #[test]
+    fn a_torn_predicate_dml_commit_recovers_unchanged() {
+        // Atomicity across the WAL boundary: an auto-committed whole-table UPDATE
+        // is one group-commit record; tearing its append makes none of the
+        // statement durable — recovery reads the pre-statement table, never a
+        // partial prefix ([STL-192] discipline applied to the scan-then-write
+        // plan). All rows are delta-resident, so the statement's only disk write
+        // is that record.
+        let faults = Faults::new();
+        let disk = MemDisk::with_faults(faults.clone());
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        for sql in [
+            "INSERT INTO account VALUES (1, 100)",
+            "INSERT INTO account VALUES (2, 200)",
+            "INSERT INTO account VALUES (3, 300)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+
+        faults.schedule(FaultOp::Append, io::ErrorKind::Other);
+        let err = engine
+            .execute(&parse_one("UPDATE account SET balance = 0"))
+            .expect_err("the torn group-commit append fails the statement");
+        assert!(matches!(err, EngineError::Storage(_)), "got {err:?}");
+        drop(engine);
+
+        let mut engine = recover_session(&disk);
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT * FROM account").rows),
+            sorted(vec![
+                vec![i4(1), i4(100)],
+                vec![i4(2), i4(200)],
+                vec![i4(3), i4(300)],
+            ]),
+            "none of the statement's writes survive the torn commit"
+        );
+    }
+
+    #[test]
+    fn a_mid_set_apply_failure_leaves_the_table_unchanged() {
+        // Atomicity of the apply itself, with a genuinely applied prefix: the
+        // transaction stages an INSERT and then a whole-table UPDATE (which
+        // expands over the buffered row too). At COMMIT the INSERT applies first
+        // (resident, no reads); the first UPDATE's read-modify-write then opens
+        // the sealed segment and its read fails (injected). The statement set
+        // must abort as a unit: the already-applied INSERT is rolled back in
+        // memory ([STL-216]) and nothing is durable — the table is unchanged,
+        // live *and* across recovery.
+        let faults = Faults::new();
+        let disk = MemDisk::with_faults(faults.clone());
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        for sql in [
+            "INSERT INTO account VALUES (1, 100)",
+            "INSERT INTO account VALUES (2, 200)",
+            "INSERT INTO account VALUES (3, 300)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // Seal the rows so every UPDATE's read-modify-write must read a segment.
+        engine.flush().expect("flush seals the delta");
+
+        let mut txn = engine.begin();
+        engine
+            .stage_dml(&parse_one("INSERT INTO account VALUES (4, 400)"), &mut txn)
+            .expect("stage insert");
+        let summary = engine
+            .stage_dml(&parse_one("UPDATE account SET balance = 0"), &mut txn)
+            .expect("stage scan update — the expansion scan runs now, faults unarmed")
+            .expect("dml summary");
+        assert_eq!(summary, DmlSummary::Update(4));
+
+        // Arm the fault now: the next sealed-segment read — the first UPDATE's
+        // read-modify-write — fails mid-set, after the INSERT already applied.
+        faults.schedule(FaultOp::ReadAt, io::ErrorKind::Other);
+        engine
+            .commit(txn)
+            .expect_err("the mid-set apply failure aborts the whole statement set");
+
+        let unchanged = sorted(vec![
+            vec![i4(1), i4(100)],
+            vec![i4(2), i4(200)],
+            vec![i4(3), i4(300)],
+        ]);
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT * FROM account").rows),
+            unchanged,
+            "the applied prefix (the INSERT) was rolled back in memory"
+        );
+        drop(engine);
+
+        let mut engine = recover_session(&disk);
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT * FROM account").rows),
+            unchanged,
+            "nothing of the aborted statement set is durable"
+        );
+    }
+
+    #[test]
+    fn predicate_dml_on_a_valid_time_table_writes_the_system_axis() {
+        // Valid-time tables take the same scan-then-write plan, system-axis-only
+        // ([STL-229] scope): the WHERE selects among system-live rows, an UPDATE
+        // opens each matched key's new version under the SET's valid period
+        // (mandatory `vf`, as for the point write — [STL-194]), and a whole-table
+        // DELETE closes every system-live row.
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE vt (id INT PRIMARY KEY, balance INT, vf TIMESTAMP, vt TIMESTAMP) \
+                 WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+            ))
+            .expect("create valid-time table");
+        engine
+            .execute(&parse_one("INSERT INTO vt VALUES (1, 100, 10, 20)"))
+            .expect("insert");
+        engine
+            .execute(&parse_one("INSERT INTO vt VALUES (2, 200, 10, 20)"))
+            .expect("insert");
+
+        assert_eq!(
+            dml(
+                &mut engine,
+                "UPDATE vt SET balance = 0, vf = 30 WHERE balance >= 200"
+            ),
+            DmlSummary::Update(1),
+            "the predicate matched one system-live row"
+        );
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT id, balance FROM vt").rows),
+            sorted(vec![vec![i4(1), i4(100)], vec![i4(2), i4(0)]])
+        );
+
+        assert_eq!(dml(&mut engine, "DELETE FROM vt"), DmlSummary::Delete(2));
+        assert!(
+            select(&mut engine, "SELECT id FROM vt").rows.is_empty(),
+            "the whole-table DELETE closed every system-live row"
+        );
+    }
+
+    /// A tiny deterministic RNG (xorshift64*) for the seeded differential
+    /// oracle — the engine crate stays free of dev-only RNG dependencies.
+    struct TestRng(u64);
+    impl TestRng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// The predicate-selection correctness oracle (testing strategy §4):
+    /// a seeded random workload of point and predicate DML runs against both the
+    /// engine and an in-process reference model (a map of live rows). After every
+    /// statement the reported tag must equal the model's matched-row count and
+    /// the full table must equal the model — across every comparison operator,
+    /// key- and value-column anchors, arithmetic predicates, NULL cells (which a
+    /// predicate never matches, but a whole-table write does), and a mid-workload
+    /// flush so the scan-then-write plan also runs over sealed segments.
+    #[test]
+    fn predicate_dml_matches_a_reference_model_over_seeded_workloads() {
+        const OPS: u64 = 60;
+        for seed in 1..=5u64 {
+            let mut rng = TestRng(seed);
+            let mut engine = session();
+            engine
+                .execute(&parse_one(
+                    "CREATE TABLE o (id INT PRIMARY KEY, v INT) WITH SYSTEM VERSIONING",
+                ))
+                .expect("create");
+            // The reference model: business key -> live value (None = SQL NULL).
+            let mut model: BTreeMap<i32, Option<i32>> = BTreeMap::new();
+
+            for op in 0..OPS {
+                // Exercise the sealed tier too: seal whatever is resident at the
+                // workload's midpoint.
+                if op == OPS / 2 {
+                    engine.flush().expect("flush");
+                }
+                match rng.below(10) {
+                    // Upsert a random key (INSERT when absent, point UPDATE when
+                    // live — the point fast path stays in the mix).
+                    0..=3 => {
+                        let key = i32::try_from(rng.below(20)).expect("small key");
+                        let value = (rng.below(5) > 0)
+                            .then(|| i32::try_from(rng.below(100)).expect("small value"));
+                        let cell = value.map_or("NULL".to_owned(), |v| v.to_string());
+                        let sql = if model.contains_key(&key) {
+                            format!("UPDATE o SET v = {cell} WHERE id = {key}")
+                        } else {
+                            format!("INSERT INTO o VALUES ({key}, {cell})")
+                        };
+                        engine.execute(&parse_one(&sql)).expect("point write");
+                        model.insert(key, value);
+                    }
+                    // Point-delete a live key.
+                    4 => {
+                        if let Some(&key) = {
+                            let keys: Vec<&i32> = model.keys().collect();
+                            let pick = keys.len();
+                            (pick > 0).then(|| {
+                                keys[usize::try_from(rng.below(pick as u64)).expect("index")]
+                            })
+                        } {
+                            engine
+                                .execute(&parse_one(&format!("DELETE FROM o WHERE id = {key}")))
+                                .expect("point delete");
+                            model.remove(&key);
+                        }
+                    }
+                    // Predicate (or whole-table) UPDATE / DELETE.
+                    kind => {
+                        let (where_sql, matched, absent_point) = random_predicate(&mut rng, &model);
+                        let is_update = kind <= 7;
+                        let new = i32::try_from(rng.below(100)).expect("small value");
+                        let sql = if is_update {
+                            format!("UPDATE o SET v = {new}{where_sql}")
+                        } else {
+                            format!("DELETE FROM o{where_sql}")
+                        };
+                        // A key-equality WHERE on an absent key takes the point
+                        // fast path, whose existing contract *errors* on a
+                        // missing key rather than reporting 0 rows (kept as-is
+                        // by STL-229; aligning it is a tracked follow-up). The
+                        // oracle pins that behavior: the statement fails and
+                        // nothing changes.
+                        if absent_point {
+                            assert!(
+                                engine.execute(&parse_one(&sql)).is_err(),
+                                "seed {seed} op {op}: the point fast path errors on an absent key"
+                            );
+                        } else {
+                            let got = dml(&mut engine, &sql);
+                            let count = matched.len() as u64;
+                            let want = if is_update {
+                                for key in &matched {
+                                    model.insert(*key, Some(new));
+                                }
+                                DmlSummary::Update(count)
+                            } else {
+                                for key in &matched {
+                                    model.remove(key);
+                                }
+                                DmlSummary::Delete(count)
+                            };
+                            assert_eq!(
+                                got, want,
+                                "seed {seed} op {op}: tag must count the matched live rows"
+                            );
+                        }
+                    }
+                }
+
+                let want: Vec<Vec<Option<Vec<u8>>>> = model
+                    .iter()
+                    .map(|(k, v)| vec![i4(*k), cell(v.map(ScalarValue::Int4))])
+                    .collect();
+                assert_eq!(
+                    sorted(select(&mut engine, "SELECT * FROM o").rows),
+                    sorted(want),
+                    "seed {seed} op {op}: the table must equal the reference model"
+                );
+            }
+        }
+    }
+
+    /// Draw a random `WHERE` for the differential oracle and compute the keys it
+    /// matches in the model. Covers: whole-table (no WHERE), all six comparison
+    /// operators anchored on the key or the value column, and an arithmetic
+    /// predicate. A NULL value cell never matches a predicate (the evaluator's
+    /// three-valued logic keeps only TRUE rows) but is matched by no-WHERE.
+    ///
+    /// The third return is `true` when the WHERE is a key **equality on an
+    /// absent key** — the one shape that lowers to the point fast path, whose
+    /// existing contract errors (`KeyNotFound`) instead of reporting 0 rows.
+    fn random_predicate(
+        rng: &mut TestRng,
+        model: &BTreeMap<i32, Option<i32>>,
+    ) -> (String, Vec<i32>, bool) {
+        const OPS: [&str; 6] = ["=", "<>", "<", "<=", ">", ">="];
+        let cmp = |op: &str, lhs: i64, rhs: i64| match op {
+            "=" => lhs == rhs,
+            "<>" => lhs != rhs,
+            "<" => lhs < rhs,
+            "<=" => lhs <= rhs,
+            ">" => lhs > rhs,
+            _ => lhs >= rhs,
+        };
+        match rng.below(8) {
+            // Whole-table: no WHERE — NULL-valued rows match too.
+            0 => (String::new(), model.keys().copied().collect(), false),
+            // Arithmetic over the value column: `v % 2 = 0`.
+            1 => (
+                " WHERE v % 2 = 0".to_owned(),
+                model
+                    .iter()
+                    .filter(|(_, v)| v.is_some_and(|v| v % 2 == 0))
+                    .map(|(k, _)| *k)
+                    .collect(),
+                false,
+            ),
+            // A comparison anchored on the key column. Equality is the point
+            // fast path ([STL-229] keeps its existing absent-key error).
+            2 | 3 => {
+                let op = OPS[usize::try_from(rng.below(6)).expect("op index")];
+                let lit = i64::try_from(rng.below(20)).expect("small literal");
+                let matched: Vec<i32> = model
+                    .keys()
+                    .filter(|k| cmp(op, i64::from(**k), lit))
+                    .copied()
+                    .collect();
+                let absent_point = op == "=" && matched.is_empty();
+                (format!(" WHERE id {op} {lit}"), matched, absent_point)
+            }
+            // A comparison anchored on the value column; NULL never matches.
+            _ => {
+                let op = OPS[usize::try_from(rng.below(6)).expect("op index")];
+                let lit = i64::try_from(rng.below(100)).expect("small literal");
+                (
+                    format!(" WHERE v {op} {lit}"),
+                    model
+                        .iter()
+                        .filter(|(_, v)| v.is_some_and(|v| cmp(op, i64::from(v), lit)))
+                        .map(|(k, _)| *k)
+                        .collect(),
+                    false,
+                )
+            }
+        }
     }
 }

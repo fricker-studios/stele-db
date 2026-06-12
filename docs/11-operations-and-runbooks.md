@@ -142,6 +142,9 @@ flowchart LR
 | **Checksum / corrupt-segment error** | Bit rot / torn write. | Segment is detectably bad ([02 §3.2](02-architecture.md#32-on-disk-segment-format)); restore that segment from backup/replica; file an incident + sim seed. |
 | **Replica lag rising** | Slow apply / network. | Check apply rate + link; consider read rerouting; assess failover readiness. |
 | **Storage cost spiking** | Tiering misconfigured / hot data not aging down. | Review [tiering policy](adr/0021-storage-lifecycle-tiered-archival.md) + tier mix; verify time-era compaction is running. |
+| **Boot refused: "refusing to listen on non-loopback … without TLS"** | Secure-defaults posture ([10 §4](10-security-and-compliance.md#4-data-protection--encryption), STL-251): a non-dev server won't serve plaintext beyond loopback. | Configure `[tls]` in `stele.toml` (PEM `cert`/`key`; see [`stele.example.toml`](../stele.example.toml)) or bind a loopback `listen`. Don't "fix" it by running `--dev` in production. |
+| **Clients failing with `FATAL 28000: connection requires TLS`** | `[tls] mode = "required"` and the client connected plaintext. | Point the client at TLS (`sslmode=require`/`verify-full`, `stele shell --tls require`); for a migration window set `mode = "optional"` (the boot log warns while it's on). |
+| **TLS clients failing after a certificate change** | Expired/rotated cert; key/cert mismatch (`[tls]` is read once at boot). | Check expiry (`openssl x509 -enddate -noout -in server.crt`); fix the pair and restart the server (live reload is a planned follow-up); mTLS rejects also mean a client cert no longer chains to `client_ca`. |
 
 > Recurring rule across all rows: **diagnose with time-travel, remediate without mutating history.** The engine's own primitives are the best forensic tools.
 

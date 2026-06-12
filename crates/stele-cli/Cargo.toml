@@ -24,6 +24,10 @@ clap         = { workspace = true }
 tokio        = { workspace = true }
 rustyline     = { workspace = true }
 unicode-width = { workspace = true }
+# `stele shell --tls` (STL-251): the same rustls the server stack uses, driven
+# through its blocking `StreamOwned` adapter — still no async client crate.
+rustls           = { workspace = true }
+rustls-pki-types = { workspace = true }
 
 [dev-dependencies]
 # The scripted-shell integration test boots an in-process engine + pgwire
@@ -32,3 +36,5 @@ stele-engine  = { workspace = true }
 stele-pgwire  = { workspace = true }
 stele-storage = { workspace = true }
 tokio         = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# Self-signed certs for the TLS shell-session tests (STL-251).
+rcgen         = { workspace = true }
