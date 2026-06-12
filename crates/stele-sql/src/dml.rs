@@ -32,6 +32,21 @@
 //!   (a read-modify-write the engine performs).
 //! * `DELETE FROM t WHERE <key> = k` — close `k`'s prior period, no successor.
 //!
+//! ## Predicate-driven `UPDATE` / `DELETE` ([STL-229])
+//!
+//! The `WHERE` is no longer restricted to `<key> = <literal>`: it binds through
+//! the same predicate binder a `SELECT`'s `WHERE` uses
+//! ([`bind_where_predicate`](crate::select)), so the two statement families share
+//! one vocabulary — a single comparison anchored on one column, any of the six
+//! comparison operators, with integer arithmetic on either side ([STL-213]). A
+//! missing `WHERE` is a **whole-table** write (match-all). A predicate that is
+//! exactly `<key> = <literal>` keeps the point fast path ([`BoundDml::Update`] /
+//! [`BoundDml::Delete`], no scan); everything else binds to the scan-then-write
+//! [`BoundDml::UpdateScan`] / [`BoundDml::DeleteScan`], which the engine expands
+//! into one point write per matched live key, applied as a single atomic group.
+//!
+//! [STL-229]: https://allegromusic.atlassian.net/browse/STL-229
+//!
 //! ## Valid-time tables ([STL-194])
 //!
 //! A table that opted into a valid axis (`… VALID TIME (vf, vt)`) carries a second
@@ -52,8 +67,8 @@
 //!
 //! ## What this rejects (with a clear bind error, never a wrong write)
 //!
-//! Multi-row `INSERT`, `INSERT … SELECT`, a `WHERE` that is not `<key> =
-//! <literal>` (including a whole-table `UPDATE`/`DELETE` with no `WHERE`),
+//! Multi-row `INSERT`, `INSERT … SELECT`, a `WHERE` outside the shared `SELECT`
+//! predicate vocabulary (an `AND`/`OR` chain, a column-to-column comparison, …),
 //! updating the key column, `RETURNING`, `ON CONFLICT`, `USING`/`FROM` joins,
 //! qualified names, a `NULL` business key, and out-of-range literals. A `NULL`
 //! **value column** is accepted (it folds to `None`, [STL-154]); a `NULL` key is
@@ -63,8 +78,8 @@
 //! [STL-151]: https://allegromusic.atlassian.net/browse/STL-151
 
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, Insert, ObjectName,
-    SetExpr, Statement as SqlStatement, TableFactor, TableObject, TableWithJoins, Update,
+    Assignment, AssignmentTarget, Delete, Expr, FromTable, Insert, ObjectName, SetExpr,
+    Statement as SqlStatement, TableFactor, TableObject, TableWithJoins, Update,
 };
 use stele_catalog::{ColumnDef, SchemaId, TableSchema, ValidTimeSpec};
 use stele_common::period::Interval;
@@ -73,7 +88,10 @@ use stele_common::types::{LogicalType, ScalarValue};
 
 use crate::ast::Statement;
 use crate::fold::{self, FoldError};
-use crate::select::{AsOfError, BindContext, TableResolution, resolve_as_of, resolve_table_at};
+use crate::select::{
+    AsOfError, BindContext, BoundPredicate, SelectError, TableResolution, bind_where_predicate,
+    resolve_as_of, resolve_table_at,
+};
 
 /// A bound `INSERT` / `UPDATE` / `DELETE`, ready for the engine to apply.
 ///
@@ -138,6 +156,48 @@ pub enum BoundDml {
         /// The business key the `WHERE` clause selected.
         key: ScalarValue,
     },
+    /// `UPDATE` selecting its rows by **predicate** rather than a single key — a
+    /// non-key `WHERE`, or no `WHERE` at all (whole-table) ([STL-229]).
+    ///
+    /// The engine runs this as a **scan-then-write** plan: enumerate the business
+    /// keys of the live rows matching [`filter`](Self::UpdateScan::filter) at the
+    /// statement snapshot, then apply one [`Update`](Self::Update) per matched key
+    /// as a single atomic group. It never reaches the per-key write path directly —
+    /// the engine expands it before buffering or applying.
+    ///
+    /// [STL-229]: https://allegromusic.atlassian.net/browse/STL-229
+    UpdateScan {
+        /// The table written.
+        table: String,
+        /// The schema version `table` resolved to at the bind snapshot.
+        schema_id: SchemaId,
+        /// The bound `WHERE` predicate selecting the rows to update — the same
+        /// vocabulary a `SELECT`'s `WHERE` binds ([STL-213]) — or `None` for a
+        /// whole-table `UPDATE` (every live row matches).
+        filter: Option<BoundPredicate>,
+        /// The `SET` clause, exactly as on [`Update`](Self::Update): `(value-column
+        /// index, new value)` pairs applied read-modify-write per matched key.
+        assignments: Vec<(usize, Option<ScalarValue>)>,
+        /// The new versions' `[from, to)` valid-time period, or `None` for a
+        /// system-only table — as on [`Update`](Self::Update); every matched key's
+        /// new version carries the same bounds ([STL-194]).
+        valid: Option<Interval>,
+    },
+    /// `DELETE` selecting its rows by **predicate** rather than a single key — a
+    /// non-key `WHERE`, or no `WHERE` at all (whole-table) ([STL-229]).
+    ///
+    /// Scan-then-write like [`UpdateScan`](Self::UpdateScan): the engine expands it
+    /// into one [`Delete`](Self::Delete) per matched live key, applied as a single
+    /// atomic group.
+    DeleteScan {
+        /// The table written.
+        table: String,
+        /// The schema version `table` resolved to at the bind snapshot.
+        schema_id: SchemaId,
+        /// The bound `WHERE` predicate selecting the rows to delete, or `None` for
+        /// a whole-table `DELETE`.
+        filter: Option<BoundPredicate>,
+    },
 }
 
 impl BoundDml {
@@ -147,7 +207,9 @@ impl BoundDml {
         match self {
             Self::Insert { table, .. }
             | Self::Update { table, .. }
-            | Self::Delete { table, .. } => table,
+            | Self::Delete { table, .. }
+            | Self::UpdateScan { table, .. }
+            | Self::DeleteScan { table, .. } => table,
         }
     }
 }
@@ -185,7 +247,7 @@ pub enum DmlError {
     UnknownTable(String),
 
     /// The bind snapshot precedes the table's first commit — a write *before the
-    /// table existed*. Mirrors [`SelectError::BeforeHistory`](crate::select::SelectError::BeforeHistory).
+    /// table existed*. Mirrors [`SelectError::BeforeHistory`].
     #[error(
         "table {table:?} did not exist at the bind snapshot {snapshot} (first commit at {first_commit})"
     )]
@@ -275,15 +337,15 @@ pub enum DmlError {
         column: String,
     },
 
-    /// An `UPDATE` / `DELETE` `WHERE` compared a column other than the business
-    /// key. v0.1 selects rows by their key only.
-    #[error("v0.1 DML WHERE must compare the business key {key:?}, not {column:?}")]
-    PredicateNotOnKey {
-        /// The key column the predicate should have named.
-        key: String,
-        /// The column it actually named.
-        column: String,
-    },
+    /// An `UPDATE` / `DELETE` `WHERE` did not bind as a row-selection predicate.
+    /// DML shares the `SELECT` `WHERE` vocabulary ([STL-229]): a single comparison
+    /// anchored on one column, with the six comparison operators and integer
+    /// arithmetic ([STL-213]) — the wrapped [`SelectError`] names the unsupported
+    /// shape, unknown column, or bad literal exactly as a `SELECT` would.
+    ///
+    /// [STL-229]: https://allegromusic.atlassian.net/browse/STL-229
+    #[error("DML WHERE: {0}")]
+    Predicate(#[source] SelectError),
 
     /// A literal's shape does not match its column's type (e.g. a string for an
     /// `int4` column).
@@ -654,14 +716,24 @@ fn bind_update(update: &Update, ctx: &BindContext) -> Result<BoundDml, DmlError>
     }
     let valid = build_interval(&table, period, from, to)?;
 
-    let key = key_predicate(update.selection.as_ref(), &table, key_col)?;
-    Ok(BoundDml::Update {
-        table,
-        schema_id: schema.schema_id(),
-        key,
-        assignments,
-        valid,
-    })
+    Ok(
+        match dml_selection(update.selection.as_ref(), &table, schema)? {
+            DmlSelection::Key(key) => BoundDml::Update {
+                table,
+                schema_id: schema.schema_id(),
+                key,
+                assignments,
+                valid,
+            },
+            DmlSelection::Scan(filter) => BoundDml::UpdateScan {
+                table,
+                schema_id: schema.schema_id(),
+                filter,
+                assignments,
+                valid,
+            },
+        },
+    )
 }
 
 /// The single, unqualified column an `UPDATE … SET` assignment targets.
@@ -703,14 +775,22 @@ fn bind_delete(delete: &Delete, ctx: &BindContext) -> Result<BoundDml, DmlError>
         ));
     };
     let table = table_of(target)?;
-    let (schema, key_col, _value_cols) = resolve_shape(ctx, &table)?;
+    let (schema, _key_col, _value_cols) = resolve_shape(ctx, &table)?;
 
-    let key = key_predicate(delete.selection.as_ref(), &table, key_col)?;
-    Ok(BoundDml::Delete {
-        table,
-        schema_id: schema.schema_id(),
-        key,
-    })
+    Ok(
+        match dml_selection(delete.selection.as_ref(), &table, schema)? {
+            DmlSelection::Key(key) => BoundDml::Delete {
+                table,
+                schema_id: schema.schema_id(),
+                key,
+            },
+            DmlSelection::Scan(filter) => BoundDml::DeleteScan {
+                table,
+                schema_id: schema.schema_id(),
+                filter,
+            },
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -752,68 +832,36 @@ fn resolve_shape<'a>(
     Ok((schema, key, values))
 }
 
-/// Bind an `UPDATE` / `DELETE` `WHERE` clause: it must be `<key> = <literal>`,
-/// naming the business key, and the literal folds against the key's type. A
-/// missing `WHERE` (a whole-table write) is rejected.
-fn key_predicate(
-    selection: Option<&Expr>,
-    table: &str,
-    key_col: &ColumnDef,
-) -> Result<ScalarValue, DmlError> {
-    let Some(expr) = selection else {
-        return Err(DmlError::Unsupported(
-            "a whole-table UPDATE/DELETE (v0.1 requires `WHERE <key> = <literal>`)".to_owned(),
-        ));
-    };
-    let Expr::BinaryOp {
-        left,
-        op: BinaryOperator::Eq,
-        right,
-    } = expr
-    else {
-        return Err(DmlError::Unsupported(
-            "a WHERE that is not `<key> = <literal>`".to_owned(),
-        ));
-    };
-    // Accept the column on either side: `id = 1` or `1 = id`. A qualified column
-    // (`t.id`) surfaces `QualifiedName`, not the generic "not `<key> = <literal>`".
-    let (column, value) = match (column_side(left)?, column_side(right)?) {
-        (Some(column), None) => (column, right.as_ref()),
-        (None, Some(column)) => (column, left.as_ref()),
-        _ => {
-            return Err(DmlError::Unsupported(
-                "a WHERE that is not `<key> = <literal>`".to_owned(),
-            ));
-        }
-    };
-    if column != key_col.name() {
-        return Err(DmlError::PredicateNotOnKey {
-            key: key_col.name().to_owned(),
-            column: column.to_owned(),
-        });
-    }
-    fold_value(value, table, key_col)
+/// How an `UPDATE` / `DELETE` selects the rows it writes ([STL-229]).
+enum DmlSelection {
+    /// `WHERE <key> = <literal>` — the point fast path: one business key, no scan.
+    Key(ScalarValue),
+    /// Any other `WHERE` (`Some`) or no `WHERE` at all (`None`, whole-table) —
+    /// the scan-then-write plan.
+    Scan(Option<BoundPredicate>),
 }
 
-/// The column name a `WHERE` side references, peeling parentheses.
+/// Bind an `UPDATE` / `DELETE` `WHERE` clause to its row selection ([STL-229]).
 ///
-/// `Ok(Some(name))` for a bare identifier, `Ok(None)` for a non-column expression
-/// (so a literal side is told apart from a column side), and
-/// [`Err(QualifiedName)`](DmlError::QualifiedName) for a qualified column like
-/// `t.id` — a clearer diagnostic than the generic "not `<key> = <literal>`".
-fn column_side(expr: &Expr) -> Result<Option<&str>, DmlError> {
-    match expr {
-        Expr::Identifier(id) => Ok(Some(id.value.as_str())),
-        Expr::CompoundIdentifier(parts) => Err(DmlError::QualifiedName(
-            parts
-                .iter()
-                .map(|p| p.value.as_str())
-                .collect::<Vec<_>>()
-                .join("."),
-        )),
-        Expr::Nested(inner) => column_side(inner),
-        _ => Ok(None),
+/// A missing `WHERE` is a whole-table write (match-all). Otherwise the predicate
+/// binds through the same [`bind_where_predicate`] a `SELECT`'s `WHERE` uses —
+/// one vocabulary, not a DML-special dialect. A predicate that is exactly
+/// `<key> = <literal>` (in either operand order,
+/// [`BoundPredicate::key_equality`]) keeps the existing single-key fast path:
+/// it lowers to the point op with no scan, byte-for-byte the pre-STL-229 plan.
+fn dml_selection(
+    selection: Option<&Expr>,
+    table: &str,
+    schema: &TableSchema,
+) -> Result<DmlSelection, DmlError> {
+    let Some(expr) = selection else {
+        return Ok(DmlSelection::Scan(None));
+    };
+    let predicate = bind_where_predicate(expr, schema, table).map_err(DmlError::Predicate)?;
+    if let Some(key) = predicate.key_equality() {
+        return Ok(DmlSelection::Key(key.clone()));
     }
+    Ok(DmlSelection::Scan(Some(predicate)))
 }
 
 /// Which boundary of a table's valid-time period a column is.
@@ -1054,6 +1102,7 @@ fn single_ident(name: &ObjectName) -> Result<&str, DmlError> {
 mod tests {
     use super::*;
     use crate::parse;
+    use crate::select::{BoundScalar, CompareOp};
     use stele_catalog::{Catalog, TableTemporal};
     use stele_common::time::SystemTimeMicros;
 
@@ -1308,14 +1357,13 @@ mod tests {
                 column: "id".to_owned(),
             })
         );
-        // A NULL key in a WHERE predicate is refused too.
-        assert_eq!(
+        // A NULL comparand in a WHERE predicate is refused too — by the shared
+        // SELECT predicate binder ([STL-229]), so the diagnostic matches a
+        // SELECT's.
+        assert!(matches!(
             bind("DELETE FROM account WHERE id = NULL", &catalog),
-            Err(DmlError::NullValue {
-                table: "account".to_owned(),
-                column: "id".to_owned(),
-            })
-        );
+            Err(DmlError::Predicate(SelectError::UnsupportedPredicate(_)))
+        ));
     }
 
     #[test]
@@ -1343,32 +1391,114 @@ mod tests {
     }
 
     #[test]
-    fn where_on_a_non_key_column_is_rejected() {
+    fn where_on_a_non_key_column_binds_a_scan_delete() {
+        // STL-229: a value-column predicate is no longer rejected — it binds the
+        // scan-then-write plan, through the same predicate binder a SELECT uses.
         let catalog = account_catalog();
         assert_eq!(
             bind("DELETE FROM account WHERE balance = 100", &catalog),
-            Err(DmlError::PredicateNotOnKey {
-                key: "id".to_owned(),
-                column: "balance".to_owned(),
+            Ok(BoundDml::DeleteScan {
+                table: "account".to_owned(),
+                schema_id: SchemaId(1),
+                filter: Some(BoundPredicate {
+                    left: BoundScalar::Column(1),
+                    op: CompareOp::Eq,
+                    right: BoundScalar::Literal(ScalarValue::Int4(100)),
+                }),
             })
         );
     }
 
     #[test]
-    fn whole_table_update_is_rejected() {
+    fn whole_table_update_binds_a_match_all_scan() {
+        // STL-229: no WHERE = every live row (the v0.1 rejection is lifted).
+        let catalog = account_catalog();
+        assert_eq!(
+            bind("UPDATE account SET balance = 0", &catalog),
+            Ok(BoundDml::UpdateScan {
+                table: "account".to_owned(),
+                schema_id: SchemaId(1),
+                filter: None,
+                assignments: vec![(0, Some(ScalarValue::Int4(0)))],
+                valid: None,
+            })
+        );
+    }
+
+    #[test]
+    fn whole_table_delete_binds_a_match_all_scan() {
+        let catalog = account_catalog();
+        assert_eq!(
+            bind("DELETE FROM account", &catalog),
+            Ok(BoundDml::DeleteScan {
+                table: "account".to_owned(),
+                schema_id: SchemaId(1),
+                filter: None,
+            })
+        );
+    }
+
+    #[test]
+    fn non_equality_key_where_binds_a_scan() {
+        // A key comparison that is not plain equality cannot take the point fast
+        // path — it scans, with the predicate anchored on the key column.
+        let catalog = account_catalog();
+        assert_eq!(
+            bind("DELETE FROM account WHERE id > 1", &catalog),
+            Ok(BoundDml::DeleteScan {
+                table: "account".to_owned(),
+                schema_id: SchemaId(1),
+                filter: Some(BoundPredicate {
+                    left: BoundScalar::Column(0),
+                    op: CompareOp::Gt,
+                    right: BoundScalar::Literal(ScalarValue::Int4(1)),
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn reversed_key_equality_keeps_the_point_fast_path() {
+        // `1 = id` is still exactly `<key> = <literal>` — the fast path detection
+        // (`BoundPredicate::key_equality`) accepts either operand order, so the
+        // statement lowers to the point op with no scan.
+        let catalog = account_catalog();
+        assert_eq!(
+            bind("DELETE FROM account WHERE 1 = id", &catalog),
+            Ok(BoundDml::Delete {
+                table: "account".to_owned(),
+                schema_id: SchemaId(1),
+                key: ScalarValue::Int4(1),
+            })
+        );
+    }
+
+    #[test]
+    fn an_arithmetic_key_equality_scans_rather_than_point_writes() {
+        // `id + 0 = 1` selects the same row as `id = 1`, but it is not the
+        // literal fast-path shape — it binds the scan plan, whose filter the
+        // engine evaluates exactly like a SELECT's.
         let catalog = account_catalog();
         assert!(matches!(
-            bind("UPDATE account SET balance = 0", &catalog),
-            Err(DmlError::Unsupported(_))
+            bind("DELETE FROM account WHERE id + 0 = 1", &catalog),
+            Ok(BoundDml::DeleteScan {
+                filter: Some(_),
+                ..
+            })
         ));
     }
 
     #[test]
-    fn non_equality_where_is_rejected() {
+    fn an_unsupported_where_shape_is_rejected_via_the_shared_binder() {
+        // AND chains are outside the shared SELECT predicate vocabulary — the
+        // refusal comes from the same binder, wrapped as `DmlError::Predicate`.
         let catalog = account_catalog();
         assert!(matches!(
-            bind("DELETE FROM account WHERE id > 1", &catalog),
-            Err(DmlError::Unsupported(_))
+            bind(
+                "DELETE FROM account WHERE id = 1 AND balance = 100",
+                &catalog
+            ),
+            Err(DmlError::Predicate(SelectError::UnsupportedPredicate(_)))
         ));
     }
 
@@ -1509,12 +1639,15 @@ mod tests {
     }
 
     #[test]
-    fn qualified_column_in_where_is_rejected_as_qualified_name() {
+    fn qualified_column_in_where_is_rejected() {
+        // The shared SELECT predicate binder ([STL-229]) resolves bare names
+        // only, so a qualified column is refused — with the same diagnostic a
+        // SELECT's WHERE gives (it sees no bindable column).
         let catalog = account_catalog();
-        assert_eq!(
+        assert!(matches!(
             bind("DELETE FROM account WHERE account.id = 1", &catalog),
-            Err(DmlError::QualifiedName("account.id".to_owned()))
-        );
+            Err(DmlError::Predicate(SelectError::UnsupportedPredicate(_)))
+        ));
     }
 
     #[test]

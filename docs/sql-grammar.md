@@ -206,6 +206,43 @@ live at the resolved system-time snapshot, that `snapshot`, an optional
   column names. The `WHERE` clause stays on the AST for the executor-glue layer
   (pgwire, STL-104) to lower.
 
+## DML row selection (STL-229)
+
+`UPDATE` / `DELETE` select the rows they write with the **same `WHERE`
+vocabulary the `SELECT` path evaluates** (STL-213): a single comparison anchored
+on one column — any of `=`, `<>`, `<`, `<=`, `>`, `>=`, with integer `+ - * / %`
+arithmetic on either side — or **no `WHERE` at all**, which is a whole-table
+write. The v0.1 `WHERE <key> = <literal>`-only restriction is lifted.
+
+```sql
+UPDATE account SET balance = 0 WHERE balance > 100;  -- value-column predicate
+DELETE FROM account WHERE id <= 3;                   -- non-equality key predicate
+DELETE FROM account;                                 -- whole table
+```
+
+Two plans, one semantics:
+
+- **Point fast path** — a `WHERE` that is exactly `<key> = <literal>` (either
+  operand order) lowers to the existing single-key write, with no scan. Its
+  pre-STL-229 contract is kept: writing an **absent** key is a statement error
+  (`KeyNotFound`), not a 0-row tag.
+- **Scan-then-write** — everything else (any other predicate, or no `WHERE`)
+  enumerates the matching **live** business keys at the statement snapshot, then
+  applies one per-key write per match as a **single atomic group** (one WAL
+  record, one fsync — the STL-192 group-commit discipline): a failure applying
+  any row of the set aborts the whole statement, leaving the table unchanged.
+
+The `UPDATE n` / `DELETE n` command tag counts the **matched live rows at the
+statement snapshot** (`0` when nothing matches). Inside a `BEGIN … COMMIT` block
+the matching scan overlays the transaction's own buffered writes
+(read-your-own-writes, STL-203) — an `INSERT` staged earlier in the block is
+matchable — and the matched set is fixed at the statement, not re-evaluated at
+`COMMIT`. On a valid-time table the selection is **system-axis-only** (it picks
+among system-live rows; an `UPDATE` still supplies the new version's period
+through its `SET`, as for a point write — STL-194); a valid-time-*scoped* bulk
+write is future work. A period predicate (`WHERE PERIOD(…) … PERIOD(…)`) is not
+accepted on DML.
+
 ## Type vocabulary
 
 Column types in `CREATE TABLE` are parsed as standard `sqlparser` `DataType`
