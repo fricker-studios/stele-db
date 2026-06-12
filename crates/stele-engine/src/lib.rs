@@ -9929,10 +9929,12 @@ mod tests {
     #[test]
     fn a_torn_group_commit_recovers_none_of_the_transaction() {
         // Crash-atomic group commit, the "none" branch ([STL-192]): if the single
-        // group-commit WAL append fails (a crash mid-commit), nothing the
-        // transaction wrote becomes durable — recovery finds none of it, never a
-        // partial prefix. Group mode buffers every write, so the commit's *only*
-        // append is the group-commit record; tearing it tears the whole transaction.
+        // group-commit WAL append fails, nothing the transaction wrote becomes
+        // durable — recovery finds none of it, never a partial prefix. Group mode
+        // buffers every write, so the commit's *only* append is the group-commit
+        // record; failing it fails the whole transaction. `MemDisk` injects this as a
+        // *clean* append failure — the fault fires before any byte is copied (no torn
+        // record) — which also exercises the STL-295 live-session rollback below.
         let faults = Faults::new();
         let disk = MemDisk::with_faults(faults.clone());
         let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
@@ -9950,7 +9952,7 @@ mod tests {
         faults.schedule(FaultOp::Append, io::ErrorKind::Other);
         let err = engine
             .commit(txn)
-            .expect_err("the torn group-commit append aborts the commit");
+            .expect_err("the clean group-commit append failure aborts the commit");
         assert!(matches!(err, EngineError::Storage(_)), "got {err:?}");
 
         // The *live* session must already match what recovery will reconstruct: the
@@ -9975,7 +9977,7 @@ mod tests {
             select(&mut engine, "SELECT id FROM account")
                 .rows
                 .is_empty(),
-            "a torn group commit leaves none of the transaction's writes",
+            "a failed group commit leaves none of the transaction's writes",
         );
     }
 
@@ -10856,11 +10858,13 @@ mod tests {
     #[test]
     fn a_torn_predicate_dml_commit_recovers_unchanged() {
         // Atomicity across the WAL boundary: an auto-committed whole-table UPDATE
-        // is one group-commit record; tearing its append makes none of the
+        // is one group-commit record; failing its append makes none of the
         // statement durable — recovery reads the pre-statement table, never a
         // partial prefix ([STL-192] discipline applied to the scan-then-write
         // plan). All rows are delta-resident, so the statement's only disk write
-        // is that record.
+        // is that record. As above, `MemDisk` models this as a *clean* append
+        // failure (the fault fires before any byte is copied), so it also pins the
+        // STL-295 live-session rollback below.
         let faults = Faults::new();
         let disk = MemDisk::with_faults(faults.clone());
         let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
@@ -10876,7 +10880,7 @@ mod tests {
         faults.schedule(FaultOp::Append, io::ErrorKind::Other);
         let err = engine
             .execute(&parse_one("UPDATE account SET balance = 0"))
-            .expect_err("the torn group-commit append fails the statement");
+            .expect_err("the clean group-commit append failure fails the statement");
         assert!(matches!(err, EngineError::Storage(_)), "got {err:?}");
 
         let unchanged = sorted(vec![
@@ -10904,7 +10908,7 @@ mod tests {
         assert_eq!(
             sorted(select(&mut engine, "SELECT * FROM account").rows),
             unchanged,
-            "none of the statement's writes survive the torn commit"
+            "none of the statement's writes survive the failed commit"
         );
     }
 
