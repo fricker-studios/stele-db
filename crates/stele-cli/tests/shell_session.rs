@@ -236,7 +236,10 @@ SELECT id, balance FROM account;
 SELECT id, balance FROM account;
 \\json
 \\?
+UPDATE account SET balance = 250 WHERE id = 1;
 \\history account 1
+\\timeline account 1
+\\lineage account 1
 \\status
 \\zz
 \\q
@@ -291,11 +294,32 @@ SELECT id, balance FROM account;
         "{stdout}"
     );
 
-    // Designed-but-not-wired tiers point at their tickets.
+    // \history — the live version-history surface (STL-199), end to end: two
+    // versions of key 1, the current one flagged, with the append-only trailer.
     assert!(
-        stdout.contains("NOTICE:  \\history") && stdout.contains("STL-199"),
+        stdout.contains("Version history — public.account  where id = 1"),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("INSERT") && stdout.contains("UPDATE"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("● current"), "{stdout}");
+    assert!(
+        stdout.contains("2 versions retained; nothing was overwritten."),
+        "{stdout}"
+    );
+
+    // \timeline — the bar chart over the balance measure, current flagged.
+    assert!(stdout.contains("Timeline — "), "{stdout}");
+    assert!(stdout.contains("public.account.balance"), "{stdout}");
+    assert!(stdout.contains("◀ as of now()"), "{stdout}");
+
+    // \lineage — the provenance tree, one branch per version.
+    assert!(stdout.contains("Lineage — "), "{stdout}");
+    assert!(stdout.contains("balance = 250"), "{stdout}");
+
+    // The still-stubbed admin tier points at its ticket.
     assert!(
         stdout.contains("NOTICE:  \\status") && stdout.contains("STL-200"),
         "{stdout}"
@@ -308,6 +332,45 @@ SELECT id, balance FROM account;
         stderr.contains("HINT:  Try \\? for a list of meta-commands."),
         "{stderr}"
     );
+}
+
+/// The `\asof` time-travel context (STL-199) injects a server-accepted
+/// `FOR SYSTEM_TIME AS OF` qualifier into a subsequent bare `SELECT`, then clears
+/// it. Uses `now()` so the round-trip is deterministic on the wall clock — the
+/// past-time-travel *semantics* are oracled at the engine and pgwire layers; here
+/// we prove the shell splices a well-formed qualifier end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn asof_context_injects_a_system_time_qualifier() {
+    let addr = spawn_server().await;
+    let script = "\
+CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING;
+INSERT INTO account VALUES (1, 100);
+\\asof now()
+SELECT balance FROM account;
+\\asof reset
+SELECT balance FROM account;
+\\q
+";
+    let output = tokio::task::spawn_blocking(move || run_shell(addr, script, &[]))
+        .await
+        .expect("shell task");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // Setting and clearing both print their context line.
+    assert!(
+        stdout.contains("Time-travel context set: AS OF now()."),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Time-travel context cleared"), "{stdout}");
+    // The time-traveled SELECT and the live one both return the row (the injected
+    // qualifier parsed and ran), and no error reached stderr.
+    assert_eq!(stdout.matches("100").count(), 2, "{stdout}");
+    assert!(!stderr.contains("ERROR"), "no error expected:\n{stderr}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

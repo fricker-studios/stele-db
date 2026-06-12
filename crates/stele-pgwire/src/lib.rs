@@ -1658,9 +1658,10 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
         // list — Postgres's 42P10, so a stock client sees the same class it
         // would from Postgres ([STL-263]).
         EngineError::Select(SelectError::DistinctOrderBy) => SQLSTATE_INVALID_COLUMN_REFERENCE,
-        EngineError::Dml(DmlError::BadLiteral { .. } | DmlError::TypeMismatch { .. }) => {
-            SQLSTATE_INVALID_TEXT_REPRESENTATION
-        }
+        EngineError::Dml(DmlError::BadLiteral { .. } | DmlError::TypeMismatch { .. })
+        // A `\history` key literal that does not fit the key column's type ([STL-199]) —
+        // the same invalid-text-representation class as a bad DML literal.
+        | EngineError::IntrospectionKey(_) => SQLSTATE_INVALID_TEXT_REPRESENTATION,
         EngineError::Select(_) | EngineError::Dml(_) | EngineError::Unsupported(_) => {
             SQLSTATE_FEATURE_NOT_SUPPORTED
         }
@@ -4078,7 +4079,58 @@ mod tests {
         let all = run_simple(&mut client, "SELECT id FROM account").await;
         let count = all.iter().filter(|(k, _)| *k == MSG_DATA_ROW).count();
         assert_eq!(count, 5, "the committed group adds both rows");
+        terminate(server, client).await;
+    }
 
+    #[tokio::test]
+    async fn stele_history_introspection_round_trips_over_the_wire() {
+        // The temporal introspection surface ([STL-199]): `SELECT * FROM
+        // stele_history('account', 1)` returns the key's append-only timeline as
+        // an ordinary row set — the metadata prefix then the table's own columns.
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+        run_simple(&mut client, "INSERT INTO account VALUES (1, 100)").await;
+        run_simple(&mut client, "UPDATE account SET balance = 250 WHERE id = 1").await;
+
+        let history = run_simple(&mut client, "SELECT * FROM stele_history('account', 1)").await;
+        assert_eq!(history[0].0, MSG_ROW_DESCRIPTION);
+        assert_eq!(
+            parse_row_description_names(&history[0].1),
+            vec![
+                "txid",
+                "op",
+                "sys_from",
+                "sys_to",
+                "current",
+                "principal",
+                "id",
+                "balance"
+            ],
+        );
+
+        let rows: Vec<Vec<Option<Vec<u8>>>> = history
+            .iter()
+            .filter(|(kind, _)| *kind == MSG_DATA_ROW)
+            .map(|(_, payload)| parse_data_row(payload))
+            .collect();
+        let text = |cell: &Option<Vec<u8>>| {
+            cell.as_ref()
+                .map(|b| String::from_utf8(b.clone()).expect("utf-8"))
+        };
+        assert_eq!(rows.len(), 2, "two versions of key 1");
+        // Oldest first: INSERT 100, superseded (current = f, sys_to present).
+        assert_eq!(text(&rows[0][1]).as_deref(), Some("INSERT"));
+        assert_eq!(text(&rows[0][4]).as_deref(), Some("f"));
+        assert!(rows[0][3].is_some(), "the superseded version has a sys_to");
+        assert_eq!(text(&rows[0][7]).as_deref(), Some("100"));
+        // Newest: UPDATE 250, current (current = t, sys_to NULL).
+        assert_eq!(text(&rows[1][1]).as_deref(), Some("UPDATE"));
+        assert_eq!(text(&rows[1][4]).as_deref(), Some("t"));
+        assert!(rows[1][3].is_none(), "the current version has no sys_to");
+        assert_eq!(text(&rows[1][7]).as_deref(), Some("250"));
+        assert_eq!(text(&rows[1][6]).as_deref(), Some("1"), "the business key");
+
+        assert_eq!(command_tag(&history.last().unwrap().1), "SELECT 2");
         terminate(server, client).await;
     }
 

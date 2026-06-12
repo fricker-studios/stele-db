@@ -15,6 +15,7 @@
 //! SQL errors render as the psql-style `ERROR:` / `SQLSTATE:` / `HINT:` block
 //! on stderr and the session continues; transport errors end the shell.
 
+use std::borrow::Cow;
 use std::io::{BufRead, IsTerminal as _, Write};
 use std::time::Instant;
 
@@ -37,8 +38,11 @@ pub struct Opts {
     pub no_color: bool,
 }
 
-/// Follow-up tickets the not-yet-wired command tiers point at.
-const TEMPORAL_TICKET: &str = "STL-199";
+/// Follow-up tickets the not-yet-wired command tiers point at. The version-history
+/// temporal commands (`\asof` / `\history` / `\timeline` / `\lineage`) are live
+/// (STL-199); these are the remaining tiers.
+const SEGMENTS_TICKET: &str = "STL-301";
+const AUDIT_TICKET: &str = "STL-302";
 const ADMIN_TICKET: &str = "STL-200";
 
 /// Per-session display state (the prototype's toggles), plus the two themes —
@@ -54,6 +58,10 @@ struct Session {
     timing: bool,
     expanded: bool,
     json: bool,
+    /// The session `\asof` time-travel context: a `FOR SYSTEM_TIME AS OF` expression
+    /// (verbatim, server-resolved) injected into subsequent bare `SELECT`s, or
+    /// `None` for the live present ([STL-199]).
+    asof: Option<String>,
     interactive: bool,
     host: String,
     port: u16,
@@ -100,6 +108,7 @@ pub fn run(opts: &Opts) -> anyhow::Result<()> {
         timing: interactive,
         expanded: false,
         json: false,
+        asof: None,
         interactive,
         host: opts.host.clone(),
         port: opts.port,
@@ -341,6 +350,25 @@ enum Meta<'a> {
     Expanded(Option<&'a str>),
     /// `\json [on|off]`.
     Json(Option<&'a str>),
+    /// `\asof <expr…|reset>` — set or clear the session time-travel context. The
+    /// argument is the rest of the line (a multi-word `FOR SYSTEM_TIME AS OF`
+    /// expression); `None` / `reset` clears it.
+    AsOf(Option<&'a str>),
+    /// `\history T [pk]` — a row's (or a table's) append-only version timeline.
+    History {
+        table: &'a str,
+        key: Option<&'a str>,
+    },
+    /// `\timeline T <pk>` — a value across system-time, as a bar chart.
+    Timeline {
+        table: &'a str,
+        key: &'a str,
+    },
+    /// `\lineage T <pk>` — provenance: which txn wrote each version.
+    Lineage {
+        table: &'a str,
+        key: &'a str,
+    },
     Clear,
     Connect,
     /// A designed-but-not-yet-wired command (temporal or admin tier).
@@ -373,9 +401,14 @@ fn toggle_value(current: bool, arg: Option<&str>) -> Result<bool, ServerError> {
 /// Parse a meta-command line; `None` means the line is SQL.
 fn parse_meta(line: &str) -> Option<Meta<'_>> {
     let trimmed = line.trim();
-    let rest = trimmed.strip_prefix('\\')?;
-    let mut parts = rest.split_whitespace();
-    let cmd = parts.next().unwrap_or("");
+    // `cmd` is the first whitespace-delimited word; `remainder` is everything after
+    // it (kept whole for `\asof`, whose argument is a multi-word expression), and
+    // `arg` / a second `parts.next()` are its first two tokens (for `\history T pk`).
+    let rest = trimmed.strip_prefix('\\')?.trim_start();
+    let (cmd, remainder) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(c, r)| (c, r.trim()));
+    let mut parts = remainder.split_whitespace();
     let arg = parts.next();
     Some(match cmd {
         "q" => Meta::Quit,
@@ -398,10 +431,48 @@ fn parse_meta(line: &str) -> Option<Meta<'_>> {
         "json" => Meta::Json(arg),
         "clear" | "c!" => Meta::Clear,
         "c" | "connect" => Meta::Connect,
-        "asof" | "history" | "timeline" | "lineage" | "audit" | "segments" => Meta::NotYet {
+        // The version-history temporal tier — live (STL-199). `\asof` takes the
+        // whole remainder (a `FOR SYSTEM_TIME AS OF` expression); the others a
+        // table and an optional / required key.
+        "asof" => Meta::AsOf(match remainder {
+            "" => None,
+            r if r.eq_ignore_ascii_case("reset") => None,
+            r => Some(r),
+        }),
+        "history" => arg.map_or_else(
+            || Meta::BadArgs {
+                message: r"\history needs a table".to_owned(),
+                hint: r"e.g. \history account 1  (omit the key to list every row)",
+            },
+            |table| Meta::History {
+                table,
+                key: parts.next(),
+            },
+        ),
+        "timeline" => match (arg, parts.next()) {
+            (Some(table), Some(key)) => Meta::Timeline { table, key },
+            _ => Meta::BadArgs {
+                message: r"\timeline needs a table and a primary key".to_owned(),
+                hint: r"e.g. \timeline account 1",
+            },
+        },
+        "lineage" => match (arg, parts.next()) {
+            (Some(table), Some(key)) => Meta::Lineage { table, key },
+            _ => Meta::BadArgs {
+                message: r"\lineage needs a table and a primary key".to_owned(),
+                hint: r"e.g. \lineage account 1",
+            },
+        },
+        // The remaining temporal-tier commands, still stubbed at their tickets.
+        "audit" => Meta::NotYet {
             cmd,
-            ticket: TEMPORAL_TICKET,
-            why: "needs the temporal introspection surface",
+            ticket: AUDIT_TICKET,
+            why: "verifies the tamper-evident commit hash chain",
+        },
+        "segments" => Meta::NotYet {
+            cmd,
+            ticket: SEGMENTS_TICKET,
+            why: "introspects columnar segments + zone maps",
         },
         "status" | "backup" | "restore" | "pitr" | "inspect-segment" | "inspect" => Meta::NotYet {
             cmd,
@@ -459,6 +530,17 @@ fn dispatch_meta(
                 write_segs(session, out, &[(Role::Mut, msg.to_owned())])?;
             }
         },
+        Meta::AsOf(expr) => {
+            session.asof = expr.map(str::to_owned);
+            let msg = session.asof.as_ref().map_or_else(
+                || "Time-travel context cleared — reading the live present.".to_owned(),
+                |e| format!("Time-travel context set: AS OF {e}."),
+            );
+            write_segs(session, out, &[(Role::Mut, msg)])?;
+        }
+        Meta::History { table, key } => history(client, session, table, *key, out)?,
+        Meta::Timeline { table, key } => timeline(client, session, table, key, out)?,
+        Meta::Lineage { table, key } => lineage(client, session, table, key, out)?,
         Meta::Clear => {
             if session.interactive {
                 // Clear screen + scrollback, home the cursor.
@@ -824,6 +906,326 @@ fn conninfo(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Temporal introspection (\asof \history \timeline \lineage) — STL-199
+// ---------------------------------------------------------------------------
+
+/// Splice the session `\asof` context into a statement: a bare `SELECT` without
+/// its own system-time qualifier gains a trailing `FOR SYSTEM_TIME AS OF <expr>`
+/// the server resolves. Everything else — a write, a query that already time-
+/// travels, or a multi-statement batch — passes through untouched.
+///
+/// The clause is appended at the end because Stele's parser **lifts** every
+/// `FOR { SYSTEM_TIME | VALID_TIME } AS OF` qualifier off the token stream
+/// wherever it sits before handing the rest to `sqlparser` (STL-162), so position
+/// does not matter and the appended expression runs cleanly to end-of-statement.
+fn apply_asof<'a>(sql: &'a str, asof: Option<&str>) -> Cow<'a, str> {
+    let Some(asof) = asof else {
+        return Cow::Borrowed(sql);
+    };
+    let trimmed = sql.trim();
+    let had_semi = trimmed.ends_with(';');
+    let body = trimmed.trim_end_matches(';').trim_end();
+    let lower = body.to_ascii_lowercase();
+    // Only a single bare SELECT, and never one that already pins the system axis.
+    // A `;` left in the body means a multi-statement batch (or a literal we will
+    // not risk mis-splicing) — leave it alone rather than guess where the clause
+    // belongs.
+    if !lower.starts_with("select") || lower.contains("for system_time as of") || body.contains(';')
+    {
+        return Cow::Borrowed(sql);
+    }
+    let rewritten = format!("{body} FOR SYSTEM_TIME AS OF {asof}");
+    Cow::Owned(if had_semi {
+        format!("{rewritten};")
+    } else {
+        rewritten
+    })
+}
+
+/// Run the `stele_history` introspection query for `table` (optionally one `key`)
+/// and return its result set, or `None` after handling the empty / error cases:
+/// a server error renders the psql block, an empty timeline a "No versions"
+/// notice. The shared fetch behind `\history` / `\timeline` / `\lineage`.
+fn fetch_history(
+    client: &mut Client,
+    session: &Session,
+    table: &str,
+    key: Option<&str>,
+    out: &mut impl Write,
+) -> anyhow::Result<Option<ResultSet>> {
+    // The table name is a string literal (single quotes doubled); the key, when
+    // given, rides verbatim as a SQL literal the server folds to the key type
+    // (so a text key must be quoted: `\history users 'alice'`).
+    let table_lit = table.replace('\'', "''");
+    let query = key.map_or_else(
+        || format!("SELECT * FROM stele_history('{table_lit}')"),
+        |k| format!("SELECT * FROM stele_history('{table_lit}', {k})"),
+    );
+    let replies = client.simple_query(&query)?;
+    if let Some(err) = first_error(&replies) {
+        print_error(session, err);
+        return Ok(None);
+    }
+    let set = first_result_set(&replies).cloned().unwrap_or(ResultSet {
+        columns: Vec::new(),
+        rows: Vec::new(),
+    });
+    if set.rows.is_empty() {
+        let what = key.map_or_else(
+            || format!("table {table}"),
+            |k| format!("{table} where key = {k}"),
+        );
+        write_segs(
+            session,
+            out,
+            &[(Role::Mut, format!("No versions for {what}."))],
+        )?;
+        return Ok(None);
+    }
+    Ok(Some(set))
+}
+
+/// The metadata-prefix width of a `stele_history` reply: `txid, op, sys_from,
+/// sys_to, current, principal` precede the table's own columns ([STL-199]).
+const HISTORY_META_COLS: usize = 6;
+
+/// The table column to chart / surface in `\timeline` / `\lineage`: the first
+/// whose name reads like a measure (`balance` / `amount` / `total` / `value`),
+/// else the last — matching the prototype's heuristic. Returns its offset within
+/// the value columns and its name. `value_cols` is never empty (every table has
+/// at least its key column).
+fn measure_column(value_cols: &[Column]) -> (usize, &str) {
+    let is_measure = |name: &str| {
+        let n = name.to_ascii_lowercase();
+        ["balance", "amount", "total", "value"]
+            .iter()
+            .any(|m| n.contains(m))
+    };
+    value_cols
+        .iter()
+        .position(|c| is_measure(&c.name))
+        .map_or_else(
+            || {
+                let last = value_cols.len().saturating_sub(1);
+                (last, value_cols[last].name.as_str())
+            },
+            |i| (i, value_cols[i].name.as_str()),
+        )
+}
+
+/// The `pk` column's name — the first of the table's own columns (the business
+/// key), or a fallback when a reply carries none.
+fn key_column_name(value_cols: &[Column]) -> &str {
+    value_cols.first().map_or("id", |c| c.name.as_str())
+}
+
+/// `\history T [pk]` — the append-only version timeline as a table: `txid`, `op`,
+/// the table's value columns, the resolved `sys_period`, and the `state` glyph,
+/// oldest first, with the retained-count trailer.
+fn history(
+    client: &mut Client,
+    session: &Session,
+    table: &str,
+    key: Option<&str>,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    let Some(set) = fetch_history(client, session, table, key, out)? else {
+        return Ok(());
+    };
+    let value_cols = set.columns.get(HISTORY_META_COLS..).unwrap_or(&[]);
+    let pk_col = key_column_name(value_cols);
+    let title = key.map_or_else(
+        || format!("Version history — public.{table}"),
+        |k| format!("Version history — public.{table}  where {pk_col} = {k}"),
+    );
+
+    // Render columns: txid, op, <value columns>, sys_period, state.
+    let mut columns = vec![
+        Column {
+            name: "txid".to_owned(),
+            type_oid: 20,
+        },
+        text_col("op"),
+    ];
+    columns.extend(value_cols.iter().cloned());
+    columns.push(text_col("sys_period"));
+    columns.push(text_col("state"));
+
+    let rows: Vec<Vec<Option<String>>> = set
+        .rows
+        .iter()
+        .map(|r| {
+            let cell = |i: usize| r.get(i).cloned().flatten();
+            let sys_from = r.get(2).and_then(Option::as_deref).unwrap_or("");
+            let sys_to = r.get(3).and_then(Option::as_deref);
+            let current = r.get(4).and_then(Option::as_deref) == Some("t");
+            let period = format!("[{sys_from}, {})", sys_to.unwrap_or("∞"));
+            let state = if current { "● current" } else { "superseded" };
+            let mut row = vec![cell(0), cell(1)];
+            row.extend((HISTORY_META_COLS..set.columns.len()).map(cell));
+            row.push(Some(period));
+            row.push(Some(state.to_owned()));
+            row
+        })
+        .collect();
+
+    let mut lines = vec![vec![(Role::Head, title)]];
+    lines.extend(render::table_lines(
+        &columns,
+        &rows,
+        session.table_opts(false),
+    ));
+    let n = set.rows.len();
+    lines.push(vec![
+        (Role::Dim, "append-only — ".to_owned()),
+        (
+            Role::Mut,
+            format!(
+                "{n} version{} retained; nothing was overwritten.",
+                if n == 1 { "" } else { "s" }
+            ),
+        ),
+    ]);
+    write_lines(session, out, &lines)
+}
+
+/// `\timeline T <pk>` — a measure column across system-time as a bar chart, one
+/// row per version (time · op glyph · value · bar), the current version flagged.
+fn timeline(
+    client: &mut Client,
+    session: &Session,
+    table: &str,
+    key: &str,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    let Some(set) = fetch_history(client, session, table, Some(key), out)? else {
+        return Ok(());
+    };
+    let value_cols = set.columns.get(HISTORY_META_COLS..).unwrap_or(&[]);
+    if value_cols.is_empty() {
+        return write_segs(
+            session,
+            out,
+            &[(Role::Mut, format!("No value column to chart in {table}."))],
+        );
+    }
+    let (vcol_off, vcol_name) = measure_column(value_cols);
+    let vcol_idx = HISTORY_META_COLS + vcol_off;
+    let pk_col = key_column_name(value_cols);
+
+    // Parse the measure to scale the bars; a non-numeric measure draws a unit bar.
+    let nums: Vec<Option<f64>> = set
+        .rows
+        .iter()
+        .map(|r| {
+            r.get(vcol_idx)
+                .and_then(Option::as_deref)
+                .and_then(|s| s.parse::<f64>().ok())
+        })
+        .collect();
+    let max = nums.iter().flatten().copied().fold(1.0_f64, f64::max);
+    const WIDTH: f64 = 26.0;
+
+    let mut lines = vec![vec![
+        (Role::Head, "Timeline — ".to_owned()),
+        (Role::Acc, format!("public.{table}.{vcol_name}")),
+        (
+            Role::Dim,
+            format!("  where {pk_col} = {key}   (system-time →)"),
+        ),
+    ]];
+    for (i, r) in set.rows.iter().enumerate() {
+        let sys_from = r.get(2).and_then(Option::as_deref).unwrap_or("");
+        let time = sys_from.get(11..19).unwrap_or(sys_from);
+        let op = r.get(1).and_then(Option::as_deref).unwrap_or("");
+        let current = r.get(4).and_then(Option::as_deref) == Some("t");
+        let value = r.get(vcol_idx).and_then(Option::as_deref).unwrap_or("");
+        let glyph = match op {
+            "INSERT" => "✚",
+            "UPDATE" => "◆",
+            _ => "✕",
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "bar length is a small, clamped count of glyphs"
+        )]
+        let len = nums[i].map_or(1, |v| ((v / max) * WIDTH).round().max(1.0) as usize);
+        let accent = if current { Role::Acc } else { Role::Dim };
+        let mut segs = vec![
+            (Role::Mut, format!("  {time}  ")),
+            (accent, glyph.to_owned()),
+            (Role::Num, format!(" {value:>6}")),
+            (accent, format!("  {}", "▇".repeat(len))),
+        ];
+        if current {
+            segs.push((Role::Ok, "  ◀ as of now()".to_owned()));
+        }
+        lines.push(segs);
+    }
+    lines.push(vec![
+        (Role::Dim, "  query any point: ".to_owned()),
+        (
+            Role::Mut,
+            format!("SELECT {vcol_name} FROM {table} FOR SYSTEM_TIME AS OF '<ts>' WHERE …"),
+        ),
+    ]);
+    write_lines(session, out, &lines)
+}
+
+/// `\lineage T <pk>` — provenance as a tree: each version's `txn` / `op` /
+/// instant, then its measure value and the principal that wrote it. (The
+/// tamper-evident `hash ← prevHash` chain is `\audit`'s job — STL-302.)
+fn lineage(
+    client: &mut Client,
+    session: &Session,
+    table: &str,
+    key: &str,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    let Some(set) = fetch_history(client, session, table, Some(key), out)? else {
+        return Ok(());
+    };
+    let value_cols = set.columns.get(HISTORY_META_COLS..).unwrap_or(&[]);
+    let (vcol_off, vcol_name) = measure_column(value_cols);
+    let vcol_idx = HISTORY_META_COLS + vcol_off;
+    let pk_col = key_column_name(value_cols);
+
+    let mut lines = vec![vec![
+        (Role::Head, "Lineage — ".to_owned()),
+        (Role::Acc, format!("public.{table}  where {pk_col} = {key}")),
+    ]];
+    let n = set.rows.len();
+    for (i, r) in set.rows.iter().enumerate() {
+        let last = i + 1 == n;
+        let txid = r.first().and_then(Option::as_deref).unwrap_or("?");
+        let op = r.get(1).and_then(Option::as_deref).unwrap_or("");
+        let sys_from = r.get(2).and_then(Option::as_deref).unwrap_or("");
+        let principal = r.get(5).and_then(Option::as_deref).unwrap_or("");
+        let value = r.get(vcol_idx).and_then(Option::as_deref).unwrap_or("");
+        let op_role = if op == "INSERT" { Role::Ok } else { Role::Acc };
+        lines.push(vec![
+            (Role::Div, (if last { "  └ " } else { "  ├ " }).to_owned()),
+            (Role::Head, format!("v{}  ", i + 1)),
+            (Role::Mut, format!("txn {txid}  ")),
+            (op_role, format!("{op:<6}")),
+            (Role::Mut, format!("  {sys_from}")),
+        ]);
+        lines.push(vec![
+            (
+                Role::Div,
+                (if last { "      " } else { "  │   " }).to_owned(),
+            ),
+            (Role::Text, format!("{vcol_name} = {value}")),
+            (Role::Dim, "   by ".to_owned()),
+            (Role::Mut, principal.to_owned()),
+            (Role::Dim, " via pg-wire".to_owned()),
+        ]);
+    }
+    write_lines(session, out, &lines)
+}
+
+// ---------------------------------------------------------------------------
 // SQL execution + rendering
 // ---------------------------------------------------------------------------
 
@@ -838,8 +1240,11 @@ fn run_statement(
     sql: &str,
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
+    // Apply the session `\asof` time-travel context: a bare `SELECT` gains a
+    // `FOR SYSTEM_TIME AS OF <expr>` qualifier the server resolves ([STL-199]).
+    let sql = apply_asof(sql, session.asof.as_deref());
     let started = Instant::now();
-    let replies = client.simple_query(sql)?;
+    let replies = client.simple_query(&sql)?;
     let timed = session.timing.then(|| started.elapsed());
     // The whole round-trip is measured once, so the trailer may carry it only
     // when there is exactly one row set to pin it to (and the table/expanded
@@ -1355,14 +1760,100 @@ mod tests {
 
     #[test]
     fn designed_tiers_resolve_to_their_tickets() {
-        let Some(Meta::NotYet { ticket, .. }) = parse_meta(r"\history account 1") else {
+        // The still-stubbed temporal-tier commands point at their split-out
+        // follow-ups; the admin tier at STL-200.
+        let Some(Meta::NotYet { ticket, .. }) = parse_meta(r"\segments account") else {
             panic!("expected NotYet");
         };
-        assert_eq!(ticket, TEMPORAL_TICKET);
+        assert_eq!(ticket, SEGMENTS_TICKET);
+        let Some(Meta::NotYet { ticket, .. }) = parse_meta(r"\audit account") else {
+            panic!("expected NotYet");
+        };
+        assert_eq!(ticket, AUDIT_TICKET);
         let Some(Meta::NotYet { ticket, .. }) = parse_meta(r"\inspect seg-0002") else {
             panic!("expected NotYet");
         };
         assert_eq!(ticket, ADMIN_TICKET);
+    }
+
+    #[test]
+    fn temporal_commands_parse_their_table_and_key() {
+        assert_eq!(
+            parse_meta(r"\history account 1"),
+            Some(Meta::History {
+                table: "account",
+                key: Some("1"),
+            })
+        );
+        // \history's key is optional (whole-table timeline).
+        assert_eq!(
+            parse_meta(r"\history account"),
+            Some(Meta::History {
+                table: "account",
+                key: None,
+            })
+        );
+        assert_eq!(
+            parse_meta(r"\timeline account 1"),
+            Some(Meta::Timeline {
+                table: "account",
+                key: "1",
+            })
+        );
+        assert_eq!(
+            parse_meta(r"\lineage account 1"),
+            Some(Meta::Lineage {
+                table: "account",
+                key: "1",
+            })
+        );
+        // \timeline / \lineage require a key.
+        assert!(matches!(
+            parse_meta(r"\timeline account"),
+            Some(Meta::BadArgs { .. })
+        ));
+        assert!(matches!(
+            parse_meta(r"\history"),
+            Some(Meta::BadArgs { .. })
+        ));
+    }
+
+    #[test]
+    fn asof_takes_a_multi_word_expression_and_resets() {
+        // The whole remainder is the AS OF expression, spaces and all.
+        assert_eq!(
+            parse_meta(r"\asof now() - interval '1 second'"),
+            Some(Meta::AsOf(Some("now() - interval '1 second'")))
+        );
+        // Bare and `reset` both clear.
+        assert_eq!(parse_meta(r"\asof"), Some(Meta::AsOf(None)));
+        assert_eq!(parse_meta(r"\asof reset"), Some(Meta::AsOf(None)));
+        assert_eq!(parse_meta(r"\asof RESET"), Some(Meta::AsOf(None)));
+    }
+
+    #[test]
+    fn asof_rewrites_only_bare_selects() {
+        // A bare SELECT gains the qualifier; the trailing `;` is preserved.
+        assert_eq!(
+            apply_asof("SELECT * FROM account;", Some("2")),
+            "SELECT * FROM account FOR SYSTEM_TIME AS OF 2;"
+        );
+        // No context set → untouched.
+        assert_eq!(
+            apply_asof("SELECT * FROM account;", None),
+            "SELECT * FROM account;"
+        );
+        // A write is never time-traveled.
+        assert_eq!(
+            apply_asof("INSERT INTO account VALUES (1, 2);", Some("2")),
+            "INSERT INTO account VALUES (1, 2);"
+        );
+        // A query that already pins the system axis is left as written.
+        let already = "SELECT * FROM account FOR SYSTEM_TIME AS OF 5;";
+        assert_eq!(apply_asof(already, Some("2")), already);
+        // A multi-statement batch is not spliced.
+        let batch = "SELECT 1; SELECT 2;";
+        assert_eq!(apply_asof(batch, Some("2")), batch);
     }
 
     #[test]

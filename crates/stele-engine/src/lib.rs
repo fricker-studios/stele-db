@@ -68,7 +68,7 @@ use stele_common::period::Interval;
 use stele_common::provenance::{Principal, TxnId};
 use stele_common::row_codec::{self, RowCodecError};
 use stele_common::scram::{self, ScramVerifier};
-use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
+use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros, ValidTimeMicros};
 use stele_common::types::{LogicalType, ScalarValue};
 use stele_exec::{
     AggregateFunc as ExecAggregateFunc, Aggregator, ArithOp as ExecArithOp, Batch, CmpOp, Column,
@@ -91,7 +91,7 @@ use stele_sql::{
     bind_dml, bind_select, without_filter,
 };
 use stele_storage::backend::Disk;
-use stele_storage::delta::{BusinessKey, Snapshot};
+use stele_storage::delta::{BusinessKey, Snapshot, Version};
 use stele_storage::dml::{CommittedTxns, DmlOutcome};
 use stele_storage::engine::{Engine, EngineError as StorageError};
 use stele_storage::segment::{ColumnId, Predicate, ZoneBound};
@@ -674,6 +674,13 @@ pub enum EngineError {
     /// `SELECT`, nor an `INSERT` / `UPDATE` / `DELETE`.
     #[error("statement not routable by the session engine: {0}")]
     Unsupported(&'static str),
+
+    /// A `\history` introspection key literal ([STL-199]) could not be folded to
+    /// the table's key-column type — a `NULL`, wrong-typed, or out-of-range key.
+    /// Carries the reason; the wire layer maps it to `22P02`
+    /// (`invalid_text_representation`).
+    #[error("invalid history key: {0}")]
+    IntrospectionKey(String),
 
     /// A snapshot-isolation **write-write conflict**: a key this transaction wrote
     /// was committed by another transaction *after* this one's pinned snapshot.
@@ -1330,6 +1337,115 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .collect()
     }
 
+    /// The append-only version timeline of `key` in `table` — or of every key when
+    /// `key` is `None` — for the shell's `\history` / `\timeline` / `\lineage`
+    /// temporal commands ([STL-199]).
+    ///
+    /// The result is a [`SelectResult`] whose columns are a fixed metadata prefix
+    /// — `txid`, `op`, `sys_from`, `sys_to`, `current`, `principal` — then the
+    /// table's own columns (the business key, then its value columns), so one
+    /// reply feeds every renderer. There is one row per version, grouped by key and
+    /// ordered oldest-to-newest within each key; superseded and deleted versions
+    /// are all present (Stele never destroys history), a current version has
+    /// `sys_to = NULL` / `current = true`.
+    ///
+    /// The key literal is folded to the key column's type **the same way
+    /// `bind_dml` folds an `INSERT` key** ([`stele_sql::fold_literal`]), so the
+    /// business key matches byte-for-byte. Each version's stored payload is sliced
+    /// back into its value columns ([row codec](stele_common::row_codec)); its `op`
+    /// is derived from chain adjacency (`version_op`) and its provenance rides
+    /// inline on the record. Read-only introspection: it makes no commit and
+    /// mutates nothing. An empty result (unknown key, empty table) is `Ok` with
+    /// zero rows, not an error.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::UnknownTable`] if `table` is not live;
+    /// [`EngineError::IntrospectionKey`] if `key` cannot be folded to the key
+    /// column's type; [`EngineError::Storage`] / [`EngineError::RowCodec`] if a
+    /// tier read or a payload decode fails.
+    pub fn version_history(
+        &self,
+        table: &str,
+        key: Option<&stele_sql::sqlparser::ast::Expr>,
+    ) -> Result<SelectResult, EngineError> {
+        // `version_history` resolves the table's schema at the current instant; a
+        // missing tier or unresolvable name is an unknown table.
+        let state = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
+        let schema = self
+            .catalog
+            .resolve(table, self.clock.current())
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
+        let schema_columns: Vec<(String, LogicalType)> = schema
+            .columns()
+            .iter()
+            .map(|c| (c.name().to_owned(), c.ty()))
+            .collect();
+        // Column 0 is the business key; the rest are value columns packed into the
+        // payload by the row codec.
+        let key_ty = schema_columns
+            .first()
+            .map_or(LogicalType::Int8, |(_, ty)| *ty);
+        let value_count = schema_columns.len().saturating_sub(1);
+
+        // Fold the introspection key exactly as `bind_dml` folded the `INSERT` key,
+        // so the business key bytes match what was written ([`fold_literal`]).
+        let business_key = match key {
+            Some(expr) => Some(business_key(
+                &stele_sql::fold_literal(expr, key_ty).map_err(EngineError::IntrospectionKey)?,
+            )),
+            None => None,
+        };
+
+        let versions = state.engine.version_history(business_key.as_ref())?;
+
+        // Columns: the metadata prefix, then the table's own columns (key + values).
+        let mut columns = vec![
+            ("txid".to_owned(), LogicalType::Int8),
+            ("op".to_owned(), LogicalType::Text),
+            ("sys_from".to_owned(), LogicalType::TimestampTz),
+            ("sys_to".to_owned(), LogicalType::TimestampTz),
+            ("current".to_owned(), LogicalType::Bool),
+            ("principal".to_owned(), LogicalType::Text),
+        ];
+        columns.extend(schema_columns.iter().cloned());
+
+        let mut rows = Vec::with_capacity(versions.len());
+        let mut prev: Option<&Version> = None;
+        for v in &versions {
+            let op = version_op(prev, v);
+            prev = Some(v);
+            let current = v.sys_to == SYSTEM_TIME_OPEN;
+            let principal = String::from_utf8_lossy(&v.provenance.principal.0).into_owned();
+
+            // Every cell is the value's canonical encoding (or `None` for NULL), the
+            // same shape a `SELECT` ships — the wire layer decodes each by its column
+            // type ([`stele_common::types::ScalarValue::decode`]). The business key
+            // and the row-codec-sliced value cells are already canonical encodings,
+            // so only the synthesized metadata cells are encoded here.
+            let mut row: Vec<Option<Vec<u8>>> = vec![
+                Some(encode_value(&ScalarValue::Int8(
+                    i64::try_from(v.provenance.txn_id.0).unwrap_or(i64::MAX),
+                ))),
+                Some(encode_value(&ScalarValue::Text(op.to_owned()))),
+                Some(encode_value(&ScalarValue::TimestampTz(v.sys_from.0))),
+                (!current).then(|| encode_value(&ScalarValue::TimestampTz(v.sys_to.0))),
+                Some(encode_value(&ScalarValue::Bool(current))),
+                Some(encode_value(&ScalarValue::Text(principal))),
+                Some(v.business_key.as_bytes().to_vec()),
+            ];
+            row.extend(row_codec::decode_payload(
+                value_count,
+                v.payload.as_deref(),
+            )?);
+            rows.push(row);
+        }
+        Ok(SelectResult { columns, rows })
+    }
+
     /// Execute one parsed [`Statement`] against the session.
     ///
     /// Routes by binding, in order: a `CREATE TABLE` / `DROP TABLE` applies to the
@@ -1624,6 +1740,20 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // are routed before the binders, which all assume one ([STL-219]).
         if let StatementBody::Admin(cmd) = &stmt.body {
             return self.apply_admin(*cmd);
+        }
+
+        // Stele-native temporal introspection: `SELECT * FROM stele_history('t'[, key])`
+        // is the wire surface the shell's `\history` / `\timeline` / `\lineage`
+        // commands read ([STL-199]). Recognized structurally here — ahead of the
+        // binders, which have no `stele_history` relation — and answered from the
+        // version timeline as an ordinary row set, so the whole wire path (rows,
+        // errors, the extended protocol) carries it unchanged. Introspection reads
+        // committed state at the current instant, not the overlay/`read_snapshot`,
+        // so it ignores both (a transaction's buffered writes do not appear).
+        if let Some((table, key)) = stele_history_call(stmt) {
+            return self
+                .version_history(&table, key)
+                .map(StatementOutcome::Rows);
         }
 
         // DDL first: `bind_ddl` cleanly rejects non-DDL with `NotDdl`, which we
@@ -4082,6 +4212,99 @@ fn business_key(value: &ScalarValue) -> BusinessKey {
     BusinessKey::new(encode_value(value))
 }
 
+/// Recognize the Stele-native temporal introspection call `stele_history('t'[,
+/// key])` — the wire surface the shell's `\history` / `\timeline` / `\lineage`
+/// commands issue ([STL-199]) — returning the table name and the optional key
+/// literal (borrowed from `stmt`, folded to the key type later). `None` for any
+/// other statement, so the normal binders run.
+///
+/// Recognized structurally, like the `pg_catalog` shim: a single-relation `FROM`
+/// whose base is a table-valued function named `stele_history` (case-insensitive,
+/// last name part), its first unnamed argument a string literal (the table), an
+/// optional second the business key. A `JOIN`, a missing/non-string table
+/// argument, or any extra shape falls through to the binders unchanged.
+fn stele_history_call(
+    stmt: &Statement,
+) -> Option<(String, Option<&stele_sql::sqlparser::ast::Expr>)> {
+    use stele_sql::sqlparser::ast::{
+        Expr, FunctionArg, FunctionArgExpr, SetExpr, Statement as SqlStatement, TableFactor, Value,
+    };
+
+    let SqlStatement::Query(query) = stmt.sql()? else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let [from] = select.from.as_slice() else {
+        return None;
+    };
+    if !from.joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table {
+        name,
+        args: Some(args),
+        ..
+    } = &from.relation
+    else {
+        return None;
+    };
+    if !name
+        .0
+        .last()?
+        .as_ident()
+        .is_some_and(|id| id.value.eq_ignore_ascii_case("stele_history"))
+    {
+        return None;
+    }
+    let mut exprs = args.args.iter().filter_map(|arg| match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
+        _ => None,
+    });
+    // First argument: the table name, a single-quoted string literal.
+    let table = match exprs.next()? {
+        Expr::Value(v) => match &v.value {
+            Value::SingleQuotedString(s) => s.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    // Optional second argument: the business-key literal, folded to the key type
+    // by [`SessionEngine::version_history`]. Absent ⇒ every key's timeline.
+    Some((table, exprs.next()))
+}
+
+/// The operation that produced `version`, for the `\history` / `\lineage`
+/// timeline ([STL-199]): an `UPDATE` iff its predecessor in the **same key's**
+/// chain abuts it — the prior period's `sys_to` equals this version's `sys_from`,
+/// a supersession — otherwise an `INSERT` (the first version of a key, or a
+/// re-insert across a deletion gap, where the prior period ended strictly earlier).
+///
+/// A pure function of chain adjacency: the same insight that lets a from-scratch
+/// rebuild re-derive a supersession close from version adjacency but not a
+/// retraction ([ADR-0023]). `prev` must be the version immediately before
+/// `version` in the timeline (`version_history` returns them grouped by key and
+/// ordered by `(sys_from, seq)`), or `None` at the start. A deleted key needs no
+/// special case — its final version's `op` is whatever opened it; the deletion
+/// shows only as that version's closed `sys_to`.
+fn version_op(prev: Option<&Version>, version: &Version) -> &'static str {
+    match prev {
+        // The abutment is `prev.sys_to == version.sys_from` by design — the prior
+        // period's *end* meets this version's *start*. Clippy reads the asymmetry
+        // (`sys_to`/`sys_from`) as a likely typo for `sys_to == version.sys_to`,
+        // but that mirror would be the bug: it is the gap-free chain check.
+        #[expect(
+            clippy::suspicious_operation_groupings,
+            reason = "sys_to abuts sys_from — the adjacency test, not a typo"
+        )]
+        Some(p) if p.business_key == version.business_key && p.sys_to == version.sys_from => {
+            "UPDATE"
+        }
+        _ => "INSERT",
+    }
+}
+
 /// Lower the binder's [`Interval`] (the `stele-sql` layer does not depend on
 /// storage) into the storage [`ValidInterval`] the write path takes ([STL-194]).
 ///
@@ -4889,6 +5112,248 @@ mod tests {
         assert!(matches!(
             balance_as_of(&mut engine, "(now() - interval '30 second')"),
             Err(EngineError::Select(SelectError::BeforeHistory { .. }))
+        ));
+    }
+
+    /// Apply one seed's deterministic INSERT/UPDATE/DELETE workload to a fresh
+    /// system-versioned `account` engine — a flush partway seals the early
+    /// timeline — returning, per key, the `(op, balance)` sequence of versions it
+    /// created: the reference `version_history` must reproduce. A delete clears the
+    /// key (its next insert is an INSERT again) and makes no version of its own.
+    fn apply_account_workload(
+        engine: &mut SessionEngine<SteppedClock, MemDisk>,
+        clock: &SteppedClock,
+        seed: u64,
+    ) -> BTreeMap<i64, Vec<(&'static str, i64)>> {
+        const KEY_POOL: i64 = 3;
+        let mut rng = PlainOracleRng(seed.wrapping_mul(0x1234_5678).wrapping_add(1));
+        let mut model: BTreeMap<i64, Vec<(&'static str, i64)>> = BTreeMap::new();
+        let mut live: BTreeMap<i64, i64> = BTreeMap::new();
+        let mut now = 1_000_000_i64;
+        let mut next_balance = 0_i64;
+
+        let ops = 10 + rng.below(14);
+        for op in 0..ops {
+            now += 1 + rng.below(1000);
+            clock.set(now);
+            let id = rng.below(KEY_POOL);
+            if op == ops / 2 {
+                engine.flush().expect("flush"); // seal the timeline so far
+            }
+            if live.contains_key(&id) && rng.below(3) == 0 {
+                engine
+                    .execute(&parse_one(&format!("DELETE FROM account WHERE id = {id}")))
+                    .expect("delete");
+                live.remove(&id);
+                continue;
+            }
+            next_balance += 1;
+            if let std::collections::btree_map::Entry::Vacant(e) = live.entry(id) {
+                e.insert(next_balance);
+                engine
+                    .execute(&parse_one(&format!(
+                        "INSERT INTO account (id, balance) VALUES ({id}, {next_balance})"
+                    )))
+                    .expect("insert");
+                model.entry(id).or_default().push(("INSERT", next_balance));
+            } else {
+                live.insert(id, next_balance);
+                engine
+                    .execute(&parse_one(&format!(
+                        "UPDATE account SET balance = {next_balance} WHERE id = {id}"
+                    )))
+                    .expect("update");
+                model.entry(id).or_default().push(("UPDATE", next_balance));
+            }
+        }
+        model
+    }
+
+    /// `\history`'s introspection surface ([STL-199]), differentially oracled
+    /// against the canonical `FOR SYSTEM_TIME AS OF` read path (testing-strategy
+    /// §4). A deterministic random INSERT/UPDATE/DELETE workload over a small key
+    /// pool, with a flush partway so the timeline spans the delta tier and a sealed
+    /// segment, then two checks per seed:
+    ///
+    /// * **shape** — the per-key `(op, balance)` sequence `version_history`
+    ///   reports equals the sequence the workload applied (INSERT for a key's first
+    ///   version *and a re-insert across a deletion gap*, UPDATE for a supersession;
+    ///   a DELETE makes no version), and `current` flags exactly the open tail;
+    /// * **agreement** — every version's stated value at its own `sys_from` is what
+    ///   a snapshot read at that instant returns (a bare-µs `AS OF`, [STL-164]) —
+    ///   the history view never disagrees with time travel.
+    #[test]
+    fn version_history_matches_the_as_of_read_path() {
+        for seed in 0..40u64 {
+            let clock = SteppedClock::new(1_000_000);
+            let mut engine = SessionEngine::open(MemDisk::new(), clock.clone());
+            engine.execute(&parse_one(CREATE)).expect("create");
+            let model = apply_account_workload(&mut engine, &clock, seed);
+
+            let history = engine
+                .version_history("account", None)
+                .expect("version_history");
+            // Column layout: txid, op, sys_from, sys_to, current, principal, id, balance.
+            let col = |name: &str| {
+                history
+                    .columns
+                    .iter()
+                    .position(|(n, _)| n == name)
+                    .unwrap_or_else(|| panic!("history has a {name} column"))
+            };
+            let (c_op, c_from, c_cur, c_id, c_bal) = (
+                col("op"),
+                col("sys_from"),
+                col("current"),
+                col("id"),
+                col("balance"),
+            );
+
+            let mut reported: BTreeMap<i64, Vec<(&'static str, i64)>> = BTreeMap::new();
+            for row in &history.rows {
+                let id = decode_int(row[c_id].as_ref(), LogicalType::Int4);
+                let balance = decode_int(row[c_bal].as_ref(), LogicalType::Int4);
+                let ScalarValue::Text(op_text) =
+                    ScalarValue::decode(LogicalType::Text, row[c_op].as_ref().expect("non-null"))
+                        .expect("decode text")
+                else {
+                    unreachable!("op is text")
+                };
+                let op: &'static str = if op_text == "INSERT" {
+                    "INSERT"
+                } else {
+                    "UPDATE"
+                };
+                reported.entry(id).or_default().push((op, balance));
+
+                // `current` is true exactly when this version has no `sys_to`.
+                let ScalarValue::Bool(current) =
+                    ScalarValue::decode(LogicalType::Bool, row[c_cur].as_ref().expect("non-null"))
+                        .expect("decode bool")
+                else {
+                    unreachable!("current is bool")
+                };
+                assert_eq!(current, row[col("sys_to")].is_none(), "seed {seed}");
+
+                // Agreement with time travel: the version's value at its own start
+                // instant, read through the canonical `FOR SYSTEM_TIME AS OF` path
+                // with a bare-µs literal ([STL-164]).
+                let ScalarValue::TimestampTz(sys_from) = ScalarValue::decode(
+                    LogicalType::TimestampTz,
+                    row[c_from].as_ref().expect("non-null"),
+                )
+                .expect("decode ts") else {
+                    unreachable!("sys_from is a timestamptz")
+                };
+                let sql = format!(
+                    "SELECT balance FROM account FOR SYSTEM_TIME AS OF {sys_from} WHERE id = {id}"
+                );
+                let StatementOutcome::Rows(r) =
+                    engine.execute(&parse_one(&sql)).expect("as_of read")
+                else {
+                    panic!("SELECT must return rows");
+                };
+                let live_here = r
+                    .rows
+                    .into_iter()
+                    .next()
+                    .and_then(|mut cells| cells.remove(0))
+                    .map(|bytes| decode_int(Some(&bytes), LogicalType::Int4));
+                // The message interpolates only `seed` (a loop counter), never a
+                // decode-derived value: a decoded value in the message text trips
+                // CodeQL's (false) `rust/cleartext-logging` taint on its `Debug`
+                // (the same reason `decode_int` keeps a static panic message). The
+                // seed alone replays the failure deterministically.
+                assert_eq!(
+                    live_here,
+                    Some(balance),
+                    "seed {seed}: version-history value disagrees with the AS OF read",
+                );
+            }
+            assert_eq!(
+                reported, model,
+                "seed {seed}: reported timeline vs workload"
+            );
+        }
+    }
+
+    /// The wire-facing surface: `SELECT * FROM stele_history('t'[, key])` routes
+    /// through `execute` as an ordinary row set ([STL-199]) — fixed metadata
+    /// columns then the table's own columns, the keyed form filtered to one key
+    /// and the keyless form spanning every key, with unknown-table and bad-key
+    /// literals surfaced as engine errors (not silent empties).
+    #[test]
+    fn stele_history_query_routes_through_execute() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        for sql in [
+            "INSERT INTO account (id, balance) VALUES (1, 100)",
+            "UPDATE account SET balance = 250 WHERE id = 1",
+            "INSERT INTO account (id, balance) VALUES (2, 500)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("write");
+        }
+
+        let rows = |engine: &mut SessionEngine<ZeroClock, MemDisk>, q: &str| {
+            let StatementOutcome::Rows(r) = engine.execute(&parse_one(q)).expect("history") else {
+                panic!("stele_history returns rows");
+            };
+            r
+        };
+
+        // The keyed form: key 1's two versions, oldest first, the metadata prefix
+        // then the table's `id` / `balance` columns.
+        let keyed = rows(&mut engine, "SELECT * FROM stele_history('account', 1)");
+        assert_eq!(
+            keyed
+                .columns
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "txid",
+                "op",
+                "sys_from",
+                "sys_to",
+                "current",
+                "principal",
+                "id",
+                "balance"
+            ],
+        );
+        let op = |row: &[Option<Vec<u8>>]| match ScalarValue::decode(
+            LogicalType::Text,
+            row[1].as_ref().expect("op present"),
+        )
+        .expect("decode")
+        {
+            ScalarValue::Text(s) => s,
+            _ => unreachable!(),
+        };
+        assert_eq!(keyed.rows.len(), 2);
+        assert_eq!(op(&keyed.rows[0]), "INSERT");
+        assert_eq!(op(&keyed.rows[1]), "UPDATE");
+        // Oldest version closed (has a sys_to), newest current (none).
+        assert!(keyed.rows[0][3].is_some());
+        assert!(keyed.rows[1][3].is_none());
+        // The value column decodes to the second version's balance.
+        assert_eq!(
+            decode_int(keyed.rows[1][7].as_ref(), LogicalType::Int4),
+            250
+        );
+
+        // The keyless form spans every key: key 1's two versions + key 2's one.
+        let all = rows(&mut engine, "SELECT * FROM stele_history('account')");
+        assert_eq!(all.rows.len(), 3);
+
+        // An unknown table and a wrong-typed key are errors, never empty rows.
+        assert!(matches!(
+            engine.execute(&parse_one("SELECT * FROM stele_history('ghost', 1)")),
+            Err(EngineError::UnknownTable(_)),
+        ));
+        assert!(matches!(
+            engine.execute(&parse_one("SELECT * FROM stele_history('account', 'oops')")),
+            Err(EngineError::IntrospectionKey(_)),
         ));
     }
 
