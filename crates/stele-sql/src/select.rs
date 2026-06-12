@@ -57,14 +57,16 @@ use sqlparser::ast::{
     BinaryOperator, Distinct, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr,
     FunctionArguments, GroupByExpr, Join, JoinConstraint, JoinOperator, LimitClause, OrderByExpr,
     OrderByKind, Query, Select, SelectItem, SetExpr, Statement as SqlStatement, TableFactor,
-    TableWithJoins, Value,
+    TableWithJoins, Value, WildcardAdditionalOptions,
 };
 use stele_catalog::{Catalog, SchemaId, TableSchema};
 use stele_common::period::{Interval, IntervalError, PeriodPredicate};
 use stele_common::time::SystemTimeMicros;
 use stele_common::types::{LogicalType, ScalarValue};
 
-use crate::ast::{PeriodExpr, PeriodPredicateClause, Statement, TimeDimension};
+use crate::ast::{
+    PeriodExpr, PeriodPredicateClause, Statement, StatementBody, Temporal, TimeDimension,
+};
 use crate::fold::{self, FoldError};
 
 /// The context a [`bind_select`] needs: the transaction snapshot and the
@@ -334,6 +336,13 @@ pub struct BoundSelect {
     ///
     /// [STL-171]: https://allegromusic.atlassian.net/browse/STL-171
     pub aggregate: Option<BoundAggregate>,
+    /// A bound **uncorrelated subquery** `WHERE` — a scalar comparison,
+    /// `[NOT] IN`, or `[NOT] EXISTS` against a once-evaluated inner query
+    /// ([STL-234]). Mutually exclusive with [`filter`](Self::filter) and
+    /// [`period_filter`](Self::period_filter) — a `WHERE` is exactly one of the
+    /// three shapes. The executor runs the inner query once at *this* plan's
+    /// snapshot (docs/16 §6) and folds its result into the row filter.
+    pub subquery_filter: Option<BoundSubqueryFilter>,
     /// A bound two-table `JOIN` plan, or `None` for a single-table read
     /// ([STL-172]). When `Some`, the query reads the join's two sides and the
     /// result columns are the [join's](BoundJoin::columns); the single-table
@@ -361,6 +370,69 @@ pub struct BoundSelect {
     /// `None` for unlimited (including the explicit `LIMIT ALL`) ([STL-263]).
     /// `LIMIT 0` is a valid empty read. Applied after `ORDER BY` and `OFFSET`.
     pub limit: Option<u64>,
+}
+
+/// A bound `WHERE` clause whose predicate is an **uncorrelated subquery** — a
+/// scalar comparison, `[NOT] IN`, or `[NOT] EXISTS` ([STL-234]).
+///
+/// *Uncorrelated* means the inner query references no outer column, so its result
+/// is a **constant** with respect to the outer rows: the executor evaluates
+/// [`subquery`](Self::subquery) **once**, at the outer statement's `(sys, valid)`
+/// snapshot (the binder binds it under the same [`BindContext`], so it inherits
+/// the one consistent per-statement snapshot — docs/16 §6), materializes the
+/// result, and folds it into the outer row filter (a folded literal, an
+/// equality-`OR` set test, or a constant keep-all/keep-none).
+///
+/// Mutually exclusive with [`BoundSelect::filter`] and
+/// [`BoundSelect::period_filter`]: a `WHERE` is exactly one of the three shapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundSubqueryFilter {
+    /// Which subquery predicate the `WHERE` is, and the outer column it tests.
+    pub kind: SubqueryKind,
+    /// The bound inner query, evaluated once at the outer plan's snapshot.
+    pub subquery: Box<BoundSelect>,
+}
+
+/// The shape of an uncorrelated-subquery `WHERE` predicate ([STL-234]).
+///
+/// The outer operand is always a single value column (by schema index) — the
+/// same one-anchor-column restriction the plain [`BoundPredicate`] filter uses;
+/// a richer comparand (an arithmetic of the column, the SELECT-list position) is
+/// a tracked follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubqueryKind {
+    /// `<column> <op> (SELECT <scalar>)` — the inner yields one scalar value: the
+    /// executor folds it to a literal and applies `<column> <op> <literal>`. An
+    /// inner returning **no row** makes the scalar `NULL` (the comparison is
+    /// then unknown for every row — none pass); one returning **more than one
+    /// row** is the standard's cardinality violation (SQLSTATE `21000`).
+    Scalar {
+        /// The outer value column compared, by schema index.
+        column: usize,
+        /// The comparison operator, as written with the column on its original
+        /// side.
+        op: CompareOp,
+        /// `true` when the subquery is the **left** operand (`(SELECT …) < col`),
+        /// so the lowering preserves operand order for a non-commutative `op`.
+        subquery_left: bool,
+    },
+    /// `<column> [NOT] IN (SELECT <col>)` — membership of the outer column in the
+    /// inner's single-column result set, under SQL three-valued logic. An empty
+    /// set makes `IN` false (and `NOT IN` true) for every row; a `NOT IN` whose
+    /// set contains a `NULL` matches no row (the classic three-valued trap).
+    In {
+        /// The outer value column tested, by schema index.
+        column: usize,
+        /// `true` for `NOT IN`.
+        negated: bool,
+    },
+    /// `[NOT] EXISTS (SELECT …)` — whether the inner returns any row. Being
+    /// uncorrelated, the test is a single constant for the whole outer scan; the
+    /// inner's select-list is irrelevant (only row presence matters).
+    Exists {
+        /// `true` for `NOT EXISTS`.
+        negated: bool,
+    },
 }
 
 /// A bound `GROUP BY` + aggregate query: the grouping columns, the aggregates to
@@ -645,6 +717,19 @@ pub enum SelectError {
     /// silently dropped (which would return unfiltered rows — a wrong answer).
     #[error("unsupported WHERE predicate ({0})")]
     UnsupportedPredicate(String),
+
+    /// A `WHERE` subquery predicate ([STL-234]) — a scalar comparison,
+    /// `[NOT] IN`, or `[NOT] EXISTS` — is not a shape v0.3 binds: the outer
+    /// operand of a scalar comparison or `IN` is not a bare value column, the
+    /// inner query returns a number of columns other than one, the inner's
+    /// single column has a different type than the outer column it is compared
+    /// to, or the inner query itself does not bind. Correlated subqueries (the
+    /// inner referencing an outer column) are a sibling ticket ([STL-239]) and
+    /// surface here too. Rejected with the reason rather than silently dropped.
+    ///
+    /// [STL-239]: https://allegromusic.atlassian.net/browse/STL-239
+    #[error("unsupported subquery ({0})")]
+    Subquery(String),
 
     /// A `SELECT` item in an aggregate query is a bare column that is **not** in
     /// the `GROUP BY` ([STL-171]). SQL requires every non-aggregated output column
@@ -955,10 +1040,17 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
     )?;
     let (limit, offset) = bind_limit_offset(query)?;
 
-    let filter = bind_filter(select, schema, table)?;
+    // The `WHERE` is one of three mutually-exclusive shapes: an uncorrelated
+    // subquery predicate ([STL-234]), or the plain `<col> <cmp> <scalar>`
+    // comparison ([STL-213]). (A period predicate is the third — lifted off the
+    // token stream below.) The subquery dispatcher is tried first, since a
+    // comparison whose operand is a `(SELECT …)` is its shape, not the plain
+    // predicate binder's.
+    let (filter, subquery_filter) =
+        bind_where(select, schema, table, ctx, snapshot, valid_snapshot)?;
 
     // A period predicate is lifted off the token stream (the executor-glue
-    // `WHERE` is gone by the time `bind_filter` runs), so the two filter shapes
+    // `WHERE` is gone by the time `bind_where` runs), so the two filter shapes
     // are naturally mutually exclusive. Its `PERIOD(...)` endpoints fold against
     // the transaction `now` (`ctx.snapshot`), like `AS OF` operands.
     let period_filter = stmt
@@ -976,6 +1068,7 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
         projection,
         filter,
         period_filter,
+        subquery_filter,
         aggregate,
         join: None,
         distinct,
@@ -1422,6 +1515,7 @@ fn bind_join<'a>(
         projection: Projection::All,
         filter: None,
         period_filter: None,
+        subquery_filter: None,
         aggregate: None,
         join: Some(BoundJoin {
             join_type,
@@ -1834,25 +1928,334 @@ fn bind_period_endpoint(
         .map_err(SelectError::PeriodOperand)
 }
 
-/// Lower a `WHERE` clause to a [`BoundPredicate`], or `None` when there is none.
+/// Lower a `WHERE` clause to its bound shape, or `(None, None)` when there is
+/// none.
 ///
-/// v0.2 lowers a single comparison over exactly one column ([STL-151], [STL-213]):
-/// any of the six [comparison operators](CompareOp), with either side optionally an
-/// integer arithmetic expression of that column (`qty % 2 = 0`, `price > 100`,
-/// either order). The one column anchors the literal folding, so both sides share
-/// its type. Every other shape — a column-to-column compare, an `AND`/`OR` chain,
-/// `BETWEEN`/`IN`, arithmetic over a non-integer column — is
-/// [`SelectError::UnsupportedPredicate`], never silently dropped (which would
-/// return rows the query excluded).
-fn bind_filter(
+/// A `WHERE` is one of two row-filter shapes the binder distinguishes here (the
+/// third, a period predicate, is lifted off the token stream before this runs):
+///
+/// * an **uncorrelated subquery** predicate ([STL-234]) — `<col> <cmp> (SELECT
+///   <scalar>)`, `<col> [NOT] IN (SELECT <col>)`, or `[NOT] EXISTS (SELECT …)`,
+///   returned as the second tuple element;
+/// * the plain `<col> <cmp> <scalar>` comparison ([STL-151], [STL-213]),
+///   returned as the first.
+///
+/// The subquery dispatcher runs first, since a comparison whose operand is a
+/// `(SELECT …)` is the subquery shape, not a plain predicate (its operand would
+/// not fold to a literal). The two are mutually exclusive — at most one tuple
+/// element is `Some`.
+fn bind_where(
     select: &Select,
     schema: &TableSchema,
     table: &str,
-) -> Result<Option<BoundPredicate>, SelectError> {
+    ctx: &BindContext,
+    snapshot: SystemTimeMicros,
+    valid_snapshot: Option<SystemTimeMicros>,
+) -> Result<(Option<BoundPredicate>, Option<BoundSubqueryFilter>), SelectError> {
     let Some(expr) = select.selection.as_ref() else {
-        return Ok(None);
+        return Ok((None, None));
     };
-    bind_where_predicate(expr, schema, table).map(Some)
+    // The inner subquery inherits the outer's **resolved** system snapshot (after
+    // `AS OF` folding), not the raw transaction snapshot `ctx.snapshot` — so a
+    // `… (SELECT … FROM s) … FOR SYSTEM_TIME AS OF p` reads `s` at `p` too, the
+    // one consistent per-statement snapshot (docs/16 §6). The valid axis is
+    // inherited separately ([`inherit_valid_snapshot`]).
+    let inner_ctx = BindContext {
+        snapshot,
+        catalog: ctx.catalog,
+    };
+    if let Some(mut subquery) = try_bind_subquery_filter(expr, schema, table, &inner_ctx)? {
+        inherit_valid_snapshot(&mut subquery.subquery, valid_snapshot, ctx.catalog);
+        return Ok((None, Some(subquery)));
+    }
+    Ok((Some(bind_where_predicate(expr, schema, table)?), None))
+}
+
+/// Pin an inner subquery's valid axis to the outer statement's `FOR VALID_TIME
+/// AS OF` instant, when the outer carried one and the inner reads a valid-time
+/// table (docs/16 §6 — one consistent `(sys, valid)` snapshot per statement).
+///
+/// The system axis is inherited automatically — the inner binds under the same
+/// [`BindContext`], so its [`snapshot`](BoundSelect::snapshot) is the outer's.
+/// The valid axis is not, since the inner's own [`Temporal`] is empty; it is
+/// applied here. A system-only inner has no valid axis to pin (it is left
+/// unpinned), and a join inner does not carry a valid-time read, so only a plain
+/// single-table valid-time inner inherits the pin.
+fn inherit_valid_snapshot(
+    inner: &mut BoundSelect,
+    outer_valid: Option<SystemTimeMicros>,
+    catalog: &Catalog,
+) {
+    let Some(valid) = outer_valid else {
+        return;
+    };
+    if inner.join.is_some() {
+        return;
+    }
+    if let TableResolution::Found(schema) = resolve_table_at(catalog, &inner.table, inner.snapshot)
+        && schema.temporal().valid_time_enabled()
+    {
+        inner.valid_snapshot = Some(valid);
+    }
+}
+
+/// Recognize and bind an uncorrelated-subquery `WHERE` ([STL-234]): `[NOT]
+/// EXISTS`, `[NOT] IN (SELECT …)`, or a comparison with a `(SELECT …)` operand.
+/// Returns `None` for every other `WHERE` — those fall through to the plain
+/// [`bind_where_predicate`].
+fn try_bind_subquery_filter(
+    expr: &Expr,
+    schema: &TableSchema,
+    table: &str,
+    ctx: &BindContext,
+) -> Result<Option<BoundSubqueryFilter>, SelectError> {
+    match unwrap_nested(expr) {
+        Expr::Exists { subquery, negated } => {
+            Ok(Some(bind_exists_subquery(subquery, *negated, ctx)?))
+        }
+        Expr::InSubquery {
+            expr: lhs,
+            subquery,
+            negated,
+        } => Ok(Some(bind_in_subquery(
+            lhs, subquery, *negated, schema, table, ctx,
+        )?)),
+        Expr::BinaryOp { left, op, right } => {
+            bind_scalar_subquery_compare(left, op, right, schema, table, ctx)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Bind `[NOT] EXISTS (SELECT …)`. `EXISTS` tests only row presence, so the
+/// inner select-list is irrelevant; the inner binds with its projection
+/// normalized (see [`bind_inner_query`]).
+fn bind_exists_subquery(
+    subquery: &Query,
+    negated: bool,
+    ctx: &BindContext,
+) -> Result<BoundSubqueryFilter, SelectError> {
+    let inner = bind_inner_query(subquery, ctx, /* exists = */ true)?;
+    Ok(BoundSubqueryFilter {
+        kind: SubqueryKind::Exists { negated },
+        subquery: Box::new(inner),
+    })
+}
+
+/// Bind `<column> [NOT] IN (SELECT <col>)`. The outer operand must be a bare
+/// value column, and the inner must return exactly one column of the same type.
+fn bind_in_subquery(
+    lhs: &Expr,
+    subquery: &Query,
+    negated: bool,
+    schema: &TableSchema,
+    table: &str,
+    ctx: &BindContext,
+) -> Result<BoundSubqueryFilter, SelectError> {
+    let column = subquery_anchor_column(lhs, schema, table, "IN")?;
+    let inner = bind_inner_query(subquery, ctx, /* exists = */ false)?;
+    check_subquery_column_type(&inner, schema, column, ctx.catalog, "IN")?;
+    Ok(BoundSubqueryFilter {
+        kind: SubqueryKind::In { column, negated },
+        subquery: Box::new(inner),
+    })
+}
+
+/// Bind a comparison with a `(SELECT …)` scalar operand, or `None` when neither
+/// side is a subquery (then it is a plain comparison, bound elsewhere).
+///
+/// Exactly one side must be a subquery; the other must be a bare value column of
+/// the inner's output type. A comparison between two subqueries, or with a
+/// non-column outer operand, is a [`SelectError::Subquery`] rather than a
+/// fall-through (which would mis-bind it as a plain predicate).
+fn bind_scalar_subquery_compare(
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    schema: &TableSchema,
+    table: &str,
+    ctx: &BindContext,
+) -> Result<Option<BoundSubqueryFilter>, SelectError> {
+    let left = unwrap_nested(left);
+    let right = unwrap_nested(right);
+    let (column_expr, subquery, subquery_left) = match (as_subquery(left), as_subquery(right)) {
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => {
+            return Err(SelectError::Subquery(
+                "a comparison between two subqueries is not supported".to_owned(),
+            ));
+        }
+        (Some(query), None) => (right, query, true),
+        (None, Some(query)) => (left, query, false),
+    };
+    // Only a comparison operator lowers to a scalar-subquery test; a non-comparison
+    // (`a + (SELECT …)`) over a subquery is not a v0.3 shape.
+    let Some(compare) = compare_op(op) else {
+        return Err(SelectError::Subquery(format!(
+            "operator `{op}` is not supported with a subquery operand"
+        )));
+    };
+    let column =
+        subquery_anchor_column(column_expr, schema, table, "a scalar subquery comparison")?;
+    let inner = bind_inner_query(subquery, ctx, /* exists = */ false)?;
+    check_subquery_column_type(&inner, schema, column, ctx.catalog, "a scalar subquery")?;
+    Ok(Some(BoundSubqueryFilter {
+        kind: SubqueryKind::Scalar {
+            column,
+            op: compare,
+            subquery_left,
+        },
+        subquery: Box::new(inner),
+    }))
+}
+
+/// The `(SELECT …)` a parenthesized-subquery expression wraps, or `None`.
+const fn as_subquery(expr: &Expr) -> Option<&Query> {
+    match expr {
+        Expr::Subquery(query) => Some(query),
+        _ => None,
+    }
+}
+
+/// Resolve the bare value column an `IN` / scalar-subquery comparison tests, to
+/// its schema index. A non-bare-column outer operand (an arithmetic, a literal,
+/// the business key compared in a richer way) is a [`SelectError::Subquery`]
+/// with the predicate's name, since the executor folds the inner result against
+/// exactly this one column.
+fn subquery_anchor_column(
+    expr: &Expr,
+    schema: &TableSchema,
+    table: &str,
+    what: &str,
+) -> Result<usize, SelectError> {
+    match unwrap_nested(expr) {
+        Expr::Identifier(id) => {
+            column_index(schema, &id.value).ok_or_else(|| SelectError::UnknownColumn {
+                table: table.to_owned(),
+                column: id.value.clone(),
+            })
+        }
+        other => Err(SelectError::Subquery(format!(
+            "the outer operand of {what} must be a bare column, not `{other}`"
+        ))),
+    }
+}
+
+/// Check that an inner subquery returns exactly one column whose type matches the
+/// outer column it is compared to. The executor compares the materialized inner
+/// values against the outer column's typed vector, which requires identical
+/// types (Stele does not implicitly coerce — the same posture the plain filter's
+/// literal folding takes).
+fn check_subquery_column_type(
+    inner: &BoundSelect,
+    outer_schema: &TableSchema,
+    outer_column: usize,
+    catalog: &Catalog,
+    what: &str,
+) -> Result<(), SelectError> {
+    let inner_ty = sole_output_type(inner, catalog)?;
+    let outer_ty = outer_schema.columns()[outer_column].ty();
+    if inner_ty != outer_ty {
+        return Err(SelectError::Subquery(format!(
+            "{what} yields {inner_ty}, but the outer column is {outer_ty}"
+        )));
+    }
+    Ok(())
+}
+
+/// The single output column type of an inner subquery, or a
+/// [`SelectError::Subquery`] when it returns a number of columns other than one.
+///
+/// Mirrors the engine's output-column resolution: an aggregate query's columns
+/// are its [`BoundAggregate::columns`], a join's its [`BoundJoin::columns`], and a
+/// plain projection's are read from the schema live at the inner's snapshot.
+fn sole_output_type(bound: &BoundSelect, catalog: &Catalog) -> Result<LogicalType, SelectError> {
+    if let Some(agg) = &bound.aggregate {
+        return single_output_type(&agg.columns);
+    }
+    if let Some(join) = &bound.join {
+        return single_output_type(&join.columns);
+    }
+    // `bind_select` already resolved the inner table here, so a miss is a
+    // contract break rather than user input.
+    let TableResolution::Found(schema) = resolve_table_at(catalog, &bound.table, bound.snapshot)
+    else {
+        return Err(SelectError::Subquery(format!(
+            "subquery table {:?} is no longer resolvable",
+            bound.table
+        )));
+    };
+    match &bound.projection {
+        Projection::All => {
+            let columns = schema.columns();
+            if columns.len() != 1 {
+                return Err(SelectError::Subquery(format!(
+                    "a subquery used here must return one column, but it returns {}",
+                    columns.len()
+                )));
+            }
+            Ok(columns[0].ty())
+        }
+        Projection::Columns(names) => match names.as_slice() {
+            [name] => {
+                let index = column_index(schema, name).ok_or_else(|| {
+                    SelectError::Subquery(format!("unknown subquery column {name:?}"))
+                })?;
+                Ok(schema.columns()[index].ty())
+            }
+            _ => Err(SelectError::Subquery(format!(
+                "a subquery used here must return one column, but it returns {}",
+                names.len()
+            ))),
+        },
+    }
+}
+
+/// The type of a one-element `(name, type)` output-column list, or a
+/// [`SelectError::Subquery`] when the list is not exactly one column.
+fn single_output_type(columns: &[(String, LogicalType)]) -> Result<LogicalType, SelectError> {
+    match columns {
+        [(_, ty)] => Ok(*ty),
+        _ => Err(SelectError::Subquery(format!(
+            "a subquery used here must return one column, but it returns {}",
+            columns.len()
+        ))),
+    }
+}
+
+/// Bind an inner (subquery) `SELECT` under the **same** [`BindContext`] as the
+/// outer query, so it inherits the one consistent per-statement snapshot
+/// (docs/16 §6) — the temporal rule that makes an uncorrelated subquery's result
+/// well-defined.
+///
+/// The inner query carries no temporal grammar of its own ([`Temporal::default`]):
+/// the parser lifts every `FOR … AS OF` to the statement level, so a subquery is
+/// always read at the outer snapshot. For an `EXISTS` subquery (`exists`), a
+/// non-aggregate inner's select-list is normalized to `*` so the idiomatic
+/// `EXISTS (SELECT 1 …)` binds without constant-projection support — `EXISTS`
+/// ignores the select-list anyway. An aggregate inner keeps its shape (it always
+/// yields exactly one row, so the row-presence test is well-defined).
+///
+/// A correlated subquery — the inner referencing an outer column — is not
+/// detected here; it binds as an unknown-column error against the inner schema,
+/// the sibling ticket's job ([STL-239]).
+fn bind_inner_query(
+    query: &Query,
+    ctx: &BindContext,
+    exists: bool,
+) -> Result<BoundSelect, SelectError> {
+    let mut query = query.clone();
+    if exists
+        && let SetExpr::Select(select) = query.body.as_mut()
+        && !is_aggregate_query(select)
+    {
+        select.projection = vec![SelectItem::Wildcard(WildcardAdditionalOptions::default())];
+    }
+    let stmt = Statement {
+        body: StatementBody::Sql(SqlStatement::Query(Box::new(query))),
+        temporal: Temporal::default(),
+    };
+    bind_select(&stmt, ctx)
 }
 
 /// Bind one `WHERE` expression to a [`BoundPredicate`] against `table`'s schema —
@@ -4346,5 +4749,145 @@ mod tests {
         // Qualifying resolves it.
         let join = join_of("SELECT a.id FROM a JOIN b ON a.id = b.id", &catalog);
         assert_eq!(join.output, vec![JoinColumnRef::Left(0)]);
+    }
+
+    // ---- STL-234: uncorrelated subquery binding ----
+
+    /// A catalog with an outer `t (id INT, a INT)`, an inner `s (id INT, a INT)`,
+    /// and a type-mismatched `s2 (id INT, b TEXT)` — the subquery-binding fixtures.
+    fn catalog_with_subquery_tables() -> Catalog {
+        let mut catalog = Catalog::new();
+        for (name, value_col, ty) in [
+            ("t", "a", LogicalType::Int4),
+            ("s", "a", LogicalType::Int4),
+            ("s2", "b", LogicalType::Text),
+        ] {
+            catalog
+                .create_table(
+                    name,
+                    vec![
+                        ColumnDef::new("id", LogicalType::Int4).expect("col"),
+                        ColumnDef::new(value_col, ty).expect("col"),
+                    ],
+                    TableTemporal::system_only(),
+                    SystemTimeMicros(1_000),
+                )
+                .expect("create");
+        }
+        catalog
+    }
+
+    #[test]
+    fn binds_each_uncorrelated_subquery_shape() {
+        let catalog = catalog_with_subquery_tables();
+        let kind = |sql: &str| {
+            bind(sql, &catalog)
+                .expect("bind subquery")
+                .subquery_filter
+                .expect("a subquery filter")
+                .kind
+        };
+        assert_eq!(
+            kind("SELECT id FROM t WHERE a = (SELECT a FROM s WHERE id = 1)"),
+            SubqueryKind::Scalar {
+                column: 1,
+                op: CompareOp::Eq,
+                subquery_left: false,
+            }
+        );
+        // A subquery on the left records the operand order.
+        assert_eq!(
+            kind("SELECT id FROM t WHERE (SELECT a FROM s WHERE id = 1) < a"),
+            SubqueryKind::Scalar {
+                column: 1,
+                op: CompareOp::Lt,
+                subquery_left: true,
+            }
+        );
+        assert_eq!(
+            kind("SELECT id FROM t WHERE a IN (SELECT a FROM s)"),
+            SubqueryKind::In {
+                column: 1,
+                negated: false,
+            }
+        );
+        assert_eq!(
+            kind("SELECT id FROM t WHERE a NOT IN (SELECT a FROM s)"),
+            SubqueryKind::In {
+                column: 1,
+                negated: true,
+            }
+        );
+        assert_eq!(
+            kind("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s)"),
+            SubqueryKind::Exists { negated: false }
+        );
+        assert_eq!(
+            kind("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM s)"),
+            SubqueryKind::Exists { negated: true }
+        );
+    }
+
+    #[test]
+    fn the_inner_subquery_inherits_the_outer_snapshot() {
+        let catalog = catalog_with_subquery_tables();
+        // With no AS OF, the inner reads the transaction snapshot, like the outer.
+        let bound =
+            bind("SELECT id FROM t WHERE a IN (SELECT a FROM s)", &catalog).expect("bind subquery");
+        let inner = &bound.subquery_filter.expect("subquery").subquery;
+        assert_eq!(inner.snapshot, NOW);
+        assert_eq!(inner.snapshot, bound.snapshot);
+
+        // A `FOR SYSTEM_TIME AS OF p` on the outer pins the inner at `p` too.
+        let bound = bind(
+            "SELECT id FROM t WHERE a IN (SELECT a FROM s) FOR SYSTEM_TIME AS OF 1500",
+            &catalog,
+        )
+        .expect("bind subquery AS OF");
+        assert_eq!(bound.snapshot, SystemTimeMicros(1_500));
+        let inner = &bound.subquery_filter.expect("subquery").subquery;
+        assert_eq!(inner.snapshot, SystemTimeMicros(1_500));
+    }
+
+    #[test]
+    fn rejects_a_type_mismatched_in_subquery() {
+        let catalog = catalog_with_subquery_tables();
+        // `t.a` is INT, `s2.b` is TEXT — no implicit coercion.
+        let err = bind("SELECT id FROM t WHERE a IN (SELECT b FROM s2)", &catalog).unwrap_err();
+        assert!(matches!(err, SelectError::Subquery(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_a_multi_column_in_subquery() {
+        let catalog = catalog_with_subquery_tables();
+        let err = bind(
+            "SELECT id FROM t WHERE a IN (SELECT id, a FROM s)",
+            &catalog,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SelectError::Subquery(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_a_comparison_between_two_subqueries() {
+        let catalog = catalog_with_subquery_tables();
+        let err = bind(
+            "SELECT id FROM t WHERE (SELECT a FROM s) = (SELECT a FROM s)",
+            &catalog,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SelectError::Subquery(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_a_non_column_outer_operand() {
+        let catalog = catalog_with_subquery_tables();
+        // The outer operand of a scalar/IN subquery must be a bare column.
+        let err = bind(
+            "SELECT id FROM t WHERE a + 1 IN (SELECT a FROM s)",
+            &catalog,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SelectError::Subquery(_)), "got {err:?}");
     }
 }

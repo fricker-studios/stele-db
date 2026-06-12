@@ -1685,9 +1685,12 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
         // User DDL against the user store ([STL-252]) — the role codes.
         EngineError::DuplicateUser(_) => SQLSTATE_DUPLICATE_OBJECT,
         EngineError::UnknownUser(_) => SQLSTATE_UNDEFINED_OBJECT,
-        // Two MERGE source rows resolving to one target row — the standard's
-        // cardinality violation, refused before any write applies (STL-230).
-        EngineError::MergeRowTwice => SQLSTATE_CARDINALITY_VIOLATION,
+        // Two MERGE source rows resolving to one target row, or a scalar subquery
+        // returning more than one row — the standard's cardinality violation
+        // (STL-230, STL-234).
+        EngineError::MergeRowTwice | EngineError::ScalarSubqueryCardinality => {
+            SQLSTATE_CARDINALITY_VIOLATION
+        }
         // A write-write conflict at COMMIT — the retryable serialization failure.
         EngineError::Conflict => SQLSTATE_SERIALIZATION_FAILURE,
     }

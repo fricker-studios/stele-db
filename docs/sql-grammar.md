@@ -261,10 +261,13 @@ live at the resolved system-time snapshot, that `snapshot`, an optional
   validity index — [ADR-0023], STL-133). The binder does not re-implement the
   prune; carrying the snapshot *is* the rewrite. Joint `(sys, valid)` version
   resolution from `valid_snapshot` is the executor's job (STL-163).
-- **Rejected in v0.1**: joins / set operations / subqueries (single-table scan
-  only), schema-qualified table names, and projections other than `*` or bare
-  column names. The `WHERE` clause stays on the AST for the executor-glue layer
-  (pgwire, STL-104) to lower.
+- **Beyond the single-table scan**: a two-table join binds (STL-172) and an
+  uncorrelated `WHERE` subquery binds (STL-234, see [Subquery
+  predicates](#subquery-predicates-stl-234)). **Rejected**: set operations,
+  schema-qualified table names, and projections other than `*` or bare column
+  names (a computed or aliased select item — including a scalar subquery in the
+  select list — is not yet projected). The `WHERE` clause stays on the AST for
+  the executor-glue layer (pgwire, STL-104) to lower.
 
 ## Result shaping (STL-263)
 
@@ -302,6 +305,47 @@ Result shaping over a **join** read is rejected (`ORDER BY`/`LIMIT`/`DISTINCT`
 over a `JOIN`, the same posture as `WHERE` and aggregates over a join) — join
 composability is STL-264. Top-N pushdown and sort spill are performance work,
 deliberately out of v0.3 scope.
+
+## Subquery predicates (STL-234)
+
+A `WHERE` may be a single **uncorrelated subquery** predicate — the inner query
+references no outer column, so it is evaluated **once** and its result folded
+into the outer row filter. Three shapes bind:
+
+```sql
+SELECT id FROM t WHERE a = (SELECT max(a) FROM s);             -- scalar comparison
+SELECT id FROM t WHERE a IN (SELECT a FROM s);                 -- [NOT] IN
+SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s WHERE a > 100); -- [NOT] EXISTS
+```
+
+- **Scalar** — `<column> <cmp> (SELECT <scalar>)` (either operand order). The
+  inner returns exactly one column, and at runtime **at most one row** — more is
+  the standard's cardinality violation (SQLSTATE `21000`, refused before the
+  outer scan). **No row ⇒ the scalar is `NULL`**, so the comparison is unknown
+  for every row and none match.
+- **`<column> [NOT] IN (SELECT <col>)`** — membership in the inner's
+  single-column set, under SQL three-valued logic. `IN` keeps a row when the
+  column equals a non-`NULL` member; an **empty (or all-`NULL`) set keeps no
+  row**. `NOT IN` keeps a row when the column differs from every member, but a
+  **`NULL` anywhere in the set keeps no row** (the classic three-valued trap),
+  and an empty set keeps every row.
+- **`[NOT] EXISTS (SELECT …)`** — row-presence only; the inner's select-list is
+  irrelevant (`SELECT 1`, `SELECT *`, `SELECT k` are equivalent). Being
+  uncorrelated, the test is one constant for the whole scan.
+
+**Snapshot rule.** The inner query inherits the outer statement's resolved
+`(sys, valid)` snapshot — one consistent snapshot per statement (docs/16 §6). A
+`… (SELECT … FROM s) … FOR SYSTEM_TIME AS OF p` reads `s` at `p` too; inside a
+transaction the inner also sees the read-your-own-writes buffer (STL-203).
+
+The outer operand of a scalar / `IN` comparison must be a bare value column, and
+the inner's single column must match its type (no implicit coercion). **Not yet
+bound** (each a tracked follow-up): a scalar subquery in the **select list**
+(needs expression projection), **correlated** subqueries (STL-239), subqueries in
+`FROM` / CTEs (STL-242), and a subquery composed with `AND` / `OR` or set over a
+join. Bound as `BoundSelect::subquery_filter` (mutually exclusive with the plain
+and period `WHERE` shapes); the engine's `resolve_filter` runs the inner once and
+folds it into the same `FilterPlan` the plain path produces.
 
 ## DML row selection (STL-229)
 
