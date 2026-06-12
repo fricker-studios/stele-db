@@ -3099,6 +3099,10 @@ fn verify_vectorized_aggregates(seed: u64, rows: &[ExecRow], digest: u64) -> u64
         panic!("seed {seed}: the aggregate output columns have the wrong shape");
     };
 
+    // The output rows in the operator's native emission order — the digest
+    // folds this (not the re-sorted map), so an output-order regression in
+    // `hash_aggregate` breaks same-seed reproducibility loudly.
+    let mut native: Vec<(Option<i64>, AggRow)> = Vec::with_capacity(out.num_groups);
     let mut got: BTreeMap<Option<i64>, AggRow> = BTreeMap::new();
     for i in 0..out.num_groups {
         let row = (
@@ -3109,6 +3113,7 @@ fn verify_vectorized_aggregates(seed: u64, rows: &[ExecRow], digest: u64) -> u64
             max[i],
             avg[i],
         );
+        native.push((g[i], row));
         assert!(
             got.insert(g[i], row).is_none(),
             "seed {seed}: hash_aggregate emitted group {:?} twice",
@@ -3151,7 +3156,7 @@ fn verify_vectorized_aggregates(seed: u64, rows: &[ExecRow], digest: u64) -> u64
             .expect("group count fits u64")
             .to_le_bytes(),
     );
-    for (group, row) in &got {
+    for (group, row) in &native {
         digest = fold_opt_i64(digest, *group);
         digest = fnv1a(digest, &row.0.to_le_bytes());
         digest = fnv1a(digest, &row.1.to_le_bytes());
@@ -3231,7 +3236,10 @@ fn verify_vectorized_joins(seed: u64, left: &[ExecRow], right: &[ExecRow], diges
         semi.left, want_semi,
         "seed {seed}: SEMI join on the business key disagrees with the reference",
     );
-    assert!(semi.right.is_empty(), "a SEMI join emits no right side");
+    assert!(
+        semi.right.is_empty(),
+        "seed {seed}: a SEMI join emits no right side",
+    );
     let anti = join(JoinType::Anti, 2);
     let want_anti: Vec<usize> = matched
         .iter()
@@ -3242,7 +3250,10 @@ fn verify_vectorized_joins(seed: u64, left: &[ExecRow], right: &[ExecRow], diges
         anti.left, want_anti,
         "seed {seed}: ANTI join on the business key disagrees with the reference",
     );
-    assert!(anti.right.is_empty(), "an ANTI join emits no right side");
+    assert!(
+        anti.right.is_empty(),
+        "seed {seed}: an ANTI join emits no right side",
+    );
 
     // Fold the verified shapes: the INNER pair list, then the key-join match
     // vector (which LEFT/SEMI/ANTI all re-derive from).
