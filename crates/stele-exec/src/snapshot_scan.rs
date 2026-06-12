@@ -105,6 +105,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::Arc;
 
+use stele_common::metrics::SharedMetrics;
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::row_codec::RowCodecError;
 use stele_common::time::{SystemTimeMicros, ValidTimeMicros};
@@ -601,6 +602,28 @@ impl ScanStats {
     pub const fn segments_pruned(&self) -> usize {
         self.segments_pruned_zone + self.segments_pruned_superseded
     }
+
+    /// Add this run's accounting into the process-wide scan counters
+    /// ([STL-253]).
+    ///
+    /// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
+    pub fn record(&self, metrics: &stele_common::metrics::Metrics) {
+        metrics
+            .scan_segments_scanned
+            .add(self.segments_scanned as u64);
+        metrics
+            .scan_segments_pruned_zone
+            .add(self.segments_pruned_zone as u64);
+        metrics
+            .scan_segments_pruned_superseded
+            .add(self.segments_pruned_superseded as u64);
+        metrics
+            .scan_row_groups_scanned
+            .add(self.row_groups_scanned as u64);
+        metrics
+            .scan_row_groups_pruned_zone
+            .add(self.row_groups_pruned_zone as u64);
+    }
 }
 
 /// The result of executing a [`SnapshotScan`]: the projected [`Batch`] and the
@@ -640,6 +663,14 @@ pub struct SnapshotScan<'a, D: Disk, I: Disk, F: DiskFile> {
     valid_time: bool,
     projection: Vec<ColumnId>,
     predicate: Predicate,
+    /// The session's shared metric registry, when installed via
+    /// [`metrics`](Self::metrics) ([STL-253]): [`execute`](Self::execute)
+    /// reports its pruning [`ScanStats`] into the process-wide scan counters.
+    /// Pure atomic bumps, so an uninstrumented scan (tests, the simulator) is
+    /// byte-identical with an instrumented one.
+    ///
+    /// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
+    metrics: Option<SharedMetrics>,
 }
 
 impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
@@ -664,7 +695,18 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             valid_time: false,
             projection: ColumnId::ALL.to_vec(),
             predicate: Predicate::All,
+            metrics: None,
         }
+    }
+
+    /// Report this scan's pruning [`ScanStats`] into `metrics`'s process-wide
+    /// scan counters when it executes ([STL-253]).
+    ///
+    /// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
+    #[must_use]
+    pub fn metrics(mut self, metrics: SharedMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Resolve the **valid-time** axis at `point` as well as the system axis,
@@ -765,6 +807,9 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
     /// operator does not materialize at v0.1.
     pub fn execute(&self) -> Result<ScanOutput, ScanError> {
         let (rows, stats) = self.resolve_rows()?;
+        if let Some(m) = &self.metrics {
+            stats.record(m);
+        }
         let filtered: Vec<Version> = rows
             .into_iter()
             .filter(|v| predicate_matches(&self.predicate, v))

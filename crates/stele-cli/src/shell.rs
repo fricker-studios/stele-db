@@ -31,6 +31,7 @@ pub struct Opts {
     pub port: u16,
     pub user: String,
     pub dbname: String,
+    pub tls: crate::client::TlsOpts,
     pub border: BorderStyle,
     pub row_nums: bool,
     pub no_color: bool,
@@ -72,7 +73,7 @@ enum Flow {
 /// Fails on connect failure or a mid-session transport failure; SQL errors are
 /// reported inline and do not end the session.
 pub fn run(opts: &Opts) -> anyhow::Result<()> {
-    let mut client = Client::connect(&opts.host, opts.port, &opts.user, &opts.dbname)
+    let mut client = Client::connect(&opts.host, opts.port, &opts.user, &opts.dbname, &opts.tls)
         .context("starting stele shell")?;
     let stdin = std::io::stdin();
     // Interactive needs BOTH ends on a terminal: with stdout redirected

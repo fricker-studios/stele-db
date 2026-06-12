@@ -22,7 +22,19 @@
 //! once written ([architecture §12 invariant 1](../../../../docs/02-architecture.md#12-cross-cutting-architectural-invariants)).
 //! So [`DiskFile`] exposes [`append`](DiskFile::append) (logical `O_APPEND`),
 //! never a positional overwrite. Positional *reads* ([`read_at`](DiskFile::read_at))
-//! are fine — sealed segments are read at arbitrary offsets.
+//! are fine — sealed segments are read at arbitrary offsets. The absence of
+//! in-place rewrite is also what keeps this contract implementable by an
+//! object store — see [`conformance`] for the expectations a new backend
+//! must meet.
+//!
+//! ## Two durability points
+//!
+//! [`DiskFile::sync`] makes a file's *contents* durable; [`Disk::sync_dir`] —
+//! the directory fence ([STL-232]) — makes the *namespace* durable. Recovery
+//! discovers files by listing the disk, so both are load-bearing: the engine
+//! fences after creating any file whose existence recovery relies on. The
+//! full fsync discipline (which operation syncs what, and when) is documented
+//! in [02 — architecture §3.7](../../../../docs/02-architecture.md#37-on-disk-layout--durability-discipline-local-backend).
 //!
 //! ## Determinism
 //!
@@ -35,6 +47,7 @@ use std::io;
 use std::path::{Component, Path};
 
 pub mod any;
+pub mod conformance;
 pub mod local;
 pub mod memory;
 
@@ -97,6 +110,29 @@ pub trait Disk: Send + Sync + 'static {
     /// filesystem-backed [`Disk`] implements this as [`std::fs::remove_file`];
     /// the in-memory disk models the same.
     fn remove(&self, name: &str) -> io::Result<()>;
+
+    /// Directory fence ([STL-232]): make this disk's *namespace* — which files
+    /// exist — durable. After `sync_dir` returns, every [`create`](Self::create)
+    /// and [`remove`](Self::remove) previously performed through this disk
+    /// survives a crash.
+    ///
+    /// [`DiskFile::sync`] makes a file's *contents* durable, but on a real
+    /// filesystem the directory entry is separate metadata: a crash can keep
+    /// the synced bytes yet lose the name that finds them. Recovery discovers
+    /// WAL segments and sealed segments by walking the namespace
+    /// ([`list`](Self::list)), so a durability claim is only as strong as the
+    /// directory entry behind it. Callers fence after creating a file whose
+    /// *existence* recovery relies on — a fresh/rotated WAL segment before
+    /// records in it count as durable, a flushed segment before the checkpoint
+    /// manifest vouches for it.
+    ///
+    /// A backend where namespace mutations are atomically durable — the
+    /// in-memory model, or an object store whose PUT is atomic ([ADR-0007](../../../../docs/adr/0007-storage-compute-separation.md))
+    /// — returns `Ok(())` without doing work. A filesystem-backed backend must
+    /// fsync the backing directory. The method is *required* (no default
+    /// no-op) precisely so a wrapper cannot silently drop the fence on its way
+    /// to the real backend.
+    fn sync_dir(&self) -> io::Result<()>;
 }
 
 /// A single append-only file within a [`Disk`].

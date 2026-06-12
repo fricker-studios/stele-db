@@ -4,8 +4,9 @@
 //! change *speed* but never *results* — the superset contract
 //! (`stele-engine`'s `secondary` module docs). This harness pins it the
 //! [testing-strategy §4](../../../docs/06-testing-strategy.md#4-correctness-oracles-the-temporal-heart)
-//! way: one seeded random workload (inserts, partial updates, deletes,
-//! flushes, a mid-workload restart) is applied to **two** engines — one that
+//! way: one seeded random workload (inserts, partial updates, point and
+//! predicate-driven ([STL-229]) updates/deletes, flushes, a mid-workload
+//! restart) is applied to **two** engines — one that
 //! also executes the index DDL, one that never does (the forced full scan) —
 //! and to a deliberately-dumb reference model. A probe matrix of projections ×
 //! predicates is then swept over live reads *and* system-time `AS OF` reads at
@@ -27,6 +28,7 @@
 //! [`IndexScript`] and their predicate shapes to [`probes`] rather than
 //! writing their own harness.
 //!
+//! [STL-229]: https://allegromusic.atlassian.net/browse/STL-229
 //! [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
 //! [STL-237]: https://allegromusic.atlassian.net/browse/STL-237
 //! [STL-238]: https://allegromusic.atlassian.net/browse/STL-238
@@ -304,7 +306,24 @@ fn next_dml(rng: &mut Rng, model: &mut Vec<Row>, next_id: &mut i32) -> String {
             .map_or_else(|| "NULL".to_owned(), |s| format!("'{s}'"))
     };
 
-    match rng.index(4) {
+    match rng.index(6) {
+        // A predicate-driven UPDATE ([STL-229]): the indexed engine expands the
+        // WHERE through an index probe, the unindexed one through a full scan —
+        // the resulting writes (and later reads) must still agree byte-for-byte.
+        4 => {
+            let target = i32::try_from(1 + rng.index(3)).expect("small domain");
+            let b = int_or_null(rng, &[10, 20]);
+            for row in model.iter_mut().filter(|row| row.a == Some(target)) {
+                row.b = b;
+            }
+            format!("UPDATE t SET b = {} WHERE a = {target}", sql_int(b))
+        }
+        // A predicate-driven DELETE ([STL-229]), same probe-vs-scan expansion.
+        5 => {
+            let target = i32::try_from(1 + rng.index(3)).expect("small domain");
+            model.retain(|row| row.a != Some(target));
+            format!("DELETE FROM t WHERE a = {target}")
+        }
         2 if !model.is_empty() => {
             let idx = rng.index(model.len());
             let id = model[idx].id;

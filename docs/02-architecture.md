@@ -245,6 +245,75 @@ flowchart LR
     boot["Boot"] --> verify["Verify sealed segments<br/>(checksums)"] --> cp["Load latest checkpoint"] --> replay["Replay WAL from checkpoint<br/>(idempotent redo)"] --> rebuild["Rebuild delta tier + open sentinels"] --> ready["Ready (consistent)"]
 ```
 
+### 3.7 On-disk layout & durability discipline (local backend)
+
+Every byte the engine persists flows through the storage-backend trait
+(`stele_storage::backend::Disk` — STL-90/STL-232), and the **`local`** backend —
+the default ([05 — configuration](05-dev-environment.md#configuration)) — is its
+complete reference implementation: one real directory (`[server] data_dir`)
+holding a **flat namespace** of **append-only** files. The `memory` backend
+models the identical contract on the heap (tests, sim, throwaway runs); an
+object-store backend slots in at v0.4 (§4, [ADR-0007](adr/0007-storage-compute-separation.md)).
+A shared conformance suite (`stele_storage::backend::conformance`) runs
+unchanged against `local`, `memory`, and the sim's seeded fault disk, and
+records the contract a new backend must meet.
+
+**Data-dir layout.** Engine-wide logs sit at the root; each table's tier is
+namespaced by a fixed-width prefix `t{NNNNNNNNNNNNNNNNNNNN}-` (its catalog
+namespace index, zero-padded to 20 digits) so independent tables never collide
+in the flat namespace:
+
+| File | Scope | Contents |
+|---|---|---|
+| `stele.catalog` | root | append-only catalog log: every acknowledged DDL ([ADR-0028](adr/0028-durable-catalog-log.md)) |
+| `stele.commits` | root | cross-table commit-marker log ([ADR-0029](adr/0029-cross-table-commit-marker.md)) |
+| `t…-wal-{n}.log` | per table | WAL segments, numbered from 0, rotated by size |
+| `t…-stele.checkpoint` | per table | append-only checkpoint manifest: replay floor, durable fence, vouched segment count |
+| `t…-seg-{n}.seg` | per table | sealed, immutable columnar segments (§3.2) |
+| `t…-delta-spill-{n}.row`, `t…-validity-spill-{n}.row` | per table | ephemeral spill files — reconstructible from WAL replay, deletable |
+
+All `{n}` are zero-padded to 20 digits so lexicographic and numeric order
+agree. Unrecognized names are ignored (forward compatibility); a sealed
+segment not vouched by the checkpoint manifest is an **orphan** — debris of a
+crashed flush — and is ignored by recovery, then overwritten by the next flush.
+
+**Fsync discipline (file *and* directory).** The trait has two durability
+points, and both are real fsyncs on `local`:
+
+* `DiskFile::sync` (`fsync(2)`/`FlushFileBuffers`) makes a file's *contents*
+  durable. It is issued at the WAL group-commit tick — **the** durability
+  point (§3.4) — at segment seal (`SegmentWriter::finish`), and after every
+  checkpoint/catalog/commit-marker append.
+* `Disk::sync_dir` — the **directory fence** (STL-232) — makes the *namespace*
+  durable: POSIX separates a file's bytes from its directory entry, and
+  recovery rediscovers files by listing the directory, so a synced record in
+  an unlinked file would be silently lost. The engine fences after creating
+  any file recovery relies on: WAL open/rotation (before any record in the new
+  segment can count as durable), flush (after sealing the segment, *before*
+  the checkpoint vouches for it), and each root log's first creation. On
+  Windows there is no supported directory flush; NTFS metadata journaling
+  covers the gap and the fence is a documented no-op.
+
+**Torn-tail posture.** Appends can tear (power loss mid-write). Every
+append-only log tolerates a torn *tail*: a partial or magic-less trailing
+frame is the unacknowledged debris of a crashed append and is skipped (WAL
+replay, checkpoint scan, catalog/commit-marker replay all stop cleanly), while
+a *complete* frame whose CRC fails is corruption of acknowledged history and
+**fails closed**. Sealed segments are checksummed per page and verified at
+recovery (§3.6) — flipping any byte fails the read.
+
+**Error taxonomy.** Namespace misuse surfaces before I/O (`InvalidInput` for a
+non-flat name; `AlreadyExists`/`NotFound` for create/open-remove conflicts);
+reads past EOF are short counts or `Ok(0)`, never errors. A **failed fsync is
+a crash, not a clean abort** (STL-217): a failed WAL `sync` or rotation fence
+poisons the WAL — every subsequent write refuses with `WalError::Poisoned`
+until the operator restarts into recovery — because a record staged before a
+failed fsync has *indeterminate* durability and must never be flushed later
+under the guise of an aborted operation. A failed fence elsewhere fails the
+operation before anything is acknowledged (a flush aborts before the
+checkpoint vouches; a first catalog append fails before the DDL is
+acknowledged).
+
 ---
 
 ## 4. Object-storage tiering & storage/compute separation

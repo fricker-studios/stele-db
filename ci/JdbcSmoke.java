@@ -29,8 +29,11 @@ public final class JdbcSmoke {
     public static void main(String[] args) throws Exception {
         String host = args.length > 0 ? args[0] : "localhost";
         String port = args.length > 1 ? args[1] : "5454";
+        // sslmode=require drives the STL-251 TLS leg; pgjdbc treats `require` as
+        // encrypt-without-validating, exactly like libpq.
+        String sslmode = args.length > 2 ? args[2] : "disable";
         String url = "jdbc:postgresql://" + host + ":" + port + "/stele"
-                + "?assumeMinServerVersion=9.4";
+                + "?assumeMinServerVersion=9.4&sslmode=" + sslmode;
 
         try (Connection conn = connectWithRetry(url)) {
             try (Statement st = conn.createStatement()) {

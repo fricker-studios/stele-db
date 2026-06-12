@@ -13,6 +13,7 @@
 pub mod datetime;
 pub mod hash;
 pub mod hashkey;
+pub mod metrics;
 pub mod period;
 pub mod provenance;
 pub mod row_codec;

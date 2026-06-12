@@ -313,6 +313,12 @@ data_dir   = "/var/lib/stele"
 backend    = "local"            # local | memory | s3
 # [storage.s3] bucket = "stele-cold"  endpoint = "http://minio:9000"
 
+[tls]                           # TLS on pg-wire (STL-251)
+mode       = "required"         # required (default) | optional | disabled
+cert       = "/etc/stele/server.crt"
+key        = "/etc/stele/server.key"
+# client_ca = "/etc/stele/clients.crt"  # set to require mTLS client certs
+
 [storage.cache]
 hot_cache_bytes = "8GiB"
 
@@ -324,6 +330,10 @@ metrics    = "0.0.0.0:9090"     # Prometheus/OpenMetrics
 tracing    = "info"
 ```
 
-A ready-to-copy sample lives at [`stele.example.toml`](../stele.example.toml) in the repo root — `cp stele.example.toml stele.toml` and edit. Only `[server] listen`/`data_dir` and `[storage] backend` are read today (STL-116); the other sections above are reserved (the parser ignores unknown sections) and land in later tickets.
+A ready-to-copy sample lives at [`stele.example.toml`](../stele.example.toml) in the repo root — `cp stele.example.toml stele.toml` and edit. Only `[server] listen`/`data_dir`, `[storage] backend`, `[tls]`, and `[telemetry] metrics` (the ops HTTP listener — `/metrics`, `/healthz`, `/readyz`; see [11 §1](11-operations-and-runbooks.md#1-health--monitoring)) are read today (STL-116, STL-251, STL-253); the other sections above are reserved (the parser ignores unknown sections) and land in later tickets.
+
+**Secure defaults** ([10 §4](10-security-and-compliance.md#4-data-protection--encryption), STL-251): a config-file (non-dev) run **without `[tls]` may only bind loopback** — the server refuses to start on a non-loopback `listen` rather than silently serve plaintext. Configure `[tls]`, bind `127.0.0.1`, or use `--dev`.
+
+`backend = "local"` — the default, and the fully-realized reference backend (STL-232) — roots everything at `data_dir`; what lands in that directory and the durability discipline behind it (file **and** directory fsync, torn-tail tolerance, fsync-failure poisoning) are documented in [02 — architecture §3.7](02-architecture.md#37-on-disk-layout--durability-discipline-local-backend). `backend = "memory"` runs the identical contract on the heap — nothing survives a restart; both backends (plus the sim's fault disk) pass the shared conformance suite (`stele_storage::backend::conformance`).
 
 Dev mode (`--dev`) supplies safe defaults so a contributor needs **no config file** to get running — config is for operators, not for the five-minute path.

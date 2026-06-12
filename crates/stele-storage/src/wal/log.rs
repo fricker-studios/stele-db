@@ -8,6 +8,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
+use stele_common::metrics::SharedMetrics;
+
 use super::record::{HEADER_LEN, MAX_PAYLOAD_LEN, encode};
 use super::segment;
 use crate::backend::{Disk, DiskFile};
@@ -116,6 +118,15 @@ pub(super) struct Inner<D: Disk> {
     /// successful `tick` flush it ([STL-217]). Reads (replay) stay available so
     /// recovery can run; recovery opens a fresh WAL, which starts unpoisoned.
     poisoned: bool,
+    /// The session's shared metric registry, when one has been installed
+    /// ([`Wal::set_metrics`], [STL-253]): appends and fsyncs report into it.
+    /// Pure atomic bumps — no time is read unless the *host* installed a time
+    /// source on the registry, so the deterministic core stays clock-free
+    /// ([ADR-0010]).
+    ///
+    /// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
+    /// [ADR-0010]: ../../../../docs/adr/0010-deterministic-simulation-testing.md
+    metrics: Option<SharedMetrics>,
 }
 
 /// One distinct `LogOffset` target shared by 1..N pending `Commit` futures.
@@ -138,10 +149,20 @@ impl<D: Disk> Wal<D> {
     /// callers needing to verify the log should use [`Wal::replay_from`] first.
     pub fn open(disk: D, config: WalConfig) -> Result<Self, WalError> {
         let segments = list_segments(&disk)?;
-        let (current_segment_index, current) = match segments.last().copied() {
-            Some(idx) => (idx, disk.open(&segment::name_for(idx))?),
-            None => (0, disk.create(&segment::name_for(0))?),
+        let (current_segment_index, current) = if let Some(idx) = segments.last().copied() {
+            (idx, disk.open(&segment::name_for(idx))?)
+        } else {
+            (0, disk.create(&segment::name_for(0))?)
         };
+        // Directory fence ([STL-232]), on *both* paths: recovery rediscovers
+        // the log by listing the disk, so every segment's *entry* must be
+        // durable before a record fsync'd into it can count as durable.
+        // Fencing unconditionally (not just after the create) also heals any
+        // entry a previous incarnation created but never fenced — a crash (or
+        // fence failure) between `create` and `sync_dir` in a prior open or
+        // rotation leaves exactly that debris, and this boot-time fence
+        // vouches for it before any new durability claim is made.
+        disk.sync_dir()?;
         let end = LogOffset {
             segment_index: current_segment_index,
             byte_offset: current.len(),
@@ -156,8 +177,19 @@ impl<D: Disk> Wal<D> {
                 durable_end: end,
                 waiters: Vec::new(),
                 poisoned: false,
+                metrics: None,
             })),
         })
+    }
+
+    /// Install the session's shared metric registry ([STL-253]): subsequent
+    /// appends count into `stele_wal_appends_total` and fsyncs observe
+    /// `stele_wal_fsync_seconds`. Without one (the default) instrumentation is
+    /// skipped entirely.
+    ///
+    /// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
+    pub fn set_metrics(&self, metrics: SharedMetrics) {
+        self.inner.lock().expect("wal mutex poisoned").metrics = Some(metrics);
     }
 
     /// Stage `payload` as a single record. Returns the [`LogOffset`] *after* the
@@ -212,6 +244,9 @@ impl<D: Disk> Wal<D> {
                     encode(payload, &mut frame);
                     g.current.append(&frame).map_err(WalError::Io)?;
                     g.staged_end.byte_offset += record_len;
+                    if let Some(m) = &g.metrics {
+                        m.wal_appends.inc();
+                    }
                     Ok(g.staged_end)
                 })
             }
@@ -317,10 +352,12 @@ fn drain_tick<D: Disk>(inner: &Mutex<Inner<D>>) -> (Vec<Waker>, Result<(), WalEr
     // caller wakes them and each re-polls to observe the poison (resolving
     // `Err(Poisoned)`) instead of hanging. The first failure still returns the
     // concrete I/O error; subsequent calls get `WalError::Poisoned`.
+    let fsync_started = g.metrics.as_ref().map(|m| m.now_micros());
     if let Err(e) = g.current.sync() {
         g.poisoned = true;
         return (drain_all_waiters(&mut g), Err(WalError::Io(e)));
     }
+    observe_fsync(g.metrics.as_ref(), fsync_started);
     g.durable_end = g.staged_end;
     (drain_waiters(&mut g), Ok(()))
 }
@@ -366,13 +403,27 @@ fn rotate<D: Disk>(g: &mut Inner<D>, wakers: &mut Vec<Waker>) -> Result<(), WalE
     // caller wakes them (this runs inside `append`'s lock scope, whose post-lock
     // wake loop fires `wakers` on the error path too) — otherwise a durability
     // future parked before the rotation would hang.
+    let fsync_started = g.metrics.as_ref().map(|m| m.now_micros());
     if let Err(e) = g.current.sync() {
         g.poisoned = true;
         wakers.extend(drain_all_waiters(g));
         return Err(WalError::Io(e));
     }
+    observe_fsync(g.metrics.as_ref(), fsync_started);
     let new_idx = g.current_segment_index + 1;
     let new_file = g.disk.create(&segment::name_for(new_idx))?;
+    // Directory fence ([STL-232]): the new segment's *entry* must be durable
+    // before any record fsync'd into it can count as durable — recovery finds
+    // segments by listing the disk, so a synced record in an unlinked file
+    // would be silently lost. A failed fence is a failed fsync: poison, same
+    // as the closing-segment sync above ([STL-217]). The unfenced file this
+    // leaves behind is healed by [`Wal::open`]'s unconditional fence on the
+    // post-poison restart, before the reopened WAL claims any durability.
+    if let Err(e) = g.disk.sync_dir() {
+        g.poisoned = true;
+        wakers.extend(drain_all_waiters(g));
+        return Err(WalError::Io(e));
+    }
 
     // From here on the rotation is committed. The closing segment is durable,
     // so every record in it is durable — advance `durable_end` past the
@@ -389,6 +440,20 @@ fn rotate<D: Disk>(g: &mut Inner<D>, wakers: &mut Vec<Waker>) -> Result<(), WalE
     g.durable_end = g.staged_end;
     wakers.extend(drain_waiters(g));
     Ok(())
+}
+
+/// Observe one successful fsync into the registry's WAL-fsync histogram
+/// ([STL-253]). `started` is the pre-sync reading paired with the registry it
+/// came from; both `None` (no registry installed) skip the observation. With a
+/// registry but no installed time source both readings are `0`, so the
+/// duration observes as zero — the count still ticks, deterministically.
+///
+/// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
+fn observe_fsync(metrics: Option<&SharedMetrics>, started: Option<u64>) {
+    if let (Some(m), Some(started)) = (metrics, started) {
+        m.wal_fsync_seconds
+            .observe_micros(m.now_micros().saturating_sub(started));
+    }
 }
 
 fn list_segments<D: Disk>(disk: &D) -> io::Result<Vec<u64>> {

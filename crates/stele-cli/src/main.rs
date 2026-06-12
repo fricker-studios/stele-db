@@ -51,6 +51,14 @@ struct ShellArgs {
     /// Database name sent in the startup message.
     #[arg(long, default_value = "stele")]
     dbname: String,
+    /// TLS, libpq sslmode-style: `prefer` (try TLS, fall back to plaintext —
+    /// the default), `disable`, `require` (TLS or fail; encrypts but does not
+    /// verify the server), or `verify-full` (verify against --tls-ca + host).
+    #[arg(long, value_enum, default_value_t = client::SslMode::Prefer)]
+    tls: client::SslMode,
+    /// PEM CA bundle that `--tls verify-full` verifies the server against.
+    #[arg(long)]
+    tls_ca: Option<std::path::PathBuf>,
     /// Result-table border style.
     #[arg(long, value_enum, default_value_t = render::BorderStyle::Psql)]
     border: render::BorderStyle,
@@ -107,6 +115,10 @@ fn main() -> anyhow::Result<()> {
             port: s.port,
             user: s.user,
             dbname: s.dbname,
+            tls: client::TlsOpts {
+                mode: s.tls,
+                ca: s.tls_ca,
+            },
             border: s.border,
             row_nums: s.row_numbers,
             no_color: s.no_color,
@@ -175,6 +187,28 @@ mod tests {
         assert_eq!(s.port, stele_common::DEFAULT_PG_PORT);
         assert_eq!(s.user, "stele");
         assert_eq!(s.dbname, "stele");
+        // libpq's default: try TLS, fall back to plaintext (STL-251).
+        assert_eq!(s.tls, client::SslMode::Prefer);
+        assert!(s.tls_ca.is_none());
+    }
+
+    #[test]
+    fn shell_accepts_tls_flags() {
+        let Cmd::Shell(s) = parse(&[
+            "stele",
+            "shell",
+            "--tls",
+            "verify-full",
+            "--tls-ca",
+            "/etc/stele/ca.pem",
+        ]) else {
+            panic!("expected shell subcommand");
+        };
+        assert_eq!(s.tls, client::SslMode::VerifyFull);
+        assert_eq!(
+            s.tls_ca.as_deref(),
+            Some(std::path::Path::new("/etc/stele/ca.pem"))
+        );
     }
 
     #[test]

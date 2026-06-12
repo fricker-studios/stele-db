@@ -55,13 +55,24 @@
 //! in text (the `text_format` module) or binary (the `binary_format` module)
 //! accordingly. Mixed text/binary columns in one row are honored.
 //!
+//! ## TLS (v0.3)
+//!
+//! [STL-251] lands wire encryption on the startup path: an `SSLRequest` is
+//! answered with `S` and upgraded through a rustls handshake when the server
+//! is built [`with_tls`](Server::with_tls) (the `tls` module owns the
+//! acceptor, including the optional **mTLS** client-CA verification), and a
+//! plaintext `StartupMessage` is refused with `FATAL` SQLSTATE `28000` when
+//! the policy is [`TlsMode::Required`]. Without TLS configured the v0.1
+//! behavior stands: refuse with `N`, accept the plaintext fallback.
+//!
 //! ## Not yet
 //!
 //! * `COPY` — v0.3.
-//! * SCRAM-SHA-256 auth + TLS — v0.3.
+//! * SCRAM-SHA-256 auth — v0.3 (STL-252).
 //!
 //! [STL-182]: https://allegromusic.atlassian.net/browse/STL-182
 //! [STL-183]: https://allegromusic.atlassian.net/browse/STL-183
+//! [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
 //! [STL-77]: https://allegromusic.atlassian.net/browse/STL-77
 //!
 //! ## Architectural constraint
@@ -76,6 +87,7 @@ mod binary_format;
 mod extended;
 mod pg_catalog;
 mod text_format;
+mod tls;
 
 use std::collections::HashMap;
 use std::io;
@@ -83,14 +95,16 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::{BufMut, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, instrument, warn};
 
 pub use stele_common::DEFAULT_PG_PORT;
+pub use tls::{ServerTls, TlsError, TlsMode, TlsSettings};
 
 use stele_catalog::CatalogError;
 use stele_common::hashkey::hash_key;
+use stele_common::metrics::SharedMetrics;
 use stele_common::time::Clock;
 use stele_common::types::{DecodeError, LogicalType, ScalarValue};
 use stele_engine::{
@@ -160,6 +174,9 @@ const MSG_PORTAL_SUSPENDED: u8 = b's';
 const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
 const SQLSTATE_PROTOCOL_VIOLATION: &str = "08P01";
 const SQLSTATE_SYNTAX_ERROR: &str = "42601";
+/// `invalid_authorization_specification` — the class Postgres itself uses to
+/// reject a plaintext connection when `pg_hba.conf` demands SSL (STL-251).
+const SQLSTATE_INVALID_AUTHORIZATION: &str = "28000";
 // DDL-routing SQLSTATEs (STL-131): the standard Postgres codes for the catalog
 // failures a `CREATE`/`DROP TABLE` can hit, so a stock client classifies them
 // the way it would against Postgres.
@@ -291,6 +308,29 @@ pub trait SessionHandle: Send {
     /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
     /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
     fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError>;
+
+    /// Whether the engine has **poisoned** — a WAL fsync failed, durability is
+    /// indeterminate, and the session must restart into recovery — see
+    /// [`SessionEngine::is_poisoned`] ([STL-217]). The ops listener's `/readyz`
+    /// probe reports not-ready on `true` ([STL-253]). Defaults to `false` so
+    /// session fakes that never touch storage need not implement it.
+    ///
+    /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
+    /// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
+    fn is_poisoned(&self) -> bool {
+        false
+    }
+
+    /// The session's shared metric registry — see [`SessionEngine::metrics`]
+    /// ([STL-253]). The wire front end counts connections and transaction
+    /// rollbacks into it, and the ops listener renders it; sharing the engine's
+    /// instance puts every series on one `/metrics` page. Defaults to a fresh,
+    /// unshared registry so session fakes need not implement it.
+    ///
+    /// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
+    fn metrics(&self) -> SharedMetrics {
+        SharedMetrics::default()
+    }
 }
 
 impl<C, D> SessionHandle for SessionEngine<C, D>
@@ -340,6 +380,14 @@ where
     fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError> {
         Self::commit(self, txn)
     }
+
+    fn is_poisoned(&self) -> bool {
+        Self::is_poisoned(self)
+    }
+
+    fn metrics(&self) -> SharedMetrics {
+        Arc::clone(Self::metrics(self))
+    }
 }
 
 /// A session handle shared across connections: one engine behind a mutex, with
@@ -357,6 +405,7 @@ pub type SharedSession = Arc<Mutex<dyn SessionHandle>>;
 pub struct Server {
     listen_addr: SocketAddr,
     session: SharedSession,
+    tls: Option<Arc<ServerTls>>,
 }
 
 impl Server {
@@ -365,7 +414,20 @@ impl Server {
         Self {
             listen_addr,
             session,
+            tls: None,
         }
+    }
+
+    /// Serve TLS ([STL-251]): answer `SSLRequest` with `S` and run the
+    /// handshake through `tls`'s acceptor. Whether a plaintext startup is
+    /// still accepted is `tls`'s [`TlsMode`]. Without this call the server
+    /// refuses `SSLRequest` with `N` and runs plaintext (the v0.1 behavior).
+    ///
+    /// [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
+    #[must_use]
+    pub fn with_tls(mut self, tls: ServerTls) -> Self {
+        self.tls = Some(Arc::new(tls));
+        self
     }
 
     /// Bind the listen socket now, returning a [`BoundServer`] whose
@@ -386,6 +448,7 @@ impl Server {
             listener,
             local_addr,
             session: self.session,
+            tls: self.tls,
         })
     }
 
@@ -411,6 +474,7 @@ pub struct BoundServer {
     listener: TcpListener,
     local_addr: SocketAddr,
     session: SharedSession,
+    tls: Option<Arc<ServerTls>>,
 }
 
 impl BoundServer {
@@ -429,6 +493,14 @@ impl BoundServer {
     pub async fn serve(self) -> io::Result<()> {
         info!(addr = %self.local_addr, "stele-pgwire: listening");
 
+        // The engine's registry ([`SessionHandle::metrics`], [STL-253]) — taken
+        // once, then cloned per connection for the accept/teardown counters.
+        let metrics = self
+            .session
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .metrics();
+
         loop {
             let (stream, peer) = match self.listener.accept().await {
                 Ok(pair) => pair,
@@ -442,10 +514,23 @@ impl BoundServer {
             // Disable Nagle — short Postgres messages don't benefit from coalescing.
             let _ = stream.set_nodelay(true);
             let session = Arc::clone(&self.session);
+            let tls = self.tls.clone();
+            let metrics = Arc::clone(&metrics);
+            metrics.connections_total.inc();
+            metrics.connections_active.inc();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, peer, session).await {
-                    warn!(%peer, error = %e, "connection closed with error");
+                match handle_connection(stream, peer, session, tls, &metrics).await {
+                    Ok(()) => {}
+                    // Expected, policy- or client-driven closures (a plaintext
+                    // attempt against tls = "required", a CancelRequest): not a
+                    // server-side problem, so don't page anyone over them.
+                    Err(e @ (WireError::TlsRequired | WireError::Cancelled)) => {
+                        debug!(%peer, error = %e, "connection closed");
+                    }
+                    Err(e) => warn!(%peer, error = %e, "connection closed with error"),
                 }
+                // Every arm — clean close, policy closure, error — releases the gauge.
+                metrics.connections_active.dec();
             });
         }
     }
@@ -466,7 +551,24 @@ pub enum WireError {
 
     #[error("client cancelled startup")]
     Cancelled,
+
+    /// A plaintext `StartupMessage` arrived while the server policy is
+    /// `tls = "required"` ([STL-251]). The client already got a `FATAL`
+    /// `28000` explaining itself before the connection closed.
+    ///
+    /// [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
+    #[error("plaintext startup refused: server requires TLS")]
+    TlsRequired,
 }
+
+/// The duplex byte stream a connection runs over — a plain [`TcpStream`] or
+/// the TLS-wrapped one the `SSLRequest` negotiation produced ([STL-251]).
+/// Every post-accept helper is generic over this so the one session loop
+/// serves both. Blanket-implemented; never implemented by hand.
+///
+/// [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
+trait Wire: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Wire for T {}
 
 // ---------------------------------------------------------------------------
 // Connection handler
@@ -563,25 +665,129 @@ fn txn_control(stmt: &Statement) -> Option<TxnControl<'_>> {
     }
 }
 
-#[instrument(skip(stream, session), fields(%peer))]
+#[instrument(skip(stream, session, tls, metrics), fields(%peer))]
 async fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: SocketAddr,
     session: SharedSession,
+    tls: Option<Arc<ServerTls>>,
+    metrics: &SharedMetrics,
 ) -> Result<(), WireError> {
     // --- 1. Startup phase --------------------------------------------------
-    let startup = read_startup(&mut stream).await?;
+    // Negotiate first (the `SSLRequest` may upgrade the stream to TLS); the
+    // protocol proper then runs identically over either stream.
+    match negotiate_startup(stream, tls.as_deref()).await? {
+        Negotiated::Plain(mut stream, startup) => {
+            run_session(&mut stream, startup, session, metrics).await
+        }
+        Negotiated::Tls(mut stream, startup) => {
+            run_session(stream.as_mut(), startup, session, metrics).await
+        }
+    }
+}
+
+/// What [`negotiate_startup`] settled on: the stream the session runs over
+/// (plain or TLS-wrapped) plus the parsed `StartupMessage`.
+enum Negotiated {
+    Plain(TcpStream, StartupMessage),
+    Tls(
+        Box<tokio_rustls::server::TlsStream<TcpStream>>,
+        StartupMessage,
+    ),
+}
+
+/// Drive the startup-shape phase on a fresh connection ([STL-251]): answer
+/// `SSLRequest` (running the TLS handshake when an acceptor is configured,
+/// refusing with `N` otherwise), refuse GSS, surface `CancelRequest`, and
+/// enforce the plaintext policy before a `StartupMessage` is accepted.
+///
+/// [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
+async fn negotiate_startup(
+    mut stream: TcpStream,
+    tls: Option<&ServerTls>,
+) -> Result<Negotiated, WireError> {
+    loop {
+        let (length, code) = read_startup_header(&mut stream).await?;
+        match code {
+            // SSLRequest / GSSENCRequest are exactly 8 bytes; any other length
+            // would leave unread bytes that desynchronize the next header read.
+            SSL_REQUEST_CODE | GSS_ENC_REQUEST_CODE if length != 8 => {
+                return Err(WireError::Protocol("encryption request length must be 8"));
+            }
+            SSL_REQUEST_CODE => {
+                if let Some(ctx) = tls {
+                    stream.write_all(b"S").await?;
+                    stream.flush().await?;
+                    let mut tls_stream = Box::new(ctx.acceptor.accept(stream).await?);
+                    debug!("TLS handshake complete");
+                    // mTLS note: when a client CA is configured the handshake
+                    // above already verified the client certificate — an
+                    // unauthenticated peer never reaches the startup message.
+                    let startup = read_startup(tls_stream.as_mut()).await?;
+                    return Ok(Negotiated::Tls(tls_stream, startup));
+                }
+                // No TLS configured: refuse; the client may fall back to
+                // plaintext and resend a StartupMessage.
+                stream.write_all(b"N").await?;
+                stream.flush().await?;
+            }
+            GSS_ENC_REQUEST_CODE => {
+                stream.write_all(b"N").await?;
+                stream.flush().await?;
+            }
+            CANCEL_REQUEST_CODE => {
+                // CancelRequest is fire-and-forget and gets no reply: close
+                // without draining the pid/secret payload (we don't use it, and
+                // a read here could park the task on partial input).
+                return Err(WireError::Cancelled);
+            }
+            PROTOCOL_3_0 | PROTOCOL_3_2 => {
+                // Read the whole startup message *before* any refusal: bytes
+                // left unread at close turn the FIN into an RST on most
+                // platforms, which can destroy the ErrorResponse before the
+                // client reads it.
+                let startup = read_startup_payload(&mut stream, length, code).await?;
+                if matches!(tls.map(|t| t.mode), Some(TlsMode::Required)) {
+                    // tls = "required": a plaintext startup is refused with the
+                    // same SQLSTATE class (28000) Postgres uses for a pg_hba
+                    // "SSL off" reject, so every driver renders it sensibly.
+                    write_error_response(
+                        &mut stream,
+                        "FATAL",
+                        SQLSTATE_INVALID_AUTHORIZATION,
+                        "connection requires TLS (server policy is tls = \"required\"); \
+                         reconnect with sslmode=require",
+                    )
+                    .await?;
+                    stream.flush().await?;
+                    return Err(WireError::TlsRequired);
+                }
+                return Ok(Negotiated::Plain(stream, startup));
+            }
+            v => return Err(WireError::UnsupportedVersion(v)),
+        }
+    }
+}
+
+/// Run the post-negotiation protocol — the OK bundle, then the message loop —
+/// over an established (plain or TLS) stream.
+async fn run_session<S: Wire>(
+    stream: &mut S,
+    startup: StartupMessage,
+    session: SharedSession,
+    metrics: &SharedMetrics,
+) -> Result<(), WireError> {
     debug!(?startup.params, "startup complete");
 
     // --- 2. Send the OK bundle: AuthOk → ParameterStatus → BackendKeyData → ReadyForQuery
-    write_authentication_ok(&mut stream).await?;
+    write_authentication_ok(stream).await?;
     for (k, v) in default_parameter_status() {
-        write_parameter_status(&mut stream, k, v).await?;
+        write_parameter_status(stream, k, v).await?;
     }
     // BackendKeyData lets clients later issue CancelRequest. We don't honor
     // cancellation in v0.1, but the message itself is part of a clean handshake.
-    write_backend_key_data(&mut stream, 0, 0).await?;
-    write_ready_for_query(&mut stream, ConnTxn::Idle.status_byte()).await?;
+    write_backend_key_data(stream, 0, 0).await?;
+    write_ready_for_query(stream, ConnTxn::Idle.status_byte()).await?;
 
     // The connection's transaction state — auto-commit (`Idle`) until a `BEGIN`
     // opens an explicit block. Persists across messages for the life of the
@@ -593,7 +799,7 @@ async fn handle_connection(
     // "skip until Sync" error latch live for the whole connection.
     let mut state = ConnState::default();
     loop {
-        let Some(msg) = read_typed_message(&mut stream).await? else {
+        let Some(msg) = read_typed_message(stream).await? else {
             debug!("peer closed connection");
             return Ok(());
         };
@@ -617,17 +823,17 @@ async fn handle_connection(
                 // (STL-174). A bare Sync outside any batch is a harmless no-op that
                 // still owes a ReadyForQuery.
                 state.skip_until_sync = false;
-                write_ready_for_query(&mut stream, txn.status_byte()).await?;
+                write_ready_for_query(stream, txn.status_byte()).await?;
             }
-            MSG_PARSE => handle_parse(&mut stream, &mut state, &msg.payload).await?,
-            MSG_BIND => handle_bind(&mut stream, &mut state, &msg.payload).await?,
+            MSG_PARSE => handle_parse(stream, &mut state, &msg.payload).await?,
+            MSG_BIND => handle_bind(stream, &mut state, &msg.payload).await?,
             MSG_DESCRIBE => {
-                handle_describe(&mut stream, &mut state, &msg.payload, &session, &mut txn).await?;
+                handle_describe(stream, &mut state, &msg.payload, &session, &mut txn).await?;
             }
             MSG_EXECUTE => {
-                handle_execute(&mut stream, &mut state, &msg.payload, &session, &mut txn).await?;
+                handle_execute(stream, &mut state, &msg.payload, &session, &mut txn).await?;
             }
-            MSG_CLOSE => handle_close(&mut stream, &mut state, &msg.payload).await?,
+            MSG_CLOSE => handle_close(stream, &mut state, &msg.payload).await?,
             MSG_FLUSH => {
                 // We write replies straight to the socket with no backend buffer,
                 // so Flush only needs to push them past the OS send buffer.
@@ -645,13 +851,13 @@ async fn handle_connection(
                 let Some(q) = cstring_from(&msg.payload) else {
                     warn!("Query payload missing NUL terminator");
                     write_error_response(
-                        &mut stream,
+                        stream,
                         "ERROR",
                         SQLSTATE_PROTOCOL_VIOLATION,
                         "Query message missing NUL terminator",
                     )
                     .await?;
-                    write_ready_for_query(&mut stream, txn.status_byte()).await?;
+                    write_ready_for_query(stream, txn.status_byte()).await?;
                     continue;
                 };
                 // The whole simple-query message produces exactly one
@@ -660,8 +866,8 @@ async fn handle_connection(
                 // first error). `handle_simple_query` writes the per-statement
                 // replies and advances the transaction state; the trailing
                 // ReadyForQuery — carrying the resulting status byte — is ours.
-                handle_simple_query(&mut stream, &q, &session, &mut txn).await?;
-                write_ready_for_query(&mut stream, txn.status_byte()).await?;
+                handle_simple_query(stream, &q, &session, &mut txn, metrics).await?;
+                write_ready_for_query(stream, txn.status_byte()).await?;
             }
             other => {
                 // Simple + extended query and the lifecycle messages are all
@@ -776,11 +982,12 @@ struct ResultColumn {
 // control flow without making it clearer — a readability follow-up, not an
 // MSRV-bump concern.
 #[allow(clippy::cognitive_complexity)]
-async fn handle_simple_query(
-    stream: &mut TcpStream,
+async fn handle_simple_query<S: Wire>(
+    stream: &mut S,
     sql: &str,
     session: &SharedSession,
     txn: &mut ConnTxn,
+    metrics: &SharedMetrics,
 ) -> Result<(), WireError> {
     if sql.trim().is_empty() {
         debug!("empty simple query");
@@ -825,9 +1032,9 @@ async fn handle_simple_query(
                 // A failed COMMIT writes an ErrorResponse and returns `false`, so
                 // the batch aborts here like any other statement error — nothing
                 // more may follow an error on the wire.
-                TxnControl::Commit => run_commit(stream, session, txn).await?,
+                TxnControl::Commit => run_commit(stream, session, txn, metrics).await?,
                 TxnControl::Rollback => {
-                    run_rollback(stream, txn).await?;
+                    run_rollback(stream, txn, metrics).await?;
                     true
                 }
                 // Savepoint statements manipulate the open transaction's buffer in
@@ -929,8 +1136,8 @@ async fn handle_simple_query(
 ///
 /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
 /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
-async fn run_begin(
-    stream: &mut TcpStream,
+async fn run_begin<S: Wire>(
+    stream: &mut S,
     session: &SharedSession,
     txn: &mut ConnTxn,
 ) -> Result<(), WireError> {
@@ -961,10 +1168,11 @@ async fn run_begin(
 /// Returns whether the batch may continue: `Ok(true)` on success, `Ok(false)` when
 /// the commit replay failed — an `ErrorResponse` was written, so the caller must
 /// stop processing this message (nothing may follow an error on the wire).
-async fn run_commit(
-    stream: &mut TcpStream,
+async fn run_commit<S: Wire>(
+    stream: &mut S,
     session: &SharedSession,
     txn: &mut ConnTxn,
+    metrics: &SharedMetrics,
 ) -> Result<bool, WireError> {
     match std::mem::replace(txn, ConnTxn::Idle) {
         ConnTxn::Active(buffered) => match commit_txn(session, buffered) {
@@ -983,8 +1191,12 @@ async fn run_commit(
             }
         },
         // Postgres rolls a failed transaction back on COMMIT and reports ROLLBACK;
-        // the retained buffer (and its snapshot lease) is dropped here unapplied.
-        ConnTxn::Failed(_) => write_command_complete_tag(stream, "ROLLBACK").await?,
+        // the retained buffer (and its snapshot lease) is dropped here unapplied —
+        // a rollback in every sense, so it counts as one ([STL-253]).
+        ConnTxn::Failed(_) => {
+            metrics.txn_rollbacks.inc();
+            write_command_complete_tag(stream, "ROLLBACK").await?;
+        }
         // No open transaction — a warning-only no-op that still reports COMMIT.
         ConnTxn::Idle => write_command_complete_tag(stream, "COMMIT").await?,
     }
@@ -996,7 +1208,16 @@ async fn run_commit(
 /// Returns to idle from any state, dropping an [`ConnTxn::Active`] buffer (nothing
 /// it staged ever reaches storage) or clearing a [`ConnTxn::Failed`] block. A
 /// `ROLLBACK` with no open transaction still reports `ROLLBACK`.
-async fn run_rollback(stream: &mut TcpStream, txn: &mut ConnTxn) -> Result<(), WireError> {
+async fn run_rollback<S: Wire>(
+    stream: &mut S,
+    txn: &mut ConnTxn,
+    metrics: &SharedMetrics,
+) -> Result<(), WireError> {
+    // Only a real open (or aborted) block counts as a rollback ([STL-253]); a
+    // `ROLLBACK` with no transaction is the Postgres warning-only no-op.
+    if !matches!(txn, ConnTxn::Idle) {
+        metrics.txn_rollbacks.inc();
+    }
     *txn = ConnTxn::Idle;
     write_command_complete_tag(stream, "ROLLBACK")
         .await
@@ -1010,8 +1231,8 @@ async fn run_rollback(stream: &mut TcpStream, txn: &mut ConnTxn) -> Result<(), W
 /// no open transaction this is the Postgres error "SAVEPOINT can only be used in
 /// transaction blocks" (`25P01`); inside an aborted one it is refused like any
 /// other statement (`25P02`). Returns whether the batch may continue.
-async fn run_savepoint(
-    stream: &mut TcpStream,
+async fn run_savepoint<S: Wire>(
+    stream: &mut S,
     txn: &mut ConnTxn,
     name: &str,
 ) -> Result<bool, WireError> {
@@ -1035,8 +1256,8 @@ async fn run_savepoint(
 /// does not exist` (`3B001`), which also aborts the transaction (like any error in
 /// a block). State errors mirror [`run_savepoint`]. Returns whether the batch may
 /// continue.
-async fn run_release(
-    stream: &mut TcpStream,
+async fn run_release<S: Wire>(
+    stream: &mut S,
     txn: &mut ConnTxn,
     name: &str,
 ) -> Result<bool, WireError> {
@@ -1068,8 +1289,8 @@ async fn run_release(
 /// statement managed to stage (in practice nothing — a write is buffered only
 /// once its bind fully succeeds — but the rewind is robust either way). The
 /// [`ConnTxn::Failed`] state retains the buffer precisely so this can find it.
-async fn run_rollback_to(
-    stream: &mut TcpStream,
+async fn run_rollback_to<S: Wire>(
+    stream: &mut S,
     txn: &mut ConnTxn,
     name: &str,
 ) -> Result<bool, WireError> {
@@ -1099,7 +1320,7 @@ async fn run_rollback_to(
 /// Error reply for a savepoint statement issued with no open transaction (`25P01`).
 /// `verb` is the statement spelled for the message. Always `Ok(false)`: an error
 /// closes the wire turn, so the batch aborts.
-async fn savepoint_not_in_txn(stream: &mut TcpStream, verb: &str) -> Result<bool, WireError> {
+async fn savepoint_not_in_txn<S: Wire>(stream: &mut S, verb: &str) -> Result<bool, WireError> {
     write_error_response(
         stream,
         "ERROR",
@@ -1113,7 +1334,7 @@ async fn savepoint_not_in_txn(stream: &mut TcpStream, verb: &str) -> Result<bool
 /// Error reply for a savepoint statement issued inside an aborted transaction
 /// (`25P02`) — the same refusal every other statement gets there. Always
 /// `Ok(false)`.
-async fn savepoint_in_aborted_txn(stream: &mut TcpStream) -> Result<bool, WireError> {
+async fn savepoint_in_aborted_txn<S: Wire>(stream: &mut S) -> Result<bool, WireError> {
     write_error_response(
         stream,
         "ERROR",
@@ -1127,8 +1348,8 @@ async fn savepoint_in_aborted_txn(stream: &mut TcpStream) -> Result<bool, WireEr
 /// Error reply for `ROLLBACK TO` / `RELEASE` of a savepoint that does not exist
 /// (`3B001`). Like any error inside a block this aborts the transaction, so the
 /// open transaction is moved to the failed state and `Ok(false)` returned.
-async fn no_such_savepoint(
-    stream: &mut TcpStream,
+async fn no_such_savepoint<S: Wire>(
+    stream: &mut S,
     txn: &mut ConnTxn,
     name: &str,
 ) -> Result<bool, WireError> {
@@ -1201,8 +1422,8 @@ fn run_ddl(
 /// All result-row cells are decoded up front, so a decode failure surfaces as a
 /// single `ErrorResponse` rather than a `RowDescription` followed by a torn row
 /// stream.
-async fn run_statement(
-    stream: &mut TcpStream,
+async fn run_statement<S: Wire>(
+    stream: &mut S,
     stmt: &Statement,
     session: &SharedSession,
     txn: &mut ConnTxn,
@@ -1329,9 +1550,13 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
         | EngineError::Dml(DmlError::UnknownTable(_) | DmlError::TableNotLive { .. })
         | EngineError::UnknownTable(_) => SQLSTATE_UNDEFINED_TABLE,
         // A named column the schema does not contain — Postgres's undefined_column,
-        // distinct from undefined_table, so a client can branch on it.
+        // distinct from undefined_table, so a client can branch on it. A DML
+        // WHERE binds through the shared SELECT predicate binder ([STL-229]), so
+        // its unknown column surfaces wrapped and maps the same way.
         EngineError::Select(SelectError::UnknownColumn { .. })
-        | EngineError::Dml(DmlError::UnknownColumn { .. }) => SQLSTATE_UNDEFINED_COLUMN,
+        | EngineError::Dml(
+            DmlError::UnknownColumn { .. } | DmlError::Predicate(SelectError::UnknownColumn { .. }),
+        ) => SQLSTATE_UNDEFINED_COLUMN,
         EngineError::Dml(DmlError::BadLiteral { .. } | DmlError::TypeMismatch { .. }) => {
             SQLSTATE_INVALID_TEXT_REPRESENTATION
         }
@@ -1352,7 +1577,8 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
         | EngineError::Scan(_)
         | EngineError::RowCodec(_)
         | EngineError::SchemaChanged { .. }
-        | EngineError::MalformedValidBound => SQLSTATE_INTERNAL_ERROR,
+        | EngineError::MalformedValidBound
+        | EngineError::MalformedBusinessKey => SQLSTATE_INTERNAL_ERROR,
         // A write-write conflict at COMMIT — the retryable serialization failure.
         EngineError::Conflict => SQLSTATE_SERIALIZATION_FAILURE,
     }
@@ -1838,8 +2064,8 @@ fn ensure_executed(
 /// Write an `ErrorResponse` and latch the connection into skip-until-Sync — the
 /// extended-query failure path (no trailing `ReadyForQuery`; the client's Sync
 /// re-opens the batch).
-async fn fail_extended(
-    stream: &mut TcpStream,
+async fn fail_extended<S: Wire>(
+    stream: &mut S,
     state: &mut ConnState,
     sqlstate: &str,
     message: &str,
@@ -1850,8 +2076,8 @@ async fn fail_extended(
 }
 
 /// `Parse` ('P'): parse the query, store it under its name, reply `ParseComplete`.
-async fn handle_parse(
-    stream: &mut TcpStream,
+async fn handle_parse<S: Wire>(
+    stream: &mut S,
     state: &mut ConnState,
     payload: &[u8],
 ) -> Result<(), WireError> {
@@ -1884,8 +2110,8 @@ async fn handle_parse(
 /// client negotiated — text verbatim, or binary decoded under the declared type
 /// OID (STL-183) — and the requested result format codes are stashed on the portal
 /// for Describe / Execute to honor.
-async fn handle_bind(
-    stream: &mut TcpStream,
+async fn handle_bind<S: Wire>(
+    stream: &mut S,
     state: &mut ConnState,
     payload: &[u8],
 ) -> Result<(), WireError> {
@@ -2009,8 +2235,8 @@ fn describe_statement_columns(
 /// `Describe` ('D'): report the shape of a prepared statement (its parameter
 /// types, then its `RowDescription` — or `NoData` for a non-row statement) or a
 /// portal (its `RowDescription`, or `NoData` for a write / empty portal).
-async fn handle_describe(
-    stream: &mut TcpStream,
+async fn handle_describe<S: Wire>(
+    stream: &mut S,
     state: &mut ConnState,
     payload: &[u8],
     session: &SharedSession,
@@ -2060,8 +2286,8 @@ async fn handle_describe(
 
 /// The portal arm of [`handle_describe`]: run a row-returning portal (caching the
 /// result) and reply `RowDescription`; reply `NoData` for a write or empty portal.
-async fn handle_describe_portal(
-    stream: &mut TcpStream,
+async fn handle_describe_portal<S: Wire>(
+    stream: &mut S,
     state: &mut ConnState,
     name: &str,
     session: &SharedSession,
@@ -2108,8 +2334,8 @@ async fn handle_describe_portal(
 /// issuing `Describe` on the statement or portal first (every mainstream driver
 /// does); re-sending the row description on Execute would be a duplicate the
 /// Describe-then-Execute flow does not expect.
-async fn handle_execute(
-    stream: &mut TcpStream,
+async fn handle_execute<S: Wire>(
+    stream: &mut S,
     state: &mut ConnState,
     payload: &[u8],
     session: &SharedSession,
@@ -2196,8 +2422,8 @@ async fn handle_execute(
 
 /// `Close` ('C'): drop a prepared statement or portal (idempotent — closing an
 /// absent name is not an error), reply `CloseComplete`.
-async fn handle_close(
-    stream: &mut TcpStream,
+async fn handle_close<S: Wire>(
+    stream: &mut S,
     state: &mut ConnState,
     payload: &[u8],
 ) -> Result<(), WireError> {
@@ -2232,51 +2458,63 @@ struct StartupMessage {
     params: Vec<(String, String)>,
 }
 
-/// Read the startup phase, transparently handling repeated SSL/GSS refusals.
-async fn read_startup(stream: &mut TcpStream) -> Result<StartupMessage, WireError> {
+/// Read the startup phase, transparently refusing repeated SSL/GSS requests.
+///
+/// This is the *post-negotiation* reader: by the time it runs, the TLS
+/// question is settled ([`negotiate_startup`] owns the upgrade), so a further
+/// `SSLRequest` — e.g. from a client probing inside an established TLS
+/// session — is simply refused with `N`.
+async fn read_startup<S: Wire>(stream: &mut S) -> Result<StartupMessage, WireError> {
     loop {
         let (length, code) = read_startup_header(stream).await?;
         match code {
-            SSL_REQUEST_CODE => {
-                // We refuse TLS in v0.1. The client will fall back to plaintext
-                // and resend a StartupMessage.
-                stream.write_all(b"N").await?;
-                stream.flush().await?;
+            // Exactly 8 bytes, or the unread remainder desyncs the next header.
+            SSL_REQUEST_CODE | GSS_ENC_REQUEST_CODE if length != 8 => {
+                return Err(WireError::Protocol("encryption request length must be 8"));
             }
-            GSS_ENC_REQUEST_CODE => {
+            SSL_REQUEST_CODE | GSS_ENC_REQUEST_CODE => {
                 stream.write_all(b"N").await?;
                 stream.flush().await?;
             }
             CANCEL_REQUEST_CODE => {
-                // CancelRequest is fire-and-forget — drain and close.
-                let mut sink = vec![0u8; 8];
-                stream.read_exact(&mut sink).await?;
+                // CancelRequest is fire-and-forget and gets no reply: close
+                // without draining the pid/secret payload (we don't use it, and
+                // a read here could park the task on partial input).
                 return Err(WireError::Cancelled);
             }
             PROTOCOL_3_0 | PROTOCOL_3_2 => {
-                // Read the rest of the startup payload.
-                let payload_len = usize::try_from(length)
-                    .map_err(|_| WireError::Protocol("startup length negative"))?
-                    .checked_sub(8)
-                    .ok_or(WireError::Protocol("startup length too short"))?;
-                if payload_len > MAX_STARTUP_PAYLOAD_SIZE {
-                    return Err(WireError::Protocol("startup payload exceeds limit"));
-                }
-                let mut payload = vec![0u8; payload_len];
-                stream.read_exact(&mut payload).await?;
-                let params = parse_startup_params(&payload)?;
-                return Ok(StartupMessage {
-                    protocol_version: code,
-                    params,
-                });
+                return read_startup_payload(stream, length, code).await;
             }
             v => return Err(WireError::UnsupportedVersion(v)),
         }
     }
 }
 
+/// Read the parameter payload of a `StartupMessage` whose header (`length`,
+/// protocol `code`) has already been consumed.
+async fn read_startup_payload<S: Wire>(
+    stream: &mut S,
+    length: i32,
+    code: i32,
+) -> Result<StartupMessage, WireError> {
+    let payload_len = usize::try_from(length)
+        .map_err(|_| WireError::Protocol("startup length negative"))?
+        .checked_sub(8)
+        .ok_or(WireError::Protocol("startup length too short"))?;
+    if payload_len > MAX_STARTUP_PAYLOAD_SIZE {
+        return Err(WireError::Protocol("startup payload exceeds limit"));
+    }
+    let mut payload = vec![0u8; payload_len];
+    stream.read_exact(&mut payload).await?;
+    let params = parse_startup_params(&payload)?;
+    Ok(StartupMessage {
+        protocol_version: code,
+        params,
+    })
+}
+
 /// Read the 8-byte startup-shape header (length + code).
-async fn read_startup_header(stream: &mut TcpStream) -> Result<(i32, i32), WireError> {
+async fn read_startup_header<S: Wire>(stream: &mut S) -> Result<(i32, i32), WireError> {
     let mut header = [0u8; 8];
     stream.read_exact(&mut header).await?;
     let length = i32::from_be_bytes(header[0..4].try_into().expect("4 bytes"));
@@ -2323,7 +2561,7 @@ struct TypedMessage {
     payload: BytesMut,
 }
 
-async fn read_typed_message(stream: &mut TcpStream) -> Result<Option<TypedMessage>, WireError> {
+async fn read_typed_message<S: Wire>(stream: &mut S) -> Result<Option<TypedMessage>, WireError> {
     let mut header = [0u8; 5];
     match stream.read_exact(&mut header).await {
         Ok(_) => {}
@@ -2357,7 +2595,7 @@ fn cstring_from(payload: &[u8]) -> Option<String> {
 // Outbound message builders
 // ---------------------------------------------------------------------------
 
-async fn write_authentication_ok(stream: &mut TcpStream) -> io::Result<()> {
+async fn write_authentication_ok<S: Wire>(stream: &mut S) -> io::Result<()> {
     // 'R' + len(8) + Int32 0 (AuthenticationOk)
     let mut buf = BytesMut::with_capacity(9);
     buf.put_u8(MSG_AUTHENTICATION);
@@ -2366,7 +2604,7 @@ async fn write_authentication_ok(stream: &mut TcpStream) -> io::Result<()> {
     stream.write_all(&buf).await
 }
 
-async fn write_parameter_status(stream: &mut TcpStream, key: &str, value: &str) -> io::Result<()> {
+async fn write_parameter_status<S: Wire>(stream: &mut S, key: &str, value: &str) -> io::Result<()> {
     let payload_len = key.len() + 1 + value.len() + 1;
     let mut buf = BytesMut::with_capacity(5 + payload_len);
     buf.put_u8(MSG_PARAMETER_STATUS);
@@ -2378,7 +2616,7 @@ async fn write_parameter_status(stream: &mut TcpStream, key: &str, value: &str) 
     stream.write_all(&buf).await
 }
 
-async fn write_backend_key_data(stream: &mut TcpStream, pid: i32, secret: i32) -> io::Result<()> {
+async fn write_backend_key_data<S: Wire>(stream: &mut S, pid: i32, secret: i32) -> io::Result<()> {
     // 'K' + len(12) + Int32 pid + Int32 secret
     let mut buf = BytesMut::with_capacity(13);
     buf.put_u8(MSG_BACKEND_KEY_DATA);
@@ -2388,7 +2626,7 @@ async fn write_backend_key_data(stream: &mut TcpStream, pid: i32, secret: i32) -
     stream.write_all(&buf).await
 }
 
-async fn write_ready_for_query(stream: &mut TcpStream, status: u8) -> io::Result<()> {
+async fn write_ready_for_query<S: Wire>(stream: &mut S, status: u8) -> io::Result<()> {
     // 'Z' + len(5) + status byte: 'I' (idle), 'T' (in a transaction block), or
     // 'E' (in a failed transaction block) — STL-174.
     let mut buf = BytesMut::with_capacity(6);
@@ -2398,8 +2636,8 @@ async fn write_ready_for_query(stream: &mut TcpStream, status: u8) -> io::Result
     stream.write_all(&buf).await
 }
 
-async fn write_error_response(
-    stream: &mut TcpStream,
+async fn write_error_response<S: Wire>(
+    stream: &mut S,
     severity: &str,
     sqlstate: &str,
     message: &str,
@@ -2430,7 +2668,7 @@ async fn write_error_response(
 /// `EmptyQueryResponse` ('I') — the reply to a whitespace-only / comment-only
 /// query. Carries no payload; it stands in for the `CommandComplete` a real
 /// statement would have sent.
-async fn write_empty_query_response(stream: &mut TcpStream) -> io::Result<()> {
+async fn write_empty_query_response<S: Wire>(stream: &mut S) -> io::Result<()> {
     let buf: [u8; 5] = [MSG_EMPTY_QUERY_RESPONSE, 0, 0, 0, 4];
     stream.write_all(&buf).await
 }
@@ -2548,8 +2786,8 @@ fn data_row_payload(columns: &[ResultColumn], formats: &[i16]) -> Result<BytesMu
 
 /// `RowDescription` ('T'). `formats` is the portal's negotiated result format-code
 /// array (empty → all text); the text-only simple-query path passes `&[]`.
-async fn write_row_description(
-    stream: &mut TcpStream,
+async fn write_row_description<S: Wire>(
+    stream: &mut S,
     columns: &[ResultColumn],
     formats: &[i16],
 ) -> Result<(), WireError> {
@@ -2559,8 +2797,8 @@ async fn write_row_description(
 }
 
 /// `DataRow` ('D'). `formats` selects each cell's wire format (empty → all text).
-async fn write_data_row(
-    stream: &mut TcpStream,
+async fn write_data_row<S: Wire>(
+    stream: &mut S,
     columns: &[ResultColumn],
     formats: &[i16],
 ) -> Result<(), WireError> {
@@ -2570,14 +2808,14 @@ async fn write_data_row(
 }
 
 /// `CommandComplete` ('C') — the statement's [`CommandTag`] as a cstring.
-async fn write_command_complete(stream: &mut TcpStream, tag: &CommandTag) -> io::Result<()> {
+async fn write_command_complete<S: Wire>(stream: &mut S, tag: &CommandTag) -> io::Result<()> {
     write_command_complete_tag(stream, &tag.render()).await
 }
 
 /// `CommandComplete` ('C') for a tag string produced elsewhere — the DDL route
 /// writes the engine's own tag ([`DdlOutcome::command_tag`](stele_sql::DdlOutcome::command_tag))
 /// directly rather than round-tripping it through [`CommandTag`].
-async fn write_command_complete_tag(stream: &mut TcpStream, tag: &str) -> io::Result<()> {
+async fn write_command_complete_tag<S: Wire>(stream: &mut S, tag: &str) -> io::Result<()> {
     let mut payload = BytesMut::with_capacity(tag.len() + 1);
     payload.put_slice(tag.as_bytes());
     payload.put_u8(0);
@@ -2587,42 +2825,42 @@ async fn write_command_complete_tag(stream: &mut TcpStream, tag: &str) -> io::Re
 /// A payload-less typed message: 1-byte kind + Int32 length `4`. The extended
 /// protocol's acknowledgements (`ParseComplete`, `BindComplete`, `CloseComplete`,
 /// `NoData`, `PortalSuspended`) are all this shape.
-async fn write_empty_framed(stream: &mut TcpStream, kind: u8) -> io::Result<()> {
+async fn write_empty_framed<S: Wire>(stream: &mut S, kind: u8) -> io::Result<()> {
     let buf: [u8; 5] = [kind, 0, 0, 0, 4];
     stream.write_all(&buf).await
 }
 
 /// `ParseComplete` ('1').
-async fn write_parse_complete(stream: &mut TcpStream) -> io::Result<()> {
+async fn write_parse_complete<S: Wire>(stream: &mut S) -> io::Result<()> {
     write_empty_framed(stream, MSG_PARSE_COMPLETE).await
 }
 
 /// `BindComplete` ('2').
-async fn write_bind_complete(stream: &mut TcpStream) -> io::Result<()> {
+async fn write_bind_complete<S: Wire>(stream: &mut S) -> io::Result<()> {
     write_empty_framed(stream, MSG_BIND_COMPLETE).await
 }
 
 /// `CloseComplete` ('3').
-async fn write_close_complete(stream: &mut TcpStream) -> io::Result<()> {
+async fn write_close_complete<S: Wire>(stream: &mut S) -> io::Result<()> {
     write_empty_framed(stream, MSG_CLOSE_COMPLETE).await
 }
 
 /// `NoData` ('n') — the reply to Describe on a statement / portal that returns
 /// no result columns.
-async fn write_no_data(stream: &mut TcpStream) -> io::Result<()> {
+async fn write_no_data<S: Wire>(stream: &mut S) -> io::Result<()> {
     write_empty_framed(stream, MSG_NO_DATA).await
 }
 
 /// `PortalSuspended` ('s') — a row-capped Execute stopped with rows still to
 /// come; the next Execute on the same portal resumes.
-async fn write_portal_suspended(stream: &mut TcpStream) -> io::Result<()> {
+async fn write_portal_suspended<S: Wire>(stream: &mut S) -> io::Result<()> {
     write_empty_framed(stream, MSG_PORTAL_SUSPENDED).await
 }
 
 /// `ParameterDescription` ('t') — the parameter type OIDs of a prepared
 /// statement, in `$1 … $n` order (`0` = the server is left to infer the type).
-async fn write_parameter_description(
-    stream: &mut TcpStream,
+async fn write_parameter_description<S: Wire>(
+    stream: &mut S,
     oids: &[u32],
 ) -> Result<(), WireError> {
     let count =
@@ -2638,7 +2876,7 @@ async fn write_parameter_description(
 
 /// Frame a payload as a typed message: 1-byte kind + Int32 length (inclusive of
 /// the length field) + payload.
-async fn write_framed(stream: &mut TcpStream, kind: u8, payload: &[u8]) -> io::Result<()> {
+async fn write_framed<S: Wire>(stream: &mut S, kind: u8, payload: &[u8]) -> io::Result<()> {
     let len = i32::try_from(4 + payload.len()).unwrap_or(i32::MAX);
     let mut frame = BytesMut::with_capacity(5 + payload.len());
     frame.put_u8(kind);
@@ -2775,7 +3013,14 @@ mod tests {
         let bound = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_connection(stream, peer, test_session()).await
+            handle_connection(
+                stream,
+                peer,
+                test_session(),
+                None,
+                &SharedMetrics::default(),
+            )
+            .await
         });
         let mut client = TcpStream::connect(bound).await.unwrap();
 
@@ -3266,7 +3511,14 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_connection(stream, peer, test_session()).await
+            handle_connection(
+                stream,
+                peer,
+                test_session(),
+                None,
+                &SharedMetrics::default(),
+            )
+            .await
         });
 
         let mut client = TcpStream::connect(bound).await.unwrap();
@@ -3357,7 +3609,14 @@ mod tests {
         let bound = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_connection(stream, peer, test_session()).await
+            handle_connection(
+                stream,
+                peer,
+                test_session(),
+                None,
+                &SharedMetrics::default(),
+            )
+            .await
         });
 
         let mut client = TcpStream::connect(bound).await.unwrap();
@@ -3429,7 +3688,14 @@ mod tests {
         let bound = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_connection(stream, peer, test_session()).await
+            handle_connection(
+                stream,
+                peer,
+                test_session(),
+                None,
+                &SharedMetrics::default(),
+            )
+            .await
         });
 
         let mut client = TcpStream::connect(bound).await.unwrap();

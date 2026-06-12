@@ -57,6 +57,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
+use stele_common::metrics::SharedMetrics;
 use stele_common::provenance::{Principal, TxnId};
 use stele_common::time::{Clock, SystemTimeMicros};
 
@@ -668,6 +669,15 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         self.wal.is_poisoned()
     }
 
+    /// Install the session's shared metric registry on this table's WAL
+    /// ([`Wal::set_metrics`], [STL-253]), so its appends and fsyncs report into
+    /// the process-wide series.
+    ///
+    /// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
+    pub fn set_metrics(&self, metrics: SharedMetrics) {
+        self.wal.set_metrics(metrics);
+    }
+
     /// Take a **checkpoint**: group-commit fsync the WAL, then record the new
     /// durable end as the last fully-flushed offset in the checkpoint file. Leaves
     /// the replay floor and committed-segment count untouched — this is the
@@ -767,6 +777,12 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
             writer.push_retraction(c)?;
         }
         writer.finish()?; // fsyncs — the segment is now durable
+        // Directory fence ([STL-232]): make the segment's *entry* durable
+        // before the checkpoint vouches for it. Without this, a crash could
+        // keep the (appended, fsync'd) manifest record while losing the
+        // just-created file it names — recovery would then fail to open a
+        // vouched segment instead of ignoring an orphan.
+        self.disk.sync_dir()?;
 
         // 4. Commit: the checkpoint record vouches the segment and advances the
         //    floor past every record it covers.
