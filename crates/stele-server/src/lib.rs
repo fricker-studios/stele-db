@@ -57,10 +57,13 @@ pub struct Config {
     pub metrics_listen: SocketAddr,
     /// TLS on pg-wire ([STL-251]): certificate material + plaintext policy from
     /// the `[tls]` section. `None` = TLS not configured — the secure-defaults
-    /// posture then decides at boot whether the server may start at all
-    /// (plaintext is loopback-only for non-dev runs).
+    /// posture then decides at boot what plaintext means for this bind: loopback
+    /// serves plaintext (with a warning), and a non-loopback bind gets an
+    /// ephemeral self-signed certificate ([STL-304]) so the listener is
+    /// encrypted rather than plaintext-beyond-loopback.
     ///
     /// [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
+    /// [STL-304]: https://allegromusic.atlassian.net/browse/STL-304
     pub tls: Option<TlsSettings>,
     /// pg-wire authentication ([STL-252]): the `[auth]` section's mode.
     /// [`AuthMode::Trust`] when the section is absent (and always in dev);
@@ -258,9 +261,14 @@ enum PlaintextPosture {
     Proceed,
     /// Start, but say loudly what is unencrypted and how to fix it.
     Warn(String),
-    /// Don't start: this configuration would silently serve plaintext beyond
-    /// the local machine.
-    Refuse(String),
+    /// This configuration would otherwise serve plaintext beyond the local
+    /// machine. Rather than refuse to boot, generate an ephemeral self-signed
+    /// certificate so the listener is encrypted (TLS `required`) and warn — the
+    /// cert is unauthenticated and should be replaced ([STL-304]). The string
+    /// is the warning the operator must see.
+    ///
+    /// [STL-304]: https://allegromusic.atlassian.net/browse/STL-304
+    GenerateSelfSigned(String),
 }
 
 /// Decide the plaintext posture for `cfg`.
@@ -269,8 +277,12 @@ enum PlaintextPosture {
 /// * Non-dev with `tls = "required"`: nothing is plaintext — proceed.
 /// * Non-dev with `tls = "optional"`: warn — plaintext clients are accepted.
 /// * Non-dev **without TLS**: plaintext on loopback warns; a non-loopback bind
-///   is refused outright. There is no silent-plaintext production posture —
-///   the operator either configures `[tls]`, binds loopback, or runs `--dev`.
+///   generates an ephemeral self-signed certificate (encryption without
+///   authentication) and warns, rather than refusing to boot ([STL-304]). There
+///   is still no *silent*-plaintext production posture — the listener is either
+///   encrypted or loopback-only.
+///
+/// [STL-304]: https://allegromusic.atlassian.net/browse/STL-304
 fn plaintext_posture(cfg: &Config) -> PlaintextPosture {
     if cfg.dev {
         return PlaintextPosture::Proceed;
@@ -287,11 +299,12 @@ fn plaintext_posture(cfg: &Config) -> PlaintextPosture {
              configure [tls] before exposing this server",
             cfg.listen
         )),
-        None => PlaintextPosture::Refuse(format!(
-            "refusing to listen on non-loopback {} without TLS: a production \
-             server must not silently serve plaintext (docs/10 §4). Configure \
-             a [tls] section in stele.toml, bind a loopback address, or run \
-             --dev for local development",
+        None => PlaintextPosture::GenerateSelfSigned(format!(
+            "no [tls] configured: generated an ephemeral self-signed certificate \
+             for the non-loopback bind {}. Connections are ENCRYPTED but NOT \
+             authenticated — clients cannot verify this server, and the \
+             certificate is regenerated on every restart. Configure a [tls] \
+             section with a CA-issued cert before production (docs/10 §4)",
             cfg.listen
         )),
     }
@@ -321,14 +334,23 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     init_tracing(cfg.dev);
     info!(?cfg, "stele-server: starting");
 
-    // Secure defaults (STL-251, docs/10 §4): decide up front what this
-    // configuration means for plaintext — and refuse outright rather than
-    // silently serve unencrypted traffic beyond the local machine. Checked
-    // before any port is bound, so a refused config holds nothing.
+    // Secure defaults (STL-251, STL-304, docs/10 §4): decide up front what this
+    // configuration means for plaintext. A non-dev server without [tls] on a
+    // non-loopback bind mints an ephemeral self-signed certificate (encryption
+    // without authentication) rather than refusing to boot or silently serving
+    // unencrypted traffic. Decided — and the certificate generated — before any
+    // port is bound, so a generation failure holds nothing open.
+    let mut self_signed_tls = None;
     match plaintext_posture(&cfg) {
         PlaintextPosture::Proceed => {}
         PlaintextPosture::Warn(msg) => warn!("{msg}"),
-        PlaintextPosture::Refuse(msg) => anyhow::bail!(msg),
+        PlaintextPosture::GenerateSelfSigned(msg) => {
+            warn!("{msg}");
+            self_signed_tls = Some(
+                ServerTls::self_signed(TlsMode::Required)
+                    .context("generating a self-signed TLS certificate")?,
+            );
+        }
     }
     // The authentication half of the same posture (STL-252).
     if let Some(msg) = auth_posture(&cfg) {
@@ -402,6 +424,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             mode = ?settings.mode,
             mtls = settings.client_ca.is_some(),
             "TLS enabled on pg-wire"
+        );
+        pg = pg.with_tls(tls);
+    } else if let Some(tls) = self_signed_tls {
+        // The non-dev no-TLS non-loopback fallback (STL-304): warned above.
+        info!(
+            mode = ?TlsMode::Required,
+            "self-signed TLS enabled on pg-wire (ephemeral certificate)"
         );
         pg = pg.with_tls(tls);
     }
@@ -599,9 +628,10 @@ mod tests {
     fn the_committed_sample_config_parses_to_the_documented_defaults() {
         // The shipped `stele.example.toml` must always load — this guards it from
         // silently drifting out of sync with the parser (STL-208). It binds
-        // loopback (the [tls] section is commented out, and the secure-defaults
-        // posture refuses a plaintext non-loopback bind — STL-251), so a
-        // config-file run of the example boots out of the box.
+        // loopback with the [tls] section commented out: the secure-defaults
+        // posture self-signs a plaintext non-loopback bind (STL-304) but merely
+        // warns on loopback, so a config-file run of the example boots out of
+        // the box on plaintext.
         let cfg = Config::from_toml_str(include_str!("../../../stele.example.toml"))
             .expect("stele.example.toml must parse");
         assert!(!cfg.dev, "a config-file run is never dev mode");
@@ -619,8 +649,8 @@ mod tests {
             "the example ships with [auth] commented out"
         );
         assert!(
-            !matches!(plaintext_posture(&cfg), PlaintextPosture::Refuse(_)),
-            "the committed example must boot"
+            matches!(plaintext_posture(&cfg), PlaintextPosture::Warn(_)),
+            "the committed example binds loopback: plaintext warns, never self-signs"
         );
     }
 
@@ -780,15 +810,35 @@ mod tests {
     }
 
     #[test]
-    fn non_dev_without_tls_refuses_a_non_loopback_bind() {
+    fn non_dev_without_tls_self_signs_off_loopback() {
+        // STL-304: rather than refuse to boot, a non-loopback bind without [tls]
+        // generates an ephemeral self-signed certificate and warns loudly.
         let posture = plaintext_posture(&non_dev("0.0.0.0:5454", None));
-        let PlaintextPosture::Refuse(msg) = posture else {
-            panic!("expected refusal, got {posture:?}");
+        let PlaintextPosture::GenerateSelfSigned(msg) = posture else {
+            panic!("expected self-signed generation, got {posture:?}");
         };
-        // The message must hand the operator every way out.
+        // The warning must name the trade-off (encryption, not authentication)
+        // and the path to a real cert.
+        assert!(msg.contains("self-signed"), "{msg}");
+        assert!(
+            msg.contains("NOT") && msg.contains("authenticated"),
+            "{msg}"
+        );
         assert!(msg.contains("[tls]"), "{msg}");
-        assert!(msg.contains("loopback"), "{msg}");
-        assert!(msg.contains("--dev"), "{msg}");
+    }
+
+    #[test]
+    fn the_self_signed_fallback_mints_a_usable_acceptor() {
+        // The posture promises a certificate on a non-loopback no-TLS bind; prove
+        // the daemon can actually mint the acceptor it would attach (STL-304).
+        let cfg = non_dev("0.0.0.0:5454", None);
+        assert!(matches!(
+            plaintext_posture(&cfg),
+            PlaintextPosture::GenerateSelfSigned(_)
+        ));
+        let tls =
+            ServerTls::self_signed(TlsMode::Required).expect("daemon mints a self-signed acceptor");
+        assert!(format!("{tls:?}").contains("Required"), "{tls:?}");
     }
 
     #[test]

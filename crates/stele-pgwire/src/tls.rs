@@ -23,7 +23,7 @@ use std::sync::Arc;
 use rustls::ServerConfig;
 use rustls::server::WebPkiClientVerifier;
 use rustls_pki_types::pem::PemObject as _;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio_rustls::TlsAcceptor;
 
 /// What happens to a client that skips the `SSLRequest` and opens with a
@@ -74,6 +74,9 @@ pub enum TlsError {
 
     #[error("building mTLS client verifier: {0}")]
     ClientVerifier(#[from] rustls::server::VerifierBuilderError),
+
+    #[error("generating a self-signed certificate: {0}")]
+    SelfSigned(#[from] rcgen::Error),
 }
 
 /// A loaded, ready-to-accept TLS context: the rustls acceptor plus the
@@ -107,16 +110,56 @@ impl ServerTls {
             path: settings.key.clone(),
             source,
         })?;
+        let client_ca = settings
+            .client_ca
+            .as_deref()
+            .map(|path| load_certs("client CA", path))
+            .transpose()?;
+        Self::from_material(certs, key, client_ca, settings.mode)
+    }
 
+    /// Build an acceptor from a freshly generated, ephemeral self-signed
+    /// certificate — the daemon's fallback when a non-dev server is started
+    /// without operator-supplied `[tls]` material on a non-loopback bind
+    /// ([STL-304]).
+    ///
+    /// The listener is then **encrypted** (the rustls handshake runs) rather
+    /// than refusing to boot or silently serving plaintext, but the certificate
+    /// is **unauthenticated** — there is no CA chain, so a client cannot verify
+    /// it is talking to the right server, and a restart mints a fresh
+    /// certificate. The caller is expected to warn the operator loudly and to
+    /// replace it with a CA-issued cert before production. The private key never
+    /// touches disk.
+    ///
+    /// # Errors
+    /// Returns a [`TlsError`] if certificate generation or the rustls config
+    /// build fails.
+    ///
+    /// [STL-304]: https://allegromusic.atlassian.net/browse/STL-304
+    pub fn self_signed(mode: TlsMode) -> Result<Self, TlsError> {
+        let (certs, key) = generate_self_signed()?;
+        Self::from_material(certs, key, None, mode)
+    }
+
+    /// Assemble the rustls acceptor from already-parsed certificate material:
+    /// the server chain + key, the optional mTLS client-CA roots, and the
+    /// plaintext policy. Shared by [`Self::load`] (PEM from disk) and
+    /// [`Self::self_signed`] (generated in memory).
+    fn from_material(
+        certs: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        client_ca: Option<Vec<CertificateDer<'static>>>,
+        mode: TlsMode,
+    ) -> Result<Self, TlsError> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let builder = ServerConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(rustls::DEFAULT_VERSIONS)?;
 
-        let config = match &settings.client_ca {
+        let config = match client_ca {
             // mTLS: the client must present a certificate chaining to this CA.
-            Some(ca_path) => {
+            Some(ca_certs) => {
                 let mut roots = rustls::RootCertStore::empty();
-                for ca in load_certs("client CA", ca_path)? {
+                for ca in ca_certs {
                     roots.add(ca)?;
                 }
                 let verifier =
@@ -130,9 +173,23 @@ impl ServerTls {
 
         Ok(Self {
             acceptor: TlsAcceptor::from(Arc::new(config)),
-            mode: settings.mode,
+            mode,
         })
     }
+}
+
+/// Generate an ephemeral self-signed server certificate plus its key, for the
+/// `localhost` SAN — the encryption material behind [`ServerTls::self_signed`].
+/// The certificate is intentionally unauthenticated (no CA), so it only ever
+/// backs the "encrypt rather than refuse to boot" fallback.
+fn generate_self_signed() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsError>
+{
+    let key = rcgen::KeyPair::generate()?;
+    let params = rcgen::CertificateParams::new(vec!["localhost".to_owned()])?;
+    let cert = params.self_signed(&key)?;
+    let cert_der = cert.der().clone();
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
+    Ok((vec![cert_der], key_der))
 }
 
 /// Every PEM certificate in `path`, in order (a chain file works as-is).
@@ -156,4 +213,21 @@ fn load_certs(what: &'static str, path: &Path) -> Result<Vec<CertificateDer<'sta
         });
     }
     Ok(certs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn self_signed_builds_a_usable_acceptor_for_each_mode() {
+        // The ephemeral fallback (STL-304) must yield a servable acceptor:
+        // `with_single_cert` inside `from_material` validates that the generated
+        // key matches its certificate, so an `Ok` return means a real handshake
+        // can use it. The end-to-end handshake is exercised in tests/tls_wire.rs.
+        for mode in [TlsMode::Required, TlsMode::Optional] {
+            let tls = ServerTls::self_signed(mode).expect("generate self-signed acceptor");
+            assert_eq!(tls.mode, mode);
+        }
+    }
 }
