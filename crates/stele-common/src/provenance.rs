@@ -22,6 +22,7 @@
 //! without depending on each other.
 
 use crate::time::SystemTimeMicros;
+use crate::types::LogicalType;
 
 /// A transaction identifier — the writing transaction for a version.
 ///
@@ -96,4 +97,60 @@ impl Provenance {
             principal,
         }
     }
+}
+
+/// The SQL name of the [`TxnId`] provenance pseudo-column ([STL-247]).
+///
+/// [STL-247]: https://allegromusic.atlassian.net/browse/STL-247
+pub const TXN_ID_COLUMN: &str = "_stele_txn_id";
+
+/// The SQL name of the `committed_at` provenance pseudo-column ([STL-247]).
+pub const COMMITTED_AT_COLUMN: &str = "_stele_committed_at";
+
+/// The SQL name of the [`Principal`] provenance pseudo-column ([STL-247]).
+pub const PRINCIPAL_COLUMN: &str = "_stele_principal";
+
+/// The three provenance **pseudo-columns** and their SQL types, in canonical order.
+///
+/// The queryable surface over the [`Provenance`] stored inline on every version
+/// ([STL-247], [architecture §8](../../../docs/02-architecture.md#8-lineage--provenance-subsystem)).
+/// They read a row's provenance inline in a `SELECT`, the way Postgres exposes
+/// `xmin` / `ctid`: a name not in any table's user schema, so it is **hidden**
+/// from `SELECT *` and `\d` and surfaces only when named explicitly. The order
+/// is the fixed layout a read appends after the table's own columns —
+/// [`TXN_ID_COLUMN`], then [`COMMITTED_AT_COLUMN`], then [`PRINCIPAL_COLUMN`].
+///
+/// Types mirror the stored facts: the writing [`TxnId`] is an `int8` (the `u64`
+/// id carried as its `i64` bit pattern, the same lossless round-trip the segment
+/// format uses), the commit instant a `timestamptz`, and the [`Principal`] the
+/// `text` identity bytes.
+///
+/// [STL-247]: https://allegromusic.atlassian.net/browse/STL-247
+pub const PSEUDO_COLUMNS: [(&str, LogicalType); 3] = [
+    (TXN_ID_COLUMN, LogicalType::Int8),
+    (COMMITTED_AT_COLUMN, LogicalType::TimestampTz),
+    (PRINCIPAL_COLUMN, LogicalType::Text),
+];
+
+/// The SQL type of the provenance pseudo-column named `name`, or `None`.
+///
+/// The lookup the binder uses to resolve a projected or `WHERE` name that is not a
+/// user column ([STL-247]).
+#[must_use]
+pub fn pseudo_column_type(name: &str) -> Option<LogicalType> {
+    PSEUDO_COLUMNS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, ty)| *ty)
+}
+
+/// Whether `name` is one of the provenance pseudo-columns ([STL-247]).
+///
+/// A read resolves a projected or `WHERE` name against the table's own columns
+/// **first**, so a (discouraged) user column that happened to share one of these
+/// names would shadow the pseudo-column rather than collide — the Postgres
+/// system-column posture.
+#[must_use]
+pub fn is_pseudo_column(name: &str) -> bool {
+    PSEUDO_COLUMNS.iter().any(|(n, _)| *n == name)
 }

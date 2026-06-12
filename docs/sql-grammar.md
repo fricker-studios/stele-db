@@ -463,6 +463,57 @@ Semantics, pinned:
   SOURCE`, `WHEN MATCHED THEN DELETE`, clause predicates (`WHEN … AND <expr>`),
   and `OUTPUT` are rejected.
 
+## Provenance pseudo-columns (STL-247)
+
+Every stored version carries its **provenance** inline — who/what/when wrote it
+(architecture [§8](02-architecture.md#8-lineage--provenance-subsystem),
+invariant 5). Three **pseudo-columns** read that provenance inline in a `SELECT`,
+the way Postgres exposes system columns like `xmin` and `ctid`:
+
+| Pseudo-column          | Type          | Value (from the version's [`Provenance`]) |
+|------------------------|---------------|-------------------------------------------|
+| `_stele_txn_id`        | `int8`        | the writing transaction's id (the `u64` carried as its `i64` bit pattern) |
+| `_stele_committed_at`  | `timestamptz` | the commit instant — the version's `sys_from` |
+| `_stele_principal`     | `text`        | the writing identity |
+
+```sql
+SELECT id, balance, _stele_txn_id, _stele_committed_at, _stele_principal
+  FROM account;
+SELECT id FROM account WHERE _stele_txn_id = 42;             -- usable in WHERE
+SELECT id, _stele_txn_id FROM account FOR SYSTEM_TIME AS OF 1700000000000000;
+```
+
+Semantics, pinned:
+
+- **Hidden, like Postgres system columns.** A pseudo-column is reachable only
+  when **named explicitly** — it is not part of `SELECT *`, the `\d` shim, or any
+  table's declared schema. A read resolves a projected/`WHERE` name against the
+  table's own columns first, so a (discouraged) user column of the same name
+  shadows the pseudo-column rather than colliding.
+- **The value is the version's own provenance, at any read shape.** A plain read
+  returns the live version's; a `FOR SYSTEM_TIME AS OF` read returns the version
+  live *then* — its **original** writing transaction and commit instant, not the
+  latest — because provenance is immutable on the version. The values come from
+  the version metadata / commit log, never a user column. They ride the same
+  `SnapshotScan` as the data, so a future range read (`STL-244`) inherits them
+  with no extra work.
+- **`_stele_principal` value.** The engine stamps the placeholder identity
+  `stele` on every wire-issued write today. Threading the connection's
+  startup-message user (and then the SCRAM-verified user — `STL-252`) into the
+  stored principal **upgrades its trustworthiness without changing this surface**
+  and is tracked separately; until then the column honestly reports the
+  server-stamped writing principal.
+- **Read-your-own-writes.** Inside a `BEGIN` block, a row a statement *buffered*
+  but has not committed has no commit provenance yet, so its three pseudo-column
+  cells read `NULL`; committed rows read their stored provenance as usual.
+- **Out of scope** (deferred, not silently dropped): derivation lineage (the
+  v0.6 graph, assumption A17) and a `_stele_statement` column — a `_stele_*`
+  name other than the three above is an `UnknownColumn`, never a silent
+  pass-through. Aggregating or `GROUP BY`-ing a pseudo-column, and projecting one
+  through a `JOIN`, are not bound (single-table provenance only).
+
+[`Provenance`]: ../crates/stele-common/src/provenance.rs
+
 ## Type vocabulary
 
 Column types in `CREATE TABLE` are parsed as standard `sqlparser` `DataType`

@@ -239,6 +239,16 @@ impl<C: Operator> Operator for Project<C> {
 /// batch is the business key followed by those value columns, in schema order:
 /// position `0` is the key, position `i + 1` is value column `i`.
 ///
+/// ## Pass-through columns
+///
+/// Any *other* projected column — a provenance scalar ([`ColumnId::TxnId`],
+/// [`ColumnId::CommittedAt`], [`ColumnId::Principal`]) a provenance pseudo-column
+/// read materializes ([STL-247]) — passes through unchanged, appended after the
+/// value columns in the order the scan projected them. A read that projects only
+/// the key and payload (the common path) carries no such column, so this is inert
+/// there; a read that also projects provenance gets `[key, values…, provenance…]`
+/// at fixed positions the engine then addresses by index.
+///
 /// ## Addressing is positional
 ///
 /// Downstream operators ([`Filter`], the engine's positional projection) address
@@ -287,11 +297,24 @@ impl<C: Operator> Operator for ExplodePayload<C> {
             .find(|(id, _)| *id == ColumnId::BusinessKey)
             .map(|(_, col)| col.clone())
             .ok_or(ScanError::MissingColumn(ColumnId::BusinessKey))?;
-        let mut columns: Vec<(ColumnId, Column)> = Vec::with_capacity(self.value_count + 1);
+        // Columns other than the business key and the payload — a projected
+        // provenance scalar ([STL-247]) — pass through unchanged, in scan order,
+        // appended after the value columns below.
+        let passthrough: Vec<(ColumnId, Column)> = batch
+            .columns
+            .iter()
+            .filter(|(id, _)| *id != ColumnId::BusinessKey && *id != ColumnId::Payload)
+            .map(|(id, col)| (*id, col.clone()))
+            .collect();
+
+        let mut columns: Vec<(ColumnId, Column)> =
+            Vec::with_capacity(self.value_count + 1 + passthrough.len());
         columns.push((ColumnId::BusinessKey, key));
 
-        // A key-only table stores no value cells: drop the payload, emit the key.
+        // A key-only table stores no value cells: drop the payload, emit the key
+        // (then any pass-through provenance columns).
         if self.value_count == 0 {
+            columns.extend(passthrough);
             return Ok(Some(Batch::new(columns, rows)));
         }
 
@@ -326,6 +349,7 @@ impl<C: Operator> Operator for ExplodePayload<C> {
                 .into_iter()
                 .map(|cells| (ColumnId::Payload, Column::Bytes(cells.into()))),
         );
+        columns.extend(passthrough);
         Ok(Some(Batch::new(columns, rows)))
     }
 }

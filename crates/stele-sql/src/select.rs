@@ -61,6 +61,7 @@ use sqlparser::ast::{
 };
 use stele_catalog::{Catalog, SchemaId, TableSchema};
 use stele_common::period::{Interval, IntervalError, PeriodPredicate};
+use stele_common::provenance;
 use stele_common::time::SystemTimeMicros;
 use stele_common::types::{LogicalType, ScalarValue};
 
@@ -1006,10 +1007,13 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
 
     // Every named projected column must exist in the schema live *at the
     // snapshot* — a column added after the `AS OF` instant is not yet present
-    // and is rejected here rather than deferred to the executor.
+    // and is rejected here rather than deferred to the executor. A provenance
+    // pseudo-column ([STL-247]) is *not* a schema column — it reads the version's
+    // stored provenance, not a user cell — so it is accepted here too; the engine
+    // resolves it against the fixed virtual layout after the table's own columns.
     if let Projection::Columns(columns) = &projection {
         for column in columns {
-            if schema.column(column).is_none() {
+            if schema.column(column).is_none() && provenance::pseudo_column_type(column).is_none() {
                 return Err(SelectError::UnknownColumn {
                     table: table.to_owned(),
                     column: column.clone(),
@@ -1425,6 +1429,27 @@ fn bare_column(expr: &Expr) -> Option<&str> {
 /// A column's position in the schema (0 = business key), or `None` if absent.
 fn column_index(schema: &TableSchema, column: &str) -> Option<usize> {
     schema.columns().iter().position(|c| c.name() == column)
+}
+
+/// Resolve a `WHERE` column name to its addressable index and type ([STL-247]).
+///
+/// A user column resolves to its schema index (`0` the business key). A name not
+/// in the schema is matched against the provenance pseudo-columns
+/// ([`provenance::PSEUDO_COLUMNS`]); a match resolves to the **virtual index**
+/// `schema.columns().len() + k` — the fixed position the executor materializes
+/// the k-th provenance fact at, after the table's own columns — with the
+/// pseudo-column's type. `None` for a name that is neither, which the caller
+/// reports as [`SelectError::UnknownColumn`]. The schema is searched first, so a
+/// user column never loses to a like-named pseudo-column.
+fn resolve_filter_column(schema: &TableSchema, name: &str) -> Option<(usize, LogicalType)> {
+    if let Some(index) = column_index(schema, name) {
+        return Some((index, schema.columns()[index].ty()));
+    }
+    let n_schema = schema.columns().len();
+    provenance::PSEUDO_COLUMNS
+        .iter()
+        .position(|(n, _)| *n == name)
+        .map(|k| (n_schema + k, provenance::PSEUDO_COLUMNS[k].1))
 }
 
 /// A single two-table `JOIN` in the `FROM` clause, or `None` for any other shape
@@ -2339,15 +2364,12 @@ fn filter_anchor<'a>(
     names.dedup();
     match names.as_slice() {
         [name] => {
-            let index = column_index(schema, name).ok_or_else(|| SelectError::UnknownColumn {
-                table: table.to_owned(),
-                column: (*name).to_owned(),
-            })?;
-            Ok(FilterAnchor {
-                name,
-                index,
-                ty: schema.columns()[index].ty(),
-            })
+            let (index, ty) =
+                resolve_filter_column(schema, name).ok_or_else(|| SelectError::UnknownColumn {
+                    table: table.to_owned(),
+                    column: (*name).to_owned(),
+                })?;
+            Ok(FilterAnchor { name, index, ty })
         }
         [] => Err(SelectError::UnsupportedPredicate(
             "the WHERE references no column".to_owned(),
@@ -2386,11 +2408,12 @@ fn bind_scalar(
 ) -> Result<BoundScalar, SelectError> {
     match unwrap_nested(expr) {
         Expr::Identifier(id) => {
-            let index =
-                column_index(schema, &id.value).ok_or_else(|| SelectError::UnknownColumn {
+            let (index, _) = resolve_filter_column(schema, &id.value).ok_or_else(|| {
+                SelectError::UnknownColumn {
                     table: table.to_owned(),
                     column: id.value.clone(),
-                })?;
+                }
+            })?;
             Ok(BoundScalar::Column(index))
         }
         Expr::BinaryOp { left, op, right } => {
@@ -3782,6 +3805,70 @@ mod tests {
         };
         let ddl = parse_one("CREATE TABLE t (a INT) WITH SYSTEM VERSIONING");
         assert_eq!(bind_select(&ddl, &ctx), Err(SelectError::NotSelect));
+    }
+
+    #[test]
+    fn provenance_pseudo_columns_bind_in_a_projection() {
+        // The three provenance pseudo-columns ([STL-247]) are not schema columns,
+        // but they bind in a named projection — alongside real columns and each
+        // other — without an `UnknownColumn` error. The engine resolves them
+        // against the virtual layout after the table's own columns.
+        let catalog = catalog_with_account(1_000);
+        let ctx = BindContext {
+            snapshot: NOW,
+            catalog: &catalog,
+        };
+        let stmt = parse_one(
+            "SELECT id, _stele_txn_id, _stele_committed_at, _stele_principal FROM account",
+        );
+        assert_eq!(
+            bind_select(&stmt, &ctx).expect("bind").projection,
+            Projection::Columns(vec![
+                "id".to_owned(),
+                "_stele_txn_id".to_owned(),
+                "_stele_committed_at".to_owned(),
+                "_stele_principal".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_provenance_pseudo_column_binds_in_where() {
+        // `WHERE _stele_txn_id = <literal>` binds: the pseudo-column anchors the
+        // predicate at its virtual index (past the two schema columns), and the
+        // literal folds to its `int8` type ([STL-247]).
+        let catalog = catalog_with_account(1_000);
+        let bound = bind("SELECT id FROM account WHERE _stele_txn_id = 5", &catalog)
+            .expect("bind a pseudo-column WHERE");
+        let predicate = bound.filter.expect("a filter binds");
+        // Two schema columns (id, balance) ⇒ `_stele_txn_id` is the first pseudo
+        // index, 2.
+        assert_eq!(
+            (predicate.left, predicate.right),
+            (
+                BoundScalar::Column(2),
+                BoundScalar::Literal(ScalarValue::Int8(5)),
+            )
+        );
+    }
+
+    #[test]
+    fn an_unknown_pseudo_like_column_is_still_rejected() {
+        // Only the three documented pseudo-columns are accepted; a different
+        // `_stele_*` name is an unknown column, not a silent pass-through.
+        let catalog = catalog_with_account(1_000);
+        let ctx = BindContext {
+            snapshot: NOW,
+            catalog: &catalog,
+        };
+        let stmt = parse_one("SELECT _stele_statement FROM account");
+        assert_eq!(
+            bind_select(&stmt, &ctx),
+            Err(SelectError::UnknownColumn {
+                table: "account".to_owned(),
+                column: "_stele_statement".to_owned(),
+            })
+        );
     }
 
     #[test]
