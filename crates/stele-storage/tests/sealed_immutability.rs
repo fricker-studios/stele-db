@@ -11,9 +11,11 @@
 //! in place, the digest comparison here fails the gate (`just check` runs this
 //! file under nextest).
 //!
-//! Compaction (v0.3) is explicitly out of scope: it *rewrites into new segments*
-//! and retires old ones — never edits one in place — and gets its own oracle when
-//! it lands.
+//! Compaction is out of scope *here*: it *rewrites into new segments* and
+//! retires old ones — never edits one in place — and has its own oracle
+//! (`tests/compaction.rs`, [STL-231]), which extends this invariant as "every
+//! segment name present both before and after an operation has byte-identical
+//! content; retirement is legal, mutation is not".
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};

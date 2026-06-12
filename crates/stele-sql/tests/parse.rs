@@ -218,17 +218,19 @@ fn rejects_as_of_on_non_select_statements() {
     }
 }
 
-// --- admin commands (STL-219) --------------------------------------------
+// --- admin commands (STL-219, STL-231) ------------------------------------
 
 #[test]
 fn parses_checkpoint_and_flush_as_admin_commands() {
-    // The two storage admin commands have no sqlparser grammar; they are lifted
+    // The storage admin commands have no sqlparser grammar; they are lifted
     // at the token level into an admin body (case-insensitive, trailing `;` ok).
     for (sql, want) in [
         ("CHECKPOINT", AdminCommand::Checkpoint),
         ("checkpoint;", AdminCommand::Checkpoint),
         ("FLUSH", AdminCommand::Flush),
         ("Flush ;", AdminCommand::Flush),
+        ("COMPACT", AdminCommand::Compact),
+        ("compact ;", AdminCommand::Compact),
     ] {
         let stmts = parse(sql).unwrap_or_else(|e| panic!("parse {sql:?}: {e}"));
         assert_eq!(stmts.len(), 1, "{sql:?} is one statement");
@@ -249,6 +251,7 @@ fn admin_commands_take_no_arguments() {
     // A trailing token after the keyword is a hard error, not a silent strip.
     assert!(parse("CHECKPOINT 5").is_err());
     assert!(parse("FLUSH TABLES").is_err());
+    assert!(parse("COMPACT t").is_err());
 }
 
 // --- user DDL (STL-252) ----------------------------------------------------

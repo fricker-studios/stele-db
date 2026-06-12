@@ -163,10 +163,10 @@ fn parse_one(mut tokens: Vec<Token>) -> Result<Statement, ParseError> {
     })
 }
 
-/// Recognize a bare Stele admin command (`CHECKPOINT` / `FLUSH`) — a single
-/// keyword that `sqlparser` has no grammar for ([STL-219]). Returns the command,
-/// `None` if the tokens are not an admin command, or an error if the keyword
-/// carries trailing tokens (both commands take no arguments).
+/// Recognize a bare Stele admin command (`CHECKPOINT` / `FLUSH` / `COMPACT`) — a
+/// single keyword that `sqlparser` has no grammar for ([STL-219], [STL-231]).
+/// Returns the command, `None` if the tokens are not an admin command, or an
+/// error if the keyword carries trailing tokens (the commands take no arguments).
 fn lift_admin_command(tokens: &[Token]) -> Result<Option<AdminCommand>, ParseError> {
     let Some(first) = tokens.first() else {
         return Ok(None);
@@ -175,6 +175,8 @@ fn lift_admin_command(tokens: &[Token]) -> Result<Option<AdminCommand>, ParseErr
         (AdminCommand::Checkpoint, "CHECKPOINT")
     } else if word_is(first, "FLUSH") {
         (AdminCommand::Flush, "FLUSH")
+    } else if word_is(first, "COMPACT") {
+        (AdminCommand::Compact, "COMPACT")
     } else {
         return Ok(None);
     };

@@ -83,9 +83,13 @@ fn int_bytes(v: i32) -> Vec<u8> {
 }
 
 /// Assert the recovered engine's reads reproduce the reference model exactly:
-/// every key's point read, and every equality on the (possibly) indexed column
-/// — including a value never written, the probe's proves-empty arm. Returns a
-/// digest fold of the agreed answers.
+/// every key's point read, every equality on the (possibly) indexed column —
+/// including a value never written, the probe's proves-empty arm — and a
+/// range sweep over the same column ([STL-237]: probe-served when the index
+/// survived, full scans otherwise). Returns a digest fold of the agreed
+/// answers.
+///
+/// [STL-237]: https://allegromusic.atlassian.net/browse/STL-237
 fn assert_reads_match(
     engine: &mut Engine,
     model: &BTreeMap<i32, Option<i32>>,
@@ -130,6 +134,33 @@ fn assert_reads_match(
             "a = {v}: equality read diverged from the model after recovery"
         );
         fold(&mut digest, &got);
+    }
+    // Range reads over the same column ([STL-237]), cut inside and beyond the
+    // 1..=3 domain so the candidate-window and proves-empty arms both fire.
+    // NULL `a` cells never match (three-valued logic), matching the model's
+    // `is_some_and`.
+    for v in [1, 2, 4] {
+        for (op, keeps) in [
+            (
+                ">",
+                Box::new(move |a: i32| a > v) as Box<dyn Fn(i32) -> bool>,
+            ),
+            ("<", Box::new(move |a: i32| a < v)),
+            (">=", Box::new(move |a: i32| a >= v)),
+        ] {
+            let got = rows(engine, &format!("SELECT id FROM t WHERE a {op} {v}"));
+            let mut want: Vec<Vec<Option<Vec<u8>>>> = model
+                .iter()
+                .filter(|&(_, &a)| a.is_some_and(&keeps))
+                .map(|(&id, _)| vec![Some(int_bytes(id))])
+                .collect();
+            want.sort();
+            assert_eq!(
+                got, want,
+                "a {op} {v}: range read diverged from the model after recovery"
+            );
+            fold(&mut digest, &got);
+        }
     }
     digest
 }

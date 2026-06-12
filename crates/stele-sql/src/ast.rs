@@ -124,6 +124,13 @@ pub enum AdminCommand {
     /// `FLUSH` — seal every table's delta into a segment and advance its replay
     /// floor, bounding recovery. Maps to `SessionEngine::flush`.
     Flush,
+    /// `COMPACT` — flush, then merge every table's sealed segments into one
+    /// consolidated, read-optimized segment, retiring the inputs
+    /// ([STL-231], [ADR-0030]). Maps to `SessionEngine::compact`.
+    ///
+    /// [STL-231]: https://allegromusic.atlassian.net/browse/STL-231
+    /// [ADR-0030]: ../../../docs/adr/0030-segment-manifest-retirement.md
+    Compact,
 }
 
 impl Statement {

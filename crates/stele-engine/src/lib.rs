@@ -55,6 +55,7 @@ mod secondary;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1091,7 +1092,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 })
             })?;
         let value_count = columns.len().saturating_sub(1);
-        let mut index = IndexState::new(def.kind(), floor);
+        let mut index = IndexState::new(def.kind(), columns[position].ty(), floor);
         for row in Self::scan_all_rows(state, floor, value_count, metrics)? {
             let Some(key) = row.first().cloned().flatten() else {
                 continue; // a row always carries its key; nothing to note without one
@@ -1152,9 +1153,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// recovery reopens and replays that tier's WAL too, so flushing it bounds
     /// that work even though the catalog no longer resolves the name.
     ///
-    /// A background *policy* that decides *when* to flush, and a SQL/admin `FLUSH`
-    /// command so a wire client can trigger it, are out of scope here
-    /// ([STL-177] / [STL-219]); history-preserving compaction is v0.3.
+    /// A background *policy* that decides *when* to flush is out of scope here
+    /// ([STL-177] / [STL-219]); the wire `FLUSH` admin command drives this
+    /// ([STL-219]), and history-preserving compaction builds on it
+    /// ([`compact`](Self::compact), [STL-231]).
     ///
     /// Each table's flush is its own crash-atomic, idempotent unit (the new
     /// segment is adopted only once its checkpoint record is durable —
@@ -1176,6 +1178,42 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         }
         self.metrics
             .flush_seconds
+            .observe_micros(self.metrics.now_micros().saturating_sub(started));
+        Ok(())
+    }
+
+    /// **Compact** every resident table: flush its delta, then merge its sealed
+    /// segments into one consolidated, read-optimized segment, atomically
+    /// swapping the live set and retiring the inputs ([`Engine::compact`],
+    /// [STL-231], [ADR-0030]). The flush first folds the delta tier in, so
+    /// `COMPACT` leaves each table with at most one sealed segment and an empty
+    /// delta — the "merge delta + small sealed segments" shape of the ticket.
+    ///
+    /// Drives **every resident tier**, including a dropped table's retained
+    /// tier, for the same reason [`flush`](Self::flush) does: recovery reopens
+    /// that tier too, and compacting it bounds that work.
+    ///
+    /// Each table's flush and compaction are their own crash-atomic units (the
+    /// swap is one durable manifest record — [`Engine::compact`]), so a failure
+    /// part-way leaves the already-compacted tables compacted; the call returns
+    /// the first error and a re-run re-compacts whatever was left. Background
+    /// *scheduling* of compaction is a deliberate follow-up; this is the manual
+    /// admin trigger ([STL-231] scope).
+    ///
+    /// [STL-231]: https://allegromusic.atlassian.net/browse/STL-231
+    /// [ADR-0030]: ../../../docs/adr/0030-segment-manifest-retirement.md
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Storage`] if any table's flush or compaction fails.
+    pub fn compact(&mut self) -> Result<(), EngineError> {
+        let started = self.metrics.now_micros();
+        for state in self.tables.values_mut() {
+            state.engine.flush()?;
+            state.engine.compact()?;
+        }
+        self.metrics
+            .compaction_seconds
             .observe_micros(self.metrics.now_micros().saturating_sub(started));
         Ok(())
     }
@@ -1550,8 +1588,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         read_snapshot: SystemTimeMicros,
         overlay: &[BoundDml],
     ) -> Result<StatementOutcome, EngineError> {
-        // Admin commands (CHECKPOINT / FLUSH) have no SQL body, so they are routed
-        // before the binders, which all assume one ([STL-219]).
+        // Admin commands (CHECKPOINT / FLUSH / COMPACT) have no SQL body, so they
+        // are routed before the binders, which all assume one ([STL-219]).
         if let StatementBody::Admin(cmd) = &stmt.body {
             return self.apply_admin(*cmd);
         }
@@ -1930,14 +1968,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     ///
     /// `CHECKPOINT` → [`checkpoint`](Self::checkpoint) (the lightweight WAL fence);
     /// `FLUSH` → [`flush`](Self::flush) (seal each delta into a segment + bound
-    /// recovery). The outcome reuses [`StatementOutcome::Ddl`] purely to carry the
-    /// static tag the wire layer renders — no catalog change happens.
+    /// recovery); `COMPACT` → [`compact`](Self::compact) (flush, then merge each
+    /// table's sealed segments into one, retiring the inputs — [STL-231]). The
+    /// outcome reuses [`StatementOutcome::Ddl`] purely to carry the static tag
+    /// the wire layer renders — no catalog change happens.
     ///
     /// [STL-219]: https://allegromusic.atlassian.net/browse/STL-219
+    /// [STL-231]: https://allegromusic.atlassian.net/browse/STL-231
     ///
     /// # Errors
     ///
-    /// [`EngineError::Storage`] if a table's checkpoint or flush fails.
+    /// [`EngineError::Storage`] if a table's checkpoint, flush, or compaction
+    /// fails.
     fn apply_admin(&mut self, cmd: AdminCommand) -> Result<StatementOutcome, EngineError> {
         let tag = match cmd {
             AdminCommand::Checkpoint => {
@@ -1947,6 +1989,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             AdminCommand::Flush => {
                 self.flush()?;
                 "FLUSH"
+            }
+            AdminCommand::Compact => {
+                self.compact()?;
+                "COMPACT"
             }
         };
         Ok(StatementOutcome::Ddl { tag })
@@ -2089,13 +2135,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 &self.metrics,
             )?
         } else {
-            // Rule-based index use ([STL-233]): an equality on an indexed
-            // value column probes the table's access structure for the
-            // candidate-key window. `Empty` proves no visible row can match
-            // (the superset contract), so the scan is skipped outright; a
-            // window prunes the scan to the candidates' key range, and the
-            // exact `Filter` below keeps the answer identical to a full scan
-            // either way — an index changes speed, never results.
+            // Rule-based index use ([STL-233], ranges [STL-237]): an equality
+            // or one-sided range comparison on an indexed value column probes
+            // the table's access structure for the candidate-key window.
+            // `Empty` proves no visible row can match (the superset contract),
+            // so the scan is skipped outright; a window prunes the scan to the
+            // candidates' key range, and the exact `Filter` below keeps the
+            // answer identical to a full scan either way — an index changes
+            // speed, never results.
             match self.index_window(table, bound, &schema_columns) {
                 Some(Probe::Empty) => Vec::new(),
                 Some(Probe::Window { low, high }) => Self::scan_rows(
@@ -2246,14 +2293,17 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     }
 
     /// The candidate window for a bound `SELECT`'s `WHERE`, when a secondary
-    /// index can serve it ([STL-233]) — the rule-based "use the index when
-    /// usable" the v0.3 substrate ships in place of a cost model. Usable means
-    /// **all** of:
+    /// index can serve it ([STL-233], ranges [STL-237]) — the rule-based "use
+    /// the index when usable" the v0.3 substrate ships in place of a cost
+    /// model. Usable means **all** of:
     ///
-    /// * the `WHERE` is exactly `<value column> = <literal>`
-    ///   ([`column_equality`](BoundPredicate::column_equality) — a key
+    /// * the `WHERE` is exactly `<value column> <cmp> <literal>`
+    ///   ([`column_comparison`](BoundPredicate::column_comparison) — a key
     ///   equality keeps its own zone-map push-down);
-    /// * a live index covers exactly that column;
+    /// * a live index covers exactly that column, and its structure answers
+    ///   the operator's probe shape — `=` is an equality probe, `<` `<=` `>`
+    ///   `>=` are one-sided range probes, and a kind that cannot range-walk
+    ///   (or a `<>`, whose complement no window covers) declines;
     /// * the read snapshot is at or after the index's build/rebuild
     ///   [floor](crate::secondary::IndexState) — an `AS OF` before it reads
     ///   history the build never saw, so it must full-scan.
@@ -2261,9 +2311,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// The caller never consults the structure for an overlaid
     /// (read-your-own-writes) read: buffered writes are not committed, so they
     /// are not noted. `None` means "no index applies — full scan"; both probe
-    /// answers count toward [`index_probe_count`](Self::index_probe_count).
+    /// answers count toward [`index_probe_count`](Self::index_probe_count),
+    /// a declined probe does not (no structure served the read).
     ///
     /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    /// [STL-237]: https://allegromusic.atlassian.net/browse/STL-237
     fn index_window(
         &self,
         table: &str,
@@ -2273,22 +2325,40 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         if self.index_states.is_empty() {
             return None;
         }
-        let (position, literal) = bound.filter.as_ref()?.column_equality()?;
+        let (position, op, literal) = bound.filter.as_ref()?.column_comparison()?;
         let (column, _) = schema_columns.get(position)?;
+        // The binder folded the literal to the column's type, so its canonical
+        // encoding is exactly what the maintenance hook noted.
+        let cell = encode_value(literal);
         // Any live index on this column whose floor admits the read snapshot
         // can serve. Floors differ when indexes were created or rebuilt at
-        // different instants, so the first (name-ordered) match must not veto
-        // the probe for a usable sibling.
-        let state = self
+        // different instants, and (with sibling kinds, [STL-238]) structures
+        // differ in which probe shapes they answer — so the first (name-ordered)
+        // match must not veto the probe for a usable sibling.
+        let probe = self
             .catalog
             .indexes_on(table)
             .filter(|def| matches!(def.columns(), [c] if c == column))
             .filter_map(|def| self.index_states.get(def.name()))
-            .find(|state| bound.snapshot >= state.floor)?;
+            .filter(|state| bound.snapshot >= state.floor)
+            .find_map(|state| match op {
+                CompareOp::Eq => Some(state.structure.equality_candidates(&cell)),
+                CompareOp::Lt => state
+                    .structure
+                    .range_candidates(Bound::Unbounded, Bound::Excluded(&cell)),
+                CompareOp::Le => state
+                    .structure
+                    .range_candidates(Bound::Unbounded, Bound::Included(&cell)),
+                CompareOp::Gt => state
+                    .structure
+                    .range_candidates(Bound::Excluded(&cell), Bound::Unbounded),
+                CompareOp::Ge => state
+                    .structure
+                    .range_candidates(Bound::Included(&cell), Bound::Unbounded),
+                CompareOp::Ne => None,
+            })?;
         self.index_probes.set(self.index_probes.get() + 1);
-        // The binder folded the literal to the column's type, so its canonical
-        // encoding is exactly what the maintenance hook noted.
-        Some(state.structure.equality_candidates(&encode_value(literal)))
+        Some(probe)
     }
 
     /// The rows a transaction sees under **read-your-own-writes** ([STL-203]): the
@@ -8796,6 +8866,43 @@ mod tests {
     }
 
     #[test]
+    fn execute_routes_compact_and_it_consolidates_segments() {
+        // STL-231: COMPACT routes through `execute` like the other admin
+        // commands, folds the staged delta in (the internal flush), merges the
+        // accumulated segments into one, and the table reads identically after.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+        engine.execute(&parse_one("FLUSH")).expect("flush");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (2, 250)"))
+            .expect("insert");
+        engine.execute(&parse_one("FLUSH")).expect("flush");
+        engine
+            .execute(&parse_one("UPDATE account SET balance = 175 WHERE id = 1"))
+            .expect("update staged in the delta");
+        {
+            let st = engine.tables.get("account").expect("tier resident");
+            assert_eq!(st.engine.segment_names().len(), 2, "two flushed segments");
+        }
+        let before = sorted(select(&mut engine, "SELECT id, balance FROM account").rows);
+
+        let outcome = engine.execute(&parse_one("COMPACT")).expect("compact");
+        assert_eq!(outcome, StatementOutcome::Ddl { tag: "COMPACT" });
+        let st = engine.tables.get("account").expect("tier resident");
+        assert_eq!(
+            st.engine.segment_names().len(),
+            1,
+            "COMPACT consolidated the segments (delta folded in via flush)",
+        );
+        let after = sorted(select(&mut engine, "SELECT id, balance FROM account").rows);
+        assert_eq!(before, after, "the read surface is unchanged by COMPACT");
+        assert_eq!(before, vec![vec![i4(1), i4(175)], vec![i4(2), i4(250)]]);
+    }
+
+    #[test]
     fn recovery_resolves_old_schema_versions_and_reuses_the_namespace() {
         // A dropped name re-created with different columns: post-restart, the
         // live read sees only the new era and an AS OF read inside the old era
@@ -9443,12 +9550,62 @@ mod tests {
         );
         assert_eq!(engine.index_probe_count(), 5);
 
-        // A non-equality on the indexed column, and any read on an unindexed
-        // column, never probe.
+        // A `<>` on the indexed column (no window covers a complement), and
+        // any read on an unindexed column, never probe.
         let probes = engine.index_probe_count();
-        let _ = query_rows(&mut engine, "SELECT id FROM account WHERE balance > 0");
+        let _ = query_rows(&mut engine, "SELECT id FROM account WHERE balance <> 100");
         let _ = query_rows(&mut engine, "SELECT balance FROM account WHERE id = 2");
         assert_eq!(engine.index_probe_count(), probes);
+    }
+
+    #[test]
+    fn range_probes_serve_comparison_reads_across_signs() {
+        // The ordered structure's range service ([STL-237]): one-sided
+        // comparisons on the indexed column probe a candidate window walked in
+        // *typed* order — the negative balance must sort below the positives
+        // (the raw little-endian cell bytes would sort it above them all).
+        let mut engine = session();
+        run_sql(&mut engine, CREATE);
+        run_sql(
+            &mut engine,
+            "INSERT INTO account (id, balance) VALUES (1, -50)",
+        );
+        run_sql(
+            &mut engine,
+            "INSERT INTO account (id, balance) VALUES (2, 100)",
+        );
+        run_sql(&mut engine, "CREATE INDEX i_balance ON account (balance)");
+        // Maintenance notes post-build writes through the same transform.
+        run_sql(
+            &mut engine,
+            "INSERT INTO account (id, balance) VALUES (3, 200)",
+        );
+
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE balance < 0"),
+            vec![int_row(1)]
+        );
+        assert_eq!(engine.index_probe_count(), 1, "the range read probed");
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE balance >= 100"),
+            vec![int_row(2), int_row(3)]
+        );
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE balance <= -50"),
+            vec![int_row(1)]
+        );
+        // A literal-first comparison mirrors to the same probe: `150 < balance`
+        // is `balance > 150`.
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE 150 < balance"),
+            vec![int_row(3)]
+        );
+        // A range beyond every noted cell probes `Empty` and skips the scan.
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE balance > 200"),
+            Vec::<Vec<Option<Vec<u8>>>>::new()
+        );
+        assert_eq!(engine.index_probe_count(), 5);
     }
 
     #[test]
@@ -9468,6 +9625,7 @@ mod tests {
 
         // An `AS OF` inside pre-index history must not probe — the build never
         // saw the superseded version carrying 100 — and still answers exactly.
+        // The same floor gate covers range probes ([STL-237]).
         assert_eq!(
             query_rows(
                 &mut engine,
@@ -9475,10 +9633,18 @@ mod tests {
             ),
             vec![int_row(1)]
         );
+        assert_eq!(
+            query_rows(
+                &mut engine,
+                "SELECT id FROM account FOR SYSTEM_TIME AS OF 1015000000 WHERE balance < 150"
+            ),
+            vec![int_row(1)]
+        );
         assert_eq!(engine.index_probe_count(), 0, "pre-floor reads full-scan");
 
         // At-or-after the floor the probe serves: 100 was superseded before the
-        // build, so the structure proves emptiness; 200 resolves through it.
+        // build, so the structure proves emptiness; 200 resolves through it —
+        // by equality and by range alike.
         assert_eq!(
             query_rows(&mut engine, "SELECT id FROM account WHERE balance = 100"),
             Vec::<Vec<Option<Vec<u8>>>>::new()
@@ -9487,7 +9653,11 @@ mod tests {
             query_rows(&mut engine, "SELECT id FROM account WHERE balance = 200"),
             vec![int_row(1)]
         );
-        assert_eq!(engine.index_probe_count(), 2);
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE balance >= 150"),
+            vec![int_row(1)]
+        );
+        assert_eq!(engine.index_probe_count(), 3);
     }
 
     #[test]

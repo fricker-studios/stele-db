@@ -23,10 +23,16 @@
 //! (`the_oracle_catches_a_reference_that_ignores_the_where`) proves the
 //! differential catches a reference that drops the `WHERE`.
 //!
-//! Sibling index tickets ([STL-237] B-tree ranges, [STL-238] hash/bloom,
-//! [STL-241] valid-time) wire in here: add their `CREATE INDEX` forms to
-//! [`IndexScript`] and their predicate shapes to [`probes`] rather than
-//! writing their own harness.
+//! The B-tree range ticket ([STL-237]) wired in its predicate shapes: the
+//! one-sided `<` `<=` `>` `>=` comparisons on the indexed columns (int *and*
+//! text), probed as candidate ranges — with `a`'s value domain straddling
+//! zero so the memcomparable transform's sign handling is pinned (raw
+//! little-endian cell order would sort `-2` above every positive) — and
+//! range-driven `UPDATE`/`DELETE` in the workload, whose scan-then-write
+//! expansion ([STL-229]) routes through the same probe. Remaining sibling
+//! tickets ([STL-238] hash/bloom, [STL-241] valid-time) wire in the same way:
+//! add their `CREATE INDEX` forms to [`IndexScript`] and their predicate
+//! shapes to [`probes`] rather than writing their own harness.
 //!
 //! [STL-229]: https://allegromusic.atlassian.net/browse/STL-229
 //! [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
@@ -202,8 +208,18 @@ enum Where {
     BEq(i32),
     /// `c = s` — text equality (indexed when the seed created `i_c`).
     CEq(&'static str),
-    /// `a > v` — a non-equality; the substrate's rule never probes it.
+    /// `a > v` — an int range the ordered structure probes ([STL-237]).
     AGt(i32),
+    /// `a >= v` — inclusive-low int range.
+    AGe(i32),
+    /// `a < v` — exclusive-high int range.
+    ALt(i32),
+    /// `a <= v` — inclusive-high int range.
+    ALe(i32),
+    /// `c > s` — a text range, walked in byte (= evaluator) order.
+    CGt(&'static str),
+    /// `c < s` — exclusive-high text range.
+    CLt(&'static str),
 }
 
 impl Where {
@@ -215,6 +231,11 @@ impl Where {
             Self::BEq(v) => format!(" WHERE b = {v}"),
             Self::CEq(s) => format!(" WHERE c = '{s}'"),
             Self::AGt(v) => format!(" WHERE a > {v}"),
+            Self::AGe(v) => format!(" WHERE a >= {v}"),
+            Self::ALt(v) => format!(" WHERE a < {v}"),
+            Self::ALe(v) => format!(" WHERE a <= {v}"),
+            Self::CGt(s) => format!(" WHERE c > '{s}'"),
+            Self::CLt(s) => format!(" WHERE c < '{s}'"),
         }
     }
 
@@ -227,6 +248,11 @@ impl Where {
             Self::BEq(v) => row.b == Some(v),
             Self::CEq(s) => row.c.as_deref() == Some(s),
             Self::AGt(v) => row.a.is_some_and(|a| a > v),
+            Self::AGe(v) => row.a.is_some_and(|a| a >= v),
+            Self::ALt(v) => row.a.is_some_and(|a| a < v),
+            Self::ALe(v) => row.a.is_some_and(|a| a <= v),
+            Self::CGt(s) => row.c.as_deref().is_some_and(|c| c > s),
+            Self::CLt(s) => row.c.as_deref().is_some_and(|c| c < s),
         }
     }
 }
@@ -250,7 +276,22 @@ fn probes() -> Vec<(&'static str, Vec<usize>, Where)> {
         Where::BEq(10),
         Where::CEq("x"),
         Where::CEq("absent"),
+        // Range shapes ([STL-237]). The bounds straddle the `-2..=3` domain:
+        // sign-crossing cuts pin the memcomparable transform, the beyond-domain
+        // bounds pin the Empty-window arm, and values inside the domain make
+        // both the inclusive and exclusive edge bite.
         Where::AGt(1),
+        Where::AGt(-3), // below the domain: every non-NULL `a` matches
+        Where::AGt(5),  // above the domain: the Empty-window arm
+        Where::AGe(3),
+        Where::AGe(-2),
+        Where::ALt(1), // only the negative side: sign order is load-bearing
+        Where::ALt(-2),
+        Where::ALe(-2),
+        Where::ALe(2),
+        Where::CGt("x"),
+        Where::CGt("z"), // beyond every written text: the Empty-window arm
+        Where::CLt("y"),
     ];
     let mut out = Vec::new();
     for (proj_sql, proj) in &projections {
@@ -306,29 +347,51 @@ fn next_dml(rng: &mut Rng, model: &mut Vec<Row>, next_id: &mut i32) -> String {
             .map_or_else(|| "NULL".to_owned(), |s| format!("'{s}'"))
     };
 
+    // `a`'s domain straddles zero so the range probes' memcomparable walk is
+    // pinned across the sign boundary ([STL-237]).
+    const A_DOMAIN: &[i32] = &[-2, 1, 2, 3];
+
     match rng.index(6) {
         // A predicate-driven UPDATE ([STL-229]): the indexed engine expands the
-        // WHERE through an index probe, the unindexed one through a full scan —
-        // the resulting writes (and later reads) must still agree byte-for-byte.
+        // WHERE through an index probe — equality or range ([STL-237]) — the
+        // unindexed one through a full scan; the resulting writes (and later
+        // reads) must still agree byte-for-byte.
         4 => {
             let target = i32::try_from(1 + rng.index(3)).expect("small domain");
             let b = int_or_null(rng, &[10, 20]);
-            for row in model.iter_mut().filter(|row| row.a == Some(target)) {
-                row.b = b;
+            if rng.one_in(3) {
+                for row in model
+                    .iter_mut()
+                    .filter(|row| row.a.is_some_and(|a| a >= target))
+                {
+                    row.b = b;
+                }
+                format!("UPDATE t SET b = {} WHERE a >= {target}", sql_int(b))
+            } else {
+                for row in model.iter_mut().filter(|row| row.a == Some(target)) {
+                    row.b = b;
+                }
+                format!("UPDATE t SET b = {} WHERE a = {target}", sql_int(b))
             }
-            format!("UPDATE t SET b = {} WHERE a = {target}", sql_int(b))
         }
-        // A predicate-driven DELETE ([STL-229]), same probe-vs-scan expansion.
+        // A predicate-driven DELETE ([STL-229]), same probe-vs-scan expansion —
+        // the range form reaches the negative side of the domain.
         5 => {
             let target = i32::try_from(1 + rng.index(3)).expect("small domain");
-            model.retain(|row| row.a != Some(target));
-            format!("DELETE FROM t WHERE a = {target}")
+            if rng.one_in(3) {
+                // NULL `a` survives a range DELETE (three-valued logic).
+                model.retain(|row| row.a.is_none_or(|a| a >= target));
+                format!("DELETE FROM t WHERE a < {target}")
+            } else {
+                model.retain(|row| row.a != Some(target));
+                format!("DELETE FROM t WHERE a = {target}")
+            }
         }
         2 if !model.is_empty() => {
             let idx = rng.index(model.len());
             let id = model[idx].id;
             if rng.one_in(2) {
-                let a = int_or_null(rng, &[1, 2, 3]);
+                let a = int_or_null(rng, A_DOMAIN);
                 model[idx].a = a;
                 format!("UPDATE t SET a = {} WHERE id = {id}", sql_int(a))
             } else {
@@ -347,7 +410,7 @@ fn next_dml(rng: &mut Rng, model: &mut Vec<Row>, next_id: &mut i32) -> String {
         _ => {
             let row = Row {
                 id: *next_id,
-                a: int_or_null(rng, &[1, 2, 3]),
+                a: int_or_null(rng, A_DOMAIN),
                 b: int_or_null(rng, &[10, 20]),
                 c: text_or_null(rng),
             };

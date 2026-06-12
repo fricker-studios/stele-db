@@ -158,6 +158,15 @@ flowchart TB
 - Segments are sorted/clustered by `(business_key, sys_from)` so a key's version chain is physically local and time-range pruning is cheap.
 - "Tombstones" are **logical period-closes**, not deletions; they carry their own provenance.
 
+As of v0.3 (STL-231) compaction is the manual `COMPACT` admin command: it
+flushes the delta, merges every live segment into one consolidated segment
+(re-clustered by `(business_key, sys_from, seq)`, retraction tombstones carried
+verbatim), and **atomically swaps** the live set in the per-table segment
+manifest ([ADR-0030](adr/0030-segment-manifest-retirement.md)) — inputs are
+retired whole, never mutated. Level policy and background scheduling (the
+L0→L1→L2 ladder above) layer on later; time-era clustering is v0.7
+([ADR-0021](adr/0021-storage-lifecycle-tiered-archival.md)).
+
 ### 3.2 On-disk segment format
 
 A sealed segment is an **immutable, self-describing columnar file** (Stele's own format — see [ADR-0002](adr/0002-on-disk-storage-format.md)), conceptually Parquet/ORC-like but designed around the bitemporal record and append-only segments:
@@ -238,7 +247,7 @@ flowchart TB
 
 ### 3.6 Crash recovery
 
-On startup: validate segments by checksum, find the last checkpoint, **replay the WAL** forward (idempotently) to reconstruct the delta tier and re-open period sentinels, then resume. Recovery is **deterministic** and is exercised under fault injection in the [simulation harness](06-testing-strategy.md).
+On startup: load the checkpoint/segment-manifest record ([ADR-0030](adr/0030-segment-manifest-retirement.md)), sweep any segment file the manifest's live list does not name (a torn flush/compaction's orphan, or a retired compaction input), validate the live segments by checksum, **replay the WAL** forward (idempotently) to reconstruct the delta tier and re-open period sentinels, then resume. Recovery is **deterministic** and is exercised under fault injection in the [simulation harness](06-testing-strategy.md).
 
 ```mermaid
 flowchart LR
@@ -268,14 +277,19 @@ in the flat namespace:
 | `stele.catalog` | root | append-only catalog log: every acknowledged DDL ([ADR-0028](adr/0028-durable-catalog-log.md)) |
 | `stele.commits` | root | cross-table commit-marker log ([ADR-0029](adr/0029-cross-table-commit-marker.md)) |
 | `t…-wal-{n}.log` | per table | WAL segments, numbered from 0, rotated by size |
-| `t…-stele.checkpoint` | per table | append-only checkpoint manifest: replay floor, durable fence, vouched segment count |
+| `t…-stele.checkpoint` | per table | append-only checkpoint / segment manifest: replay floor, durable fence, live segment list ([ADR-0030](adr/0030-segment-manifest-retirement.md)) |
 | `t…-seg-{n}.seg` | per table | sealed, immutable columnar segments (§3.2) |
 | `t…-delta-spill-{n}.row`, `t…-validity-spill-{n}.row` | per table | ephemeral spill files — reconstructible from WAL replay, deletable |
 
 All `{n}` are zero-padded to 20 digits so lexicographic and numeric order
 agree. Unrecognized names are ignored (forward compatibility); a sealed
-segment not vouched by the checkpoint manifest is an **orphan** — debris of a
-crashed flush — and is ignored by recovery, then overwritten by the next flush.
+segment the manifest's live list does not name is **dead** — an **orphan**
+(debris of a crashed flush or compaction) or a **retired** compaction input
+whose cleanup was interrupted — and recovery removes it
+([ADR-0030](adr/0030-segment-manifest-retirement.md)). One fsync'd manifest
+append is the atomic commit point for every segment-set transition: a flush
+adds its segment to the list; a `COMPACT` swaps the inputs for the
+consolidated output.
 
 **Fsync discipline (file *and* directory).** The trait has two durability
 points, and both are real fsyncs on `local`:

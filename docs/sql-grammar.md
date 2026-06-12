@@ -171,7 +171,7 @@ into a `DdlStatement` that `apply`s to a `stele-catalog` `Catalog`:
   the identity-demo `CREATE TABLE account (id INT PRIMARY KEY, balance INT) …`
   binds.
 
-### `CREATE INDEX` / `DROP INDEX` — secondary indexes (STL-233)
+### `CREATE INDEX` / `DROP INDEX` — secondary indexes (STL-233, STL-237)
 
 ```sql
 CREATE INDEX i_balance ON account (balance);
@@ -189,6 +189,16 @@ query's *speed*, never its *results* — the indexed≡unindexed equivalence
 oracle pins exactly that. `DROP TABLE` drops the table's indexes with it; the
 re-created name starts index-free. `DROP INDEX IF EXISTS` of an absent index
 is a no-op.
+
+A read uses the index rule-based, when the `WHERE` is a bare
+`<indexed column> <cmp> <literal>` comparison: `=` probes the entry exactly
+(STL-233), and `<` `<=` `>` `>=` probe a candidate range walked in the
+column type's *value* order (STL-237) — the ordered structure keys its
+entries memcomparably, so integer and temporal columns range correctly
+across the sign boundary. `FLOAT8` and `PERIOD` columns decline range
+service (their encodings don't byte-order by value; equality still probes),
+`<>` never probes (no window covers a complement), and a predicate-driven
+`UPDATE`/`DELETE` (STL-229) routes its scan through the same probe.
 
 Rejected with a roadmap pointer until their sibling tickets land: `UNIQUE`,
 `USING <kind>` (hash/bloom is STL-238, the valid-time interval kind STL-241),
@@ -338,7 +348,7 @@ rather than silently coerced; these are deliberate later additions.
 Statement
 ├── body: StatementBody
 │   ├── Sql(sqlparser::ast::Statement)   // standard SQL, clauses stripped
-│   ├── Admin(AdminCommand)              // CHECKPOINT | FLUSH — no sqlparser grammar
+│   ├── Admin(AdminCommand)              // CHECKPOINT | FLUSH | COMPACT — no sqlparser grammar
 │   └── User(UserDdl)                    // CREATE | ALTER | DROP USER (STL-252)
 └── temporal: Temporal
     ├── system_versioning: bool         // WITH SYSTEM VERSIONING
@@ -358,19 +368,20 @@ standard-SQL body, or `None` for an admin command or user DDL — the seam the
 binders and the wire layer read so a lifted statement cleanly classifies as
 "none of the SQL routes".
 
-## Admin commands (STL-219)
+## Admin commands (STL-219, STL-231)
 
-Operator-facing storage durability commands. `sqlparser` has no grammar for them,
+Operator-facing storage commands. `sqlparser` has no grammar for them,
 so they are recognized at the token level — the same lift the temporal clauses use
 — and represented as a `StatementBody::Admin` body rather than a `sqlparser` node.
-Both take no arguments; a trailing token is an error. The engine routes each to the
-matching session-wide durability operation and replies with the command's own
+All take no arguments; a trailing token is an error. The engine routes each to the
+matching session-wide operation and replies with the command's own
 `CommandComplete` tag.
 
 | Command | Engine op | Effect |
 |---|---|---|
 | `CHECKPOINT` | `SessionEngine::checkpoint` | Lightweight WAL fence over every table — fsync + record the fence, no seal. |
 | `FLUSH` | `SessionEngine::flush` | Seal every table's delta into a segment and advance its replay floor (bounded recovery — STL-177 / STL-195). |
+| `COMPACT` | `SessionEngine::compact` | Flush, then merge every table's sealed segments into one read-optimized segment, retiring the inputs — history-preserving (STL-231, ADR-0030). |
 
 ## Not yet supported (deferred)
 

@@ -104,6 +104,25 @@ pub enum CompareOp {
     Ge,
 }
 
+impl CompareOp {
+    /// The operator with its operands swapped: `lit < col` is `col > lit`.
+    /// Lets [`BoundPredicate::column_comparison`] normalize a literal-first
+    /// comparison so the column always reads as the left operand ([STL-237]).
+    ///
+    /// [STL-237]: https://allegromusic.atlassian.net/browse/STL-237
+    #[must_use]
+    pub const fn mirror(self) -> Self {
+        match self {
+            Self::Eq => Self::Eq,
+            Self::Ne => Self::Ne,
+            Self::Lt => Self::Gt,
+            Self::Le => Self::Ge,
+            Self::Gt => Self::Lt,
+            Self::Ge => Self::Le,
+        }
+    }
+}
+
 /// An integer arithmetic operator a `WHERE` scalar lowers ([STL-213]).
 ///
 /// Mirrors the executor's `stele_exec::ArithOp` (same crate-split reason as
@@ -198,15 +217,34 @@ impl BoundPredicate {
     /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
     #[must_use]
     pub const fn column_equality(&self) -> Option<(usize, &ScalarValue)> {
-        if !matches!(self.op, CompareOp::Eq) {
-            return None;
+        match self.column_comparison() {
+            Some((col, CompareOp::Eq, value)) => Some((col, value)),
+            _ => None,
         }
+    }
+
+    /// The `(schema index, operator, literal)` of a bare **value-column**
+    /// comparison — exactly `<column> <cmp> <literal>` in either operand order,
+    /// normalized so the column reads as the left operand (a literal-first form
+    /// [mirrors](CompareOp::mirror) the operator) — the shape a secondary-index
+    /// equality or range probe can serve ([STL-237]). `None` for a business-key
+    /// comparison (key *equality* has its own zone-map push-down,
+    /// [`key_equality`](Self::key_equality)) and for every richer predicate (an
+    /// arithmetic side, column-to-column), which the vectorized filter still
+    /// applies exactly.
+    ///
+    /// `Ne` is reported as itself: whether an operator can window candidates is
+    /// the index's call, not the binder's.
+    ///
+    /// [STL-237]: https://allegromusic.atlassian.net/browse/STL-237
+    #[must_use]
+    pub const fn column_comparison(&self) -> Option<(usize, CompareOp, &ScalarValue)> {
         match (&self.left, &self.right) {
-            (BoundScalar::Column(col), BoundScalar::Literal(value))
-            | (BoundScalar::Literal(value), BoundScalar::Column(col))
-                if *col > 0 =>
-            {
-                Some((*col, value))
+            (BoundScalar::Column(col), BoundScalar::Literal(value)) if *col > 0 => {
+                Some((*col, self.op, value))
+            }
+            (BoundScalar::Literal(value), BoundScalar::Column(col)) if *col > 0 => {
+                Some((*col, self.op.mirror(), value))
             }
             _ => None,
         }
@@ -2871,6 +2909,48 @@ mod tests {
         );
         // A value-column equality is not pushed down to the key zone map.
         assert_eq!(column_first.key_equality(), None);
+    }
+
+    #[test]
+    fn column_comparison_normalizes_the_column_to_the_left() {
+        // The probe-facing accessor ([STL-237]): a bare `<col> <cmp> <lit>` in
+        // either operand order reads back column-left, with a literal-first
+        // form mirroring the operator (`100 < balance` is `balance > 100`).
+        let catalog = catalog_with_account(1_000);
+        let comparison = |sql: &str| {
+            bind(sql, &catalog)
+                .unwrap()
+                .filter
+                .unwrap()
+                .column_comparison()
+                .map(|(col, op, value)| (col, op, value.clone()))
+        };
+        assert_eq!(
+            comparison("SELECT id FROM account WHERE balance < 100"),
+            Some((1, CompareOp::Lt, ScalarValue::Int4(100)))
+        );
+        assert_eq!(
+            comparison("SELECT id FROM account WHERE 100 < balance"),
+            Some((1, CompareOp::Gt, ScalarValue::Int4(100)))
+        );
+        assert_eq!(
+            comparison("SELECT id FROM account WHERE 100 >= balance"),
+            Some((1, CompareOp::Le, ScalarValue::Int4(100)))
+        );
+        // The equality accessor is the comparison's `Eq` arm.
+        let eq = bind("SELECT id FROM account WHERE 100 = balance", &catalog)
+            .unwrap()
+            .filter
+            .unwrap();
+        assert_eq!(eq.column_equality(), Some((1, &ScalarValue::Int4(100))));
+        // A business-key comparison is not a value-column probe shape…
+        assert_eq!(comparison("SELECT id FROM account WHERE id > 7"), None);
+        // …and neither is an arithmetic side: the filter still applies it
+        // exactly, but no single column anchors a candidate window.
+        assert_eq!(
+            comparison("SELECT id FROM account WHERE balance % 2 = 0"),
+            None
+        );
     }
 
     #[test]
