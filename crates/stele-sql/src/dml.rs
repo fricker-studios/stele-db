@@ -198,6 +198,16 @@ pub enum BoundDml {
         /// a whole-table `DELETE`.
         filter: Option<BoundPredicate>,
     },
+    /// `MERGE INTO … USING … ON … WHEN …` — the upsert plan ([STL-230]).
+    ///
+    /// Like the scan variants, this never reaches the per-key write path directly:
+    /// the engine resolves each source row against the target's live keys at the
+    /// statement snapshot (matched ⇒ [`Update`](Self::Update), not matched ⇒
+    /// [`Insert`](Self::Insert)) and applies the whole set as a single atomic
+    /// group. See [`BoundMerge`](crate::merge::BoundMerge).
+    ///
+    /// [STL-230]: https://allegromusic.atlassian.net/browse/STL-230
+    Merge(crate::merge::BoundMerge),
 }
 
 impl BoundDml {
@@ -210,6 +220,7 @@ impl BoundDml {
             | Self::Delete { table, .. }
             | Self::UpdateScan { table, .. }
             | Self::DeleteScan { table, .. } => table,
+            Self::Merge(merge) => &merge.table,
         }
     }
 }
@@ -460,6 +471,7 @@ pub fn bind_dml(stmt: &Statement, ctx: &BindContext) -> Result<BoundDml, DmlErro
         SqlStatement::Insert(insert) => bind_insert(insert, ctx),
         SqlStatement::Update(update) => bind_update(update, ctx),
         SqlStatement::Delete(delete) => bind_delete(delete, ctx),
+        SqlStatement::Merge(merge) => crate::merge::bind_merge(merge, ctx),
         _ => Err(DmlError::NotDml),
     }
 }
@@ -596,7 +608,7 @@ fn single_values_row(insert: &Insert) -> Result<&[Expr], DmlError> {
 /// that repeats ([`DuplicateColumn`](DmlError::DuplicateColumn) — keeping only the
 /// last value for a repeated name would silently bind the wrong cell). The caller
 /// then matches a target column to the value at its position in this list.
-fn validated_columns(
+pub(crate) fn validated_columns(
     table: &str,
     cols: &[ObjectName],
     schema: &TableSchema,
@@ -737,7 +749,7 @@ fn bind_update(update: &Update, ctx: &BindContext) -> Result<BoundDml, DmlError>
 }
 
 /// The single, unqualified column an `UPDATE … SET` assignment targets.
-fn assignment_column(assignment: &Assignment) -> Result<&str, DmlError> {
+pub(crate) fn assignment_column(assignment: &Assignment) -> Result<&str, DmlError> {
     match &assignment.target {
         AssignmentTarget::ColumnName(name) => single_ident(name),
         AssignmentTarget::Tuple(_) => Err(DmlError::Unsupported(
@@ -800,7 +812,7 @@ fn bind_delete(delete: &Delete, ctx: &BindContext) -> Result<BoundDml, DmlError>
 /// Resolve `table` at the context snapshot and split its schema into the business
 /// key (the first column) and the value columns (the rest), returning the schema
 /// alongside.
-fn resolve_shape<'a>(
+pub(crate) fn resolve_shape<'a>(
     ctx: &'a BindContext,
     table: &str,
 ) -> Result<(&'a TableSchema, &'a ColumnDef, &'a [ColumnDef]), DmlError> {
@@ -1042,7 +1054,7 @@ fn fold_value(expr: &Expr, table: &str, column: &ColumnDef) -> Result<ScalarValu
 /// Map a table/column-agnostic [`FoldError`] to the DML error that names the
 /// table and column it occurred on. Reproduces the binder's pre-existing errors
 /// exactly, so the surface is unchanged.
-fn fold_err_to_dml(err: FoldError, table: &str, column: &ColumnDef) -> DmlError {
+pub(crate) fn fold_err_to_dml(err: FoldError, table: &str, column: &ColumnDef) -> DmlError {
     match err {
         FoldError::Null => DmlError::NullValue {
             table: table.to_owned(),
@@ -1083,7 +1095,7 @@ fn table_of(twj: &TableWithJoins) -> Result<String, DmlError> {
 
 /// Extract a single, unqualified identifier from an [`ObjectName`] — the table /
 /// column name forms v0.1 accepts. Mirrors the DDL binder's `bare_name`.
-fn bare_name(name: &ObjectName) -> Result<String, DmlError> {
+pub(crate) fn bare_name(name: &ObjectName) -> Result<String, DmlError> {
     single_ident(name).map(ToOwned::to_owned)
 }
 

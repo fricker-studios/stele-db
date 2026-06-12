@@ -49,7 +49,8 @@
 use stele_common::types::LogicalType;
 use stele_sql::Statement;
 use stele_sql::sqlparser::ast::{
-    Expr, Query, SelectItem, SetExpr, Statement as SqlStatement, Value,
+    Expr, MergeAction, MergeInsertKind, Query, SelectItem, SetExpr, Statement as SqlStatement,
+    TableFactor, Value,
 };
 
 use crate::{binary_format, text_format};
@@ -423,6 +424,33 @@ fn count_statement(stmt: &SqlStatement, required: &mut usize) {
                 count_expr(selection, required);
             }
         }
+        // MERGE (STL-230): placeholders can sit in the VALUES source, the ON
+        // condition, an UPDATE arm's assignments, or an INSERT arm's values.
+        SqlStatement::Merge(merge) => {
+            if let TableFactor::Derived { subquery, .. } = &merge.source {
+                count_query(subquery, required);
+            }
+            count_expr(&merge.on, required);
+            for clause in &merge.clauses {
+                match &clause.action {
+                    MergeAction::Update(update) => {
+                        for assignment in &update.assignments {
+                            count_expr(&assignment.value, required);
+                        }
+                    }
+                    MergeAction::Insert(insert) => {
+                        if let MergeInsertKind::Values(values) = &insert.kind {
+                            for row in &values.rows {
+                                for expr in &row.content {
+                                    count_expr(expr, required);
+                                }
+                            }
+                        }
+                    }
+                    MergeAction::Delete { .. } => {}
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -526,6 +554,32 @@ fn walk_statement(stmt: &mut SqlStatement, params: &[Value]) {
         SqlStatement::Delete(delete) => {
             if let Some(selection) = &mut delete.selection {
                 walk_expr(selection, params);
+            }
+        }
+        // MERGE (STL-230): the same positions `count_statement` counts.
+        SqlStatement::Merge(merge) => {
+            if let TableFactor::Derived { subquery, .. } = &mut merge.source {
+                walk_query(subquery, params);
+            }
+            walk_expr(&mut merge.on, params);
+            for clause in &mut merge.clauses {
+                match &mut clause.action {
+                    MergeAction::Update(update) => {
+                        for assignment in &mut update.assignments {
+                            walk_expr(&mut assignment.value, params);
+                        }
+                    }
+                    MergeAction::Insert(insert) => {
+                        if let MergeInsertKind::Values(values) = &mut insert.kind {
+                            for row in &mut values.rows {
+                                for expr in &mut row.content {
+                                    walk_expr(expr, params);
+                                }
+                            }
+                        }
+                    }
+                    MergeAction::Delete { .. } => {}
+                }
             }
         }
         _ => {}
@@ -901,6 +955,27 @@ mod tests {
             placeholder_count(&parse_one("INSERT INTO account VALUES ($1, $3)")),
             3
         );
+    }
+
+    #[test]
+    fn merge_placeholders_count_and_substitute() {
+        // STL-230: every expression position a MERGE binds from is reachable —
+        // the VALUES source, the ON condition, and both arms' values.
+        let sql = "MERGE INTO account USING (VALUES ($1, $2)) AS s (id, v) ON account.id = s.id \
+                   WHEN MATCHED THEN UPDATE SET balance = $3 \
+                   WHEN NOT MATCHED THEN INSERT (id, balance) VALUES (s.id, $4)";
+        let stmt = parse_one(sql);
+        assert_eq!(placeholder_count(&stmt), 4);
+
+        let params: Vec<Value> = (1..=4)
+            .map(|n| Value::Number(format!("{n}0"), false))
+            .collect();
+        let bound = substitute(&stmt, &params);
+        assert_eq!(placeholder_count(&bound), 0, "every placeholder is filled");
+        let rendered = bound.sql().expect("a SQL body").to_string();
+        for filled in ["10", "20", "30", "40"] {
+            assert!(rendered.contains(filled), "missing {filled} in {rendered}");
+        }
     }
 
     #[test]

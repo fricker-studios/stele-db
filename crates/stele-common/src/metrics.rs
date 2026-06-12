@@ -147,6 +147,10 @@ pub enum StatementKind {
     Update,
     /// `DELETE`.
     Delete,
+    /// `MERGE` ([STL-230]).
+    ///
+    /// [STL-230]: https://allegromusic.atlassian.net/browse/STL-230
+    Merge,
     /// `CREATE TABLE` / `DROP TABLE`.
     Ddl,
     /// An operator admin command (`CHECKPOINT` / `FLUSH`).
@@ -155,11 +159,12 @@ pub enum StatementKind {
 
 impl StatementKind {
     /// Every kind, in stable exposition order.
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Select,
         Self::Insert,
         Self::Update,
         Self::Delete,
+        Self::Merge,
         Self::Ddl,
         Self::Admin,
     ];
@@ -172,6 +177,7 @@ impl StatementKind {
             Self::Insert => "insert",
             Self::Update => "update",
             Self::Delete => "delete",
+            Self::Merge => "merge",
             Self::Ddl => "ddl",
             Self::Admin => "admin",
         }
@@ -184,8 +190,9 @@ impl StatementKind {
             Self::Insert => 1,
             Self::Update => 2,
             Self::Delete => 3,
-            Self::Ddl => 4,
-            Self::Admin => 5,
+            Self::Merge => 4,
+            Self::Ddl => 5,
+            Self::Admin => 6,
         }
     }
 
@@ -195,7 +202,7 @@ impl StatementKind {
     const fn latency_idx(self) -> usize {
         match self {
             Self::Select => 0,
-            Self::Insert | Self::Update | Self::Delete => 1,
+            Self::Insert | Self::Update | Self::Delete | Self::Merge => 1,
             Self::Ddl | Self::Admin => 2,
         }
     }
@@ -228,10 +235,10 @@ pub struct Metrics {
     pub connections_active: Gauge,
 
     /// Successfully executed statements by kind (`select` / `insert` /
-    /// `update` / `delete` / `ddl` / `admin`); indexed by
+    /// `update` / `delete` / `merge` / `ddl` / `admin`); indexed by
     /// [`StatementKind::idx`]. Errored statements count in
     /// [`statement_errors`](Self::statement_errors) instead.
-    statements: [Counter; 6],
+    statements: [Counter; 7],
     /// Statement latency by coarse kind (`select` / `dml` / `ddl`); indexed
     /// by [`StatementKind::latency_idx`].
     statement_seconds: [Histogram; 3],
