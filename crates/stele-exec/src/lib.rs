@@ -25,15 +25,24 @@
 //! core aggregate set (`COUNT` / `SUM` / `MIN` / `MAX` / `AVG`, [STL-171]); the
 //! join operator (STL-77 C12) builds on the same pieces.
 //!
+//! v0.3 adds the **result-shaping** stage ([STL-263]): [`distinct_selection`]
+//! (hash `DISTINCT`, the [`hash_aggregate`] row identity reused),
+//! [`sort_selection`] (`ORDER BY`, Postgres NULL placement), and
+//! [`limit_selection`] (`OFFSET`/`LIMIT`) — each a pure operation over a
+//! selection vector of row indices, applied by the engine in the Postgres
+//! pipeline order after filtering and aggregation.
+//!
 //! [STL-170]: https://allegromusic.atlassian.net/browse/STL-170
 //! [STL-171]: https://allegromusic.atlassian.net/browse/STL-171
 //! [STL-206]: https://allegromusic.atlassian.net/browse/STL-206
+//! [STL-263]: https://allegromusic.atlassian.net/browse/STL-263
 
 mod aggregate;
 mod expr;
 mod join;
 mod operator;
 mod period;
+mod shape;
 mod snapshot_scan;
 
 pub use aggregate::{AggregateFunc, AggregateOutput, Aggregator, hash_aggregate};
@@ -41,6 +50,7 @@ pub use expr::{ArithOp, CmpOp, Expr, ExprError, LogicOp, Vector, eval_expr};
 pub use join::{JoinIndices, JoinType, hash_join};
 pub use operator::{DEFAULT_BATCH_SIZE, ExplodePayload, Filter, Operator, Project, ScanSource};
 pub use period::evaluate;
+pub use shape::{SortKey, distinct_selection, limit_selection, sort_selection};
 pub use snapshot_scan::{
     Batch, Cells, Column, GatheredColumns, ScanError, ScanOutput, ScanStats, SnapshotScan,
 };

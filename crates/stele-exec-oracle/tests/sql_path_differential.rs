@@ -638,7 +638,206 @@ fn period_predicate_gates_the_bitemporal_read_vs_duckdb() {
     }
 }
 
-// --- 3. the harness can actually fail ---------------------------------------
+// --- 3. result shaping: ORDER BY / LIMIT / OFFSET / DISTINCT (STL-263) -------
+
+/// Decode a present integer result cell (`INT` or the aggregate `BIGINT`) to
+/// its value — the comparable unit of the shaping differential (a NULL cell
+/// stays `None` at the caller).
+fn int_cell(ty: LogicalType, bytes: &[u8]) -> i64 {
+    match ScalarValue::decode(ty, bytes).expect("decode integer cell") {
+        ScalarValue::Int4(v) => i64::from(v),
+        ScalarValue::Int8(v) => v,
+        // The shaping workload projects only integer columns.
+        _ => panic!("the shaping differential reads integer cells only"),
+    }
+}
+
+/// Run one Stele `SELECT` and return its rows as decoded integer cells, in
+/// **result order** (ordering is the thing under test — nothing here sorts).
+fn stele_shaped_rows(
+    engine: &mut SessionEngine<OriginClock, MemDisk>,
+    sql: &str,
+) -> Vec<Vec<Option<i64>>> {
+    let StatementOutcome::Rows(result) = engine.execute(&parse_one(sql)).expect("select") else {
+        panic!("a SELECT must return rows");
+    };
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .zip(&result.columns)
+                .map(|(cell, (_, ty))| cell.as_deref().map(|bytes| int_cell(*ty, bytes)))
+                .collect()
+        })
+        .collect()
+}
+
+/// Run one DuckDB `SELECT` over `width` integer columns, rows in result order.
+fn duck_shaped_rows(conn: &Connection, sql: &str, width: usize) -> Vec<Vec<Option<i64>>> {
+    let mut stmt = conn.prepare(sql).expect("prepare reference query");
+    let rows = stmt
+        .query_map([], |row| {
+            (0..width).map(|i| row.get::<_, Option<i64>>(i)).collect()
+        })
+        .expect("run reference query");
+    rows.map(|r| r.expect("reference row")).collect()
+}
+
+/// `ORDER BY` / `LIMIT` / `OFFSET` / `DISTINCT` — alone and composed, over the
+/// plain and the aggregate path — return exactly what DuckDB returns for the
+/// same data, across a seeded sweep with duplicate values, NULLs, and every
+/// tier regime (delta-only / fully sealed / mixed).
+///
+/// Postgres NULL placement is pinned: Stele writes **no** placement modifier
+/// (its defaults are under test), while the DuckDB reference spells
+/// `NULLS LAST` / `NULLS FIRST` explicitly — DuckDB's own default differs from
+/// Postgres (`NULLS LAST` in both directions), so an unpinned reference would
+/// mask a placement bug. Every ordered query carries a unique tiebreak key so
+/// the expected order is total and the diff is exact; the unordered DISTINCT
+/// is compared as a sorted multiset.
+#[test]
+fn result_shaping_differential_vs_duckdb() {
+    const SHAPING_SEEDS: u64 = 60;
+    for seed in 0..SHAPING_SEEDS {
+        let mut rng = Rng::new(seed.wrapping_mul(0x5EED).wrapping_add(7));
+        let duck = Connection::open_in_memory().expect("open in-memory duckdb");
+        let (mut engine, n) = seed_shaping_history(&mut rng, &duck);
+
+        let cases = shaping_cases(&mut rng, n);
+        for (stele_sql, duck_sql, width) in &cases {
+            let got = stele_shaped_rows(&mut engine, stele_sql);
+            let want = duck_shaped_rows(&duck, duck_sql, *width);
+            assert!(
+                got == want,
+                "seed {seed}: shaping diverged from DuckDB.\n  stele:  `{stele_sql}`\n  \
+                 duckdb: `{duck_sql}`\n  got  = {got:?}\n  want = {want:?}",
+            );
+        }
+
+        // Unordered DISTINCT: both engines pick their own row order, so the
+        // diff is over the sorted multiset.
+        let mut got = stele_shaped_rows(&mut engine, "SELECT DISTINCT grp, val FROM shp");
+        let mut want = duck_shaped_rows(&duck, "SELECT DISTINCT grp, val FROM shp", 2);
+        got.sort();
+        want.sort();
+        assert!(
+            got == want,
+            "seed {seed}: unordered DISTINCT diverged.\n  got  = {got:?}\n  want = {want:?}",
+        );
+    }
+}
+
+/// Seed one shaping history: `shp(id, grp, val)` written over SQL into a fresh
+/// engine and mirrored row-for-row into the DuckDB reference, with small value
+/// domains (duplicate `(grp, val)` rows), ~1-in-4 NULL cells, and one of three
+/// seal schedules (delta-only / sealed-after / mixed) so shaping reads span
+/// every tier regime. Returns the engine and the row count.
+fn seed_shaping_history(
+    rng: &mut Rng,
+    duck: &Connection,
+) -> (SessionEngine<OriginClock, MemDisk>, i64) {
+    let mut engine = SessionEngine::open(MemDisk::new(), OriginClock);
+    engine
+        .execute(&parse_one(
+            "CREATE TABLE shp (id INT PRIMARY KEY, grp INT, val INT) \
+             WITH SYSTEM VERSIONING",
+        ))
+        .expect("create shaping table");
+    duck.execute_batch("CREATE TABLE shp (id INTEGER, grp INTEGER, val INTEGER);")
+        .expect("create reference table");
+
+    let seal_mode = rng.range(3);
+    let n = 8 + rng.range(32);
+    for id in 1..=n {
+        let cell = |rng: &mut Rng, domain: i64| {
+            if rng.range(4) == 0 {
+                None
+            } else {
+                Some(rng.range(domain))
+            }
+        };
+        let grp = cell(rng, 4);
+        let val = cell(rng, 6);
+        let lit = |v: Option<i64>| v.map_or("NULL".to_owned(), |v| v.to_string());
+        engine
+            .execute(&parse_one(&format!(
+                "INSERT INTO shp VALUES ({id}, {}, {})",
+                lit(grp),
+                lit(val),
+            )))
+            .expect("insert over SQL");
+        duck.execute("INSERT INTO shp VALUES (?, ?, ?);", params![id, grp, val])
+            .expect("mirror insert");
+        // Mixed regime: seal mid-history so shaping reads span tiers.
+        if seal_mode == 2 && rng.range(4) == 0 {
+            engine.flush().expect("seal the delta mid-history");
+        }
+    }
+    if seal_mode == 1 {
+        engine.flush().expect("seal the delta into segments");
+    }
+    (engine, n)
+}
+
+/// The shaped query pairs `(stele SQL, duckdb SQL, projected width)` — the
+/// reference pins Postgres NULL placement explicitly (DuckDB's own default
+/// differs); Stele relies on its defaults, which is what is under test.
+fn shaping_cases(rng: &mut Rng, n: i64) -> Vec<(String, String, usize)> {
+    let limit = rng.range(n + 2);
+    let offset = rng.range(n + 2);
+    vec![
+        (
+            "SELECT id, grp, val FROM shp ORDER BY grp, val DESC, id".into(),
+            "SELECT id, grp, val FROM shp \
+                 ORDER BY grp ASC NULLS LAST, val DESC NULLS FIRST, id"
+                .into(),
+            3,
+        ),
+        (
+            format!("SELECT id FROM shp ORDER BY id LIMIT {limit} OFFSET {offset}"),
+            format!("SELECT id FROM shp ORDER BY id LIMIT {limit} OFFSET {offset}"),
+            1,
+        ),
+        (
+            "SELECT id FROM shp ORDER BY id LIMIT 0".into(),
+            "SELECT id FROM shp ORDER BY id LIMIT 0".into(),
+            1,
+        ),
+        (
+            format!("SELECT id FROM shp ORDER BY id OFFSET {past}", past = n + 1),
+            format!("SELECT id FROM shp ORDER BY id OFFSET {past}", past = n + 1),
+            1,
+        ),
+        (
+            "SELECT DISTINCT grp FROM shp ORDER BY grp DESC".into(),
+            "SELECT DISTINCT grp FROM shp ORDER BY grp DESC NULLS FIRST".into(),
+            1,
+        ),
+        // DISTINCT over the full projected row, composed with ORDER BY +
+        // LIMIT: the deduped (grp, val) pairs are unique, so ordering by
+        // both is total and the slice is exact.
+        (
+            "SELECT DISTINCT grp, val FROM shp ORDER BY grp, val LIMIT 5".into(),
+            "SELECT DISTINCT grp, val FROM shp \
+                 ORDER BY grp ASC NULLS LAST, val ASC NULLS LAST LIMIT 5"
+                .into(),
+            2,
+        ),
+        // The aggregate path: shaping over grouped output, ordered by the
+        // aggregate column (Stele's default output name), grouped key as
+        // the unique tiebreak.
+        (
+            "SELECT grp, COUNT(*) FROM shp GROUP BY grp ORDER BY count DESC, grp LIMIT 3".into(),
+            "SELECT grp, COUNT(*) AS count FROM shp \
+                 GROUP BY grp ORDER BY count DESC, grp ASC NULLS LAST LIMIT 3"
+                .into(),
+            2,
+        ),
+    ]
+}
+
+// --- 4. the harness can actually fail ---------------------------------------
 
 /// Guards against a vacuous oracle: if the DuckDB reference is fed a deliberately
 /// stale close (`sys_to` materialized one tick *past* the successor's `sys_from`,

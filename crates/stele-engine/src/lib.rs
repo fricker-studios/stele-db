@@ -72,8 +72,9 @@ use stele_common::types::{LogicalType, ScalarValue};
 use stele_exec::{
     AggregateFunc as ExecAggregateFunc, Aggregator, ArithOp as ExecArithOp, Batch, CmpOp, Column,
     DEFAULT_BATCH_SIZE, ExplodePayload, Expr, ExprError, Filter, GatheredColumns,
-    JoinType as ExecJoinType, Operator, ScanError, ScanSource, SnapshotScan, Vector, eval_expr,
-    evaluate, hash_aggregate, hash_join,
+    JoinType as ExecJoinType, Operator, ScanError, ScanSource, SnapshotScan, SortKey, Vector,
+    distinct_selection, eval_expr, evaluate, hash_aggregate, hash_join, limit_selection,
+    sort_selection,
 };
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::dml::{BoundDml, DmlError};
@@ -81,7 +82,7 @@ use stele_sql::merge::{BoundMerge, MergeSource, MergeValue};
 use stele_sql::select::{
     AggregateFunc, ArithOp, BoundAggregate, BoundJoin, BoundPeriod, BoundPeriodPredicate,
     BoundPredicate, BoundScalar, BoundSelect, CompareOp, JoinColumnRef, JoinType, OutputItem,
-    PeriodEndpoint, Projection, SelectError,
+    PeriodEndpoint, Projection, SelectError, SortTarget,
 };
 use stele_sql::{
     AdminCommand, BindContext, BindError, Statement, StatementBody, TimeDimension, bind_ddl,
@@ -2106,9 +2107,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         };
 
         // An aggregate query folds those rows into grouped output ([STL-171]); a
-        // plain query projects them.
+        // plain query shapes and projects them. Both paths end with the same
+        // result-shaping pipeline ([STL-263]) — and because it runs over the
+        // reconstructed `rows`, it applies identically under `AS OF` (either
+        // axis) and over the read-your-own-writes overlay (ordering after
+        // overlay, [STL-203]).
         if let Some(agg) = &bound.aggregate {
             return Ok(StatementOutcome::Rows(run_aggregate(
+                bound,
                 agg,
                 &schema_columns,
                 &rows,
@@ -2117,9 +2123,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
 
         let projection = projection_indices(&bound.projection, &schema_columns);
         let columns = projected_columns(&bound.projection, &schema_columns);
-        let out_rows: Vec<Vec<Option<Vec<u8>>>> = rows
+        let selection = shape_rows(bound, &schema_columns, &projection, &rows)?;
+        let out_rows: Vec<Vec<Option<Vec<u8>>>> = selection
             .iter()
-            .map(|full| projection.iter().map(|&i| full[i].clone()).collect())
+            .map(|&r| projection.iter().map(|&i| rows[r][i].clone()).collect())
             .collect();
         Ok(StatementOutcome::Rows(SelectResult {
             columns,
@@ -2747,6 +2754,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             period_filter: None,
             aggregate: None,
             join: None,
+            // DML row selection takes no result shaping — every match writes.
+            distinct: false,
+            order_by: Vec::new(),
+            offset: 0,
+            limit: None,
         };
         let StatementOutcome::Rows(matched) = self.run_select(&scan, overlay)? else {
             return Err(EngineError::Unsupported(
@@ -4266,7 +4278,13 @@ fn projected_columns(
 /// cell back to its canonical bytes for the wire. `rows` are the full rows
 /// (`[business key, value cells…]`) the scan produced after `WHERE`; `row_count`
 /// of `0` still yields one row for an ungrouped aggregate (`COUNT(*)` is `0`).
+///
+/// The grouped output then runs the result-shaping tail of the pipeline
+/// ([STL-263]): `DISTINCT` → `ORDER BY` → `OFFSET` → `LIMIT` over the output
+/// columns (an aggregate `ORDER BY` key is always a select-list output
+/// position — the binder enforces it).
 fn run_aggregate(
+    bound: &BoundSelect,
     agg: &BoundAggregate,
     schema_columns: &[(String, LogicalType)],
     rows: &[Vec<Option<Vec<u8>>>],
@@ -4298,8 +4316,7 @@ fn run_aggregate(
     let out = hash_aggregate(&group_keys, &aggregators, &columns, rows.len())
         .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
 
-    // Re-interleave grouping + aggregate columns into SELECT-list order and encode
-    // each cell back to its canonical bytes (`None` → a SQL NULL on the wire).
+    // Re-interleave grouping + aggregate columns into SELECT-list order.
     let output: Vec<&Vector> = agg
         .items
         .iter()
@@ -4308,8 +4325,39 @@ fn run_aggregate(
             OutputItem::Aggregate(k) => &out.aggregates[*k],
         })
         .collect();
-    let result_rows: Vec<Vec<Option<Vec<u8>>>> = (0..out.num_groups)
-        .map(|g| {
+
+    // The result-shaping tail ([STL-263]): DISTINCT → ORDER BY → OFFSET →
+    // LIMIT over the grouped output rows, as a selection of group indices.
+    let mut selection: Vec<usize> = (0..out.num_groups).collect();
+    if bound.distinct {
+        selection = distinct_selection(&output, &selection);
+    }
+    if !bound.order_by.is_empty() {
+        let keys: Vec<SortKey<'_>> = bound
+            .order_by
+            .iter()
+            .map(|key| match key.column {
+                SortTarget::Output(pos) => Ok(SortKey {
+                    column: output[pos],
+                    descending: key.descending,
+                }),
+                // The binder resolves an aggregate ORDER BY key against the
+                // select list only, so a schema-column key here is a contract
+                // break — surface it rather than panic.
+                SortTarget::Schema(_) => Err(EngineError::Unsupported(
+                    "an aggregate ORDER BY key must be a select-list output column",
+                )),
+            })
+            .collect::<Result<_, _>>()?;
+        sort_selection(&keys, &mut selection);
+    }
+    limit_selection(&mut selection, bound.offset, bound.limit);
+
+    // Encode each surviving cell back to its canonical bytes (`None` → a SQL
+    // NULL on the wire).
+    let result_rows: Vec<Vec<Option<Vec<u8>>>> = selection
+        .iter()
+        .map(|&g| {
             output
                 .iter()
                 .map(|v| v.get(g).as_ref().map(encode_value))
@@ -4321,6 +4369,78 @@ fn run_aggregate(
         columns: agg.columns.clone(),
         rows: result_rows,
     })
+}
+
+/// Apply the result-shaping pipeline to a plain (non-aggregate) read's
+/// reconstructed full rows ([STL-263]): `DISTINCT` over the projected row, then
+/// `ORDER BY`, then `OFFSET`/`LIMIT` — returning the surviving row indices in
+/// output order, for the projection to gather.
+///
+/// Shaping moves row *indices* only (the executor's selection-vector
+/// machinery); the only cell work is decoding the columns a clause actually
+/// references into typed [`Vector`]s, each once. An `ORDER BY` key may name an
+/// unprojected schema column (the Postgres plain-`SELECT` allowance) — the full
+/// rows carry every schema column, so it sorts the same way before the
+/// projection drops it.
+fn shape_rows(
+    bound: &BoundSelect,
+    schema_columns: &[(String, LogicalType)],
+    projection: &[usize],
+    rows: &[Vec<Option<Vec<u8>>>],
+) -> Result<Vec<usize>, EngineError> {
+    let mut selection: Vec<usize> = (0..rows.len()).collect();
+    if !bound.distinct && bound.order_by.is_empty() {
+        limit_selection(&mut selection, bound.offset, bound.limit);
+        return Ok(selection);
+    }
+
+    // The ORDER BY keys as `(schema index, direction)`: an output-position key
+    // maps through the projection; a schema key (an unprojected column on a
+    // non-DISTINCT read — the binder enforces that) is already one.
+    let key_indices: Vec<(usize, bool)> = bound
+        .order_by
+        .iter()
+        .map(|key| {
+            let idx = match key.column {
+                SortTarget::Output(pos) => projection[pos],
+                SortTarget::Schema(idx) => idx,
+            };
+            (idx, key.descending)
+        })
+        .collect();
+
+    // Decode each schema column a shaping clause references, once. Columns no
+    // clause touches stay opaque bytes.
+    let mut referenced: BTreeSet<usize> = key_indices.iter().map(|&(i, _)| i).collect();
+    if bound.distinct {
+        referenced.extend(projection.iter().copied());
+    }
+    let mut decoded: BTreeMap<usize, Vector> = BTreeMap::new();
+    for &i in &referenced {
+        let cells: Vec<Option<Vec<u8>>> = rows.iter().map(|r| r[i].clone()).collect();
+        let vector = Vector::from_column(schema_columns[i].1, &Column::Bytes(cells.into()))
+            .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
+        decoded.insert(i, vector);
+    }
+
+    // DISTINCT deduplicates the full projected row, before ORDER BY (whose
+    // keys DISTINCT restricts to the select list — the 42P10 rule).
+    if bound.distinct {
+        let columns: Vec<&Vector> = projection.iter().map(|i| &decoded[i]).collect();
+        selection = distinct_selection(&columns, &selection);
+    }
+    if !key_indices.is_empty() {
+        let keys: Vec<SortKey<'_>> = key_indices
+            .iter()
+            .map(|&(i, descending)| SortKey {
+                column: &decoded[&i],
+                descending,
+            })
+            .collect();
+        sort_selection(&keys, &mut selection);
+    }
+    limit_selection(&mut selection, bound.offset, bound.limit);
+    Ok(selection)
 }
 
 /// The schema-column indices an aggregate plan reads — the union of its grouping
@@ -7455,6 +7575,281 @@ mod tests {
         // A grouped aggregate over the empty table returns *no* rows.
         let r = select(&mut engine, "SELECT a, COUNT(*) FROM t GROUP BY a");
         assert!(r.rows.is_empty());
+    }
+
+    // ---- result shaping: ORDER BY / LIMIT / OFFSET / DISTINCT (STL-263) ----
+
+    /// `t` seeded with duplicate values and a NULL, the shaping fixtures:
+    /// `(1, 20, 'x'), (2, 10, 'y'), (3, 20, 'x'), (4, NULL, 'z'), (5, 10, 'y')`.
+    fn seeded_wide() -> SessionEngine<ZeroClock, MemDisk> {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_WIDE)).expect("create");
+        for sql in [
+            "INSERT INTO t VALUES (1, 20, 'x')",
+            "INSERT INTO t VALUES (2, 10, 'y')",
+            "INSERT INTO t VALUES (3, 20, 'x')",
+            "INSERT INTO t VALUES (4, NULL, 'z')",
+            "INSERT INTO t VALUES (5, 10, 'y')",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        engine
+    }
+
+    #[test]
+    fn order_by_sorts_with_postgres_null_placement() {
+        let mut engine = seeded_wide();
+        // ASC: NULLs last; ties on `a` broken by the second key.
+        let r = select(&mut engine, "SELECT id, a FROM t ORDER BY a, id");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![i4(2), i4(10)],
+                vec![i4(5), i4(10)],
+                vec![i4(1), i4(20)],
+                vec![i4(3), i4(20)],
+                vec![i4(4), cell(None)],
+            ]
+        );
+        // DESC: NULLs first; both keys flipped.
+        let r = select(&mut engine, "SELECT id, a FROM t ORDER BY a DESC, id DESC");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![i4(4), cell(None)],
+                vec![i4(3), i4(20)],
+                vec![i4(1), i4(20)],
+                vec![i4(5), i4(10)],
+                vec![i4(2), i4(10)],
+            ]
+        );
+    }
+
+    #[test]
+    fn order_by_may_sort_on_an_unprojected_column() {
+        // Postgres lets a plain SELECT sort on a column it does not project —
+        // the sort runs over the full rows, before the projection drops `a`.
+        let mut engine = seeded_wide();
+        let r = select(&mut engine, "SELECT id FROM t ORDER BY a, id");
+        assert_eq!(
+            r.rows,
+            vec![int_row(2), int_row(5), int_row(1), int_row(3), int_row(4)]
+        );
+    }
+
+    #[test]
+    fn limit_and_offset_slice_the_ordered_result() {
+        let mut engine = seeded_wide();
+        let ids =
+            |sql: &str, engine: &mut SessionEngine<ZeroClock, MemDisk>| select(engine, sql).rows;
+        assert_eq!(
+            ids("SELECT id FROM t ORDER BY id LIMIT 2", &mut engine),
+            vec![int_row(1), int_row(2)]
+        );
+        assert_eq!(
+            ids("SELECT id FROM t ORDER BY id OFFSET 3", &mut engine),
+            vec![int_row(4), int_row(5)]
+        );
+        assert_eq!(
+            ids("SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 2", &mut engine),
+            vec![int_row(3), int_row(4)]
+        );
+        // The standard FETCH FIRST spelling is the LIMIT alias.
+        assert_eq!(
+            ids(
+                "SELECT id FROM t ORDER BY id OFFSET 1 ROWS FETCH FIRST 2 ROWS ONLY",
+                &mut engine
+            ),
+            vec![int_row(2), int_row(3)]
+        );
+        // LIMIT 0 and an OFFSET past the end are valid empty reads — the
+        // header still describes the projection.
+        let r = select(&mut engine, "SELECT id FROM t LIMIT 0");
+        assert!(r.rows.is_empty());
+        assert_eq!(r.columns, vec![("id".to_owned(), LogicalType::Int4)]);
+        assert!(
+            select(&mut engine, "SELECT id FROM t ORDER BY id OFFSET 99")
+                .rows
+                .is_empty()
+        );
+        // LIMIT without ORDER BY bounds the row count (which rows is
+        // unspecified, as in Postgres).
+        assert_eq!(
+            select(&mut engine, "SELECT id FROM t LIMIT 3").rows.len(),
+            3
+        );
+    }
+
+    #[test]
+    fn distinct_deduplicates_full_rows_including_nulls() {
+        let mut engine = seeded_wide();
+        // DISTINCT over one column: NULL rows collapse into one NULL output row
+        // (the GROUP BY rule, not `=`). Ordered for a pinned expectation.
+        let r = select(&mut engine, "SELECT DISTINCT a FROM t ORDER BY a");
+        assert_eq!(r.rows, vec![vec![i4(10)], vec![i4(20)], vec![cell(None)]]);
+        // DISTINCT is over the *full* projected row: (10,'y') and (20,'x')
+        // each appear twice in the data and once here.
+        let r = select(&mut engine, "SELECT DISTINCT a, b FROM t ORDER BY a");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![i4(10), txt("y")],
+                vec![i4(20), txt("x")],
+                vec![cell(None), txt("z")],
+            ]
+        );
+        // Without ORDER BY the order is unspecified but the dedup holds.
+        assert_eq!(
+            select(&mut engine, "SELECT DISTINCT a FROM t").rows.len(),
+            3
+        );
+    }
+
+    #[test]
+    fn distinct_composes_with_order_by_and_limit() {
+        let mut engine = seeded_wide();
+        // Pipeline order: DISTINCT → ORDER BY (DESC ⇒ NULL first) → LIMIT.
+        let r = select(
+            &mut engine,
+            "SELECT DISTINCT a FROM t ORDER BY a DESC LIMIT 2",
+        );
+        assert_eq!(r.rows, vec![vec![cell(None)], vec![i4(20)]]);
+    }
+
+    #[test]
+    fn distinct_order_by_outside_the_select_list_is_rejected() {
+        let mut engine = seeded_wide();
+        // Sorting on a column DISTINCT discarded — the 42P10 bind error
+        // surfaces through execute, never a wrong answer.
+        let err = engine
+            .execute(&parse_one("SELECT DISTINCT a FROM t ORDER BY id"))
+            .expect_err("DISTINCT + unprojected ORDER BY must fail");
+        assert!(matches!(
+            err,
+            EngineError::Select(SelectError::DistinctOrderBy)
+        ));
+    }
+
+    #[test]
+    fn shaping_applies_to_aggregate_output() {
+        let mut engine = seeded_wide();
+        // Groups: a=10 ×2, a=20 ×2, a=NULL ×1. ORDER BY the aggregate's output
+        // column (its default name), ties broken by the grouping column.
+        let r = select(
+            &mut engine,
+            "SELECT a, COUNT(*) FROM t GROUP BY a ORDER BY count DESC, a LIMIT 2",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![i4(10), cell(Some(ScalarValue::Int8(2)))],
+                vec![i4(20), cell(Some(ScalarValue::Int8(2)))],
+            ]
+        );
+        // DISTINCT over the aggregate's output rows: counts {2, 2, 1} → {1, 2}.
+        let r = select(
+            &mut engine,
+            "SELECT DISTINCT COUNT(*) FROM t GROUP BY a ORDER BY count",
+        );
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![cell(Some(ScalarValue::Int8(1)))],
+                vec![cell(Some(ScalarValue::Int8(2)))],
+            ]
+        );
+    }
+
+    #[test]
+    fn order_by_under_as_of_sorts_the_past_state() {
+        // Shaping runs over the rows the snapshot resolves, so an AS OF read
+        // orders by the *past* cells — deterministically.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_WIDE)).expect("create");
+        for sql in [
+            "INSERT INTO t VALUES (1, 30, 'x')",
+            "INSERT INTO t VALUES (2, 20, 'y')",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        let before = engine.commit_clock().0;
+        // Flip the order of the two rows in the present.
+        engine
+            .execute(&parse_one("UPDATE t SET a = 10 WHERE id = 1"))
+            .expect("update");
+
+        let past = format!("SELECT id FROM t FOR SYSTEM_TIME AS OF {before} ORDER BY a, id");
+        assert_eq!(
+            select(&mut engine, &past).rows,
+            vec![int_row(2), int_row(1)],
+            "the past ordering uses the pre-update cell"
+        );
+        assert_eq!(
+            select(&mut engine, "SELECT id FROM t ORDER BY a, id").rows,
+            vec![int_row(1), int_row(2)],
+            "the present ordering uses the updated cell"
+        );
+    }
+
+    #[test]
+    fn shaping_orders_after_the_ryow_overlay() {
+        // Inside a transaction the shaping pipeline runs over the overlaid row
+        // set ([STL-203]): buffered writes participate in DISTINCT/ORDER BY/
+        // LIMIT exactly as committed rows do.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_WIDE)).expect("create");
+        for sql in [
+            "INSERT INTO t VALUES (1, 20, 'x')",
+            "INSERT INTO t VALUES (3, 10, 'y')",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+
+        let mut txn = engine.begin();
+        for sql in [
+            "INSERT INTO t VALUES (2, 15, 'z')",
+            "UPDATE t SET a = 5 WHERE id = 1",
+        ] {
+            engine
+                .execute_in_txn(&parse_one(sql), &mut txn)
+                .expect("stage");
+        }
+        let in_txn = |engine: &mut SessionEngine<ZeroClock, MemDisk>, txn: &mut _, sql: &str| {
+            let StatementOutcome::Rows(r) = engine
+                .execute_in_txn(&parse_one(sql), txn)
+                .expect("in-txn select")
+            else {
+                panic!("rows");
+            };
+            r.rows
+        };
+        // Overlaid cells: id 1 → a=5 (buffered update), id 2 → a=15 (buffered
+        // insert), id 3 → a=10 (committed).
+        assert_eq!(
+            in_txn(&mut engine, &mut txn, "SELECT id FROM t ORDER BY a"),
+            vec![int_row(1), int_row(3), int_row(2)]
+        );
+        assert_eq!(
+            in_txn(
+                &mut engine,
+                &mut txn,
+                "SELECT id FROM t ORDER BY a DESC LIMIT 1"
+            ),
+            vec![int_row(2)]
+        );
+        // DISTINCT spans committed + buffered rows: ids 1 and 3 collapse on
+        // b ('x' was overwritten? no — b is untouched by the update), so use
+        // `a` values: {5, 10, 15} are already distinct; dedupe a duplicated
+        // buffered value instead.
+        engine
+            .execute_in_txn(&parse_one("INSERT INTO t VALUES (4, 10, 'w')"), &mut txn)
+            .expect("stage");
+        assert_eq!(
+            in_txn(&mut engine, &mut txn, "SELECT DISTINCT a FROM t ORDER BY a"),
+            vec![vec![i4(5)], vec![i4(10)], vec![i4(15)]],
+            "a committed 10 and a buffered 10 dedupe to one row"
+        );
+        drop(txn);
     }
 
     #[test]
