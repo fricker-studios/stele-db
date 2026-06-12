@@ -33,6 +33,15 @@ data_dir = "/var/lib/stele"
 # setting it is a clear config error today.
 backend = "local"
 
+[telemetry]
+# Ops HTTP listen address. (active) Serves Prometheus `/metrics` plus the
+# `/healthz` (liveness) and `/readyz` (readiness: recovery complete and no
+# WAL poisoned) probes on a port distinct from pg-wire (STL-253; the admin
+# HTTP gateway will share this listener, ADR-0016). Default: "0.0.0.0:9090".
+# See docs/11-operations-and-runbooks.md#1-health--monitoring for the scrape
+# config and a first dashboard.
+metrics = "0.0.0.0:9090"
+
 # ───────────────────────────────────────────────────────────────────────────
 # RESERVED — parsed-but-ignored today (unknown sections are skipped). These show
 # the intended shape from docs/05; uncommenting them has no effect yet.
@@ -48,9 +57,8 @@ backend = "local"
 # [wal]                         # WAL group-commit policy (planned)
 # fsync = "on_commit"           # the durability point (docs/02 §3.4)
 
-# [telemetry]                   # metrics / trace endpoints (planned)
-# metrics = "0.0.0.0:9090"      # Prometheus / OpenMetrics
-# tracing = "info"
+# [telemetry] tracing = "info"  # trace verbosity via config (planned; today
+#                                # logging is env-var-driven — see below)
 
 # ───────────────────────────────────────────────────────────────────────────
 # Logging — environment variables, NOT this file (until [telemetry] is wired):
