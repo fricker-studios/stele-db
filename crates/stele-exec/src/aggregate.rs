@@ -415,8 +415,10 @@ fn scalar_i128(value: &ScalarValue) -> i128 {
 
 /// Encode a scalar to its canonical bytes — the grouping-key tuple's identity.
 /// Within a key position every value shares one type, so the type-directed
-/// encoding is injective there and equal values hash to one group.
-fn encode_scalar(value: &ScalarValue) -> Vec<u8> {
+/// encoding is injective there and equal values hash to one group. Shared with
+/// the `DISTINCT` operator ([`crate::distinct_selection`], [STL-263]), which is
+/// exactly this grouping with no aggregates.
+pub(crate) fn encode_scalar(value: &ScalarValue) -> Vec<u8> {
     let mut bytes = Vec::new();
     value.encode(&mut bytes);
     bytes

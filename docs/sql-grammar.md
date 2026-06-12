@@ -230,6 +230,43 @@ live at the resolved system-time snapshot, that `snapshot`, an optional
   column names. The `WHERE` clause stays on the AST for the executor-glue layer
   (pgwire, STL-104) to lower.
 
+## Result shaping (STL-263)
+
+`ORDER BY`, `LIMIT`/`OFFSET`/`FETCH`, and `DISTINCT` bind and execute on the
+single-table `SELECT` path — plain and aggregate reads, under `AS OF` on either
+axis, and inside transactions (the read-your-own-writes overlay is shaped like
+committed rows). The executor applies them in the Postgres pipeline order:
+
+```text
+WHERE → [GROUP BY/aggregates] → DISTINCT → ORDER BY → OFFSET → LIMIT
+```
+
+- **`ORDER BY col [ASC|DESC], …`** — bare column names, multi-key, first key
+  outermost. A name resolves against the **select list first** (an aggregate
+  query's output columns, aliases included); a plain non-`DISTINCT` query may
+  also sort on an unprojected schema column, as Postgres allows. NULL placement
+  is the Postgres default — **NULLS LAST under `ASC`, NULLS FIRST under
+  `DESC`** — and every shipped type orders (`UUID`/`BYTEA` byte-wise, where
+  Postgres is byte-wise). Rejected with the reason: expressions/ordinals as
+  keys, and an explicit `NULLS FIRST`/`NULLS LAST` override.
+- **`LIMIT n` / `OFFSET m` / `FETCH FIRST n ROWS ONLY`** — non-negative integer
+  literals (`FETCH FIRST` is the standard `LIMIT` alias; an omitted count reads
+  as 1). `LIMIT ALL` is explicitly unlimited; `LIMIT 0` is a valid empty read;
+  an `OFFSET` past the end is empty, never an error. Rejected: negative or
+  non-literal counts, `WITH TIES`, `PERCENT`, the MySQL `LIMIT off, n`.
+- **`SELECT DISTINCT`** — deduplicates the **full projected row** (NULLs equal,
+  the `GROUP BY` rule): exactly `GROUP BY` every output column with no
+  aggregates, and it reuses that hash machinery. With `DISTINCT`, an `ORDER BY`
+  key must appear in the select list — sorting on a discarded column is
+  Postgres's **42P10** (`invalid_column_reference`), returned with the same
+  wording. `DISTINCT ON (…)` is rejected (a different operation, not
+  approximated).
+
+Result shaping over a **join** read is rejected (`ORDER BY`/`LIMIT`/`DISTINCT`
+over a `JOIN`, the same posture as `WHERE` and aggregates over a join) — join
+composability is STL-264. Top-N pushdown and sort spill are performance work,
+deliberately out of v0.3 scope.
+
 ## DML row selection (STL-229)
 
 `UPDATE` / `DELETE` select the rows they write with the **same `WHERE`

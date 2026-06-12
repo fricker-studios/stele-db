@@ -45,14 +45,19 @@
 //!
 //! A single, unqualified table; projection of `*` or bare column names; the
 //! `WHERE` clause is left on the AST for the executor-glue layer to lower
-//! (pgwire, [STL-104]). Absolute `TIMESTAMP '…'` / `DATE '…'` literals in an
-//! `AS OF` are not folded yet (no civil-time codec); they surface
-//! [`AsOfError::Unsupported`] rather than a wrong instant.
+//! (pgwire, [STL-104]). The result-shaping clauses — `ORDER BY` (bare columns,
+//! multi-key), `LIMIT`/`OFFSET`/`FETCH` (non-negative integer literals), and
+//! `SELECT DISTINCT` — bind onto [`BoundSelect`] (STL-263); the executor
+//! applies them after filtering/aggregation in the Postgres pipeline order.
+//! Absolute `TIMESTAMP '…'` / `DATE '…'` literals in an `AS OF` are not folded
+//! yet (no civil-time codec); they surface [`AsOfError::Unsupported`] rather
+//! than a wrong instant.
 
 use sqlparser::ast::{
-    BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, Join, JoinConstraint, JoinOperator, Query, Select, SelectItem, SetExpr,
-    Statement as SqlStatement, TableFactor, TableWithJoins, Value,
+    BinaryOperator, Distinct, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, Join, JoinConstraint, JoinOperator, LimitClause, OrderByExpr,
+    OrderByKind, Query, Select, SelectItem, SetExpr, Statement as SqlStatement, TableFactor,
+    TableWithJoins, Value,
 };
 use stele_catalog::{Catalog, SchemaId, TableSchema};
 use stele_common::period::{Interval, IntervalError, PeriodPredicate};
@@ -81,6 +86,37 @@ pub enum Projection {
     All,
     /// `SELECT a, b, …` — the named columns, in projection order.
     Columns(Vec<String>),
+}
+
+/// One bound `ORDER BY` key: which column to sort on and in which direction
+/// ([STL-263]).
+///
+/// NULL placement is pinned to the Postgres defaults — NULLS LAST under `ASC`,
+/// NULLS FIRST under `DESC` (a NULL sorts as if larger than every value). An
+/// explicit `NULLS FIRST`/`NULLS LAST` override is not bound yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundSortKey {
+    /// The column the key sorts on.
+    pub column: SortTarget,
+    /// `true` for `DESC`; `false` for `ASC` (the default).
+    pub descending: bool,
+}
+
+/// Where a bound `ORDER BY` column lives ([STL-263]).
+///
+/// An `ORDER BY` name resolves against the **select list first** (Postgres
+/// output-column semantics); a name not projected falls back to the table's
+/// schema — legal for a plain `SELECT` (Postgres sorts on non-projected columns)
+/// but rejected for `SELECT DISTINCT` ([`SelectError::DistinctOrderBy`], the
+/// 42P10 rule) and for an aggregate query (whose rows have no schema columns).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortTarget {
+    /// A select-list column, by **output position**. For an aggregate query this
+    /// indexes [`BoundAggregate::columns`]; otherwise the projected columns.
+    Output(usize),
+    /// A schema column not in the select list, by **schema index** (`0` the
+    /// business key). Only produced for a plain, non-`DISTINCT` projection.
+    Schema(usize),
 }
 
 /// A comparison operator a `WHERE` predicate lowers ([STL-213]).
@@ -271,6 +307,22 @@ pub struct BoundSelect {
     ///
     /// [STL-172]: https://allegromusic.atlassian.net/browse/STL-172
     pub join: Option<BoundJoin>,
+    /// `SELECT DISTINCT` — deduplicate the projected rows ([STL-263]). Applies
+    /// over the **full projected row** (aggregate output for an aggregate
+    /// query); `DISTINCT ON (…)` is not bound. Two rows are duplicates iff every
+    /// projected cell matches, NULLs equal (the `GROUP BY` rule, not `=`).
+    pub distinct: bool,
+    /// The bound `ORDER BY` keys, first key outermost; empty when the query
+    /// gave none ([STL-263]). The executor sorts **after** `DISTINCT` and
+    /// before `OFFSET`/`LIMIT` (the Postgres pipeline).
+    pub order_by: Vec<BoundSortKey>,
+    /// Rows to skip before returning any (`OFFSET m`), `0` when absent
+    /// ([STL-263]). An offset past the end yields an empty result, not an error.
+    pub offset: u64,
+    /// Maximum rows to return (`LIMIT n` / `FETCH FIRST n ROWS ONLY`), or
+    /// `None` for unlimited (including the explicit `LIMIT ALL`) ([STL-263]).
+    /// `LIMIT 0` is a valid empty read. Applied after `ORDER BY` and `OFFSET`.
+    pub limit: Option<u64>,
 }
 
 /// A bound `GROUP BY` + aggregate query: the grouping columns, the aggregates to
@@ -527,11 +579,12 @@ pub enum SelectError {
     #[error("v0.1 projects `*` or bare column names only ({0})")]
     UnsupportedProjection(String),
 
-    /// The query carried a clause outside the v0.1 single-table snapshot-scan
-    /// surface (`WITH`, `ORDER BY`, `LIMIT`/`OFFSET`/`FETCH`, `DISTINCT`,
-    /// `GROUP BY`, `HAVING`, locking, …). [`BoundSelect`] does not carry these,
-    /// so accepting them would silently drop user intent — they are rejected.
-    #[error("v0.1 does not support `{0}` in a SELECT")]
+    /// The query carried a clause outside the supported single-table surface
+    /// (`WITH`, `HAVING`, `DISTINCT ON`, locking, …). [`BoundSelect`] does not
+    /// carry these, so accepting them would silently drop user intent — they
+    /// are rejected. (`ORDER BY` / `LIMIT` / `OFFSET` / `FETCH` / `DISTINCT`
+    /// bind since [STL-263]; `GROUP BY` since [STL-171].)
+    #[error("unsupported `{0}` in a SELECT")]
     UnsupportedClause(&'static str),
 
     /// A projected column is not present in the table's schema **at the resolved
@@ -576,6 +629,29 @@ pub enum SelectError {
     /// not read. Rejected with the reason rather than computed wrongly.
     #[error("unsupported aggregate query: {0}")]
     UnsupportedAggregate(String),
+
+    /// The `ORDER BY` is not a shape v0.3 binds ([STL-263]) — a non-column key
+    /// (an expression, an ordinal), an explicit `NULLS FIRST`/`NULLS LAST`
+    /// override, `ORDER BY ALL`, a ClickHouse `WITH FILL`/`INTERPOLATE`, or (in
+    /// an aggregate query) a name that is not a select-list output column.
+    /// Rejected with the reason rather than silently mis-ordered.
+    #[error("unsupported ORDER BY: {0}")]
+    UnsupportedOrderBy(String),
+
+    /// `SELECT DISTINCT … ORDER BY <col>` where `<col>` is not in the select
+    /// list ([STL-263]). After deduplication the non-projected value is
+    /// ambiguous, so Postgres rejects this (SQLSTATE `42P10`,
+    /// `invalid_column_reference`) — and so does Stele, with the same wording.
+    #[error("for SELECT DISTINCT, ORDER BY expressions must appear in select list")]
+    DistinctOrderBy,
+
+    /// The `LIMIT` / `OFFSET` / `FETCH` clause is not a shape v0.3 binds
+    /// ([STL-263]) — a non-literal count (an expression, a parameter), a
+    /// negative literal, `FETCH … WITH TIES` / `PERCENT`, a MySQL
+    /// `LIMIT off, n`, or a ClickHouse `LIMIT … BY`. Rejected with the reason
+    /// rather than silently returning the wrong number of rows.
+    #[error("unsupported LIMIT/OFFSET/FETCH: {0}")]
+    UnsupportedLimit(String),
 
     /// `FOR VALID_TIME AS OF` was given for a table that does not opt into a
     /// valid-time period — there is no valid axis to travel along. The catalog's
@@ -754,10 +830,14 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
     // An admin command (CHECKPOINT / FLUSH) has no SQL body, so it is "not a
     // SELECT" — the binder cleanly defers it to the engine's admin route.
     let body = stmt.sql().ok_or(SelectError::NotSelect)?;
-    let select = single_select(body)?;
+    let (query, select) = single_select(body)?;
     // A two-table `JOIN` binds to a wholly different shape (two sides, a join
     // condition, a combined header), so it is routed before the single-table path.
+    // The result-shaping clauses are not threaded through the join path yet
+    // ([STL-264] lifts this with the rest of join composability), so they are
+    // rejected over a join rather than silently dropped.
     if let Some(join) = detect_join(select)? {
+        reject_shaping_over_join(query, select)?;
         return bind_join(stmt, ctx, select, join);
     }
     let table = single_table(select)?;
@@ -823,6 +903,20 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
         None
     };
 
+    // The result-shaping clauses ([STL-263]): `DISTINCT` first (the 42P10 rule
+    // needs it), then `ORDER BY` (resolved against the select list, falling
+    // back to the schema), then `LIMIT`/`OFFSET`/`FETCH`.
+    let distinct = bind_distinct(select)?;
+    let order_by = bind_order_by(
+        query,
+        schema,
+        table,
+        distinct,
+        aggregate.as_ref(),
+        &projection,
+    )?;
+    let (limit, offset) = bind_limit_offset(query)?;
+
     let filter = bind_filter(select, schema, table)?;
 
     // A period predicate is lifted off the token stream (the executor-glue
@@ -846,6 +940,10 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
         period_filter,
         aggregate,
         join: None,
+        distinct,
+        order_by,
+        offset,
+        limit,
     })
 }
 
@@ -1296,6 +1394,12 @@ fn bind_join<'a>(
             output,
             columns,
         }),
+        // Result shaping over a join is rejected before this path is taken
+        // (`reject_shaping_over_join`, [STL-264] lifts it).
+        distinct: false,
+        order_by: Vec::new(),
+        offset: 0,
+        limit: None,
     })
 }
 
@@ -2171,13 +2275,17 @@ fn describe_expr(expr: &Expr) -> String {
     }
 }
 
-/// The single `SELECT` body of a query statement, after rejecting every query-
-/// and select-level clause outside the v0.1 single-table snapshot-scan surface.
+/// The single `SELECT` body of a query statement (and its enclosing [`Query`],
+/// which carries the result-shaping clauses), after rejecting every query- and
+/// select-level clause outside the supported surface.
 ///
-/// [`BoundSelect`] carries only a table, snapshot, and projection — so a clause
-/// it cannot represent (`ORDER BY`, `LIMIT`, `GROUP BY`, …) must be rejected,
-/// not silently dropped when the plan is later executed.
-fn single_select(body: &SqlStatement) -> Result<&Select, SelectError> {
+/// A clause [`BoundSelect`] cannot represent (`WITH`, `HAVING`, locking, …)
+/// must be rejected, not silently dropped when the plan is later executed. The
+/// result-shaping clauses — `ORDER BY`, `LIMIT`/`OFFSET`/`FETCH`, `DISTINCT` —
+/// are bound, not rejected ([STL-263]); their own unsupported shapes surface in
+/// [`bind_order_by`] / [`bind_limit_offset`] / [`bind_distinct`] with precise
+/// reasons.
+fn single_select(body: &SqlStatement) -> Result<(&Query, &Select), SelectError> {
     let SqlStatement::Query(query) = body else {
         return Err(SelectError::NotSelect);
     };
@@ -2191,25 +2299,17 @@ fn single_select(body: &SqlStatement) -> Result<&Select, SelectError> {
         _ => return Err(SelectError::NotSelect),
     };
     reject_unsupported_select_clauses(select)?;
-    Ok(select)
+    Ok((query, select))
 }
 
-/// Reject query-level clauses outside the v0.1 surface. `WHERE` lives on the
-/// inner `Select` and is deliberately *kept* (lowered downstream); everything
-/// that reshapes or reorders the result set is rejected.
+/// Reject query-level clauses outside the supported surface. `WHERE` lives on
+/// the inner `Select` and is deliberately *kept* (lowered downstream), and the
+/// result-shaping clauses (`ORDER BY` / `LIMIT` / `OFFSET` / `FETCH`) bind
+/// ([STL-263]).
 fn reject_unsupported_query_clauses(query: &Query) -> Result<(), SelectError> {
     let reject = |what| Err(SelectError::UnsupportedClause(what));
     if query.with.is_some() {
         return reject("WITH (CTE)");
-    }
-    if query.order_by.is_some() {
-        return reject("ORDER BY");
-    }
-    if query.limit_clause.is_some() {
-        return reject("LIMIT/OFFSET");
-    }
-    if query.fetch.is_some() {
-        return reject("FETCH");
     }
     if !query.locks.is_empty() {
         return reject("FOR UPDATE/SHARE");
@@ -2217,14 +2317,13 @@ fn reject_unsupported_query_clauses(query: &Query) -> Result<(), SelectError> {
     Ok(())
 }
 
-/// Reject select-level clauses outside the v0.1 surface — anything that
-/// aggregates, deduplicates, limits, or otherwise transforms the row set
-/// [`BoundSelect`] does not model. `WHERE` ([`Select::selection`]) is allowed.
+/// Reject select-level clauses outside the supported surface — anything that
+/// aggregates or otherwise transforms the row set [`BoundSelect`] does not
+/// model. `WHERE` ([`Select::selection`]) is allowed; `DISTINCT` binds
+/// ([STL-263], its unsupported `DISTINCT ON` shape surfaces in
+/// [`bind_distinct`]).
 fn reject_unsupported_select_clauses(select: &Select) -> Result<(), SelectError> {
     let reject = |what| Err(SelectError::UnsupportedClause(what));
-    if select.distinct.is_some() {
-        return reject("DISTINCT");
-    }
     if select.top.is_some() {
         return reject("TOP");
     }
@@ -2314,6 +2413,222 @@ fn bind_projection(select: &Select) -> Result<Projection, SelectError> {
         }
     }
     Ok(Projection::Columns(columns))
+}
+
+/// Reject the result-shaping clauses over a `JOIN` read. `ORDER BY`,
+/// `LIMIT`/`OFFSET`/`FETCH`, and `DISTINCT` bind for single-table reads only
+/// ([STL-263]); over a join each is part of join composability ([STL-264] —
+/// the same posture as `WHERE` / aggregates over a join), rejected rather than
+/// silently dropped.
+///
+/// [STL-264]: https://allegromusic.atlassian.net/browse/STL-264
+fn reject_shaping_over_join(query: &Query, select: &Select) -> Result<(), SelectError> {
+    let reject = |what: &str| Err(SelectError::UnsupportedJoin(format!("{what} over a JOIN")));
+    if select.distinct.is_some() {
+        return reject("DISTINCT");
+    }
+    if query.order_by.is_some() {
+        return reject("ORDER BY");
+    }
+    if query.limit_clause.is_some() || query.fetch.is_some() {
+        return reject("LIMIT/OFFSET/FETCH");
+    }
+    Ok(())
+}
+
+/// Bind the `SELECT [ALL | DISTINCT]` set quantifier ([STL-263]).
+///
+/// `DISTINCT` deduplicates the full projected row. The Postgres
+/// `DISTINCT ON (…)` extension is a different operation (one row per group,
+/// picked by an ordering rule) and stays out — rejected, never approximated.
+const fn bind_distinct(select: &Select) -> Result<bool, SelectError> {
+    match &select.distinct {
+        None | Some(Distinct::All) => Ok(false),
+        Some(Distinct::Distinct) => Ok(true),
+        Some(Distinct::On(_)) => Err(SelectError::UnsupportedClause("DISTINCT ON")),
+    }
+}
+
+/// Bind `ORDER BY` into [`BoundSortKey`]s ([STL-263]): bare column names, each
+/// optionally `ASC` / `DESC` (NULL placement pinned to the Postgres defaults —
+/// see [`BoundSortKey`]), first key outermost.
+fn bind_order_by(
+    query: &Query,
+    schema: &TableSchema,
+    table: &str,
+    distinct: bool,
+    aggregate: Option<&BoundAggregate>,
+    projection: &Projection,
+) -> Result<Vec<BoundSortKey>, SelectError> {
+    let Some(order_by) = &query.order_by else {
+        return Ok(Vec::new());
+    };
+    if order_by.interpolate.is_some() {
+        return Err(SelectError::UnsupportedOrderBy("INTERPOLATE".to_owned()));
+    }
+    let exprs = match &order_by.kind {
+        OrderByKind::All(_) => {
+            return Err(SelectError::UnsupportedOrderBy("ORDER BY ALL".to_owned()));
+        }
+        OrderByKind::Expressions(exprs) => exprs,
+    };
+    exprs
+        .iter()
+        .map(|key| bind_sort_key(key, schema, table, distinct, aggregate, projection))
+        .collect()
+}
+
+/// Bind one `ORDER BY` key, resolving its name the way Postgres does: the
+/// **select list first** (an aggregate query's output columns, aliases
+/// included; a plain query's projected columns), binding by output position. A
+/// plain non-`DISTINCT` query may also sort on an unprojected **schema**
+/// column; with `DISTINCT` that key is ambiguous after deduplication — the
+/// 42P10 [`SelectError::DistinctOrderBy`] — and an aggregate query's output
+/// rows have no schema columns to fall back to.
+fn bind_sort_key(
+    key: &OrderByExpr,
+    schema: &TableSchema,
+    table: &str,
+    distinct: bool,
+    aggregate: Option<&BoundAggregate>,
+    projection: &Projection,
+) -> Result<BoundSortKey, SelectError> {
+    if key.with_fill.is_some() {
+        return Err(SelectError::UnsupportedOrderBy("WITH FILL".to_owned()));
+    }
+    if key.options.nulls_first.is_some() {
+        return Err(SelectError::UnsupportedOrderBy(
+            "explicit NULLS FIRST/LAST (the Postgres defaults apply: \
+             NULLS LAST under ASC, NULLS FIRST under DESC)"
+                .to_owned(),
+        ));
+    }
+    let Expr::Identifier(ident) = &key.expr else {
+        return Err(SelectError::UnsupportedOrderBy(format!(
+            "key `{}` — only a bare column name sorts",
+            key.expr
+        )));
+    };
+    let name = ident.value.as_str();
+    let descending = key.options.asc == Some(false);
+    let output = |pos| {
+        Ok(BoundSortKey {
+            column: SortTarget::Output(pos),
+            descending,
+        })
+    };
+
+    // An aggregate query's result rows are its output columns — there is no
+    // schema column to fall back to.
+    if let Some(agg) = aggregate {
+        return agg.columns.iter().position(|(n, _)| n == name).map_or_else(
+            || {
+                Err(SelectError::UnsupportedOrderBy(format!(
+                    "column {name:?} is not a select-list column of the aggregate query"
+                )))
+            },
+            output,
+        );
+    }
+
+    // Plain query: the select list first. Under `SELECT *` the output order is
+    // the schema order, so a schema hit *is* the output position.
+    let output_pos = match projection {
+        Projection::All => column_index(schema, name),
+        Projection::Columns(names) => names.iter().position(|n| n == name),
+    };
+    if let Some(pos) = output_pos {
+        return output(pos);
+    }
+    let idx = column_index(schema, name).ok_or_else(|| SelectError::UnknownColumn {
+        table: table.to_owned(),
+        column: name.to_owned(),
+    })?;
+    if distinct {
+        // Sorting on a column DISTINCT discarded is ambiguous — Postgres's
+        // 42P10 (invalid_column_reference).
+        return Err(SelectError::DistinctOrderBy);
+    }
+    Ok(BoundSortKey {
+        column: SortTarget::Schema(idx),
+        descending,
+    })
+}
+
+/// Bind `LIMIT n` / `OFFSET m` / `FETCH FIRST n ROWS ONLY` to concrete row
+/// counts ([STL-263]), returning `(limit, offset)`.
+///
+/// Only non-negative integer literals bind (a negative or non-literal count is
+/// rejected with the reason); `LIMIT ALL` is explicitly unlimited; the
+/// standard `FETCH FIRST [n] ROWS ONLY` is the `LIMIT n` alias (count omitted
+/// = 1, as the standard reads it). Giving both `LIMIT` and `FETCH` names two
+/// counts for one query and is rejected, as Postgres does.
+fn bind_limit_offset(query: &Query) -> Result<(Option<u64>, u64), SelectError> {
+    let mut limit: Option<u64> = None;
+    let mut offset: u64 = 0;
+    if let Some(clause) = &query.limit_clause {
+        match clause {
+            LimitClause::LimitOffset {
+                limit: count,
+                offset: skip,
+                limit_by,
+            } => {
+                if !limit_by.is_empty() {
+                    return Err(SelectError::UnsupportedLimit("LIMIT … BY".to_owned()));
+                }
+                // `LIMIT ALL` parses to no count expression — explicitly
+                // unlimited, same as omitting the clause.
+                limit = count.as_ref().map(|e| row_count(e, "LIMIT")).transpose()?;
+                if let Some(skip) = skip {
+                    offset = row_count(&skip.value, "OFFSET")?;
+                }
+            }
+            LimitClause::OffsetCommaLimit { .. } => {
+                return Err(SelectError::UnsupportedLimit(
+                    "the MySQL `LIMIT <offset>, <limit>` form (use LIMIT … OFFSET …)".to_owned(),
+                ));
+            }
+        }
+    }
+    if let Some(fetch) = &query.fetch {
+        if limit.is_some() {
+            return Err(SelectError::UnsupportedLimit(
+                "both LIMIT and FETCH in one query".to_owned(),
+            ));
+        }
+        if fetch.with_ties {
+            return Err(SelectError::UnsupportedLimit(
+                "FETCH … WITH TIES".to_owned(),
+            ));
+        }
+        if fetch.percent {
+            return Err(SelectError::UnsupportedLimit("FETCH … PERCENT".to_owned()));
+        }
+        limit = Some(match &fetch.quantity {
+            Some(expr) => row_count(expr, "FETCH")?,
+            None => 1,
+        });
+    }
+    Ok((limit, offset))
+}
+
+/// Read a `LIMIT` / `OFFSET` / `FETCH` row count: a **non-negative integer
+/// literal** only ([STL-263]). A negative count parses as a unary minus over
+/// the literal, so it lands in the non-literal arm with the offending text in
+/// the message; an expression or parameter is a tracked later breadth.
+fn row_count(expr: &Expr, clause: &str) -> Result<u64, SelectError> {
+    let unsupported = |got: &dyn std::fmt::Display| {
+        SelectError::UnsupportedLimit(format!(
+            "{clause} takes a non-negative integer literal, got `{got}`"
+        ))
+    };
+    let Expr::Value(value) = expr else {
+        return Err(unsupported(&expr));
+    };
+    match &value.value {
+        Value::Number(digits, _) => digits.parse::<u64>().map_err(|_| unsupported(&digits)),
+        other => Err(unsupported(&other)),
+    }
 }
 
 #[cfg(test)]
@@ -2730,9 +3045,9 @@ mod tests {
             catalog: &catalog,
         };
         for sql in [
-            "SELECT balance FROM account ORDER BY balance",
-            "SELECT balance FROM account LIMIT 1",
-            "SELECT DISTINCT balance FROM account",
+            // `ORDER BY` / `LIMIT` / `DISTINCT` now bind ([STL-263]); the
+            // Postgres `DISTINCT ON (…)` extension stays out.
+            "SELECT DISTINCT ON (balance) balance FROM account",
             // `GROUP BY balance` now binds as an aggregate query ([STL-171]);
             // HAVING and GROUP BY ALL remain unsupported clauses.
             "SELECT balance FROM account GROUP BY balance HAVING balance > 0",
@@ -2746,6 +3061,221 @@ mod tests {
                     Err(SelectError::UnsupportedClause(_))
                 ),
                 "expected UnsupportedClause for: {sql}"
+            );
+        }
+    }
+
+    // ---- result shaping: ORDER BY / LIMIT / OFFSET / DISTINCT (STL-263) ----
+
+    #[test]
+    fn order_by_binds_multi_key_with_mixed_directions() {
+        let catalog = catalog_with_account(1_000);
+        let bound = bind(
+            "SELECT id, balance FROM account ORDER BY balance DESC, id ASC",
+            &catalog,
+        )
+        .expect("bind");
+        assert_eq!(
+            bound.order_by,
+            vec![
+                BoundSortKey {
+                    column: SortTarget::Output(1),
+                    descending: true,
+                },
+                BoundSortKey {
+                    column: SortTarget::Output(0),
+                    descending: false,
+                },
+            ]
+        );
+        assert!(!bound.distinct);
+        assert_eq!((bound.limit, bound.offset), (None, 0));
+    }
+
+    #[test]
+    fn order_by_resolves_against_the_select_list_then_the_schema() {
+        let catalog = catalog_with_account(1_000);
+        // `balance` is not projected: a plain SELECT may still sort on it, by
+        // schema index (Postgres sorts on non-projected columns).
+        let bound = bind("SELECT id FROM account ORDER BY balance", &catalog).expect("bind");
+        assert_eq!(
+            bound.order_by,
+            vec![BoundSortKey {
+                column: SortTarget::Schema(1),
+                descending: false,
+            }]
+        );
+        // Under `SELECT *` the output order is the schema order.
+        let star = bind("SELECT * FROM account ORDER BY balance", &catalog).expect("bind");
+        assert_eq!(
+            star.order_by,
+            vec![BoundSortKey {
+                column: SortTarget::Output(1),
+                descending: false,
+            }]
+        );
+        // A name in neither the select list nor the schema is the usual
+        // unknown-column error.
+        assert_eq!(
+            bind("SELECT id FROM account ORDER BY nonesuch", &catalog),
+            Err(SelectError::UnknownColumn {
+                table: "account".to_owned(),
+                column: "nonesuch".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn distinct_order_by_outside_the_select_list_is_42p10() {
+        let catalog = catalog_with_account(1_000);
+        // Sorting on a column DISTINCT discarded is ambiguous — Postgres 42P10.
+        assert_eq!(
+            bind("SELECT DISTINCT id FROM account ORDER BY balance", &catalog),
+            Err(SelectError::DistinctOrderBy)
+        );
+        // In the select list it is fine.
+        let ok = bind("SELECT DISTINCT id FROM account ORDER BY id", &catalog).expect("bind");
+        assert!(ok.distinct);
+        assert_eq!(
+            ok.order_by,
+            vec![BoundSortKey {
+                column: SortTarget::Output(0),
+                descending: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn unsupported_order_by_shapes_are_rejected_with_the_reason() {
+        let catalog = catalog_with_account(1_000);
+        for sql in [
+            // Only a bare column name sorts — no expressions or ordinals yet.
+            "SELECT id FROM account ORDER BY balance + 1",
+            "SELECT id FROM account ORDER BY 1",
+            // Explicit NULL placement is not bound (the Postgres defaults apply).
+            "SELECT id FROM account ORDER BY id NULLS FIRST",
+            "SELECT id FROM account ORDER BY id DESC NULLS LAST",
+            // (`ORDER BY ALL` parses as a column named "all" under this
+            // dialect — Postgres-faithful — so it surfaces as UnknownColumn,
+            // not here; the `OrderByKind::All` arm stays as dialect defense.)
+        ] {
+            assert!(
+                matches!(bind(sql, &catalog), Err(SelectError::UnsupportedOrderBy(_))),
+                "expected UnsupportedOrderBy for: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn order_by_in_an_aggregate_query_names_output_columns_only() {
+        let catalog = catalog_with_sales();
+        let bound = bind(
+            "SELECT region, SUM(amount) AS total FROM sales GROUP BY region \
+             ORDER BY total DESC, region",
+            &catalog,
+        )
+        .expect("bind");
+        assert_eq!(
+            bound.order_by,
+            vec![
+                BoundSortKey {
+                    column: SortTarget::Output(1),
+                    descending: true,
+                },
+                BoundSortKey {
+                    column: SortTarget::Output(0),
+                    descending: false,
+                },
+            ]
+        );
+        // A schema column outside the aggregate's select list has no single
+        // value per output row.
+        assert!(matches!(
+            bind(
+                "SELECT region FROM sales GROUP BY region ORDER BY amount",
+                &catalog,
+            ),
+            Err(SelectError::UnsupportedOrderBy(_))
+        ));
+    }
+
+    #[test]
+    fn limit_offset_and_fetch_bind_non_negative_literals() {
+        let catalog = catalog_with_account(1_000);
+        let bound = bind("SELECT id FROM account LIMIT 10 OFFSET 3", &catalog).expect("bind");
+        assert_eq!((bound.limit, bound.offset), (Some(10), 3));
+
+        // LIMIT 0 is a valid empty read, not an error.
+        let zero = bind("SELECT id FROM account LIMIT 0", &catalog).expect("bind");
+        assert_eq!(zero.limit, Some(0));
+
+        // LIMIT ALL is explicitly unlimited.
+        let all = bind("SELECT id FROM account LIMIT ALL OFFSET 2", &catalog).expect("bind");
+        assert_eq!((all.limit, all.offset), (None, 2));
+
+        // The standard FETCH FIRST alias; an omitted count reads as 1.
+        let fetch = bind("SELECT id FROM account FETCH FIRST 5 ROWS ONLY", &catalog).expect("bind");
+        assert_eq!(fetch.limit, Some(5));
+        let one = bind("SELECT id FROM account FETCH FIRST ROW ONLY", &catalog).expect("bind");
+        assert_eq!(one.limit, Some(1));
+    }
+
+    #[test]
+    fn unsupported_limit_shapes_are_rejected_with_the_reason() {
+        let catalog = catalog_with_account(1_000);
+        for sql in [
+            // Negative and non-literal counts.
+            "SELECT id FROM account LIMIT -1",
+            "SELECT id FROM account OFFSET -2",
+            "SELECT id FROM account LIMIT 1 + 1",
+            "SELECT id FROM account LIMIT 1.5",
+            // FETCH variants that change semantics.
+            "SELECT id FROM account FETCH FIRST 5 ROWS WITH TIES",
+            "SELECT id FROM account FETCH FIRST 5 PERCENT ROWS ONLY",
+            // Two counts for one query.
+            "SELECT id FROM account LIMIT 5 FETCH FIRST 5 ROWS ONLY",
+        ] {
+            assert!(
+                matches!(bind(sql, &catalog), Err(SelectError::UnsupportedLimit(_))),
+                "expected UnsupportedLimit for: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_binds_over_plain_and_aggregate_reads() {
+        let catalog = catalog_with_sales();
+        assert!(
+            bind("SELECT DISTINCT region FROM sales", &catalog)
+                .expect("bind")
+                .distinct
+        );
+        // DISTINCT over an aggregate's output rows.
+        let agg = bind(
+            "SELECT DISTINCT COUNT(*) FROM sales GROUP BY region",
+            &catalog,
+        )
+        .expect("bind");
+        assert!(agg.distinct && agg.aggregate.is_some());
+        // `SELECT ALL` is the explicit default.
+        assert!(
+            !bind("SELECT ALL region FROM sales", &catalog)
+                .expect("bind")
+                .distinct
+        );
+    }
+
+    #[test]
+    fn result_shaping_over_a_join_is_rejected() {
+        let catalog = catalog_with_join_tables();
+        for sql in [
+            "SELECT name FROM users JOIN orders ON users.id = orders.uid ORDER BY name",
+            "SELECT name FROM users JOIN orders ON users.id = orders.uid LIMIT 1",
+            "SELECT DISTINCT name FROM users JOIN orders ON users.id = orders.uid",
+        ] {
+            assert!(
+                matches!(bind(sql, &catalog), Err(SelectError::UnsupportedJoin(_))),
+                "expected UnsupportedJoin for: {sql}"
             );
         }
     }

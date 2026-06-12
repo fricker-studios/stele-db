@@ -210,6 +210,9 @@ const SQLSTATE_INVALID_CURSOR_NAME: &str = "34000";
 // type — Postgres's `invalid_binary_representation`, distinct from the text-form
 // `22P02` (STL-183).
 const SQLSTATE_INVALID_BINARY_REPRESENTATION: &str = "22P03";
+// `SELECT DISTINCT … ORDER BY <col>` with `<col>` outside the select list —
+// Postgres's `invalid_column_reference` (STL-263).
+const SQLSTATE_INVALID_COLUMN_REFERENCE: &str = "42P10";
 
 // Per-field / per-parameter wire format codes (STL-105 text, STL-183 binary). A
 // `RowDescription` field and a `Bind` parameter / result slot each carry one of
@@ -1557,6 +1560,10 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
         | EngineError::Dml(
             DmlError::UnknownColumn { .. } | DmlError::Predicate(SelectError::UnknownColumn { .. }),
         ) => SQLSTATE_UNDEFINED_COLUMN,
+        // `SELECT DISTINCT … ORDER BY <col>` with `<col>` outside the select
+        // list — Postgres's 42P10, so a stock client sees the same class it
+        // would from Postgres ([STL-263]).
+        EngineError::Select(SelectError::DistinctOrderBy) => SQLSTATE_INVALID_COLUMN_REFERENCE,
         EngineError::Dml(DmlError::BadLiteral { .. } | DmlError::TypeMismatch { .. }) => {
             SQLSTATE_INVALID_TEXT_REPRESENTATION
         }
