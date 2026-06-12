@@ -48,11 +48,20 @@
 //! Everything before the floor is durable in committed segments and rebuilt from
 //! the segment store ([ADR-0023], no persisted index snapshot), so routine
 //! recovery is `segment rebuild + tail replay` rather than a full-log scan. The
-//! checkpoint file is the manifest that makes a crash *during* a flush safe: a
-//! segment is committed only once its checkpoint record (carrying the advanced
-//! floor and the bumped committed-segment count) is durable, so a
+//! checkpoint file is the **segment manifest** ([ADR-0030]) that makes a crash
+//! *during* a flush safe: a segment is committed only once its manifest record
+//! (carrying the advanced floor and the new live-segment list) is durable, so a
 //! segment written by a torn flush is an **orphan** recovery ignores, falling
 //! back to the WAL — the atomic-commit seam STL-133 / STL-136 anticipated.
+//!
+//! [`Engine::compact`] rides the same commit point ([STL-231]): it merges every
+//! live segment into one consolidated, read-optimized segment and **atomically
+//! swaps** the manifest's live list from the inputs to the output — inputs are
+//! retired whole, never mutated (invariant 1), and a crash anywhere leaves
+//! either the inputs live or the output live, never half.
+//!
+//! [ADR-0030]: ../../../docs/adr/0030-segment-manifest-retirement.md
+//! [STL-231]: https://allegromusic.atlassian.net/browse/STL-231
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -108,6 +117,19 @@ pub struct RecoveryMarks {
     pub max_txn_id: u64,
 }
 
+/// What one [`Engine::compact`] run did — observability for the admin trigger
+/// and the compaction oracle ([STL-231]).
+///
+/// [STL-231]: https://allegromusic.atlassian.net/browse/STL-231
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionOutcome {
+    /// How many input segments were merged and retired. `0` means the engine
+    /// had fewer than two live segments and the call was a no-op.
+    pub segments_in: usize,
+    /// The consolidated output segment's filename, when one was written.
+    pub output: Option<String>,
+}
+
 /// Errors surfaced from the engine boot/recovery flow and the write path.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -161,14 +183,19 @@ pub struct Engine<C: Clock, D: Disk + Clone> {
     /// resident; a per-key segment index is the follow-up the [`crate::systime`]
     /// module anticipates.
     sealed: SealedVersions,
-    /// The validated, **committed** sealed segment filenames, in sorted order —
-    /// observability for tests and the manifest hook a [`Self::flush`] appends to.
-    /// Excludes orphan segments left by a torn flush (recovery drops those).
+    /// The validated, **live** sealed segment filenames, ascending — the
+    /// in-memory mirror of the durable manifest's live list ([ADR-0030]):
+    /// [`Self::flush`] appends to it, [`Self::compact`] swaps it. Excludes dead
+    /// segments — orphans left by a torn flush/compaction and retired
+    /// compaction inputs (recovery drops both).
+    ///
+    /// [ADR-0030]: ../../../docs/adr/0030-segment-manifest-retirement.md
     segment_names: Vec<String>,
-    /// The next sealed-segment index a [`Self::flush`] will allocate — equal to
-    /// the committed segment count, i.e. `segment_names.len()`
-    /// at the last commit. Segment files at this index or above are uncommitted
-    /// orphans.
+    /// The next sealed-segment index a [`Self::flush`] or [`Self::compact`]
+    /// will allocate — strictly above every index ever committed, never reused
+    /// ([ADR-0030]), so a lingering dead file can never collide with a live one.
+    ///
+    /// [ADR-0030]: ../../../docs/adr/0030-segment-manifest-retirement.md
     next_segment_index: u64,
     /// The WAL offset recovery resumes replay from — advanced by [`Self::flush`]
     /// past every record the flushed segments now cover. [`LogOffset::ZERO`] until
@@ -268,35 +295,40 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         committed: &CommittedTxns,
     ) -> Result<Self, EngineError> {
         // 1. Load the durable recovery point: where replay resumes (`floor`), the
-        //    torn-tail boundary (`fence`), and how many sealed segments committed
-        //    flushes vouched (`segment_count`). No record ⇒ no flush ever
-        //    committed: replay the whole log from the origin and trust no segment.
+        //    torn-tail boundary (`fence`), and the manifest's live segment list
+        //    ([ADR-0030]). No record ⇒ no flush ever committed: replay the whole
+        //    log from the origin and trust no segment.
         let recovery = checkpoint::load(&disk)?;
-        let (floor, fence, segment_count) = recovery
-            .map_or((LogOffset::ZERO, LogOffset::ZERO, 0), |p: RecoveryPoint| {
-                (p.replay_floor, p.durable_fence, p.segment_count)
-            });
+        let has_checkpoint = recovery.is_some();
+        let (floor, fence, live_segments) = recovery.map_or_else(
+            || (LogOffset::ZERO, LogOffset::ZERO, Vec::new()),
+            |p: RecoveryPoint| (p.replay_floor, p.durable_fence, p.live_segments),
+        );
+        let live: BTreeSet<u64> = live_segments.into_iter().collect();
 
-        // 2. Drop orphan segments — any `seg-*` at or above the committed count was
-        //    written by a flush whose checkpoint record never became durable. The
-        //    records they hold are still in the WAL (the flush advances the floor
-        //    only *after* its checkpoint record is durable), so the orphan is
-        //    re-flushed from replay. Removing it keeps the next flush's `create`
-        //    from colliding; best-effort, since a leftover only forces an
-        //    overwrite next time ([STL-177] crash-during-flush safety).
+        // 2. Drop dead segments — any `seg-*` whose index the manifest does not
+        //    name is either an **orphan** (written by a flush/compaction whose
+        //    manifest record never became durable) or a **retired** compaction
+        //    input whose post-commit cleanup was interrupted ([ADR-0030]). An
+        //    orphan's records are still in the WAL (the flush advances the floor
+        //    only *after* its manifest record is durable), so it is re-flushed
+        //    from replay; a retired input's content lives on in the committed
+        //    output that replaced it. Removing them keeps a later `create` from
+        //    colliding; best-effort, since a leftover only forces an overwrite
+        //    next time ([STL-177] crash-during-flush safety).
         for name in &list_segment_names(&disk)? {
-            let committed = segment_index_of(name).is_some_and(|idx| idx < segment_count);
-            if !committed {
+            let alive = segment_index_of(name).is_some_and(|idx| live.contains(&idx));
+            if !alive {
                 let _ = disk.remove(name);
             }
         }
 
-        // 3. Validate and read the committed segments (`seg-0 … seg-{count-1}`) by
-        //    checksum. `SegmentReader::open` checks the header + footer CRC; reading
-        //    the versions and retractions forces every per-column-chunk CRC, so a
-        //    torn page in a *committed* segment is caught here and recovery refuses
-        //    rather than serving corrupt history.
-        let segment_names: Vec<String> = (0..segment_count).map(segment_name).collect();
+        // 3. Validate and read the live segments by checksum. `SegmentReader::open`
+        //    checks the header + footer CRC; reading the versions and retractions
+        //    forces every per-column-chunk CRC, so a torn page in a *committed*
+        //    segment is caught here and recovery refuses rather than serving
+        //    corrupt history.
+        let segment_names: Vec<String> = live.iter().copied().map(segment_name).collect();
         let mut sealed_versions = Vec::new();
         let mut sealed_retractions = Vec::new();
         for name in &segment_names {
@@ -348,9 +380,12 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
             index,
             sealed: SealedVersions::new(sealed_versions),
             segment_names,
-            next_segment_index: segment_count,
+            // Allocation is monotone past every live index ([ADR-0030]): a
+            // retired index is never reused, so a lingering retired file can
+            // never collide with a fresh segment of the same name.
+            next_segment_index: live.last().map_or(0, |max| max + 1),
             replay_floor: floor,
-            checkpoint: recovery.map(|p| p.durable_fence),
+            checkpoint: has_checkpoint.then_some(fence),
             flush_row_group_rows: DEFAULT_FLUSH_ROW_GROUP_ROWS,
         })
     }
@@ -695,14 +730,25 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         let fence = self.wal.durable_end();
         checkpoint::store(
             &self.disk,
-            RecoveryPoint {
+            &RecoveryPoint {
                 replay_floor: self.replay_floor,
                 durable_fence: fence,
-                segment_count: self.next_segment_index,
+                live_segments: self.live_indexes(),
             },
         )?;
         self.checkpoint = Some(fence);
         Ok(fence)
+    }
+
+    /// The live segment indexes, ascending — the manifest list every
+    /// [`checkpoint::store`] this engine performs vouches ([ADR-0030]). Derived
+    /// from `segment_names`, which only ever holds names this engine built via
+    /// [`segment_name`], so the parse cannot fail.
+    fn live_indexes(&self) -> Vec<u64> {
+        self.segment_names
+            .iter()
+            .map(|name| segment_index_of(name).expect("engine-built segment name"))
+            .collect()
     }
 
     /// **Flush** the delta tier into a fresh sealed segment and advance the replay
@@ -742,13 +788,13 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         if versions.is_empty() && retractions.is_empty() {
             // Nothing staged ⇒ no unflushed records since the last flush, so the
             // floor is already current. Record the fence (a degenerate flush) and
-            // leave the floor / count untouched.
+            // leave the floor / live set untouched.
             checkpoint::store(
                 &self.disk,
-                RecoveryPoint {
+                &RecoveryPoint {
                     replay_floor: self.replay_floor,
                     durable_fence: fence,
-                    segment_count: self.next_segment_index,
+                    live_segments: self.live_indexes(),
                 },
             )?;
             self.checkpoint = Some(fence);
@@ -784,14 +830,17 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         // vouched segment instead of ignoring an orphan.
         self.disk.sync_dir()?;
 
-        // 4. Commit: the checkpoint record vouches the segment and advances the
+        // 4. Commit: the manifest record vouches the segment — its live list is
+        //    the current set plus the new index ([ADR-0030]) — and advances the
         //    floor past every record it covers.
+        let mut live_segments = self.live_indexes();
+        live_segments.push(idx);
         checkpoint::store(
             &self.disk,
-            RecoveryPoint {
+            &RecoveryPoint {
                 replay_floor: fence,
                 durable_fence: fence,
-                segment_count: idx + 1,
+                live_segments,
             },
         )?;
 
@@ -810,6 +859,138 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         self.checkpoint = Some(fence);
         self.delta.discard_flushed();
         Ok(fence)
+    }
+
+    /// **Compact** the sealed segment set: merge every live segment into one
+    /// consolidated, read-optimized segment, then atomically swap the live set
+    /// to the output and retire the inputs ([STL-231], [ADR-0030]).
+    ///
+    /// History-preserving by construction: the output carries every version row
+    /// and every retraction tombstone of the inputs **verbatim** — same
+    /// `(business_key, sys_from, seq)` keying ([STL-145]), same payload bytes,
+    /// same provenance — merely re-clustered by `(business_key, sys_from, seq)`
+    /// so a key's version chain is physically local and zone-map pruning is
+    /// cheap ([architecture §3.1]). No committed record is dropped, rewritten,
+    /// or inferred; rebuilding the validity index from the output yields exactly
+    /// the index the inputs implied ([ADR-0023], [`rebuild_index_from_segments`]).
+    /// Inputs are **retired, never mutated** (invariant 1): the sealed bytes of
+    /// every surviving segment are untouched, the STL-186 immutability oracle's
+    /// contract.
+    ///
+    /// The sequence is ordered for crash safety, mirroring [`Self::flush`]:
+    ///
+    /// 1. `fsync` the WAL — refuses early on a poisoned engine ([STL-217]) and
+    ///    refreshes the fence the swap record carries.
+    /// 2. Read every input segment in full, re-validating each header/footer and
+    ///    per-chunk CRC — compaction refuses to rewrite history it cannot verify.
+    /// 3. Seal the merged rows into `seg-{next}` — row-group bounded
+    ///    ([STL-197]), fresh zone maps — `fsync` it, and fence the directory
+    ///    entry ([STL-232]).
+    /// 4. Append the manifest record whose live list names the **output instead
+    ///    of the inputs**. **This is the atomic swap** ([ADR-0030]): until it is
+    ///    durable the output is an orphan recovery ignores and the inputs remain
+    ///    live; once durable the inputs are retired. The replay floor is
+    ///    untouched — compaction covers exactly the WAL prefix the inputs did.
+    /// 5. Only now adopt the swap in memory and remove the retired input files,
+    ///    **best-effort**: a cleanup failure must not abort after the commit
+    ///    point; recovery removes any lingering non-live file ([ADR-0030]).
+    ///
+    /// With fewer than two live segments there is nothing to merge: the call is
+    /// a no-op returning `segments_in: 0` (so a repeated `COMPACT` is
+    /// idempotent), and the delta tier is never touched — fold it in with a
+    /// [`Self::flush`] first.
+    ///
+    /// [STL-231]: https://allegromusic.atlassian.net/browse/STL-231
+    /// [ADR-0030]: ../../../docs/adr/0030-segment-manifest-retirement.md
+    /// [ADR-0023]: ../../../docs/adr/0023-append-only-record-model-validity-index.md
+    /// [architecture §3.1]: ../../../docs/02-architecture.md#31-tiered-layout-lsm-flavored-history-preserving
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Wal`] on the fsync (incl. a poisoned WAL),
+    /// [`EngineError::Segment`] reading an input or sealing the output, or
+    /// [`EngineError::Io`] on the directory fence / manifest append. On any
+    /// error the live set — in memory and durable — is unchanged: the inputs
+    /// stay live and a partially-written output is a dead orphan.
+    pub fn compact(&mut self) -> Result<CompactionOutcome, EngineError> {
+        if self.segment_names.len() < 2 {
+            return Ok(CompactionOutcome {
+                segments_in: 0,
+                output: None,
+            });
+        }
+
+        // 1. Fail fast on a poisoned engine and refresh the durable fence.
+        self.wal.tick()?;
+        let fence = self.wal.durable_end();
+
+        // 2. Read the inputs in full — every version row and every retraction
+        //    tombstone ([STL-143]) — re-validating every CRC on the way.
+        let mut versions = Vec::new();
+        let mut retractions = Vec::new();
+        for name in &self.segment_names {
+            let reader = SegmentReader::open(&self.disk, name)?;
+            versions.extend(reader.read_versions()?);
+            retractions.extend(reader.read_retractions()?);
+        }
+
+        // Re-cluster by `(business_key, sys_from, seq)` — the read-optimized
+        // layout of [architecture §3.1]: a key's chain becomes physically local,
+        // so business-key zone maps tighten per row-group ([STL-173]).
+        versions.sort_by(|a, b| {
+            (&a.business_key, a.sys_from, a.seq).cmp(&(&b.business_key, b.sys_from, b.seq))
+        });
+        retractions.sort_by(|a, b| {
+            (&a.business_key, a.sys_from, a.seq).cmp(&(&b.business_key, b.sys_from, b.seq))
+        });
+
+        // 3. Seal the consolidated output at the next (monotone) index. Clear
+        //    any orphan left at that name first, as flush does.
+        let idx = self.next_segment_index;
+        let name = segment_name(idx);
+        let _ = self.disk.remove(&name);
+        let mut writer = if self.valid_time {
+            SegmentWriter::create_valid_time(&self.disk, &name)?
+        } else {
+            SegmentWriter::create(&self.disk, &name)?
+        }
+        .with_max_row_group_rows(self.flush_row_group_rows);
+        for v in &versions {
+            writer.push(v.clone())?;
+        }
+        for c in &retractions {
+            writer.push_retraction(c.clone())?;
+        }
+        writer.finish()?; // fsyncs — the output is now durable
+        // Directory fence ([STL-232]): make the output's *entry* durable before
+        // the manifest vouches for it.
+        self.disk.sync_dir()?;
+
+        // 4. The atomic swap: one manifest record whose live list is the output
+        //    alone. The floor is untouched — the output covers exactly the WAL
+        //    prefix the inputs covered.
+        checkpoint::store(
+            &self.disk,
+            &RecoveryPoint {
+                replay_floor: self.replay_floor,
+                durable_fence: fence,
+                live_segments: vec![idx],
+            },
+        )?;
+
+        // 5. The swap is durable: adopt it, then retire the input files,
+        //    best-effort — recovery sweeps any straggler ([ADR-0030]).
+        let retired = std::mem::replace(&mut self.segment_names, vec![name.clone()]);
+        self.sealed = SealedVersions::new(versions);
+        self.next_segment_index = idx + 1;
+        self.checkpoint = Some(fence);
+        for old in &retired {
+            let _ = self.disk.remove(old);
+        }
+        Ok(CompactionOutcome {
+            segments_in: retired.len(),
+            output: Some(name),
+        })
     }
 
     /// The version of `key` live at `snapshot` — the `AS OF` read, merging the

@@ -37,6 +37,7 @@ Use the [template](_template.md) for new records. Number sequentially.
 | [0027](0027-vectorized-execution-model.md) | Vectorized execution: batch-at-a-time Volcano pull over Arrow-shaped batches | Accepted |
 | [0028](0028-durable-catalog-log.md) | Durable catalog: a dedicated append-only DDL log at the session level | Accepted |
 | [0029](0029-cross-table-commit-marker.md) | Cross-table commit atomicity: a transaction commit-marker over the per-table WALs | Accepted |
+| [0030](0030-segment-manifest-retirement.md) | Segment manifest & retirement: the checkpoint record names the live segment set | Accepted |
 
 ## Conventions
 
