@@ -303,6 +303,58 @@ through its `SET`, as for a point write — STL-194); a valid-time-*scoped* bulk
 write is future work. A period predicate (`WHERE PERIOD(…) … PERIOD(…)`) is not
 accepted on DML.
 
+## MERGE upsert (STL-230)
+
+First-class `MERGE` — the statement shape of the v0.3 historization workhorse.
+Source rows probe the target by **business key** at the statement snapshot; the
+`MATCHED` arm updates, the `NOT MATCHED` arm inserts, and the whole statement
+applies as **one crash-atomic group** over the STL-229 scan-then-write plan.
+
+```sql
+MERGE INTO account [AS a]
+USING (VALUES (1, 100), (3, 300)) AS s (id, balance)   -- or: USING feed [AS s]
+ON account.id = s.id                                    -- the business-key equality
+WHEN MATCHED THEN UPDATE SET balance = s.balance
+WHEN NOT MATCHED THEN INSERT (id, balance) VALUES (s.id, s.balance);
+```
+
+The supported subset:
+
+- **Source**: a `VALUES` list with named alias columns (`AS s (c1, …)`, folded
+  to typed rows at bind — each column's type is inferred from where it is used,
+  and conflicting uses are a bind error), or a **plain table** (read at the
+  statement snapshot when the plan expands). Subqueries beyond `VALUES` are
+  rejected.
+- **`ON`**: exactly one equality joining the target's business key to one source
+  column, either operand order. A non-key target column, `AND` chains, or
+  expressions are rejected.
+- **Arms**: at most one `WHEN MATCHED THEN UPDATE SET …` and one `WHEN NOT
+  MATCHED THEN INSERT … VALUES …`, either alone — a source row whose arm is
+  absent is skipped. Arm values are literals or source-column references
+  (`s.c`); referencing the target row is rejected. The `INSERT` arm follows the
+  plain-`INSERT` column-list discipline (positional with no list; every target
+  column must be supplied).
+
+Semantics, pinned:
+
+- Per-source-row arm resolution happens **at execution**, against the target's
+  live keys at the statement snapshot. Inside a `BEGIN … COMMIT` block both the
+  probe and a table source overlay the transaction's own buffered writes
+  (read-your-own-writes, STL-203), and the per-key writes are what the buffer
+  holds — the acted-on set is fixed at the statement, not at `COMMIT`.
+- The `MERGE n` command tag counts the **acted-on source rows** (each one update
+  or one insert; skipped rows don't count).
+- The write set applies as a single atomic group (one WAL record, one fsync —
+  STL-192): a failure on any row leaves the table unchanged (STL-216).
+- Two source rows resolving to the **same target row** fail the statement with
+  SQLSTATE `21000` (`cardinality_violation`) before any write applies — the
+  standard's deterministic posture; so do `NULL` flowing into the inserted
+  business key (a `NULL` join key itself simply never matches).
+- A `MERGE` into a **valid-time table** is rejected: valid-period close/open
+  semantics are the temporal-MERGE sibling (STL-235). `WHEN NOT MATCHED BY
+  SOURCE`, `WHEN MATCHED THEN DELETE`, clause predicates (`WHEN … AND <expr>`),
+  and `OUTPUT` are rejected.
+
 ## Type vocabulary
 
 Column types in `CREATE TABLE` are parsed as standard `sqlparser` `DataType`
