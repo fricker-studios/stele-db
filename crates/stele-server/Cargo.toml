@@ -29,3 +29,10 @@ toml               = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# The ops-endpoint integration tests drive real wire load through the server
+# (STL-253): tokio-postgres as the SQL client, stele-sql for the `Statement`
+# type a delegating test session needs in its `SessionHandle` signatures.
+stele-sql      = { workspace = true }
+tokio-postgres = { workspace = true }

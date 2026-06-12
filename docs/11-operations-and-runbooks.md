@@ -20,6 +20,76 @@ Stele exposes Prometheus/OpenMetrics, OpenTelemetry traces, structured logs, and
 | **KMS reachability** | No KMS → no decrypt of at-rest data ([ADR-0019](adr/0019-encryption-at-rest-kms.md)). | KMS errors / latency. |
 | **Temporal-specific metrics** | You can't benchmark or debug what you can't see — instrument *before* perf work. | per-query block reads, **version-chain depth**, **visibility lag** (submit→queryable), clock-uncertainty window, compaction stats. |
 
+### 1.1 First dashboard (the v0.3 shipped metric set — STL-253)
+
+The server exposes an **ops HTTP listener** on a port distinct from pg-wire —
+default `0.0.0.0:9090`, configured by `[telemetry] metrics` in `stele.toml`
+([05 — configuration](05-dev-environment.md#configuration)); the admin HTTP
+gateway will share this listener ([ADR-0016](adr/0016-admin-control-plane-api.md)):
+
+| Endpoint | Meaning |
+|---|---|
+| `GET /healthz` | Liveness: `200` whenever the process answers. |
+| `GET /readyz` | Readiness: `200` only once **recovery completed** and **no table's WAL is poisoned** (a failed fsync — STL-217). The listener binds *before* recovery, so a (re)start is observable as `503 → 200`; a poisoned engine flips it back to `503` and the remedy is a restart into recovery. Wire this to the orchestrator's readiness probe. |
+| `GET /metrics` | Prometheus/OpenMetrics text exposition. `503` until recovery completes. |
+
+Scrape config:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: stele
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["stele-host:9090"]
+```
+
+**The metric names are stable.** Renaming or re-labeling any series below is a
+breaking change to operators' dashboards and gets the same deprecation
+discipline as a SQL surface change ([ADR-0014](adr/0014-release-channels-and-versioning-policy.md)).
+
+| Series | Type | Meaning |
+|---|---|---|
+| `stele_connections_active` | gauge | Open pg-wire connections. |
+| `stele_connections_total` | counter | Connections ever accepted. |
+| `stele_statements_total{kind}` | counter | Successfully executed statements; `kind` ∈ `select` `insert` `update` `delete` `ddl` `admin`. Errored statements are **not** counted here — they land in `stele_statement_errors_total`, so total attempted throughput is the sum of both. |
+| `stele_statement_seconds{kind}` | histogram | Statement latency; `kind` ∈ `select` `dml` `ddl`. |
+| `stele_statement_errors_total` | counter | Statements that returned an error. |
+| `stele_rows_returned_total` | counter | Rows returned by `SELECT`s. |
+| `stele_rows_written_total` | counter | Rows written by DML (counted at statement execution; a later `ROLLBACK` does not subtract). |
+| `stele_txn_commits_total` / `stele_txn_rollbacks_total` / `stele_txn_conflicts_total` | counter | Transaction outcomes; conflicts are first-committer-wins refusals (retryable). |
+| `stele_wal_appends_total` | counter | WAL records staged, across every table's WAL. |
+| `stele_wal_fsync_seconds` | histogram | **The durability point** ([02 §3.4](02-architecture.md#34-write-path-sequence)): group-commit and segment-rotation fsync latency; `_count` is the fsync count. |
+| `stele_flush_seconds` / `stele_checkpoint_seconds` | histogram | Flush (seal delta → segment) and checkpoint (durability fence) durations; `_count` is successful runs. |
+| `stele_scan_segments_scanned_total`, `stele_scan_segments_pruned_zone_total`, `stele_scan_segments_pruned_superseded_total`, `stele_scan_row_groups_scanned_total`, `stele_scan_row_groups_pruned_zone_total` | counter | Snapshot-scan pruning accounting (STL-146/STL-173): how much sealed data reads actually touch vs. skip. |
+
+Compaction and backup series land with their features (STL-231 / STL-249).
+
+**The five queries an operator looks at first:**
+
+```promql
+# 1. p99 fsync latency — ingest is at risk before anything else shows it.
+histogram_quantile(0.99, rate(stele_wal_fsync_seconds_bucket[5m]))
+
+# 2. p99 SELECT latency, and statement throughput by kind.
+histogram_quantile(0.99, rate(stele_statement_seconds_bucket{kind="select"}[5m]))
+sum by (kind) (rate(stele_statements_total[5m]))
+
+# 3. Error + conflict pressure. Conflicts are retryable; a climb means hot keys.
+rate(stele_statement_errors_total[5m]) + rate(stele_txn_conflicts_total[5m])
+
+# 4. Prune effectiveness — near 0 on a growing table means zone maps aren't
+#    helping and a flush/compaction or predicate shape needs a look.
+rate(stele_scan_segments_pruned_zone_total[5m])
+  / clamp_min(rate(stele_scan_segments_scanned_total[5m])
+              + rate(stele_scan_segments_pruned_zone_total[5m])
+              + rate(stele_scan_segments_pruned_superseded_total[5m]), 1e-9)
+
+# 5. Alert: not-ready. `/readyz` ≠ 200 — fires across crash-loops AND a
+#    poisoned WAL (the engine refuses writes until restarted into recovery).
+probe_success{job="stele-readyz"} == 0   # via blackbox_exporter on /readyz
+```
+
 ## 2. Incident response
 
 A blameless, severity-driven process (the engineering `incident-response` workflow applies).

@@ -330,7 +330,7 @@ metrics    = "0.0.0.0:9090"     # Prometheus/OpenMetrics
 tracing    = "info"
 ```
 
-A ready-to-copy sample lives at [`stele.example.toml`](../stele.example.toml) in the repo root — `cp stele.example.toml stele.toml` and edit. Only `[server] listen`/`data_dir`, `[storage] backend`, and `[tls]` are read today (STL-116, STL-251); the other sections above are reserved (the parser ignores unknown sections) and land in later tickets.
+A ready-to-copy sample lives at [`stele.example.toml`](../stele.example.toml) in the repo root — `cp stele.example.toml stele.toml` and edit. Only `[server] listen`/`data_dir`, `[storage] backend`, `[tls]`, and `[telemetry] metrics` (the ops HTTP listener — `/metrics`, `/healthz`, `/readyz`; see [11 §1](11-operations-and-runbooks.md#1-health--monitoring)) are read today (STL-116, STL-251, STL-253); the other sections above are reserved (the parser ignores unknown sections) and land in later tickets.
 
 **Secure defaults** ([10 §4](10-security-and-compliance.md#4-data-protection--encryption), STL-251): a config-file (non-dev) run **without `[tls]` may only bind loopback** — the server refuses to start on a non-loopback `listen` rather than silently serve plaintext. Configure `[tls]`, bind `127.0.0.1`, or use `--dev`.
 

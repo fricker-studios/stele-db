@@ -12,9 +12,12 @@
 //! scratch dir). [STL-116] wires the `[storage] backend` selection through to the
 //! [`AnyDisk`] the engine constructs at boot.
 
+pub mod ops;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use anyhow::Context as _;
 use serde::Deserialize;
@@ -44,6 +47,14 @@ pub struct Config {
     pub backend: BackendKind,
     /// Data directory the `local` backend roots itself at (ignored by `memory`).
     pub data_dir: PathBuf,
+    /// Ops HTTP listen address — `/metrics`, `/healthz`, `/readyz` ([STL-253]),
+    /// the listener the admin HTTP gateway will share ([ADR-0016]). Configured
+    /// by `[telemetry] metrics` (the shape docs/05 reserved); defaults to
+    /// `0.0.0.0:9090`.
+    ///
+    /// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
+    /// [ADR-0016]: ../../../docs/adr/0016-admin-control-plane-api.md
+    pub metrics_listen: SocketAddr,
     /// TLS on pg-wire ([STL-251]): certificate material + plaintext policy from
     /// the `[tls]` section. `None` = TLS not configured — the secure-defaults
     /// posture then decides at boot whether the server may start at all
@@ -64,6 +75,7 @@ impl Config {
             dev: true,
             backend: BackendKind::Local,
             data_dir: dev_scratch_dir(),
+            metrics_listen: default_metrics_listen(),
             tls: None,
         }
     }
@@ -106,6 +118,8 @@ struct FileConfig {
     server: ServerSection,
     #[serde(default)]
     storage: StorageSection,
+    #[serde(default)]
+    telemetry: TelemetrySection,
     tls: Option<TlsSection>,
 }
 
@@ -113,6 +127,15 @@ struct FileConfig {
 struct ServerSection {
     listen: Option<SocketAddr>,
     data_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TelemetrySection {
+    /// The ops HTTP listen address (`/metrics`, `/healthz`, `/readyz`) — the
+    /// `[telemetry] metrics` key from docs/05, active since [STL-253].
+    ///
+    /// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
+    metrics: Option<SocketAddr>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -181,6 +204,10 @@ impl FileConfig {
                 .server
                 .data_dir
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR)),
+            metrics_listen: self
+                .telemetry
+                .metrics
+                .unwrap_or_else(default_metrics_listen),
             tls: self.tls.map(TlsSection::resolve).transpose()?.flatten(),
         })
     }
@@ -233,7 +260,10 @@ fn plaintext_posture(cfg: &Config) -> PlaintextPosture {
     }
 }
 
-/// Boot the engine: install tracing, construct the configured storage backend,
+/// Boot the engine.
+///
+/// Install tracing, apply the plaintext posture, start the ops HTTP listener,
+/// construct the configured storage backend, recover the session engine,
 /// start the pgwire listener, wait for SIGINT.
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     init_tracing(cfg.dev);
@@ -241,12 +271,24 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
     // Secure defaults (STL-251, docs/10 §4): decide up front what this
     // configuration means for plaintext — and refuse outright rather than
-    // silently serve unencrypted traffic beyond the local machine.
+    // silently serve unencrypted traffic beyond the local machine. Checked
+    // before any port is bound, so a refused config holds nothing.
     match plaintext_posture(&cfg) {
         PlaintextPosture::Proceed => {}
         PlaintextPosture::Warn(msg) => warn!("{msg}"),
         PlaintextPosture::Refuse(msg) => anyhow::bail!(msg),
     }
+
+    // Stand the ops HTTP listener up FIRST, before recovery runs (STL-253):
+    // `/healthz` answers as soon as the process holds the port, while
+    // `/readyz` reports 503 until recovery completes — the flip orchestrators
+    // key their traffic-routing on.
+    let ops_state = Arc::new(ops::OpsState::new());
+    let ops = ops::OpsServer::new(cfg.metrics_listen, Arc::clone(&ops_state))
+        .bind()
+        .await
+        .with_context(|| format!("binding ops listener on {}", cfg.metrics_listen))?;
+    let mut ops_task = tokio::spawn(ops.serve());
 
     // Construct the backend the operator selected, then stand up the per-session
     // engine on it — the Catalog + commit clock + per-table storage tiers that
@@ -268,6 +310,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         tables = engine.describe_live_tables().len(),
         "session engine ready"
     );
+    // Give the registry real durations (STL-253). Only the production server
+    // installs a time source — see [`uptime_micros`].
+    engine.metrics().install_time_source(uptime_micros);
 
     // One engine shared across every connection, behind a mutex (STL-131): a
     // CREATE TABLE on any connection is visible to the next statement, and the
@@ -275,6 +320,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // follow in STL-147). The lock is held only per synchronous statement,
     // never across wire I/O.
     let session: SharedSession = Arc::new(Mutex::new(engine));
+    // Recovery is complete: flip `/readyz` (STL-253). From here it tracks the
+    // engine's WAL-poison state live.
+    ops_state.set_ready(Arc::clone(&session));
     let mut pg = PgServer::new(cfg.listen, session);
     if let Some(settings) = &cfg.tls {
         // Load certificate material now so a bad path / non-PEM file is a boot
@@ -290,6 +338,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
     tokio::select! {
         res = pg.run() => res.context("pgwire listener exited")?,
+        // The ops listener only exits on a bind/served I/O failure or a panic —
+        // either way the operator surface is gone, so treat it as fatal rather
+        // than serving on half a contract.
+        res = &mut ops_task => res.context("ops listener task aborted")?.context("ops listener exited")?,
         _ = signal::ctrl_c() => {
             info!("received SIGINT, shutting down");
         }
@@ -300,6 +352,29 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
 const fn default_listen() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PG_PORT)
+}
+
+/// Stele's default ops/metrics HTTP port — `9090`, the conventional
+/// Prometheus-ecosystem scrape port documented in
+/// [05 — configuration](../../../docs/05-dev-environment.md#configuration).
+const DEFAULT_METRICS_PORT: u16 = 9090;
+
+const fn default_metrics_listen() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_METRICS_PORT)
+}
+
+/// Microseconds since the first call — the monotonic time source the server
+/// installs on the engine's metric registry
+/// ([`Metrics::install_time_source`](stele_common::metrics::Metrics::install_time_source)).
+/// Only the production server installs one; tests and the simulator leave the
+/// registry sourceless (all durations zero), which is what keeps the
+/// deterministic core clock-free ([ADR-0010]).
+///
+/// [ADR-0010]: ../../../docs/adr/0010-deterministic-simulation-testing.md
+fn uptime_micros() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    u64::try_from(epoch.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 /// A per-process scratch directory for `--dev`, under the OS temp dir so a fresh
@@ -404,6 +479,22 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_metrics_listen_is_parsed() {
+        let cfg = Config::from_toml_str("[telemetry]\nmetrics = \"127.0.0.1:9988\"\n").unwrap();
+        assert_eq!(cfg.metrics_listen, "127.0.0.1:9988".parse().unwrap());
+    }
+
+    #[test]
+    fn metrics_listen_defaults_to_the_documented_port() {
+        // Both an empty operator config and dev mode land on 0.0.0.0:9090
+        // (docs/05 — configuration).
+        let cfg = Config::from_toml_str("").unwrap();
+        assert_eq!(cfg.metrics_listen, default_metrics_listen());
+        assert_eq!(Config::dev().metrics_listen, default_metrics_listen());
+        assert_eq!(default_metrics_listen().port(), 9090);
+    }
+
+    #[test]
     fn missing_storage_section_defaults_to_local() {
         let cfg = Config::from_toml_str("[server]\ndata_dir = \"/srv/stele\"\n").unwrap();
         assert_eq!(cfg.backend, BackendKind::Local);
@@ -447,6 +538,7 @@ mod tests {
         assert_eq!(cfg.backend, BackendKind::Local);
         assert_eq!(cfg.listen, "127.0.0.1:5454".parse().unwrap());
         assert_eq!(cfg.data_dir, PathBuf::from(DEFAULT_DATA_DIR));
+        assert_eq!(cfg.metrics_listen, default_metrics_listen());
         assert!(
             cfg.tls.is_none(),
             "the example ships with [tls] commented out"

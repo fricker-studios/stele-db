@@ -57,6 +57,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
+use stele_common::metrics::SharedMetrics;
 use stele_common::provenance::{Principal, TxnId};
 use stele_common::time::{Clock, SystemTimeMicros};
 
@@ -666,6 +667,15 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
     pub fn is_poisoned(&self) -> bool {
         self.wal.is_poisoned()
+    }
+
+    /// Install the session's shared metric registry on this table's WAL
+    /// ([`Wal::set_metrics`], [STL-253]), so its appends and fsyncs report into
+    /// the process-wide series.
+    ///
+    /// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
+    pub fn set_metrics(&self, metrics: SharedMetrics) {
+        self.wal.set_metrics(metrics);
     }
 
     /// Take a **checkpoint**: group-commit fsync the WAL, then record the new

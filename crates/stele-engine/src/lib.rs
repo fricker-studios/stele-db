@@ -59,6 +59,7 @@ use std::sync::{Arc, Mutex};
 use crate::catalog_log::CatalogRecord;
 
 use stele_catalog::{Catalog, CatalogError};
+use stele_common::metrics::{SharedMetrics, StatementKind};
 use stele_common::period::Interval;
 use stele_common::provenance::{Principal, TxnId};
 use stele_common::row_codec::{self, RowCodecError};
@@ -761,6 +762,19 @@ pub struct SessionEngine<C: Clock + Clone, D: Disk + Clone> {
     /// not on every auto-committed write under a long-lived open transaction
     /// ([STL-204]).
     pruned_below: SystemTimeMicros,
+    /// The session's metric registry ([STL-253]): every statement, transaction
+    /// outcome, flush/checkpoint, scan, and (via [`Engine::set_metrics`]) WAL
+    /// append/fsync reports into it. Owned here — the engine is the one place
+    /// every instrumented path meets — and shared by `Arc` with the wire front
+    /// end and the ops HTTP listener that renders it. Durations read the
+    /// registry's installed time source
+    /// ([`Metrics::install_time_source`](stele_common::metrics::Metrics::install_time_source)),
+    /// which no test or simulator installs, so instrumentation never makes the
+    /// engine read a wall clock itself ([ADR-0010]).
+    ///
+    /// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
+    /// [ADR-0010]: ../../../docs/adr/0010-deterministic-simulation-testing.md
+    metrics: SharedMetrics,
 }
 
 impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
@@ -784,6 +798,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             write_index: BTreeMap::new(),
             open_snapshots: OpenSnapshots::default(),
             pruned_below: SystemTimeMicros(0),
+            metrics: SharedMetrics::default(),
         }
     }
 
@@ -941,7 +956,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             }
         }
 
-        Ok(Self {
+        let session = Self {
             catalog,
             clock,
             disk,
@@ -951,7 +966,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             write_index: BTreeMap::new(),
             open_snapshots: OpenSnapshots::default(),
             pruned_below: SystemTimeMicros(0),
-        })
+            metrics: SharedMetrics::default(),
+        };
+        // Recovered tiers were opened before the session's registry existed;
+        // point their WALs at it now ([STL-253]).
+        for state in session.tables.values() {
+            state.engine.set_metrics(Arc::clone(&session.metrics));
+        }
+        Ok(session)
     }
 
     /// Take a lightweight **checkpoint** of every resident table: group-commit
@@ -982,9 +1004,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     ///
     /// [`EngineError::Storage`] if any table's checkpoint fails.
     pub fn checkpoint(&mut self) -> Result<(), EngineError> {
+        let started = self.metrics.now_micros();
         for state in self.tables.values_mut() {
             state.engine.checkpoint()?;
         }
+        self.metrics
+            .checkpoint_seconds
+            .observe_micros(self.metrics.now_micros().saturating_sub(started));
         Ok(())
     }
 
@@ -1017,9 +1043,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     ///
     /// [`EngineError::Storage`] if any table's flush fails.
     pub fn flush(&mut self) -> Result<(), EngineError> {
+        let started = self.metrics.now_micros();
         for state in self.tables.values_mut() {
             state.engine.flush()?;
         }
+        self.metrics
+            .flush_seconds
+            .observe_micros(self.metrics.now_micros().saturating_sub(started));
         Ok(())
     }
 
@@ -1114,7 +1144,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // transaction instead — see [`execute_in_txn`](Self::execute_in_txn).)
         // No write buffer to overlay: an auto-commit read sees only committed
         // state.
-        self.execute_at(stmt, self.clock.observe(), &[])
+        let started = self.metrics.now_micros();
+        let result = self.execute_at(stmt, self.clock.observe(), &[]);
+        self.observe_statement(stmt, started, result.as_ref());
+        result
     }
 
     /// Resolve a row-returning statement's `RowDescription` columns **without
@@ -1229,6 +1262,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         stmt: &Statement,
         txn: &mut SessionTransaction,
     ) -> Result<StatementOutcome, EngineError> {
+        let started = self.metrics.now_micros();
+        let result = self.execute_in_txn_inner(stmt, txn);
+        self.observe_statement(stmt, started, result.as_ref());
+        result
+    }
+
+    /// The unmetered body of [`execute_in_txn`](Self::execute_in_txn).
+    fn execute_in_txn_inner(
+        &mut self,
+        stmt: &Statement,
+        txn: &mut SessionTransaction,
+    ) -> Result<StatementOutcome, EngineError> {
         if let Some(summary) = self.stage_dml(stmt, txn)? {
             return Ok(StatementOutcome::Dml(summary));
         }
@@ -1262,6 +1307,62 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // Keep the open-snapshot multiset in step with the advanced pin, so the
         // prune floor reflects where this transaction now reads ([STL-204]).
         txn.lease.repin(snapshot);
+    }
+
+    /// The session's metric registry ([STL-253]) — the wire front end and the
+    /// ops HTTP listener share (and render) this exact instance, so engine-side
+    /// and wire-side series land on one page.
+    ///
+    /// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
+    #[must_use]
+    pub const fn metrics(&self) -> &SharedMetrics {
+        &self.metrics
+    }
+
+    /// Record one finished statement into the registry ([STL-253]): the
+    /// per-kind count, latency, rows in/out, and the error count. `started_micros`
+    /// is the registry time-source reading taken before the statement ran (zero
+    /// when no source is installed, keeping tests and the simulator
+    /// deterministic).
+    ///
+    /// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
+    fn observe_statement(
+        &self,
+        stmt: &Statement,
+        started_micros: u64,
+        result: Result<&StatementOutcome, &EngineError>,
+    ) {
+        let m = &self.metrics;
+        match result {
+            Ok(outcome) => {
+                let kind = match outcome {
+                    StatementOutcome::Rows(r) => {
+                        m.rows_returned.add(r.rows.len() as u64);
+                        StatementKind::Select
+                    }
+                    StatementOutcome::Dml(summary) => {
+                        let (kind, n) = match summary {
+                            DmlSummary::Insert(n) => (StatementKind::Insert, *n),
+                            DmlSummary::Update(n) => (StatementKind::Update, *n),
+                            DmlSummary::Delete(n) => (StatementKind::Delete, *n),
+                        };
+                        m.rows_written.add(n);
+                        kind
+                    }
+                    // CHECKPOINT / FLUSH report a DDL-shaped outcome; label them
+                    // by the statement's admin body instead.
+                    StatementOutcome::Ddl { .. } => {
+                        if matches!(stmt.body, StatementBody::Admin(_)) {
+                            StatementKind::Admin
+                        } else {
+                            StatementKind::Ddl
+                        }
+                    }
+                };
+                m.observe_statement(kind, m.now_micros().saturating_sub(started_micros));
+            }
+            Err(_) => m.statement_errors.inc(),
+        }
     }
 
     /// The shared statement router, resolving **reads** — a `SELECT`, and the
@@ -1525,6 +1626,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let namespace = self.next_namespace;
         let disk = NamespacedDisk::new(self.disk.clone(), namespace);
         let engine = Engine::open(disk, self.clock.clone(), valid_time)?;
+        engine.set_metrics(Arc::clone(&self.metrics));
         self.next_namespace += 1;
         Ok(TableState {
             engine,
@@ -1648,9 +1750,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 value_count,
                 overlay,
                 valid_cols,
+                &self.metrics,
             )?
         } else {
-            Self::scan_rows(bound, state, &schema_columns, value_count)?
+            Self::scan_rows(bound, state, &schema_columns, value_count, &self.metrics)?
         };
 
         // An aggregate query folds those rows into grouped output ([STL-171]); a
@@ -1695,6 +1798,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         state: &TableState<C, D>,
         schema_columns: &[(String, LogicalType)],
         value_count: usize,
+        metrics: &SharedMetrics,
     ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
         // Resolve the `WHERE` to a single vectorized predicate ([STL-213]): a
         // `<col> <cmp> <scalar>` comparison ([STL-151]) or a per-row period
@@ -1735,7 +1839,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // Declare the table's valid-time policy so a no-pin read still strips the
         // delta tier's framed prefix — otherwise a plain `SELECT` over a
         // valid-time table decodes the temporal envelope as row data ([STL-218]).
-        .valid_time(state.valid_time);
+        .valid_time(state.valid_time)
+        // Report the scan's pruning accounting into the session series ([STL-253]).
+        .metrics(Arc::clone(metrics));
         // Pin the valid axis too when the bound plan carries a `FOR VALID_TIME
         // AS OF v` instant ([STL-164]); without one a valid-time table is read
         // unfiltered (every system-live version, period columns readable).
@@ -1787,6 +1893,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// makes with [`SnapshotScan::valid_as_of`] ([STL-164]) — before the `WHERE`.
     /// `valid_cols` is the `(from, to)` period-column positions, `None` for a
     /// system-only table (which never carries a valid pin).
+    #[allow(clippy::too_many_arguments)]
     fn overlaid_rows(
         bound: &BoundSelect,
         state: &TableState<C, D>,
@@ -1794,8 +1901,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         value_count: usize,
         overlay: &[BoundDml],
         valid_cols: Option<(usize, usize)>,
+        metrics: &SharedMetrics,
     ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
-        let base = Self::scan_all_rows(state, bound.snapshot, value_count)?;
+        let base = Self::scan_all_rows(state, bound.snapshot, value_count, metrics)?;
         let overlaid = overlay_table_writes(base, overlay, bound.table.as_str(), value_count);
         // Pin the valid axis when the read carries `FOR VALID_TIME AS OF v`. The pin
         // only ever reaches a valid-time table (`bind_select` rejects it otherwise),
@@ -1926,6 +2034,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         state: &TableState<C, D>,
         snapshot: SystemTimeMicros,
         value_count: usize,
+        metrics: &SharedMetrics,
     ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
         let readers = state.engine.open_segment_readers()?;
         let scan = SnapshotScan::new(
@@ -1935,7 +2044,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             Snapshot(snapshot),
         )
         .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
-        .valid_time(state.valid_time);
+        .valid_time(state.valid_time)
+        .metrics(Arc::clone(metrics));
         let source = ScanSource::new(scan, DEFAULT_BATCH_SIZE);
         let mut exploded = ExplodePayload::new(source, value_count);
 
@@ -2652,6 +2762,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 .get(&key)
                 .is_some_and(|&committed_at| committed_at > txn.snapshot)
             {
+                self.metrics.txn_conflicts.inc();
                 return Err(EngineError::Conflict);
             }
         }
@@ -2685,6 +2796,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // the write index below the new oldest live snapshot ([STL-204]).
         drop(lease);
         self.prune_write_index();
+        if result.is_ok() {
+            self.metrics.txn_commits.inc();
+        }
         result
     }
 
@@ -5764,6 +5878,62 @@ mod tests {
             payload_column(&result),
             vec![encode_value(&ScalarValue::Int4(200))],
             "first committer wins; the conflicting transaction had no effect"
+        );
+    }
+
+    #[test]
+    fn the_metric_registry_tracks_statements_transactions_and_flushes() {
+        // The engine-side series of STL-253: per-kind statement counts, rows
+        // in/out, transaction outcomes, and the flush/checkpoint histograms.
+        // No time source is installed, so durations observe as zero — the
+        // counts are the deterministic part and the point here.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+        engine
+            .execute(&parse_one("SELECT id, balance FROM account"))
+            .expect("select");
+        engine
+            .execute(&parse_one("SELECT id FROM missing"))
+            .expect_err("unknown table");
+
+        let mut winner = engine.begin();
+        let mut loser = engine.begin();
+        engine
+            .stage_dml(
+                &parse_one("UPDATE account SET balance = 200 WHERE id = 1"),
+                &mut winner,
+            )
+            .expect("stage winner");
+        engine
+            .stage_dml(
+                &parse_one("UPDATE account SET balance = 300 WHERE id = 1"),
+                &mut loser,
+            )
+            .expect("stage loser");
+        engine.commit(winner).expect("first committer wins");
+        engine.commit(loser).expect_err("conflict");
+
+        engine.flush().expect("flush");
+        engine.checkpoint().expect("checkpoint");
+
+        let m = engine.metrics();
+        assert_eq!(m.statements(StatementKind::Ddl), 1);
+        assert_eq!(m.statements(StatementKind::Insert), 1);
+        assert_eq!(m.statements(StatementKind::Select), 1);
+        assert_eq!(m.statement_errors.get(), 1, "the unknown-table SELECT");
+        assert_eq!(m.rows_returned.get(), 1, "one row out of the SELECT");
+        assert_eq!(m.rows_written.get(), 1, "the auto-commit INSERT");
+        assert_eq!(m.txn_commits.get(), 1);
+        assert_eq!(m.txn_conflicts.get(), 1);
+        assert_eq!(m.flush_seconds.count(), 1);
+        assert_eq!(m.checkpoint_seconds.count(), 1);
+        assert!(
+            m.wal_appends.get() >= 2,
+            "the insert and the group commit reached the WAL, got {}",
+            m.wal_appends.get()
         );
     }
 

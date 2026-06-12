@@ -104,6 +104,7 @@ pub use tls::{ServerTls, TlsError, TlsMode, TlsSettings};
 
 use stele_catalog::CatalogError;
 use stele_common::hashkey::hash_key;
+use stele_common::metrics::SharedMetrics;
 use stele_common::time::Clock;
 use stele_common::types::{DecodeError, LogicalType, ScalarValue};
 use stele_engine::{
@@ -307,6 +308,29 @@ pub trait SessionHandle: Send {
     /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
     /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
     fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError>;
+
+    /// Whether the engine has **poisoned** — a WAL fsync failed, durability is
+    /// indeterminate, and the session must restart into recovery — see
+    /// [`SessionEngine::is_poisoned`] ([STL-217]). The ops listener's `/readyz`
+    /// probe reports not-ready on `true` ([STL-253]). Defaults to `false` so
+    /// session fakes that never touch storage need not implement it.
+    ///
+    /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
+    /// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
+    fn is_poisoned(&self) -> bool {
+        false
+    }
+
+    /// The session's shared metric registry — see [`SessionEngine::metrics`]
+    /// ([STL-253]). The wire front end counts connections and transaction
+    /// rollbacks into it, and the ops listener renders it; sharing the engine's
+    /// instance puts every series on one `/metrics` page. Defaults to a fresh,
+    /// unshared registry so session fakes need not implement it.
+    ///
+    /// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
+    fn metrics(&self) -> SharedMetrics {
+        SharedMetrics::default()
+    }
 }
 
 impl<C, D> SessionHandle for SessionEngine<C, D>
@@ -355,6 +379,14 @@ where
 
     fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError> {
         Self::commit(self, txn)
+    }
+
+    fn is_poisoned(&self) -> bool {
+        Self::is_poisoned(self)
+    }
+
+    fn metrics(&self) -> SharedMetrics {
+        Arc::clone(Self::metrics(self))
     }
 }
 
@@ -461,6 +493,14 @@ impl BoundServer {
     pub async fn serve(self) -> io::Result<()> {
         info!(addr = %self.local_addr, "stele-pgwire: listening");
 
+        // The engine's registry ([`SessionHandle::metrics`], [STL-253]) — taken
+        // once, then cloned per connection for the accept/teardown counters.
+        let metrics = self
+            .session
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .metrics();
+
         loop {
             let (stream, peer) = match self.listener.accept().await {
                 Ok(pair) => pair,
@@ -475,8 +515,11 @@ impl BoundServer {
             let _ = stream.set_nodelay(true);
             let session = Arc::clone(&self.session);
             let tls = self.tls.clone();
+            let metrics = Arc::clone(&metrics);
+            metrics.connections_total.inc();
+            metrics.connections_active.inc();
             tokio::spawn(async move {
-                match handle_connection(stream, peer, session, tls).await {
+                match handle_connection(stream, peer, session, tls, &metrics).await {
                     Ok(()) => {}
                     // Expected, policy- or client-driven closures (a plaintext
                     // attempt against tls = "required", a CancelRequest): not a
@@ -486,6 +529,8 @@ impl BoundServer {
                     }
                     Err(e) => warn!(%peer, error = %e, "connection closed with error"),
                 }
+                // Every arm — clean close, policy closure, error — releases the gauge.
+                metrics.connections_active.dec();
             });
         }
     }
@@ -620,20 +665,23 @@ fn txn_control(stmt: &Statement) -> Option<TxnControl<'_>> {
     }
 }
 
-#[instrument(skip(stream, session, tls), fields(%peer))]
+#[instrument(skip(stream, session, tls, metrics), fields(%peer))]
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
     session: SharedSession,
     tls: Option<Arc<ServerTls>>,
+    metrics: &SharedMetrics,
 ) -> Result<(), WireError> {
     // --- 1. Startup phase --------------------------------------------------
     // Negotiate first (the `SSLRequest` may upgrade the stream to TLS); the
     // protocol proper then runs identically over either stream.
     match negotiate_startup(stream, tls.as_deref()).await? {
-        Negotiated::Plain(mut stream, startup) => run_session(&mut stream, startup, session).await,
+        Negotiated::Plain(mut stream, startup) => {
+            run_session(&mut stream, startup, session, metrics).await
+        }
         Negotiated::Tls(mut stream, startup) => {
-            run_session(stream.as_mut(), startup, session).await
+            run_session(stream.as_mut(), startup, session, metrics).await
         }
     }
 }
@@ -727,6 +775,7 @@ async fn run_session<S: Wire>(
     stream: &mut S,
     startup: StartupMessage,
     session: SharedSession,
+    metrics: &SharedMetrics,
 ) -> Result<(), WireError> {
     debug!(?startup.params, "startup complete");
 
@@ -817,7 +866,7 @@ async fn run_session<S: Wire>(
                 // first error). `handle_simple_query` writes the per-statement
                 // replies and advances the transaction state; the trailing
                 // ReadyForQuery — carrying the resulting status byte — is ours.
-                handle_simple_query(stream, &q, &session, &mut txn).await?;
+                handle_simple_query(stream, &q, &session, &mut txn, metrics).await?;
                 write_ready_for_query(stream, txn.status_byte()).await?;
             }
             other => {
@@ -938,6 +987,7 @@ async fn handle_simple_query<S: Wire>(
     sql: &str,
     session: &SharedSession,
     txn: &mut ConnTxn,
+    metrics: &SharedMetrics,
 ) -> Result<(), WireError> {
     if sql.trim().is_empty() {
         debug!("empty simple query");
@@ -982,9 +1032,9 @@ async fn handle_simple_query<S: Wire>(
                 // A failed COMMIT writes an ErrorResponse and returns `false`, so
                 // the batch aborts here like any other statement error — nothing
                 // more may follow an error on the wire.
-                TxnControl::Commit => run_commit(stream, session, txn).await?,
+                TxnControl::Commit => run_commit(stream, session, txn, metrics).await?,
                 TxnControl::Rollback => {
-                    run_rollback(stream, txn).await?;
+                    run_rollback(stream, txn, metrics).await?;
                     true
                 }
                 // Savepoint statements manipulate the open transaction's buffer in
@@ -1122,6 +1172,7 @@ async fn run_commit<S: Wire>(
     stream: &mut S,
     session: &SharedSession,
     txn: &mut ConnTxn,
+    metrics: &SharedMetrics,
 ) -> Result<bool, WireError> {
     match std::mem::replace(txn, ConnTxn::Idle) {
         ConnTxn::Active(buffered) => match commit_txn(session, buffered) {
@@ -1140,8 +1191,12 @@ async fn run_commit<S: Wire>(
             }
         },
         // Postgres rolls a failed transaction back on COMMIT and reports ROLLBACK;
-        // the retained buffer (and its snapshot lease) is dropped here unapplied.
-        ConnTxn::Failed(_) => write_command_complete_tag(stream, "ROLLBACK").await?,
+        // the retained buffer (and its snapshot lease) is dropped here unapplied —
+        // a rollback in every sense, so it counts as one ([STL-253]).
+        ConnTxn::Failed(_) => {
+            metrics.txn_rollbacks.inc();
+            write_command_complete_tag(stream, "ROLLBACK").await?;
+        }
         // No open transaction — a warning-only no-op that still reports COMMIT.
         ConnTxn::Idle => write_command_complete_tag(stream, "COMMIT").await?,
     }
@@ -1153,7 +1208,16 @@ async fn run_commit<S: Wire>(
 /// Returns to idle from any state, dropping an [`ConnTxn::Active`] buffer (nothing
 /// it staged ever reaches storage) or clearing a [`ConnTxn::Failed`] block. A
 /// `ROLLBACK` with no open transaction still reports `ROLLBACK`.
-async fn run_rollback<S: Wire>(stream: &mut S, txn: &mut ConnTxn) -> Result<(), WireError> {
+async fn run_rollback<S: Wire>(
+    stream: &mut S,
+    txn: &mut ConnTxn,
+    metrics: &SharedMetrics,
+) -> Result<(), WireError> {
+    // Only a real open (or aborted) block counts as a rollback ([STL-253]); a
+    // `ROLLBACK` with no transaction is the Postgres warning-only no-op.
+    if !matches!(txn, ConnTxn::Idle) {
+        metrics.txn_rollbacks.inc();
+    }
     *txn = ConnTxn::Idle;
     write_command_complete_tag(stream, "ROLLBACK")
         .await
@@ -2949,7 +3013,14 @@ mod tests {
         let bound = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_connection(stream, peer, test_session(), None).await
+            handle_connection(
+                stream,
+                peer,
+                test_session(),
+                None,
+                &SharedMetrics::default(),
+            )
+            .await
         });
         let mut client = TcpStream::connect(bound).await.unwrap();
 
@@ -3440,7 +3511,14 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_connection(stream, peer, test_session(), None).await
+            handle_connection(
+                stream,
+                peer,
+                test_session(),
+                None,
+                &SharedMetrics::default(),
+            )
+            .await
         });
 
         let mut client = TcpStream::connect(bound).await.unwrap();
@@ -3531,7 +3609,14 @@ mod tests {
         let bound = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_connection(stream, peer, test_session(), None).await
+            handle_connection(
+                stream,
+                peer,
+                test_session(),
+                None,
+                &SharedMetrics::default(),
+            )
+            .await
         });
 
         let mut client = TcpStream::connect(bound).await.unwrap();
@@ -3603,7 +3688,14 @@ mod tests {
         let bound = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_connection(stream, peer, test_session(), None).await
+            handle_connection(
+                stream,
+                peer,
+                test_session(),
+                None,
+                &SharedMetrics::default(),
+            )
+            .await
         });
 
         let mut client = TcpStream::connect(bound).await.unwrap();
