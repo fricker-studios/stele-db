@@ -32,6 +32,12 @@ RPO = "RPO"
 # typos splits on the digit and flags the bare stem "wrk" as a typo for "work".
 wrk = "wrk"
 
+# RFC 4648 §10 base64 known-answer vectors ("f", "fo", "foo", …) and the
+# deliberate one-byte-different compare operand in the constant-time-equality
+# test (stele_common::scram, STL-252). Spec-mandated bytes, not prose.
+fo = "fo"
+abd = "abd"
+
 [files]
 # Don't scan vendored or generated output. (Cargo.lock is regenerated; binary
 # artifacts under target/ are already excluded by .gitignore.)

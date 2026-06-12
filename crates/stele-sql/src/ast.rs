@@ -50,6 +50,63 @@ pub enum StatementBody {
     Sql(SqlStatement),
     /// A Stele admin command lifted off the token stream before `sqlparser`.
     Admin(AdminCommand),
+    /// User-administration DDL lifted off the token stream before `sqlparser`
+    /// ([STL-252]): `sqlparser` parses `CREATE USER` / `ALTER USER` with
+    /// Snowflake's `KEY = VALUE` option grammar, not the Postgres
+    /// `PASSWORD '…'` form Stele speaks, so the family is recognized at the
+    /// token level — the same lift discipline as [`AdminCommand`].
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    User(UserDdl),
+}
+
+/// A user-administration statement ([STL-252]) — Stele's Postgres-compatible
+/// subset of the role DDL family, recognized at the token level.
+///
+/// Names are matched verbatim (no case-folding), as Stele does for table,
+/// column, and savepoint names. The password literal rides in a [`Password`]
+/// so it never reaches a log line through `Debug`.
+///
+/// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserDdl {
+    /// `CREATE USER <name> [WITH] PASSWORD '<password>'`.
+    CreateUser {
+        /// The user name.
+        name: String,
+        /// The password to derive a SCRAM verifier from.
+        password: Password,
+    },
+    /// `ALTER USER <name> [WITH] PASSWORD '<password>'` — rotate the password.
+    AlterUserPassword {
+        /// The user name.
+        name: String,
+        /// The replacement password.
+        password: Password,
+    },
+    /// `DROP USER [IF EXISTS] <name>`.
+    DropUser {
+        /// The user name.
+        name: String,
+        /// `IF EXISTS` was given — dropping an absent user is then a no-op.
+        if_exists: bool,
+    },
+}
+
+/// A password literal in flight between the parser and the engine's verifier
+/// derivation ([STL-252]).
+///
+/// A newtype purely so `Debug` — on the statement, a bind error, a trace span
+/// — redacts it instead of echoing the secret.
+///
+/// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+#[derive(Clone, PartialEq, Eq)]
+pub struct Password(pub String);
+
+impl std::fmt::Debug for Password {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Password(<redacted>)")
+    }
 }
 
 /// An operator-facing storage durability command, triggered over the wire.
@@ -83,24 +140,25 @@ impl Statement {
     }
 
     /// The standard-SQL body, or `None` if this is an admin command
-    /// ([`StatementBody::Admin`]) with no `sqlparser` AST. The binders and the
-    /// wire layer's statement-shape checks read the body through this, so an admin
-    /// command cleanly classifies as "none of the SQL routes".
+    /// ([`StatementBody::Admin`]) or user DDL ([`StatementBody::User`]) with no
+    /// `sqlparser` AST. The binders and the wire layer's statement-shape checks
+    /// read the body through this, so a lifted statement cleanly classifies as
+    /// "none of the SQL routes".
     #[must_use]
     pub const fn sql(&self) -> Option<&SqlStatement> {
         match &self.body {
             StatementBody::Sql(body) => Some(body),
-            StatementBody::Admin(_) => None,
+            StatementBody::Admin(_) | StatementBody::User(_) => None,
         }
     }
 
     /// The standard-SQL body for an in-place rewrite (extended-protocol parameter
-    /// substitution), or `None` for an admin command.
+    /// substitution), or `None` for an admin command or user DDL.
     #[must_use]
     pub const fn sql_mut(&mut self) -> Option<&mut SqlStatement> {
         match &mut self.body {
             StatementBody::Sql(body) => Some(body),
-            StatementBody::Admin(_) => None,
+            StatementBody::Admin(_) | StatementBody::User(_) => None,
         }
     }
 }

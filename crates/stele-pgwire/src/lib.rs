@@ -86,6 +86,7 @@
 mod binary_format;
 mod extended;
 mod pg_catalog;
+mod scram;
 mod text_format;
 mod tls;
 
@@ -105,6 +106,7 @@ pub use tls::{ServerTls, TlsError, TlsMode, TlsSettings};
 use stele_catalog::CatalogError;
 use stele_common::hashkey::hash_key;
 use stele_common::metrics::SharedMetrics;
+use stele_common::scram::ScramVerifier;
 use stele_common::time::Clock;
 use stele_common::types::{DecodeError, LogicalType, ScalarValue};
 use stele_engine::{
@@ -177,6 +179,14 @@ const SQLSTATE_SYNTAX_ERROR: &str = "42601";
 /// `invalid_authorization_specification` — the class Postgres itself uses to
 /// reject a plaintext connection when `pg_hba.conf` demands SSL (STL-251).
 const SQLSTATE_INVALID_AUTHORIZATION: &str = "28000";
+/// `invalid_password` — a failed SCRAM proof or an unknown user (the two are
+/// deliberately indistinguishable on the wire), exactly Postgres's code for a
+/// failed password authentication (STL-252).
+const SQLSTATE_INVALID_PASSWORD: &str = "28P01";
+// User-DDL SQLSTATEs (STL-252): the codes Postgres returns for role catalog
+// failures, so stock clients classify them natively.
+const SQLSTATE_DUPLICATE_OBJECT: &str = "42710";
+const SQLSTATE_UNDEFINED_OBJECT: &str = "42704";
 // DDL-routing SQLSTATEs (STL-131): the standard Postgres codes for the catalog
 // failures a `CREATE`/`DROP TABLE` can hit, so a stock client classifies them
 // the way it would against Postgres.
@@ -338,6 +348,18 @@ pub trait SessionHandle: Send {
     fn metrics(&self) -> SharedMetrics {
         SharedMetrics::default()
     }
+
+    /// The stored SCRAM verifier for `user` — what the SASL exchange
+    /// authenticates against when the server runs `auth = "scram"`
+    /// ([STL-252]); see [`SessionEngine::auth_verifier`]. Defaults to `None`
+    /// ("unknown user", every authentication refused) so session fakes that
+    /// never serve a SCRAM listener need not implement it.
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    fn auth_verifier(&self, user: &str) -> Option<ScramVerifier> {
+        let _ = user;
+        None
+    }
 }
 
 impl<C, D> SessionHandle for SessionEngine<C, D>
@@ -395,6 +417,10 @@ where
     fn metrics(&self) -> SharedMetrics {
         Arc::clone(Self::metrics(self))
     }
+
+    fn auth_verifier(&self, user: &str) -> Option<ScramVerifier> {
+        Self::auth_verifier(self, user)
+    }
 }
 
 /// A session handle shared across connections: one engine behind a mutex, with
@@ -407,12 +433,30 @@ where
 /// released entirely within synchronous helpers.
 pub type SharedSession = Arc<Mutex<dyn SessionHandle>>;
 
+/// How connections authenticate before the OK bundle ([STL-252]).
+///
+/// The server-level policy — every connection gets the same treatment
+/// (per-host/per-user rules à la `pg_hba.conf` are out of scope at v0.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthMode {
+    /// No authentication: every startup is accepted as-is (the v0.1 posture,
+    /// and the dev default). The startup `user` parameter is taken on faith.
+    #[default]
+    Trust,
+    /// SASL SCRAM-SHA-256 ([RFC 7677]): the client must prove possession of
+    /// the password for an existing user before anything else is served.
+    ///
+    /// [RFC 7677]: https://www.rfc-editor.org/rfc/rfc7677
+    Scram,
+}
+
 /// pgwire front-end entry point. Bind, accept, dispatch.
 #[derive(Clone)]
 pub struct Server {
     listen_addr: SocketAddr,
     session: SharedSession,
     tls: Option<Arc<ServerTls>>,
+    auth: AuthMode,
 }
 
 impl Server {
@@ -422,6 +466,7 @@ impl Server {
             listen_addr,
             session,
             tls: None,
+            auth: AuthMode::default(),
         }
     }
 
@@ -434,6 +479,17 @@ impl Server {
     #[must_use]
     pub fn with_tls(mut self, tls: ServerTls) -> Self {
         self.tls = Some(Arc::new(tls));
+        self
+    }
+
+    /// Set the authentication policy ([STL-252]). [`AuthMode::Scram`] runs the
+    /// SASL SCRAM-SHA-256 exchange against the session's user store before any
+    /// statement is served; the default is [`AuthMode::Trust`] (no auth).
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    #[must_use]
+    pub const fn with_auth(mut self, auth: AuthMode) -> Self {
+        self.auth = auth;
         self
     }
 
@@ -456,6 +512,7 @@ impl Server {
             local_addr,
             session: self.session,
             tls: self.tls,
+            auth: self.auth,
         })
     }
 
@@ -482,6 +539,7 @@ pub struct BoundServer {
     local_addr: SocketAddr,
     session: SharedSession,
     tls: Option<Arc<ServerTls>>,
+    auth: AuthMode,
 }
 
 impl BoundServer {
@@ -522,16 +580,20 @@ impl BoundServer {
             let _ = stream.set_nodelay(true);
             let session = Arc::clone(&self.session);
             let tls = self.tls.clone();
+            let auth = self.auth;
             let metrics = Arc::clone(&metrics);
             metrics.connections_total.inc();
             metrics.connections_active.inc();
             tokio::spawn(async move {
-                match handle_connection(stream, peer, session, tls, &metrics).await {
+                match handle_connection(stream, peer, session, tls, auth, &metrics).await {
                     Ok(()) => {}
                     // Expected, policy- or client-driven closures (a plaintext
-                    // attempt against tls = "required", a CancelRequest): not a
-                    // server-side problem, so don't page anyone over them.
-                    Err(e @ (WireError::TlsRequired | WireError::Cancelled)) => {
+                    // attempt against tls = "required", a refused authentication,
+                    // a CancelRequest): not a server-side problem, so don't page
+                    // anyone over them.
+                    Err(
+                        e @ (WireError::TlsRequired | WireError::Cancelled | WireError::AuthFailed),
+                    ) => {
                         debug!(%peer, error = %e, "connection closed");
                     }
                     Err(e) => warn!(%peer, error = %e, "connection closed with error"),
@@ -566,6 +628,14 @@ pub enum WireError {
     /// [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
     #[error("plaintext startup refused: server requires TLS")]
     TlsRequired,
+
+    /// The SASL exchange refused the connection ([STL-252]) — a failed proof,
+    /// an unknown user, or an unsupported mechanism/policy. The client already
+    /// got the `FATAL` with the right SQLSTATE before the connection closed.
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    #[error("authentication failed")]
+    AuthFailed,
 }
 
 /// The duplex byte stream a connection runs over — a plain [`TcpStream`] or
@@ -672,12 +742,16 @@ fn txn_control(stmt: &Statement) -> Option<TxnControl<'_>> {
     }
 }
 
-#[instrument(skip(stream, session, tls, metrics), fields(%peer))]
+// The `user` field starts empty and is recorded once SCRAM authentication
+// succeeds, so the connection span carries the *authenticated* identity
+// (STL-107 × STL-252) — never the unverified startup parameter.
+#[instrument(skip(stream, session, tls, auth, metrics), fields(%peer, user = tracing::field::Empty))]
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
     session: SharedSession,
     tls: Option<Arc<ServerTls>>,
+    auth: AuthMode,
     metrics: &SharedMetrics,
 ) -> Result<(), WireError> {
     // --- 1. Startup phase --------------------------------------------------
@@ -685,10 +759,10 @@ async fn handle_connection(
     // protocol proper then runs identically over either stream.
     match negotiate_startup(stream, tls.as_deref()).await? {
         Negotiated::Plain(mut stream, startup) => {
-            run_session(&mut stream, startup, session, metrics).await
+            run_session(&mut stream, startup, session, auth, metrics).await
         }
         Negotiated::Tls(mut stream, startup) => {
-            run_session(stream.as_mut(), startup, session, metrics).await
+            run_session(stream.as_mut(), startup, session, auth, metrics).await
         }
     }
 }
@@ -776,17 +850,27 @@ async fn negotiate_startup(
     }
 }
 
-/// Run the post-negotiation protocol — the OK bundle, then the message loop —
-/// over an established (plain or TLS) stream.
+/// Run the post-negotiation protocol — authentication, the OK bundle, then
+/// the message loop — over an established (plain or TLS) stream.
 async fn run_session<S: Wire>(
     stream: &mut S,
     startup: StartupMessage,
     session: SharedSession,
+    auth: AuthMode,
     metrics: &SharedMetrics,
 ) -> Result<(), WireError> {
     debug!(?startup.params, "startup complete");
 
-    // --- 2. Send the OK bundle: AuthOk → ParameterStatus → BackendKeyData → ReadyForQuery
+    // --- 2. Authenticate ([STL-252]): under `scram`, the SASL exchange must
+    // succeed before anything else is served; the authenticated identity then
+    // lands on the connection span (STL-107). `trust` skips straight to the
+    // OK bundle (the v0.1 posture, and the dev default).
+    if auth == AuthMode::Scram {
+        let user = scram::authenticate(stream, &startup, &session).await?;
+        tracing::Span::current().record("user", user.as_str());
+    }
+
+    // --- 3. Send the OK bundle: AuthOk → ParameterStatus → BackendKeyData → ReadyForQuery
     write_authentication_ok(stream).await?;
     for (k, v) in default_parameter_status() {
         write_parameter_status(stream, k, v).await?;
@@ -801,7 +885,7 @@ async fn run_session<S: Wire>(
     // connection (STL-174).
     let mut txn = ConnTxn::Idle;
 
-    // --- 3. Message loop --------------------------------------------------
+    // --- 4. Message loop --------------------------------------------------
     // The extended-query caches (prepared statements + portals) and the
     // "skip until Sync" error latch live for the whole connection.
     let mut state = ConnState::default();
@@ -1596,7 +1680,11 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
         | EngineError::SchemaChanged { .. }
         | EngineError::MalformedValidBound
         | EngineError::MalformedBusinessKey
+        | EngineError::Entropy(_)
         | EngineError::MalformedMergeSource => SQLSTATE_INTERNAL_ERROR,
+        // User DDL against the user store ([STL-252]) — the role codes.
+        EngineError::DuplicateUser(_) => SQLSTATE_DUPLICATE_OBJECT,
+        EngineError::UnknownUser(_) => SQLSTATE_UNDEFINED_OBJECT,
         // Two MERGE source rows resolving to one target row — the standard's
         // cardinality violation, refused before any write applies (STL-230).
         EngineError::MergeRowTwice => SQLSTATE_CARDINALITY_VIOLATION,
@@ -1738,6 +1826,10 @@ const fn sqlstate_for(err: &EngineError) -> &'static str {
         EngineError::Catalog(_) | EngineError::ValidTimePolicyChange { .. } => {
             SQLSTATE_INVALID_TABLE_DEFINITION
         }
+        // User DDL against the user store ([STL-252]) — the codes Postgres
+        // returns for `CREATE`/`DROP ROLE` failures.
+        EngineError::DuplicateUser(_) => SQLSTATE_DUPLICATE_OBJECT,
+        EngineError::UnknownUser(_) => SQLSTATE_UNDEFINED_OBJECT,
         // Storage/scan/select/unknown-table/unsupported can't arise from a DDL
         // route, but map them rather than panic if the contract ever shifts.
         _ => SQLSTATE_INTERNAL_ERROR,
@@ -3039,6 +3131,7 @@ mod tests {
                 peer,
                 test_session(),
                 None,
+                AuthMode::Trust,
                 &SharedMetrics::default(),
             )
             .await
@@ -3538,6 +3631,7 @@ mod tests {
                 peer,
                 test_session(),
                 None,
+                AuthMode::Trust,
                 &SharedMetrics::default(),
             )
             .await
@@ -3636,6 +3730,7 @@ mod tests {
                 peer,
                 test_session(),
                 None,
+                AuthMode::Trust,
                 &SharedMetrics::default(),
             )
             .await
@@ -3715,6 +3810,7 @@ mod tests {
                 peer,
                 test_session(),
                 None,
+                AuthMode::Trust,
                 &SharedMetrics::default(),
             )
             .await

@@ -6,7 +6,7 @@
 //! grammar. The negative cases pin what the parser must reject.
 
 use sqlparser::ast::{SetExpr, Statement as SqlStatement, TableFactor};
-use stele_sql::{AdminCommand, StatementBody, TimeDimension, parse};
+use stele_sql::{AdminCommand, Password, StatementBody, TimeDimension, UserDdl, parse};
 
 /// The canonical four-statement identity demo.
 const DEMO: &str = "\
@@ -241,7 +241,7 @@ fn parses_checkpoint_and_flush_as_admin_commands() {
         assert!(stmts[0].sql().is_none(), "{sql:?} has no SQL body");
         match &stmts[0].body {
             StatementBody::Admin(cmd) => assert_eq!(*cmd, want, "{sql:?}"),
-            StatementBody::Sql(_) => panic!("{sql:?} must be an admin command"),
+            other => panic!("{sql:?} must be an admin command, got {other:?}"),
         }
     }
 }
@@ -252,6 +252,103 @@ fn admin_commands_take_no_arguments() {
     assert!(parse("CHECKPOINT 5").is_err());
     assert!(parse("FLUSH TABLES").is_err());
     assert!(parse("COMPACT t").is_err());
+}
+
+// --- user DDL (STL-252) ----------------------------------------------------
+
+#[test]
+fn parses_the_user_ddl_family() {
+    // The Postgres-compatible forms, lifted at the token level (sqlparser's
+    // CREATE USER grammar is Snowflake's `KEY = VALUE`, which would reject
+    // `PASSWORD '…'`). Keyword case-insensitive; names verbatim.
+    let cases: &[(&str, UserDdl)] = &[
+        (
+            "CREATE USER alice PASSWORD 's3cret'",
+            UserDdl::CreateUser {
+                name: "alice".to_owned(),
+                password: Password("s3cret".to_owned()),
+            },
+        ),
+        (
+            "create user Bob with password 'p w';",
+            UserDdl::CreateUser {
+                name: "Bob".to_owned(),
+                password: Password("p w".to_owned()),
+            },
+        ),
+        (
+            "ALTER USER alice WITH PASSWORD 'rotated'",
+            UserDdl::AlterUserPassword {
+                name: "alice".to_owned(),
+                password: Password("rotated".to_owned()),
+            },
+        ),
+        (
+            "DROP USER alice",
+            UserDdl::DropUser {
+                name: "alice".to_owned(),
+                if_exists: false,
+            },
+        ),
+        (
+            "DROP USER IF EXISTS ghost",
+            UserDdl::DropUser {
+                name: "ghost".to_owned(),
+                if_exists: true,
+            },
+        ),
+    ];
+    for (sql, want) in cases {
+        let stmts = parse(sql).unwrap_or_else(|e| panic!("parse {sql:?}: {e}"));
+        assert_eq!(stmts.len(), 1, "{sql:?} is one statement");
+        assert!(stmts[0].sql().is_none(), "{sql:?} has no SQL body");
+        match &stmts[0].body {
+            StatementBody::User(ddl) => assert_eq!(ddl, want, "{sql:?}"),
+            other => panic!("{sql:?} must be user DDL, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn malformed_user_ddl_is_a_loud_syntax_error() {
+    // Once the `<verb> USER` prefix matches, the tail must parse exactly —
+    // nothing falls through to sqlparser's Snowflake-shaped grammar.
+    for sql in [
+        "CREATE USER alice",                                                // no password
+        "CREATE USER alice PASSWORD",                                       // dangling keyword
+        "CREATE USER alice PASSWORD s3cret",                                // unquoted password
+        "CREATE USER alice PASSWORD 'pw' LOGIN",                            // trailing option
+        "CREATE USER alice SUPERUSER",                                      // unsupported option
+        "CREATE USER alice PASSWORD ''",                                    // empty password
+        "ALTER USER alice",                                                 // nothing to alter
+        "DROP USER",                                                        // no name
+        "DROP USER alice bob",                                              // trailing junk
+        "DROP USER IF EXISTS", // no name after IF EXISTS
+        "CREATE USER alice WITH PASSWORD 'pw' FOR SYSTEM_TIME AS OF now()", // temporal misuse
+    ] {
+        assert!(parse(sql).is_err(), "{sql:?} must be rejected");
+    }
+}
+
+#[test]
+fn user_ddl_password_is_redacted_in_debug_output() {
+    // The parsed statement gets Debug-printed in traces and assertion
+    // messages; the password literal must never surface there.
+    let stmts = parse("CREATE USER alice PASSWORD 'hunter2'").expect("parses");
+    let rendered = format!("{:?}", stmts[0]);
+    assert!(!rendered.contains("hunter2"), "{rendered}");
+    assert!(rendered.contains("<redacted>"), "{rendered}");
+}
+
+#[test]
+fn quoted_user_names_are_preserved_verbatim() {
+    let stmts = parse("CREATE USER \"Mixed Case\" PASSWORD 'pw'").expect("parses");
+    match &stmts[0].body {
+        StatementBody::User(UserDdl::CreateUser { name, .. }) => {
+            assert_eq!(name, "Mixed Case");
+        }
+        other => panic!("expected CREATE USER, got {other:?}"),
+    }
 }
 
 #[test]

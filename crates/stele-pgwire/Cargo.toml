@@ -27,6 +27,8 @@ tracing       = { workspace = true }
 rustls           = { workspace = true }
 tokio-rustls     = { workspace = true }
 rustls-pki-types = { workspace = true }
+# Fresh per-connection SASL server nonces (STL-252).
+getrandom        = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt", "rt-multi-thread", "macros"] }

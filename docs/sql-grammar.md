@@ -205,6 +205,32 @@ Rejected with a roadmap pointer until their sibling tickets land: `UNIQUE`,
 multi-column and expression columns, partial indexes (`… WHERE`), `INCLUDE`,
 `CONCURRENTLY`, `IF NOT EXISTS`, and per-column `ASC`/`DESC`/`NULLS` ordering.
 
+### `CREATE USER` / `ALTER USER` / `DROP USER` — authentication (STL-252)
+
+```sql
+CREATE USER alice PASSWORD 's3cret';
+ALTER USER alice WITH PASSWORD 'rotated';   -- WITH is optional
+DROP USER alice;
+DROP USER IF EXISTS alice;
+```
+
+The pg-wire authentication user store (docs/10 §5). Like the admin commands,
+the family is **lifted at the token level**: `sqlparser` parses `CREATE USER`
+with Snowflake's `KEY = VALUE` option grammar, which rejects the Postgres
+`PASSWORD '…'` form — so the lift owns the grammar and a malformed tail is a
+loud syntax error. The engine derives a salted, iterated **SCRAM-SHA-256
+verifier** (RFC 7677) and appends it to the durable catalog log (ADR-0028) —
+the password itself is never stored, and the parsed AST redacts it from
+`Debug` output. Command tags are Postgres's role tags (`CREATE ROLE` /
+`ALTER ROLE` / `DROP ROLE`); a duplicate `CREATE USER` is `42710`, an unknown
+`ALTER`/`DROP USER` is `42704`. User names are matched verbatim (no
+case-folding), like table and column names. The empty password is rejected at
+parse time.
+
+Out of scope until their tickets land: role options (`LOGIN`, `SUPERUSER`,
+`CREATEDB`, …), `CREATE ROLE`/`GRANT` (RBAC is v0.5), `IF NOT EXISTS`, and
+`RENAME TO`.
+
 ## Query binding (STL-101, STL-162)
 
 `stele_sql::bind_select` lowers a `SELECT … [FOR SYSTEM_TIME AS OF <s>]
@@ -411,7 +437,8 @@ rather than silently coerced; these are deliberate later additions.
 Statement
 ├── body: StatementBody
 │   ├── Sql(sqlparser::ast::Statement)   // standard SQL, clauses stripped
-│   └── Admin(AdminCommand)              // CHECKPOINT | FLUSH | COMPACT — no sqlparser grammar
+│   ├── Admin(AdminCommand)              // CHECKPOINT | FLUSH | COMPACT — no sqlparser grammar
+│   └── User(UserDdl)                    // CREATE | ALTER | DROP USER (STL-252)
 └── temporal: Temporal
     ├── system_versioning: bool         // WITH SYSTEM VERSIONING
     ├── valid_time: Option<ValidTimePeriod>   // VALID TIME (from, to)
@@ -426,8 +453,9 @@ Statement
 
 A statement with no temporal grammar carries `Temporal::default()` (all empty);
 `Statement::is_temporal()` reports the difference. `Statement::sql()` returns the
-standard-SQL body, or `None` for an admin command — the seam the binders and the
-wire layer read so an admin command cleanly classifies as "none of the SQL routes".
+standard-SQL body, or `None` for an admin command or user DDL — the seam the
+binders and the wire layer read so a lifted statement cleanly classifies as
+"none of the SQL routes".
 
 ## Admin commands (STL-219, STL-231)
 

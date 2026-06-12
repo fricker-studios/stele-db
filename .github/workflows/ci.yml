@@ -233,13 +233,76 @@ jobs:
         run: /tmp/psycopg-venv/bin/python ci/psycopg-smoke.py localhost 5455 require
       - name: Driver gate (TLS) — pgjdbc connects with sslmode=require
         run: ci/jdbc-smoke.sh localhost 5455 require
+      # The SCRAM leg (STL-252): the documented operator bootstrap, run for
+      # real. A seed container boots TLS-required + trust on a fresh data
+      # volume and CREATE USERs the CI principal; a second container boots the
+      # SAME volume with [auth] (scram) — proving verifiers survive a restart —
+      # and psql, psycopg, and pgjdbc each authenticate via SCRAM-SHA-256. A
+      # wrong password must be refused with the 28P01 FATAL.
+      - name: Bootstrap a SCRAM user store (trust boot → CREATE USER → restart)
+        run: |
+          mkdir -p /tmp/stele-auth
+          cp /tmp/stele-tls/server.crt /tmp/stele-tls/server.key /tmp/stele-auth/
+          cat > /tmp/stele-auth/stele.toml <<'CONF'
+          [server]
+          listen = "0.0.0.0:5454"
+          data_dir = "/var/lib/stele"
+          [tls]
+          mode = "required"
+          cert = "/etc/stele/server.crt"
+          key  = "/etc/stele/server.key"
+          CONF
+          docker volume create stele-auth-data
+          docker run -d --name stele-auth-seed -p 5456:5454 \
+            -v /tmp/stele-auth:/etc/stele:ro \
+            -v stele-auth-data:/var/lib/stele stele:ci
+          CONN="host=localhost port=5456 user=stele dbname=stele sslmode=require"
+          for _ in $(seq 1 30); do
+            psql "$CONN" -c "SELECT 1" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          psql "$CONN" -c "CREATE USER ci PASSWORD 'ci-s3cret'"
+          docker rm -f stele-auth-seed
+          cat >> /tmp/stele-auth/stele.toml <<'CONF'
+          [auth]
+          mode = "scram"
+          CONF
+          docker run -d --name stele-auth -p 5456:5454 \
+            -v /tmp/stele-auth:/etc/stele:ro \
+            -v stele-auth-data:/var/lib/stele stele:ci
+      - name: Driver gate (SCRAM) — psql authenticates via SCRAM-SHA-256
+        run: |
+          CONN="host=localhost port=5456 user=ci dbname=stele sslmode=require"
+          for _ in $(seq 1 30); do
+            PGPASSWORD=ci-s3cret psql "$CONN" -c "SELECT 1" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          PGPASSWORD=ci-s3cret psql "$CONN" -tA -c "SELECT 1" | grep -qx 1
+      - name: Driver gate (SCRAM) — a wrong password is refused with 28P01
+        run: |
+          set +e
+          OUT=$(PGPASSWORD=wrong psql \
+            "host=localhost port=5456 user=ci dbname=stele sslmode=require" \
+            -c "SELECT 1" 2>&1)
+          STATUS=$?
+          set -e
+          echo "$OUT"
+          test "$STATUS" -ne 0
+          echo "$OUT" | grep -q "password authentication failed"
+      - name: Driver gate (SCRAM) — psycopg authenticates via SCRAM-SHA-256
+        run: /tmp/psycopg-venv/bin/python ci/psycopg-smoke.py localhost 5456 require ci ci-s3cret
+      - name: Driver gate (SCRAM) — pgjdbc authenticates via SCRAM-SHA-256
+        run: ci/jdbc-smoke.sh localhost 5456 require ci ci-s3cret
       - name: Engine logs
         if: always()
         run: |
           docker logs stele || true
           docker logs stele-tls || true
+          docker logs stele-auth || true
       - name: Stop the engine
         if: always()
         run: |
           docker rm -f stele || true
           docker rm -f stele-tls || true
+          docker rm -f stele-auth || true
+          docker volume rm stele-auth-data || true

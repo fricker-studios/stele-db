@@ -26,8 +26,8 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 use stele_common::period::PeriodPredicate;
 
 use crate::ast::{
-    AdminCommand, AsOf, PeriodExpr, PeriodPredicateClause, Statement, StatementBody, Temporal,
-    TimeDimension, ValidTimePeriod,
+    AdminCommand, AsOf, Password, PeriodExpr, PeriodPredicateClause, Statement, StatementBody,
+    Temporal, TimeDimension, UserDdl, ValidTimePeriod,
 };
 use crate::dialect::SteleDialect;
 use crate::error::ParseError;
@@ -104,6 +104,18 @@ fn parse_one(mut tokens: Vec<Token>) -> Result<Statement, ParseError> {
         });
     }
 
+    // User DDL (`CREATE`/`ALTER`/`DROP USER`, [STL-252]) is lifted the same
+    // way: `sqlparser` parses the family with Snowflake's `KEY = VALUE` option
+    // grammar and rejects the Postgres `PASSWORD '…'` form Stele speaks. Like
+    // an admin command, user DDL carries no temporal grammar — a stray
+    // temporal clause fails the strict pattern and errors loudly.
+    if let Some(user) = lift_user_ddl(&tokens)? {
+        return Ok(Statement {
+            body: StatementBody::User(user),
+            temporal: Temporal::default(),
+        });
+    }
+
     let (system_versioning, valid_time) = extract_create_table_clauses(&mut tokens)?;
     let as_of = lift_as_of(&mut tokens, &dialect)?;
     let period_predicate = lift_period_predicate(&mut tokens, &dialect)?;
@@ -174,6 +186,97 @@ fn lift_admin_command(tokens: &[Token]) -> Result<Option<AdminCommand>, ParseErr
         ))));
     }
     Ok(Some(cmd))
+}
+
+/// Recognize Stele's user-administration DDL ([STL-252]):
+///
+/// ```text
+/// CREATE USER <name> [WITH] PASSWORD '<password>'
+/// ALTER  USER <name> [WITH] PASSWORD '<password>'
+/// DROP   USER [IF EXISTS] <name>
+/// ```
+///
+/// Returns `None` when the tokens do not start with one of the three verbs
+/// followed by `USER` (the statement belongs to another route); once the
+/// prefix matches, the rest must parse **exactly** — a malformed tail is a
+/// loud syntax error, never a fall-through to `sqlparser`'s Snowflake-shaped
+/// `KEY = VALUE` grammar for the same statements.
+fn lift_user_ddl(tokens: &[Token]) -> Result<Option<UserDdl>, ParseError> {
+    let verb = match tokens.first() {
+        Some(t) if word_is(t, "CREATE") => "CREATE",
+        Some(t) if word_is(t, "ALTER") => "ALTER",
+        Some(t) if word_is(t, "DROP") => "DROP",
+        _ => return Ok(None),
+    };
+    if !tokens.get(1).is_some_and(|t| word_is(t, "USER")) {
+        return Ok(None);
+    }
+    let syntax = |msg: String| ParseError::Syntax(ParserError::ParserError(msg));
+    let rest = &tokens[2..];
+
+    if verb == "DROP" {
+        // DROP USER [IF EXISTS] <name>
+        let (if_exists, rest) = if rest.first().is_some_and(|t| word_is(t, "IF"))
+            && rest.get(1).is_some_and(|t| word_is(t, "EXISTS"))
+        {
+            (true, &rest[2..])
+        } else {
+            (false, rest)
+        };
+        let [name_tok] = rest else {
+            return Err(syntax("expected DROP USER [IF EXISTS] <name>".to_owned()));
+        };
+        let name = token_as_ident(name_tok)
+            .ok_or_else(|| syntax(format!("expected a user name, found: {name_tok}")))?;
+        return Ok(Some(UserDdl::DropUser {
+            name: name.value,
+            if_exists,
+        }));
+    }
+
+    // CREATE | ALTER USER <name> [WITH] PASSWORD '<password>'
+    let Some(name_tok) = rest.first() else {
+        return Err(syntax(format!(
+            "expected {verb} USER <name> [WITH] PASSWORD '<password>'"
+        )));
+    };
+    let name = token_as_ident(name_tok)
+        .ok_or_else(|| syntax(format!("expected a user name, found: {name_tok}")))?;
+    let mut rest = &rest[1..];
+    if rest.first().is_some_and(|t| word_is(t, "WITH")) {
+        rest = &rest[1..];
+    }
+    let [password_kw, password_tok] = rest else {
+        return Err(syntax(format!(
+            "expected {verb} USER <name> [WITH] PASSWORD '<password>'"
+        )));
+    };
+    if !word_is(password_kw, "PASSWORD") {
+        return Err(syntax(format!(
+            "expected PASSWORD, found: {password_kw} \
+             (only the PASSWORD option is supported on {verb} USER)"
+        )));
+    }
+    let Token::SingleQuotedString(password) = password_tok else {
+        return Err(syntax(format!(
+            "expected a single-quoted password string, found: {password_tok}"
+        )));
+    };
+    if password.is_empty() {
+        return Err(syntax("password must not be empty".to_owned()));
+    }
+    let password = Password(password.clone());
+    Ok(Some(if verb == "CREATE" {
+        UserDdl::CreateUser {
+            name: name.value,
+            password,
+        }
+    } else {
+        UserDdl::AlterUserPassword {
+            name: name.value,
+            password,
+        }
+    }))
 }
 
 /// Whether a token is an (unquoted) word equal to `kw`, case-insensitively.

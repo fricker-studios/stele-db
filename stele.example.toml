@@ -47,6 +47,25 @@ data_dir = "/var/lib/stele"
 # client_ca = "/etc/stele/clients.crt"  # optional: require mTLS — every client
 #                                       # must present a cert chaining to this CA
 
+# [auth]                         # pg-wire authentication (active; STL-252)
+# SASL SCRAM-SHA-256 (RFC 7677), the standard Postgres password exchange:
+# psql, psycopg, and pgjdbc all speak it natively. The server stores salted,
+# iterated SCRAM *verifiers* in the durable catalog — never passwords — and
+# they survive restarts. Without this section connections are unauthenticated
+# ("trust" — the dev posture; a non-dev boot warns).
+#
+# Bootstrap the first user before enabling: boot once WITHOUT [auth] (trust
+# over loopback, or behind [tls]), run
+#     CREATE USER admin PASSWORD 'change-me';
+# then uncomment the section and restart. Manage users over SQL afterwards:
+# CREATE USER / ALTER USER <name> [WITH] PASSWORD '…' / DROP USER [IF EXISTS].
+#
+# mode = "scram"                 # "scram" (default once [auth] is present):
+#                                #   every connection runs the SASL exchange;
+#                                #   wrong password / unknown user → FATAL 28P01
+#                                # "trust": no authentication — the bootstrap
+#                                #   and dev posture
+
 [storage]
 # Which storage backend the engine boots on. (active) One of:
 #   "local"  — durable, rooted at [server] data_dir (the default). What lands

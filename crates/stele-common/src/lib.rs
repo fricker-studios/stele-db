@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod period;
 pub mod provenance;
 pub mod row_codec;
+pub mod scram;
 pub mod time;
 pub mod types;
 

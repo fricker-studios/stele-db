@@ -24,7 +24,7 @@ use serde::Deserialize;
 use stele_common::DEFAULT_PG_PORT;
 use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
-use stele_pgwire::{Server as PgServer, ServerTls, SharedSession, TlsMode, TlsSettings};
+use stele_pgwire::{AuthMode, Server as PgServer, ServerTls, SharedSession, TlsMode, TlsSettings};
 use stele_storage::backend::{AnyDisk, BackendKind};
 use tokio::signal;
 use tracing::{info, warn};
@@ -62,6 +62,13 @@ pub struct Config {
     ///
     /// [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
     pub tls: Option<TlsSettings>,
+    /// pg-wire authentication ([STL-252]): the `[auth]` section's mode.
+    /// [`AuthMode::Trust`] when the section is absent (and always in dev);
+    /// an `[auth]` section defaults to `"scram"` — configuring authentication
+    /// means wanting it, the same secure-defaults posture as `[tls]`.
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    pub auth: AuthMode,
 }
 
 impl Config {
@@ -77,6 +84,7 @@ impl Config {
             data_dir: dev_scratch_dir(),
             metrics_listen: default_metrics_listen(),
             tls: None,
+            auth: AuthMode::Trust,
         }
     }
 
@@ -121,6 +129,7 @@ struct FileConfig {
     #[serde(default)]
     telemetry: TelemetrySection,
     tls: Option<TlsSection>,
+    auth: Option<AuthSection>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -188,6 +197,31 @@ impl TlsSection {
     }
 }
 
+/// The `[auth]` section ([STL-252]): pg-wire authentication. `mode` defaults
+/// to `"scram"` — configuring authentication means wanting it, the same
+/// posture as `[tls]` defaulting to `"required"`.
+///
+/// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+#[derive(Debug, Default, Deserialize)]
+struct AuthSection {
+    /// `"scram"` (default) | `"trust"`.
+    mode: Option<String>,
+}
+
+impl AuthSection {
+    fn resolve(self) -> anyhow::Result<AuthMode> {
+        match self.mode.as_deref().unwrap_or("scram") {
+            "scram" => Ok(AuthMode::Scram),
+            // Explicitly configured trust — handy for keeping the section in
+            // the file while bootstrapping the first user.
+            "trust" => Ok(AuthMode::Trust),
+            other => anyhow::bail!(
+                "[auth] mode {other:?} is not recognized (expected \"scram\" or \"trust\")"
+            ),
+        }
+    }
+}
+
 impl FileConfig {
     fn resolve(self) -> anyhow::Result<Config> {
         let backend = match self.storage.backend.as_deref() {
@@ -209,6 +243,9 @@ impl FileConfig {
                 .metrics
                 .unwrap_or_else(default_metrics_listen),
             tls: self.tls.map(TlsSection::resolve).transpose()?.flatten(),
+            auth: self
+                .auth
+                .map_or(Ok(AuthMode::Trust), AuthSection::resolve)?,
         })
     }
 }
@@ -260,6 +297,21 @@ fn plaintext_posture(cfg: &Config) -> PlaintextPosture {
     }
 }
 
+/// The boot-time authentication warning for `cfg`, if any ([STL-252]).
+///
+/// A non-dev server running `trust` accepts any startup as any identity, so it
+/// warns — unless mTLS is on, where the client certificate *is* the
+/// authentication story. Dev stays friction-free, exactly like the plaintext
+/// posture.
+fn auth_posture(cfg: &Config) -> Option<String> {
+    let mtls = cfg.tls.as_ref().is_some_and(|tls| tls.client_ca.is_some());
+    (!cfg.dev && cfg.auth == AuthMode::Trust && !mtls).then(|| {
+        "no [auth] configured: pg-wire connections are UNAUTHENTICATED (trust); \
+         configure [auth] mode = \"scram\" (and CREATE USER) before exposing this server"
+            .to_owned()
+    })
+}
+
 /// Boot the engine.
 ///
 /// Install tracing, apply the plaintext posture, start the ops HTTP listener,
@@ -277,6 +329,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         PlaintextPosture::Proceed => {}
         PlaintextPosture::Warn(msg) => warn!("{msg}"),
         PlaintextPosture::Refuse(msg) => anyhow::bail!(msg),
+    }
+    // The authentication half of the same posture (STL-252).
+    if let Some(msg) = auth_posture(&cfg) {
+        warn!("{msg}");
     }
 
     // Stand the ops HTTP listener up FIRST, before recovery runs (STL-253):
@@ -308,8 +364,19 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .context("recovering session engine from on-disk state")?;
     info!(
         tables = engine.describe_live_tables().len(),
+        users = engine.user_count(),
         "session engine ready"
     );
+    // SCRAM with an empty user store refuses every connection (STL-252) —
+    // boot anyway (the config is coherent), but say loudly how to get in.
+    if cfg.auth == AuthMode::Scram && engine.user_count() == 0 {
+        warn!(
+            "[auth] mode = \"scram\" but no users exist: every connection will be \
+             refused. Bootstrap: boot once without [auth] (trust, loopback or TLS), \
+             run CREATE USER <name> PASSWORD '<password>', then re-enable [auth] — \
+             verifiers are durable and survive the restart"
+        );
+    }
     // Give the registry real durations (STL-253). Only the production server
     // installs a time source — see [`uptime_micros`].
     engine.metrics().install_time_source(uptime_micros);
@@ -323,7 +390,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // Recovery is complete: flip `/readyz` (STL-253). From here it tracks the
     // engine's WAL-poison state live.
     ops_state.set_ready(Arc::clone(&session));
-    let mut pg = PgServer::new(cfg.listen, session);
+    let mut pg = PgServer::new(cfg.listen, session).with_auth(cfg.auth);
+    if cfg.auth == AuthMode::Scram {
+        info!("SCRAM-SHA-256 authentication enabled on pg-wire");
+    }
     if let Some(settings) = &cfg.tls {
         // Load certificate material now so a bad path / non-PEM file is a boot
         // error with context, not a per-connection surprise.
@@ -543,6 +613,11 @@ mod tests {
             cfg.tls.is_none(),
             "the example ships with [tls] commented out"
         );
+        assert_eq!(
+            cfg.auth,
+            AuthMode::Trust,
+            "the example ships with [auth] commented out"
+        );
         assert!(
             !matches!(plaintext_posture(&cfg), PlaintextPosture::Refuse(_)),
             "the committed example must boot"
@@ -617,6 +692,70 @@ mod tests {
     #[test]
     fn no_tls_section_means_no_tls() {
         assert!(Config::from_toml_str("").unwrap().tls.is_none());
+    }
+
+    // --- [auth] section (STL-252) -------------------------------------------
+
+    #[test]
+    fn no_auth_section_means_trust() {
+        assert_eq!(Config::from_toml_str("").unwrap().auth, AuthMode::Trust);
+        assert_eq!(Config::dev().auth, AuthMode::Trust, "dev stays auth-free");
+    }
+
+    #[test]
+    fn auth_section_defaults_to_scram() {
+        // Configuring authentication means wanting it — the bare section is
+        // the production posture, like [tls] defaulting to "required".
+        assert_eq!(
+            Config::from_toml_str("[auth]\n").unwrap().auth,
+            AuthMode::Scram
+        );
+        assert_eq!(
+            Config::from_toml_str("[auth]\nmode = \"scram\"\n")
+                .unwrap()
+                .auth,
+            AuthMode::Scram
+        );
+    }
+
+    #[test]
+    fn auth_trust_mode_is_the_explicit_opt_out() {
+        assert_eq!(
+            Config::from_toml_str("[auth]\nmode = \"trust\"\n")
+                .unwrap()
+                .auth,
+            AuthMode::Trust
+        );
+    }
+
+    #[test]
+    fn auth_unknown_mode_is_a_clear_config_error() {
+        let err = Config::from_toml_str("[auth]\nmode = \"md5\"\n").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("\"md5\""), "{msg}");
+        assert!(msg.contains("scram") && msg.contains("trust"), "{msg}");
+    }
+
+    #[test]
+    fn auth_posture_warns_on_non_dev_trust_without_mtls() {
+        // Non-dev trust is a warning…
+        let cfg = non_dev("127.0.0.1:5454", None);
+        let msg = auth_posture(&cfg).expect("trust warns");
+        assert!(msg.contains("UNAUTHENTICATED"), "{msg}");
+        assert!(msg.contains("scram"), "{msg}");
+
+        // …dev is friction-free, scram is silent…
+        assert_eq!(auth_posture(&Config::dev()), None);
+        let mut scram = non_dev("127.0.0.1:5454", None);
+        scram.auth = AuthMode::Scram;
+        assert_eq!(auth_posture(&scram), None);
+
+        // …and mTLS counts as authentication (the client cert is the identity).
+        let mut mtls = non_dev("0.0.0.0:5454", Some(TlsMode::Required));
+        if let Some(tls) = mtls.tls.as_mut() {
+            tls.client_ca = Some(PathBuf::from("ca.pem"));
+        }
+        assert_eq!(auth_posture(&mtls), None);
     }
 
     // --- secure-defaults posture (STL-251, docs/10 §4) -----------------------
