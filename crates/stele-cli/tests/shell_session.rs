@@ -10,13 +10,14 @@
 
 use std::io::Write as _;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
-use stele_pgwire::{Server, SharedSession};
+use stele_pgwire::{Server, ServerTls, SharedSession, TlsMode, TlsSettings};
 use stele_storage::backend::MemDisk;
 
 /// Boot a fresh engine + pgwire server on an ephemeral port (STL-152: the
@@ -31,6 +32,62 @@ async fn spawn_server() -> SocketAddr {
     let addr = bound.local_addr();
     tokio::spawn(bound.serve());
     addr
+}
+
+/// A self-signed CA + server certificate for `127.0.0.1`, written as PEM under
+/// a scratch dir (STL-251). Returns the cert/key paths for the server and the
+/// CA path for `--tls verify-full`.
+fn mint_tls(test: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let ca_key = rcgen::KeyPair::generate().expect("CA key");
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "stele shell test CA");
+    let ca_cert = ca_params.clone().self_signed(&ca_key).expect("CA cert");
+    let ca_pem = ca_cert.pem();
+    let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+    let key = rcgen::KeyPair::generate().expect("server key");
+    // The shell dials --host 127.0.0.1, so verify-full needs the IP SAN.
+    let params =
+        rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned()]).expect("server params");
+    let cert = params.signed_by(&key, &issuer).expect("server cert");
+
+    let dir = std::env::temp_dir().join(format!("stele-shell-tls-{}-{test}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let write = |name: &str, pem: &str| -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, pem).expect("write PEM");
+        path
+    };
+    (
+        write("server.crt", &cert.pem()),
+        write("server.key", &key.serialize_pem()),
+        write("ca.crt", &ca_pem),
+    )
+}
+
+/// Boot a TLS-required engine + pgwire server; returns the address + CA path.
+async fn spawn_tls_server(test: &str) -> (SocketAddr, PathBuf) {
+    let (cert, key, ca) = mint_tls(test);
+    let tls = ServerTls::load(&TlsSettings {
+        cert,
+        key,
+        client_ca: None,
+        mode: TlsMode::Required,
+    })
+    .expect("load TLS material");
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let bound = Server::new("127.0.0.1:0".parse().unwrap(), session)
+        .with_tls(tls)
+        .bind()
+        .await
+        .expect("bind ephemeral port");
+    let addr = bound.local_addr();
+    tokio::spawn(bound.serve());
+    (addr, ca)
 }
 
 /// Run `stele shell` (plus `extra` flags) against `addr`, feed it `script` on
@@ -282,4 +339,65 @@ SELECT id, balance FROM account;
     assert!(stdout.contains("| 1 |  1 |     100 |"), "{stdout}");
     assert!(stdout.contains("| 2 |  2 |     250 |"), "{stdout}");
     assert!(stdout.contains("(2 rows)"), "{stdout}");
+}
+
+// ---------------------------------------------------------------------------
+// TLS sessions (STL-251)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls_require_session_round_trips_encrypted() {
+    let (addr, _ca) = spawn_tls_server("require").await;
+    let script = "SELECT 1;\n\\q\n";
+    let output =
+        tokio::task::spawn_blocking(move || run_shell(addr, script, &["--tls", "require"]))
+            .await
+            .expect("shell task");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stderr.is_empty(), "clean session wrote to stderr: {stderr}");
+    assert!(stdout.contains("(1 row)"), "{stdout}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls_verify_full_checks_the_server_against_the_ca() {
+    let (addr, ca) = spawn_tls_server("verify-full").await;
+    let ca = ca.to_str().expect("utf-8 path").to_owned();
+    let script = "SELECT 1;\n\\q\n";
+    let output = tokio::task::spawn_blocking(move || {
+        run_shell(addr, script, &["--tls", "verify-full", "--tls-ca", &ca])
+    })
+    .await
+    .expect("shell task");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("(1 row)"), "{stdout}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls_require_fails_loudly_against_a_plaintext_server() {
+    // A server without TLS answers the SSLRequest with `N`; `--tls require`
+    // must refuse to continue rather than silently downgrade.
+    let addr = spawn_server().await;
+    let output =
+        tokio::task::spawn_blocking(move || run_shell(addr, "\\q\n", &["--tls", "require"]))
+            .await
+            .expect("shell task");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "shell must fail when the server refuses required TLS"
+    );
+    assert!(stderr.contains("refused TLS"), "{stderr}");
 }

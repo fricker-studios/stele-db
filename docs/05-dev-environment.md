@@ -313,6 +313,12 @@ data_dir   = "/var/lib/stele"
 backend    = "local"            # local | memory | s3
 # [storage.s3] bucket = "stele-cold"  endpoint = "http://minio:9000"
 
+[tls]                           # TLS on pg-wire (STL-251)
+mode       = "required"         # required (default) | optional | disabled
+cert       = "/etc/stele/server.crt"
+key        = "/etc/stele/server.key"
+# client_ca = "/etc/stele/clients.crt"  # set to require mTLS client certs
+
 [storage.cache]
 hot_cache_bytes = "8GiB"
 
@@ -324,6 +330,8 @@ metrics    = "0.0.0.0:9090"     # Prometheus/OpenMetrics
 tracing    = "info"
 ```
 
-A ready-to-copy sample lives at [`stele.example.toml`](../stele.example.toml) in the repo root — `cp stele.example.toml stele.toml` and edit. Only `[server] listen`/`data_dir` and `[storage] backend` are read today (STL-116); the other sections above are reserved (the parser ignores unknown sections) and land in later tickets.
+A ready-to-copy sample lives at [`stele.example.toml`](../stele.example.toml) in the repo root — `cp stele.example.toml stele.toml` and edit. Only `[server] listen`/`data_dir`, `[storage] backend`, and `[tls]` are read today (STL-116, STL-251); the other sections above are reserved (the parser ignores unknown sections) and land in later tickets.
+
+**Secure defaults** ([10 §4](10-security-and-compliance.md#4-data-protection--encryption), STL-251): a config-file (non-dev) run **without `[tls]` may only bind loopback** — the server refuses to start on a non-loopback `listen` rather than silently serve plaintext. Configure `[tls]`, bind `127.0.0.1`, or use `--dev`.
 
 Dev mode (`--dev`) supplies safe defaults so a contributor needs **no config file** to get running — config is for operators, not for the five-minute path.

@@ -88,6 +88,13 @@ compatibility *matrix* is a v0.5 deliverable
 a local dev server: `ci/psycopg-smoke.py localhost 5454` /
 `ci/jdbc-smoke.sh localhost 5454`.
 
+The job also runs a **TLS leg** (STL-251): a second container boots non-dev
+from a config file with `[tls] mode = "required"` and a self-signed cert
+minted on the runner, then `psql`, psycopg, and pgjdbc each connect with
+`sslmode=require` (the scripts take it as an optional third argument) and a
+plaintext attempt is asserted to be refused with the server's `FATAL`
+(SQLSTATE `28000`).
+
 ---
 
 ## Cross-platform matrix

@@ -186,9 +186,60 @@ jobs:
           /tmp/psycopg-venv/bin/python ci/psycopg-smoke.py localhost 5454
       - name: Driver gate — JDBC (pgjdbc) runs a parameterized prepared query
         run: ci/jdbc-smoke.sh localhost 5454
+      # The TLS leg (STL-251): a second container boots NON-dev from a config
+      # file with `[tls] mode = "required"` and a self-signed cert minted on
+      # the runner. psql, psycopg, and pgjdbc each connect with
+      # sslmode=require and run a query; a plaintext attempt must be refused
+      # with the FATAL the server emits (SQLSTATE 28000).
+      - name: Start a TLS-required engine from a config file
+        run: |
+          mkdir -p /tmp/stele-tls
+          openssl req -x509 -newkey rsa:2048 -sha256 -days 2 -nodes \
+            -keyout /tmp/stele-tls/server.key -out /tmp/stele-tls/server.crt \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+          chmod 644 /tmp/stele-tls/server.key
+          cat > /tmp/stele-tls/stele.toml <<'CONF'
+          [server]
+          listen = "0.0.0.0:5454"
+          data_dir = "/var/lib/stele"
+          [tls]
+          mode = "required"
+          cert = "/etc/stele/server.crt"
+          key  = "/etc/stele/server.key"
+          CONF
+          # No --dev: the image's default CMD reads /etc/stele/stele.toml.
+          docker run -d --name stele-tls -p 5455:5454 \
+            -v /tmp/stele-tls:/etc/stele:ro stele:ci
+      - name: Driver gate (TLS) — psql connects with sslmode=require
+        run: |
+          CONN="host=localhost port=5455 user=stele dbname=stele sslmode=require"
+          for _ in $(seq 1 30); do
+            psql "$CONN" -c "SELECT 1" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          psql "$CONN" -tA -c "SELECT 1" | grep -qx 1
+      - name: Driver gate (TLS) — plaintext is refused while TLS is required
+        run: |
+          set +e
+          OUT=$(psql "host=localhost port=5455 user=stele dbname=stele sslmode=disable" \
+            -c "SELECT 1" 2>&1)
+          STATUS=$?
+          set -e
+          echo "$OUT"
+          test "$STATUS" -ne 0
+          echo "$OUT" | grep -q "requires TLS"
+      - name: Driver gate (TLS) — psycopg connects with sslmode=require
+        run: /tmp/psycopg-venv/bin/python ci/psycopg-smoke.py localhost 5455 require
+      - name: Driver gate (TLS) — pgjdbc connects with sslmode=require
+        run: ci/jdbc-smoke.sh localhost 5455 require
       - name: Engine logs
         if: always()
-        run: docker logs stele || true
+        run: |
+          docker logs stele || true
+          docker logs stele-tls || true
       - name: Stop the engine
         if: always()
-        run: docker rm -f stele || true
+        run: |
+          docker rm -f stele || true
+          docker rm -f stele-tls || true
