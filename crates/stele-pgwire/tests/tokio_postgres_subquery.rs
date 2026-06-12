@@ -19,17 +19,24 @@ use tokio_postgres::{NoTls, SimpleQueryMessage};
 
 mod common;
 
-/// The `id` column of a `SELECT id FROM t WHERE …` reply, as a sorted `Vec` (a
-/// `WHERE` does not order its output, so callers compare row *sets*).
-fn ids(messages: &[SimpleQueryMessage]) -> Vec<String> {
-    let mut out: Vec<String> = messages
+/// The `id` column of a `SELECT id FROM t WHERE …` reply, as a numerically
+/// sorted `Vec` (a `WHERE` does not order its output, so callers compare row
+/// *sets*; sorting by value, not lexically, keeps the comparison robust if the
+/// fixture grows past single digits).
+fn ids(messages: &[SimpleQueryMessage]) -> Vec<i32> {
+    let mut out: Vec<i32> = messages
         .iter()
         .filter_map(|m| match m {
-            SimpleQueryMessage::Row(row) => Some(row.get("id").expect("id cell").to_owned()),
+            SimpleQueryMessage::Row(row) => Some(
+                row.get("id")
+                    .expect("id cell")
+                    .parse()
+                    .expect("id is an int"),
+            ),
             _ => None,
         })
         .collect();
-    out.sort();
+    out.sort_unstable();
     out
 }
 
@@ -67,14 +74,14 @@ async fn tokio_postgres_runs_uncorrelated_subqueries() {
         .simple_query("SELECT id FROM t WHERE a = (SELECT a FROM s WHERE id = 1)")
         .await
         .expect("scalar subquery");
-    assert_eq!(ids(&reply), vec!["1".to_owned()]);
+    assert_eq!(ids(&reply), vec![1]);
 
     // IN: `a IN {10, 30}` (the NULL member is inert) → rows 1 and 3.
     let reply = client
         .simple_query("SELECT id FROM t WHERE a IN (SELECT a FROM s)")
         .await
         .expect("IN subquery");
-    assert_eq!(ids(&reply), vec!["1".to_owned(), "3".to_owned()]);
+    assert_eq!(ids(&reply), vec![1, 3]);
 
     // NOT IN over a set that contains a NULL matches no row (the 3VL trap).
     let reply = client
@@ -83,7 +90,8 @@ async fn tokio_postgres_runs_uncorrelated_subqueries() {
         .expect("NOT IN subquery");
     assert!(ids(&reply).is_empty(), "NOT IN with a NULL keeps no row");
 
-    // EXISTS over a non-empty inner keeps every outer row.
+    // EXISTS over an *empty* inner (no s row has a > 100) keeps no outer row;
+    // NOT EXISTS over the same empty inner keeps them all.
     let reply = client
         .simple_query("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s WHERE a > 100)")
         .await
@@ -93,10 +101,7 @@ async fn tokio_postgres_runs_uncorrelated_subqueries() {
         .simple_query("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM s WHERE a > 100)")
         .await
         .expect("NOT EXISTS subquery");
-    assert_eq!(
-        ids(&reply),
-        vec!["1".to_owned(), "2".to_owned(), "3".to_owned()]
-    );
+    assert_eq!(ids(&reply), vec![1, 2, 3]);
 
     // A scalar subquery returning more than one row is the standard's 21000.
     let err = client

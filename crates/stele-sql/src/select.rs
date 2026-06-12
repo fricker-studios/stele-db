@@ -1965,7 +1965,7 @@ fn bind_where(
         catalog: ctx.catalog,
     };
     if let Some(mut subquery) = try_bind_subquery_filter(expr, schema, table, &inner_ctx)? {
-        inherit_valid_snapshot(&mut subquery.subquery, valid_snapshot, ctx.catalog);
+        inherit_valid_snapshot(&mut subquery.subquery, valid_snapshot, ctx.catalog)?;
         return Ok((None, Some(subquery)));
     }
     Ok((Some(bind_where_predicate(expr, schema, table)?), None))
@@ -1979,24 +1979,36 @@ fn bind_where(
 /// [`BindContext`], so its [`snapshot`](BoundSelect::snapshot) is the outer's.
 /// The valid axis is not, since the inner's own [`Temporal`] is empty; it is
 /// applied here. A system-only inner has no valid axis to pin (it is left
-/// unpinned), and a join inner does not carry a valid-time read, so only a plain
-/// single-table valid-time inner inherits the pin.
+/// unpinned — there is no valid axis to travel).
+///
+/// A **join** inner is the one case that **fails closed**: the executor's join
+/// path (STL-172) cannot carry a valid-time pin, so an outer `FOR VALID_TIME
+/// AS OF` over a subquery that joins tables would read the join's valid-time
+/// sides *unpinned* — silently violating the one-snapshot-per-statement rule.
+/// Rather than return rows from the wrong valid slice, it is rejected
+/// ([`SelectError::Subquery`]) until joins can apply a valid pin (a tracked
+/// follow-up alongside the other clauses-over-a-join, STL-264).
 fn inherit_valid_snapshot(
     inner: &mut BoundSelect,
     outer_valid: Option<SystemTimeMicros>,
     catalog: &Catalog,
-) {
+) -> Result<(), SelectError> {
     let Some(valid) = outer_valid else {
-        return;
+        return Ok(());
     };
     if inner.join.is_some() {
-        return;
+        return Err(SelectError::Subquery(
+            "a FOR VALID_TIME AS OF read cannot pin the valid axis of a subquery that joins \
+             tables (the join path carries no valid-time pin yet)"
+                .to_owned(),
+        ));
     }
     if let TableResolution::Found(schema) = resolve_table_at(catalog, &inner.table, inner.snapshot)
         && schema.temporal().valid_time_enabled()
     {
         inner.valid_snapshot = Some(valid);
     }
+    Ok(())
 }
 
 /// Recognize and bind an uncorrelated-subquery `WHERE` ([STL-234]): `[NOT]
@@ -2097,8 +2109,13 @@ fn bind_scalar_subquery_compare(
     };
     let column =
         subquery_anchor_column(column_expr, schema, table, "a scalar subquery comparison")?;
-    let inner = bind_inner_query(subquery, ctx, /* exists = */ false)?;
+    let mut inner = bind_inner_query(subquery, ctx, /* exists = */ false)?;
     check_subquery_column_type(&inner, schema, column, ctx.catalog, "a scalar subquery")?;
+    // A scalar subquery only needs the 0 / 1 / >1 distinction, so cap it at two
+    // rows: the engine still raises the cardinality violation (≥2 rows → still 2),
+    // without materializing an arbitrarily large inner result first. A user's
+    // tighter `LIMIT` (e.g. `LIMIT 1`) is kept.
+    inner.limit = Some(inner.limit.map_or(2, |existing| existing.min(2)));
     Ok(Some(BoundSubqueryFilter {
         kind: SubqueryKind::Scalar {
             column,
@@ -4885,6 +4902,47 @@ mod tests {
         // The outer operand of a scalar/IN subquery must be a bare column.
         let err = bind(
             "SELECT id FROM t WHERE a + 1 IN (SELECT a FROM s)",
+            &catalog,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SelectError::Subquery(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_a_valid_time_pin_over_a_join_subquery() {
+        // A subquery that joins tables cannot inherit the outer's FOR VALID_TIME
+        // AS OF pin (the join path carries no valid-time pin yet), so it fails
+        // closed rather than reading the join's valid-time sides unpinned.
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(
+                "bk",
+                vec![
+                    ColumnDef::new("k", LogicalType::Int4).expect("col"),
+                    ColumnDef::new("v", LogicalType::Int4).expect("col"),
+                    ColumnDef::new("vf", LogicalType::Timestamp).expect("col"),
+                    ColumnDef::new("ve", LogicalType::Timestamp).expect("col"),
+                ],
+                TableTemporal::with_valid_time(ValidTimeSpec::new("vf", "ve").expect("spec")),
+                SystemTimeMicros(1_000),
+            )
+            .expect("create bk");
+        for name in ["a", "b"] {
+            catalog
+                .create_table(
+                    name,
+                    vec![
+                        ColumnDef::new("id", LogicalType::Int4).expect("col"),
+                        ColumnDef::new("n", LogicalType::Int4).expect("col"),
+                    ],
+                    TableTemporal::system_only(),
+                    SystemTimeMicros(1_000),
+                )
+                .expect("create");
+        }
+        let err = bind(
+            "SELECT k FROM bk WHERE v IN (SELECT a.n FROM a JOIN b ON a.id = b.id) \
+             FOR VALID_TIME AS OF 100",
             &catalog,
         )
         .unwrap_err();
