@@ -138,6 +138,35 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
     }
 }
 
+/// Public façade over the internal literal folder for callers outside the binder.
+///
+/// The engine's temporal introspection folds a `\history` key literal to the
+/// table's key type ([STL-199]) and must produce **byte-identical** bytes to the
+/// ones [`bind_dml`](crate::bind_dml) folded the original `INSERT` key to, so the
+/// business key matches. Reusing the same folding path is what guarantees that;
+/// this only collapses the crate-private fold error into a short human reason,
+/// keeping the error enum internal to the binder.
+///
+/// # Errors
+///
+/// A one-line reason if `expr` is not a literal of type `ty` (NULL, a type
+/// mismatch, an out-of-range / malformed literal, or an unsupported column type).
+///
+/// [STL-199]: https://allegromusic.atlassian.net/browse/STL-199
+pub fn fold_literal(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, String> {
+    fold_scalar(expr, ty).map_err(|err| match err {
+        FoldError::Null => "key literal is NULL".to_owned(),
+        FoldError::TypeMismatch { found } => {
+            format!("key literal is a {found}, expected {ty}")
+        }
+        FoldError::BadLiteral { literal, reason } => reason.map_or_else(
+            || format!("key literal {literal:?} is not a valid {ty}"),
+            |reason| format!("key literal {literal:?} is not a valid {ty}: {reason}"),
+        ),
+        FoldError::UnsupportedType(ty) => format!("{ty} keys are not supported"),
+    })
+}
+
 /// Fold a civil-time literal through one of the [`stele_common::datetime`]
 /// codecs, mapping its parse error onto [`FoldError::BadLiteral`].
 fn fold_civil(

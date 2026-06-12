@@ -77,7 +77,7 @@ use crate::dml::{self, CommittedTxns, DmlError, DmlOutcome, DmlWriter};
 use crate::merge;
 use crate::rebuild::rebuild_index_from_segments;
 use crate::segment::{SegmentError, SegmentReader, SegmentWriter};
-use crate::systime::SealedVersions;
+use crate::systime::{SealedLookup, SealedSegments, SealedVersions};
 use crate::validity::{ClosedInterval, ValidityConfig, ValidityError, ValidityIndex};
 use crate::validtime::ValidInterval;
 use crate::wal::{Checkpoint, LogOffset, Wal, WalConfig, WalError};
@@ -1153,6 +1153,77 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
             .map(|name| SegmentReader::open(&self.disk, name).map_err(EngineError::from))
             .collect()
     }
+
+    /// The full append-only version timeline of `key` — or of **every** key when
+    /// `key` is `None` — resolved across the delta tier, the sealed segments, and
+    /// the validity index ([STL-199]).
+    ///
+    /// Unlike a snapshot read ([`crate::merge::resolve_snapshot`], the
+    /// `SnapshotScan`), which returns the single version live at one instant, this
+    /// keeps **every** version a key ever had — superseded and deleted ones
+    /// included, since Stele never destroys history. Each returned [`Version`]
+    /// carries its resolved `[sys_from, sys_to)` interval and `closed_by`
+    /// provenance overlaid from the index ([`crate::merge::fold_chains`]); an open
+    /// (current) version keeps `sys_to =`
+    /// [`SYSTEM_TIME_OPEN`](stele_common::time::SYSTEM_TIME_OPEN) / `closed_by =
+    /// None`. Retraction tombstones are **not** versions and never appear — a
+    /// deleted key's final version simply shows a closed `sys_to`.
+    ///
+    /// Versions come back grouped by business key, each key's chain in
+    /// `(sys_from, seq)` order — the canonical timeline order the shell renders.
+    /// This is introspection over the live state, not a durability path: it makes
+    /// no commit and mutates nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Delta`] / [`EngineError::Segment`] / [`EngineError::Validity`]
+    /// if a tier or a backing spill / segment cannot be read, or
+    /// [`EngineError::Dml`] if a valid-time delta payload is too short to unframe
+    /// (a truncated interval prefix — corrupt stored bytes).
+    pub fn version_history(&self, key: Option<&BusinessKey>) -> Result<Vec<Version>, EngineError> {
+        // Raw (open, unresolved) candidates from both tiers; the index overlay
+        // below supplies each one's `sys_to` / `closed_by`.
+        let readers = self.open_segment_readers()?;
+        // Delta-tier versions carry, on a valid-time table, the 16-byte interval
+        // frame on their payload; sealed versions store the payload bare (the
+        // interval lives in segment columns). Strip the delta frame here so every
+        // returned payload is the bare user row, uniform across tiers — the same
+        // normalization the scan does with `valid_time` set ([STL-218]/[STL-226]).
+        // Decoding a sealed (already-bare) payload as if framed would corrupt it,
+        // so only the delta-origin versions are unframed.
+        let mut delta = match key {
+            Some(k) => self.delta.candidate_versions(k)?,
+            None => self.delta.staged_versions()?,
+        };
+        if self.valid_time {
+            for version in &mut delta {
+                if let Some(payload) = version.payload.take() {
+                    let (_, bare) = crate::validtime::unframe_payload(true, &payload)
+                        .map_err(|e| EngineError::Dml(e.into()))?;
+                    version.payload = Some(bare.to_vec());
+                }
+            }
+        }
+        let mut versions = delta;
+        match key {
+            // `SealedSegments` zone-prunes by business key before reading a segment,
+            // so a key absent from a segment costs no column I/O.
+            Some(k) => versions.extend(SealedSegments::new(&readers).versions_for(k)?),
+            None => {
+                for reader in &readers {
+                    versions.extend(reader.read_versions()?);
+                }
+            }
+        }
+        // `fold_chains` keys each chain by `(sys_from, seq)`, so the same
+        // `(key, sys_from, seq)` pulled from both tiers mid-flush collapses to one
+        // row rather than doubling.
+        let chains = merge::fold_chains(versions, &self.index)?;
+        Ok(chains
+            .into_values()
+            .flat_map(BTreeMap::into_values)
+            .collect())
+    }
 }
 
 /// Build the canonical sealed-segment filename for `index`.
@@ -1184,6 +1255,7 @@ fn list_segment_names<D: Disk>(disk: &D) -> io::Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stele_common::time::SYSTEM_TIME_OPEN;
 
     #[test]
     fn segment_name_round_trips_under_the_prefix_filter() {
@@ -1223,6 +1295,125 @@ mod tests {
         fn now(&self) -> SystemTimeMicros {
             SystemTimeMicros(self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1)
         }
+    }
+
+    /// `version_history` returns the full append-only timeline of a key, resolved
+    /// across the delta tier, the sealed segments, and the validity index — and it
+    /// **agrees with the snapshot read path** ([`Engine::as_of`]): the version
+    /// whose `[sys_from, sys_to)` brackets an instant is exactly the one a read at
+    /// that instant returns, with nothing live in a deletion gap (STL-199, the
+    /// history-vs-AS-OF oracle of testing-strategy §4).
+    #[test]
+    fn version_history_spans_tiers_and_agrees_with_as_of() {
+        let principal = Principal::new(b"op".to_vec());
+        let key1 = BusinessKey::new(b"1".to_vec());
+        let key2 = BusinessKey::new(b"2".to_vec());
+
+        let mut engine = Engine::open(
+            crate::backend::MemDisk::new(),
+            StepClock(std::sync::atomic::AtomicI64::new(0)),
+            false,
+        )
+        .expect("open");
+
+        // key1: insert → update → update (three versions, the last open).
+        engine
+            .insert(
+                key1.clone(),
+                None,
+                Some(b"v1".to_vec()),
+                0,
+                TxnId(1),
+                principal.clone(),
+            )
+            .expect("insert k1");
+        // Flush so the first version lives in a sealed segment while later ones
+        // stay in the delta — exercising the cross-tier fold.
+        engine.flush().expect("flush");
+        engine
+            .update(
+                key1.clone(),
+                None,
+                Some(b"v2".to_vec()),
+                0,
+                TxnId(2),
+                principal.clone(),
+            )
+            .expect("update k1");
+        engine
+            .update(
+                key1.clone(),
+                None,
+                Some(b"v3".to_vec()),
+                0,
+                TxnId(3),
+                principal.clone(),
+            )
+            .expect("update k1 again");
+        // key2: insert → delete (one version, closed by a retraction).
+        engine
+            .insert(
+                key2.clone(),
+                None,
+                Some(b"w1".to_vec()),
+                0,
+                TxnId(4),
+                principal.clone(),
+            )
+            .expect("insert k2");
+        engine
+            .delete(&key2, TxnId(5), principal)
+            .expect("delete k2");
+
+        // key1's timeline: three versions, ordered, gap-free, last one open.
+        let h1 = engine.version_history(Some(&key1)).expect("history k1");
+        assert_eq!(h1.len(), 3, "every version retained, nothing overwritten");
+        assert_eq!(
+            h1.iter().map(|v| v.payload.clone()).collect::<Vec<_>>(),
+            vec![
+                Some(b"v1".to_vec()),
+                Some(b"v2".to_vec()),
+                Some(b"v3".to_vec())
+            ],
+        );
+        assert_eq!(h1[0].provenance.txn_id, TxnId(1));
+        assert_eq!(
+            h1[0].sys_to, h1[1].sys_from,
+            "the periods abut (supersession)"
+        );
+        assert_eq!(h1[1].sys_to, h1[2].sys_from);
+        assert_eq!(
+            h1[2].sys_to, SYSTEM_TIME_OPEN,
+            "the newest version is current"
+        );
+
+        // key2's timeline: one version, closed by the delete — not current.
+        let h2 = engine.version_history(Some(&key2)).expect("history k2");
+        assert_eq!(h2.len(), 1);
+        assert_ne!(
+            h2[0].sys_to, SYSTEM_TIME_OPEN,
+            "a deleted key has no live version"
+        );
+        assert_eq!(
+            h2[0].closed_by.as_ref().map(|p| p.txn_id),
+            Some(TxnId(5)),
+            "the retraction's provenance is who deleted it",
+        );
+
+        // The all-keys form returns every version of both keys.
+        let all = engine.version_history(None).expect("history all");
+        assert_eq!(all.len(), 4);
+
+        // The oracle: every version brackets exactly the instant a snapshot read
+        // resolves to it; a read in key2's deletion gap sees nothing.
+        for v in &h1 {
+            let live = engine.as_of(&key1, Snapshot(v.sys_from)).expect("as_of");
+            assert_eq!(live.map(|x| x.payload), Some(v.payload.clone()));
+        }
+        let after_delete = engine
+            .as_of(&key2, Snapshot(h2[0].sys_to))
+            .expect("as_of gap");
+        assert!(after_delete.is_none(), "the deletion gap is empty");
     }
 
     /// A failed WAL fsync inside [`Engine::checkpoint`] poisons the engine
