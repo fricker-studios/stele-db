@@ -425,10 +425,11 @@ fn on_side(
                 ))),
                 (true, None) => Ok(OnSide::TargetKey),
                 (false, Some(idx)) => Ok(OnSide::Source(idx)),
-                (false, None) => Err(DmlError::UnknownColumn {
-                    table: source.names.table.clone(),
-                    column: name.to_owned(),
-                }),
+                // Neither the business key nor a source column. The name is not a
+                // source-column reference, so attributing it to the source table
+                // would mislead (e.g. `ON balance = s.id` — a non-key target
+                // column, or a typo); say what the operand must be instead.
+                (false, None) => Err(unsupported_on(key_col)),
             }
         }
         _ => Err(unsupported_on(key_col)),
@@ -1031,6 +1032,25 @@ mod tests {
                 "{sql:?} must reject mentioning {needle:?}; got {msg:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_unqualified_non_key_non_source_on_operand_names_the_requirement() {
+        // A bare name in the ON that is neither the business key nor a source
+        // column is not a source-column reference — the error must say the
+        // operand has to be the key or a source column, not blame the source
+        // table (which would mislead for `balance` — a non-key target column).
+        let catalog = catalog();
+        let err = bind(
+            "MERGE INTO account USING (VALUES (1, 2)) AS s (id, v) ON balance = s.v \
+             WHEN MATCHED THEN UPDATE SET balance = s.v",
+            &catalog,
+        )
+        .expect_err("balance is neither the key nor a source column");
+        assert!(
+            matches!(&err, DmlError::Unsupported(msg) if msg.contains("ON condition")),
+            "got {err:?}"
+        );
     }
 
     #[test]

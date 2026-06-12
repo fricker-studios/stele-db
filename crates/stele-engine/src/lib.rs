@@ -2849,9 +2849,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 .get(merge.on)
                 .ok_or(EngineError::MalformedMergeSource)?
                 .as_ref();
-            // SQL equality: a NULL join key matches nothing — the row is unmatched.
-            let matched = joined.filter(|key| live.contains(&encode_value(key)));
-            let (key, write) = if let Some(key) = matched {
+            // SQL equality: a NULL join key matches nothing — the row is
+            // unmatched. Encode the join key once and reuse it for the probe and,
+            // on the matched arm, the write key (which *is* the join key there).
+            let probe = joined.map(|key| (key, encode_value(key)));
+            let matched = probe.as_ref().filter(|(_, encoded)| live.contains(encoded));
+            let (write_key, write) = if let Some((key, encoded)) = matched {
                 let Some(assignments) = &merge.matched else {
                     continue;
                 };
@@ -2860,11 +2863,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     .map(|(idx, value)| (*idx, resolve_merge_value(value, row)))
                     .collect();
                 (
-                    key.clone(),
+                    encoded.clone(),
                     BoundDml::Update {
                         table: merge.table.clone(),
                         schema_id: merge.schema_id,
-                        key: key.clone(),
+                        key: (*key).clone(),
                         assignments,
                         valid: None,
                     },
@@ -2875,7 +2878,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 };
                 let mut cells = template.iter().map(|value| resolve_merge_value(value, row));
                 // The template is aligned to all target columns, key first; a
-                // NULL resolving into the key can never insert.
+                // NULL resolving into the key can never insert. The inserted key
+                // need not equal the join key, so it is encoded separately.
                 let key = cells.next().flatten().ok_or_else(|| {
                     EngineError::Dml(DmlError::NullValue {
                         table: merge.table.clone(),
@@ -2884,7 +2888,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 })?;
                 let values: Vec<Option<ScalarValue>> = cells.collect();
                 (
-                    key.clone(),
+                    encode_value(&key),
                     BoundDml::Insert {
                         table: merge.table.clone(),
                         schema_id: merge.schema_id,
@@ -2894,7 +2898,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     },
                 )
             };
-            if writes.insert(encode_value(&key), write).is_some() {
+            if writes.insert(write_key, write).is_some() {
                 return Err(EngineError::MergeRowTwice);
             }
         }
