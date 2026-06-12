@@ -448,7 +448,11 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     /// post-failure length against the staged end, so a partial physical write is
     /// distinguished from a clean one and only the former poisons. A backend that
     /// cannot surface a partial write (a clean-failure-only fault) simply never trips
-    /// the poison — the resident rollback above still keeps it consistent.
+    /// the poison — the resident rollback above still keeps it consistent. The real
+    /// `LocalFile::append` does not yet advance its tracked length on a partial
+    /// `write_all`, so surfacing the poison there is the follow-up [STL-305].
+    ///
+    /// [STL-305]: https://allegromusic.atlassian.net/browse/STL-305
     ///
     /// [STL-216]: https://allegromusic.atlassian.net/browse/STL-216
     /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
