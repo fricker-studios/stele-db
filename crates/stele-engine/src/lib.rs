@@ -1427,9 +1427,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // and the row-codec-sliced value cells are already canonical encodings,
             // so only the synthesized metadata cells are encoded here.
             let mut row: Vec<Option<Vec<u8>>> = vec![
-                Some(encode_value(&ScalarValue::Int8(
-                    i64::try_from(v.provenance.txn_id.0).unwrap_or(i64::MAX),
-                ))),
+                Some(encode_value(&ScalarValue::Int8(txid_as_i64(
+                    v.provenance.txn_id,
+                )))),
                 Some(encode_value(&ScalarValue::Text(op.to_owned()))),
                 Some(encode_value(&ScalarValue::TimestampTz(v.sys_from.0))),
                 (!current).then(|| encode_value(&ScalarValue::TimestampTz(v.sys_to.0))),
@@ -4227,7 +4227,8 @@ fn stele_history_call(
     stmt: &Statement,
 ) -> Option<(String, Option<&stele_sql::sqlparser::ast::Expr>)> {
     use stele_sql::sqlparser::ast::{
-        Expr, FunctionArg, FunctionArgExpr, SetExpr, Statement as SqlStatement, TableFactor, Value,
+        Expr, FunctionArg, FunctionArgExpr, GroupByExpr, SelectItem, SetExpr,
+        Statement as SqlStatement, TableFactor, Value,
     };
 
     let SqlStatement::Query(query) = stmt.sql()? else {
@@ -4258,6 +4259,23 @@ fn stele_history_call(
     {
         return None;
     }
+    // Only the canonical **unshaped** `SELECT * FROM stele_history(...)` is answered
+    // here. This path bypasses the binder/planner, so any projection, filter, or
+    // shaping clause would be silently dropped — answering `SELECT id … WHERE … ORDER
+    // BY …` as if it were `SELECT *` would violate SQL semantics. A shaped query
+    // instead falls through to the binders, which reject the unknown `stele_history`
+    // relation with a normal error.
+    let unshaped = matches!(select.projection.as_slice(), [SelectItem::Wildcard(_)])
+        && select.selection.is_none()
+        && select.distinct.is_none()
+        && select.having.is_none()
+        && matches!(&select.group_by, GroupByExpr::Expressions(g, m) if g.is_empty() && m.is_empty())
+        && query.order_by.is_none()
+        && query.limit_clause.is_none()
+        && query.fetch.is_none();
+    if !unshaped {
+        return None;
+    }
     let mut exprs = args.args.iter().filter_map(|arg| match arg {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
         _ => None,
@@ -4272,7 +4290,13 @@ fn stele_history_call(
     };
     // Optional second argument: the business-key literal, folded to the key type
     // by [`SessionEngine::version_history`]. Absent ⇒ every key's timeline.
-    Some((table, exprs.next()))
+    let key = exprs.next();
+    // A third (or further) argument is malformed — fall through to the binders
+    // rather than silently ignoring it.
+    if exprs.next().is_some() {
+        return None;
+    }
+    Some((table, key))
 }
 
 /// The operation that produced `version`, for the `\history` / `\lineage`
@@ -4288,6 +4312,18 @@ fn stele_history_call(
 /// ordered by `(sys_from, seq)`), or `None` at the start. A deleted key needs no
 /// special case — its final version's `op` is whatever opened it; the deletion
 /// shows only as that version's closed `sys_to`.
+/// A transaction id as a lossless `int8` for the `\history` `txid` column: a bit
+/// reinterpretation of the `u64`, the **same** encoding segment storage uses for
+/// its `TxnId` column (STL-145), so a `txn_id > i64::MAX` keeps its bits rather
+/// than saturating (which would collapse distinct ids and break ordering).
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "lossless u64→i64 bit reinterpretation, matching segment storage"
+)]
+const fn txid_as_i64(txn_id: TxnId) -> i64 {
+    txn_id.0 as i64
+}
+
 fn version_op(prev: Option<&Version>, version: &Version) -> &'static str {
     match prev {
         // The abutment is `prev.sys_to == version.sys_from` by design — the prior
@@ -5259,14 +5295,14 @@ mod tests {
                     .next()
                     .and_then(|mut cells| cells.remove(0))
                     .map(|bytes| decode_int(Some(&bytes), LogicalType::Int4));
-                // The message interpolates only `seed` (a loop counter), never a
-                // decode-derived value: a decoded value in the message text trips
-                // CodeQL's (false) `rust/cleartext-logging` taint on its `Debug`
+                // `assert!` on the comparison, with a `seed`-only message — not
+                // `assert_eq!`, which would `Debug`-format the decode-derived
+                // operands into the panic text and trip CodeQL's (false)
+                // `rust/cleartext-logging` taint on a possible `ScalarValue::Uuid`
                 // (the same reason `decode_int` keeps a static panic message). The
                 // seed alone replays the failure deterministically.
-                assert_eq!(
-                    live_here,
-                    Some(balance),
+                assert!(
+                    live_here == Some(balance),
                     "seed {seed}: version-history value disagrees with the AS OF read",
                 );
             }
@@ -5355,6 +5391,22 @@ mod tests {
             engine.execute(&parse_one("SELECT * FROM stele_history('account', 'oops')")),
             Err(EngineError::IntrospectionKey(_)),
         ));
+
+        // Only the unshaped `SELECT *` form is intercepted — a projection, a
+        // filter, or a third argument falls through to the binders (which reject
+        // the unknown `stele_history` relation), never silently dropping the
+        // shaping clause.
+        for shaped in [
+            "SELECT id FROM stele_history('account', 1)",
+            "SELECT * FROM stele_history('account', 1) WHERE id = 1",
+            "SELECT * FROM stele_history('account', 1) ORDER BY id",
+            "SELECT * FROM stele_history('account', 1, 2)",
+        ] {
+            assert!(
+                engine.execute(&parse_one(shaped)).is_err(),
+                "shaped/over-argument call must not route: {shaped}",
+            );
+        }
     }
 
     /// Observing the clock for a read snapshot must not let a later commit slide

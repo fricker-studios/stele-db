@@ -942,6 +942,15 @@ fn apply_asof<'a>(sql: &'a str, asof: Option<&str>) -> Cow<'a, str> {
     })
 }
 
+/// Whether a `\history` key token is safe to splice verbatim into the
+/// introspection query: no `;` (which would start a second statement) and no
+/// control characters. A text key the user quotes (`'alice'`) passes; a `;`
+/// inside that quoted literal is the one case this conservatively rejects, which
+/// is fine for a structured shell command.
+fn key_is_safe(key: &str) -> bool {
+    !key.contains(';') && !key.contains(char::is_control)
+}
+
 /// Run the `stele_history` introspection query for `table` (optionally one `key`)
 /// and return its result set, or `None` after handling the empty / error cases:
 /// a server error renders the psql block, an empty timeline a "No versions"
@@ -953,9 +962,26 @@ fn fetch_history(
     key: Option<&str>,
     out: &mut impl Write,
 ) -> anyhow::Result<Option<ResultSet>> {
-    // The table name is a string literal (single quotes doubled); the key, when
-    // given, rides verbatim as a SQL literal the server folds to the key type
-    // (so a text key must be quoted: `\history users 'alice'`).
+    // The key rides verbatim as a SQL literal the server folds to the key type
+    // (so a text key must be quoted: `\history users 'alice'`). Reject one that
+    // could break out of the single statement — a `;` or a control character would
+    // turn this structured command into a multi-statement batch — before building
+    // the query.
+    if let Some(k) = key
+        && !key_is_safe(k)
+    {
+        print_error(
+            session,
+            &usage_error(
+                format!(
+                    "invalid key {k:?}: a history key may not contain ';' or control characters"
+                ),
+                r"e.g. \history account 1  ·  text keys are quoted: \history users 'alice'",
+            ),
+        );
+        return Ok(None);
+    }
+    // The table name is a string literal (single quotes doubled).
     let table_lit = table.replace('\'', "''");
     let query = key.map_or_else(
         || format!("SELECT * FROM stele_history('{table_lit}')"),
@@ -1854,6 +1880,16 @@ mod tests {
         // A multi-statement batch is not spliced.
         let batch = "SELECT 1; SELECT 2;";
         assert_eq!(apply_asof(batch, Some("2")), batch);
+    }
+
+    #[test]
+    fn history_key_rejects_statement_breakers() {
+        // Plain int / quoted-text keys are fine.
+        assert!(key_is_safe("1"));
+        assert!(key_is_safe("'alice'"));
+        // A `;` or a control character could break out of the single statement.
+        assert!(!key_is_safe("1;DROP TABLE account"));
+        assert!(!key_is_safe("1\nSELECT 1"));
     }
 
     #[test]

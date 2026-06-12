@@ -1172,7 +1172,9 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     /// # Errors
     ///
     /// [`EngineError::Delta`] / [`EngineError::Segment`] / [`EngineError::Validity`]
-    /// if a tier or a backing spill / segment cannot be read.
+    /// if a tier or a backing spill / segment cannot be read, or
+    /// [`EngineError::Dml`] if a valid-time delta payload is too short to unframe
+    /// (a truncated interval prefix — corrupt stored bytes).
     pub fn version_history(&self, key: Option<&BusinessKey>) -> Result<Vec<Version>, EngineError> {
         // Raw (open, unresolved) candidates from both tiers; the index overlay
         // below supplies each one's `sys_to` / `closed_by`.
