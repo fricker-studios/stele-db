@@ -374,3 +374,25 @@ async fn startup_without_a_user_is_refused_under_scram() {
     assert_eq!(kind, b'E');
     assert_eq!(error_sqlstate(&payload), "28000");
 }
+
+#[tokio::test]
+async fn a_non_sasl_message_during_the_exchange_is_refused_with_a_fatal() {
+    // The client must answer AuthenticationSASL with a 'p' SASLInitialResponse;
+    // any other live message is a protocol violation the server refuses with a
+    // FATAL 08P01 (not a silent drop) — distinct from EOF.
+    let addr = spawn_scram_server(session_with_users(&[("alice", "s3cret")])).await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    write_startup(&mut stream, "alice").await;
+    let (code, _) = read_auth(&mut stream).await;
+    assert_eq!(code, 10);
+    // Send a Query ('Q') where a SASL response is expected.
+    let q = b"SELECT 1\0";
+    let mut buf = Vec::new();
+    buf.push(b'Q');
+    buf.extend_from_slice(&i32::try_from(4 + q.len()).unwrap().to_be_bytes());
+    buf.extend_from_slice(q);
+    stream.write_all(&buf).await.expect("write query");
+    let (kind, payload) = read_msg(&mut stream).await;
+    assert_eq!(kind, b'E', "a non-SASL message must draw a FATAL");
+    assert_eq!(error_sqlstate(&payload), "08P01");
+}

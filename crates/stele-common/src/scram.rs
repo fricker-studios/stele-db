@@ -272,7 +272,26 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
 
-    let trimmed = s.trim_end_matches('=').as_bytes();
+    let bytes = s.as_bytes();
+    // Validate padding canonicality before decoding, rather than just trimming
+    // every trailing '='. Padding, when present, is a run of `=` at the very
+    // end (no embedded `=`), 1 or 2 characters (never more), and makes the
+    // total length a multiple of 4 — so `"Zg="` (under-padded), `"Zm9v===="`
+    // (over-padded), and `"Z=m9"` (embedded) are all rejected, not repaired.
+    let unpadded = bytes.iter().take_while(|&&b| b != b'=').count();
+    if bytes[unpadded..].iter().any(|&b| b != b'=') {
+        return None; // a non-`=` byte after the first `=`: padding is not a clean tail
+    }
+    let pad = bytes.len() - unpadded;
+    if pad > 0 {
+        // The only canonical pad for `unpadded % 4` of 2 or 3 is 2 or 1
+        // respectively; 0 and 1 admit no padding at all.
+        let canonical_pad = (4 - unpadded % 4) % 4;
+        if bytes.len() % 4 != 0 || pad != canonical_pad {
+            return None;
+        }
+    }
+    let trimmed = &bytes[..unpadded];
     let mut out = Vec::with_capacity(trimmed.len() * 3 / 4);
     for chunk in trimmed.chunks(4) {
         let mut vals = [0u8; 4];
@@ -437,6 +456,19 @@ mod tests {
         assert_eq!(b64_decode("Z"), None);
         assert_eq!(b64_decode("Zh=="), None, "non-zero trailing bits");
         assert_eq!(b64_decode("Zm9="), None, "non-zero trailing bits");
+    }
+
+    #[test]
+    fn base64_rejects_non_canonical_padding() {
+        // Hostile auth input must not be repaired: under-, over-, and
+        // misplaced padding are all rejected rather than silently trimmed.
+        assert_eq!(b64_decode("Zg="), None, "under-padded (needs ==)");
+        assert_eq!(b64_decode("Zm9v===="), None, "over-padded");
+        assert_eq!(b64_decode("Z=m9"), None, "embedded '='");
+        assert_eq!(b64_decode("Zm8=="), None, "wrong pad count for length");
+        // The canonical encodings of the same lengths still decode.
+        assert_eq!(b64_decode("Zg==").as_deref(), Some(&b"f"[..]));
+        assert_eq!(b64_decode("Zm8=").as_deref(), Some(&b"fo"[..]));
     }
 
     #[test]

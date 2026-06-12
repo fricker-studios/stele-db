@@ -60,10 +60,13 @@ const SERVER_NONCE_RAW_LEN: usize = 18;
 
 /// Run the SASL exchange and return the authenticated user name.
 ///
-/// On any refusal the client has already received a `FATAL` `ErrorResponse`
-/// (the right SQLSTATE per failure shape — `28P01` for a failed proof or
-/// unknown user, `08P01` for a malformed exchange, `28000`/`0A000` for policy)
-/// and the connection unwinds with [`WireError::AuthFailed`].
+/// On any **server-initiated** refusal the client has already received a
+/// `FATAL` `ErrorResponse` (the right SQLSTATE per failure shape — `28P01` for
+/// a failed proof or unknown user, `08P01` for a malformed exchange,
+/// `28000`/`0A000` for policy) and the connection unwinds with
+/// [`WireError::AuthFailed`]. The one exception is the client closing the
+/// connection mid-exchange (EOF): there is no peer to tell, so that unwinds as
+/// [`WireError::Protocol`] with no reply.
 pub(crate) async fn authenticate<S: Wire>(
     stream: &mut S,
     startup: &StartupMessage,
@@ -93,8 +96,13 @@ pub(crate) async fn authenticate<S: Wire>(
     stream.flush().await?;
 
     // --- C: SASLInitialResponse — chosen mechanism + client-first-message.
+    // Malformed framing is a protocol violation we refuse with a `FATAL`
+    // `08P01`, the same as every other malformed-exchange path.
     let payload = read_sasl_message(stream).await?;
-    let (mechanism, client_first_raw) = parse_sasl_initial(&payload)?;
+    let (mechanism, client_first_raw) = match parse_sasl_initial(&payload) {
+        Ok(parsed) => parsed,
+        Err(message) => return fail(stream, SQLSTATE_PROTOCOL_VIOLATION, message).await,
+    };
     if mechanism != MECHANISM {
         return fail(
             stream,
@@ -109,36 +117,26 @@ pub(crate) async fn authenticate<S: Wire>(
     };
 
     // --- Verifier lookup. An unknown user gets a fresh random verifier and a
-    // full, doomed exchange: the failure is then indistinguishable from a
-    // wrong password (anti-enumeration), and the work done is the same.
-    let stored = {
-        let guard = session.lock().unwrap_or_else(PoisonError::into_inner);
-        guard.auth_verifier(&user)
-    };
-    let known = stored.is_some();
-    let verifier = match stored {
-        Some(v) => v,
-        None => mock_verifier()?,
-    };
+    // full, doomed exchange (anti-enumeration — see [`lookup_verifier`]).
+    let (verifier, known) = lookup_verifier(session, &user)?;
 
     // --- S: AuthenticationSASLContinue — server-first-message. The server
     // nonce appends fresh entropy to the client's: every exchange signs a
     // different nonce, which is what makes a captured exchange unreplayable.
-    let mut raw_nonce = [0u8; SERVER_NONCE_RAW_LEN];
-    getrandom::fill(&mut raw_nonce).map_err(io::Error::from)?;
-    let server_nonce = format!("{}{}", client_first.nonce, scram::b64_encode(&raw_nonce));
-    let server_first = format!(
-        "r={server_nonce},s={},i={}",
-        scram::b64_encode(&verifier.salt),
-        verifier.iterations
-    );
+    let (server_nonce, server_first) = server_first_message(&client_first.nonce, &verifier)?;
     write_auth_request(stream, AUTH_SASL_CONTINUE, server_first.as_bytes()).await?;
     stream.flush().await?;
 
     // --- C: SASLResponse — client-final-message.
     let payload = read_sasl_message(stream).await?;
-    let client_final_raw = String::from_utf8(payload.to_vec())
-        .map_err(|_| WireError::Protocol("SASL response is not UTF-8"))?;
+    let Ok(client_final_raw) = String::from_utf8(payload.to_vec()) else {
+        return fail(
+            stream,
+            SQLSTATE_PROTOCOL_VIOLATION,
+            "SASL response is not valid UTF-8",
+        )
+        .await;
+    };
     let client_final = match parse_client_final(&client_final_raw) {
         Ok(parsed) => parsed,
         Err(reject) => return fail(stream, reject.sqlstate, reject.message).await,
@@ -190,6 +188,45 @@ pub(crate) async fn authenticate<S: Wire>(
     Ok(user)
 }
 
+/// Look up the stored verifier for `user`, falling back to a fresh random
+/// **mock** verifier when the user does not exist. The returned `bool` is
+/// whether the user is real; the caller runs the full exchange either way and
+/// only consults the flag at the final proof check, so an unknown user costs
+/// the same work and fails identically to a wrong password (anti-enumeration).
+fn lookup_verifier(
+    session: &SharedSession,
+    user: &str,
+) -> Result<(ScramVerifier, bool), WireError> {
+    let stored = {
+        let guard = session.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.auth_verifier(user)
+    };
+    let known = stored.is_some();
+    let verifier = match stored {
+        Some(v) => v,
+        None => mock_verifier()?,
+    };
+    Ok((verifier, known))
+}
+
+/// Build the server-first-message and the combined nonce it carries. The
+/// server nonce appends fresh OS entropy to the client's, so every exchange
+/// signs a different nonce — what makes a captured exchange unreplayable.
+fn server_first_message(
+    client_nonce: &str,
+    verifier: &ScramVerifier,
+) -> Result<(String, String), WireError> {
+    let mut raw_nonce = [0u8; SERVER_NONCE_RAW_LEN];
+    getrandom::fill(&mut raw_nonce).map_err(io::Error::from)?;
+    let server_nonce = format!("{client_nonce}{}", scram::b64_encode(&raw_nonce));
+    let server_first = format!(
+        "r={server_nonce},s={},i={}",
+        scram::b64_encode(&verifier.salt),
+        verifier.iterations
+    );
+    Ok((server_nonce, server_first))
+}
+
 /// Write the `FATAL` refusal and unwind with [`WireError::AuthFailed`]. The
 /// `Result`'s success type is generic so call sites can `return fail(…)`
 /// from any context.
@@ -230,8 +267,12 @@ async fn write_auth_request<S: Wire>(stream: &mut S, code: i32, data: &[u8]) -> 
 }
 
 /// Read the next typed message and require it to be a SASL response (`'p'`).
-/// EOF or any other type mid-exchange is a protocol failure, not an auth one —
-/// the client never presented credentials to refuse.
+///
+/// A **live** out-of-grammar message (the client sent something other than a
+/// SASL response) is a protocol violation we refuse with a `FATAL` `08P01`
+/// before closing, so the client gets a concrete error rather than a silent
+/// drop. The one quiet case is EOF: the client closed the connection, so there
+/// is no peer to send a `FATAL` to — that unwinds as [`WireError::Protocol`].
 async fn read_sasl_message<S: Wire>(stream: &mut S) -> Result<BytesMut, WireError> {
     let Some(msg) = read_typed_message(stream).await? else {
         return Err(WireError::Protocol(
@@ -239,37 +280,39 @@ async fn read_sasl_message<S: Wire>(stream: &mut S) -> Result<BytesMut, WireErro
         ));
     };
     if msg.kind != b'p' {
-        return Err(WireError::Protocol(
+        return fail(
+            stream,
+            SQLSTATE_PROTOCOL_VIOLATION,
             "expected a SASL response during authentication",
-        ));
+        )
+        .await;
     }
     Ok(msg.payload)
 }
 
 /// Split a `SASLInitialResponse` payload: NUL-terminated mechanism name, then
 /// an `Int32`-length-prefixed initial client response (−1 = absent, which
-/// SCRAM never sends).
-fn parse_sasl_initial(payload: &[u8]) -> Result<(String, String), WireError> {
+/// SCRAM never sends). The `Err` is the protocol-violation message the caller
+/// turns into a `FATAL` `08P01`.
+fn parse_sasl_initial(payload: &[u8]) -> Result<(String, String), &'static str> {
     let nul = payload
         .iter()
         .position(|&b| b == 0)
-        .ok_or(WireError::Protocol("SASLInitialResponse missing mechanism"))?;
-    let mechanism = String::from_utf8(payload[..nul].to_vec())
-        .map_err(|_| WireError::Protocol("SASL mechanism is not UTF-8"))?;
+        .ok_or("SASLInitialResponse missing mechanism")?;
+    let mechanism =
+        String::from_utf8(payload[..nul].to_vec()).map_err(|_| "SASL mechanism is not UTF-8")?;
     let rest = &payload[nul + 1..];
     if rest.len() < 4 {
-        return Err(WireError::Protocol("SASLInitialResponse truncated"));
+        return Err("SASLInitialResponse truncated");
     }
     let declared = i32::from_be_bytes(rest[..4].try_into().expect("4 bytes"));
     let body = &rest[4..];
     let expected = i32::try_from(body.len()).unwrap_or(i32::MAX);
     if declared < 0 || declared != expected {
-        return Err(WireError::Protocol(
-            "SASLInitialResponse length does not match its payload",
-        ));
+        return Err("SASLInitialResponse length does not match its payload");
     }
-    let initial = String::from_utf8(body.to_vec())
-        .map_err(|_| WireError::Protocol("SCRAM client-first message is not UTF-8"))?;
+    let initial =
+        String::from_utf8(body.to_vec()).map_err(|_| "SCRAM client-first message is not UTF-8")?;
     Ok((mechanism, initial))
 }
 
