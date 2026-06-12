@@ -825,20 +825,9 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("[tls]"), "{msg}");
-    }
-
-    #[test]
-    fn the_self_signed_fallback_mints_a_usable_acceptor() {
-        // The posture promises a certificate on a non-loopback no-TLS bind; prove
-        // the daemon can actually mint the acceptor it would attach (STL-304).
-        let cfg = non_dev("0.0.0.0:5454", None);
-        assert!(matches!(
-            plaintext_posture(&cfg),
-            PlaintextPosture::GenerateSelfSigned(_)
-        ));
-        let tls =
-            ServerTls::self_signed(TlsMode::Required).expect("daemon mints a self-signed acceptor");
-        assert!(format!("{tls:?}").contains("Required"), "{tls:?}");
+        // That the daemon can actually mint the promised acceptor is proved,
+        // for both modes plus a real handshake, in stele-pgwire's tls /
+        // tls_wire tests — the call is identical regardless of caller crate.
     }
 
     #[test]
