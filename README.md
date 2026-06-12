@@ -13,7 +13,7 @@
 
 Stele treats history as the primary key of reality. Every fact is stored with *when it was true in the world* (valid time) and *when the system learned it* (system time), and nothing is ever destructively overwritten. On that foundation, "what did this table look like last Tuesday, as we understood it at month-end close?" is a first-class query — not an archaeology project.
 
-It competes on **correctness, time-travel, and auditability** for analytical and temporal/audit workloads. It explicitly does **not** try to out-benchmark ClickHouse and Postgres at the same time — [that's a known graveyard](docs/00-charter.md#3-the-guardrail--lead-with-the-non-goal).
+It competes on **correctness, time-travel, and auditability** for analytical and temporal/audit workloads.
 
 ## The thesis in four SQL statements
 
