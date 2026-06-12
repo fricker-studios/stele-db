@@ -24,16 +24,41 @@ PGJDBC_VERSION="42.7.7"
 PGJDBC_SHA256="157963d60ae66d607e09466e8c0cdf8087e9cb20d0159899ffca96bca2528460"
 
 JAR="${PGJDBC_JAR:-${TMPDIR:-/tmp}/postgresql-${PGJDBC_VERSION}.jar}"
-if [ ! -f "$JAR" ]; then
-  curl -fsSL -o "$JAR" \
-    "https://repo1.maven.org/maven2/org/postgresql/postgresql/${PGJDBC_VERSION}/postgresql-${PGJDBC_VERSION}.jar"
-fi
+JAR_URL="https://repo1.maven.org/maven2/org/postgresql/postgresql/${PGJDBC_VERSION}/postgresql-${PGJDBC_VERSION}.jar"
+
+# Atomic fetch: download (with retries) to a temp file and rename into place,
+# so an interrupted transfer never leaves a partial jar at $JAR.
+fetch_jar() {
+  local tmp
+  tmp="$(mktemp "${JAR}.XXXXXX")"
+  curl -fsSL --retry 3 --retry-delay 2 -o "$tmp" "$JAR_URL" || {
+    rm -f "$tmp"
+    return 1
+  }
+  mv "$tmp" "$JAR"
+}
 
 # `shasum -a 256` exists on both the GitHub ubuntu runners and macOS dev boxes
 # (sha256sum does not ship with macOS).
-echo "${PGJDBC_SHA256}  ${JAR}" | shasum -a 256 -c - >/dev/null || {
-  echo "FAIL: pgjdbc jar checksum mismatch (expected ${PGJDBC_SHA256})" >&2
-  exit 1
+verify_jar() {
+  echo "${PGJDBC_SHA256}  ${JAR}" | shasum -a 256 -c - >/dev/null 2>&1
 }
+
+[ -f "$JAR" ] || fetch_jar
+if ! verify_jar; then
+  if [ -n "${PGJDBC_JAR:-}" ]; then
+    # A caller-supplied jar is never replaced behind the caller's back.
+    echo "FAIL: pgjdbc jar checksum mismatch (expected ${PGJDBC_SHA256})" >&2
+    exit 1
+  fi
+  # A stale or corrupt cached download (e.g. an interrupted earlier fetch):
+  # replace it once and re-verify before failing.
+  rm -f "$JAR"
+  fetch_jar
+  verify_jar || {
+    echo "FAIL: pgjdbc jar checksum mismatch after re-download (expected ${PGJDBC_SHA256})" >&2
+    exit 1
+  }
+fi
 
 exec java -cp "$JAR" "$(dirname "$0")/JdbcSmoke.java" "$HOST" "$PORT"
