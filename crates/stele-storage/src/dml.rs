@@ -352,20 +352,31 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     ///
     /// * **the append fails / is torn** — no complete record reaches the log, so
     ///   recovery finds nothing of the transaction (a torn frame fails its CRC and
-    ///   is dropped at the fence); and
+    ///   is dropped at the fence). The buffered writes already applied *resident* to
+    ///   `delta`/`index`, so they are rolled back **in place** (the [STL-216] in-memory
+    ///   undo) before the error is surfaced — a refused commit therefore leaves the live
+    ///   engine matching what recovery reconstructs (none of the transaction), with no
+    ///   restart ([STL-295]); and
     /// * **the append succeeds but the fsync ([`Wal::tick`]) fails** — the complete
     ///   record is already *staged* in the WAL, so its durability is **indeterminate**:
     ///   a later successful `tick` (e.g. a [`checkpoint`](crate::engine::Engine::checkpoint))
     ///   could otherwise still make it durable. An fsync failure is therefore treated as
-    ///   a crash, not a clean abort: the failed `tick` **poisons** the WAL
-    ///   ([`WalError::Poisoned`]), so every later `append`/`tick` is refused and the
-    ///   staged record can never be flushed by a subsequent op — the engine stops and
-    ///   recovers ([STL-217]). Either way no *new* durability point is introduced: the
-    ///   fsync is the only one.
+    ///   a crash, not a clean abort: the resident writes are **not** rolled back, the
+    ///   failed `tick` **poisons** the WAL ([`WalError::Poisoned`]) so every later
+    ///   `append`/`tick` is refused and the staged record can never be flushed by a
+    ///   subsequent op — the engine stops and recovers ([STL-217], which replays the
+    ///   staged record). Either way no *new* durability point is introduced: the fsync
+    ///   is the only one.
     ///
+    /// [STL-216]: https://allegromusic.atlassian.net/browse/STL-216
     /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
-    pub fn commit_group(&mut self) -> Result<LogOffset, DmlError> {
-        self.finish_group(None)
+    /// [STL-295]: https://allegromusic.atlassian.net/browse/STL-295
+    pub fn commit_group<I: Disk>(
+        &mut self,
+        delta: &mut Delta<D>,
+        index: &mut ValidityIndex<I>,
+    ) -> Result<LogOffset, DmlError> {
+        self.finish_group(delta, index, None)
     }
 
     /// Group-commit the open buffer as **one leg of a multi-table transaction**
@@ -381,39 +392,97 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     /// takes the plain [`commit_group`](Self::commit_group) fast path instead.
     ///
     /// Clears the group buffer, returning the writer to auto-commit mode. The
-    /// fsync-failure caveat is identical to [`commit_group`](Self::commit_group)
-    /// ([STL-217]).
+    /// append-failure (in-place rollback, [STL-295]) and fsync-failure (poison,
+    /// [STL-217]) caveats are identical to [`commit_group`](Self::commit_group).
     ///
     /// [STL-215]: https://allegromusic.atlassian.net/browse/STL-215
+    /// [STL-295]: https://allegromusic.atlassian.net/browse/STL-295
     ///
     /// # Errors
     ///
     /// [`DmlError::Wal`] if the append or fsync fails.
-    pub fn commit_group_two_phase(&mut self, txn_id: TxnId) -> Result<LogOffset, DmlError> {
-        self.finish_group(Some(txn_id))
+    pub fn commit_group_two_phase<I: Disk>(
+        &mut self,
+        delta: &mut Delta<D>,
+        index: &mut ValidityIndex<I>,
+        txn_id: TxnId,
+    ) -> Result<LogOffset, DmlError> {
+        self.finish_group(delta, index, Some(txn_id))
     }
 
     /// Append the buffered transaction as one WAL record and fsync once — the
     /// shared body of [`commit_group`](Self::commit_group) (plain, `txn_id` =
     /// [`None`]) and [`commit_group_two_phase`](Self::commit_group_two_phase)
-    /// (`txn_id` = [`Some`]). A plain record is byte-for-byte what the single-record
-    /// path always wrote; a two-phase record prepends the
-    /// [`TWO_PHASE_RECORD_TAG`] envelope. An empty buffer writes no record and skips
-    /// the fsync.
-    fn finish_group(&mut self, txn_id: Option<TxnId>) -> Result<LogOffset, DmlError> {
+    /// (`txn_id` = [`Some`]). An empty buffer writes no record and skips the fsync.
+    ///
+    /// The buffered writes already applied **resident** to `delta`/`index`
+    /// ([`log_and_apply`](Self::log_and_apply)), so the two failure modes the WAL
+    /// surfaces need different in-memory handling ([STL-295]):
+    ///
+    /// * **the append fails** — no complete record reaches the log (a clean failure
+    ///   writes nothing; a torn one leaves a frame that fails its CRC and is dropped
+    ///   at the fence), so recovery reconstructs *none* of the transaction. The
+    ///   resident writes are therefore rolled back **in place** ([`crate::systime::undo`],
+    ///   the [STL-216] inverse of `apply_resident`) before the error is surfaced — the
+    ///   live engine matches the recovered state without a restart. The append did not
+    ///   poison the WAL, so the engine stays healthy and serves the rolled-back state.
+    /// * **the fsync ([`Wal::tick`]) fails** — the complete record is already *staged*,
+    ///   so its durability is indeterminate and recovery may replay it. This is a crash,
+    ///   not a clean abort: the resident writes are left in place, the WAL poisons
+    ///   ([STL-217]), and the engine recovers.
+    ///
+    /// A torn (partially-written) append is *also* dropped at recovery, so the resident
+    /// rollback above is correct for it too; whether the WAL should additionally poison
+    /// on a detectably-torn append (the stray bytes are unsafe to append past) is a
+    /// separate WAL-durability concern — no current backend models a partial write
+    /// (`MemDisk` faults fire before the write; `LocalFile::append` does not advance its
+    /// tracked length on a partial `write_all`), so it is not detectable or testable
+    /// here and is left to a follow-up.
+    ///
+    /// [STL-216]: https://allegromusic.atlassian.net/browse/STL-216
+    /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
+    /// [STL-295]: https://allegromusic.atlassian.net/browse/STL-295
+    fn finish_group<I: Disk>(
+        &mut self,
+        delta: &mut Delta<D>,
+        index: &mut ValidityIndex<I>,
+        txn_id: Option<TxnId>,
+    ) -> Result<LogOffset, DmlError> {
         let redos = self.group.take().unwrap_or_default();
         if redos.is_empty() {
             return Ok(self.wal.durable_end());
         }
+        // Encode + append are the "did a complete record reach the log?" step. Any
+        // failure here means recovery reconstructs none of the transaction, so undo
+        // the resident writes in place to match — otherwise a refused commit leaves
+        // undurable rows a live SELECT can see but a restart erases (STL-295).
+        if let Err(e) = self.append_group_record(txn_id, &redos) {
+            crate::systime::undo(delta, index, redos);
+            return Err(e);
+        }
+        // The single group-commit fsync — the transaction's durability point. If it
+        // fails after the append above, the staged record's durability is
+        // indeterminate (a later tick may still flush it); the caller must treat
+        // that as a crash, not a clean abort, so the resident writes are *not* rolled
+        // back and the WAL poisons (STL-217).
+        self.wal.tick()?;
+        Ok(self.wal.durable_end())
+    }
+
+    /// Encode the buffered redo set as a single WAL record and append it — the
+    /// fallible "did a complete record reach the log?" half of
+    /// [`finish_group`](Self::finish_group), split out so the caller can roll the
+    /// resident writes back on failure ([STL-295]).
+    ///
+    /// A plain record (`txn_id` = [`None`]) is byte-for-byte what the single-record
+    /// path always wrote — recovery applies it unconditionally; a two-phase record
+    /// (`txn_id` = [`Some`]) prepends the [`TWO_PHASE_RECORD_TAG`] envelope so recovery
+    /// gates it on the commit marker ([STL-215]).
+    fn append_group_record(&self, txn_id: Option<TxnId>, redos: &[Redo]) -> Result<(), DmlError> {
         let record = match txn_id {
-            // Single-table / auto-commit: the record boundary alone is the atomic
-            // commit point, so it stays the pre-STL-215 framing — recovery applies
-            // it unconditionally.
-            None => encode_redo(&redos)?,
-            // A leg of a multi-table transaction: tag the record with the committing
-            // transaction so recovery can gate it on the commit marker (STL-215).
+            None => encode_redo(redos)?,
             Some(txn_id) => {
-                let redos = encode_redo(&redos)?;
+                let redos = encode_redo(redos)?;
                 let mut record = Vec::with_capacity(1 + 8 + redos.len());
                 record.push(TWO_PHASE_RECORD_TAG);
                 record.extend_from_slice(&txn_id.0.to_le_bytes());
@@ -422,12 +491,7 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
             }
         };
         self.wal.append(&record)?;
-        // The single group-commit fsync — the transaction's durability point. If it
-        // fails after the append above, the staged record's durability is
-        // indeterminate (a later tick may still flush it); the caller must treat
-        // that as a crash, not a clean abort (STL-217).
-        self.wal.tick()?;
-        Ok(self.wal.durable_end())
+        Ok(())
     }
 
     /// Discard the open group buffer without logging it — the transaction aborted
@@ -982,7 +1046,9 @@ mod tests {
             "no fsync before commit_group"
         );
 
-        writer.commit_group().expect("group commit");
+        writer
+            .commit_group(&mut delta, &mut index)
+            .expect("group commit");
 
         // Exactly one record now carries all three inserts' redos, and it is durable.
         let records: Vec<Vec<u8>> = wal
@@ -1234,6 +1300,170 @@ mod tests {
         );
     }
 
+    /// A group commit whose WAL append fails **cleanly** (no bytes written) must roll
+    /// the buffered writes back in memory, exactly like an explicit
+    /// [`abort_group`](DmlWriter::abort_group) — so a *refused* commit leaves the live
+    /// tiers identical to what a from-the-WAL recovery reconstructs, with no restart
+    /// ([STL-295]). Before the fix `finish_group` took the buffer *before* the append,
+    /// so a failed append dropped the undo list and the applied-but-undurable rows
+    /// stayed live — a SELECT showing rows a restart would erase.
+    ///
+    /// This is the recovery-equivalence oracle of
+    /// [`abort_after_a_chained_group_matches_a_fresh_recovery`], driven by a *failed
+    /// append* rather than an explicit abort: the chained `INSERT`+`UPDATE` of a new
+    /// key plus the `DELETE` of a committed key exercise every redo flavour the undo
+    /// path reverses — chained inserts, the supersession `Close`, and the delete's
+    /// `Retract` (tombstone + close).
+    #[test]
+    #[allow(clippy::too_many_lines)] // a staged-vs-recovered oracle reads long but stays one scenario
+    fn a_clean_append_failure_rolls_the_group_back_to_a_fresh_recovery() {
+        use stele_common::provenance::Principal;
+
+        use crate::backend::{FaultOp, Faults, MemDisk};
+        use crate::delta::{Delta, DeltaConfig};
+        use crate::systime::EmptySealed;
+        use crate::validity::{ValidityConfig, ValidityIndex};
+        use crate::wal::{Wal, WalConfig};
+
+        // Only the WAL disk injects faults — the delta/index tiers write cleanly, so
+        // the sole failure surface is the one group-commit append.
+        let faults = Faults::new();
+        let wal =
+            Wal::open(MemDisk::with_faults(faults.clone()), WalConfig::default()).expect("wal");
+        let mut delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("delta");
+        let mut index =
+            ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("index");
+        let mut writer = DmlWriter::new(
+            wal.clone(),
+            StepClock(std::sync::atomic::AtomicI64::new(0)),
+            false,
+        );
+        let principal = Principal::new(b"p".to_vec());
+        let k_base = BusinessKey::new(b"base".to_vec());
+        let k_new = BusinessKey::new(b"new".to_vec());
+
+        // Committed baseline: one auto-commit INSERT, logged as its own record.
+        writer
+            .insert(
+                &mut delta,
+                &mut index,
+                &EmptySealed,
+                k_base.clone(),
+                None,
+                Some(b"base-v0".to_vec()),
+                0,
+                TxnId(1),
+                principal.clone(),
+            )
+            .expect("baseline insert");
+        let base_bytes = delta.byte_size();
+        let base_base_versions = delta.candidate_versions(&k_base).expect("base candidates");
+        let base_index = index.materialize().expect("base index");
+
+        // A multi-statement transaction: INSERT new, UPDATE new (resolves against the
+        // just-inserted version — front-to-back), DELETE the committed base.
+        writer.begin_group();
+        writer
+            .insert(
+                &mut delta,
+                &mut index,
+                &EmptySealed,
+                k_new.clone(),
+                None,
+                Some(b"new-v0".to_vec()),
+                0,
+                TxnId(2),
+                principal.clone(),
+            )
+            .expect("group insert");
+        writer
+            .update(
+                &mut delta,
+                &mut index,
+                &EmptySealed,
+                k_new.clone(),
+                None,
+                Some(b"new-v1".to_vec()),
+                0,
+                TxnId(2),
+                principal.clone(),
+            )
+            .expect("group update sees the buffered insert");
+        writer
+            .delete(
+                &mut delta,
+                &mut index,
+                &EmptySealed,
+                &k_base,
+                TxnId(2),
+                principal,
+            )
+            .expect("group delete of the committed key");
+
+        // Fail the one group-commit append — the transaction's sole durability write.
+        // Nothing is written (the fault fires before the byte copy), so the WAL is not
+        // poisoned and recovery finds none of the transaction.
+        faults.schedule(FaultOp::Append, std::io::ErrorKind::Other);
+        let err = writer
+            .commit_group(&mut delta, &mut index)
+            .expect_err("the clean append failure refuses the commit");
+        assert!(matches!(err, DmlError::Wal(_)), "got {err:?}");
+
+        // The live tiers are rolled back to the committed baseline …
+        assert!(
+            delta
+                .candidate_versions(&k_new)
+                .expect("new gone")
+                .is_empty(),
+            "the new key's chained versions were rolled back",
+        );
+        assert_eq!(
+            delta.candidate_versions(&k_base).expect("base restored"),
+            base_base_versions,
+            "the deleted-then-rolled-back base key is restored to its committed version",
+        );
+        assert!(
+            delta.staged_retractions().is_empty(),
+            "the delete's retraction tombstone was rolled back",
+        );
+        assert_eq!(
+            index.materialize().expect("index restored"),
+            base_index,
+            "every close the refused transaction materialized was rolled back",
+        );
+        assert_eq!(
+            delta.byte_size(),
+            base_bytes,
+            "resident byte accounting returned to the baseline",
+        );
+
+        // … and identical to what replaying the WAL into fresh tiers reconstructs: the
+        // baseline record alone (the refused commit logged nothing).
+        let mut rec_delta = Delta::open(MemDisk::new(), DeltaConfig::default()).expect("rec delta");
+        let mut rec_index =
+            ValidityIndex::open(MemDisk::new(), ValidityConfig::default()).expect("rec index");
+        replay(&wal, &mut rec_delta, &mut rec_index, Checkpoint::BEGIN).expect("replay");
+        assert_eq!(
+            delta.candidate_versions(&k_base).expect("live base"),
+            rec_delta
+                .candidate_versions(&k_base)
+                .expect("recovered base"),
+            "live base key matches the recovered base key",
+        );
+        assert!(
+            rec_delta
+                .candidate_versions(&k_new)
+                .expect("recovered new")
+                .is_empty(),
+            "recovery reconstructs none of the refused transaction's new key",
+        );
+        assert_eq!(
+            index.materialize().expect("live index"),
+            rec_index.materialize().expect("recovered index"),
+            "live index matches the recovered index exactly",
+        );
+    }
+
     /// A group statement that fails **after a partial apply** must still roll back
     /// fully on abort ([STL-216]; regression for the Copilot review of PR #130). An
     /// `UPDATE` resolves to `[Close, Insert]`: in group mode the close materializes
@@ -1355,7 +1585,9 @@ mod tests {
                 Principal::new(b"p".to_vec()),
             )
             .expect("buffered insert");
-        writer.commit_group().expect("plain group commit");
+        writer
+            .commit_group(&mut delta, &mut index)
+            .expect("plain group commit");
 
         let records: Vec<Vec<u8>> = wal
             .replay_from(Checkpoint::BEGIN)
@@ -1417,7 +1649,7 @@ mod tests {
                 .expect("buffered insert");
         }
         writer
-            .commit_group_two_phase(txn)
+            .commit_group_two_phase(&mut delta, &mut index, txn)
             .expect("two-phase group commit");
         let fence = wal.durable_end();
 
