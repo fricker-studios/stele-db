@@ -117,10 +117,18 @@ impl<C> MonotonicClock<C> {
         }
     }
 
-    /// The latest timestamp handed out, **without** advancing the clock — the
-    /// default read snapshot ("read the current state"). A reader at this instant
-    /// sees every commit so far (each had `sys_from <= high_water`) and nothing
-    /// not yet committed.
+    /// The latest timestamp handed out, **without** consulting the inner clock.
+    /// A reader at this instant sees every commit so far (each had
+    /// `sys_from <= high_water`) and nothing not yet committed.
+    ///
+    /// This is the right instant for resolving *committed state* — catalog
+    /// lookups, conflict bookkeeping, the [`commit_clock`](SessionEngine::commit_clock)
+    /// the oracle aligns on. It is **not** the right base for a fresh read
+    /// snapshot: between writes the mark stands still, so `now()` arithmetic in
+    /// an `AS OF` would be frozen at the last commit. Fresh snapshots go through
+    /// [`observe`](Self::observe) instead ([STL-227]).
+    ///
+    /// [STL-227]: https://allegromusic.atlassian.net/browse/STL-227
     #[must_use]
     pub fn current(&self) -> SystemTimeMicros {
         SystemTimeMicros(self.high_water.load(Ordering::Acquire))
@@ -139,6 +147,36 @@ impl<C> MonotonicClock<C> {
     /// [ADR-0022]: ../../../docs/adr/0022-clock-synchronization-and-ordering.md
     pub fn advance_to(&self, mark: SystemTimeMicros) {
         self.high_water.fetch_max(mark.0, Ordering::AcqRel);
+    }
+}
+
+impl<C: Clock> MonotonicClock<C> {
+    /// Take a fresh read snapshot: the inner clock's reading folded into the
+    /// high-water mark ([STL-227]).
+    ///
+    /// On an idle database [`current`](Self::current) is pinned at the last
+    /// commit, which froze `AS OF now()` arithmetic there — `now() - interval
+    /// '1 second'` resolved to one second before the last *write*, however long
+    /// ago that was. Observing the inner clock makes a fresh snapshot track real
+    /// time (statement time on auto-commit, transaction-start time inside a
+    /// `BEGIN` block — Postgres `now()` semantics).
+    ///
+    /// Raising the mark while reading is load-bearing, not incidental: a later
+    /// commit takes `max(inner, high_water + 1)` ([`now`](Clock::now)), so once
+    /// the snapshot is folded in every subsequent commit is **strictly greater**
+    /// than it — a pinned snapshot can never retroactively cover a commit, even
+    /// if the inner clock stalls or steps backwards (snapshot isolation,
+    /// [ADR-0022]). Under the sim the inner clock is virtual and only moves when
+    /// the scenario says so, so this degenerates to [`current`](Self::current)
+    /// and seeded traces are unchanged.
+    ///
+    /// [ADR-0022]: ../../../docs/adr/0022-clock-synchronization-and-ordering.md
+    /// [STL-227]: https://allegromusic.atlassian.net/browse/STL-227
+    #[must_use]
+    pub fn observe(&self) -> SystemTimeMicros {
+        let reading = self.inner.now().0;
+        let prev = self.high_water.fetch_max(reading, Ordering::AcqRel);
+        SystemTimeMicros(reading.max(prev))
     }
 }
 
@@ -989,14 +1027,17 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         &self.catalog
     }
 
-    /// The commit clock's current high-water mark — the system instant the most
-    /// recently committed write was stamped with, and the default read snapshot
-    /// ([`MonotonicClock::current`]). After a single auto-committed
-    /// [`execute`](Self::execute) of an `INSERT` / `UPDATE` / `DELETE`, this is
-    /// exactly that statement's commit instant (the engine assigns commit time
-    /// internally, so a caller cannot otherwise observe it). The differential
+    /// The commit clock's current high-water mark ([`MonotonicClock::current`]).
+    /// After a single auto-committed [`execute`](Self::execute) of an `INSERT` /
+    /// `UPDATE` / `DELETE`, this is exactly that statement's commit instant — the
+    /// commit is the last thing to advance the clock (the engine assigns commit
+    /// time internally, so a caller cannot otherwise observe it). The differential
     /// correctness oracle uses it to align an independent reference's timeline with
-    /// the engine's own commit ticks ([STL-167]).
+    /// the engine's own commit ticks ([STL-167]). Note the mark also rises when a
+    /// read takes a fresh snapshot ([`MonotonicClock::observe`], [STL-227]), so
+    /// between writes it tracks the last *observation*, not the last commit.
+    ///
+    /// [STL-227]: https://allegromusic.atlassian.net/browse/STL-227
     ///
     /// [STL-167]: https://allegromusic.atlassian.net/browse/STL-167
     #[must_use]
@@ -1049,12 +1090,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// [`EngineError`] if binding, catalog application, the scan, or the write
     /// fails.
     pub fn execute(&mut self, stmt: &Statement) -> Result<StatementOutcome, EngineError> {
-        // An auto-committed statement is its own snapshot: read the latest
-        // committed state, then write immediately. (Snapshot isolation pins one
-        // snapshot for a whole multi-statement transaction instead — see
-        // [`execute_in_txn`](Self::execute_in_txn).) No write buffer to overlay:
-        // an auto-commit read sees only committed state.
-        self.execute_at(stmt, self.clock.current(), &[])
+        // An auto-committed statement is its own snapshot: read at statement
+        // time — the clock observed fresh, so `AS OF now()` arithmetic tracks
+        // real time on an idle database ([STL-227]) — then write immediately.
+        // (Snapshot isolation pins one snapshot for a whole multi-statement
+        // transaction instead — see [`execute_in_txn`](Self::execute_in_txn).)
+        // No write buffer to overlay: an auto-commit read sees only committed
+        // state.
+        self.execute_at(stmt, self.clock.observe(), &[])
     }
 
     /// Resolve a row-returning statement's `RowDescription` columns **without
@@ -1086,7 +1129,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         &self,
         stmt: &Statement,
     ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError> {
-        self.describe_at(self.clock.current(), stmt)
+        // Observe the clock just as `execute` does, so a `Describe` of an
+        // `AS OF now() - …` statement resolves at the same kind of instant the
+        // `Execute` will ([STL-227]) — a frozen mark here could `BeforeHistory`
+        // a statement the execution would accept.
+        self.describe_at(self.clock.observe(), stmt)
     }
 
     /// As [`describe`](Self::describe), but resolving the row shape at an open
@@ -1192,7 +1239,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// [`execute_in_txn`](Self::execute_in_txn); the in-process path advances the
     /// snapshot itself.
     pub fn repin_snapshot(&self, txn: &mut SessionTransaction) {
-        let snapshot = self.clock.current();
+        // Re-pin at the observed instant, matching `begin` ([STL-227]).
+        let snapshot = self.clock.observe();
         txn.snapshot = snapshot;
         // Keep the open-snapshot multiset in step with the advanced pin, so the
         // prune floor reflects where this transaction now reads ([STL-204]).
@@ -2231,7 +2279,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
     #[must_use]
     pub fn begin(&self) -> SessionTransaction {
-        let snapshot = self.clock.current();
+        // Pin at transaction-start time (clock observed fresh, [STL-227]):
+        // `now()` inside the block is the `BEGIN` instant, Postgres-style, and
+        // every later commit lands strictly past the pin (`observe` folds the
+        // reading into the high-water mark), so the snapshot stays consistent.
+        let snapshot = self.clock.observe();
         SessionTransaction {
             snapshot,
             writes: Vec::new(),
@@ -3192,6 +3244,25 @@ mod tests {
         SessionEngine::open(MemDisk::new(), ZeroClock)
     }
 
+    /// A settable inner clock, for the tests that need real-looking microsecond
+    /// gaps between commits and idle stretches where time passes with no writes
+    /// ([STL-227]). `set` only steps where the test says so — deterministic.
+    #[derive(Debug, Clone)]
+    struct SteppedClock(Arc<AtomicI64>);
+    impl SteppedClock {
+        fn new(start: i64) -> Self {
+            Self(Arc::new(AtomicI64::new(start)))
+        }
+        fn set(&self, micros: i64) {
+            self.0.store(micros, Ordering::Release);
+        }
+    }
+    impl Clock for SteppedClock {
+        fn now(&self) -> SystemTimeMicros {
+            SystemTimeMicros(self.0.load(Ordering::Acquire))
+        }
+    }
+
     fn parse_one(sql: &str) -> Statement {
         stele_sql::parse(sql)
             .expect("parse")
@@ -3202,6 +3273,126 @@ mod tests {
 
     const CREATE: &str =
         "CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING";
+
+    /// The projected `balance` cell at an `AS OF` qualifier, or `None` when no
+    /// version is live there. `qualifier` is spliced verbatim so the tests can
+    /// exercise `now()` arithmetic exactly as a client writes it ([STL-227]).
+    fn balance_as_of(
+        engine: &mut SessionEngine<SteppedClock, MemDisk>,
+        qualifier: &str,
+    ) -> Result<Option<Vec<u8>>, EngineError> {
+        let sql =
+            format!("SELECT balance FROM account FOR SYSTEM_TIME AS OF {qualifier} WHERE id = 1");
+        let StatementOutcome::Rows(r) = engine.execute(&parse_one(&sql))? else {
+            panic!("SELECT must return rows");
+        };
+        assert!(
+            r.rows.len() <= 1,
+            "one key resolves to at most one live version"
+        );
+        Ok(r.rows
+            .into_iter()
+            .next()
+            .and_then(|row| row.into_iter().next().expect("the projected balance cell")))
+    }
+
+    /// The STL-227 repro: on an idle database, `AS OF now() - interval '…'` must
+    /// track real elapsed time, not stay frozen at the last commit. The stepped
+    /// clock plays the reporter's timeline — insert, update 5s later, then 10s of
+    /// idle — and the offsets pick out each system-time era deterministically.
+    #[test]
+    fn as_of_now_tracks_the_clock_between_writes() {
+        let clock = SteppedClock::new(1_000_000_000);
+        let mut engine = SessionEngine::open(MemDisk::new(), clock.clone());
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        clock.set(1_010_000_000);
+        engine
+            .execute(&parse_one(
+                "INSERT INTO account (id, balance) VALUES (1, 100)",
+            ))
+            .expect("insert");
+        clock.set(1_015_000_000);
+        engine
+            .execute(&parse_one("UPDATE account SET balance = 250 WHERE id = 1"))
+            .expect("update");
+
+        // 10 idle seconds: time passes, nothing commits, the high-water mark
+        // would have stood still — the frozen-`now()` bug lived here.
+        clock.set(1_025_000_000);
+
+        // now() - 1s = t+24s: past the update — the *new* value, however long
+        // the database has been idle.
+        assert_eq!(
+            balance_as_of(&mut engine, "(now() - interval '1 second')").expect("select"),
+            cell(Some(ScalarValue::Int4(250)))
+        );
+        // now() - 11s = t+14s: inside [insert, update) — the old value.
+        assert_eq!(
+            balance_as_of(&mut engine, "(now() - interval '11 second')").expect("select"),
+            cell(Some(ScalarValue::Int4(100)))
+        );
+        // now() - 20s = t+5s: after CREATE, before the insert — no live version.
+        assert_eq!(
+            balance_as_of(&mut engine, "(now() - interval '20 second')").expect("select"),
+            None
+        );
+        // now() - 30s: before the table's first commit — the documented error,
+        // never a silent empty read.
+        assert!(matches!(
+            balance_as_of(&mut engine, "(now() - interval '30 second')"),
+            Err(EngineError::Select(SelectError::BeforeHistory { .. }))
+        ));
+    }
+
+    /// Observing the clock for a read snapshot must not let a later commit slide
+    /// at or under it, even when the inner clock stalls or steps backwards —
+    /// `observe` folds the reading into the high-water mark, so the next commit
+    /// is strictly greater and a pinned `BEGIN` snapshot stays consistent.
+    #[test]
+    fn commits_after_an_observed_snapshot_stay_strictly_later() {
+        let clock = SteppedClock::new(1_000_000_000);
+        let mut engine = SessionEngine::open(MemDisk::new(), clock.clone());
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one(
+                "INSERT INTO account (id, balance) VALUES (1, 100)",
+            ))
+            .expect("insert");
+
+        // Pin a transaction snapshot at t+10s, then step the clock *backwards*
+        // before a concurrent auto-commit writes.
+        clock.set(1_010_000_000);
+        let mut txn = engine.begin();
+        let pinned = engine.commit_clock();
+        clock.set(1_005_000_000);
+        engine
+            .execute(&parse_one("UPDATE account SET balance = 250 WHERE id = 1"))
+            .expect("auto-commit update");
+        assert!(
+            engine.commit_clock() > pinned,
+            "a commit after an observed snapshot lands strictly past it, \
+             even against a backwards-stepping inner clock"
+        );
+
+        // The pinned snapshot still reads the pre-update value; the live read
+        // (a fresh observation) sees the update.
+        let StatementOutcome::Rows(in_txn) = engine
+            .execute_in_txn(&parse_one("SELECT balance FROM account"), &mut txn)
+            .expect("select in txn")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(in_txn.rows, vec![vec![cell(Some(ScalarValue::Int4(100)))]]);
+        drop(txn);
+        let StatementOutcome::Rows(live) = engine
+            .execute(&parse_one("SELECT balance FROM account"))
+            .expect("live select")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(live.rows, vec![vec![cell(Some(ScalarValue::Int4(250)))]]);
+    }
 
     #[test]
     fn create_then_insert_then_select_within_one_session() {
