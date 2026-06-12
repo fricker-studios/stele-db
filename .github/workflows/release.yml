@@ -122,12 +122,11 @@ jobs:
           # GitHub drops hosted Intel macOS entirely and this target retires
           # (STL-161).
           - { os: macos-15-intel, target: x86_64-apple-darwin, ext: "" }
-          # Tier 3 (x86_64-pc-windows-msvc) is deferred: the storage backend's
-          # positioned read uses the Unix-only `pread` (std::os::unix FileExt),
-          # so the engine does not yet compile on Windows, and Windows has no CI
-          # coverage. Restored once the portable seek_read path + a Windows CI
-          # leg land (STL-160). Keeping a broken release-only target here would
-          # block every GitHub Release (this matrix feeds `release`).
+          # Tier 3 — restored by STL-160 (portable seek_read storage backend).
+          # Unlike v0.1 this is no longer a release-only target: ci.yml's
+          # `windows` job builds the workspace + runs the storage suite on
+          # every PR, so a tag can't be the first time Windows compiles.
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: ".exe" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3

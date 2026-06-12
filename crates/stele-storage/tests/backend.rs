@@ -148,6 +148,62 @@ fn memory_backend_satisfies_contract() {
     run_disk_contract(&disk);
 }
 
+/// STL-160: a positioned read must never disturb the append cursor — every
+/// append lands at end-of-file no matter what reads happened in between. Unix
+/// gets this from `pread(2)` (no cursor involved at all); Windows gets it from
+/// `FILE_APPEND_DATA` append-mode writes (`seek_read` *may* move the cursor,
+/// and appends must not care). The interleaving below parks the cursor at the
+/// front of the file before every append, then asserts the file is the exact
+/// concatenation of the appended chunks.
+fn run_positioned_reads_never_move_the_append_cursor<D: Disk>(disk: &D) {
+    let mut f = disk.create("interleaved").expect("create");
+    let mut expected = Vec::new();
+    for i in 0..32u8 {
+        // Variable-length chunks so a cursor bug can't hide behind alignment.
+        let chunk = vec![i; usize::from(i % 7) + 1];
+        f.append(&chunk).expect("append");
+        expected.extend_from_slice(&chunk);
+
+        // Park any cursor at the *front* of the file…
+        let mut probe = [0u8; 4];
+        let n = f.read_at(0, &mut probe).expect("probe front");
+        assert_eq!(&probe[..n], &expected[..n]);
+        // …and straddle EOF for good measure (short read, never an error).
+        let mut tail = [0u8; 8];
+        let n = f
+            .read_at(expected.len() as u64 - 1, &mut tail)
+            .expect("probe tail");
+        assert_eq!(&tail[..n], &expected[expected.len() - 1..]);
+    }
+
+    // A fresh handle's cursor starts at 0; read first, then append — the
+    // append must still land at EOF.
+    drop(f);
+    let mut f = disk.open("interleaved").expect("reopen");
+    let mut probe = [0u8; 1];
+    assert_eq!(f.read_at(0, &mut probe).expect("read front"), 1);
+    f.append(b"Z").expect("append after positioned read");
+    expected.push(b'Z');
+
+    assert_eq!(f.len(), expected.len() as u64);
+    let mut got = vec![0u8; expected.len()];
+    let n = f.read_at(0, &mut got).expect("read everything back");
+    assert_eq!(n, expected.len());
+    assert_eq!(got, expected, "every append landed at end-of-file");
+}
+
+#[test]
+fn local_positioned_reads_never_move_the_append_cursor() {
+    let tmp = TempDir::new();
+    let disk = LocalDisk::open(tmp.path()).expect("open LocalDisk");
+    run_positioned_reads_never_move_the_append_cursor(&disk);
+}
+
+#[test]
+fn memory_positioned_reads_never_move_the_append_cursor() {
+    run_positioned_reads_never_move_the_append_cursor(&MemDisk::new());
+}
+
 // --- a real storage test, run unchanged on both backends --------------------
 
 fn sample_versions() -> Vec<Version> {

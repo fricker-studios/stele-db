@@ -96,9 +96,9 @@ a local dev server: `ci/psycopg-smoke.py localhost 5454` /
 |---|---|---|
 | **Tier 1 (gating)** | `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` (macOS arm64) | Every PR |
 | **Tier 2** | `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin` | Nightly + release |
-| **Tier 3 (best effort)** | `x86_64-pc-windows-msvc` | **Deferred** — not yet shipped (STL-160) |
+| **Tier 3 (best effort)** | `x86_64-pc-windows-msvc` | Every PR (build + storage tests) + release |
 
-Rationale in [assumption A6](assumptions.md): servers run Linux; contributors develop on macOS; Windows is built but not prioritized. Windows is currently **deferred**: the storage backend's positioned read uses the Unix-only `pread`, so the engine does not yet compile for `x86_64-pc-windows-msvc`. The portable `seek_read` path and a Windows CI leg land in STL-160, which restores the target to the release matrix.
+Rationale in [assumption A6](assumptions.md): servers run Linux; contributors develop on macOS; Windows is built but not prioritized. The storage backend's positioned read is platform-split (`pread` on Unix, `seek_read` on Windows — STL-160); a dedicated per-PR `windows` job in `ci.yml` compiles the whole workspace (test targets included) and runs the storage backend suite — the one surface where platform file semantics diverge (append-mode writes vs the file cursor) — and `release.yml` ships the `x86_64-pc-windows-msvc` archive. The full test gate stays tier-1-only; Windows coverage widens if a Windows-heavy contributor base appears (A6).
 
 ---
 

@@ -1512,7 +1512,6 @@ mod tests {
         // is `MemHistory` whose save/append/load are no-ops, so the file would
         // never appear (0600 check fails) and the reload would recall nothing.
         use rustyline::history::{DefaultHistory, History as _, SearchDirection};
-        use std::os::unix::fs::PermissionsExt as _;
 
         // A throwaway path under the temp dir — never the real ~/.stele_history.
         let dir = std::env::temp_dir().join(format!(".stele-hist-{}", std::process::id()));
@@ -1533,8 +1532,15 @@ mod tests {
         first.append(&path).expect("append");
 
         // History can carry a credential in a literal — it must be owner-only.
-        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "history mode {mode:o}, expected 0600");
+        // Mode bits are a Unix concept; on Windows the file inherits the user
+        // profile's ACL instead, so this half of the test is Unix-only
+        // (STL-160) while the persistence half runs everywhere.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "history mode {mode:o}, expected 0600");
+        }
 
         // Session two: a fresh history loads the prior session's entries, the
         // multi-line statement intact as one entry.

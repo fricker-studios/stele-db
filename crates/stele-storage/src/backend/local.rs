@@ -2,18 +2,24 @@
 //!
 //! A thin wrapper over [`std::fs`]: each [`Disk`] is one directory, each
 //! [`DiskFile`] one file inside it. Files are opened in append + random-read
-//! mode; writes use `O_APPEND` semantics and positional reads use `pread(2)`
-//! ([`FileExt::read_at`]), so an in-flight reader never disturbs the append
-//! cursor. [`sync`](DiskFile::sync) is `fsync(2)` — the engine's only
-//! durability point.
+//! mode; writes use append semantics — `O_APPEND` on Unix, `FILE_APPEND_DATA`
+//! on Windows — so every write lands at end-of-file regardless of where any
+//! reader is positioned. Positional reads are `pread(2)` (`FileExt::read_at`)
+//! on Unix and `seek_read` (`ReadFile` with an explicit offset) on Windows.
+//! [`sync`](DiskFile::sync) is `fsync(2)` / `FlushFileBuffers` — the engine's
+//! only durability point.
 //!
-//! Unix-only by construction (`pread`). Stele's supported targets are Linux and
-//! macOS ([04 — CI/CD](../../../../docs/04-cicd.md)); a Windows port would add a
-//! `seek_read`-based path here.
+//! The one platform difference worth knowing (STL-160): `pread` never touches
+//! the file cursor, while Windows `seek_read` may move it. That asymmetry is
+//! harmless here *because* the handle is append-mode: `FILE_APPEND_DATA`
+//! writes ignore the cursor and append at EOF, exactly like `O_APPEND`. The
+//! backend conformance suite pins this invariant on every platform
+//! (`tests/backend.rs`, the append-cursor contract), and the Windows CI leg
+//! runs it on `x86_64-pc-windows-msvc`
+//! ([04 — CI/CD](../../../../docs/04-cicd.md)).
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use super::{Disk, DiskFile, validate_name};
@@ -98,17 +104,31 @@ pub struct LocalFile {
 impl DiskFile for LocalFile {
     fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
         use std::io::Write as _;
-        // The file was opened with `O_APPEND`, so every byte lands at
-        // end-of-file regardless of any prior `read_at`.
+        // The file was opened in append mode (`O_APPEND` on Unix,
+        // `FILE_APPEND_DATA` on Windows), so every byte lands at end-of-file
+        // regardless of any prior `read_at`.
         self.file.write_all(bytes)?;
         self.len += bytes.len() as u64;
         Ok(())
     }
 
+    #[cfg(unix)]
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         // `read_at` is `pread(2)`: it ignores and does not move the file
         // offset, so it cannot race the append cursor.
+        use std::os::unix::fs::FileExt as _;
         self.file.read_at(buf, offset)
+    }
+
+    #[cfg(windows)]
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        // `seek_read` is `ReadFile` with an explicit offset. Unlike `pread` it
+        // may move the file cursor, which is harmless on this handle: it was
+        // opened append-mode (`FILE_APPEND_DATA`), so writes ignore the cursor
+        // and land at EOF, same as `O_APPEND`. A read entirely past EOF is
+        // `ERROR_HANDLE_EOF`, which std maps to `Ok(0)` — matching `pread`.
+        use std::os::windows::fs::FileExt as _;
+        self.file.seek_read(buf, offset)
     }
 
     fn sync(&mut self) -> io::Result<()> {
