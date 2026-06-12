@@ -8,7 +8,7 @@
 //! subset of that into a typed [`DdlStatement`] whose
 //! [`apply`](DdlStatement::apply) effects the change against a [`Catalog`].
 //!
-//! ## What v0.1 binds
+//! ## What binds
 //!
 //! * `CREATE TABLE <name> (<cols>) WITH SYSTEM VERSIONING [, VALID TIME (f, t)]`
 //!   — every table is system-versioned (invariant 4), so `WITH SYSTEM
@@ -18,22 +18,36 @@
 //!   table and typed `TIMESTAMP`.
 //! * `DROP TABLE <name>` — a **logical** drop ([`Catalog::drop_table`]): a
 //!   catalog version transition, never a segment deletion.
+//! * `CREATE INDEX <name> ON <table> (<column>)` / `DROP INDEX <name>` — the
+//!   v0.3 secondary-index substrate ([STL-233]): a named, single-column index
+//!   in the default (B-tree) kind. An index is derived, rebuildable state, so
+//!   both directions are catalog/engine transitions that can change *speed*
+//!   but never *results*.
 //!
-//! ## What v0.1 rejects (with a message pointing at the roadmap)
+//! ## What is rejected (with a message pointing at the roadmap)
 //!
 //! Column and table constraints other than a column-level `PRIMARY KEY`
 //! (`FOREIGN KEY`/`REFERENCES`, `UNIQUE`, `CHECK`, `NOT NULL`, `DEFAULT`, …),
-//! indexes, `CREATE TABLE … AS SELECT`, `LIKE`/`CLONE`, `IF NOT EXISTS`,
+//! `CREATE TABLE … AS SELECT`, `LIKE`/`CLONE`, `IF NOT EXISTS`,
 //! `OR REPLACE`, temporary/external tables, schema-qualified names, and
 //! `DROP … CASCADE`. `PRIMARY KEY` is **accepted but not enforced** in v0.1
 //! (uniqueness/indexing is a later ticket) so the identity-demo
-//! `CREATE TABLE account (id INT PRIMARY KEY, balance INT) …` binds.
+//! `CREATE TABLE account (id INT PRIMARY KEY, balance INT) …` binds. On the
+//! index side: `UNIQUE`, `USING <kind>`, multi-column, expression, and partial
+//! (`WHERE`) indexes are rejected until their sibling tickets land — as are
+//! `CONCURRENTLY`, `IF NOT EXISTS`, `INCLUDE`, `NULLS [NOT] DISTINCT`,
+//! `WITH (…)`, per-column `ASC`/`DESC`/`NULLS` ordering and operator classes,
+//! an unnamed `CREATE INDEX`, and `DROP INDEX … CASCADE` / multi-index drops.
+//!
+//! [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
 
 use sqlparser::ast::{
-    ColumnDef as SqlColumnDef, ColumnOption, CreateTable, ObjectName, ObjectType,
-    Statement as SqlStatement,
+    ColumnDef as SqlColumnDef, ColumnOption, CreateIndex, CreateTable, Expr, IndexColumn,
+    ObjectName, ObjectType, Statement as SqlStatement,
 };
-use stele_catalog::{Catalog, CatalogError, ColumnDef, SchemaId, TableTemporal, ValidTimeSpec};
+use stele_catalog::{
+    Catalog, CatalogError, ColumnDef, IndexDef, IndexKind, SchemaId, TableTemporal, ValidTimeSpec,
+};
 use stele_common::time::SystemTimeMicros;
 use stele_common::types::LogicalType;
 
@@ -128,6 +142,32 @@ pub enum DdlStatement {
         /// rather than an error.
         if_exists: bool,
     },
+    /// `CREATE INDEX <name> ON <table> (<column>)` — register a secondary
+    /// index ([STL-233]). The substrate binds the bare (B-tree-kind,
+    /// single-column) form; `USING`, multi-column, `UNIQUE`, and partial
+    /// indexes are sibling/later tickets.
+    ///
+    /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    CreateIndex {
+        /// The index name — unique across the live index set.
+        name: String,
+        /// The table the index accelerates.
+        table: String,
+        /// The indexed value column names, in declaration order.
+        columns: Vec<String>,
+    },
+    /// `DROP INDEX <name>` — remove a secondary index ([STL-233]). Purely a
+    /// catalog/engine transition: an index is derived state, so nothing
+    /// historical is lost.
+    ///
+    /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    DropIndex {
+        /// The index name.
+        name: String,
+        /// `IF EXISTS` was given — dropping an absent index is then a no-op
+        /// rather than an error.
+        if_exists: bool,
+    },
 }
 
 /// What [`DdlStatement::apply`] did to the catalog.
@@ -139,6 +179,16 @@ pub enum DdlOutcome {
     Dropped(SchemaId),
     /// A `DROP TABLE IF EXISTS` named a table that did not exist — a no-op.
     DropNoOp,
+    /// A secondary index was registered ([STL-233]).
+    ///
+    /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    CreatedIndex,
+    /// A secondary index was removed ([STL-233]).
+    ///
+    /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    DroppedIndex,
+    /// A `DROP INDEX IF EXISTS` named an index that did not exist — a no-op.
+    DropIndexNoOp,
 }
 
 impl DdlOutcome {
@@ -149,6 +199,8 @@ impl DdlOutcome {
         match self {
             Self::Created(_) => "CREATE TABLE",
             Self::Dropped(_) | Self::DropNoOp => "DROP TABLE",
+            Self::CreatedIndex => "CREATE INDEX",
+            Self::DroppedIndex | Self::DropIndexNoOp => "DROP INDEX",
         }
     }
 }
@@ -166,6 +218,7 @@ pub fn bind_ddl(stmt: &Statement) -> Result<DdlStatement, BindError> {
     };
     match body {
         SqlStatement::CreateTable(create) => bind_create_table(create, stmt),
+        SqlStatement::CreateIndex(create) => bind_create_index(create),
         SqlStatement::Drop {
             object_type: ObjectType::Table,
             if_exists,
@@ -189,9 +242,21 @@ pub fn bind_ddl(stmt: &Statement) -> Result<DdlStatement, BindError> {
             }
             bind_drop_table(names, *if_exists)
         }
+        SqlStatement::Drop {
+            object_type: ObjectType::Index,
+            if_exists,
+            names,
+            cascade,
+            ..
+        } => {
+            if *cascade {
+                return Err(BindError::Unsupported("DROP INDEX … CASCADE".to_owned()));
+            }
+            bind_drop_index(names, *if_exists)
+        }
         // A DROP of some other object kind is DDL we don't implement.
         SqlStatement::Drop { object_type, .. } => Err(BindError::Unsupported(format!(
-            "DROP {object_type} (only DROP TABLE is supported)"
+            "DROP {object_type} (only DROP TABLE / DROP INDEX is supported)"
         ))),
         _ => Err(BindError::NotDdl),
     }
@@ -316,6 +381,96 @@ fn bind_drop_table(names: &[ObjectName], if_exists: bool) -> Result<DdlStatement
     })
 }
 
+/// Lower a parsed `CREATE INDEX` to the substrate surface ([STL-233]): a named,
+/// single-column index in the default (B-tree) kind. Everything richer —
+/// `USING <kind>`, multi-column, `UNIQUE`, partial (`WHERE`), `INCLUDE`,
+/// expression columns — is rejected with a roadmap pointer; the sibling index
+/// tickets lift those as their access structures land.
+///
+/// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+fn bind_create_index(create: &CreateIndex) -> Result<DdlStatement, BindError> {
+    let unsupported = |what: &str| Err(BindError::Unsupported(what.to_owned()));
+    if create.unique {
+        return unsupported("CREATE UNIQUE INDEX");
+    }
+    if create.concurrently {
+        return unsupported("CREATE INDEX CONCURRENTLY");
+    }
+    if create.if_not_exists {
+        return unsupported("CREATE INDEX IF NOT EXISTS");
+    }
+    if create.using.is_some() {
+        return unsupported("CREATE INDEX … USING <kind> (the default kind only)");
+    }
+    if !create.include.is_empty() {
+        return unsupported("CREATE INDEX … INCLUDE");
+    }
+    if create.nulls_distinct.is_some() {
+        return unsupported("CREATE INDEX … NULLS [NOT] DISTINCT");
+    }
+    if !create.with.is_empty() {
+        return unsupported("CREATE INDEX … WITH (…)");
+    }
+    if create.predicate.is_some() {
+        return unsupported("partial index (CREATE INDEX … WHERE)");
+    }
+    if !create.index_options.is_empty() || !create.alter_options.is_empty() {
+        return unsupported("CREATE INDEX options");
+    }
+    // `DROP INDEX` resolves by name alone, so an anonymous index would be
+    // undroppable; require the name rather than synthesizing one.
+    let Some(name) = &create.name else {
+        return unsupported("CREATE INDEX without an index name");
+    };
+    let name = bare_name(name)?;
+    let table = bare_name(&create.table_name)?;
+    // The substrate indexes exactly one column; the metadata carries a list so
+    // multi-column is an extension, not a format change.
+    let [column] = create.columns.as_slice() else {
+        return unsupported("multi-column CREATE INDEX");
+    };
+    Ok(DdlStatement::CreateIndex {
+        name,
+        table,
+        columns: vec![index_column(column)?],
+    })
+}
+
+/// Extract a plain column name from one parsed index column, rejecting the
+/// per-column decorations (`ASC`/`DESC`, `NULLS FIRST`, operator classes,
+/// expression columns) the substrate does not honor.
+fn index_column(column: &IndexColumn) -> Result<String, BindError> {
+    let unsupported = |what: &str| Err(BindError::Unsupported(what.to_owned()));
+    if column.operator_class.is_some() {
+        return unsupported("an operator class on an index column");
+    }
+    let order = &column.column;
+    if order.options.asc.is_some() || order.options.nulls_first.is_some() {
+        return unsupported("ASC/DESC/NULLS ordering on an index column");
+    }
+    if order.with_fill.is_some() {
+        return unsupported("WITH FILL on an index column");
+    }
+    match &order.expr {
+        Expr::Identifier(ident) => Ok(ident.value.clone()),
+        other => Err(BindError::Unsupported(format!(
+            "index over an expression `{other}` (plain columns only)"
+        ))),
+    }
+}
+
+fn bind_drop_index(names: &[ObjectName], if_exists: bool) -> Result<DdlStatement, BindError> {
+    let [name] = names else {
+        return Err(BindError::Unsupported(
+            "DROP INDEX of multiple indexes in one statement".to_owned(),
+        ));
+    };
+    Ok(DdlStatement::DropIndex {
+        name: bare_name(name)?,
+        if_exists,
+    })
+}
+
 /// Extract a single, unqualified identifier from an [`ObjectName`].
 fn bare_name(name: &ObjectName) -> Result<String, BindError> {
     match name.0.as_slice() {
@@ -360,6 +515,20 @@ impl DdlStatement {
             Self::DropTable { name, if_exists } => match catalog.drop_table(&name, at) {
                 Ok(id) => Ok(DdlOutcome::Dropped(id)),
                 Err(CatalogError::UnknownTable(_)) if if_exists => Ok(DdlOutcome::DropNoOp),
+                Err(e) => Err(e),
+            },
+            // Index metadata is live-only (an index changes speed, never
+            // results), so `at` does not participate ([STL-233]).
+            Self::CreateIndex {
+                name,
+                table,
+                columns,
+            } => catalog
+                .create_index(IndexDef::new(name, table, IndexKind::BTree, columns)?)
+                .map(|()| DdlOutcome::CreatedIndex),
+            Self::DropIndex { name, if_exists } => match catalog.drop_index(&name) {
+                Ok(_) => Ok(DdlOutcome::DroppedIndex),
+                Err(CatalogError::UnknownIndex(_)) if if_exists => Ok(DdlOutcome::DropIndexNoOp),
                 Err(e) => Err(e),
             },
         }

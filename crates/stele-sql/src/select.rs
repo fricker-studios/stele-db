@@ -187,6 +187,30 @@ impl BoundPredicate {
             _ => None,
         }
     }
+
+    /// The `(schema index, literal)` this predicate equates a **value column**
+    /// to, if it is exactly `<column> = <literal>` (in either operand order)
+    /// over a non-key column — the shape a secondary-index equality probe can
+    /// serve ([STL-233]). `None` for a business-key equality (which has its own
+    /// zone-map push-down, [`key_equality`](Self::key_equality)) and for every
+    /// richer predicate, which the vectorized filter still applies exactly.
+    ///
+    /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    #[must_use]
+    pub const fn column_equality(&self) -> Option<(usize, &ScalarValue)> {
+        if !matches!(self.op, CompareOp::Eq) {
+            return None;
+        }
+        match (&self.left, &self.right) {
+            (BoundScalar::Column(col), BoundScalar::Literal(value))
+            | (BoundScalar::Literal(value), BoundScalar::Column(col))
+                if *col > 0 =>
+            {
+                Some((*col, value))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// A bound `SELECT … [FOR SYSTEM_TIME AS OF …]`, ready to lower to a

@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 
 use stele_common::time::{SYSTEM_TIME_OPEN, SystemTimeMicros};
 
+use crate::index::IndexDef;
 use crate::schema::{ColumnDef, SchemaId, TableSchema};
 use crate::{CatalogError, TableTemporal};
 
@@ -56,6 +57,13 @@ pub struct Catalog {
     /// last entry is the open one (`sys_to == SYSTEM_TIME_OPEN`) while the table
     /// is live; a dropped table's last entry is closed instead.
     tables: BTreeMap<String, Vec<SchemaVersion>>,
+    /// The **live** secondary indexes, by name ([STL-233]). Deliberately not
+    /// versioned on the system-time axis: an index changes speed, never
+    /// results, so a past `AS OF` read needs no record of the indexes live
+    /// *then* — see the [`IndexDef`] docs.
+    ///
+    /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    indexes: BTreeMap<String, IndexDef>,
     /// Monotonic schema-id allocator. Ids are never reused, so a footer's
     /// recorded id always names exactly one historical schema. Starts at
     /// [`FIRST_SCHEMA_ID`], reserving `0` (see [`SchemaId`]).
@@ -72,6 +80,7 @@ impl Default for Catalog {
     fn default() -> Self {
         Self {
             tables: BTreeMap::new(),
+            indexes: BTreeMap::new(),
             next_schema_id: FIRST_SCHEMA_ID,
         }
     }
@@ -302,7 +311,94 @@ impl Catalog {
             .last_mut()
             .expect("a registered table always has at least one schema version")
             .sys_to = at;
+        // An index lives only as long as its table: the drop cascades, so a
+        // later re-create of the name starts index-free ([STL-233]). The index
+        // set is live-only metadata — there is no history to preserve here, the
+        // dropped era's *rows* keep answering `AS OF` reads via a full scan.
+        self.indexes.retain(|_, def| def.table() != name);
         Ok(schema_id)
+    }
+
+    /// Register a live secondary index ([STL-233]).
+    ///
+    /// Index names share one namespace across the catalog (a `DROP INDEX`
+    /// names no table). The target table must be **live** and declare every
+    /// indexed column; the table's *first* column — the business key — is
+    /// refused, since the storage layer already resolves key lookups without a
+    /// secondary structure (zone-map pruning + the validity index).
+    ///
+    /// Index metadata is live-only (not system-time versioned) — see the
+    /// [`IndexDef`] docs for why.
+    ///
+    /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    ///
+    /// # Errors
+    ///
+    /// - [`CatalogError::IndexAlreadyExists`] if the name is already a live index.
+    /// - [`CatalogError::UnknownTable`] if the target table is absent or dropped.
+    /// - [`CatalogError::IndexColumnUnknown`] if an indexed column is not a
+    ///   column of the table's live schema.
+    /// - [`CatalogError::IndexOnBusinessKey`] if an indexed column is the
+    ///   table's first (business-key) column.
+    pub fn create_index(&mut self, def: IndexDef) -> Result<(), CatalogError> {
+        if self.indexes.contains_key(def.name()) {
+            return Err(CatalogError::IndexAlreadyExists(def.name().to_owned()));
+        }
+        let schema = &self
+            .open_version(def.table())
+            .ok_or_else(|| CatalogError::UnknownTable(def.table().to_owned()))?
+            .schema;
+        for column in def.columns() {
+            if schema.column(column).is_none() {
+                return Err(CatalogError::IndexColumnUnknown {
+                    index: def.name().to_owned(),
+                    column: column.clone(),
+                });
+            }
+            if schema
+                .columns()
+                .first()
+                .is_some_and(|key| key.name() == column)
+            {
+                return Err(CatalogError::IndexOnBusinessKey {
+                    index: def.name().to_owned(),
+                    column: column.clone(),
+                });
+            }
+        }
+        self.indexes.insert(def.name().to_owned(), def);
+        Ok(())
+    }
+
+    /// Remove a live secondary index, returning its definition ([STL-233]).
+    ///
+    /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::UnknownIndex`] if no live index has this name.
+    pub fn drop_index(&mut self, name: &str) -> Result<IndexDef, CatalogError> {
+        self.indexes
+            .remove(name)
+            .ok_or_else(|| CatalogError::UnknownIndex(name.to_owned()))
+    }
+
+    /// The live index with this name, if any.
+    #[must_use]
+    pub fn index(&self, name: &str) -> Option<&IndexDef> {
+        self.indexes.get(name)
+    }
+
+    /// The live indexes on `table`, in name order.
+    pub fn indexes_on<'a>(&'a self, table: &'a str) -> impl Iterator<Item = &'a IndexDef> {
+        self.indexes
+            .values()
+            .filter(move |def| def.table() == table)
+    }
+
+    /// Every live index, in name order.
+    pub fn live_indexes(&self) -> impl Iterator<Item = &IndexDef> {
+        self.indexes.values()
     }
 
     /// Resolve a table name to the schema in effect at `snapshot` — the
@@ -754,6 +850,150 @@ mod tests {
                 assert_contiguous(&cat, t);
             }
         }
+    }
+
+    /// A single-column [`IndexDef`] for the index tests.
+    fn idx(name: &str, table: &str, column: &str) -> IndexDef {
+        IndexDef::new(
+            name,
+            table,
+            crate::IndexKind::BTree,
+            vec![column.to_owned()],
+        )
+        .expect("well-formed index def")
+    }
+
+    #[test]
+    fn create_index_registers_a_live_index_on_a_live_table() {
+        let mut cat = Catalog::new();
+        cat.create_table(
+            "t",
+            vec![col("id"), col("a")],
+            TableTemporal::system_only(),
+            SystemTimeMicros(1),
+        )
+        .expect("create table");
+
+        cat.create_index(idx("i_a", "t", "a"))
+            .expect("create index");
+        let def = cat.index("i_a").expect("index resolves");
+        assert_eq!(def.table(), "t");
+        assert_eq!(def.columns(), ["a".to_owned()]);
+        assert_eq!(cat.indexes_on("t").count(), 1);
+        assert_eq!(cat.live_indexes().count(), 1);
+        assert_eq!(cat.indexes_on("other").count(), 0);
+    }
+
+    #[test]
+    fn create_index_validates_name_table_and_columns() {
+        let mut cat = Catalog::new();
+        cat.create_table(
+            "t",
+            vec![col("id"), col("a")],
+            TableTemporal::system_only(),
+            SystemTimeMicros(1),
+        )
+        .expect("create table");
+        cat.create_index(idx("i_a", "t", "a"))
+            .expect("create index");
+
+        // A duplicate name is refused — names share one namespace.
+        assert_eq!(
+            cat.create_index(idx("i_a", "t", "a")),
+            Err(CatalogError::IndexAlreadyExists("i_a".to_owned()))
+        );
+        // The table must be live.
+        assert_eq!(
+            cat.create_index(idx("i_b", "missing", "a")),
+            Err(CatalogError::UnknownTable("missing".to_owned()))
+        );
+        // The column must exist in the live schema.
+        assert_eq!(
+            cat.create_index(idx("i_b", "t", "ghost")),
+            Err(CatalogError::IndexColumnUnknown {
+                index: "i_b".to_owned(),
+                column: "ghost".to_owned(),
+            })
+        );
+        // The business key (first column) is always indexed by storage already.
+        assert_eq!(
+            cat.create_index(idx("i_b", "t", "id")),
+            Err(CatalogError::IndexOnBusinessKey {
+                index: "i_b".to_owned(),
+                column: "id".to_owned(),
+            })
+        );
+        // Malformed defs are refused at construction.
+        assert_eq!(
+            IndexDef::new("", "t", crate::IndexKind::BTree, vec!["a".to_owned()]),
+            Err(CatalogError::InvalidIndexName)
+        );
+        assert_eq!(
+            IndexDef::new("i_b", "t", crate::IndexKind::BTree, vec![]),
+            Err(CatalogError::IndexHasNoColumns("i_b".to_owned()))
+        );
+    }
+
+    #[test]
+    fn drop_index_removes_exactly_the_named_index() {
+        let mut cat = Catalog::new();
+        cat.create_table(
+            "t",
+            vec![col("id"), col("a"), col("b")],
+            TableTemporal::system_only(),
+            SystemTimeMicros(1),
+        )
+        .expect("create table");
+        cat.create_index(idx("i_a", "t", "a")).expect("index a");
+        cat.create_index(idx("i_b", "t", "b")).expect("index b");
+
+        let dropped = cat.drop_index("i_a").expect("drop");
+        assert_eq!(dropped.columns(), ["a".to_owned()]);
+        assert!(cat.index("i_a").is_none());
+        assert!(cat.index("i_b").is_some());
+        assert_eq!(
+            cat.drop_index("i_a"),
+            Err(CatalogError::UnknownIndex("i_a".to_owned()))
+        );
+    }
+
+    #[test]
+    fn drop_table_cascades_its_indexes_and_a_recreate_starts_index_free() {
+        let mut cat = Catalog::new();
+        cat.create_table(
+            "t",
+            vec![col("id"), col("a")],
+            TableTemporal::system_only(),
+            SystemTimeMicros(1),
+        )
+        .expect("create t");
+        cat.create_table(
+            "u",
+            vec![col("id"), col("a")],
+            TableTemporal::system_only(),
+            SystemTimeMicros(2),
+        )
+        .expect("create u");
+        cat.create_index(idx("i_t", "t", "a")).expect("index t");
+        cat.create_index(idx("i_u", "u", "a")).expect("index u");
+
+        cat.drop_table("t", SystemTimeMicros(10)).expect("drop t");
+        // Only t's index cascades away; u's survives.
+        assert!(cat.index("i_t").is_none());
+        assert!(cat.index("i_u").is_some());
+
+        // The re-created name begins index-free — and its dropped-era index
+        // name is reusable.
+        cat.create_table(
+            "t",
+            vec![col("id"), col("a")],
+            TableTemporal::system_only(),
+            SystemTimeMicros(20),
+        )
+        .expect("re-create t");
+        assert_eq!(cat.indexes_on("t").count(), 0);
+        cat.create_index(idx("i_t", "t", "a"))
+            .expect("the dropped era's index name is free again");
     }
 
     /// Assert one table's version chain is a gap-free, non-overlapping tiling

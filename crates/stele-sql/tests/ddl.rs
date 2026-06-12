@@ -259,3 +259,146 @@ fn dropping_an_absent_table_without_if_exists_errors() {
     // Surfaces the catalog's unknown-table error.
     assert!(err.to_string().contains("ghost"), "got {err}");
 }
+
+// ---------------------------------------------------------------------------
+// Secondary-index DDL (STL-233)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn binds_create_index_and_drop_index() {
+    let ddl = bind_one("CREATE INDEX i_balance ON account (balance)").expect("bind create index");
+    assert_eq!(
+        ddl,
+        DdlStatement::CreateIndex {
+            name: "i_balance".to_owned(),
+            table: "account".to_owned(),
+            columns: vec!["balance".to_owned()],
+        }
+    );
+
+    let ddl = bind_one("DROP INDEX i_balance").expect("bind drop index");
+    assert_eq!(
+        ddl,
+        DdlStatement::DropIndex {
+            name: "i_balance".to_owned(),
+            if_exists: false,
+        }
+    );
+
+    let ddl = bind_one("DROP INDEX IF EXISTS i_balance").expect("bind drop index if exists");
+    assert_eq!(
+        ddl,
+        DdlStatement::DropIndex {
+            name: "i_balance".to_owned(),
+            if_exists: true,
+        }
+    );
+}
+
+#[test]
+fn create_index_outside_the_substrate_surface_is_rejected() {
+    // Everything richer than the bare named single-column form points at the
+    // roadmap / sibling tickets rather than silently binding to less.
+    for sql in [
+        "CREATE UNIQUE INDEX i ON t (a)",
+        "CREATE INDEX CONCURRENTLY i ON t (a)",
+        "CREATE INDEX IF NOT EXISTS i ON t (a)",
+        "CREATE INDEX i ON t USING hash (a)",
+        "CREATE INDEX i ON t (a, b)",
+        "CREATE INDEX i ON t (a DESC)",
+        "CREATE INDEX i ON t (a NULLS FIRST)",
+        "CREATE INDEX i ON t (lower(a))",
+        "CREATE INDEX i ON t (a) WHERE a > 1",
+        "CREATE INDEX i ON t (a) INCLUDE (b)",
+        "CREATE INDEX ON t (a)",
+    ] {
+        let err = bind_one(sql).expect_err(sql);
+        assert!(matches!(err, BindError::Unsupported(_)), "{sql}: {err:?}");
+    }
+    // Qualified names stay rejected, same as table DDL.
+    assert!(matches!(
+        bind_one("CREATE INDEX i ON s.t (a)"),
+        Err(BindError::QualifiedName(_))
+    ));
+    assert!(matches!(
+        bind_one("DROP INDEX s.i"),
+        Err(BindError::QualifiedName(_))
+    ));
+    assert!(matches!(
+        bind_one("DROP INDEX i CASCADE"),
+        Err(BindError::Unsupported(_))
+    ));
+}
+
+/// Parse → bind → apply round-trip for the index half of the catalog: the
+/// index registers against a live table, cascades away with a table drop, and
+/// `IF EXISTS` keeps an absent drop a no-op.
+#[test]
+fn create_then_drop_index_round_trips_against_the_catalog() {
+    let mut cat = Catalog::new();
+    bind_one("CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING")
+        .expect("bind create table")
+        .apply(&mut cat, SystemTimeMicros(100))
+        .expect("apply create table");
+
+    let outcome = bind_one("CREATE INDEX i_balance ON account (balance)")
+        .expect("bind create index")
+        .apply(&mut cat, SystemTimeMicros(110))
+        .expect("apply create index");
+    assert_eq!(outcome, DdlOutcome::CreatedIndex);
+    assert_eq!(outcome.command_tag(), "CREATE INDEX");
+    assert_eq!(
+        cat.index("i_balance").map(stele_catalog::IndexDef::table),
+        Some("account")
+    );
+
+    let outcome = bind_one("DROP INDEX i_balance")
+        .expect("bind drop index")
+        .apply(&mut cat, SystemTimeMicros(120))
+        .expect("apply drop index");
+    assert_eq!(outcome, DdlOutcome::DroppedIndex);
+    assert_eq!(outcome.command_tag(), "DROP INDEX");
+    assert!(cat.index("i_balance").is_none());
+
+    let outcome = bind_one("DROP INDEX IF EXISTS i_balance")
+        .expect("bind drop-if-exists")
+        .apply(&mut cat, SystemTimeMicros(130))
+        .expect("apply is a no-op, not an error");
+    assert_eq!(outcome, DdlOutcome::DropIndexNoOp);
+    assert_eq!(outcome.command_tag(), "DROP INDEX");
+}
+
+#[test]
+fn create_index_on_missing_table_column_or_key_surfaces_the_catalog_error() {
+    let mut cat = Catalog::new();
+    bind_one("CREATE TABLE t (id INT PRIMARY KEY, a INT) WITH SYSTEM VERSIONING")
+        .expect("bind create table")
+        .apply(&mut cat, SystemTimeMicros(1))
+        .expect("apply create table");
+
+    let err = bind_one("CREATE INDEX i ON ghost (a)")
+        .expect("bind")
+        .apply(&mut cat, SystemTimeMicros(2))
+        .expect_err("unknown table");
+    assert!(err.to_string().contains("ghost"), "got {err}");
+
+    let err = bind_one("CREATE INDEX i ON t (missing)")
+        .expect("bind")
+        .apply(&mut cat, SystemTimeMicros(3))
+        .expect_err("unknown column");
+    assert!(err.to_string().contains("missing"), "got {err}");
+
+    // The business key is always indexed by storage; a secondary index on it
+    // is refused rather than silently building dead weight.
+    let err = bind_one("CREATE INDEX i ON t (id)")
+        .expect("bind")
+        .apply(&mut cat, SystemTimeMicros(4))
+        .expect_err("business key");
+    assert!(err.to_string().contains("always indexed"), "got {err}");
+
+    let err = bind_one("DROP INDEX i_ghost")
+        .expect("bind")
+        .apply(&mut cat, SystemTimeMicros(5))
+        .expect_err("unknown index");
+    assert!(err.to_string().contains("i_ghost"), "got {err}");
+}

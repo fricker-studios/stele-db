@@ -38,7 +38,7 @@
 
 use std::io;
 
-use stele_catalog::{ColumnDef, TableTemporal, ValidTimeSpec};
+use stele_catalog::{ColumnDef, IndexKind, TableTemporal, ValidTimeSpec};
 use stele_common::time::SystemTimeMicros;
 use stele_common::types::LogicalType;
 use stele_storage::backend::{Disk, DiskFile};
@@ -93,12 +93,66 @@ pub(crate) enum CatalogRecord {
         /// The dropped table's name.
         name: String,
     },
+    /// A `CREATE INDEX` was acknowledged at `at` ([STL-233]). Only the
+    /// *metadata* is durable: the access structure itself is derived,
+    /// rebuildable state ([ADR-0023]) that recovery reconstructs from the
+    /// table's tiers — so a crash at any point during the build leaves either
+    /// no record (the statement was never acknowledged, no index exists) or
+    /// this record (recovery rebuilds the structure). `at` doubles as
+    /// provenance: the instant from which the maintained structure covers the
+    /// table's writes.
+    ///
+    /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    /// [ADR-0023]: ../../../docs/adr/0023-append-only-record-model-validity-index.md
+    CreateIndex {
+        /// The system time the index DDL was acknowledged.
+        at: SystemTimeMicros,
+        /// The index name — unique across the live index set.
+        name: String,
+        /// The table the index accelerates.
+        table: String,
+        /// The access-structure family.
+        kind: IndexKind,
+        /// The indexed value column names, in declaration order.
+        columns: Vec<String>,
+    },
+    /// A `DROP INDEX` was acknowledged at `at` ([STL-233]). A `DROP TABLE`
+    /// carries **no** per-index records: replay re-derives the cascade (the
+    /// dropped table's indexes go with it), exactly as the live session did.
+    ///
+    /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    DropIndex {
+        /// The system time the index DDL was acknowledged.
+        at: SystemTimeMicros,
+        /// The dropped index's name.
+        name: String,
+    },
 }
 
 /// Record-kind discriminants. `0` is deliberately unused so a zero-filled
 /// region can never decode as a record even if its CRC were somehow valid.
 const KIND_CREATE_TABLE: u8 = 1;
 const KIND_DROP_TABLE: u8 = 2;
+const KIND_CREATE_INDEX: u8 = 3;
+const KIND_DROP_INDEX: u8 = 4;
+
+/// Map an [`IndexKind`] to its stable on-log tag. Exhaustive, like
+/// [`type_tag`]: a sibling ticket adding a kind fails compilation here until
+/// it assigns a tag (append-only; never renumber).
+const fn index_kind_tag(kind: IndexKind) -> u8 {
+    match kind {
+        IndexKind::BTree => 1,
+    }
+}
+
+/// The inverse of [`index_kind_tag`], or [`None`] for a tag this build does
+/// not know (a log written by a newer build).
+const fn index_kind_from_tag(tag: u8) -> Option<IndexKind> {
+    Some(match tag {
+        1 => IndexKind::BTree,
+        _ => return None,
+    })
+}
 
 /// Map a [`LogicalType`] to its stable on-log tag. Exhaustive: adding a
 /// variant to [`LogicalType`] fails compilation here, forcing a conscious tag
@@ -194,6 +248,30 @@ fn encode_payload(record: &CatalogRecord) -> io::Result<Vec<u8>> {
         }
         CatalogRecord::DropTable { at, name } => {
             buf.push(KIND_DROP_TABLE);
+            buf.extend_from_slice(&at.0.to_le_bytes());
+            put_str(&mut buf, name)?;
+        }
+        CatalogRecord::CreateIndex {
+            at,
+            name,
+            table,
+            kind,
+            columns,
+        } => {
+            buf.push(KIND_CREATE_INDEX);
+            buf.extend_from_slice(&at.0.to_le_bytes());
+            put_str(&mut buf, name)?;
+            put_str(&mut buf, table)?;
+            buf.push(index_kind_tag(*kind));
+            let count = u16::try_from(columns.len())
+                .map_err(|_| corrupt(format!("too many index columns ({})", columns.len())))?;
+            buf.extend_from_slice(&count.to_le_bytes());
+            for column in columns {
+                put_str(&mut buf, column)?;
+            }
+        }
+        CatalogRecord::DropIndex { at, name } => {
+            buf.push(KIND_DROP_INDEX);
             buf.extend_from_slice(&at.0.to_le_bytes());
             put_str(&mut buf, name)?;
         }
@@ -314,6 +392,30 @@ fn decode_payload(payload: &[u8]) -> io::Result<CatalogRecord> {
             }
         }
         KIND_DROP_TABLE => CatalogRecord::DropTable {
+            at: SystemTimeMicros(cur.i64()?),
+            name: cur.string()?,
+        },
+        KIND_CREATE_INDEX => {
+            let at = SystemTimeMicros(cur.i64()?);
+            let name = cur.string()?;
+            let table = cur.string()?;
+            let tag = cur.u8()?;
+            let kind = index_kind_from_tag(tag)
+                .ok_or_else(|| corrupt(format!("unknown index kind tag {tag}")))?;
+            let count = usize::from(cur.u16()?);
+            let mut columns = Vec::with_capacity(count);
+            for _ in 0..count {
+                columns.push(cur.string()?);
+            }
+            CatalogRecord::CreateIndex {
+                at,
+                name,
+                table,
+                kind,
+                columns,
+            }
+        }
+        KIND_DROP_INDEX => CatalogRecord::DropIndex {
             at: SystemTimeMicros(cur.i64()?),
             name: cur.string()?,
         },
@@ -544,6 +646,63 @@ mod tests {
         };
         append(&disk, &record).expect("append");
         assert_eq!(replay(&disk).expect("replay"), vec![record]);
+    }
+
+    #[test]
+    fn index_records_round_trip_in_order() {
+        // The STL-233 records intermix with table DDL in one log; replay must
+        // reproduce the exact sequence (the engine re-derives the live index
+        // set, including the drop-table cascade, from this order).
+        let disk = MemDisk::new();
+        let records = vec![
+            create_record(),
+            CatalogRecord::CreateIndex {
+                at: SystemTimeMicros(50),
+                name: "i_balance".to_owned(),
+                table: "account".to_owned(),
+                kind: IndexKind::BTree,
+                columns: vec!["balance".to_owned()],
+            },
+            CatalogRecord::DropIndex {
+                at: SystemTimeMicros(60),
+                name: "i_balance".to_owned(),
+            },
+            CatalogRecord::DropTable {
+                at: SystemTimeMicros(70),
+                name: "account".to_owned(),
+            },
+        ];
+        for r in &records {
+            append(&disk, r).expect("append");
+        }
+        assert_eq!(replay(&disk).expect("replay"), records);
+    }
+
+    #[test]
+    fn an_unknown_index_kind_tag_fails_closed() {
+        // A log written by a newer build (an index kind this build does not
+        // know) must refuse rather than silently dropping the index — the
+        // sibling-kind seam mirrors the record-kind contract.
+        let disk = MemDisk::new();
+        let mut frame = encode_frame(&CatalogRecord::CreateIndex {
+            at: SystemTimeMicros(1),
+            name: "i".to_owned(),
+            table: "account".to_owned(),
+            kind: IndexKind::BTree,
+            columns: vec!["balance".to_owned()],
+        })
+        .expect("encode");
+        // The kind tag sits after the record kind byte, the i64 instant, and
+        // the two length-prefixed strings ("i", "account").
+        let tag_at = HEADER_LEN + 1 + 8 + (2 + 1) + (2 + 7);
+        frame[tag_at] = 0xEE;
+        let crc = crc32c(&frame[..frame.len() - CRC_LEN]);
+        let crc_at = frame.len() - CRC_LEN;
+        frame[crc_at..].copy_from_slice(&crc.to_le_bytes());
+        let mut file = disk.create(CATALOG_LOG_FILENAME).expect("create");
+        file.append(&frame).expect("append");
+        let err = replay(&disk).expect_err("unknown index kind must fail closed");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

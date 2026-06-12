@@ -2494,6 +2494,7 @@ dependencies = [
  "clap",
  "stele-catalog",
  "stele-common",
+ "stele-engine",
  "stele-exec",
  "stele-sql",
  "stele-storage",

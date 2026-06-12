@@ -44,10 +44,12 @@
 
 mod as_of_oracle;
 mod fault_disk;
+mod index_build;
 mod si_oracle;
 
 pub use as_of_oracle::run_as_of_oracle_seed;
 pub use fault_disk::{FaultDisk, FaultEvent, FaultKind, FaultProfile};
+pub use index_build::run_index_build_crash_seed;
 pub use si_oracle::run_si_oracle_seed;
 
 use std::collections::BTreeMap;
@@ -916,7 +918,7 @@ pub fn run_engine_flush_recover_seed(seed: u64) -> u64 {
 /// a small, seed-derived spread so different seeds stress different fault mixes
 /// while every probability stays integer-derived and reproducible.
 #[allow(clippy::cast_precision_loss)] // permille < 1000 is exact in f64
-fn prob_permille(rng: &mut Rng, lo: u64, hi: u64) -> f64 {
+pub(crate) fn prob_permille(rng: &mut Rng, lo: u64, hi: u64) -> f64 {
     let pm = lo + rng.below(hi - lo + 1);
     pm as f64 / 1000.0
 }
@@ -2391,7 +2393,7 @@ const fn err_kind_tag(kind: io::ErrorKind) -> u8 {
 /// A stable tag byte for a [`FaultOp`](stele_storage::backend::FaultOp), so the
 /// folded fault log is order- and identity-sensitive without depending on the
 /// enum's `Debug` text.
-const fn fault_op_tag(op: stele_storage::backend::FaultOp) -> u8 {
+pub(crate) const fn fault_op_tag(op: stele_storage::backend::FaultOp) -> u8 {
     use stele_storage::backend::FaultOp;
     match op {
         FaultOp::Create => 0,
@@ -2406,7 +2408,7 @@ const fn fault_op_tag(op: stele_storage::backend::FaultOp) -> u8 {
 }
 
 /// A stable tag byte for a [`FaultKind`].
-const fn fault_kind_tag(kind: FaultKind) -> u8 {
+pub(crate) const fn fault_kind_tag(kind: FaultKind) -> u8 {
     match kind {
         FaultKind::BitFlip => 0,
         FaultKind::ShortRead => 1,
@@ -3626,6 +3628,7 @@ pub fn registry() -> Vec<Box<dyn Scenario>> {
         FnScenario::fault("vectorized-exec-faults", run_vectorized_exec_faults_seed),
         FnScenario::boxed("schedule", run_schedule_seed_digest),
         FnScenario::fault("fault-disk", run_fault_seed),
+        FnScenario::fault("index-build-crash", run_index_build_crash_seed),
     ]
 }
 
@@ -4130,6 +4133,7 @@ mod tests {
                 "engine-recover-faults",
                 "fault-disk",
                 "group-commit-recover-faults",
+                "index-build-crash",
                 "txn-commit-rollback-faults",
                 "vectorized-exec-faults",
                 "wal-fsync-poison",
