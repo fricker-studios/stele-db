@@ -2967,6 +2967,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             period_filter: None,
             aggregate: None,
             join: None,
+            distinct: false,
+            order_by: Vec::new(),
+            offset: 0,
+            limit: None,
         };
         let StatementOutcome::Rows(live) = self.run_select(&probe, overlay)? else {
             return Err(EngineError::Unsupported(
@@ -3083,6 +3087,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     period_filter: None,
                     aggregate: None,
                     join: None,
+                    distinct: false,
+                    order_by: Vec::new(),
+                    offset: 0,
+                    limit: None,
                 };
                 let StatementOutcome::Rows(result) = self.run_select(&scan, overlay)? else {
                     return Err(EngineError::Unsupported(
