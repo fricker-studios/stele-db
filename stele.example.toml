@@ -19,11 +19,33 @@
 # pg-wire listen address. (active) Default: "0.0.0.0:5454" — Stele's default
 # Postgres-wire port (ADR-0017). A bare `--listen` flag is ignored when a config
 # file is given; this key wins.
-listen = "0.0.0.0:5454"
+#
+# Secure defaults (STL-251, docs/10 §4): a non-dev server WITHOUT a [tls]
+# section may only bind loopback — it refuses to start on a non-loopback
+# address rather than silently serve plaintext beyond the local machine. To
+# listen on "0.0.0.0:5454", configure the [tls] section below. (In a container
+# the listener must be reachable through the port mapping: use "0.0.0.0:5454"
+# plus [tls], or run the container with `--dev` instead of a config file.)
+listen = "127.0.0.1:5454"
 
 # Directory the `local` backend roots its data at (created if absent). (active)
 # Ignored by the `memory` backend. Default: "/var/lib/stele".
 data_dir = "/var/lib/stele"
+
+# [tls]                          # TLS on pg-wire (active; STL-251)
+# Wire encryption via the standard Postgres SSLRequest negotiation: psql,
+# psycopg, pgjdbc, and `stele shell --tls` all speak it natively
+# (`sslmode=require` / `verify-full`). Uncomment and point at PEM files:
+#
+# mode      = "required"         # "required" (default once [tls] is present):
+#                                #   plaintext startups are refused (FATAL 28000)
+#                                # "optional": TLS offered, plaintext accepted —
+#                                #   the migration posture (warns at boot)
+#                                # "disabled": section kept, TLS off
+# cert      = "/etc/stele/server.crt"   # PEM certificate chain, leaf first
+# key       = "/etc/stele/server.key"   # PEM private key (PKCS#8/PKCS#1/SEC1)
+# client_ca = "/etc/stele/clients.crt"  # optional: require mTLS — every client
+#                                       # must present a cert chaining to this CA
 
 [storage]
 # Which storage backend the engine boots on. (active) One of:

@@ -21,10 +21,10 @@ use serde::Deserialize;
 use stele_common::DEFAULT_PG_PORT;
 use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
-use stele_pgwire::{Server as PgServer, SharedSession};
+use stele_pgwire::{Server as PgServer, ServerTls, SharedSession, TlsMode, TlsSettings};
 use stele_storage::backend::{AnyDisk, BackendKind};
 use tokio::signal;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Default data directory for non-dev runs that omit `[server] data_dir`
 /// (matches the `stele.toml` example in [05 — configuration](../../../docs/05-dev-environment.md#configuration)).
@@ -44,6 +44,13 @@ pub struct Config {
     pub backend: BackendKind,
     /// Data directory the `local` backend roots itself at (ignored by `memory`).
     pub data_dir: PathBuf,
+    /// TLS on pg-wire ([STL-251]): certificate material + plaintext policy from
+    /// the `[tls]` section. `None` = TLS not configured — the secure-defaults
+    /// posture then decides at boot whether the server may start at all
+    /// (plaintext is loopback-only for non-dev runs).
+    ///
+    /// [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
+    pub tls: Option<TlsSettings>,
 }
 
 impl Config {
@@ -57,6 +64,7 @@ impl Config {
             dev: true,
             backend: BackendKind::Local,
             data_dir: dev_scratch_dir(),
+            tls: None,
         }
     }
 
@@ -98,6 +106,7 @@ struct FileConfig {
     server: ServerSection,
     #[serde(default)]
     storage: StorageSection,
+    tls: Option<TlsSection>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -111,6 +120,49 @@ struct StorageSection {
     /// Kept as a raw string so the parse error (and its clear message) is owned
     /// by [`BackendKind`]'s [`FromStr`](std::str::FromStr), not serde.
     backend: Option<String>,
+}
+
+/// The `[tls]` section ([STL-251]): certificate material plus the plaintext
+/// policy. `mode` defaults to `"required"` — configuring TLS means wanting it,
+/// so the lenient posture (`"optional"`) is the explicit opt-in, not the default.
+///
+/// [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
+#[derive(Debug, Default, Deserialize)]
+struct TlsSection {
+    /// `"required"` (default) | `"optional"` | `"disabled"`.
+    mode: Option<String>,
+    /// PEM server certificate chain.
+    cert: Option<PathBuf>,
+    /// PEM private key.
+    key: Option<PathBuf>,
+    /// PEM client CA — setting it switches on **mTLS** (every client must
+    /// present a certificate chaining to it).
+    client_ca: Option<PathBuf>,
+}
+
+impl TlsSection {
+    fn resolve(self) -> anyhow::Result<Option<TlsSettings>> {
+        let mode = match self.mode.as_deref().unwrap_or("required") {
+            "required" => TlsMode::Required,
+            "optional" => TlsMode::Optional,
+            // The whole section is inert — handy for keeping the cert paths in
+            // the file while temporarily turning TLS off.
+            "disabled" => return Ok(None),
+            other => anyhow::bail!(
+                "[tls] mode {other:?} is not recognized (expected \"required\", \
+                 \"optional\", or \"disabled\")"
+            ),
+        };
+        let (Some(cert), Some(key)) = (self.cert, self.key) else {
+            anyhow::bail!("[tls] requires both `cert` and `key` (PEM file paths)");
+        };
+        Ok(Some(TlsSettings {
+            cert,
+            key,
+            client_ca: self.client_ca,
+            mode,
+        }))
+    }
 }
 
 impl FileConfig {
@@ -129,7 +181,55 @@ impl FileConfig {
                 .server
                 .data_dir
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR)),
+            tls: self.tls.map(TlsSection::resolve).transpose()?.flatten(),
         })
+    }
+}
+
+/// What boot does about plaintext, per the secure-defaults posture
+/// ([docs/10 §4](../../../docs/10-security-and-compliance.md#4-data-protection--encryption), STL-251).
+#[derive(Debug, PartialEq, Eq)]
+enum PlaintextPosture {
+    /// Start silently.
+    Proceed,
+    /// Start, but say loudly what is unencrypted and how to fix it.
+    Warn(String),
+    /// Don't start: this configuration would silently serve plaintext beyond
+    /// the local machine.
+    Refuse(String),
+}
+
+/// Decide the plaintext posture for `cfg`.
+///
+/// * `--dev` is friction-free: plaintext is the documented five-minute path.
+/// * Non-dev with `tls = "required"`: nothing is plaintext — proceed.
+/// * Non-dev with `tls = "optional"`: warn — plaintext clients are accepted.
+/// * Non-dev **without TLS**: plaintext on loopback warns; a non-loopback bind
+///   is refused outright. There is no silent-plaintext production posture —
+///   the operator either configures `[tls]`, binds loopback, or runs `--dev`.
+fn plaintext_posture(cfg: &Config) -> PlaintextPosture {
+    if cfg.dev {
+        return PlaintextPosture::Proceed;
+    }
+    match &cfg.tls {
+        Some(tls) if tls.mode == TlsMode::Required => PlaintextPosture::Proceed,
+        Some(_) => PlaintextPosture::Warn(
+            "[tls] mode = \"optional\": plaintext connections are still accepted; \
+             set mode = \"required\" once clients are migrated"
+                .to_owned(),
+        ),
+        None if cfg.listen.ip().is_loopback() => PlaintextPosture::Warn(format!(
+            "no [tls] configured: pg-wire on {} is PLAINTEXT (loopback-only); \
+             configure [tls] before exposing this server",
+            cfg.listen
+        )),
+        None => PlaintextPosture::Refuse(format!(
+            "refusing to listen on non-loopback {} without TLS: a production \
+             server must not silently serve plaintext (docs/10 §4). Configure \
+             a [tls] section in stele.toml, bind a loopback address, or run \
+             --dev for local development",
+            cfg.listen
+        )),
     }
 }
 
@@ -138,6 +238,15 @@ impl FileConfig {
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     init_tracing(cfg.dev);
     info!(?cfg, "stele-server: starting");
+
+    // Secure defaults (STL-251, docs/10 §4): decide up front what this
+    // configuration means for plaintext — and refuse outright rather than
+    // silently serve unencrypted traffic beyond the local machine.
+    match plaintext_posture(&cfg) {
+        PlaintextPosture::Proceed => {}
+        PlaintextPosture::Warn(msg) => warn!("{msg}"),
+        PlaintextPosture::Refuse(msg) => anyhow::bail!(msg),
+    }
 
     // Construct the backend the operator selected, then stand up the per-session
     // engine on it — the Catalog + commit clock + per-table storage tiers that
@@ -166,7 +275,18 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // follow in STL-147). The lock is held only per synchronous statement,
     // never across wire I/O.
     let session: SharedSession = Arc::new(Mutex::new(engine));
-    let pg = PgServer::new(cfg.listen, session);
+    let mut pg = PgServer::new(cfg.listen, session);
+    if let Some(settings) = &cfg.tls {
+        // Load certificate material now so a bad path / non-PEM file is a boot
+        // error with context, not a per-connection surprise.
+        let tls = ServerTls::load(settings).context("loading [tls] certificate material")?;
+        info!(
+            mode = ?settings.mode,
+            mtls = settings.client_ca.is_some(),
+            "TLS enabled on pg-wire"
+        );
+        pg = pg.with_tls(tls);
+    }
 
     tokio::select! {
         res = pg.run() => res.context("pgwire listener exited")?,
@@ -317,15 +437,24 @@ mod tests {
     #[test]
     fn the_committed_sample_config_parses_to_the_documented_defaults() {
         // The shipped `stele.example.toml` must always load — this guards it from
-        // silently drifting out of sync with the parser (STL-208). It uses the
-        // documented defaults, so a config-file run resolves to exactly them
-        // (non-dev, local backend, default listen + data_dir).
+        // silently drifting out of sync with the parser (STL-208). It binds
+        // loopback (the [tls] section is commented out, and the secure-defaults
+        // posture refuses a plaintext non-loopback bind — STL-251), so a
+        // config-file run of the example boots out of the box.
         let cfg = Config::from_toml_str(include_str!("../../../stele.example.toml"))
             .expect("stele.example.toml must parse");
         assert!(!cfg.dev, "a config-file run is never dev mode");
         assert_eq!(cfg.backend, BackendKind::Local);
-        assert_eq!(cfg.listen, default_listen());
+        assert_eq!(cfg.listen, "127.0.0.1:5454".parse().unwrap());
         assert_eq!(cfg.data_dir, PathBuf::from(DEFAULT_DATA_DIR));
+        assert!(
+            cfg.tls.is_none(),
+            "the example ships with [tls] commented out"
+        );
+        assert!(
+            !matches!(plaintext_posture(&cfg), PlaintextPosture::Refuse(_)),
+            "the committed example must boot"
+        );
     }
 
     #[test]
@@ -333,6 +462,126 @@ mod tests {
         let cfg = Config::dev();
         assert!(cfg.dev);
         assert_eq!(cfg.backend, BackendKind::Local);
+        assert!(cfg.tls.is_none(), "dev mode does not configure TLS");
+    }
+
+    // --- [tls] section (STL-251) -------------------------------------------
+
+    #[test]
+    fn tls_section_parses_paths_and_defaults_to_required() {
+        let toml = "[tls]\ncert = \"/etc/stele/server.crt\"\nkey = \"/etc/stele/server.key\"\n";
+        let tls = Config::from_toml_str(toml)
+            .unwrap()
+            .tls
+            .expect("tls configured");
+        assert_eq!(tls.cert, PathBuf::from("/etc/stele/server.crt"));
+        assert_eq!(tls.key, PathBuf::from("/etc/stele/server.key"));
+        assert_eq!(
+            tls.mode,
+            TlsMode::Required,
+            "configuring TLS means wanting it"
+        );
+        assert!(tls.client_ca.is_none(), "mTLS is opt-in");
+    }
+
+    #[test]
+    fn tls_optional_mode_and_client_ca_parse() {
+        let toml = "[tls]\nmode = \"optional\"\ncert = \"c.pem\"\nkey = \"k.pem\"\nclient_ca = \"ca.pem\"\n";
+        let tls = Config::from_toml_str(toml)
+            .unwrap()
+            .tls
+            .expect("tls configured");
+        assert_eq!(tls.mode, TlsMode::Optional);
+        assert_eq!(tls.client_ca, Some(PathBuf::from("ca.pem")));
+    }
+
+    #[test]
+    fn tls_disabled_mode_turns_the_section_inert() {
+        // The operator keeps the cert paths in the file but switches TLS off.
+        let toml = "[tls]\nmode = \"disabled\"\ncert = \"c.pem\"\nkey = \"k.pem\"\n";
+        assert!(Config::from_toml_str(toml).unwrap().tls.is_none());
+    }
+
+    #[test]
+    fn tls_section_without_cert_or_key_is_a_clear_config_error() {
+        let err = Config::from_toml_str("[tls]\ncert = \"c.pem\"\n").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("[tls]"), "{msg}");
+        assert!(msg.contains("cert") && msg.contains("key"), "{msg}");
+    }
+
+    #[test]
+    fn tls_unknown_mode_is_a_clear_config_error() {
+        let err = Config::from_toml_str("[tls]\nmode = \"prefer\"\ncert = \"c\"\nkey = \"k\"\n")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("\"prefer\""), "{msg}");
+        assert!(
+            msg.contains("required") && msg.contains("optional"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn no_tls_section_means_no_tls() {
+        assert!(Config::from_toml_str("").unwrap().tls.is_none());
+    }
+
+    // --- secure-defaults posture (STL-251, docs/10 §4) -----------------------
+
+    fn non_dev(listen: &str, tls: Option<TlsMode>) -> Config {
+        let mut cfg = Config::from_toml_str("").unwrap();
+        cfg.listen = listen.parse().unwrap();
+        cfg.tls = tls.map(|mode| TlsSettings {
+            cert: PathBuf::from("c.pem"),
+            key: PathBuf::from("k.pem"),
+            client_ca: None,
+            mode,
+        });
+        cfg
+    }
+
+    #[test]
+    fn dev_mode_is_friction_free_even_off_loopback() {
+        let mut cfg = Config::dev();
+        cfg.listen = "0.0.0.0:5454".parse().unwrap();
+        assert_eq!(plaintext_posture(&cfg), PlaintextPosture::Proceed);
+    }
+
+    #[test]
+    fn non_dev_without_tls_refuses_a_non_loopback_bind() {
+        let posture = plaintext_posture(&non_dev("0.0.0.0:5454", None));
+        let PlaintextPosture::Refuse(msg) = posture else {
+            panic!("expected refusal, got {posture:?}");
+        };
+        // The message must hand the operator every way out.
+        assert!(msg.contains("[tls]"), "{msg}");
+        assert!(msg.contains("loopback"), "{msg}");
+        assert!(msg.contains("--dev"), "{msg}");
+    }
+
+    #[test]
+    fn non_dev_without_tls_warns_on_loopback() {
+        let posture = plaintext_posture(&non_dev("127.0.0.1:5454", None));
+        let PlaintextPosture::Warn(msg) = posture else {
+            panic!("expected warning, got {posture:?}");
+        };
+        assert!(msg.contains("PLAINTEXT"), "{msg}");
+    }
+
+    #[test]
+    fn non_dev_with_required_tls_proceeds_silently() {
+        let cfg = non_dev("0.0.0.0:5454", Some(TlsMode::Required));
+        assert_eq!(plaintext_posture(&cfg), PlaintextPosture::Proceed);
+    }
+
+    #[test]
+    fn non_dev_with_optional_tls_warns_about_plaintext_clients() {
+        let posture = plaintext_posture(&non_dev("0.0.0.0:5454", Some(TlsMode::Optional)));
+        let PlaintextPosture::Warn(msg) = posture else {
+            panic!("expected warning, got {posture:?}");
+        };
+        assert!(msg.contains("optional"), "{msg}");
     }
 
     #[test]

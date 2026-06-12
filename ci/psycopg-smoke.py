@@ -14,8 +14,8 @@ with `prepare=True` forcing a *named* server-side prepared statement that is
 re-executed with fresh parameters — the [STL-182] statement cache on the
 server side.
 
-Usage: ci/psycopg-smoke.py [host] [port]
-  defaults: localhost 5454
+Usage: ci/psycopg-smoke.py [host] [port] [sslmode]
+  defaults: localhost 5454 disable (sslmode=require drives the STL-251 TLS leg)
 
 Requires psycopg 3 (`pip install "psycopg[binary]"`); the CI job pins the
 version. Exits non-zero — failing CI — on any mismatch or if the engine never
@@ -29,6 +29,7 @@ import psycopg
 
 HOST = sys.argv[1] if len(sys.argv) > 1 else "localhost"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 5454
+SSLMODE = sys.argv[3] if len(sys.argv) > 3 else "disable"
 
 
 def connect_with_retry(deadline_s: float = 60.0) -> psycopg.Connection:
@@ -37,7 +38,12 @@ def connect_with_retry(deadline_s: float = 60.0) -> psycopg.Connection:
     while True:
         try:
             return psycopg.connect(
-                host=HOST, port=PORT, dbname="stele", user="stele", autocommit=True
+                host=HOST,
+                port=PORT,
+                dbname="stele",
+                user="stele",
+                sslmode=SSLMODE,
+                autocommit=True,
             )
         except psycopg.OperationalError:
             if time.monotonic() >= deadline:

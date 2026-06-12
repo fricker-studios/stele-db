@@ -6,8 +6,8 @@
 # fetch, so it gets the same checksum treatment ADR-0005 gives actions), then
 # runs the single-file JdbcSmoke program against a running Stele engine.
 #
-# Usage: ci/jdbc-smoke.sh [host] [port]
-#   defaults: localhost 5454
+# Usage: ci/jdbc-smoke.sh [host] [port] [sslmode]
+#   defaults: localhost 5454 disable (sslmode=require drives the STL-251 TLS leg)
 #
 # Requires `java` 11+ (single-file source launch) and `curl` on PATH. Set
 # PGJDBC_JAR to an already-downloaded jar to skip the fetch (it is still
@@ -16,6 +16,7 @@ set -euo pipefail
 
 HOST="${1:-localhost}"
 PORT="${2:-5454}"
+SSLMODE="${3:-disable}"
 
 # Bump the version and checksum together. The checksum is the SHA-256 of
 # https://repo1.maven.org/maven2/org/postgresql/postgresql/${PGJDBC_VERSION}/…jar,
@@ -61,4 +62,4 @@ if ! verify_jar; then
   }
 fi
 
-exec java -cp "$JAR" "$(dirname "$0")/JdbcSmoke.java" "$HOST" "$PORT"
+exec java -cp "$JAR" "$(dirname "$0")/JdbcSmoke.java" "$HOST" "$PORT" "$SSLMODE"

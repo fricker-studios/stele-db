@@ -23,7 +23,13 @@ bytes         = { workspace = true }
 thiserror     = { workspace = true }
 tokio         = { workspace = true }
 tracing       = { workspace = true }
+# TLS on the startup path (STL-251): rustls acceptor + the async stream wrapper.
+rustls           = { workspace = true }
+tokio-rustls     = { workspace = true }
+rustls-pki-types = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt", "rt-multi-thread", "macros"] }
 tokio-postgres = { workspace = true }
+# Self-signed CA / server / client certs minted per test (STL-251).
+rcgen = { workspace = true }
