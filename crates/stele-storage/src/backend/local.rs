@@ -104,8 +104,9 @@ pub struct LocalFile {
 impl DiskFile for LocalFile {
     fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
         use std::io::Write as _;
-        // The file was opened with `O_APPEND`, so every byte lands at
-        // end-of-file regardless of any prior `read_at`.
+        // The file was opened in append mode (`O_APPEND` on Unix,
+        // `FILE_APPEND_DATA` on Windows), so every byte lands at end-of-file
+        // regardless of any prior `read_at`.
         self.file.write_all(bytes)?;
         self.len += bytes.len() as u64;
         Ok(())
