@@ -462,8 +462,10 @@ flowchart LR
 ```
 
 Two tiers of provenance:
-1. **Per-row transaction provenance** (Must, v0.2): who/what/when wrote each version. Cheap, always-on.
+1. **Per-row transaction provenance** (Must, v0.2): who/what/when wrote each version. Cheap, always-on. It is a **queryable surface** (v0.3, [STL-247]): three hidden pseudo-columns — `_stele_txn_id`, `_stele_committed_at`, `_stele_principal` — read a row's provenance inline in a `SELECT` (and a `WHERE`), the Postgres system-column posture (excluded from `SELECT *` and `\d`). They resolve over live, `AS OF`, and range reads — each returning the version's *own* writing provenance, drawn from the version metadata, never a user column. See [sql-grammar.md](sql-grammar.md#provenance-pseudo-columns-stl-247). The `_stele_principal` value is the server-stamped writing identity today; the [security](10-security-and-compliance.md) line threads the connection's authenticated user into it, upgrading its trust without changing the surface.
 2. **Derivation lineage** (Later, opt-in, v0.7+): a graph of "this row was computed from those inputs by that statement." Powerful but expensive; off by default. See [01 §A.4](01-feature-plan.md#a4--lineage--provenance-first-class).
+
+[STL-247]: https://allegromusic.atlassian.net/browse/STL-247
 
 This is the substrate that makes audit *and* Data Vault cheap to build **on top of Stele** — without Stele knowing what a hub or a claim is ([ADR-0009](adr/0009-data-vault-conceptual-seam.md)).
 

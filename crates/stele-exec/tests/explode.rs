@@ -159,3 +159,72 @@ fn an_empty_stream_explodes_to_nothing() {
     let out = drain(ExplodePayload::new(source(vec![]), 2));
     assert!(out.is_empty());
 }
+
+#[test]
+fn provenance_columns_pass_through_after_the_values() {
+    // A provenance pseudo-column read ([STL-247]) projects the three provenance
+    // scalars alongside the payload. They are neither the key nor the payload, so
+    // they pass through unchanged — appended *after* the exploded value columns, in
+    // scan order: [key, value, TxnId, CommittedAt, Principal].
+    let batch = Batch::new(
+        vec![
+            (
+                ColumnId::BusinessKey,
+                Column::Bytes(vec![some(b"k1"), some(b"k2")].into()),
+            ),
+            (
+                ColumnId::Payload,
+                Column::Bytes(vec![some(b"v1"), some(b"v2")].into()),
+            ),
+            (ColumnId::TxnId, Column::I64(vec![7, 8].into())),
+            (ColumnId::CommittedAt, Column::I64(vec![70, 80].into())),
+            (
+                ColumnId::Principal,
+                Column::Bytes(vec![some(b"alice"), some(b"bob")].into()),
+            ),
+        ],
+        2,
+    );
+    let out = drain(ExplodePayload::new(source(vec![batch]), 1));
+
+    assert_eq!(out.len(), 1);
+    let cols = &out[0].columns;
+    assert_eq!(cols.len(), 5, "key + value + three provenance columns");
+    // The key and the exploded value keep positions 0 and 1.
+    assert_eq!(cols[0].0, ColumnId::BusinessKey);
+    assert_eq!(cols[1].0, ColumnId::Payload);
+    assert_eq!(column_cells(&out, 0), vec![some(b"k1"), some(b"k2")]);
+    assert_eq!(column_cells(&out, 1), vec![some(b"v1"), some(b"v2")]);
+    // The provenance scalars follow, in the order they were projected.
+    assert_eq!(cols[2], (ColumnId::TxnId, Column::I64(vec![7, 8].into())));
+    assert_eq!(
+        cols[3],
+        (ColumnId::CommittedAt, Column::I64(vec![70, 80].into()))
+    );
+    assert_eq!(cols[4].0, ColumnId::Principal);
+    assert_eq!(column_cells(&out, 4), vec![some(b"alice"), some(b"bob")]);
+}
+
+#[test]
+fn a_key_only_table_still_passes_provenance_through() {
+    // value_count == 0 drops the payload, but a projected provenance column still
+    // passes through after the key ([STL-247]).
+    let batch = Batch::new(
+        vec![
+            (
+                ColumnId::BusinessKey,
+                Column::Bytes(vec![some(b"k1")].into()),
+            ),
+            (ColumnId::Payload, Column::Bytes(vec![some(b"junk")].into())),
+            (ColumnId::TxnId, Column::I64(vec![42].into())),
+        ],
+        1,
+    );
+    let out = drain(ExplodePayload::new(source(vec![batch]), 0));
+    assert_eq!(out[0].columns.len(), 2, "key + the pass-through txn id");
+    assert_eq!(out[0].columns[0].0, ColumnId::BusinessKey);
+    assert_eq!(
+        out[0].columns[1],
+        (ColumnId::TxnId, Column::I64(vec![42].into()))
+    );
+}

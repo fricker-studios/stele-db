@@ -65,7 +65,7 @@ use crate::secondary::{IndexState, Probe};
 use stele_catalog::{Catalog, CatalogError, IndexDef, IndexKind, TableSchema};
 use stele_common::metrics::{SharedMetrics, StatementKind};
 use stele_common::period::Interval;
-use stele_common::provenance::{Principal, TxnId};
+use stele_common::provenance::{self, Principal, TxnId};
 use stele_common::row_codec::{self, RowCodecError};
 use stele_common::scram::{self, ScramVerifier};
 use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
@@ -2098,7 +2098,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .iter()
             .map(|c| (c.name().to_owned(), c.ty()))
             .collect();
-        Ok(projected_columns(&bound.projection, &schema_columns))
+        let n_schema = schema_columns.len();
+        Ok(projected_columns(
+            &bound.projection,
+            &addressable_columns(&schema_columns),
+            n_schema,
+        ))
     }
 
     /// Run a snapshot scan for a bound `SELECT`, honoring its projection list and
@@ -2156,6 +2161,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .map(|c| (c.name().to_owned(), c.ty()))
             .collect();
         let value_count = schema_columns.len().saturating_sub(1);
+        let n_schema = schema_columns.len();
+
+        // The columns the projection / `WHERE` address by position: the table's own
+        // columns, then the provenance pseudo-columns ([STL-247]) at the fixed
+        // virtual layout after them. `SELECT *` spans only the first `n_schema`; a
+        // pseudo-column is reachable only when named. When the query references one,
+        // the read must materialize the version's provenance alongside its payload.
+        let addressable = addressable_columns(&schema_columns);
+        let projection = projection_indices(&bound.projection, &addressable, n_schema);
+        let needs_provenance = references_provenance(bound, &projection, n_schema);
 
         // The valid-time period columns' positions in the schema (`(from, to)`, each
         // an index into `schema_columns` — and so into a reconstructed row, which is
@@ -2190,13 +2205,29 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             Self::overlaid_rows(
                 bound,
                 state,
-                &schema_columns,
+                &addressable,
                 value_count,
                 overlay,
                 valid_cols,
                 &plan,
+                needs_provenance,
                 &self.metrics,
             )?
+        } else if needs_provenance {
+            // A provenance pseudo-column ([STL-247]) is referenced: materialize each
+            // version's provenance after its value columns and filter over the
+            // extended rows in the engine (the fused vectorized `Filter` addresses
+            // only the table's own columns, so a `WHERE` on a pseudo-column — or a
+            // mix — cannot ride it). Honors `AS OF` on either axis through the same
+            // `SnapshotScan` as the fast path.
+            let base = Self::scan_all_rows_with_provenance(
+                state,
+                bound.snapshot,
+                bound.valid_snapshot,
+                value_count,
+                &self.metrics,
+            )?;
+            filter_rows(&plan, &addressable, base)?
         } else {
             // Rule-based index use ([STL-233], ranges [STL-237]): an equality
             // or one-sided range comparison on an indexed value column probes
@@ -2244,9 +2275,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             )?));
         }
 
-        let projection = projection_indices(&bound.projection, &schema_columns);
-        let columns = projected_columns(&bound.projection, &schema_columns);
-        let selection = shape_rows(bound, &schema_columns, &projection, &rows)?;
+        let columns = projected_columns(&bound.projection, &addressable, n_schema);
+        let selection = shape_rows(bound, &addressable, &projection, &rows)?;
         let out_rows: Vec<Vec<Option<Vec<u8>>>> = selection
             .iter()
             .map(|&r| projection.iter().map(|&i| rows[r][i].clone()).collect())
@@ -2508,15 +2538,33 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     fn overlaid_rows(
         bound: &BoundSelect,
         state: &TableState<C, D>,
-        schema_columns: &[(String, LogicalType)],
+        addressable: &[(String, LogicalType)],
         value_count: usize,
         overlay: &[BoundDml],
         valid_cols: Option<(usize, usize)>,
         plan: &FilterPlan,
+        needs_provenance: bool,
         metrics: &SharedMetrics,
     ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
-        let base = Self::scan_all_rows(state, bound.snapshot, value_count, metrics)?;
-        let overlaid = overlay_table_writes(base, overlay, bound.table.as_str(), value_count);
+        // The valid-axis pin is applied *after* the overlay (`filter_overlaid_valid`
+        // below), so the base scan leaves the valid axis open — `valid_snapshot` is
+        // `None` here even on a `FOR VALID_TIME AS OF` read. When a provenance
+        // pseudo-column ([STL-247]) is referenced the base carries each version's
+        // provenance; a buffered (uncommitted) write then has no commit provenance,
+        // so the overlay stamps `NULL` for it.
+        let n_schema = value_count + 1;
+        let base = if needs_provenance {
+            Self::scan_all_rows_with_provenance(state, bound.snapshot, None, value_count, metrics)?
+        } else {
+            Self::scan_all_rows(state, bound.snapshot, value_count, metrics)?
+        };
+        let overlaid = overlay_table_writes(
+            base,
+            overlay,
+            bound.table.as_str(),
+            value_count,
+            needs_provenance,
+        );
         // Pin the valid axis when the read carries `FOR VALID_TIME AS OF v`. The pin
         // only ever reaches a valid-time table (`bind_select` rejects it otherwise),
         // so the period columns are present whenever `valid_snapshot` is set — but if
@@ -2529,7 +2577,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             }
             None => overlaid,
         };
-        filter_rows(plan, schema_columns, pinned)
+        // Filter over exactly the columns the rows carry: the schema columns alone, or
+        // the schema columns plus the three provenance pseudo-columns ([STL-247]).
+        let columns = if needs_provenance {
+            addressable
+        } else {
+            &addressable[..n_schema]
+        };
+        filter_rows(plan, columns, pinned)
     }
 
     /// Run a bound two-table `JOIN` ([STL-172]).
@@ -2662,6 +2717,67 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let mut exploded = ExplodePayload::new(source, value_count);
 
         let ncols = value_count + 1;
+        let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+        while let Some(batch) = exploded.next()? {
+            for r in 0..batch.rows {
+                rows.push((0..ncols).map(|i| batch_cell(&batch, i, r)).collect());
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Scan a table's reconstructed rows at `snapshot`, **with provenance** — each
+    /// row is `[business key, value cells…, txn_id, committed_at, principal]`, the
+    /// extended shape a provenance pseudo-column read needs ([STL-247]).
+    ///
+    /// The same `ScanSource → ExplodePayload` pipeline [`scan_all_rows`](Self::scan_all_rows)
+    /// runs, but the scan additionally projects the three provenance columns
+    /// ([`ColumnId::TxnId`] / [`CommittedAt`](ColumnId::CommittedAt) /
+    /// [`Principal`](ColumnId::Principal)) — which every version already carries
+    /// inline (invariant 5) — and [`ExplodePayload`] passes them through after the
+    /// value columns. The provenance scalars are read straight off the version, so
+    /// `AS OF` on either axis (a past `snapshot`, a `valid_snapshot` pin) returns
+    /// each historical version's *own* writing provenance, with no extra work.
+    ///
+    /// The read is **unfiltered**: a `WHERE` — over a user *or* a provenance column,
+    /// or a mix — is applied by the engine over the extended rows afterwards
+    /// ([`filter_rows`]), because the fused vectorized [`Filter`] addresses only the
+    /// table's own columns. The valid-time policy is declared (so a valid-time
+    /// table's delta frame is stripped, [STL-218]) and the valid axis pinned when
+    /// the read carries `FOR VALID_TIME AS OF v`, exactly as
+    /// [`scan_rows`](Self::scan_rows) does.
+    fn scan_all_rows_with_provenance(
+        state: &TableState<C, D>,
+        snapshot: SystemTimeMicros,
+        valid_snapshot: Option<SystemTimeMicros>,
+        value_count: usize,
+        metrics: &SharedMetrics,
+    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+        let readers = state.engine.open_segment_readers()?;
+        let mut scan = SnapshotScan::new(
+            state.engine.delta(),
+            state.engine.index(),
+            &readers,
+            Snapshot(snapshot),
+        )
+        .project(vec![
+            ColumnId::BusinessKey,
+            ColumnId::Payload,
+            ColumnId::TxnId,
+            ColumnId::CommittedAt,
+            ColumnId::Principal,
+        ])
+        .valid_time(state.valid_time)
+        .metrics(Arc::clone(metrics));
+        if let Some(v) = valid_snapshot {
+            scan = scan.valid_as_of(ValidTimeMicros(v.0));
+        }
+        let source = ScanSource::new(scan, DEFAULT_BATCH_SIZE);
+        let mut exploded = ExplodePayload::new(source, value_count);
+
+        // key + value columns + the three provenance scalars — the fixed
+        // `addressable_columns` width ([STL-247]).
+        let ncols = value_count + 1 + provenance::PSEUDO_COLUMNS.len();
         let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
         while let Some(batch) = exploded.next()? {
             for r in 0..batch.rows {
@@ -4486,6 +4602,7 @@ fn overlay_table_writes(
     overlay: &[BoundDml],
     table: &str,
     value_count: usize,
+    provenance: bool,
 ) -> Vec<Vec<Option<Vec<u8>>>> {
     // Index by business-key bytes (cell 0); a system-time snapshot resolves at most
     // one live row per key. A `BTreeMap` keeps the output deterministic (ascending
@@ -4500,7 +4617,7 @@ fn overlay_table_writes(
         match dml {
             BoundDml::Insert { key, values, .. } => {
                 let key_bytes = encode_value(key);
-                let row = overlay_row(&key_bytes, values, value_count);
+                let row = overlay_row(&key_bytes, values, value_count, provenance);
                 rows.insert(key_bytes, row);
             }
             BoundDml::Update {
@@ -4509,7 +4626,7 @@ fn overlay_table_writes(
                 let key_bytes = encode_value(key);
                 let mut row = rows
                     .remove(&key_bytes)
-                    .unwrap_or_else(|| overlay_row(&key_bytes, &[], value_count));
+                    .unwrap_or_else(|| overlay_row(&key_bytes, &[], value_count, provenance));
                 for (idx, value) in assignments {
                     // The +1 skips the business key at cell 0; an index past the
                     // live value columns (a schema narrowed since binding) is
@@ -4518,6 +4635,11 @@ fn overlay_table_writes(
                         *cell = value.as_ref().map(encode_value);
                     }
                 }
+                // A buffered write is uncommitted, so its provenance ([STL-247]) is
+                // not yet decided: clear the three trailing cells to `NULL`, whether
+                // this update started from a committed base row (which carried the
+                // superseded version's provenance) or from an absent key.
+                clear_overlay_provenance(&mut row, value_count, provenance);
                 rows.insert(key_bytes, row);
             }
             BoundDml::Delete { key, .. } => {
@@ -4550,13 +4672,35 @@ fn overlay_row(
     key_bytes: &[u8],
     values: &[Option<ScalarValue>],
     value_count: usize,
+    provenance: bool,
 ) -> Vec<Option<Vec<u8>>> {
-    let mut row = Vec::with_capacity(value_count + 1);
+    let prov_count = if provenance {
+        provenance::PSEUDO_COLUMNS.len()
+    } else {
+        0
+    };
+    let mut row = Vec::with_capacity(value_count + 1 + prov_count);
     row.push(Some(key_bytes.to_vec()));
     for i in 0..value_count {
         row.push(values.get(i).and_then(|v| v.as_ref().map(encode_value)));
     }
+    // A buffered (uncommitted) write has no commit provenance ([STL-247]); the three
+    // trailing pseudo-column cells are `NULL` until it commits.
+    row.extend(std::iter::repeat_n(None, prov_count));
     row
+}
+
+/// Clear an overlaid row's three trailing provenance cells to `NULL` ([STL-247]) —
+/// a no-op unless the read materializes provenance. Used after an `UPDATE`'s
+/// read-modify-write, whose base row may have carried the superseded version's
+/// provenance that the now-buffered write replaces.
+fn clear_overlay_provenance(row: &mut [Option<Vec<u8>>], value_count: usize, provenance: bool) {
+    if !provenance {
+        return;
+    }
+    for cell in row.iter_mut().skip(value_count + 1) {
+        *cell = None;
+    }
 }
 
 /// Keep the overlaid rows whose valid-time period `[valid_from, valid_to)` contains
@@ -4727,14 +4871,23 @@ fn batch_cell(batch: &Batch, position: usize, row: usize) -> Option<Vec<u8>> {
     }
 }
 
-/// The schema-column indices a [`Projection`] selects, in output order: `All` is
-/// every column left-to-right; `Columns` maps each name to its position.
+/// The addressable indices a [`Projection`] selects, in output order: `All` is
+/// every **schema** column left-to-right (the first `n_schema` of `columns`);
+/// `Columns` maps each name to its position in `columns`.
 ///
-/// `bind_select` has already proved every named column exists in this schema, so
-/// the lookup never misses — a miss would be a binder/engine contract break.
-fn projection_indices(projection: &Projection, columns: &[(String, LogicalType)]) -> Vec<usize> {
+/// `columns` is the addressable set ([`addressable_columns`]) — the table's own
+/// columns followed by the provenance pseudo-columns ([STL-247]) — so a named
+/// pseudo-column resolves past `n_schema`, while `SELECT *` stops at the schema.
+/// `bind_select` has already proved every named column is either a schema column
+/// or a pseudo-column, so the lookup never misses — a miss would be a
+/// binder/engine contract break.
+fn projection_indices(
+    projection: &Projection,
+    columns: &[(String, LogicalType)],
+    n_schema: usize,
+) -> Vec<usize> {
     match projection {
-        Projection::All => (0..columns.len()).collect(),
+        Projection::All => (0..n_schema).collect(),
         Projection::Columns(names) => names
             .iter()
             .map(|name| {
@@ -4747,19 +4900,70 @@ fn projection_indices(projection: &Projection, columns: &[(String, LogicalType)]
     }
 }
 
-/// The `(name, type)` output columns a projection selects from a table's schema
-/// columns — the projected slice of `schema_columns`, in projection order. Shared
-/// by the streaming read (`run_select`) and the parameter-free statement
-/// `Describe` (`SessionEngine::describe`), so both agree on a plain `SELECT`'s
-/// `RowDescription` shape.
+/// The `(name, type)` output columns a projection selects from the addressable
+/// columns — the projected slice of `columns` (schema columns then provenance
+/// pseudo-columns), in projection order. Shared by the streaming read
+/// (`run_select`) and the parameter-free statement `Describe`
+/// (`SessionEngine::describe`), so both agree on a `SELECT`'s `RowDescription`
+/// shape, pseudo-columns included.
 fn projected_columns(
     projection: &Projection,
-    schema_columns: &[(String, LogicalType)],
+    columns: &[(String, LogicalType)],
+    n_schema: usize,
 ) -> Vec<(String, LogicalType)> {
-    projection_indices(projection, schema_columns)
+    projection_indices(projection, columns, n_schema)
         .iter()
-        .map(|&i| schema_columns[i].clone())
+        .map(|&i| columns[i].clone())
         .collect()
+}
+
+/// The columns a bound `SELECT` can address by position: the table's own schema
+/// columns (key, then value columns), then the three provenance pseudo-columns
+/// ([STL-247]) at the fixed virtual layout `[n_schema, n_schema + 1, n_schema + 2]`
+/// = (`_stele_txn_id`, `_stele_committed_at`, `_stele_principal`).
+///
+/// They are appended, never woven in, so `SELECT *` (`Projection::All`, the first
+/// `n_schema`) and the `\d` shim never surface them — the Postgres system-column
+/// posture; a read materializes them only when one is named.
+fn addressable_columns(schema_columns: &[(String, LogicalType)]) -> Vec<(String, LogicalType)> {
+    let mut columns = schema_columns.to_vec();
+    columns.extend(
+        provenance::PSEUDO_COLUMNS
+            .iter()
+            .map(|(name, ty)| ((*name).to_owned(), *ty)),
+    );
+    columns
+}
+
+/// Whether a bound `SELECT` references a provenance pseudo-column ([STL-247]) — in
+/// its projection or its `WHERE` — so the read must materialize each version's
+/// provenance alongside its payload. `n_schema` is the table's own column count; an
+/// addressed index at or past it names a pseudo-column.
+fn references_provenance(bound: &BoundSelect, projection: &[usize], n_schema: usize) -> bool {
+    projection.iter().any(|&i| i >= n_schema)
+        || bound
+            .filter
+            .as_ref()
+            .is_some_and(|p| predicate_references_pseudo(p, n_schema))
+}
+
+/// Whether a bound `WHERE` predicate addresses a column at or past `n_schema` — a
+/// provenance pseudo-column ([STL-247]).
+fn predicate_references_pseudo(predicate: &BoundPredicate, n_schema: usize) -> bool {
+    scalar_references_pseudo(&predicate.left, n_schema)
+        || scalar_references_pseudo(&predicate.right, n_schema)
+}
+
+/// Whether a bound `WHERE` scalar addresses a column at or past `n_schema`,
+/// descending through arithmetic ([STL-247]).
+fn scalar_references_pseudo(scalar: &BoundScalar, n_schema: usize) -> bool {
+    match scalar {
+        BoundScalar::Column(index) => *index >= n_schema,
+        BoundScalar::Literal(_) => false,
+        BoundScalar::Arith { left, right, .. } => {
+            scalar_references_pseudo(left, n_schema) || scalar_references_pseudo(right, n_schema)
+        }
+    }
 }
 
 /// Fold reconstructed rows into grouped aggregate output ([STL-171]).
