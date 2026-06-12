@@ -164,12 +164,36 @@ into a `DdlStatement` that `apply`s to a `stele-catalog` `Catalog`:
   `DROP TABLE IF EXISTS` of an absent table is a no-op.
 - **Rejected in v0.1**, each with a roadmap pointer: constraints other than a
   column-level `PRIMARY KEY` (`FOREIGN KEY`/`REFERENCES`, `UNIQUE`, `CHECK`,
-  `NOT NULL`, `DEFAULT`, …), table-level constraints, indexes,
+  `NOT NULL`, `DEFAULT`, …), table-level constraints,
   `CREATE TABLE … AS SELECT`, `LIKE`/`CLONE`, `IF NOT EXISTS`, `OR REPLACE`,
   temporary/external tables, schema-qualified names, and `DROP … CASCADE`.
   `PRIMARY KEY` is **accepted but not enforced** (no uniqueness/index yet), so
   the identity-demo `CREATE TABLE account (id INT PRIMARY KEY, balance INT) …`
   binds.
+
+### `CREATE INDEX` / `DROP INDEX` — secondary indexes (STL-233)
+
+```sql
+CREATE INDEX i_balance ON account (balance);
+DROP INDEX i_balance;
+DROP INDEX IF EXISTS i_balance;
+```
+
+The v0.3 secondary-index substrate: a **named, single-column** index in the
+default (B-tree) kind on a **value column** — the business key (the table's
+first column) is always indexed by storage and is refused. An index is
+*derived, rebuildable* state (ADR-0023): only the DDL metadata is durable
+(ADR-0028 catalog log), the access structure is built from the table's tiers,
+maintained on every committed write, and rebuilt on cold boot. It can change a
+query's *speed*, never its *results* — the indexed≡unindexed equivalence
+oracle pins exactly that. `DROP TABLE` drops the table's indexes with it; the
+re-created name starts index-free. `DROP INDEX IF EXISTS` of an absent index
+is a no-op.
+
+Rejected with a roadmap pointer until their sibling tickets land: `UNIQUE`,
+`USING <kind>` (hash/bloom is STL-238, the valid-time interval kind STL-241),
+multi-column and expression columns, partial indexes (`… WHERE`), `INCLUDE`,
+`CONCURRENTLY`, `IF NOT EXISTS`, and per-column `ASC`/`DESC`/`NULLS` ordering.
 
 ## Query binding (STL-101, STL-162)
 

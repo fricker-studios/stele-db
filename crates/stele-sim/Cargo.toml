@@ -23,4 +23,5 @@ stele-txn     = { workspace = true }
 stele-exec    = { workspace = true }
 stele-sql     = { workspace = true }
 stele-catalog = { workspace = true }
+stele-engine  = { workspace = true }
 clap          = { workspace = true }

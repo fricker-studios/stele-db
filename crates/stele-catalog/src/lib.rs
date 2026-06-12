@@ -38,9 +38,11 @@
 
 #![allow(dead_code)] // scaffold for the not-yet-wired binder/DML seams ([STL-94]/[STL-95])
 
+mod index;
 mod schema;
 mod versioned;
 
+pub use index::{IndexDef, IndexKind};
 pub use schema::{ColumnDef, SchemaId, TableSchema};
 pub use versioned::Catalog;
 
@@ -123,6 +125,46 @@ pub enum CatalogError {
     /// silently reusing an id, which would corrupt footer→schema resolution.
     #[error("schema-id space (u32) is exhausted")]
     SchemaIdExhausted,
+
+    /// An [`IndexDef`] was given an empty name. An index needs a name to be
+    /// droppable (`DROP INDEX` resolves by name alone).
+    #[error("index name must be non-empty")]
+    InvalidIndexName,
+
+    /// An [`IndexDef`] declared no columns — there is nothing to index.
+    #[error("index {0:?} declares no columns")]
+    IndexHasNoColumns(String),
+
+    /// [`Catalog::create_index`] named an index that is already live. Index
+    /// names share one namespace across the catalog.
+    #[error("index {0:?} already exists")]
+    IndexAlreadyExists(String),
+
+    /// An operation referenced an index that is not live — never created,
+    /// already dropped, or removed when its table was dropped.
+    #[error("unknown index {0:?}")]
+    UnknownIndex(String),
+
+    /// [`Catalog::create_index`] named a column the target table's live schema
+    /// does not declare.
+    #[error("index {index:?} names column {column:?}, which is not a column of the table")]
+    IndexColumnUnknown {
+        /// The index whose creation was rejected.
+        index: String,
+        /// The unknown column it named.
+        column: String,
+    },
+
+    /// [`Catalog::create_index`] targeted the table's first column — the
+    /// business key, which the storage layer already resolves without a
+    /// secondary structure (zone-map pruning + the validity index).
+    #[error("index {index:?} targets the business-key column {column:?}, which is always indexed")]
+    IndexOnBusinessKey {
+        /// The index whose creation was rejected.
+        index: String,
+        /// The business-key column it named.
+        column: String,
+    },
 }
 
 /// The two boundary columns of a table's valid-time period, captured from a

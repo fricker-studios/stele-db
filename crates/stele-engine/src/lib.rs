@@ -50,15 +50,18 @@
 
 mod catalog_log;
 mod commit_log;
+mod secondary;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::catalog_log::CatalogRecord;
+use crate::secondary::{IndexState, Probe};
 
-use stele_catalog::{Catalog, CatalogError};
+use stele_catalog::{Catalog, CatalogError, IndexDef, IndexKind, TableSchema};
 use stele_common::period::Interval;
 use stele_common::provenance::{Principal, TxnId};
 use stele_common::row_codec::{self, RowCodecError};
@@ -744,6 +747,23 @@ pub struct SessionEngine<C: Clock + Clone, D: Disk + Clone> {
     /// not on every auto-committed write under a long-lived open transaction
     /// ([STL-204]).
     pruned_below: SystemTimeMicros,
+    /// The live secondary indexes' access structures, by index name
+    /// ([STL-233]). Derived, rebuildable state (see the `secondary` module):
+    /// the catalog owns the matching [`IndexDef`] metadata, the durable log
+    /// owns its history, and these are (re)built from the table tiers —
+    /// at `CREATE INDEX` and on every [`recover`](Self::recover).
+    ///
+    /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    index_states: BTreeMap<String, IndexState>,
+    /// How many reads consulted a secondary index ([STL-233]) — both `Empty`
+    /// and `Window` probe answers count, since both replaced full-scan
+    /// planning. Monotonic over the session; a [`Cell`] because the read path
+    /// is `&self`. Observability for the equivalence oracle today and
+    /// `EXPLAIN` ([STL-260]) tomorrow.
+    ///
+    /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    /// [STL-260]: https://allegromusic.atlassian.net/browse/STL-260
+    index_probes: Cell<u64>,
 }
 
 impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
@@ -767,6 +787,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             write_index: BTreeMap::new(),
             open_snapshots: OpenSnapshots::default(),
             pruned_below: SystemTimeMicros(0),
+            index_states: BTreeMap::new(),
+            index_probes: Cell::new(0),
         }
     }
 
@@ -860,9 +882,26 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     max_commit = max_commit.max(at);
                 }
                 CatalogRecord::DropTable { at, name } => {
+                    // Cascades the dropped table's index metadata away, exactly
+                    // as the live session did ([STL-233]) — drops carry no
+                    // per-index records.
                     catalog.drop_table(&name, at)?;
                     // Records are in log order, so the last drop for a name wins.
                     latest_drop.insert(name, at);
+                    max_commit = max_commit.max(at);
+                }
+                CatalogRecord::CreateIndex {
+                    at,
+                    name,
+                    table,
+                    kind,
+                    columns,
+                } => {
+                    catalog.create_index(IndexDef::new(name, table, kind, columns)?)?;
+                    max_commit = max_commit.max(at);
+                }
+                CatalogRecord::DropIndex { at, name } => {
+                    catalog.drop_index(&name)?;
                     max_commit = max_commit.max(at);
                 }
             }
@@ -924,6 +963,17 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             }
         }
 
+        // 5. Rebuild every live secondary index from the recovered tiers
+        //    ([STL-233], the ADR-0023 derived-state posture): the durable log
+        //    carries only the metadata, so the access structures are
+        //    reconstructed from the rows live at the recovered high-water mark.
+        //    That instant becomes each structure's floor — reads at or after it
+        //    may probe, earlier `AS OF` reads full-scan (exactly the build
+        //    semantics `CREATE INDEX` gives a fresh index). This also closes
+        //    the crash-mid-build window: an acknowledged `CREATE INDEX` whose
+        //    in-memory build died with the process is simply rebuilt here.
+        let index_states = Self::rebuild_index_states(&catalog, &tables, clock.current())?;
+
         Ok(Self {
             catalog,
             clock,
@@ -934,7 +984,74 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             write_index: BTreeMap::new(),
             open_snapshots: OpenSnapshots::default(),
             pruned_below: SystemTimeMicros(0),
+            index_states,
+            index_probes: Cell::new(0),
         })
+    }
+
+    /// Rebuild every live index's access structure from the recovered tiers at
+    /// `rebuild_at` — step 5 of [`recover`](Self::recover).
+    fn rebuild_index_states(
+        catalog: &Catalog,
+        tables: &BTreeMap<String, TableState<C, D>>,
+        rebuild_at: SystemTimeMicros,
+    ) -> Result<BTreeMap<String, IndexState>, EngineError> {
+        let mut index_states = BTreeMap::new();
+        for def in catalog.live_indexes() {
+            // A live index always has a live table (a table drop cascades its
+            // indexes away in the same replay), so both lookups must resolve;
+            // failing closed beats serving without a recorded index.
+            let state = tables
+                .get(def.table())
+                .ok_or_else(|| EngineError::UnknownTable(def.table().to_owned()))?;
+            let schema = catalog
+                .resolve(def.table(), rebuild_at)
+                .ok_or_else(|| EngineError::UnknownTable(def.table().to_owned()))?;
+            index_states.insert(
+                def.name().to_owned(),
+                Self::build_index_state(state, schema, def, rebuild_at)?,
+            );
+        }
+        Ok(index_states)
+    }
+
+    /// Build one index's access structure from the rows live at `floor` — the
+    /// shared core of `CREATE INDEX` ([`apply_ddl`](Self::apply_ddl)) and the
+    /// cold-boot rebuild ([`recover`](Self::recover)). Each live row's indexed
+    /// cell is noted under its business key; `NULL` cells are skipped (an
+    /// equality can never match them). Writes committed after `floor` are noted
+    /// by the DML maintenance hook, so together the structure covers every
+    /// snapshot at or after `floor` (the superset contract — see the
+    /// `secondary` module docs).
+    fn build_index_state(
+        state: &TableState<C, D>,
+        schema: &TableSchema,
+        def: &IndexDef,
+        floor: SystemTimeMicros,
+    ) -> Result<IndexState, EngineError> {
+        let columns = schema.columns();
+        // The catalog validated the column at create/replay; resolve its
+        // position in the (append-only) schema.
+        let position = columns
+            .iter()
+            .position(|c| Some(c.name()) == def.columns().first().map(String::as_str))
+            .ok_or_else(|| {
+                EngineError::Catalog(CatalogError::IndexColumnUnknown {
+                    index: def.name().to_owned(),
+                    column: def.columns().first().cloned().unwrap_or_default(),
+                })
+            })?;
+        let value_count = columns.len().saturating_sub(1);
+        let mut index = IndexState::new(def.kind(), floor);
+        for row in Self::scan_all_rows(state, floor, value_count)? {
+            let Some(key) = row.first().cloned().flatten() else {
+                continue; // a row always carries its key; nothing to note without one
+            };
+            if let Some(cell) = row.get(position).and_then(|c| c.as_deref()) {
+                index.structure.note(cell, &BusinessKey::new(key));
+            }
+        }
+        Ok(index)
     }
 
     /// Take a lightweight **checkpoint** of every resident table: group-commit
@@ -1043,6 +1160,19 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     #[must_use]
     pub fn commit_clock(&self) -> SystemTimeMicros {
         self.clock.current()
+    }
+
+    /// How many reads have consulted a secondary index this session
+    /// ([STL-233]) — monotonic, counting every probe (whether it proved
+    /// emptiness or produced a candidate window). The indexed≡unindexed
+    /// equivalence oracle asserts on this to prove the index path actually
+    /// ran; `EXPLAIN` ([STL-260]) is its operator-facing future.
+    ///
+    /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    /// [STL-260]: https://allegromusic.atlassian.net/browse/STL-260
+    #[must_use]
+    pub const fn index_probe_count(&self) -> u64 {
+        self.index_probes.get()
     }
 
     /// The live tables and their columns at the current read snapshot.
@@ -1424,6 +1554,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     };
                     catalog_log::append(&self.disk, &record).map_err(EngineError::CatalogLog)?;
                     self.catalog = staged;
+                    // The catalog drop cascaded the table's index *metadata*
+                    // away ([STL-233]); discard the orphaned access structures
+                    // with it. Derived state only — nothing durable to undo,
+                    // and replay re-derives the same cascade from the drop
+                    // record.
+                    self.index_states
+                        .retain(|index_name, _| self.catalog.index(index_name).is_some());
                     // The catalog name is now closed, but the tier stays resident
                     // (history survives, and a re-create reuses it). Close every
                     // row still system-live at the drop instant so the re-created
@@ -1456,7 +1593,97 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     tag: outcome.command_tag(),
                 })
             }
+            DdlStatement::CreateIndex {
+                name,
+                table,
+                columns,
+            } => self.apply_create_index(name, table, columns, at),
+            DdlStatement::DropIndex { name, if_exists } => {
+                self.apply_drop_index(&name, if_exists, at)
+            }
         }
+    }
+
+    /// Apply a `CREATE INDEX` ([STL-233]), following the same write-ahead
+    /// discipline as the table arms of [`apply_ddl`](Self::apply_ddl)
+    /// ([ADR-0028]), with the build standing in for the tier setup:
+    ///
+    /// 1. validate on a catalog copy,
+    /// 2. build the access structure from the rows live at `at` — a scan
+    ///    failure aborts with nothing acknowledged, and a *crash* here leaves
+    ///    no record, so the DDL simply never happened (the rebuildable
+    ///    mid-build state the ticket's DoD names),
+    /// 3. fsync the log record — the durability point,
+    /// 4. commit the copy and adopt the structure.
+    ///
+    /// After this instant the DML maintenance hook keeps the structure
+    /// current, and recovery rebuilds it from the durable record.
+    ///
+    /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    /// [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
+    fn apply_create_index(
+        &mut self,
+        name: String,
+        table: String,
+        columns: Vec<String>,
+        at: SystemTimeMicros,
+    ) -> Result<StatementOutcome, EngineError> {
+        let def = IndexDef::new(name, table, IndexKind::default(), columns)?;
+        let mut staged = self.catalog.clone();
+        staged.create_index(def.clone())?;
+        let state = self
+            .tables
+            .get(def.table())
+            .ok_or_else(|| EngineError::UnknownTable(def.table().to_owned()))?;
+        let schema = staged
+            .resolve(def.table(), at)
+            .ok_or_else(|| EngineError::UnknownTable(def.table().to_owned()))?;
+        let built = Self::build_index_state(state, schema, &def, at)?;
+        let record = CatalogRecord::CreateIndex {
+            at,
+            name: def.name().to_owned(),
+            table: def.table().to_owned(),
+            kind: def.kind(),
+            columns: def.columns().to_vec(),
+        };
+        catalog_log::append(&self.disk, &record).map_err(EngineError::CatalogLog)?;
+        let name = def.name().to_owned();
+        self.catalog = staged;
+        self.index_states.insert(name, built);
+        Ok(StatementOutcome::Ddl {
+            tag: DdlOutcome::CreatedIndex.command_tag(),
+        })
+    }
+
+    /// Apply a `DROP INDEX` ([STL-233]): record the drop durably, then discard
+    /// the metadata and the access structure. The `IF EXISTS` no-op writes no
+    /// record — nothing changed, nothing to recover.
+    ///
+    /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    fn apply_drop_index(
+        &mut self,
+        name: &str,
+        if_exists: bool,
+        at: SystemTimeMicros,
+    ) -> Result<StatementOutcome, EngineError> {
+        let mut staged = self.catalog.clone();
+        let outcome = match staged.drop_index(name) {
+            Ok(_) => DdlOutcome::DroppedIndex,
+            Err(CatalogError::UnknownIndex(_)) if if_exists => DdlOutcome::DropIndexNoOp,
+            Err(e) => return Err(EngineError::Catalog(e)),
+        };
+        if matches!(outcome, DdlOutcome::DroppedIndex) {
+            let record = CatalogRecord::DropIndex {
+                at,
+                name: name.to_owned(),
+            };
+            catalog_log::append(&self.disk, &record).map_err(EngineError::CatalogLog)?;
+            self.catalog = staged;
+            self.index_states.remove(name);
+        }
+        Ok(StatementOutcome::Ddl {
+            tag: outcome.command_tag(),
+        })
     }
 
     /// Apply an operator-facing admin command ([STL-219]): drive the matching
@@ -1622,7 +1849,24 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 valid_cols,
             )?
         } else {
-            Self::scan_rows(bound, state, &schema_columns, value_count)?
+            // Rule-based index use ([STL-233]): an equality on an indexed
+            // value column probes the table's access structure for the
+            // candidate-key window. `Empty` proves no visible row can match
+            // (the superset contract), so the scan is skipped outright; a
+            // window prunes the scan to the candidates' key range, and the
+            // exact `Filter` below keeps the answer identical to a full scan
+            // either way — an index changes speed, never results.
+            match self.index_window(table, bound, &schema_columns) {
+                Some(Probe::Empty) => Vec::new(),
+                Some(Probe::Window { low, high }) => Self::scan_rows(
+                    bound,
+                    state,
+                    &schema_columns,
+                    value_count,
+                    Some(&(low, high)),
+                )?,
+                None => Self::scan_rows(bound, state, &schema_columns, value_count, None)?,
+            }
         };
 
         // An aggregate query folds those rows into grouped output ([STL-171]); a
@@ -1667,6 +1911,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         state: &TableState<C, D>,
         schema_columns: &[(String, LogicalType)],
         value_count: usize,
+        key_window: Option<&(BusinessKey, BusinessKey)>,
     ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
         // Resolve the `WHERE` to a single vectorized predicate ([STL-213]): a
         // `<col> <cmp> <scalar>` comparison ([STL-151]) or a per-row period
@@ -1680,20 +1925,30 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             FilterPlan::Predicate(expr) => Some(expr),
         };
 
-        // Push a business-key equality down to the scan for zone-map pruning; any
-        // richer predicate (a value-column compare, an arithmetic, a period) lives
-        // inside the opaque payload, which a zone map cannot reason about, so the
-        // vectorized `Filter` below is where it is applied. The pushed-down key
-        // predicate is re-applied by that same `Filter`, so the answer is exact
-        // regardless of what the prune could prove.
-        let predicate = bound
-            .filter
-            .as_ref()
-            .and_then(BoundPredicate::key_equality)
-            .map_or(Predicate::All, |value| Predicate::Eq {
+        // Push a business-key constraint down to the scan for zone-map pruning:
+        // an index probe's candidate window when one was taken ([STL-233]), else
+        // a literal key equality. Any richer predicate (a value-column compare,
+        // an arithmetic, a period) lives inside the opaque payload, which a zone
+        // map cannot reason about, so the vectorized `Filter` below is where it
+        // is applied. The pushed-down predicate is re-applied by that same
+        // `Filter`, so the answer is exact regardless of what the prune could
+        // prove — for the index window, because every key outside it is no
+        // candidate at all (the superset contract).
+        let predicate = match key_window {
+            Some((low, high)) => Predicate::Range {
                 column: ColumnId::BusinessKey,
-                value: ZoneBound::Bytes(encode_value(value)),
-            });
+                low: ZoneBound::Bytes(low.as_bytes().to_vec()),
+                high: ZoneBound::Bytes(high.as_bytes().to_vec()),
+            },
+            None => bound
+                .filter
+                .as_ref()
+                .and_then(BoundPredicate::key_equality)
+                .map_or(Predicate::All, |value| Predicate::Eq {
+                    column: ColumnId::BusinessKey,
+                    value: ZoneBound::Bytes(encode_value(value)),
+                }),
+        };
 
         let readers = state.engine.open_segment_readers()?;
         let mut scan = SnapshotScan::new(
@@ -1737,6 +1992,50 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             }
         }
         Ok(rows)
+    }
+
+    /// The candidate window for a bound `SELECT`'s `WHERE`, when a secondary
+    /// index can serve it ([STL-233]) — the rule-based "use the index when
+    /// usable" the v0.3 substrate ships in place of a cost model. Usable means
+    /// **all** of:
+    ///
+    /// * the `WHERE` is exactly `<value column> = <literal>`
+    ///   ([`column_equality`](BoundPredicate::column_equality) — a key
+    ///   equality keeps its own zone-map push-down);
+    /// * a live index covers exactly that column;
+    /// * the read snapshot is at or after the index's build/rebuild
+    ///   [floor](crate::secondary::IndexState) — an `AS OF` before it reads
+    ///   history the build never saw, so it must full-scan.
+    ///
+    /// The caller never consults the structure for an overlaid
+    /// (read-your-own-writes) read: buffered writes are not committed, so they
+    /// are not noted. `None` means "no index applies — full scan"; both probe
+    /// answers count toward [`index_probe_count`](Self::index_probe_count).
+    ///
+    /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    fn index_window(
+        &self,
+        table: &str,
+        bound: &BoundSelect,
+        schema_columns: &[(String, LogicalType)],
+    ) -> Option<Probe> {
+        if self.index_states.is_empty() {
+            return None;
+        }
+        let (position, literal) = bound.filter.as_ref()?.column_equality()?;
+        let (column, _) = schema_columns.get(position)?;
+        let def = self
+            .catalog
+            .indexes_on(table)
+            .find(|def| matches!(def.columns(), [c] if c == column))?;
+        let state = self.index_states.get(def.name())?;
+        if bound.snapshot < state.floor {
+            return None;
+        }
+        self.index_probes.set(self.index_probes.get() + 1);
+        // The binder folded the literal to the column's type, so its canonical
+        // encoding is exactly what the maintenance hook noted.
+        Some(state.structure.equality_candidates(&encode_value(literal)))
     }
 
     /// The rows a transaction sees under **read-your-own-writes** ([STL-203]): the
@@ -2128,6 +2427,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     txn_id,
                     principal.clone(),
                 )?;
+                // The write is applied; note its cells into the table's live
+                // access structures ([STL-233]) so a probe at any later
+                // snapshot finds this key (the superset contract).
+                self.note_indexes(&table, &committed.1, &cells);
                 DmlSummary::Insert(1)
             }
             BoundDml::Update {
@@ -2171,6 +2474,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     txn_id,
                     principal.clone(),
                 )?;
+                // Note the *merged* row's cells ([STL-233]). Add-only: the
+                // prior value's entry deliberately stays — a past snapshot may
+                // still see it (the superset contract).
+                self.note_indexes(&table, &committed.1, &cells);
                 DmlSummary::Update(1)
             }
             BoundDml::Delete { table, key, .. } => {
@@ -2187,6 +2494,55 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // so every committed write is tracked.
         self.write_index.insert(committed, self.clock.current());
         Ok(summary)
+    }
+
+    /// Note one committed row's indexed cells into the table's live access
+    /// structures ([STL-233]) — the DML maintenance half of the superset
+    /// contract (the `secondary` module docs). Called after every applied
+    /// `INSERT` / `UPDATE` (both the auto-commit path and a multi-statement
+    /// `COMMIT` funnel through [`apply_bound_dml`](Self::apply_bound_dml)); a
+    /// `DELETE` notes nothing — the structures are add-only, and a delete
+    /// introduces no new value. Infallible by design: the write is already
+    /// applied when this runs, so there is nothing sound to do with an error —
+    /// and none arises, since the catalog validated the indexed columns at
+    /// `CREATE INDEX` and the schema is append-only.
+    ///
+    /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    fn note_indexes(&mut self, table: &str, key: &BusinessKey, cells: &[Option<Vec<u8>>]) {
+        if self.index_states.is_empty() {
+            return;
+        }
+        let Some(schema) = self.catalog.resolve(table, self.clock.current()) else {
+            // The write that just applied resolved this table; a miss here is
+            // unreachable, and noting nothing only costs a probe its prune.
+            return;
+        };
+        let columns = schema.columns();
+        let targets: Vec<(String, usize)> = self
+            .catalog
+            .indexes_on(table)
+            .filter_map(|def| {
+                let position = columns
+                    .iter()
+                    .position(|c| Some(c.name()) == def.columns().first().map(String::as_str))?;
+                Some((def.name().to_owned(), position))
+            })
+            .collect();
+        for (name, position) in targets {
+            // Schema position 0 is the business key; the value cells are
+            // offset by one. A NULL cell is never noted — an equality probe
+            // can never match it (three-valued logic).
+            let Some(cell) = position
+                .checked_sub(1)
+                .and_then(|i| cells.get(i))
+                .and_then(|c| c.as_deref())
+            else {
+                continue;
+            };
+            if let Some(state) = self.index_states.get_mut(&name) {
+                state.structure.note(cell, key);
+            }
+        }
     }
 
     /// The number of value columns (the schema's column count minus the business
@@ -8207,5 +8563,351 @@ mod tests {
             matches!(err, EngineError::ValidTimePolicyChange { .. }),
             "the recovered tier still enforces its valid-time policy, got {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Secondary-index substrate (STL-233)
+    // -----------------------------------------------------------------------
+
+    /// Execute one statement, panicking with the SQL on error.
+    fn run_sql<C: Clock + Clone>(
+        engine: &mut SessionEngine<C, MemDisk>,
+        sql: &str,
+    ) -> StatementOutcome {
+        engine
+            .execute(&parse_one(sql))
+            .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"))
+    }
+
+    /// Execute one `SELECT` and return its raw row cells.
+    fn query_rows<C: Clock + Clone>(
+        engine: &mut SessionEngine<C, MemDisk>,
+        sql: &str,
+    ) -> Vec<Vec<Option<Vec<u8>>>> {
+        let StatementOutcome::Rows(r) = run_sql(engine, sql) else {
+            panic!("`{sql}` must return rows");
+        };
+        r.rows
+    }
+
+    /// One single-cell `Int4` row, in the canonical encoding `SelectResult` carries.
+    fn int_row(v: i32) -> Vec<Option<Vec<u8>>> {
+        vec![cell(Some(ScalarValue::Int4(v)))]
+    }
+
+    #[test]
+    fn index_probes_serve_equality_reads_across_dml() {
+        let mut engine = session();
+        run_sql(&mut engine, CREATE);
+        run_sql(
+            &mut engine,
+            "INSERT INTO account (id, balance) VALUES (1, 100)",
+        );
+        run_sql(
+            &mut engine,
+            "INSERT INTO account (id, balance) VALUES (2, 200)",
+        );
+        run_sql(
+            &mut engine,
+            "INSERT INTO account (id, balance) VALUES (3, 100)",
+        );
+
+        let outcome = run_sql(&mut engine, "CREATE INDEX i_balance ON account (balance)");
+        assert!(matches!(
+            outcome,
+            StatementOutcome::Ddl {
+                tag: "CREATE INDEX"
+            }
+        ));
+        assert_eq!(engine.index_probe_count(), 0, "DDL itself probes nothing");
+
+        // The build covered the pre-existing rows.
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE balance = 100"),
+            vec![int_row(1), int_row(3)]
+        );
+        assert_eq!(engine.index_probe_count(), 1, "the equality read probed");
+
+        // Maintenance keeps the structure current across UPDATE and DELETE —
+        // and the superset posture (old entries linger) never leaks a stale
+        // row, because the exact filter re-applies.
+        run_sql(&mut engine, "UPDATE account SET balance = 300 WHERE id = 1");
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE balance = 100"),
+            vec![int_row(3)]
+        );
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE balance = 300"),
+            vec![int_row(1)]
+        );
+        run_sql(&mut engine, "DELETE FROM account WHERE id = 3");
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE balance = 100"),
+            Vec::<Vec<Option<Vec<u8>>>>::new()
+        );
+        // A value never written probes `Empty` and skips the scan outright.
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE balance = 999"),
+            Vec::<Vec<Option<Vec<u8>>>>::new()
+        );
+        assert_eq!(engine.index_probe_count(), 5);
+
+        // A non-equality on the indexed column, and any read on an unindexed
+        // column, never probe.
+        let probes = engine.index_probe_count();
+        let _ = query_rows(&mut engine, "SELECT id FROM account WHERE balance > 0");
+        let _ = query_rows(&mut engine, "SELECT balance FROM account WHERE id = 2");
+        assert_eq!(engine.index_probe_count(), probes);
+    }
+
+    #[test]
+    fn as_of_before_the_index_floor_full_scans_and_stays_correct() {
+        let clock = SteppedClock::new(1_000_000_000);
+        let mut engine = SessionEngine::open(MemDisk::new(), clock.clone());
+        run_sql(&mut engine, CREATE);
+        clock.set(1_010_000_000);
+        run_sql(
+            &mut engine,
+            "INSERT INTO account (id, balance) VALUES (1, 100)",
+        );
+        clock.set(1_020_000_000);
+        run_sql(&mut engine, "UPDATE account SET balance = 200 WHERE id = 1");
+        clock.set(1_030_000_000);
+        run_sql(&mut engine, "CREATE INDEX i_balance ON account (balance)");
+
+        // An `AS OF` inside pre-index history must not probe — the build never
+        // saw the superseded version carrying 100 — and still answers exactly.
+        assert_eq!(
+            query_rows(
+                &mut engine,
+                "SELECT id FROM account FOR SYSTEM_TIME AS OF 1015000000 WHERE balance = 100"
+            ),
+            vec![int_row(1)]
+        );
+        assert_eq!(engine.index_probe_count(), 0, "pre-floor reads full-scan");
+
+        // At-or-after the floor the probe serves: 100 was superseded before the
+        // build, so the structure proves emptiness; 200 resolves through it.
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE balance = 100"),
+            Vec::<Vec<Option<Vec<u8>>>>::new()
+        );
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE balance = 200"),
+            vec![int_row(1)]
+        );
+        assert_eq!(engine.index_probe_count(), 2);
+    }
+
+    #[test]
+    fn a_committed_transaction_maintains_the_index_and_ryow_reads_never_probe() {
+        let mut engine = session();
+        run_sql(&mut engine, CREATE);
+        run_sql(&mut engine, "CREATE INDEX i_balance ON account (balance)");
+
+        let mut txn = engine.begin();
+        engine
+            .execute_in_txn(
+                &parse_one("INSERT INTO account (id, balance) VALUES (1, 100)"),
+                &mut txn,
+            )
+            .expect("stage insert");
+        // The buffered row is visible to the transaction (read-your-own-writes)
+        // but is not committed, so the read takes the overlay path — no probe.
+        let StatementOutcome::Rows(r) = engine
+            .execute_in_txn(
+                &parse_one("SELECT id FROM account WHERE balance = 100"),
+                &mut txn,
+            )
+            .expect("ryow select")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(r.rows, vec![int_row(1)]);
+        assert_eq!(engine.index_probe_count(), 0, "overlaid reads never probe");
+
+        // Commit funnels through the same apply path as auto-commit, so the
+        // index now covers the transaction's writes.
+        engine.commit(txn).expect("commit");
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE balance = 100"),
+            vec![int_row(1)]
+        );
+        assert_eq!(engine.index_probe_count(), 1);
+    }
+
+    #[test]
+    fn index_ddl_round_trips_catalog_persistence_and_cold_boot_rebuild() {
+        let disk = MemDisk::new();
+        {
+            let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+            run_sql(&mut engine, CREATE);
+            run_sql(
+                &mut engine,
+                "INSERT INTO account (id, balance) VALUES (1, 100)",
+            );
+            run_sql(
+                &mut engine,
+                "INSERT INTO account (id, balance) VALUES (2, 200)",
+            );
+            // Seal part of the history so the rebuild reads sealed + delta.
+            engine.flush().expect("flush");
+            run_sql(&mut engine, "CREATE INDEX i_balance ON account (balance)");
+            run_sql(
+                &mut engine,
+                "INSERT INTO account (id, balance) VALUES (3, 100)",
+            );
+            // The engine is dropped here — the crash/restart boundary.
+        }
+
+        let mut engine = recover_session(&disk);
+        assert_eq!(engine.index_probe_count(), 0);
+        // The rebuilt structure serves probes over both pre-flush (sealed) and
+        // post-index (maintained, WAL-replayed) rows.
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE balance = 100"),
+            vec![int_row(1), int_row(3)]
+        );
+        assert_eq!(engine.index_probe_count(), 1, "the recovered index serves");
+
+        // …and post-recovery writes keep maintaining it.
+        run_sql(
+            &mut engine,
+            "INSERT INTO account (id, balance) VALUES (4, 100)",
+        );
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE balance = 100"),
+            vec![int_row(1), int_row(3), int_row(4)]
+        );
+    }
+
+    #[test]
+    fn dropped_indexes_stay_dropped_across_recovery() {
+        let disk = MemDisk::new();
+        {
+            let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+            run_sql(&mut engine, CREATE);
+            run_sql(
+                &mut engine,
+                "INSERT INTO account (id, balance) VALUES (1, 100)",
+            );
+            run_sql(&mut engine, "CREATE INDEX i_balance ON account (balance)");
+            let outcome = run_sql(&mut engine, "DROP INDEX i_balance");
+            assert!(matches!(
+                outcome,
+                StatementOutcome::Ddl { tag: "DROP INDEX" }
+            ));
+            // Equality reads fall back to full scans, exactly.
+            assert_eq!(
+                query_rows(&mut engine, "SELECT id FROM account WHERE balance = 100"),
+                vec![int_row(1)]
+            );
+            assert_eq!(engine.index_probe_count(), 0, "no live index, no probe");
+        }
+
+        let mut engine = recover_session(&disk);
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE balance = 100"),
+            vec![int_row(1)]
+        );
+        assert_eq!(engine.index_probe_count(), 0, "the drop replayed");
+    }
+
+    #[test]
+    fn drop_table_cascades_indexes_in_session_and_across_recovery() {
+        let disk = MemDisk::new();
+        {
+            let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+            run_sql(&mut engine, CREATE);
+            run_sql(
+                &mut engine,
+                "INSERT INTO account (id, balance) VALUES (1, 100)",
+            );
+            run_sql(&mut engine, "CREATE INDEX i_balance ON account (balance)");
+            run_sql(&mut engine, "DROP TABLE account");
+            // The cascade freed the name; the re-created table starts
+            // index-free and its reads never probe.
+            run_sql(&mut engine, CREATE);
+            assert_eq!(
+                query_rows(&mut engine, "SELECT id FROM account WHERE balance = 100"),
+                Vec::<Vec<Option<Vec<u8>>>>::new()
+            );
+            assert_eq!(engine.index_probe_count(), 0);
+            // …and the index name is reusable on the fresh era.
+            run_sql(&mut engine, "CREATE INDEX i_balance ON account (balance)");
+        }
+
+        // Replay re-derives the same cascade: create → drop(cascade) →
+        // re-create → fresh index. Recovery rebuilds only the live one.
+        let mut engine = recover_session(&disk);
+        run_sql(
+            &mut engine,
+            "INSERT INTO account (id, balance) VALUES (7, 700)",
+        );
+        assert_eq!(
+            query_rows(&mut engine, "SELECT id FROM account WHERE balance = 700"),
+            vec![int_row(7)]
+        );
+        assert_eq!(engine.index_probe_count(), 1);
+    }
+
+    #[test]
+    fn index_ddl_misuse_is_refused_over_execute() {
+        let mut engine = session();
+        run_sql(&mut engine, CREATE);
+        run_sql(&mut engine, "CREATE INDEX i_balance ON account (balance)");
+
+        // Duplicate name — one namespace across the live set.
+        let err = engine
+            .execute(&parse_one("CREATE INDEX i_balance ON account (balance)"))
+            .expect_err("duplicate index name");
+        assert!(
+            matches!(
+                err,
+                EngineError::Catalog(CatalogError::IndexAlreadyExists(_))
+            ),
+            "got {err:?}"
+        );
+        // Unknown table / column, and the always-indexed business key.
+        let err = engine
+            .execute(&parse_one("CREATE INDEX i ON ghost (balance)"))
+            .expect_err("unknown table");
+        assert!(
+            matches!(err, EngineError::Catalog(CatalogError::UnknownTable(_))),
+            "got {err:?}"
+        );
+        let err = engine
+            .execute(&parse_one("CREATE INDEX i ON account (ghost)"))
+            .expect_err("unknown column");
+        assert!(
+            matches!(
+                err,
+                EngineError::Catalog(CatalogError::IndexColumnUnknown { .. })
+            ),
+            "got {err:?}"
+        );
+        let err = engine
+            .execute(&parse_one("CREATE INDEX i ON account (id)"))
+            .expect_err("business key");
+        assert!(
+            matches!(
+                err,
+                EngineError::Catalog(CatalogError::IndexOnBusinessKey { .. })
+            ),
+            "got {err:?}"
+        );
+        // DROP of an absent index errors without IF EXISTS, no-ops with it.
+        let err = engine
+            .execute(&parse_one("DROP INDEX i_ghost"))
+            .expect_err("unknown index");
+        assert!(
+            matches!(err, EngineError::Catalog(CatalogError::UnknownIndex(_))),
+            "got {err:?}"
+        );
+        let outcome = run_sql(&mut engine, "DROP INDEX IF EXISTS i_ghost");
+        assert!(matches!(
+            outcome,
+            StatementOutcome::Ddl { tag: "DROP INDEX" }
+        ));
     }
 }
