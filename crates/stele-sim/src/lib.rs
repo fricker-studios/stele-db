@@ -20,7 +20,11 @@
 //! its fault-event log into a digest. [`run_engine_recover_faults_seed`] then
 //! drives the full kill-and-recover path *through* that fault disk ([STL-153]),
 //! asserting recovery either converges to a consistent committed prefix or cleanly
-//! detects corruption — never silently diverges.
+//! detects corruption — never silently diverges. The v0.2 surface rides the same
+//! pattern ([STL-187]): [`run_txn_commit_rollback_faults_seed`] interleaves
+//! committed and rolled-back multi-statement transactions under those faults, and
+//! [`run_vectorized_exec_faults_seed`] drives the vectorized aggregate/join
+//! operators over fault-recovered state against independent scalar folds.
 //!
 //! The deterministic substrate — a [`VirtualClock`] that advances on demand, the
 //! ChaCha20-backed [`SeededRng`], and the cooperative [`Scheduler`] that drives
@@ -55,7 +59,10 @@ use stele_catalog::{Catalog, ColumnDef, TableTemporal};
 use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
 use stele_common::types::LogicalType;
-use stele_exec::{Column, SnapshotScan};
+use stele_exec::{
+    AggregateFunc, Aggregator, Column, Expr, JoinType, SnapshotScan, Vector, hash_aggregate,
+    hash_join,
+};
 use stele_storage::backend::{Disk, DiskFile, MemDisk, MemFile};
 use stele_storage::delta::{BusinessKey, Delta, DeltaConfig, Snapshot, Version};
 use stele_storage::dml::{self, DmlWriter};
@@ -1505,6 +1512,236 @@ pub fn run_group_commit_recover_faults_seed(seed: u64) -> u64 {
     digest
 }
 
+/// Stage one multi-statement transaction and **roll it back** — the
+/// `BEGIN … ROLLBACK` arm of [`run_txn_commit_rollback_faults_seed`].
+///
+/// The same seeded distinct-key batch shape as `apply_group_txn`, staged under
+/// [`Engine::begin_group`] so every write applies to the resident delta/index
+/// but defers its WAL record — then dropped by [`Engine::abort_group`] instead
+/// of committed. The oracle is untouched: a rolled-back transaction has no
+/// effects.
+///
+/// After the abort, every chosen key is read back live at the last staged
+/// instant and asserted equal to the committed-only oracle — a rolled-back
+/// write that stayed visible (a leaked resident application, the [STL-216]
+/// regression) fails here with the seed in the message.
+///
+/// Returns `false` on a staged-write fault — the crash, after which the caller
+/// stops the workload (the buffer is aborted first, mirroring `apply_group_txn`).
+fn apply_rollback_group_txn(
+    engine: &mut Engine<StepClock, FaultDisk>,
+    rng: &mut Rng,
+    keys: &[BusinessKey],
+    live: &[bool],
+    oracle: &BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Option<Vec<u8>>>>,
+    txn: TxnId,
+    seed: u64,
+) -> bool {
+    // The same distinct-key subset drawing as the commit arm, so a seed's
+    // batches keep their shape whichever way its commit/rollback coins land.
+    let mut pool: Vec<usize> = (0..keys.len()).collect();
+    let take = (1 + rng.below_usize(4)).min(keys.len());
+    for i in 0..take {
+        let j = i + rng.below_usize(pool.len() - i);
+        pool.swap(i, j);
+    }
+    let chosen = &pool[..take];
+
+    engine.begin_group();
+    let mut last_staged: Option<SystemTimeMicros> = None;
+    for &k in chosen {
+        let principal = Principal::new(b"sim".to_vec());
+        // A payload namespace disjoint from the committed arm's `t{txn}k{key}` —
+        // if a rolled-back write ever leaks into a live read or a recovered
+        // state, it can never alias a committed write, so the equality checks
+        // catch it rather than coincidentally passing.
+        let payload = format!("rb-t{}k{k}", txn.0).into_bytes();
+        let want_delete = live[k] && rng.below(2) == 0;
+        let outcome = if live[k] {
+            if want_delete {
+                engine.delete(&keys[k], txn, principal)
+            } else {
+                engine.update(keys[k].clone(), None, Some(payload), 0, txn, principal)
+            }
+        } else {
+            engine.insert(keys[k].clone(), None, Some(payload), 0, txn, principal)
+        };
+        let Ok(o) = outcome else {
+            engine.abort_group();
+            return false;
+        };
+        last_staged = Some(o.commit);
+    }
+
+    // ROLLBACK: discard the buffered redos and undo their resident application
+    // ([STL-216]) — no WAL record was or will be written for this transaction.
+    engine.abort_group();
+
+    // The live engine must show none of the rolled-back writes: every chosen key
+    // reads back exactly the committed-only truth at the last staged instant.
+    if let Some(s) = last_staged {
+        for &k in chosen {
+            let got = engine
+                .as_of_payload(&keys[k], Snapshot(s))
+                .expect("post-rollback as_of")
+                .flatten();
+            let want = oracle
+                .get(&keys[k])
+                .and_then(|tl| tl.range(..=s).next_back())
+                .and_then(|(_, payload)| payload.clone());
+            assert_eq!(
+                got, want,
+                "seed {seed}: txn {} key {k}: a rolled-back write is visible live",
+                txn.0,
+            );
+        }
+    }
+    true
+}
+
+/// Kill and `recover` a seeded **mixed `BEGIN … COMMIT` / `BEGIN … ROLLBACK`**
+/// workload through a [`FaultDisk`] — the multi-statement-transaction DST
+/// coverage of [STL-187].
+///
+/// [`run_group_commit_recover_faults_seed`] proves a committed group is
+/// all-or-nothing across a crash; [`run_group_commit_abort_rollback_seed`]
+/// proves a fault-free rollback leaves no trace. This scenario closes the gap
+/// between them: a seed-chosen interleaving of committed and rolled-back
+/// transactions with write-path faults armed throughout — the shape a real
+/// session produces, where a `ROLLBACK` lands between two durable commits.
+///
+/// Each rolled-back transaction stages its writes under [`Engine::begin_group`]
+/// and drops them with [`Engine::abort_group`]; the live state is immediately
+/// asserted clean (`apply_rollback_group_txn`). Committed transactions, the
+/// two-phase fault arming, and the crash/recovery tail are exactly
+/// [`run_group_commit_recover_faults_seed`]'s: the reference oracle records
+/// committed transactions only, and recovery must converge to a consistent
+/// committed-transaction prefix or cleanly detect corruption. Rolled-back
+/// payloads live in a disjoint namespace (`rb-…`), so a rollback resurrected by
+/// replay can never alias a committed write — it fails the membership check
+/// loudly. Same seed ⇒ same digest.
+///
+/// # Panics
+///
+/// Panics if a rolled-back write is visible live after its `ROLLBACK`, or if
+/// recovery returns `Ok` with a state that is not a consistent
+/// committed-transaction prefix of the oracle (e.g. a rolled-back write
+/// resurrected by WAL replay).
+#[must_use]
+pub fn run_txn_commit_rollback_faults_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+
+    // The group-commit sweep's fault mix, drawn from a stream of its own so the
+    // commit/rollback interleaving is independent of the profile.
+    let mut prof_rng = Rng::new(seed ^ 0x0DDC_0FFE_E0DD_F00D);
+    let p_torn = prob_permille(&mut prof_rng, 40, 120);
+    let p_full = prob_permille(&mut prof_rng, 10, 30);
+    let p_slow = prob_permille(&mut prof_rng, 200, 500);
+    let p_bit = prob_permille(&mut prof_rng, 80, 200);
+    let p_short = prob_permille(&mut prof_rng, 80, 200);
+
+    let mut rng = Rng::new(seed);
+
+    let mut oracle: BTreeMap<BusinessKey, BTreeMap<SystemTimeMicros, Option<Vec<u8>>>> =
+        BTreeMap::new();
+    let mut boundaries: Vec<SystemTimeMicros> = Vec::new();
+
+    let key_count = 2 + rng.below_usize(5);
+    let keys: Vec<BusinessKey> = (0..key_count)
+        .map(|i| BusinessKey::new(format!("k-{i:04}").into_bytes()))
+        .collect();
+
+    let disk = FaultDisk::new(seed, FaultProfile::none());
+    {
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1), false).expect("open engine");
+        disk.enable(FaultKind::TornWrite, p_torn);
+        disk.enable(FaultKind::FullDisk, p_full);
+        disk.enable(FaultKind::SlowSync, p_slow);
+
+        let mut live = vec![false; key_count];
+        let txns = 6 + rng.below(12);
+        for t in 0..txns {
+            // The commit/rollback coin: about a third of the transactions roll
+            // back, so most seeds interleave both outcomes before the crash.
+            let rollback = rng.below(3) == 0;
+            let survived = if rollback {
+                apply_rollback_group_txn(
+                    &mut engine,
+                    &mut rng,
+                    &keys,
+                    &live,
+                    &oracle,
+                    TxnId(t),
+                    seed,
+                )
+            } else {
+                apply_group_txn(
+                    &mut engine,
+                    &mut rng,
+                    &keys,
+                    &mut live,
+                    &mut oracle,
+                    &mut boundaries,
+                    TxnId(t),
+                )
+            };
+            if !survived {
+                break;
+            }
+            // A periodic durable checkpoint advances the fence; a fault writing
+            // it is also a crash.
+            if rng.below(3) == 0 && engine.checkpoint().is_err() {
+                break;
+            }
+        }
+        let _ = engine.checkpoint();
+    }
+
+    // Re-arm for recovery: silence write faults, arm read corruption.
+    disk.disable(FaultKind::TornWrite);
+    disk.disable(FaultKind::FullDisk);
+    disk.disable(FaultKind::SlowSync);
+    disk.enable(FaultKind::BitFlip, p_bit);
+    disk.enable(FaultKind::ShortRead, p_short);
+
+    let recovered = Engine::recover(disk.clone(), StepClock::new(1_000_000), false);
+
+    disk.disable(FaultKind::BitFlip);
+    disk.disable(FaultKind::ShortRead);
+
+    let mut digest = FNV_OFFSET;
+    match recovered {
+        Err(_) => digest = fnv1a(digest, &[0xE2]),
+        Ok(engine) => {
+            // The recovered state must be a consistent committed-transaction
+            // prefix; a leaked rollback or a partial commit matches no cutoff.
+            let (k, recovered_fp) =
+                verify_recovered_prefix(seed, &engine, &oracle, &boundaries, &keys);
+            digest = fnv1a(digest, &[0x0C]);
+            digest = fnv1a(
+                digest,
+                &u64::try_from(k).expect("prefix len fits u64").to_le_bytes(),
+            );
+            for entry in &recovered_fp {
+                match entry {
+                    Some(payload) => {
+                        digest = fnv1a(digest, &[1]);
+                        digest = fnv1a(digest, payload);
+                    }
+                    None => digest = fnv1a(digest, &[0]),
+                }
+            }
+        }
+    }
+
+    for ev in disk.events() {
+        digest = fnv1a(digest, &ev.seq.to_le_bytes());
+        digest = fnv1a(digest, &[fault_op_tag(ev.op), fault_kind_tag(ev.kind)]);
+        digest = fnv1a(digest, &ev.detail.to_le_bytes());
+    }
+    digest
+}
+
 /// Drive a seeded [`Engine`] workload into a **failed WAL fsync** and assert the
 /// WAL/engine **poisons** — the [STL-217] DoD, seed-reproducibly.
 ///
@@ -2704,6 +2941,560 @@ pub fn run_as_of_resolution_seed(seed: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Vectorized-exec scenario — aggregates and joins over fault-recovered state
+// (STL-187).
+// ---------------------------------------------------------------------------
+
+/// One typed row of the vectorized-exec scenario's table: the business key plus
+/// the `(group, value)` cell pair its payload encodes. `None` is a SQL NULL
+/// cell — the payload encodes NULL in-band, so the operators' NULL semantics
+/// (NULL keys group together, a NULL join key matches nothing, aggregates skip
+/// NULL arguments) are exercised over storage-derived data, not hand-built
+/// vectors.
+struct ExecRow {
+    key: String,
+    group: Option<i64>,
+    value: Option<i64>,
+}
+
+/// Encode a `(group, value)` cell pair into the opaque payload the storage
+/// tiers carry — `"{g}|{v}"`, with `n` for a NULL cell.
+fn encode_exec_payload(group: Option<i64>, value: Option<i64>) -> Vec<u8> {
+    let cell = |c: Option<i64>| c.map_or_else(|| "n".to_owned(), |x| x.to_string());
+    format!("{}|{}", cell(group), cell(value)).into_bytes()
+}
+
+/// Decode [`encode_exec_payload`]'s framing back into the typed cell pair.
+fn decode_exec_payload(seed: u64, payload: &[u8]) -> (Option<i64>, Option<i64>) {
+    let text = std::str::from_utf8(payload)
+        .unwrap_or_else(|_| panic!("seed {seed}: exec payload must be UTF-8"));
+    let (g, v) = text
+        .split_once('|')
+        .unwrap_or_else(|| panic!("seed {seed}: exec payload must be `g|v`, got `{text}`"));
+    let cell = |s: &str| {
+        (s != "n").then(|| {
+            s.parse()
+                .unwrap_or_else(|_| panic!("seed {seed}: exec cell must be an i64, got `{s}`"))
+        })
+    };
+    (cell(g), cell(v))
+}
+
+/// Scan the recovered engine at `s`, assert the result equals the reference
+/// oracle truncated at the recovered `cutoff`, and decode it into typed rows.
+///
+/// The returned rows are sorted by business key (the scan map's order) — the
+/// deterministic row order the operator verification builds its expected
+/// outputs in. The scan-vs-oracle equality also ties [`SnapshotScan`] to the
+/// point-lookup path `verify_recovered_prefix` already proved, so the operators
+/// below consume input that is *known* correct — any later divergence is theirs.
+fn exec_rows_at(
+    seed: u64,
+    engine: &Engine<StepClock, FaultDisk>,
+    oracle: &ScanOracle,
+    cutoff: Option<SystemTimeMicros>,
+    s: SystemTimeMicros,
+) -> Vec<ExecRow> {
+    let readers = engine
+        .open_segment_readers()
+        .expect("re-open recovered segments");
+    let out = SnapshotScan::new(engine.delta(), engine.index(), &readers, Snapshot(s))
+        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .execute()
+        .expect("snapshot scan over recovered tiers");
+    let got = scan_map(&out);
+
+    let mut want: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    if let Some(c) = cutoff {
+        for (key, timeline) in oracle {
+            if let Some((_, Some(payload))) = timeline.range(..=s.min(c)).next_back() {
+                want.insert(key.as_bytes().to_vec(), payload.clone());
+            }
+        }
+    }
+    assert_eq!(
+        got, want,
+        "seed {seed}: vectorized scan at {s:?} disagrees with the committed-prefix oracle",
+    );
+
+    got.into_iter()
+        .map(|(key, payload)| {
+            let (group, value) = decode_exec_payload(seed, &payload);
+            ExecRow {
+                key: String::from_utf8(key).expect("business keys are UTF-8"),
+                group,
+                value,
+            }
+        })
+        .collect()
+}
+
+/// The rows as the executor's typed input batch: column 0 the `group` key
+/// (`INT8`), column 1 the `value` argument (`INT8`), column 2 the business key
+/// (`TEXT`) — the join identity.
+fn exec_columns(rows: &[ExecRow]) -> Vec<Vector> {
+    vec![
+        Vector::Int8(rows.iter().map(|r| r.group).collect()),
+        Vector::Int8(rows.iter().map(|r| r.value).collect()),
+        Vector::Text(rows.iter().map(|r| Some(r.key.clone())).collect()),
+    ]
+}
+
+/// Fold a nullable `i64` cell into the digest, presence-tagged so a NULL never
+/// hashes like a zero.
+fn fold_opt_i64(digest: u64, cell: Option<i64>) -> u64 {
+    cell.map_or_else(
+        || fnv1a(digest, &[0]),
+        |v| fnv1a(fnv1a(digest, &[1]), &v.to_le_bytes()),
+    )
+}
+
+/// [`fold_opt_i64`] for `u64` cells (AVG bits, join row indices).
+fn fold_opt_u64(digest: u64, cell: Option<u64>) -> u64 {
+    cell.map_or_else(
+        || fnv1a(digest, &[0]),
+        |v| fnv1a(fnv1a(digest, &[1]), &v.to_le_bytes()),
+    )
+}
+
+/// One group's expected aggregate row: `(COUNT(*), COUNT(v), SUM(v), MIN(v),
+/// MAX(v), AVG(v) as IEEE-754 bits)`.
+type AggRow = (i64, i64, Option<i64>, Option<i64>, Option<i64>, Option<u64>);
+
+/// A group's in-progress scalar reference fold: `(COUNT(v), Σv, MIN(v), MAX(v))`.
+type AggFold = (i64, i128, Option<i64>, Option<i64>);
+
+/// Run [`hash_aggregate`] over the scanned rows — `COUNT(*)`, `COUNT(v)`,
+/// `SUM(v)`, `MIN(v)`, `MAX(v)`, `AVG(v)` grouped by the `group` column — and
+/// assert every group agrees with an independent scalar fold of the same rows.
+/// Returns the digest with the verified aggregate table folded in.
+#[allow(clippy::cast_precision_loss)] // AVG's reference mean is fractional by definition
+fn verify_vectorized_aggregates(seed: u64, rows: &[ExecRow], digest: u64) -> u64 {
+    let columns = exec_columns(rows);
+    let agg = |func: AggregateFunc, arg: Option<Expr>| Aggregator { func, arg };
+    let aggregators = [
+        agg(AggregateFunc::Count, None),
+        agg(AggregateFunc::Count, Some(Expr::col(1))),
+        agg(AggregateFunc::Sum, Some(Expr::col(1))),
+        agg(AggregateFunc::Min, Some(Expr::col(1))),
+        agg(AggregateFunc::Max, Some(Expr::col(1))),
+        agg(AggregateFunc::Avg, Some(Expr::col(1))),
+    ];
+    let out = hash_aggregate(&[Expr::col(0)], &aggregators, &columns, rows.len())
+        .expect("hash_aggregate over scanned rows");
+
+    // Unpack the output columns; a shape mismatch is an operator regression.
+    let [Vector::Int8(g)] = out.groups.as_slice() else {
+        panic!("seed {seed}: GROUP BY an INT8 column must key the output by INT8");
+    };
+    let [
+        Vector::Int8(count_star),
+        Vector::Int8(count_v),
+        Vector::Int8(sum),
+        Vector::Int8(min),
+        Vector::Int8(max),
+        Vector::Float8(avg),
+    ] = out.aggregates.as_slice()
+    else {
+        panic!("seed {seed}: the aggregate output columns have the wrong shape");
+    };
+
+    let mut got: BTreeMap<Option<i64>, AggRow> = BTreeMap::new();
+    for i in 0..out.num_groups {
+        let row = (
+            count_star[i].expect("COUNT(*) is never NULL"),
+            count_v[i].expect("COUNT(v) is never NULL"),
+            sum[i],
+            min[i],
+            max[i],
+            avg[i],
+        );
+        assert!(
+            got.insert(g[i], row).is_none(),
+            "seed {seed}: hash_aggregate emitted group {:?} twice",
+            g[i],
+        );
+    }
+
+    // The independent reference: a scalar fold over the same rows.
+    let mut star: BTreeMap<Option<i64>, i64> = BTreeMap::new();
+    let mut folds: BTreeMap<Option<i64>, AggFold> = BTreeMap::new();
+    for row in rows {
+        *star.entry(row.group).or_insert(0) += 1;
+        let e = folds.entry(row.group).or_insert((0, 0, None, None));
+        if let Some(v) = row.value {
+            e.0 += 1;
+            e.1 += i128::from(v);
+            e.2 = Some(e.2.map_or(v, |m: i64| m.min(v)));
+            e.3 = Some(e.3.map_or(v, |m: i64| m.max(v)));
+        }
+    }
+    let want: BTreeMap<Option<i64>, AggRow> = folds
+        .into_iter()
+        .map(|(group, (n, total, min, max))| {
+            let sum = (n != 0).then(|| i64::try_from(total).ok()).flatten();
+            // The aggregator's documented arithmetic: the exact integer total
+            // converted to f64 once, divided by the non-NULL count.
+            let avg = (n != 0).then(|| (total as f64 / n as f64).to_bits());
+            (group, (star[&group], n, sum, min, max, avg))
+        })
+        .collect();
+
+    assert_eq!(
+        got, want,
+        "seed {seed}: hash_aggregate disagrees with the scalar reference fold",
+    );
+
+    let mut digest = fnv1a(
+        digest,
+        &u64::try_from(out.num_groups)
+            .expect("group count fits u64")
+            .to_le_bytes(),
+    );
+    for (group, row) in &got {
+        digest = fold_opt_i64(digest, *group);
+        digest = fnv1a(digest, &row.0.to_le_bytes());
+        digest = fnv1a(digest, &row.1.to_le_bytes());
+        digest = fold_opt_i64(digest, row.2);
+        digest = fold_opt_i64(digest, row.3);
+        digest = fold_opt_i64(digest, row.4);
+        digest = fold_opt_u64(digest, row.5);
+    }
+    digest
+}
+
+/// Run [`hash_join`] between the live rows (`left`) and an earlier snapshot's
+/// rows (`right`) and assert every emitted index list against an independent
+/// nested-loop reference — `INNER` on the (nullable, fanning-out) `group`
+/// column, then `LEFT` / `SEMI` / `ANTI` on the (per-snapshot-unique) business
+/// key. Returns the digest with the verified indices folded in.
+fn verify_vectorized_joins(seed: u64, left: &[ExecRow], right: &[ExecRow], digest: u64) -> u64 {
+    let lcols = exec_columns(left);
+    let rcols = exec_columns(right);
+    let join = |ty: JoinType, key: usize| {
+        hash_join(
+            ty,
+            &lcols,
+            left.len(),
+            &Expr::col(key),
+            &rcols,
+            right.len(),
+            &Expr::col(key),
+        )
+        .expect("hash_join over scanned rows")
+    };
+
+    // INNER on `group`: every (l, r) pair with equal non-NULL groups, probe
+    // (left) order outermost and build rows ascending within a probe — the
+    // operator's documented deterministic order. A NULL group matches nothing.
+    let inner = join(JoinType::Inner, 0);
+    let mut want_left = Vec::new();
+    let mut want_right = Vec::new();
+    for (l, lrow) in left.iter().enumerate() {
+        if let Some(g) = lrow.group {
+            for (r, rrow) in right.iter().enumerate() {
+                if rrow.group == Some(g) {
+                    want_left.push(l);
+                    want_right.push(Some(r));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        (&inner.left, &inner.right),
+        (&want_left, &want_right),
+        "seed {seed}: INNER join on the group column disagrees with the reference",
+    );
+
+    // LEFT / SEMI / ANTI on the business key: a key is live at most once per
+    // snapshot, so each left row has at most one match and the three outputs
+    // partition the left rows by "key also live at the earlier snapshot".
+    let matched: Vec<(usize, Option<usize>)> = left
+        .iter()
+        .enumerate()
+        .map(|(l, lrow)| (l, right.iter().position(|rrow| rrow.key == lrow.key)))
+        .collect();
+    let left_join = join(JoinType::Left, 2);
+    let (want_l, want_r): (Vec<usize>, Vec<Option<usize>>) = matched.iter().copied().unzip();
+    assert_eq!(
+        (&left_join.left, &left_join.right),
+        (&want_l, &want_r),
+        "seed {seed}: LEFT join on the business key disagrees with the reference",
+    );
+    let semi = join(JoinType::Semi, 2);
+    let want_semi: Vec<usize> = matched
+        .iter()
+        .filter(|(_, r)| r.is_some())
+        .map(|&(l, _)| l)
+        .collect();
+    assert_eq!(
+        semi.left, want_semi,
+        "seed {seed}: SEMI join on the business key disagrees with the reference",
+    );
+    assert!(semi.right.is_empty(), "a SEMI join emits no right side");
+    let anti = join(JoinType::Anti, 2);
+    let want_anti: Vec<usize> = matched
+        .iter()
+        .filter(|(_, r)| r.is_none())
+        .map(|&(l, _)| l)
+        .collect();
+    assert_eq!(
+        anti.left, want_anti,
+        "seed {seed}: ANTI join on the business key disagrees with the reference",
+    );
+    assert!(anti.right.is_empty(), "an ANTI join emits no right side");
+
+    // Fold the verified shapes: the INNER pair list, then the key-join match
+    // vector (which LEFT/SEMI/ANTI all re-derive from).
+    let mut digest = fnv1a(
+        digest,
+        &u64::try_from(inner.left.len())
+            .expect("join size fits u64")
+            .to_le_bytes(),
+    );
+    for (&l, r) in inner.left.iter().zip(&inner.right) {
+        digest = fnv1a(
+            digest,
+            &u64::try_from(l).expect("row fits u64").to_le_bytes(),
+        );
+        if let Some(r) = *r {
+            digest = fnv1a(
+                digest,
+                &u64::try_from(r).expect("row fits u64").to_le_bytes(),
+            );
+        }
+    }
+    for (l, r) in matched {
+        digest = fnv1a(
+            digest,
+            &u64::try_from(l).expect("row fits u64").to_le_bytes(),
+        );
+        digest = fold_opt_u64(digest, r.map(|r| u64::try_from(r).expect("row fits u64")));
+    }
+    digest
+}
+
+/// Apply one seeded op of [`run_vectorized_exec_faults_seed`]'s workload — an
+/// insert/update/delete whose payload carries a typed `(group, value)` row,
+/// either cell sometimes NULL. Committed effects fold into the oracle; returns
+/// `false` on a faulted write — the crash, after which the caller stops.
+#[allow(clippy::too_many_arguments)] // engine + rng + the oracle/live model + the row shape
+fn apply_exec_op(
+    engine: &mut Engine<StepClock, FaultDisk>,
+    rng: &mut Rng,
+    keys: &[BusinessKey],
+    live: &mut [bool],
+    oracle: &mut ScanOracle,
+    committed: &mut Vec<SystemTimeMicros>,
+    group_count: u64,
+    op: u64,
+) -> bool {
+    let k = rng.below_usize(keys.len());
+    let key = keys[k].clone();
+    let txn = TxnId(op);
+    let principal = Principal::new(b"sim".to_vec());
+    let group =
+        (rng.below(6) != 0).then(|| i64::try_from(rng.below(group_count)).expect("group fits i64"));
+    let value = (rng.below(6) != 0).then(|| i64::try_from(op).expect("op fits i64"));
+    let payload = encode_exec_payload(group, value);
+    let want_delete = live[k] && rng.below(4) == 0;
+    let outcome = if live[k] {
+        if want_delete {
+            engine.delete(&key, txn, principal)
+        } else {
+            engine.update(key.clone(), None, Some(payload.clone()), 0, txn, principal)
+        }
+    } else {
+        engine.insert(key.clone(), None, Some(payload.clone()), 0, txn, principal)
+    };
+    outcome.is_ok_and(|o| {
+        let effect = if want_delete { None } else { Some(payload) };
+        oracle.entry(key).or_default().insert(o.commit, effect);
+        committed.push(o.commit);
+        live[k] = !want_delete;
+        true
+    })
+}
+
+/// Drive the **vectorized operators over fault-recovered storage** — the
+/// vectorized-exec DST coverage of [STL-187].
+///
+/// The unit tests pin [`hash_aggregate`] / [`hash_join`] semantics over
+/// hand-built vectors; what no sweep covered is the pipeline the engine
+/// actually runs — typed rows written through a faulty disk, torn by a crash,
+/// recovered, scanned, and only then aggregated and joined. Per seed:
+///
+/// * **Workload phase**: a clean prelude of seeded auto-commit
+///   inserts/updates/deletes whose payloads encode a typed `(group, value)`
+///   row — either cell seeded NULL sometimes, so the NULL semantics travel
+///   end-to-end — then torn-write / full-disk / slow-fsync faults arm and the
+///   writing continues until the first faulted write or mid-flush fault: the
+///   crash. Periodic [`Engine::flush`]es seal segments under a seeded
+///   row-group bound, so the later scan merges delta + sealed tiers across
+///   row-group boundaries.
+/// * **Recovery phase** (faults silenced): [`Engine::recover`] replays the
+///   surviving log — a torn group tail or an orphaned mid-flush segment must
+///   resolve to a consistent committed prefix (`verify_recovered_prefix`).
+///   Read-rot is deliberately not armed during recovery: that dimension
+///   belongs to the recovery sweeps ([`run_engine_recover_faults_seed`] & co.),
+///   and refusing recovery would starve the phase this scenario exists for.
+/// * **Vectorized phase**: [`SnapshotScan`] reads the
+///   recovered tiers at the live snapshot and at a seed-chosen earlier commit
+///   boundary, each asserted equal to the committed-prefix oracle; the typed
+///   rows then drive [`hash_aggregate`] (`COUNT(*)` / `COUNT` / `SUM` / `MIN` /
+///   `MAX` / `AVG` by `group`) and [`hash_join`] (`INNER` on `group`,
+///   `LEFT` / `SEMI` / `ANTI` on the business key — a current-vs-historical
+///   self-join), each asserted against an independent scalar reference fold of
+///   the same rows.
+///
+/// The digest folds the prefix cutoff, the verified aggregate table, the
+/// verified join indices, and the disk's fault-event log. Same seed ⇒ same
+/// digest.
+///
+/// # Panics
+///
+/// Panics if recovery silently diverges from every committed prefix, if a scan
+/// disagrees with the committed-prefix oracle, or if an operator output
+/// disagrees with its scalar reference — correctness regressions, not workload
+/// outcomes.
+#[must_use]
+#[allow(clippy::too_many_lines)] // workload + crash + recovery + operator verification reads as one scenario
+pub fn run_vectorized_exec_faults_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+
+    // Write-path rates match the recovery sweeps. Read-rot is deliberately
+    // NOT armed in this scenario: recovery-under-corruption is the recovery
+    // sweeps' dimension ([`run_engine_recover_faults_seed`] & co.), and with
+    // the many segments this workload seals, even a tiny per-read rate would
+    // refuse recovery on most seeds — starving the vectorized phase, which is
+    // the coverage this scenario exists to add.
+    let mut prof_rng = Rng::new(seed ^ 0xFA17_D15C_0BAD_F00D);
+    let p_torn = prob_permille(&mut prof_rng, 20, 60);
+    let p_full = prob_permille(&mut prof_rng, 10, 30);
+    let p_slow = prob_permille(&mut prof_rng, 200, 500);
+
+    let mut rng = Rng::new(seed);
+
+    let mut oracle: ScanOracle = BTreeMap::new();
+    let mut committed: Vec<SystemTimeMicros> = Vec::new();
+
+    let key_count = 4 + rng.below_usize(6);
+    let keys: Vec<BusinessKey> = (0..key_count)
+        .map(|i| BusinessKey::new(format!("k-{i:04}").into_bytes()))
+        .collect();
+    // A handful of group ids, so groups usually hold several rows (join
+    // fan-out, multi-row aggregates) while several groups coexist.
+    let group_count = 2 + rng.below(3);
+
+    let disk = FaultDisk::new(seed, FaultProfile::none());
+    {
+        let row_group_rows = 1 + rng.below_usize(3);
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1), false)
+            .expect("open engine")
+            .with_flush_row_group_rows(row_group_rows);
+        let mut live = vec![false; key_count];
+
+        // A clean prelude seeds the table before any fault is armed: the
+        // vectorized phase needs rows to chew on, and a crash on the very
+        // first writes would starve it (the recovery sweeps own the
+        // everything-torn shapes). Prelude flushes seal part of it, so the
+        // later scan merges delta + sealed tiers either way.
+        let prelude = 10 + rng.below(12);
+        for op in 0..prelude {
+            assert!(
+                apply_exec_op(
+                    &mut engine,
+                    &mut rng,
+                    &keys,
+                    &mut live,
+                    &mut oracle,
+                    &mut committed,
+                    group_count,
+                    op,
+                ),
+                "seed {seed}: a clean-prelude write cannot fault",
+            );
+            if rng.below(4) == 0 {
+                engine.flush().expect("a clean-prelude flush cannot fault");
+            }
+        }
+
+        // Now arm the write faults and keep writing. The first faulted write
+        // is the crash; so is a mid-flush fault (the orphan-segment case
+        // recovery must survive).
+        disk.enable(FaultKind::TornWrite, p_torn);
+        disk.enable(FaultKind::FullDisk, p_full);
+        disk.enable(FaultKind::SlowSync, p_slow);
+        let ops = 8 + rng.below(16);
+        'workload: for op in 0..ops {
+            if !apply_exec_op(
+                &mut engine,
+                &mut rng,
+                &keys,
+                &mut live,
+                &mut oracle,
+                &mut committed,
+                group_count,
+                prelude + op,
+            ) {
+                break 'workload;
+            }
+            if rng.below(4) == 0 && engine.flush().is_err() {
+                break 'workload;
+            }
+        }
+        // Best-effort graceful-shutdown flush, then drop the engine — the crash.
+        let _ = engine.flush();
+    }
+
+    // Silence the write faults for recovery; reads stay clean (see the
+    // profile note above — read-rot is the recovery sweeps' dimension).
+    disk.disable(FaultKind::TornWrite);
+    disk.disable(FaultKind::FullDisk);
+    disk.disable(FaultKind::SlowSync);
+
+    let recovered = Engine::recover(disk.clone(), StepClock::new(1_000_000), false);
+
+    let mut digest = FNV_OFFSET;
+    match recovered {
+        // Defensive: with clean reads recovery is expected to succeed, but a
+        // refusal is still a sound (detected) outcome, digested as such.
+        Err(_) => digest = fnv1a(digest, &[0xE2]),
+        Ok(engine) => {
+            let (k, _) = verify_recovered_prefix(seed, &engine, &oracle, &committed, &keys);
+            digest = fnv1a(digest, &[0x0C]);
+            digest = fnv1a(
+                digest,
+                &u64::try_from(k).expect("prefix len fits u64").to_le_bytes(),
+            );
+            let cutoff = (k != 0).then(|| committed[k - 1]);
+
+            // The live side: every key's recovered current row, as typed rows.
+            let s_hi = SystemTimeMicros(committed.last().map_or(1, |c| c.0 + 1));
+            let current = exec_rows_at(seed, &engine, &oracle, cutoff, s_hi);
+            digest = verify_vectorized_aggregates(seed, &current, digest);
+
+            // The historical side: a seed-chosen commit boundary, scanned the
+            // same way — the AS-OF self-join's right input.
+            if committed.is_empty() {
+                digest = fnv1a(digest, &[0x00]);
+            } else {
+                let s_lo = committed[rng.below_usize(committed.len())];
+                let history = exec_rows_at(seed, &engine, &oracle, cutoff, s_lo);
+                digest = verify_vectorized_joins(seed, &current, &history, digest);
+            }
+        }
+    }
+
+    for ev in disk.events() {
+        digest = fnv1a(digest, &ev.seq.to_le_bytes());
+        digest = fnv1a(digest, &[fault_op_tag(ev.op), fault_kind_tag(ev.kind)]);
+        digest = fnv1a(digest, &ev.detail.to_le_bytes());
+    }
+    digest
+}
+
+// ---------------------------------------------------------------------------
 // Scenario registry — the surface the CLI drives (STL-110).
 // ---------------------------------------------------------------------------
 
@@ -2811,11 +3602,16 @@ pub fn registry() -> Vec<Box<dyn Scenario>> {
             "group-commit-recover-faults",
             run_group_commit_recover_faults_seed,
         ),
+        FnScenario::fault(
+            "txn-commit-rollback-faults",
+            run_txn_commit_rollback_faults_seed,
+        ),
         FnScenario::fault("wal-fsync-poison", run_wal_fsync_poison_seed),
         FnScenario::boxed(
             "group-commit-abort-rollback",
             run_group_commit_abort_rollback_seed,
         ),
+        FnScenario::fault("vectorized-exec-faults", run_vectorized_exec_faults_seed),
         FnScenario::boxed("schedule", run_schedule_seed_digest),
         FnScenario::fault("fault-disk", run_fault_seed),
     ]
@@ -3115,6 +3911,55 @@ mod tests {
     }
 
     #[test]
+    fn txn_commit_rollback_faults_seed_is_reproducible() {
+        // Each seed also asserts (internally) that a rolled-back transaction's
+        // writes are invisible live and that recovery through the FaultDisk
+        // lands on a consistent committed-transaction prefix or cleanly errors
+        // (STL-187 DoD).
+        for seed in 0..64 {
+            assert_eq!(
+                run_txn_commit_rollback_faults_seed(seed),
+                run_txn_commit_rollback_faults_seed(seed),
+                "seed {seed} must replay to an identical commit/rollback digest"
+            );
+        }
+    }
+
+    #[test]
+    fn txn_commit_rollback_faults_distinct_seeds_diverge() {
+        let digests: std::collections::HashSet<u64> =
+            (0..64).map(run_txn_commit_rollback_faults_seed).collect();
+        assert!(
+            digests.len() > 1,
+            "the commit/rollback fault workload must actually depend on the seed"
+        );
+    }
+
+    #[test]
+    fn vectorized_exec_faults_seed_is_reproducible() {
+        // Each seed also asserts (internally) that the recovered scan matches
+        // the committed-prefix oracle and that hash_aggregate / hash_join over
+        // the scanned rows match an independent scalar reference (STL-187 DoD).
+        for seed in 0..64 {
+            assert_eq!(
+                run_vectorized_exec_faults_seed(seed),
+                run_vectorized_exec_faults_seed(seed),
+                "seed {seed} must replay to an identical vectorized-exec digest"
+            );
+        }
+    }
+
+    #[test]
+    fn vectorized_exec_faults_distinct_seeds_diverge() {
+        let digests: std::collections::HashSet<u64> =
+            (0..64).map(run_vectorized_exec_faults_seed).collect();
+        assert!(
+            digests.len() > 1,
+            "the vectorized-exec fault workload must actually depend on the seed"
+        );
+    }
+
+    #[test]
     fn mvcc_seed_is_reproducible() {
         for seed in 0..64 {
             assert_eq!(
@@ -3273,6 +4118,8 @@ mod tests {
                 "engine-recover-faults",
                 "fault-disk",
                 "group-commit-recover-faults",
+                "txn-commit-rollback-faults",
+                "vectorized-exec-faults",
                 "wal-fsync-poison",
             ],
             "exactly the fault-injected scenarios are fault-gated"
@@ -3309,6 +4156,14 @@ mod tests {
         assert_eq!(
             replayed["group-commit-recover-faults"],
             run_group_commit_recover_faults_seed(seed)
+        );
+        assert_eq!(
+            replayed["txn-commit-rollback-faults"],
+            run_txn_commit_rollback_faults_seed(seed)
+        );
+        assert_eq!(
+            replayed["vectorized-exec-faults"],
+            run_vectorized_exec_faults_seed(seed)
         );
         assert_eq!(
             replayed["wal-fsync-poison"],
