@@ -3665,8 +3665,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// uncommitted (recovery discards whatever legs reached disk); the remaining
     /// tables' buffers are discarded
     /// ([`abort_group`](stele_storage::engine::Engine::abort_group)) so none is left
-    /// buffering. The already-applied in-memory tier state is not rolled back here
-    /// ([STL-216]).
+    /// buffering. The failing leg rolls its own resident writes back in place (a clean
+    /// append failure, [STL-295]); the in-memory state of legs that *already* committed
+    /// a durable (inert) two-phase record before the failure is not rolled back here —
+    /// the cross-table in-memory rollback stays a follow-up ([STL-216]).
     ///
     /// One caveat on a failing leg: if its commit failed *after* the WAL append (a
     /// failed fsync, not a torn write), its staged record's durability is
@@ -9950,6 +9952,22 @@ mod tests {
             .commit(txn)
             .expect_err("the torn group-commit append aborts the commit");
         assert!(matches!(err, EngineError::Storage(_)), "got {err:?}");
+
+        // The *live* session must already match what recovery will reconstruct: the
+        // refused commit's buffered writes are rolled back in memory, so a SELECT on
+        // the still-running engine shows none of them — not the applied-but-undurable
+        // rows a restart would erase ([STL-295]). The append did not poison the WAL, so
+        // the engine stays healthy and serves reads.
+        assert!(
+            !engine.is_poisoned(),
+            "a clean append failure does not poison the session",
+        );
+        assert!(
+            select(&mut engine, "SELECT id FROM account")
+                .rows
+                .is_empty(),
+            "the refused commit leaves no rows live — the buffered writes were rolled back",
+        );
         drop(engine);
 
         let mut engine = recover_session(&disk);
@@ -10860,16 +10878,32 @@ mod tests {
             .execute(&parse_one("UPDATE account SET balance = 0"))
             .expect_err("the torn group-commit append fails the statement");
         assert!(matches!(err, EngineError::Storage(_)), "got {err:?}");
+
+        let unchanged = sorted(vec![
+            vec![i4(1), i4(100)],
+            vec![i4(2), i4(200)],
+            vec![i4(3), i4(300)],
+        ]);
+        // The *live* session matches recovery without a restart: the refused auto-commit
+        // rolled its scan-then-write group back in memory, so a SELECT on the still-
+        // running engine shows the pre-statement rows — not the `balance = 0` rows it
+        // applied but never made durable ([STL-295]). A clean append failure does not
+        // poison the WAL, so the engine keeps serving.
+        assert!(
+            !engine.is_poisoned(),
+            "a clean append failure does not poison the session",
+        );
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT * FROM account").rows),
+            unchanged,
+            "the refused UPDATE left the live table at its pre-statement values",
+        );
         drop(engine);
 
         let mut engine = recover_session(&disk);
         assert_eq!(
             sorted(select(&mut engine, "SELECT * FROM account").rows),
-            sorted(vec![
-                vec![i4(1), i4(100)],
-                vec![i4(2), i4(200)],
-                vec![i4(3), i4(300)],
-            ]),
+            unchanged,
             "none of the statement's writes survive the torn commit"
         );
     }

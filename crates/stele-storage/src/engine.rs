@@ -651,15 +651,18 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     /// # Errors
     ///
     /// [`EngineError::Dml`] if the append or fsync fails. A torn or unwritten append
-    /// recovers to nothing; but if the append succeeds and only the fsync fails the
-    /// staged record's durability is **indeterminate** (a later `tick` could
-    /// otherwise still flush it). That fsync failure now **poisons** the shared WAL
-    /// ([STL-217]): every subsequent write through this engine is refused
-    /// ([`is_poisoned`](Self::is_poisoned)) until the operator restarts into
-    /// [`recover`](Self::recover), so the staged record can never be flushed as a
-    /// clean op — see [`DmlWriter::commit_group`].
+    /// recovers to nothing, so the buffered writes — already applied to this engine's
+    /// delta/index — are rolled back **in place** before the error is surfaced, leaving
+    /// the live engine matching the recovered state ([STL-295]). But if the append
+    /// succeeds and only the fsync fails the staged record's durability is
+    /// **indeterminate** (a later `tick` could otherwise still flush it). That fsync
+    /// failure is *not* a clean abort: the resident writes are left in place, and it
+    /// **poisons** the shared WAL ([STL-217]) — every subsequent write through this
+    /// engine is refused ([`is_poisoned`](Self::is_poisoned)) until the operator
+    /// restarts into [`recover`](Self::recover), so the staged record can never be
+    /// flushed as a clean op — see [`DmlWriter::commit_group`].
     pub fn commit_group(&mut self) -> Result<LogOffset, EngineError> {
-        Ok(self.writer.commit_group()?)
+        Ok(self.writer.commit_group(&mut self.delta, &mut self.index)?)
     }
 
     /// Group-commit the open buffer as **one leg of a multi-table transaction**
@@ -676,7 +679,9 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     ///
     /// As [`commit_group`](Self::commit_group).
     pub fn commit_group_two_phase(&mut self, txn_id: TxnId) -> Result<LogOffset, EngineError> {
-        Ok(self.writer.commit_group_two_phase(txn_id)?)
+        Ok(self
+            .writer
+            .commit_group_two_phase(&mut self.delta, &mut self.index, txn_id)?)
     }
 
     /// Discard the open group buffer without logging it — the transaction aborted
