@@ -90,6 +90,35 @@ jobs:
       - run: cargo nextest run --workspace --exclude stele-exec-oracle --all-features
       - run: cargo test --doc --workspace --exclude stele-exec-oracle --all-features
 
+  # Windows portability gate (STL-160). A dedicated job rather than a `test`
+  # matrix row: Windows is tier-3 best-effort (docs/04-cicd.md), and the
+  # storage backend is the only place platform file semantics actually diverge
+  # (`O_APPEND`+`pread` vs `FILE_APPEND_DATA`+`seek_read`) — so this compiles
+  # the whole workspace (tests included) and runs the storage suite, without
+  # putting the full test gate's runtime on the slowest hosted runner.
+  # GitHub-hosted: the self-hosted ARC pool is Linux-only (same reasoning as
+  # release.yml's matrix).
+  windows:
+    name: windows (build + storage tests)
+    needs: quick
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (no semver tags)
+        with:
+          toolchain: "1.89.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10
+        with:
+          tool: nextest
+      # `--all-targets` proves every test/bench target compiles on Windows, not
+      # just the shipped binaries; `stele-exec-oracle` is excluded for the same
+      # reason as everywhere else (bundled DuckDB amalgamation, STL-158).
+      - run: cargo build --workspace --exclude stele-exec-oracle --all-targets --all-features --locked
+      # The platform-divergent surface: the backend conformance suite pins the
+      # append-cursor invariant (positioned reads never move it) on NTFS.
+      - run: cargo nextest run -p stele-storage --all-features
+
   msrv:
     name: msrv (1.89.0)
     needs: quick
