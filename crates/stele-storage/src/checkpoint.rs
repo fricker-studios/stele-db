@@ -160,6 +160,14 @@ fn decode_legacy(buf: &[u8; LEGACY_RECORD_LEN]) -> Option<RecoveryPoint> {
         return None;
     }
     let segment_count = u64::from_le_bytes(buf[36..44].try_into().expect("8 bytes"));
+    // Same plausibility bound the STMF path applies before allocating: a crafted
+    // (CRC-matching) or corrupt count must not drive an unbounded `(0..count)`
+    // expansion at startup. A count this large is far beyond any real
+    // never-compacted table ([ADR-0030] cost note), so reject the record and
+    // fall back to the prior good one — never replay from an OOM.
+    if segment_count > u64::from(MAX_LIVE_SEGMENTS) {
+        return None;
+    }
     Some(RecoveryPoint {
         replay_floor: get_offset(buf, 4),
         durable_fence: get_offset(buf, 20),
@@ -497,6 +505,28 @@ mod tests {
         file.append(&bad).expect("append corrupt");
         file.sync().expect("sync");
         assert_eq!(load(&disk).expect("load"), Some(good));
+    }
+
+    #[test]
+    fn an_implausible_legacy_segment_count_is_rejected_before_allocating() {
+        // A crafted/corrupt **legacy** STCK record whose huge `segment_count`
+        // carries a *matching* CRC must still be rejected by the same
+        // plausibility bound the STMF path uses — never expanded into an
+        // OOM-sized `(0..count)` live list at startup.
+        let disk = MemDisk::new();
+        let good = point(offset(1, 1), offset(1, 1), &[0]);
+        store(&disk, &good).expect("store");
+        // A CRC-valid legacy record (encode_legacy fixes the CRC) with an
+        // implausible count — the attacker-controlled-bytes case.
+        let bad = encode_legacy(offset(2, 2), offset(2, 2), u64::from(MAX_LIVE_SEGMENTS) + 1);
+        let mut file = disk.open(CHECKPOINT_FILENAME).expect("open");
+        file.append(&bad).expect("append corrupt");
+        file.sync().expect("sync");
+        assert_eq!(
+            load(&disk).expect("load"),
+            Some(good),
+            "the implausible legacy record is rejected, not expanded",
+        );
     }
 
     #[test]
