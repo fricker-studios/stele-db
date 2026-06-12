@@ -4766,15 +4766,41 @@ fn filter_rows(
     }
 }
 
+/// The batch-column positions an [`Expr`] reads, collected by descending the whole
+/// tree ([`Expr::Column`] leaves) — the columns [`rows_passing_filter`] must decode.
+fn collect_expr_columns(expr: &Expr, out: &mut BTreeSet<usize>) {
+    match expr {
+        Expr::Column(index) => {
+            out.insert(*index);
+        }
+        Expr::Literal(_) => {}
+        Expr::Not(inner) | Expr::IsNull(inner) => collect_expr_columns(inner, out),
+        Expr::Compare { left, right, .. }
+        | Expr::Logic { left, right, .. }
+        | Expr::Arith { left, right, .. }
+        | Expr::Period { left, right, .. } => {
+            collect_expr_columns(left, out);
+            collect_expr_columns(right, out);
+        }
+        Expr::MakePeriod { from, to } => {
+            collect_expr_columns(from, out);
+            collect_expr_columns(to, out);
+        }
+    }
+}
+
 /// Evaluate a vectorized `WHERE` predicate over already-materialized rows, keeping
 /// the rows it reports TRUE ([STL-213]).
 ///
 /// Bridges the row-major encoded cells into one typed column [`Vector`] per schema
 /// position — the same form the streaming [`Filter`] decodes from a batch — then
-/// runs the predicate through [`eval_expr`]. The overlay row set is a transaction's
-/// own buffered writes (small), so decoding every column is cheap and keeps the
-/// semantics identical to the committed-only `Filter`: a `FALSE` *or* `NULL` row is
-/// dropped (only a `TRUE` keeps a row).
+/// runs the predicate through [`eval_expr`]. Only the columns the predicate
+/// **references** are decoded; the rest stay empty placeholders the evaluator never
+/// reads (the [`run_aggregate`] discipline), so this stays cheap when used over a
+/// large materialized set — a provenance read of a wide table ([STL-247]) decodes
+/// just its predicate's columns, not every column of every row. The semantics match
+/// the committed-only `Filter`: a `FALSE` *or* `NULL` row is dropped (only a `TRUE`
+/// keeps a row).
 fn rows_passing_filter(
     predicate: &Expr,
     schema_columns: &[(String, LogicalType)],
@@ -4784,16 +4810,22 @@ fn rows_passing_filter(
     if row_count == 0 {
         return Ok(rows);
     }
-    let mut columns: Vec<Vector> = Vec::with_capacity(schema_columns.len());
-    for (position, (_, ty)) in schema_columns.iter().enumerate() {
+    let mut referenced = BTreeSet::new();
+    collect_expr_columns(predicate, &mut referenced);
+    let mut columns: Vec<Vector> = (0..schema_columns.len())
+        .map(|_| Vector::Bool(Vec::new()))
+        .collect();
+    for position in referenced {
+        let Some((_, ty)) = schema_columns.get(position) else {
+            continue;
+        };
         let cells: Vec<Option<Vec<u8>>> = rows
             .iter()
             .map(|row| row.get(position).cloned().flatten())
             .collect();
         let column = Column::Bytes(cells.into());
-        let vector = Vector::from_column(*ty, &column)
+        columns[position] = Vector::from_column(*ty, &column)
             .map_err(|err| EngineError::Scan(ScanError::Eval(err)))?;
-        columns.push(vector);
     }
     let mask = match eval_expr(predicate, &columns, row_count)
         .map_err(|err| EngineError::Scan(ScanError::Eval(err)))?

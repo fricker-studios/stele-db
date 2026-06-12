@@ -126,6 +126,12 @@ async fn tokio_postgres_reads_provenance_pseudo_columns() {
         "SELECT * surfaces only the user columns",
     );
 
+    // Dropping the client closes the connection; the driver task must then finish
+    // cleanly — a late protocol error or panic surfaces here rather than passing
+    // silently.
     drop(client);
-    let _ = driver.await;
+    driver
+        .await
+        .expect("pgwire driver task did not panic")
+        .expect("pgwire connection closed cleanly");
 }
