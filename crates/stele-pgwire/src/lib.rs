@@ -4045,6 +4045,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_row_insert_over_the_wire_writes_all_rows() {
+        // STL-228: a multi-row INSERT replies `INSERT 0 N` and commits every row,
+        // both auto-committed and inside an explicit BEGIN … COMMIT block.
+        let (server, mut client) = connect_past_handshake().await;
+        run_simple(&mut client, CREATE_ACCOUNT).await;
+
+        // Auto-commit: three rows in one statement → `INSERT 0 3`.
+        let inserted = run_simple(
+            &mut client,
+            "INSERT INTO account VALUES (1, 100), (2, 200), (3, 300)",
+        )
+        .await;
+        assert_eq!(
+            inserted.len(),
+            1,
+            "DML emits only CommandComplete: {inserted:?}"
+        );
+        assert_eq!(command_tag(&inserted[0].1), "INSERT 0 3");
+
+        let after = run_simple(&mut client, "SELECT id FROM account").await;
+        let count = after.iter().filter(|(k, _)| *k == MSG_DATA_ROW).count();
+        assert_eq!(count, 3, "all three auto-committed rows are readable");
+
+        // Inside a transaction: two more rows in one statement, committed as a
+        // group — the tag still reports the row count.
+        run_simple(&mut client, "BEGIN").await;
+        let staged = run_simple(&mut client, "INSERT INTO account VALUES (4, 400), (5, 500)").await;
+        assert_eq!(command_tag(&staged[0].1), "INSERT 0 2");
+        run_simple(&mut client, "COMMIT").await;
+
+        let all = run_simple(&mut client, "SELECT id FROM account").await;
+        let count = all.iter().filter(|(k, _)| *k == MSG_DATA_ROW).count();
+        assert_eq!(count, 5, "the committed group adds both rows");
+
+        terminate(server, client).await;
+    }
+
+    #[tokio::test]
     async fn update_and_delete_tag_their_row_counts() {
         let (server, mut client) = connect_past_handshake().await;
         run_simple(&mut client, CREATE_ACCOUNT).await;

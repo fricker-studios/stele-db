@@ -81,7 +81,7 @@ pub use ast::{
 };
 pub use ddl::{BindError, DdlOutcome, DdlStatement, bind_ddl};
 pub use dialect::SteleDialect;
-pub use dml::{BoundDml, DmlError, bind_dml};
+pub use dml::{BoundDml, DmlError, InsertRow, bind_dml};
 pub use error::ParseError;
 pub use merge::{BoundMerge, MergeSource, MergeValue};
 pub use parser::parse;
