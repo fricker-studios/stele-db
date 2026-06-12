@@ -8,7 +8,7 @@
 //! subset of that into a typed [`DdlStatement`] whose
 //! [`apply`](DdlStatement::apply) effects the change against a [`Catalog`].
 //!
-//! ## What v0.1 binds
+//! ## What binds
 //!
 //! * `CREATE TABLE <name> (<cols>) WITH SYSTEM VERSIONING [, VALID TIME (f, t)]`
 //!   — every table is system-versioned (invariant 4), so `WITH SYSTEM
@@ -34,7 +34,10 @@
 //! (uniqueness/indexing is a later ticket) so the identity-demo
 //! `CREATE TABLE account (id INT PRIMARY KEY, balance INT) …` binds. On the
 //! index side: `UNIQUE`, `USING <kind>`, multi-column, expression, and partial
-//! (`WHERE`) indexes are rejected until their sibling tickets land.
+//! (`WHERE`) indexes are rejected until their sibling tickets land — as are
+//! `CONCURRENTLY`, `IF NOT EXISTS`, `INCLUDE`, `NULLS [NOT] DISTINCT`,
+//! `WITH (…)`, per-column `ASC`/`DESC`/`NULLS` ordering and operator classes,
+//! an unnamed `CREATE INDEX`, and `DROP INDEX … CASCADE` / multi-index drops.
 //!
 //! [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
 

@@ -2024,14 +2024,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         }
         let (position, literal) = bound.filter.as_ref()?.column_equality()?;
         let (column, _) = schema_columns.get(position)?;
-        let def = self
+        // Any live index on this column whose floor admits the read snapshot
+        // can serve. Floors differ when indexes were created or rebuilt at
+        // different instants, so the first (name-ordered) match must not veto
+        // the probe for a usable sibling.
+        let state = self
             .catalog
             .indexes_on(table)
-            .find(|def| matches!(def.columns(), [c] if c == column))?;
-        let state = self.index_states.get(def.name())?;
-        if bound.snapshot < state.floor {
-            return None;
-        }
+            .filter(|def| matches!(def.columns(), [c] if c == column))
+            .filter_map(|def| self.index_states.get(def.name()))
+            .find(|state| bound.snapshot >= state.floor)?;
         self.index_probes.set(self.index_probes.get() + 1);
         // The binder folded the literal to the column's type, so its canonical
         // encoding is exactly what the maintenance hook noted.
@@ -8697,6 +8699,49 @@ mod tests {
             vec![int_row(1)]
         );
         assert_eq!(engine.index_probe_count(), 2);
+    }
+
+    #[test]
+    fn a_usable_same_column_sibling_serves_when_a_newer_index_cannot() {
+        // Two live indexes on one column with different floors: the read
+        // snapshot predates the (name-earlier) newer index's floor, so the
+        // older sibling must serve the probe rather than the first name-order
+        // match vetoing it.
+        let clock = SteppedClock::new(1_000_000_000);
+        let mut engine = SessionEngine::open(MemDisk::new(), clock.clone());
+        run_sql(&mut engine, CREATE);
+        clock.set(1_010_000_000);
+        run_sql(
+            &mut engine,
+            "INSERT INTO account (id, balance) VALUES (1, 100)",
+        );
+        clock.set(1_020_000_000);
+        run_sql(&mut engine, "CREATE INDEX z_old ON account (balance)");
+        // A snapshot between the two creations…
+        clock.set(1_030_000_000);
+        run_sql(
+            &mut engine,
+            "INSERT INTO account (id, balance) VALUES (2, 200)",
+        );
+        let between = engine.commit_clock().0;
+        // …then a second index on the same column, named *before* the first.
+        clock.set(1_040_000_000);
+        run_sql(&mut engine, "CREATE INDEX a_new ON account (balance)");
+
+        assert_eq!(
+            query_rows(
+                &mut engine,
+                &format!(
+                    "SELECT id FROM account FOR SYSTEM_TIME AS OF {between} WHERE balance = 100"
+                )
+            ),
+            vec![int_row(1)]
+        );
+        assert_eq!(
+            engine.index_probe_count(),
+            1,
+            "the older same-column index serves the pre-floor-of-the-newer read"
+        );
     }
 
     #[test]

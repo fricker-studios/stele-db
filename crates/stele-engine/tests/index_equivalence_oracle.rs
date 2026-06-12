@@ -18,8 +18,9 @@
 //!
 //! The probe-count assertion proves the indexed engine actually served reads
 //! through the index (a silently-never-usable index would pass equivalence
-//! vacuously), and the [teeth test](#) proves the differential catches a
-//! reference that drops the `WHERE`.
+//! vacuously), and the teeth test
+//! (`the_oracle_catches_a_reference_that_ignores_the_where`) proves the
+//! differential catches a reference that drops the `WHERE`.
 //!
 //! Sibling index tickets ([STL-237] B-tree ranges, [STL-238] hash/bloom,
 //! [STL-241] valid-time) wire in here: add their `CREATE INDEX` forms to
