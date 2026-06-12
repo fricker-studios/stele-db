@@ -344,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn garbage_request_line_is_404_not_a_panic() {
+    fn garbage_request_line_is_refused_not_a_panic() {
         let state = OpsState::new();
         assert_eq!(respond("", &state).status, "405 Method Not Allowed");
         assert_eq!(respond("GET\r\n\r\n", &state).status, "404 Not Found");

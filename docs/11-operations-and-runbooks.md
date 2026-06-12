@@ -52,7 +52,7 @@ discipline as a SQL surface change ([ADR-0014](adr/0014-release-channels-and-ver
 |---|---|---|
 | `stele_connections_active` | gauge | Open pg-wire connections. |
 | `stele_connections_total` | counter | Connections ever accepted. |
-| `stele_statements_total{kind}` | counter | Completed statements; `kind` ∈ `select` `insert` `update` `delete` `ddl` `admin`. |
+| `stele_statements_total{kind}` | counter | Successfully executed statements; `kind` ∈ `select` `insert` `update` `delete` `ddl` `admin`. Errored statements are **not** counted here — they land in `stele_statement_errors_total`, so total attempted throughput is the sum of both. |
 | `stele_statement_seconds{kind}` | histogram | Statement latency; `kind` ∈ `select` `dml` `ddl`. |
 | `stele_statement_errors_total` | counter | Statements that returned an error. |
 | `stele_rows_returned_total` | counter | Rows returned by `SELECT`s. |

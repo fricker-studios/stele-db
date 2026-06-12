@@ -227,8 +227,10 @@ pub struct Metrics {
     /// Currently open pg-wire connections.
     pub connections_active: Gauge,
 
-    /// Completed statements by kind (`select` / `insert` / `update` /
-    /// `delete` / `ddl` / `admin`); indexed by [`StatementKind::idx`].
+    /// Successfully executed statements by kind (`select` / `insert` /
+    /// `update` / `delete` / `ddl` / `admin`); indexed by
+    /// [`StatementKind::idx`]. Errored statements count in
+    /// [`statement_errors`](Self::statement_errors) instead.
     statements: [Counter; 6],
     /// Statement latency by coarse kind (`select` / `dml` / `ddl`); indexed
     /// by [`StatementKind::latency_idx`].
@@ -328,7 +330,7 @@ impl Metrics {
         header(
             &mut out,
             "stele_statements_total",
-            "Completed statements by kind.",
+            "Successfully executed statements by kind (errors count in stele_statement_errors_total).",
             "counter",
         );
         for kind in StatementKind::ALL {
