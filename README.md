@@ -1,5 +1,12 @@
 # Stele
 
+[![ci](https://github.com/fricker-studios/stele-db/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/fricker-studios/stele-db/actions/workflows/ci.yml)
+[![nightly](https://github.com/fricker-studios/stele-db/actions/workflows/nightly.yml/badge.svg?branch=main)](https://github.com/fricker-studios/stele-db/actions/workflows/nightly.yml)
+[![release](https://img.shields.io/github/v/release/fricker-studios/stele-db?include_prereleases&label=release)](https://github.com/fricker-studios/stele-db/releases)
+[![docker hub](https://img.shields.io/docker/v/frickerstudios/stele/latest?logo=docker&label=docker%20hub)](https://hub.docker.com/r/frickerstudios/stele)
+[![MSRV](https://img.shields.io/badge/MSRV-1.89-orange?logo=rust)](rust-toolchain.toml)
+[![license](https://img.shields.io/badge/license-BSL%201.1-blue)](docs/07-licensing-and-oss.md)
+
 **A from-scratch, append-only, bitemporal, audit-native analytical database engine.**
 
 > A *stele* is an inscribed stone slab that preserves a record permanently — and, in botany, the central column of a plant. Both meanings are the design: **a permanent, append-only record built around a columnar core.**
