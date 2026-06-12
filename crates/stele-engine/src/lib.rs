@@ -73,8 +73,8 @@ use stele_common::types::{LogicalType, ScalarValue};
 use stele_exec::{
     AggregateFunc as ExecAggregateFunc, Aggregator, ArithOp as ExecArithOp, Batch, CmpOp, Column,
     DEFAULT_BATCH_SIZE, ExplodePayload, Expr, ExprError, Filter, GatheredColumns,
-    JoinType as ExecJoinType, Operator, ScanError, ScanSource, SnapshotScan, SortKey, Vector,
-    distinct_selection, eval_expr, evaluate, hash_aggregate, hash_join, limit_selection,
+    JoinType as ExecJoinType, LogicOp, Operator, ScanError, ScanSource, SnapshotScan, SortKey,
+    Vector, distinct_selection, eval_expr, evaluate, hash_aggregate, hash_join, limit_selection,
     sort_selection,
 };
 use stele_sql::Password;
@@ -84,7 +84,7 @@ use stele_sql::merge::{BoundMerge, MergeSource, MergeValue};
 use stele_sql::select::{
     AggregateFunc, ArithOp, BoundAggregate, BoundJoin, BoundPeriod, BoundPeriodPredicate,
     BoundPredicate, BoundScalar, BoundSelect, CompareOp, JoinColumnRef, JoinType, OutputItem,
-    PeriodEndpoint, Projection, SelectError, SortTarget,
+    PeriodEndpoint, Projection, SelectError, SortTarget, SubqueryKind,
 };
 use stele_sql::{
     AdminCommand, BindContext, BindError, Statement, StatementBody, TimeDimension, bind_ddl,
@@ -757,6 +757,16 @@ pub enum EngineError {
     /// [STL-230]: https://allegromusic.atlassian.net/browse/STL-230
     #[error("a MERGE source row could not be decoded while expanding the plan")]
     MalformedMergeSource,
+
+    /// A scalar subquery used as a comparison operand returned **more than one
+    /// row** ([STL-234]). A scalar subquery must yield at most one value; this is
+    /// the standard's cardinality violation (SQLSTATE `21000`), raised before the
+    /// outer filter runs so the whole statement fails deterministically rather
+    /// than picking an arbitrary row's value.
+    ///
+    /// [STL-234]: https://allegromusic.atlassian.net/browse/STL-234
+    #[error("more than one row returned by a subquery used as an expression")]
+    ScalarSubqueryCardinality,
 }
 
 /// One table's live state inside a session.
@@ -2157,6 +2167,17 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             Some((idx(spec.from_column())?, idx(spec.to_column())?))
         });
 
+        // Resolve the `WHERE` to a concrete row filter. For a plain or period
+        // `WHERE` this is the syntactic [`filter_plan`]; for an uncorrelated
+        // subquery `WHERE` ([STL-234]) it runs the inner query **once** at this
+        // plan's snapshot and folds the result into the same [`FilterPlan`] shape
+        // (a literal comparison, an equality-`OR` set test, or a constant
+        // keep-all/keep-none) — so the scan and overlay paths below see one
+        // resolved plan, identical to a non-subquery `WHERE`. The inner read sees
+        // the outer's overlay too, so an in-transaction subquery is consistent
+        // with read-your-own-writes ([STL-203]).
+        let plan = self.resolve_filter(bound, overlay)?;
+
         // Reconstruct the full rows [key, value cells…] live at the snapshot, after
         // the `WHERE` filter. Read-your-own-writes ([STL-203], [STL-223]): when this
         // read sits inside a transaction that has buffered writes for this table,
@@ -2173,6 +2194,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 value_count,
                 overlay,
                 valid_cols,
+                &plan,
                 &self.metrics,
             )?
         } else {
@@ -2192,6 +2214,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     &schema_columns,
                     value_count,
                     Some(&(low, high)),
+                    &plan,
                     &self.metrics,
                 )?,
                 None => Self::scan_rows(
@@ -2200,6 +2223,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     &schema_columns,
                     value_count,
                     None,
+                    &plan,
                     &self.metrics,
                 )?,
             }
@@ -2233,6 +2257,56 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         }))
     }
 
+    /// Resolve a bound `SELECT`'s `WHERE` to a concrete [`FilterPlan`].
+    ///
+    /// A plain or period `WHERE` (no subquery) is the syntactic [`filter_plan`]
+    /// unchanged. An **uncorrelated subquery** `WHERE` ([STL-234]) runs its inner
+    /// query **once** — at *this* plan's snapshot and over the same `overlay`, so
+    /// it reads the outer's `(sys, valid)` state and any in-transaction buffered
+    /// writes ([read-your-own-writes](SessionEngine::run_select), docs/16 §6) —
+    /// and folds the materialized result into the same `FilterPlan` the plain
+    /// path produces:
+    ///
+    /// * a **scalar** subquery becomes `<column> <op> <literal>` (or
+    ///   [`Empty`](FilterPlan::Empty) when it yields `NULL` / no row; SQLSTATE
+    ///   `21000` when it yields more than one row);
+    /// * an **`IN`** subquery becomes an equality-`OR` set test (three-valued —
+    ///   see [`in_subquery_plan`]);
+    /// * an **`EXISTS`** subquery becomes a constant
+    ///   [`KeepAll`](FilterPlan::KeepAll) / [`Empty`](FilterPlan::Empty), since
+    ///   the test is one value for the whole scan.
+    fn resolve_filter(
+        &self,
+        bound: &BoundSelect,
+        overlay: &[BoundDml],
+    ) -> Result<FilterPlan, EngineError> {
+        let Some(sub) = &bound.subquery_filter else {
+            return Ok(filter_plan(bound));
+        };
+        // The inner is itself a bound `SELECT`, so it always returns rows.
+        let StatementOutcome::Rows(result) = self.run_select(&sub.subquery, overlay)? else {
+            return Err(EngineError::Unsupported("a subquery must be a SELECT"));
+        };
+        match sub.kind {
+            SubqueryKind::Scalar {
+                column,
+                op,
+                subquery_left,
+            } => scalar_subquery_plan(&result, column, op, subquery_left),
+            SubqueryKind::In { column, negated } => in_subquery_plan(&result, column, negated),
+            SubqueryKind::Exists { negated } => {
+                let exists = !result.rows.is_empty();
+                // EXISTS keeps every row when the inner has any; NOT EXISTS keeps
+                // them when it has none.
+                Ok(if exists ^ negated {
+                    FilterPlan::KeepAll
+                } else {
+                    FilterPlan::Empty
+                })
+            }
+        }
+    }
+
     /// Resolve a bound `SELECT`'s rows through the vectorized operator pipeline
     /// ([STL-206], ADR-0027): the scan source emits `(business_key, payload)`
     /// batches, [`ExplodePayload`] slices the packed payload into first-class typed
@@ -2254,18 +2328,20 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         schema_columns: &[(String, LogicalType)],
         value_count: usize,
         key_window: Option<&(BusinessKey, BusinessKey)>,
+        plan: &FilterPlan,
         metrics: &SharedMetrics,
     ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
-        // Resolve the `WHERE` to a single vectorized predicate ([STL-213]): a
-        // `<col> <cmp> <scalar>` comparison ([STL-151]) or a per-row period
+        // The `WHERE` resolves to a single vectorized predicate ([STL-213]): a
+        // `<col> <cmp> <scalar>` comparison ([STL-151]), a per-row period
         // predicate lowered to `Expr::Period` over `MakePeriod` operands
-        // ([STL-193]). A fully-constant period predicate ([STL-165]) folds to a
-        // truth value instead — a `false` excludes every row, so skip the scan
-        // entirely (never a silently-unfiltered read).
-        let filter_expr = match filter_plan(bound) {
+        // ([STL-193]), or an uncorrelated subquery folded to its constant filter
+        // ([STL-234]). A fully-constant predicate folds to a truth value instead —
+        // an `Empty` plan excludes every row, so skip the scan entirely (never a
+        // silently-unfiltered read).
+        let filter_expr = match plan {
             FilterPlan::Empty => return Ok(Vec::new()),
             FilterPlan::KeepAll => None,
-            FilterPlan::Predicate(expr) => Some(expr),
+            FilterPlan::Predicate(expr) => Some(expr.clone()),
         };
 
         // Push a business-key constraint down to the scan for zone-map pruning:
@@ -2436,6 +2512,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         value_count: usize,
         overlay: &[BoundDml],
         valid_cols: Option<(usize, usize)>,
+        plan: &FilterPlan,
         metrics: &SharedMetrics,
     ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
         let base = Self::scan_all_rows(state, bound.snapshot, value_count, metrics)?;
@@ -2452,7 +2529,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             }
             None => overlaid,
         };
-        filter_rows(bound, schema_columns, pinned)
+        filter_rows(plan, schema_columns, pinned)
     }
 
     /// Run a bound two-table `JOIN` ([STL-172]).
@@ -2869,6 +2946,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             projection: Projection::Columns(vec![key_col.name().to_owned()]),
             filter,
             period_filter: None,
+            subquery_filter: None,
             aggregate: None,
             join: None,
             // DML row selection takes no result shaping — every match writes.
@@ -2993,6 +3071,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             projection: Projection::Columns(vec![key_name.clone()]),
             filter: None,
             period_filter: None,
+            subquery_filter: None,
             aggregate: None,
             join: None,
             distinct: false,
@@ -3113,6 +3192,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     ),
                     filter: None,
                     period_filter: None,
+                    subquery_filter: None,
                     aggregate: None,
                     join: None,
                     distinct: false,
@@ -4245,18 +4325,31 @@ fn const_period_interval(operand: &BoundPeriod) -> Option<Interval> {
 /// Both the committed-only fused scan ([`scan_rows`](SessionEngine::scan_rows)) and
 /// the read-your-own-writes overlay ([`filter_rows`]) read the same plan, so a
 /// `WHERE` filters identically whether or not the transaction has buffered writes.
+///
+/// Resolved once per read ([`resolve_filter`](SessionEngine::resolve_filter)) and
+/// shared by both paths, so it is `Clone` (the scan moves the predicate into the
+/// streaming [`Filter`], the overlay borrows it).
+#[derive(Clone)]
 enum FilterPlan {
     /// No predicate — keep every row.
     KeepAll,
-    /// A fully-constant period predicate ([STL-165]) that folds false — keep none.
+    /// A constant predicate that folds false — keep no row. A fully-constant
+    /// period predicate ([STL-165]), an empty / NULL-only `IN` set, a `NOT
+    /// EXISTS` over a non-empty inner, or a scalar subquery that resolved to
+    /// `NULL` ([STL-234]).
     Empty,
     /// A vectorized predicate to evaluate per row: a `<col> <cmp> <scalar>`
-    /// comparison ([STL-151], [STL-213]) or a per-row period predicate lowered to
-    /// `Expr::Period` ([STL-193], [STL-213]).
+    /// comparison ([STL-151], [STL-213]), a per-row period predicate lowered to
+    /// `Expr::Period` ([STL-193], [STL-213]), or an uncorrelated subquery folded
+    /// to a literal comparison or equality-`OR` set test ([STL-234]).
     Predicate(Expr),
 }
 
 /// Resolve a bound `SELECT`'s mutually-exclusive `WHERE` shapes to a [`FilterPlan`].
+///
+/// The subquery shape ([`BoundSelect::subquery_filter`]) is resolved separately
+/// ([`resolve_filter`](SessionEngine::resolve_filter)), since folding it requires
+/// running the inner query — this is the snapshot-pure plain/period part.
 fn filter_plan(bound: &BoundSelect) -> FilterPlan {
     if let Some(predicate) = &bound.filter {
         return FilterPlan::Predicate(lower_predicate(predicate));
@@ -4271,6 +4364,99 @@ fn filter_plan(bound: &BoundSelect) -> FilterPlan {
                 None => FilterPlan::Predicate(lower_period_predicate(period)),
             }
         })
+}
+
+/// Decode an uncorrelated subquery's single output column into typed, nullable
+/// scalar values ([STL-234]).
+///
+/// Reuses the streaming `Filter`'s decode ([`Vector::from_column`]) rather than a
+/// second decode path, so a malformed inner cell surfaces the identical
+/// [`ScanError::Eval`]. The binder proved the inner returns exactly one column
+/// ([`check_subquery_column_type`](stele_sql::select)), so column `0` is read.
+fn subquery_column_values(result: &SelectResult) -> Result<Vec<Option<ScalarValue>>, EngineError> {
+    let ty = result.columns[0].1;
+    let cells: Vec<Option<Vec<u8>>> = result
+        .rows
+        .iter()
+        .map(|row| row.first().cloned().flatten())
+        .collect();
+    let n = cells.len();
+    let column = Column::Bytes(cells.into());
+    let vector =
+        Vector::from_column(ty, &column).map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
+    Ok((0..n).map(|i| vector.get(i)).collect())
+}
+
+/// Fold a scalar subquery's result into a comparison [`FilterPlan`] ([STL-234]).
+///
+/// No row — or a single `NULL` — makes the scalar unknown, so the comparison is
+/// unknown for every row and nothing passes ([`Empty`](FilterPlan::Empty)). One
+/// concrete value folds to `<column> <op> <literal>` (the operand order is
+/// preserved for a non-commutative `op` via `subquery_left`). More than one row
+/// is the standard's cardinality violation ([`ScalarSubqueryCardinality`], `21000`).
+fn scalar_subquery_plan(
+    result: &SelectResult,
+    column: usize,
+    op: CompareOp,
+    subquery_left: bool,
+) -> Result<FilterPlan, EngineError> {
+    let values = subquery_column_values(result)?;
+    match values.as_slice() {
+        [] | [None] => Ok(FilterPlan::Empty),
+        [Some(value)] => {
+            let cmp = lower_compare_op(op);
+            let col = Expr::col(column);
+            let lit = Expr::lit(value.clone());
+            // `subquery_left` keeps `(SELECT …) < col` from lowering as `col < …`.
+            let expr = if subquery_left {
+                lit.compare(cmp, col)
+            } else {
+                col.compare(cmp, lit)
+            };
+            Ok(FilterPlan::Predicate(expr))
+        }
+        _ => Err(EngineError::ScalarSubqueryCardinality),
+    }
+}
+
+/// Fold an `IN` / `NOT IN` subquery's result into a [`FilterPlan`] ([STL-234]),
+/// with SQL three-valued semantics for the `WHERE` context (only a `TRUE` row is
+/// kept).
+///
+/// `IN` is `col = m1 OR col = m2 OR …` over the **non-NULL** members: a NULL
+/// member (or a NULL `col`) can never make the predicate `TRUE`, so dropping NULL
+/// members is exact, and an empty / all-NULL set keeps no row. `NOT IN` is `col
+/// <> m1 AND col <> m2 AND …`, but a NULL **anywhere** in the set makes the
+/// predicate unknown for every row — the classic trap — so it keeps no row; an
+/// empty set keeps every row.
+fn in_subquery_plan(
+    result: &SelectResult,
+    column: usize,
+    negated: bool,
+) -> Result<FilterPlan, EngineError> {
+    let values = subquery_column_values(result)?;
+    if negated {
+        if values.iter().any(Option::is_none) {
+            return Ok(FilterPlan::Empty);
+        }
+        let plan = values.into_iter().flatten().fold(None::<Expr>, |acc, v| {
+            let term = Expr::col(column).compare(CmpOp::Ne, Expr::lit(v));
+            Some(match acc {
+                Some(e) => e.logic(LogicOp::And, term),
+                None => term,
+            })
+        });
+        Ok(plan.map_or(FilterPlan::KeepAll, FilterPlan::Predicate))
+    } else {
+        let plan = values.into_iter().flatten().fold(None::<Expr>, |acc, v| {
+            let term = Expr::col(column).compare(CmpOp::Eq, Expr::lit(v));
+            Some(match acc {
+                Some(e) => e.logic(LogicOp::Or, term),
+                None => term,
+            })
+        });
+        Ok(plan.map_or(FilterPlan::Empty, FilterPlan::Predicate))
+    }
 }
 
 /// Overlay a transaction's buffered writes for `table` onto the snapshot-resolved
@@ -4425,14 +4611,14 @@ fn valid_bound_micros(row: &[Option<Vec<u8>>], idx: usize) -> Result<i64, Engine
 /// over the materialized rows by [`rows_passing_filter`] — so the two paths agree
 /// on which rows survive, whatever the predicate's shape.
 fn filter_rows(
-    bound: &BoundSelect,
+    plan: &FilterPlan,
     schema_columns: &[(String, LogicalType)],
     rows: Vec<Vec<Option<Vec<u8>>>>,
 ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
-    match filter_plan(bound) {
+    match plan {
         FilterPlan::Empty => Ok(Vec::new()),
         FilterPlan::KeepAll => Ok(rows),
-        FilterPlan::Predicate(predicate) => rows_passing_filter(&predicate, schema_columns, rows),
+        FilterPlan::Predicate(predicate) => rows_passing_filter(predicate, schema_columns, rows),
     }
 }
 
@@ -11789,6 +11975,469 @@ mod tests {
                     "seed {seed} op {op}: the table must equal the reference model"
                 );
             }
+        }
+    }
+
+    // ---- STL-234: uncorrelated subqueries (scalar, IN, EXISTS) ----
+
+    /// A session with an outer `t` and an inner `s`, each a key plus one INT
+    /// value column — the substrate for the subquery tests.
+    fn subquery_session() -> SessionEngine<ZeroClock, MemDisk> {
+        let mut engine = session();
+        for ddl in [
+            "CREATE TABLE t (id INT PRIMARY KEY, a INT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE s (id INT PRIMARY KEY, a INT) WITH SYSTEM VERSIONING",
+        ] {
+            engine.execute(&parse_one(ddl)).expect("create");
+        }
+        engine
+    }
+
+    /// The `id` column of a `SELECT id FROM …` result, ascending — the outer rows
+    /// a subquery `WHERE` kept.
+    fn subquery_ids(result: &SelectResult) -> Vec<i32> {
+        let mut ids: Vec<i32> = result
+            .rows
+            .iter()
+            .map(|row| {
+                let bytes = row[0].as_ref().expect("id is never NULL");
+                match ScalarValue::decode(LogicalType::Int4, bytes).expect("decode id") {
+                    ScalarValue::Int4(id) => id,
+                    _ => panic!("id is INT"),
+                }
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn scalar_subquery_in_where_folds_to_a_literal() {
+        let mut engine = subquery_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 10)",
+            "INSERT INTO t VALUES (2, 20)",
+            "INSERT INTO t VALUES (3, 30)",
+            "INSERT INTO s VALUES (1, 20)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // `a = (SELECT a FROM s WHERE id = 1)` folds to `a = 20` → row 2.
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a = (SELECT a FROM s WHERE id = 1)",
+        ));
+        assert_eq!(got, vec![2]);
+        // A non-commutative op keeps its operand order: `a > 20` → row 3.
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a > (SELECT a FROM s WHERE id = 1)",
+        ));
+        assert_eq!(got, vec![3]);
+        // Subquery on the left: `20 < a` → row 3 (not mis-lowered as `a < 20`).
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE (SELECT a FROM s WHERE id = 1) < a",
+        ));
+        assert_eq!(got, vec![3]);
+    }
+
+    #[test]
+    fn scalar_subquery_with_no_row_is_null_and_matches_nothing() {
+        let mut engine = subquery_session();
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (1, 10)"))
+            .expect("insert");
+        // The inner returns no row → the scalar is NULL → the comparison is
+        // unknown for every row → empty result (never a silently-unfiltered read).
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a = (SELECT a FROM s WHERE id = 99)",
+        ));
+        assert!(got.is_empty(), "got {got:?}");
+    }
+
+    #[test]
+    fn scalar_subquery_returning_many_rows_is_cardinality_violation() {
+        let mut engine = subquery_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 10)",
+            "INSERT INTO s VALUES (1, 10)",
+            "INSERT INTO s VALUES (2, 20)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // `SELECT a FROM s` returns two rows used as a scalar → SQLSTATE 21000.
+        let err = engine
+            .execute(&parse_one("SELECT id FROM t WHERE a = (SELECT a FROM s)"))
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::ScalarSubqueryCardinality),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn in_subquery_is_set_membership() {
+        let mut engine = subquery_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 10)",
+            "INSERT INTO t VALUES (2, 20)",
+            "INSERT INTO t VALUES (3, 30)",
+            "INSERT INTO s VALUES (1, 10)",
+            "INSERT INTO s VALUES (2, 30)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a IN (SELECT a FROM s)",
+        ));
+        assert_eq!(got, vec![1, 3]);
+    }
+
+    #[test]
+    fn in_empty_set_matches_nothing_and_not_in_empty_set_matches_all() {
+        let mut engine = subquery_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 10)",
+            "INSERT INTO t VALUES (2, 20)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // `s` is empty: `IN ()` is false for every row, `NOT IN ()` true for every.
+        let in_got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a IN (SELECT a FROM s)",
+        ));
+        assert!(in_got.is_empty(), "got {in_got:?}");
+        let not_in_got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s)",
+        ));
+        assert_eq!(not_in_got, vec![1, 2]);
+    }
+
+    #[test]
+    fn not_in_subquery_with_null_in_set_matches_nothing() {
+        let mut engine = subquery_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 10)",
+            "INSERT INTO t VALUES (2, 20)",
+            "INSERT INTO s VALUES (1, 10)",
+            "INSERT INTO s VALUES (2, NULL)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // The classic three-valued trap: `a NOT IN (10, NULL)` is never TRUE.
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s)",
+        ));
+        assert!(got.is_empty(), "got {got:?}");
+        // Plain `IN` still matches the non-NULL member (the NULL is inert).
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a IN (SELECT a FROM s)",
+        ));
+        assert_eq!(got, vec![1]);
+    }
+
+    #[test]
+    fn in_subquery_with_null_outer_value_is_excluded() {
+        let mut engine = subquery_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 10)",
+            "INSERT INTO t VALUES (2, NULL)",
+            "INSERT INTO s VALUES (1, 10)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // A NULL outer value is never provably IN (nor NOT IN) a set.
+        let in_got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a IN (SELECT a FROM s)",
+        ));
+        assert_eq!(in_got, vec![1]);
+        let not_in_got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s)",
+        ));
+        assert!(not_in_got.is_empty(), "got {not_in_got:?}");
+    }
+
+    #[test]
+    fn exists_subquery_is_a_constant_keep_or_drop() {
+        let mut engine = subquery_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 10)",
+            "INSERT INTO t VALUES (2, 20)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // `s` empty: EXISTS keeps none, NOT EXISTS keeps all (idiomatic SELECT 1).
+        assert!(
+            subquery_ids(&select(
+                &mut engine,
+                "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s)"
+            ))
+            .is_empty()
+        );
+        assert_eq!(
+            subquery_ids(&select(
+                &mut engine,
+                "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM s)"
+            )),
+            vec![1, 2]
+        );
+        engine
+            .execute(&parse_one("INSERT INTO s VALUES (1, 99)"))
+            .expect("insert");
+        // `s` non-empty: EXISTS keeps all, NOT EXISTS keeps none.
+        assert_eq!(
+            subquery_ids(&select(
+                &mut engine,
+                "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s)"
+            )),
+            vec![1, 2]
+        );
+        assert!(
+            subquery_ids(&select(
+                &mut engine,
+                "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM s)"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn exists_with_an_inner_where_tests_filtered_presence() {
+        let mut engine = subquery_session();
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (1, 10)"))
+            .expect("insert");
+        engine
+            .execute(&parse_one("INSERT INTO s VALUES (1, 5)"))
+            .expect("insert");
+        // The inner WHERE excludes every `s` row → EXISTS keeps none.
+        assert!(
+            subquery_ids(&select(
+                &mut engine,
+                "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s WHERE a > 100)"
+            ))
+            .is_empty()
+        );
+        // The inner WHERE keeps a row → EXISTS keeps the outer row.
+        assert_eq!(
+            subquery_ids(&select(
+                &mut engine,
+                "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s WHERE a > 1)"
+            )),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn scalar_subquery_over_an_aggregate_inner() {
+        let mut engine = subquery_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 10)",
+            "INSERT INTO t VALUES (2, 20)",
+            "INSERT INTO t VALUES (3, 30)",
+            "INSERT INTO s VALUES (1, 10)",
+            "INSERT INTO s VALUES (2, 30)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // `a = (SELECT MAX(a) FROM s)` → `a = 30` → row 3 (aggregate inner yields one row).
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a = (SELECT MAX(a) FROM s)",
+        ));
+        assert_eq!(got, vec![3]);
+    }
+
+    #[test]
+    fn subquery_inherits_the_outer_statement_snapshot() {
+        // STL-234 DoD oracle: an uncorrelated subquery is evaluated at the outer
+        // statement's snapshot (docs/16 §6). Reading the integrated
+        // `WHERE a IN (SELECT a FROM s)` at an `AS OF` instant must equal composing
+        // two *independent* `AS OF` reads of `t` and `s` at that same instant — so
+        // the inner can never leak the present into a time-travel read.
+        let clock = SteppedClock::new(1_000);
+        let mut engine = SessionEngine::open(MemDisk::new(), clock.clone());
+        for ddl in [
+            "CREATE TABLE t (id INT PRIMARY KEY, a INT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE s (id INT PRIMARY KEY, a INT) WITH SYSTEM VERSIONING",
+        ] {
+            engine.execute(&parse_one(ddl)).expect("create");
+        }
+
+        // Era 1 @ 2_000: t = {1:10, 2:20, 3:30}, s = {1:10, 2:30}.
+        clock.set(2_000);
+        for sql in [
+            "INSERT INTO t VALUES (1, 10)",
+            "INSERT INTO t VALUES (2, 20)",
+            "INSERT INTO t VALUES (3, 30)",
+            "INSERT INTO s VALUES (1, 10)",
+            "INSERT INTO s VALUES (2, 30)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert era1");
+        }
+
+        // Era 2 @ 5_000: rewrite s to {1:20, 2:20} — the inner result now picks t.id 2.
+        clock.set(5_000);
+        for sql in [
+            "UPDATE s SET a = 20 WHERE id = 1",
+            "UPDATE s SET a = 20 WHERE id = 2",
+        ] {
+            engine.execute(&parse_one(sql)).expect("update era2");
+        }
+        clock.set(9_000);
+
+        let run = |engine: &mut SessionEngine<SteppedClock, MemDisk>, sql: &str| -> SelectResult {
+            let StatementOutcome::Rows(r) = engine.execute(&parse_one(sql)).expect("select") else {
+                panic!("SELECT must return rows");
+            };
+            r
+        };
+        let int_at = |row: &Option<Vec<u8>>| -> Option<i32> {
+            row.as_ref().map(
+                |b| match ScalarValue::decode(LogicalType::Int4, b).expect("decode") {
+                    ScalarValue::Int4(v) => v,
+                    _ => panic!("INT column"),
+                },
+            )
+        };
+
+        // The integrated subquery at each instant must equal the composed reference.
+        for at in [4_000_i64, 9_000] {
+            let set: Vec<i32> = run(
+                &mut engine,
+                &format!("SELECT a FROM s FOR SYSTEM_TIME AS OF {at}"),
+            )
+            .rows
+            .iter()
+            .filter_map(|row| int_at(&row[0]))
+            .collect();
+            let mut want: Vec<i32> = run(
+                &mut engine,
+                &format!("SELECT id, a FROM t FOR SYSTEM_TIME AS OF {at}"),
+            )
+            .rows
+            .iter()
+            .filter(|row| int_at(&row[1]).is_some_and(|a| set.contains(&a)))
+            .map(|row| int_at(&row[0]).expect("id"))
+            .collect();
+            want.sort_unstable();
+            let got = subquery_ids(&run(
+                &mut engine,
+                &format!(
+                    "SELECT id FROM t WHERE a IN (SELECT a FROM s) FOR SYSTEM_TIME AS OF {at}"
+                ),
+            ));
+            assert_eq!(
+                got, want,
+                "AS OF {at}: integrated subquery vs composed reference"
+            );
+        }
+
+        // And the two eras genuinely differ, so the test cannot pass by reading the
+        // present at both: era 1 → {1, 3}, present → {2}.
+        assert_eq!(
+            subquery_ids(&run(
+                &mut engine,
+                "SELECT id FROM t WHERE a IN (SELECT a FROM s) FOR SYSTEM_TIME AS OF 4000",
+            )),
+            vec![1, 3]
+        );
+        assert_eq!(
+            subquery_ids(&run(
+                &mut engine,
+                "SELECT id FROM t WHERE a IN (SELECT a FROM s) FOR SYSTEM_TIME AS OF 9000",
+            )),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn subquery_reads_its_own_uncommitted_writes_in_a_transaction() {
+        // Read-your-own-writes ([STL-203]): an in-transaction subquery sees the
+        // transaction's buffered writes, the same as the outer read.
+        let mut engine = subquery_session();
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (1, 10)"))
+            .expect("insert t");
+
+        let mut txn = engine.begin();
+        engine
+            .execute_in_txn(&parse_one("INSERT INTO s VALUES (1, 10)"), &mut txn)
+            .expect("stage insert into s");
+        // The buffered `s` row is visible to the subquery → the outer row matches.
+        let StatementOutcome::Rows(result) = engine
+            .execute_in_txn(
+                &parse_one("SELECT id FROM t WHERE a IN (SELECT a FROM s)"),
+                &mut txn,
+            )
+            .expect("select in txn")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(subquery_ids(&result), vec![1]);
+        engine.commit(txn).expect("commit");
+    }
+
+    #[test]
+    fn subquery_inherits_the_outer_valid_time_snapshot() {
+        // The `(sys, valid)` rule on the *valid* axis (docs/16 §6): an uncorrelated
+        // subquery over a valid-time table inherits the outer `FOR VALID_TIME AS OF`
+        // pin, so the inner reads the same valid slice. The rows have disjoint valid
+        // windows, so each instant makes exactly one row live — the integrated
+        // subquery must agree with composing two independent valid-`AS OF` reads.
+        let mut engine =
+            valid_time_acct(&[(1, 100, 10, 20), (2, 200, 30, 40), (3, 300, 50, i64::MAX)]);
+        let int_at = |row: &Option<Vec<u8>>| -> Option<i32> {
+            row.as_ref().map(
+                |b| match ScalarValue::decode(LogicalType::Int4, b).expect("decode") {
+                    ScalarValue::Int4(v) => v,
+                    _ => panic!("INT column"),
+                },
+            )
+        };
+        for (at, want_len) in [(15_i64, 1), (35, 1), (55, 1)] {
+            // Compose two independent valid-`AS OF` reads at the same instant: the
+            // inner's live balance set, then the outer rows whose balance is in it.
+            let set: Vec<i32> = select(
+                &mut engine,
+                &format!("SELECT balance FROM acct FOR VALID_TIME AS OF {at}"),
+            )
+            .rows
+            .iter()
+            .filter_map(|row| int_at(&row[0]))
+            .collect();
+            assert_eq!(set.len(), want_len, "the live valid slice at {at}");
+            let mut want: Vec<i32> = select(
+                &mut engine,
+                &format!("SELECT id, balance FROM acct FOR VALID_TIME AS OF {at}"),
+            )
+            .rows
+            .iter()
+            .filter(|row| int_at(&row[1]).is_some_and(|b| set.contains(&b)))
+            .map(|row| int_at(&row[0]).expect("id"))
+            .collect();
+            want.sort_unstable();
+            // The integrated subquery, pinned at the same valid instant, must match.
+            let got = subquery_ids(&select(
+                &mut engine,
+                &format!(
+                    "SELECT id FROM acct WHERE balance IN (SELECT balance FROM acct) \
+                     FOR VALID_TIME AS OF {at}"
+                ),
+            ));
+            assert_eq!(
+                got, want,
+                "VALID AS OF {at}: integrated subquery vs composed"
+            );
         }
     }
 }
