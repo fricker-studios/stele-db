@@ -66,6 +66,7 @@ use stele_common::metrics::{SharedMetrics, StatementKind};
 use stele_common::period::Interval;
 use stele_common::provenance::{Principal, TxnId};
 use stele_common::row_codec::{self, RowCodecError};
+use stele_common::scram::{self, ScramVerifier};
 use stele_common::time::{Clock, SystemTimeMicros, ValidTimeMicros};
 use stele_common::types::{LogicalType, ScalarValue};
 use stele_exec::{
@@ -74,6 +75,7 @@ use stele_exec::{
     JoinType as ExecJoinType, Operator, ScanError, ScanSource, SnapshotScan, Vector, eval_expr,
     evaluate, hash_aggregate, hash_join,
 };
+use stele_sql::Password;
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::dml::{BoundDml, DmlError};
 use stele_sql::select::{
@@ -700,6 +702,29 @@ pub enum EngineError {
     /// [STL-229]: https://allegromusic.atlassian.net/browse/STL-229
     #[error("a scanned business key could not be decoded while expanding a predicate DML")]
     MalformedBusinessKey,
+
+    /// A `CREATE USER` named a user that already exists ([STL-252]). Postgres
+    /// wording so the wire layer's `42710` (`duplicate_object`) reads natively.
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    #[error("role {0:?} already exists")]
+    DuplicateUser(String),
+
+    /// An `ALTER USER` / `DROP USER` named a user that does not exist
+    /// ([STL-252]). Postgres wording for the wire layer's `42704`
+    /// (`undefined_object`).
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    #[error("role {0:?} does not exist")]
+    UnknownUser(String),
+
+    /// The OS entropy source failed while generating a SCRAM salt
+    /// ([STL-252]). The user DDL is refused — a predictable salt is not an
+    /// acceptable fallback.
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    #[error("entropy source unavailable: {0}")]
+    Entropy(#[source] io::Error),
 }
 
 /// One table's live state inside a session.
@@ -795,6 +820,14 @@ pub struct SessionEngine<C: Clock + Clone, D: Disk + Clone> {
     /// [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
     /// [ADR-0010]: ../../../docs/adr/0010-deterministic-simulation-testing.md
     metrics: SharedMetrics,
+    /// The live user store ([STL-252]): user name → stored SCRAM verifier.
+    /// Current state only — the durable history is the catalog log's
+    /// `CreateUser`/`AlterUser`/`DropUser` records, which
+    /// [`recover`](Self::recover) replays to rebuild this map. Never holds a
+    /// password.
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    users: BTreeMap<String, ScramVerifier>,
 }
 
 impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
@@ -821,6 +854,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             index_states: BTreeMap::new(),
             index_probes: Cell::new(0),
             metrics: SharedMetrics::default(),
+            users: BTreeMap::new(),
         }
     }
 
@@ -883,61 +917,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             CommittedTxns::Only(commit_log::replay(&disk).map_err(EngineError::CommitLog)?);
         let clock = MonotonicClock::new(clock);
 
-        // 1. Rebuild the catalog by replaying the DDL history, tracking per
-        //    name the tier to reopen: the namespace and valid-time policy of
-        //    its *latest* create. (A drop keeps the entry — the tier stays
-        //    resident for history, exactly as in a live session.)
-        let mut catalog = Catalog::new();
-        let mut tiers: BTreeMap<String, (u64, bool)> = BTreeMap::new();
-        // The instant of each name's *latest* drop, if any ([STL-220]). After the
-        // tiers are reopened, recovery re-derives that drop's storage closes from
-        // this durable catalog record, closing the cross-log window in which the
-        // drop was acknowledged but the tier's auto-commit closes never reached
-        // its WAL. The latest drop suffices (the WAL is append-only, so at most
-        // one era is open at recovery — see [`Engine::close_dropped_era`]).
-        let mut latest_drop: BTreeMap<String, SystemTimeMicros> = BTreeMap::new();
-        let mut next_namespace = 0u64;
-        let mut max_commit = SystemTimeMicros(0);
-        for record in records {
-            match record {
-                CatalogRecord::CreateTable {
-                    at,
-                    namespace,
-                    name,
-                    columns,
-                    temporal,
-                } => {
-                    let valid_time = temporal.valid_time_enabled();
-                    catalog.create_table(name.clone(), columns, temporal, at)?;
-                    tiers.insert(name, (namespace, valid_time));
-                    next_namespace = next_namespace.max(namespace + 1);
-                    max_commit = max_commit.max(at);
-                }
-                CatalogRecord::DropTable { at, name } => {
-                    // Cascades the dropped table's index metadata away, exactly
-                    // as the live session did ([STL-233]) — drops carry no
-                    // per-index records.
-                    catalog.drop_table(&name, at)?;
-                    // Records are in log order, so the last drop for a name wins.
-                    latest_drop.insert(name, at);
-                    max_commit = max_commit.max(at);
-                }
-                CatalogRecord::CreateIndex {
-                    at,
-                    name,
-                    table,
-                    kind,
-                    columns,
-                } => {
-                    catalog.create_index(IndexDef::new(name, table, kind, columns)?)?;
-                    max_commit = max_commit.max(at);
-                }
-                CatalogRecord::DropIndex { at, name } => {
-                    catalog.drop_index(&name)?;
-                    max_commit = max_commit.max(at);
-                }
-            }
-        }
+        // 1. Rebuild the catalog (and the user store) by replaying the DDL
+        //    history — see [`fold_catalog_records`].
+        let ReplayedCatalog {
+            catalog,
+            users,
+            tiers,
+            latest_drop,
+            next_namespace,
+            mut max_commit,
+        } = fold_catalog_records(records)?;
 
         // 2. Reopen each recorded tier from its slice of the disk, and fold in
         //    its high-water marks (largest commit instant / txn id on disk).
@@ -984,6 +973,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             index_states: BTreeMap::new(),
             index_probes: Cell::new(0),
             metrics: SharedMetrics::default(),
+            users,
         };
         // Recovered tiers were opened before the session's registry existed;
         // point their WALs at it now ([STL-253]).
@@ -1469,6 +1459,27 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         &self.metrics
     }
 
+    /// The stored SCRAM verifier for `user`, if one exists ([STL-252]) — what
+    /// the pg-wire SASL exchange authenticates against. `None` is "unknown
+    /// user"; the wire layer runs a doomed mock exchange on it so the refusal
+    /// is indistinguishable from a wrong password.
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    #[must_use]
+    pub fn auth_verifier(&self, user: &str) -> Option<ScramVerifier> {
+        self.users.get(user).cloned()
+    }
+
+    /// How many users the live user store holds ([STL-252]). The server reads
+    /// this at boot to warn when `auth = "scram"` is configured with no users
+    /// (every connection would be refused until the operator bootstraps one).
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    #[must_use]
+    pub fn user_count(&self) -> usize {
+        self.users.len()
+    }
+
     /// Record one finished statement into the registry ([STL-253]): the
     /// per-kind count, latency, rows in/out, and the error count. `started_micros`
     /// is the registry time-source reading taken before the statement ran (zero
@@ -1750,6 +1761,84 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             DdlStatement::DropIndex { name, if_exists } => {
                 self.apply_drop_index(&name, if_exists, at)
             }
+            user @ (DdlStatement::CreateUser { .. }
+            | DdlStatement::AlterUserPassword { .. }
+            | DdlStatement::DropUser { .. }) => self.apply_user_ddl(user, at),
+        }
+    }
+
+    /// Apply a `CREATE`/`ALTER`/`DROP USER` ([STL-252]) to the durable user
+    /// store, following the same write-ahead discipline as the table arms of
+    /// [`apply_ddl`](Self::apply_ddl): validate against the live store, fsync
+    /// the catalog-log record — the durability point — then commit the
+    /// in-memory map. The record carries the derived verifier, never the
+    /// password.
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    fn apply_user_ddl(
+        &mut self,
+        ddl: DdlStatement,
+        at: SystemTimeMicros,
+    ) -> Result<StatementOutcome, EngineError> {
+        match ddl {
+            DdlStatement::CreateUser { name, password } => {
+                if self.users.contains_key(&name) {
+                    return Err(EngineError::DuplicateUser(name));
+                }
+                let verifier = derive_verifier(&password)?;
+                let record = CatalogRecord::CreateUser {
+                    at,
+                    name: name.clone(),
+                    verifier: verifier.clone(),
+                };
+                catalog_log::append(&self.disk, &record).map_err(EngineError::CatalogLog)?;
+                self.users.insert(name, verifier);
+                Ok(StatementOutcome::Ddl {
+                    tag: DdlOutcome::CreatedUser.command_tag(),
+                })
+            }
+            DdlStatement::AlterUserPassword { name, password } => {
+                if !self.users.contains_key(&name) {
+                    return Err(EngineError::UnknownUser(name));
+                }
+                // A rotation derives under a *fresh* salt — reusing the old one
+                // would let a captured pre-rotation exchange confirm whether the
+                // password changed.
+                let verifier = derive_verifier(&password)?;
+                let record = CatalogRecord::AlterUser {
+                    at,
+                    name: name.clone(),
+                    verifier: verifier.clone(),
+                };
+                catalog_log::append(&self.disk, &record).map_err(EngineError::CatalogLog)?;
+                self.users.insert(name, verifier);
+                Ok(StatementOutcome::Ddl {
+                    tag: DdlOutcome::AlteredUser.command_tag(),
+                })
+            }
+            // The `IF EXISTS` no-op writes no record — nothing changed, nothing
+            // to recover (the same posture as `DROP TABLE IF EXISTS`).
+            DdlStatement::DropUser { name, if_exists } => {
+                if !self.users.contains_key(&name) {
+                    if if_exists {
+                        return Ok(StatementOutcome::Ddl {
+                            tag: DdlOutcome::DropUserNoOp.command_tag(),
+                        });
+                    }
+                    return Err(EngineError::UnknownUser(name));
+                }
+                let record = CatalogRecord::DropUser {
+                    at,
+                    name: name.clone(),
+                };
+                catalog_log::append(&self.disk, &record).map_err(EngineError::CatalogLog)?;
+                self.users.remove(&name);
+                Ok(StatementOutcome::Ddl {
+                    tag: DdlOutcome::DroppedUser.command_tag(),
+                })
+            }
+            // The table/index arms route through `apply_ddl` itself.
+            _ => unreachable!("apply_user_ddl is only called with user DDL"),
         }
     }
 
@@ -3385,8 +3474,127 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
 /// v0.1 has no authentication ([ADR-0003] defers SCRAM/TLS to v0.3), so every
 /// routed DML commit shares this fixed principal until a connection carries a real
 /// identity. Provenance is still captured inline at commit, per the architectural
-/// invariant — only the identity is a placeholder.
+/// invariant — only the identity is a placeholder. (Authentication itself landed
+/// with [STL-252]; threading the authenticated user into write provenance is the
+/// `_stele_principal` provenance ticket's half.)
+///
+/// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
 const WIRE_PRINCIPAL: &[u8] = b"stele";
+
+/// The in-memory state step 1 of [`SessionEngine::recover`] derives from the
+/// replayed catalog log, before any tier is reopened.
+struct ReplayedCatalog {
+    /// The schema-version chains, reproduced in recorded order.
+    catalog: Catalog,
+    /// The user store ([STL-252]): name → latest acknowledged verifier.
+    users: BTreeMap<String, ScramVerifier>,
+    /// Per name, the tier to reopen: the namespace and valid-time policy of
+    /// its *latest* create. (A drop keeps the entry — the tier stays resident
+    /// for history, exactly as in a live session.)
+    tiers: BTreeMap<String, (u64, bool)>,
+    /// The instant of each name's *latest* drop, if any ([STL-220]). After the
+    /// tiers are reopened, recovery re-derives that drop's storage closes from
+    /// this durable catalog record, closing the cross-log window in which the
+    /// drop was acknowledged but the tier's auto-commit closes never reached
+    /// its WAL. The latest drop suffices (the WAL is append-only, so at most
+    /// one era is open at recovery — see [`Engine::close_dropped_era`]).
+    ///
+    /// [STL-220]: https://allegromusic.atlassian.net/browse/STL-220
+    latest_drop: BTreeMap<String, SystemTimeMicros>,
+    /// One past the largest recorded namespace — the allocator floor.
+    next_namespace: u64,
+    /// The largest DDL instant seen (tier replay folds commits in after).
+    max_commit: SystemTimeMicros,
+}
+
+/// Fold the replayed catalog-log records, in order, into the recovered
+/// in-memory state — step 1 of [`SessionEngine::recover`] ([ADR-0028]).
+///
+/// [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
+fn fold_catalog_records(records: Vec<CatalogRecord>) -> Result<ReplayedCatalog, EngineError> {
+    let mut folded = ReplayedCatalog {
+        catalog: Catalog::new(),
+        users: BTreeMap::new(),
+        tiers: BTreeMap::new(),
+        latest_drop: BTreeMap::new(),
+        next_namespace: 0,
+        max_commit: SystemTimeMicros(0),
+    };
+    for record in records {
+        match record {
+            CatalogRecord::CreateTable {
+                at,
+                namespace,
+                name,
+                columns,
+                temporal,
+            } => {
+                let valid_time = temporal.valid_time_enabled();
+                folded
+                    .catalog
+                    .create_table(name.clone(), columns, temporal, at)?;
+                folded.tiers.insert(name, (namespace, valid_time));
+                folded.next_namespace = folded.next_namespace.max(namespace + 1);
+                folded.max_commit = folded.max_commit.max(at);
+            }
+            CatalogRecord::DropTable { at, name } => {
+                // Cascades the dropped table's index metadata away, exactly
+                // as the live session did ([STL-233]) — drops carry no
+                // per-index records.
+                folded.catalog.drop_table(&name, at)?;
+                // Records are in log order, so the last drop for a name wins.
+                folded.latest_drop.insert(name, at);
+                folded.max_commit = folded.max_commit.max(at);
+            }
+            CatalogRecord::CreateIndex {
+                at,
+                name,
+                table,
+                kind,
+                columns,
+            } => {
+                folded
+                    .catalog
+                    .create_index(IndexDef::new(name, table, kind, columns)?)?;
+                folded.max_commit = folded.max_commit.max(at);
+            }
+            CatalogRecord::DropIndex { at, name } => {
+                folded.catalog.drop_index(&name)?;
+                folded.max_commit = folded.max_commit.max(at);
+            }
+            // The user store ([STL-252]): the latest create/alter's verifier
+            // wins, a drop removes the name. Records are in log order, so
+            // plain map mutations reproduce the acknowledged end state.
+            CatalogRecord::CreateUser { at, name, verifier }
+            | CatalogRecord::AlterUser { at, name, verifier } => {
+                folded.users.insert(name, verifier);
+                folded.max_commit = folded.max_commit.max(at);
+            }
+            CatalogRecord::DropUser { at, name } => {
+                folded.users.remove(&name);
+                folded.max_commit = folded.max_commit.max(at);
+            }
+        }
+    }
+    Ok(folded)
+}
+
+/// Derive a fresh SCRAM verifier for `password` under an OS-entropy salt and
+/// the default iteration count ([STL-252]). The only entropy read in this
+/// crate, and only on the user-DDL path — never in the storage/txn core the
+/// simulator drives ([ADR-0010]).
+///
+/// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+/// [ADR-0010]: ../../../docs/adr/0010-deterministic-simulation-testing.md
+fn derive_verifier(password: &Password) -> Result<ScramVerifier, EngineError> {
+    let mut salt = [0u8; scram::SALT_LEN];
+    getrandom::fill(&mut salt).map_err(|e| EngineError::Entropy(io::Error::from(e)))?;
+    Ok(ScramVerifier::derive(
+        &password.0,
+        &salt,
+        scram::DEFAULT_ITERATIONS,
+    ))
+}
 
 /// The affected-row summary a bound **point** DML operation reports — one row
 /// per statement, tagged by kind so the wire layer renders the right
@@ -8466,6 +8674,125 @@ mod tests {
             st.engine.replay_floor() > LogOffset::ZERO,
             "FLUSH advanced the recovery floor off the origin",
         );
+    }
+
+    // --- user DDL + durable user store (STL-252) ----------------------------
+
+    #[test]
+    fn user_ddl_routes_through_execute_with_postgres_tags() {
+        let mut engine = session();
+        let outcome = engine
+            .execute(&parse_one("CREATE USER alice PASSWORD 's3cret'"))
+            .expect("create user");
+        assert_eq!(outcome, StatementOutcome::Ddl { tag: "CREATE ROLE" });
+        assert!(engine.auth_verifier("alice").is_some());
+        assert_eq!(engine.user_count(), 1);
+
+        let outcome = engine
+            .execute(&parse_one("ALTER USER alice PASSWORD 'rotated'"))
+            .expect("alter user");
+        assert_eq!(outcome, StatementOutcome::Ddl { tag: "ALTER ROLE" });
+
+        let outcome = engine
+            .execute(&parse_one("DROP USER alice"))
+            .expect("drop user");
+        assert_eq!(outcome, StatementOutcome::Ddl { tag: "DROP ROLE" });
+        assert!(engine.auth_verifier("alice").is_none());
+        assert_eq!(engine.user_count(), 0);
+
+        // IF EXISTS on an absent user is a tagged no-op, not an error.
+        let outcome = engine
+            .execute(&parse_one("DROP USER IF EXISTS alice"))
+            .expect("drop if exists");
+        assert_eq!(outcome, StatementOutcome::Ddl { tag: "DROP ROLE" });
+    }
+
+    #[test]
+    fn duplicate_and_unknown_users_are_refused() {
+        let mut engine = session();
+        engine
+            .execute(&parse_one("CREATE USER alice PASSWORD 'pw'"))
+            .expect("create user");
+        assert!(matches!(
+            engine.execute(&parse_one("CREATE USER alice PASSWORD 'other'")),
+            Err(EngineError::DuplicateUser(name)) if name == "alice"
+        ));
+        assert!(matches!(
+            engine.execute(&parse_one("ALTER USER ghost PASSWORD 'pw'")),
+            Err(EngineError::UnknownUser(name)) if name == "ghost"
+        ));
+        assert!(matches!(
+            engine.execute(&parse_one("DROP USER ghost")),
+            Err(EngineError::UnknownUser(name)) if name == "ghost"
+        ));
+        // The refused statements left the store untouched.
+        assert_eq!(engine.user_count(), 1);
+    }
+
+    #[test]
+    fn verifiers_survive_recovery() {
+        // The DoD's restart half: CREATE USER on one session, recover a fresh
+        // session from the same disk, and the verifier — the exact key
+        // material — is back. A dropped user stays dropped.
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine
+            .execute(&parse_one("CREATE USER alice PASSWORD 's3cret'"))
+            .expect("create alice");
+        engine
+            .execute(&parse_one("CREATE USER bob PASSWORD 'hunter2'"))
+            .expect("create bob");
+        engine
+            .execute(&parse_one("ALTER USER alice PASSWORD 'rotated'"))
+            .expect("rotate alice");
+        engine
+            .execute(&parse_one("DROP USER bob"))
+            .expect("drop bob");
+        let live = engine.auth_verifier("alice").expect("alice exists");
+        drop(engine);
+
+        let recovered = SessionEngine::recover(disk, ZeroClock).expect("recover");
+        assert_eq!(recovered.user_count(), 1);
+        let verifier = recovered.auth_verifier("alice").expect("alice recovered");
+        assert_eq!(verifier, live, "recovered verifier is byte-identical");
+        assert!(
+            recovered.auth_verifier("bob").is_none(),
+            "bob stays dropped"
+        );
+
+        // The recovered verifier authenticates the post-rotation password and
+        // refuses the original — proof the *latest* record won.
+        let msg = b"n=alice,r=cnonce,r=cnoncesnonce,s=salt,i=4096,c=biws,r=cnoncesnonce";
+        let good =
+            stele_common::scram::client_proof("rotated", &verifier.salt, verifier.iterations, msg);
+        let stale =
+            stele_common::scram::client_proof("s3cret", &verifier.salt, verifier.iterations, msg);
+        assert!(verifier.verify_client_proof(msg, &good));
+        assert!(!verifier.verify_client_proof(msg, &stale));
+    }
+
+    #[test]
+    fn fresh_salts_make_equal_passwords_distinct() {
+        // Two users with the same password — and a rotation back to the same
+        // password — must never share salt or key material (no cross-user or
+        // cross-rotation correlation).
+        let mut engine = session();
+        engine
+            .execute(&parse_one("CREATE USER a PASSWORD 'same'"))
+            .expect("create a");
+        engine
+            .execute(&parse_one("CREATE USER b PASSWORD 'same'"))
+            .expect("create b");
+        let a = engine.auth_verifier("a").expect("a");
+        let b = engine.auth_verifier("b").expect("b");
+        assert_ne!(a.salt, b.salt, "fresh salt per user");
+        assert_ne!(a.stored_key, b.stored_key);
+
+        engine
+            .execute(&parse_one("ALTER USER a PASSWORD 'same'"))
+            .expect("rotate a");
+        let rotated = engine.auth_verifier("a").expect("a rotated");
+        assert_ne!(rotated.salt, a.salt, "fresh salt per rotation");
     }
 
     #[test]

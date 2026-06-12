@@ -32,10 +32,14 @@ public final class JdbcSmoke {
         // sslmode=require drives the STL-251 TLS leg; pgjdbc treats `require` as
         // encrypt-without-validating, exactly like libpq.
         String sslmode = args.length > 2 ? args[2] : "disable";
+        // user+password drive the STL-252 SCRAM leg; pgjdbc speaks
+        // SCRAM-SHA-256 natively whenever the server asks for SASL.
+        String user = args.length > 3 ? args[3] : "stele";
+        String password = args.length > 4 ? args[4] : "";
         String url = "jdbc:postgresql://" + host + ":" + port + "/stele"
                 + "?assumeMinServerVersion=9.4&sslmode=" + sslmode;
 
-        try (Connection conn = connectWithRetry(url)) {
+        try (Connection conn = connectWithRetry(url, user, password)) {
             try (Statement st = conn.createStatement()) {
                 st.execute("DROP TABLE IF EXISTS driver_demo_jdbc");
                 st.execute("CREATE TABLE driver_demo_jdbc (id INT PRIMARY KEY, label TEXT)"
@@ -94,11 +98,12 @@ public final class JdbcSmoke {
     }
 
     /** Wait for the engine to accept connections (cold container boot). */
-    private static Connection connectWithRetry(String url) throws Exception {
+    private static Connection connectWithRetry(String url, String user, String password)
+            throws Exception {
         long deadline = System.nanoTime() + 60L * 1_000_000_000L;
         while (true) {
             try {
-                return DriverManager.getConnection(url, "stele", "");
+                return DriverManager.getConnection(url, user, password);
             } catch (SQLException e) {
                 if (System.nanoTime() >= deadline) {
                     throw e;

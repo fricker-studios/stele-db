@@ -51,7 +51,7 @@ use stele_catalog::{
 use stele_common::time::SystemTimeMicros;
 use stele_common::types::LogicalType;
 
-use crate::ast::Statement;
+use crate::ast::{Password, Statement, StatementBody, UserDdl};
 use crate::error::ParseError;
 use crate::types::logical_type;
 
@@ -168,6 +168,37 @@ pub enum DdlStatement {
         /// rather than an error.
         if_exists: bool,
     },
+    /// `CREATE USER <name> PASSWORD '…'` — register a user; the engine derives
+    /// and durably stores a SCRAM verifier, never the password ([STL-252]).
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    CreateUser {
+        /// The user name.
+        name: String,
+        /// The password to derive the verifier from (redacted `Debug`).
+        password: Password,
+    },
+    /// `ALTER USER <name> PASSWORD '…'` — rotate a user's password
+    /// ([STL-252]): a fresh salt and verifier replace the stored one.
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    AlterUserPassword {
+        /// The user name.
+        name: String,
+        /// The replacement password (redacted `Debug`).
+        password: Password,
+    },
+    /// `DROP USER [IF EXISTS] <name>` — remove a user ([STL-252]). Existing
+    /// connections are unaffected; the next authentication attempt is refused.
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    DropUser {
+        /// The user name.
+        name: String,
+        /// `IF EXISTS` was given — dropping an absent user is then a no-op
+        /// rather than an error.
+        if_exists: bool,
+    },
 }
 
 /// What [`DdlStatement::apply`] did to the catalog.
@@ -189,11 +220,27 @@ pub enum DdlOutcome {
     DroppedIndex,
     /// A `DROP INDEX IF EXISTS` named an index that did not exist — a no-op.
     DropIndexNoOp,
+    /// A user was registered ([STL-252]).
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    CreatedUser,
+    /// A user's password (verifier) was rotated ([STL-252]).
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    AlteredUser,
+    /// A user was removed ([STL-252]).
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    DroppedUser,
+    /// A `DROP USER IF EXISTS` named a user that did not exist — a no-op.
+    DropUserNoOp,
 }
 
 impl DdlOutcome {
     /// The Postgres `CommandComplete` tag a wire client expects for this DDL —
     /// the seam the pgwire front end reads when it routes DDL (STL-95 follow-up).
+    /// User DDL reports the `ROLE` tags, exactly as Postgres does for its
+    /// `CREATE`/`ALTER`/`DROP USER` aliases.
     #[must_use]
     pub const fn command_tag(self) -> &'static str {
         match self {
@@ -201,6 +248,9 @@ impl DdlOutcome {
             Self::Dropped(_) | Self::DropNoOp => "DROP TABLE",
             Self::CreatedIndex => "CREATE INDEX",
             Self::DroppedIndex | Self::DropIndexNoOp => "DROP INDEX",
+            Self::CreatedUser => "CREATE ROLE",
+            Self::AlteredUser => "ALTER ROLE",
+            Self::DroppedUser | Self::DropUserNoOp => "DROP ROLE",
         }
     }
 }
@@ -212,6 +262,25 @@ impl DdlOutcome {
 /// [`BindError::NotDdl`] if the statement is not a `CREATE TABLE` / `DROP TABLE`;
 /// otherwise a [`BindError`] variant describing the unsupported or malformed DDL.
 pub fn bind_ddl(stmt: &Statement) -> Result<DdlStatement, BindError> {
+    // Token-lifted user DDL ([STL-252]) carries no `sqlparser` AST; the parser
+    // already validated its shape, so binding is a direct mapping.
+    if let StatementBody::User(user) = &stmt.body {
+        return Ok(match user {
+            UserDdl::CreateUser { name, password } => DdlStatement::CreateUser {
+                name: name.clone(),
+                password: password.clone(),
+            },
+            UserDdl::AlterUserPassword { name, password } => DdlStatement::AlterUserPassword {
+                name: name.clone(),
+                password: password.clone(),
+            },
+            UserDdl::DropUser { name, if_exists } => DdlStatement::DropUser {
+                name: name.clone(),
+                if_exists: *if_exists,
+            },
+        });
+    }
+
     // An admin command (CHECKPOINT / FLUSH) has no SQL body, so it is "not DDL".
     let Some(body) = stmt.sql() else {
         return Err(BindError::NotDdl);
@@ -531,6 +600,12 @@ impl DdlStatement {
                 Err(CatalogError::UnknownIndex(_)) if if_exists => Ok(DdlOutcome::DropIndexNoOp),
                 Err(e) => Err(e),
             },
+            // User DDL ([STL-252]) mutates the engine's durable user store, not
+            // the schema catalog — the engine matches these variants itself and
+            // never routes them here. Reaching this arm is a routing bug.
+            Self::CreateUser { .. } | Self::AlterUserPassword { .. } | Self::DropUser { .. } => {
+                unreachable!("user DDL is applied by the session engine's user store, not Catalog")
+            }
         }
     }
 }

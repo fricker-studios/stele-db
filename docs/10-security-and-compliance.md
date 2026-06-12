@@ -118,6 +118,37 @@ flowchart LR
 - **Federated identity (OIDC / SSO / SAML)** for the admin surfaces — later (v1.0+), important for enterprise.
 - No default credentials; first-run forces credential setup.
 
+### Shipped at v0.3 (STL-252): SASL SCRAM-SHA-256 on pg-wire
+
+The standard Postgres `AuthenticationSASL` exchange (RFC 5802/7677) — psql,
+psycopg, pgjdbc, and `tokio-postgres` all speak it natively:
+
+- **Verifiers, never passwords.** `CREATE USER <name> PASSWORD '…'` derives a
+  salted, iterated SCRAM verifier (`StoredKey`/`ServerKey`, 4096 iterations —
+  the Postgres default) and appends it to the durable catalog log (ADR-0028),
+  so the user store survives restarts via the same replay as the schema.
+  `ALTER USER … PASSWORD` rotates under a fresh salt; `DROP USER` removes.
+  The crypto is vendored in `stele_common::scram` (like the commit-log
+  SHA-256) and pinned to the published RFC test vectors; OS entropy
+  (`getrandom`) supplies salts and per-exchange server nonces.
+- **Policy is `[auth] mode = trust | scram`** in `stele.toml` (dev default
+  `trust`; a bare `[auth]` section means `scram` — configuring authentication
+  means wanting it, the §4 posture). A non-dev `trust` boot warns unless mTLS
+  is on (the client certificate is then the identity).
+- **Failures don't enumerate.** A wrong password and an unknown user both run
+  a full exchange (a mock verifier for the unknown) and fail with the same
+  `FATAL` `28P01`. Fresh server nonces make a captured exchange unreplayable;
+  the server-final `v=` signature authenticates the server back to the client.
+- **Bootstrap** (no default credentials): boot once *without* `[auth]` —
+  trust is loopback-plaintext-only or behind `[tls]` per §4 — run
+  `CREATE USER`, then enable `[auth]` and restart; verifiers are durable.
+- **Deliberate v0.3 floor, filed as follow-ups:** `SCRAM-SHA-256-PLUS`
+  channel binding (plain SCRAM is the floor; a client demanding `p=…` is
+  refused), SASLprep normalization (raw UTF-8 passwords; ASCII is unaffected),
+  and client-side SCRAM in `stele shell`. The authenticated identity reaches
+  the connection trace span (STL-107); stamping it into write provenance is
+  the `_stele_principal` pseudo-column ticket.
+
 ## 6. Authorization
 
 Layered, least-privilege:

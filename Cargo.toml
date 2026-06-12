@@ -80,6 +80,12 @@ rustyline          = { version = "18.0", default-features = false, features = ["
 unicode-width      = "0.2"
 thiserror          = "2.0"
 toml               = "1.1"
+# OS entropy for SCRAM salts and SASL nonces (STL-252). The SCRAM math itself is
+# vendored (stele_common::scram, like the SHA-256 it builds on); entropy is the
+# one piece that cannot be, and `getrandom` is the ecosystem's narrow,
+# cross-platform answer — already in the tree transitively via rand/ring.
+# `std` carries the io::Error conversion the failure path surfaces through.
+getrandom          = { version = "0.3", features = ["std"] }
 tokio              = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
 # TLS on pg-wire (STL-251). `ring` instead of the default `aws-lc-rs` provider:
 # ring is already in the dependency tree, builds clean on every CI target

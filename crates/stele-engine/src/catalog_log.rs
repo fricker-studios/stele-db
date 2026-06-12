@@ -39,6 +39,7 @@
 use std::io;
 
 use stele_catalog::{ColumnDef, IndexKind, TableTemporal, ValidTimeSpec};
+use stele_common::scram::ScramVerifier;
 use stele_common::time::SystemTimeMicros;
 use stele_common::types::LogicalType;
 use stele_storage::backend::{Disk, DiskFile};
@@ -127,6 +128,44 @@ pub(crate) enum CatalogRecord {
         /// The dropped index's name.
         name: String,
     },
+    /// A `CREATE USER` was acknowledged at `at` ([STL-252]): the durable user
+    /// store is this log. The record carries the derived **SCRAM verifier** —
+    /// salted and iterated key material, never the password — so a restart
+    /// recovers exactly the authentication state that was acknowledged.
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    CreateUser {
+        /// The system time the user DDL was acknowledged.
+        at: SystemTimeMicros,
+        /// The user name.
+        name: String,
+        /// The stored SCRAM-SHA-256 verifier.
+        verifier: ScramVerifier,
+    },
+    /// An `ALTER USER … PASSWORD` was acknowledged at `at` ([STL-252]): a
+    /// fresh salt + verifier replace the user's stored one on replay. The old
+    /// record remains in the log (append-only — the rotation history is part
+    /// of the audit trail), but only the latest verifier authenticates.
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    AlterUser {
+        /// The system time the user DDL was acknowledged.
+        at: SystemTimeMicros,
+        /// The user name.
+        name: String,
+        /// The replacement SCRAM-SHA-256 verifier.
+        verifier: ScramVerifier,
+    },
+    /// A `DROP USER` was acknowledged at `at` ([STL-252]): replay removes the
+    /// user from the recovered store.
+    ///
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    DropUser {
+        /// The system time the user DDL was acknowledged.
+        at: SystemTimeMicros,
+        /// The dropped user's name.
+        name: String,
+    },
 }
 
 /// Record-kind discriminants. `0` is deliberately unused so a zero-filled
@@ -135,6 +174,9 @@ const KIND_CREATE_TABLE: u8 = 1;
 const KIND_DROP_TABLE: u8 = 2;
 const KIND_CREATE_INDEX: u8 = 3;
 const KIND_DROP_INDEX: u8 = 4;
+const KIND_CREATE_USER: u8 = 5;
+const KIND_ALTER_USER: u8 = 6;
+const KIND_DROP_USER: u8 = 7;
 
 /// Map an [`IndexKind`] to its stable on-log tag. Exhaustive, like
 /// [`type_tag`]: a sibling ticket adding a kind fails compilation here until
@@ -215,6 +257,30 @@ fn put_str(buf: &mut Vec<u8>, s: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Append a length-prefixed byte string (`u16 LE` length + bytes) — the SCRAM
+/// salt's shape ([STL-252]).
+fn put_bytes(buf: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
+    let len = u16::try_from(bytes.len()).map_err(|_| {
+        corrupt(format!(
+            "byte field too long for the catalog log ({})",
+            bytes.len()
+        ))
+    })?;
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// Encode a [`ScramVerifier`]: `iterations u32 LE | salt (u16-prefixed) |
+/// stored_key (32 raw) | server_key (32 raw)`.
+fn put_verifier(buf: &mut Vec<u8>, verifier: &ScramVerifier) -> io::Result<()> {
+    buf.extend_from_slice(&verifier.iterations.to_le_bytes());
+    put_bytes(buf, &verifier.salt)?;
+    buf.extend_from_slice(&verifier.stored_key);
+    buf.extend_from_slice(&verifier.server_key);
+    Ok(())
+}
+
 /// Encode one record's payload (everything between the header and the CRC).
 fn encode_payload(record: &CatalogRecord) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
@@ -272,6 +338,23 @@ fn encode_payload(record: &CatalogRecord) -> io::Result<Vec<u8>> {
         }
         CatalogRecord::DropIndex { at, name } => {
             buf.push(KIND_DROP_INDEX);
+            buf.extend_from_slice(&at.0.to_le_bytes());
+            put_str(&mut buf, name)?;
+        }
+        CatalogRecord::CreateUser { at, name, verifier } => {
+            buf.push(KIND_CREATE_USER);
+            buf.extend_from_slice(&at.0.to_le_bytes());
+            put_str(&mut buf, name)?;
+            put_verifier(&mut buf, verifier)?;
+        }
+        CatalogRecord::AlterUser { at, name, verifier } => {
+            buf.push(KIND_ALTER_USER);
+            buf.extend_from_slice(&at.0.to_le_bytes());
+            put_str(&mut buf, name)?;
+            put_verifier(&mut buf, verifier)?;
+        }
+        CatalogRecord::DropUser { at, name } => {
+            buf.push(KIND_DROP_USER);
             buf.extend_from_slice(&at.0.to_le_bytes());
             put_str(&mut buf, name)?;
         }
@@ -340,10 +423,34 @@ impl<'a> Cursor<'a> {
         ))
     }
 
+    fn u32(&mut self) -> io::Result<u32> {
+        Ok(u32::from_le_bytes(
+            self.take(4)?.try_into().expect("4 bytes"),
+        ))
+    }
+
     fn string(&mut self) -> io::Result<String> {
         let len = usize::from(self.u16()?);
         let bytes = self.take(len)?;
         String::from_utf8(bytes.to_vec()).map_err(|_| corrupt("identifier is not UTF-8"))
+    }
+
+    fn bytes(&mut self) -> io::Result<Vec<u8>> {
+        let len = usize::from(self.u16()?);
+        Ok(self.take(len)?.to_vec())
+    }
+
+    fn key32(&mut self) -> io::Result<[u8; 32]> {
+        Ok(self.take(32)?.try_into().expect("32 bytes"))
+    }
+
+    fn verifier(&mut self) -> io::Result<ScramVerifier> {
+        Ok(ScramVerifier {
+            iterations: self.u32()?,
+            salt: self.bytes()?,
+            stored_key: self.key32()?,
+            server_key: self.key32()?,
+        })
     }
 
     const fn finished(&self) -> bool {
@@ -416,6 +523,20 @@ fn decode_payload(payload: &[u8]) -> io::Result<CatalogRecord> {
             }
         }
         KIND_DROP_INDEX => CatalogRecord::DropIndex {
+            at: SystemTimeMicros(cur.i64()?),
+            name: cur.string()?,
+        },
+        KIND_CREATE_USER => CatalogRecord::CreateUser {
+            at: SystemTimeMicros(cur.i64()?),
+            name: cur.string()?,
+            verifier: cur.verifier()?,
+        },
+        KIND_ALTER_USER => CatalogRecord::AlterUser {
+            at: SystemTimeMicros(cur.i64()?),
+            name: cur.string()?,
+            verifier: cur.verifier()?,
+        },
+        KIND_DROP_USER => CatalogRecord::DropUser {
             at: SystemTimeMicros(cur.i64()?),
             name: cur.string()?,
         },
@@ -676,6 +797,51 @@ mod tests {
             append(&disk, r).expect("append");
         }
         assert_eq!(replay(&disk).expect("replay"), records);
+    }
+
+    #[test]
+    fn user_records_round_trip_in_order() {
+        // The STL-252 user store intermixes with table/index DDL in one log;
+        // replay must reproduce the exact sequence (create → rotate → drop),
+        // verifier bytes included.
+        let disk = MemDisk::new();
+        let verifier = ScramVerifier::derive("s3cret", b"0123456789abcdef", 4096);
+        let rotated = ScramVerifier::derive("rotated", b"fedcba9876543210", 4096);
+        let records = vec![
+            create_record(),
+            CatalogRecord::CreateUser {
+                at: SystemTimeMicros(10),
+                name: "alice".to_owned(),
+                verifier,
+            },
+            CatalogRecord::AlterUser {
+                at: SystemTimeMicros(20),
+                name: "alice".to_owned(),
+                verifier: rotated.clone(),
+            },
+            CatalogRecord::DropUser {
+                at: SystemTimeMicros(30),
+                name: "alice".to_owned(),
+            },
+        ];
+        for r in &records {
+            append(&disk, r).expect("append");
+        }
+        let replayed = replay(&disk).expect("replay");
+        assert_eq!(replayed, records);
+        // The verifier's key material survives byte-for-byte (PartialEq above
+        // covers it, but pin the fields the SASL exchange actually reads).
+        let CatalogRecord::AlterUser {
+            verifier: replayed_verifier,
+            ..
+        } = &replayed[2]
+        else {
+            panic!("expected the AlterUser record");
+        };
+        assert_eq!(replayed_verifier.iterations, 4096);
+        assert_eq!(replayed_verifier.salt, rotated.salt);
+        assert_eq!(replayed_verifier.stored_key, rotated.stored_key);
+        assert_eq!(replayed_verifier.server_key, rotated.server_key);
     }
 
     #[test]

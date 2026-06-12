@@ -95,6 +95,14 @@ minted on the runner, then `psql`, psycopg, and pgjdbc each connect with
 plaintext attempt is asserted to be refused with the server's `FATAL`
 (SQLSTATE `28000`).
 
+And a **SCRAM leg** (STL-252), which runs the documented operator bootstrap
+for real: a seed container (TLS, trust) runs `CREATE USER`, then a second
+container boots the **same data volume** with `[auth]` — proving verifiers
+survive a restart — and `psql`, psycopg, and pgjdbc each authenticate via
+SASL SCRAM-SHA-256 (the scripts take `user`/`password` as optional fourth and
+fifth arguments). A wrong password is asserted to be refused with the `FATAL`
+`28P01`.
+
 ---
 
 ## Cross-platform matrix
