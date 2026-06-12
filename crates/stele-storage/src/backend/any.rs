@@ -157,6 +157,13 @@ impl Disk for AnyDisk {
             Self::Mem(d) => d.remove(name),
         }
     }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        match self {
+            Self::Local(d) => d.sync_dir(),
+            Self::Mem(d) => d.sync_dir(),
+        }
+    }
 }
 
 /// A file handle within an [`AnyDisk`], dispatching [`DiskFile`] calls to the

@@ -98,7 +98,13 @@ pub(crate) fn append<D: Disk>(disk: &D, txn_id: TxnId) -> io::Result<()> {
     let frame = encode_frame(txn_id);
     let mut file = match disk.open(COMMIT_LOG_FILENAME) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => disk.create(COMMIT_LOG_FILENAME)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let file = disk.create(COMMIT_LOG_FILENAME)?;
+            // Directory fence ([STL-232]): the first marker's all-or-none
+            // claim is only as durable as the file's directory entry.
+            disk.sync_dir()?;
+            file
+        }
         Err(e) => return Err(e),
     };
     file.append(&frame)?;
@@ -204,6 +210,25 @@ mod tests {
             committed,
             [TxnId(3), TxnId(7), TxnId(42)].into_iter().collect()
         );
+    }
+
+    #[test]
+    fn the_first_marker_fences_the_directory_entry() {
+        // STL-232: the log file's directory entry is fenced at creation — a
+        // failed fence fails the append before any marker is acknowledged.
+        use stele_storage::backend::{FaultOp, Faults};
+
+        let faults = Faults::new();
+        let disk = MemDisk::with_faults(faults.clone());
+        faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
+        assert!(append(&disk, TxnId(1)).is_err(), "fence failure surfaces");
+        assert_eq!(replay(&disk).expect("replay"), BTreeSet::new());
+
+        // The file exists now; append-path markers never re-fence.
+        faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
+        append(&disk, TxnId(1)).expect("append-path marker");
+        assert_eq!(faults.pending(), 1, "no fence on the append path");
+        assert_eq!(replay(&disk).expect("replay"), [TxnId(1)].into());
     }
 
     #[test]

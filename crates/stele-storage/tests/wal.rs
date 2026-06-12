@@ -99,6 +99,11 @@ impl Disk for MemDisk {
         }
         Ok(())
     }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        // In-memory namespace — atomically durable, nothing to fence.
+        Ok(())
+    }
 }
 
 impl DiskFile for MemFile {
@@ -460,6 +465,9 @@ fn replay_surfaces_disk_list_failure() {
         fn remove(&self, name: &str) -> io::Result<()> {
             self.inner.remove(name)
         }
+        fn sync_dir(&self) -> io::Result<()> {
+            self.inner.sync_dir()
+        }
     }
     impl DiskFile for ExplodingFile {
         fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -515,4 +523,58 @@ fn replay_from_checkpoint_skips_prefix() {
         })
         .collect();
     assert_eq!(got, (5u32..10).collect::<Vec<_>>());
+}
+
+/// STL-232: rotation fences the directory after creating the new segment, so a
+/// record fsync'd into it can never sit in an unlinked file recovery would not
+/// list. A failed fence is a failed fsync — the WAL poisons exactly as it does
+/// for the closing segment's data fsync ([STL-217]).
+#[test]
+fn a_failed_rotation_directory_fence_poisons_the_wal() {
+    use stele_storage::backend::{FaultOp, Faults, MemDisk as BackendMemDisk};
+    use stele_storage::wal::WalError;
+
+    let faults = Faults::new();
+    let disk = BackendMemDisk::with_faults(faults.clone());
+    let wal = Wal::open(
+        disk,
+        WalConfig {
+            segment_size_bytes: 64,
+        },
+    )
+    .unwrap();
+
+    // Fill the current segment so the next append must rotate, then fail the
+    // fence the rotation issues after creating the new segment.
+    wal.append(&[0u8; 40]).unwrap();
+    faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
+    let err = wal
+        .append(&[0u8; 40])
+        .expect_err("the rotation's directory fence fails");
+    assert!(matches!(err, WalError::Io(_)), "{err}");
+
+    // Poisoned: every later write refuses until recovery.
+    assert!(matches!(wal.append(&[1]).unwrap_err(), WalError::Poisoned));
+    assert!(matches!(wal.tick().unwrap_err(), WalError::Poisoned));
+}
+
+/// STL-232: opening a fresh WAL fences segment 0's directory entry. A failed
+/// fence fails `open`; the entry it could not vouch for is rediscovered (or
+/// recreated) by the next open once the disk behaves.
+#[test]
+fn opening_a_fresh_wal_fences_the_directory() {
+    use stele_storage::backend::{FaultOp, Faults, MemDisk as BackendMemDisk};
+
+    let faults = Faults::new();
+    faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
+    let disk = BackendMemDisk::with_faults(faults);
+    assert!(
+        Wal::open(disk.clone(), WalConfig::default()).is_err(),
+        "a failed segment-0 fence fails open"
+    );
+    // The fault is consumed; a reopen finds the created segment (or would
+    // recreate it) and succeeds.
+    let wal = Wal::open(disk, WalConfig::default()).expect("reopen");
+    wal.append(b"x").expect("append");
+    wal.tick().expect("tick");
 }

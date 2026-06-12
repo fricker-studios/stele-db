@@ -86,6 +86,11 @@ impl Disk for MemDisk {
         }
         Ok(())
     }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        // In-memory namespace — atomically durable, nothing to fence.
+        Ok(())
+    }
 }
 
 impl DiskFile for MemFile {

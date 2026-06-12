@@ -344,7 +344,13 @@ pub(crate) fn append<D: Disk>(disk: &D, record: &CatalogRecord) -> io::Result<()
     let frame = encode_frame(record)?;
     let mut file = match disk.open(CATALOG_LOG_FILENAME) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => disk.create(CATALOG_LOG_FILENAME)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let file = disk.create(CATALOG_LOG_FILENAME)?;
+            // Directory fence ([STL-232]): the first acknowledged DDL is only
+            // as durable as the log file's directory entry.
+            disk.sync_dir()?;
+            file
+        }
         Err(e) => return Err(e),
     };
     file.append(&frame)?;
@@ -469,6 +475,28 @@ mod tests {
             append(&disk, r).expect("append");
         }
         assert_eq!(replay(&disk).expect("replay"), records);
+    }
+
+    #[test]
+    fn the_first_record_fences_the_directory_entry() {
+        // STL-232: the log file's directory entry is fenced at creation — a
+        // failed fence fails the append before any DDL is acknowledged.
+        use stele_storage::backend::{FaultOp, Faults};
+
+        let faults = Faults::new();
+        let disk = MemDisk::with_faults(faults.clone());
+        faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
+        assert!(
+            append(&disk, &create_record()).is_err(),
+            "fence failure surfaces"
+        );
+        assert_eq!(replay(&disk).expect("replay"), Vec::new());
+
+        // The file exists now; append-path records never re-fence.
+        faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
+        append(&disk, &create_record()).expect("append-path record");
+        assert_eq!(faults.pending(), 1, "no fence on the append path");
+        assert_eq!(replay(&disk).expect("replay"), vec![create_record()]);
     }
 
     #[test]

@@ -253,6 +253,12 @@ impl<D: Disk + Clone> Disk for NamespacedDisk<D> {
     fn remove(&self, name: &str) -> io::Result<()> {
         self.inner.remove(&self.scoped(name))
     }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        // Every namespace view shares the one physical directory — fencing the
+        // view fences it.
+        self.inner.sync_dir()
+    }
 }
 
 /// What [`SessionEngine::execute`] did with one statement.

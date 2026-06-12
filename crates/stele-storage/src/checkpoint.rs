@@ -140,7 +140,13 @@ pub(crate) fn store<D: Disk>(disk: &D, point: RecoveryPoint) -> io::Result<()> {
     let record = encode(point);
     let mut file = match disk.open(CHECKPOINT_FILENAME) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => disk.create(CHECKPOINT_FILENAME)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let file = disk.create(CHECKPOINT_FILENAME)?;
+            // Directory fence ([STL-232]): the first checkpoint's claim is
+            // only as durable as the file's directory entry.
+            disk.sync_dir()?;
+            file
+        }
         Err(e) => return Err(e),
     };
     file.append(&record)?;
@@ -236,6 +242,32 @@ mod tests {
         let newest = point(offset(0, 200), offset(1, 50), 1);
         store(&disk, newest).expect("store");
         assert_eq!(load(&disk).expect("load"), Some(newest));
+    }
+
+    #[test]
+    fn the_first_store_fences_the_directory_and_later_stores_do_not() {
+        // STL-232: the file's directory entry is fenced exactly once, at
+        // creation — a failed fence fails the first checkpoint before anything
+        // is acknowledged; append-path stores never consult the fence again.
+        use crate::backend::{FaultOp, Faults};
+
+        let faults = Faults::new();
+        let disk = MemDisk::with_faults(faults.clone());
+        let p = point(offset(0, 0), offset(0, 10), 0);
+
+        faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
+        assert!(
+            store(&disk, p).is_err(),
+            "a failed creation fence fails the checkpoint"
+        );
+        assert_eq!(load(&disk).expect("load"), None, "nothing acknowledged");
+
+        // The file exists now; later stores append without re-fencing, so a
+        // pending SyncDir fault is never consumed.
+        faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
+        store(&disk, p).expect("append-path store");
+        assert_eq!(faults.pending(), 1, "no fence on the append path");
+        assert_eq!(load(&disk).expect("load"), Some(p));
     }
 
     #[test]

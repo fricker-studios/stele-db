@@ -105,6 +105,59 @@ fn flush_above_the_bound_splits_into_multiple_row_groups() {
     }
 }
 
+/// STL-232: `flush` fences the directory between sealing the segment and the
+/// checkpoint vouching for it, so the manifest can never name a segment whose
+/// directory entry might not survive a crash. A failed fence aborts the flush
+/// *before* the vouch: a crash right there recovers everything from the WAL
+/// (the sealed-but-unvouched segment is exactly the orphan recovery ignores),
+/// and once the disk behaves a retried flush completes cleanly.
+#[test]
+fn a_failed_directory_fence_aborts_flush_before_the_checkpoint_vouches() {
+    use std::io;
+
+    use stele_storage::backend::{FaultOp, Faults};
+
+    let faults = Faults::new();
+    let disk = MemDisk::with_faults(faults.clone());
+    let commits = {
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1_000), false).expect("open");
+        let commits = insert_keys(&mut engine, 3);
+
+        faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
+        assert!(
+            engine.flush().is_err(),
+            "a failed segment fence aborts the flush"
+        );
+        commits
+        // engine dropped — the crash, before any checkpoint vouched the segment.
+    };
+
+    // Recovery: the manifest never advanced, so the WAL replays every insert;
+    // the orphan segment the aborted flush left is ignored ([STL-177]).
+    let mut recovered = Engine::recover(disk, StepClock::new(1_000_000), false).expect("recover");
+    for (i, commit) in commits.iter().enumerate() {
+        assert_eq!(
+            recovered
+                .as_of_payload(&key(i), Snapshot(*commit))
+                .expect("as_of"),
+            Some(Some(format!("v{i}").into_bytes())),
+            "key {i} must survive the aborted flush via WAL replay",
+        );
+    }
+
+    // The fault is consumed — a retried flush seals and vouches cleanly.
+    recovered.flush().expect("retry flush");
+    for (i, commit) in commits.into_iter().enumerate() {
+        assert_eq!(
+            recovered
+                .as_of_payload(&key(i), Snapshot(commit))
+                .expect("as_of"),
+            Some(Some(format!("v{i}").into_bytes())),
+            "key {i} must resolve identically after the clean flush",
+        );
+    }
+}
+
 /// The default flush policy leaves a narrow flush a single row-group — the v0.1
 /// shape, byte-identical to before STL-197 — so existing segments and oracles are
 /// untouched until a flush actually exceeds the (1024-row) default bound.

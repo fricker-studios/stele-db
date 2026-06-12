@@ -138,9 +138,15 @@ impl<D: Disk> Wal<D> {
     /// callers needing to verify the log should use [`Wal::replay_from`] first.
     pub fn open(disk: D, config: WalConfig) -> Result<Self, WalError> {
         let segments = list_segments(&disk)?;
-        let (current_segment_index, current) = match segments.last().copied() {
-            Some(idx) => (idx, disk.open(&segment::name_for(idx))?),
-            None => (0, disk.create(&segment::name_for(0))?),
+        let (current_segment_index, current) = if let Some(idx) = segments.last().copied() {
+            (idx, disk.open(&segment::name_for(idx))?)
+        } else {
+            let file = disk.create(&segment::name_for(0))?;
+            // Directory fence ([STL-232]): recovery rediscovers the log by
+            // listing the disk, so segment 0's *entry* must be durable
+            // before any record fsync'd into it can count as durable.
+            disk.sync_dir()?;
+            (0, file)
         };
         let end = LogOffset {
             segment_index: current_segment_index,
@@ -373,6 +379,16 @@ fn rotate<D: Disk>(g: &mut Inner<D>, wakers: &mut Vec<Waker>) -> Result<(), WalE
     }
     let new_idx = g.current_segment_index + 1;
     let new_file = g.disk.create(&segment::name_for(new_idx))?;
+    // Directory fence ([STL-232]): the new segment's *entry* must be durable
+    // before any record fsync'd into it can count as durable — recovery finds
+    // segments by listing the disk, so a synced record in an unlinked file
+    // would be silently lost. A failed fence is a failed fsync: poison, same
+    // as the closing-segment sync above ([STL-217]).
+    if let Err(e) = g.disk.sync_dir() {
+        g.poisoned = true;
+        wakers.extend(drain_all_waiters(g));
+        return Err(WalError::Io(e));
+    }
 
     // From here on the rotation is committed. The closing segment is durable,
     // so every record in it is durable — advance `durable_end` past the

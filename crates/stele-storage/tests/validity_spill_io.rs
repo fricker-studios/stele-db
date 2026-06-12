@@ -100,6 +100,11 @@ impl Disk for CountingDisk {
         }
         Ok(())
     }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        // In-memory namespace — atomically durable, nothing to fence.
+        Ok(())
+    }
 }
 
 impl DiskFile for CountingFile {

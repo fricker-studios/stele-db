@@ -40,6 +40,8 @@ pub enum FaultOp {
     List,
     /// [`Disk::remove`].
     Remove,
+    /// [`Disk::sync_dir`].
+    SyncDir,
 }
 
 /// One scheduled failure: the next time `op` runs, it returns an error of
@@ -187,6 +189,13 @@ impl Disk for MemDisk {
             return Err(io::Error::new(io::ErrorKind::NotFound, name.to_owned()));
         }
         Ok(())
+    }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        // The heap namespace is atomically durable — the fence has nothing to
+        // flush. The fault hook stays, so a test can prove a caller fences
+        // where the contract demands it.
+        self.faults.check(FaultOp::SyncDir)
     }
 }
 
