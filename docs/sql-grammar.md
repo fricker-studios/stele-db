@@ -171,7 +171,7 @@ into a `DdlStatement` that `apply`s to a `stele-catalog` `Catalog`:
   the identity-demo `CREATE TABLE account (id INT PRIMARY KEY, balance INT) …`
   binds.
 
-### `CREATE INDEX` / `DROP INDEX` — secondary indexes (STL-233)
+### `CREATE INDEX` / `DROP INDEX` — secondary indexes (STL-233, STL-237)
 
 ```sql
 CREATE INDEX i_balance ON account (balance);
@@ -189,6 +189,16 @@ query's *speed*, never its *results* — the indexed≡unindexed equivalence
 oracle pins exactly that. `DROP TABLE` drops the table's indexes with it; the
 re-created name starts index-free. `DROP INDEX IF EXISTS` of an absent index
 is a no-op.
+
+A read uses the index rule-based, when the `WHERE` is a bare
+`<indexed column> <cmp> <literal>` comparison: `=` probes the entry exactly
+(STL-233), and `<` `<=` `>` `>=` probe a candidate range walked in the
+column type's *value* order (STL-237) — the ordered structure keys its
+entries memcomparably, so integer and temporal columns range correctly
+across the sign boundary. `FLOAT8` and `PERIOD` columns decline range
+service (their encodings don't byte-order by value; equality still probes),
+`<>` never probes (no window covers a complement), and a predicate-driven
+`UPDATE`/`DELETE` (STL-229) routes its scan through the same probe.
 
 Rejected with a roadmap pointer until their sibling tickets land: `UNIQUE`,
 `USING <kind>` (hash/bloom is STL-238, the valid-time interval kind STL-241),
