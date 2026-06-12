@@ -31,6 +31,3 @@ pub mod systime;
 pub mod validity;
 pub mod validtime;
 pub mod wal;
-
-// Submodule placeholders — each becomes its own ticket under STL-76.
-// pub mod compaction;

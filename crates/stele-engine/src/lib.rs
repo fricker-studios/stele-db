@@ -1163,9 +1163,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// recovery reopens and replays that tier's WAL too, so flushing it bounds
     /// that work even though the catalog no longer resolves the name.
     ///
-    /// A background *policy* that decides *when* to flush, and a SQL/admin `FLUSH`
-    /// command so a wire client can trigger it, are out of scope here
-    /// ([STL-177] / [STL-219]); history-preserving compaction is v0.3.
+    /// A background *policy* that decides *when* to flush is out of scope here
+    /// ([STL-177] / [STL-219]); the wire `FLUSH` admin command drives this
+    /// ([STL-219]), and history-preserving compaction builds on it
+    /// ([`compact`](Self::compact), [STL-231]).
     ///
     /// Each table's flush is its own crash-atomic, idempotent unit (the new
     /// segment is adopted only once its checkpoint record is durable —
@@ -1187,6 +1188,42 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         }
         self.metrics
             .flush_seconds
+            .observe_micros(self.metrics.now_micros().saturating_sub(started));
+        Ok(())
+    }
+
+    /// **Compact** every resident table: flush its delta, then merge its sealed
+    /// segments into one consolidated, read-optimized segment, atomically
+    /// swapping the live set and retiring the inputs ([`Engine::compact`],
+    /// [STL-231], [ADR-0030]). The flush first folds the delta tier in, so
+    /// `COMPACT` leaves each table with at most one sealed segment and an empty
+    /// delta — the "merge delta + small sealed segments" shape of the ticket.
+    ///
+    /// Drives **every resident tier**, including a dropped table's retained
+    /// tier, for the same reason [`flush`](Self::flush) does: recovery reopens
+    /// that tier too, and compacting it bounds that work.
+    ///
+    /// Each table's flush and compaction are their own crash-atomic units (the
+    /// swap is one durable manifest record — [`Engine::compact`]), so a failure
+    /// part-way leaves the already-compacted tables compacted; the call returns
+    /// the first error and a re-run re-compacts whatever was left. Background
+    /// *scheduling* of compaction is a deliberate follow-up; this is the manual
+    /// admin trigger ([STL-231] scope).
+    ///
+    /// [STL-231]: https://allegromusic.atlassian.net/browse/STL-231
+    /// [ADR-0030]: ../../../docs/adr/0030-segment-manifest-retirement.md
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Storage`] if any table's flush or compaction fails.
+    pub fn compact(&mut self) -> Result<(), EngineError> {
+        let started = self.metrics.now_micros();
+        for state in self.tables.values_mut() {
+            state.engine.flush()?;
+            state.engine.compact()?;
+        }
+        self.metrics
+            .compaction_seconds
             .observe_micros(self.metrics.now_micros().saturating_sub(started));
         Ok(())
     }
@@ -1540,8 +1577,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         read_snapshot: SystemTimeMicros,
         overlay: &[BoundDml],
     ) -> Result<StatementOutcome, EngineError> {
-        // Admin commands (CHECKPOINT / FLUSH) have no SQL body, so they are routed
-        // before the binders, which all assume one ([STL-219]).
+        // Admin commands (CHECKPOINT / FLUSH / COMPACT) have no SQL body, so they
+        // are routed before the binders, which all assume one ([STL-219]).
         if let StatementBody::Admin(cmd) = &stmt.body {
             return self.apply_admin(*cmd);
         }
@@ -1842,14 +1879,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     ///
     /// `CHECKPOINT` → [`checkpoint`](Self::checkpoint) (the lightweight WAL fence);
     /// `FLUSH` → [`flush`](Self::flush) (seal each delta into a segment + bound
-    /// recovery). The outcome reuses [`StatementOutcome::Ddl`] purely to carry the
-    /// static tag the wire layer renders — no catalog change happens.
+    /// recovery); `COMPACT` → [`compact`](Self::compact) (flush, then merge each
+    /// table's sealed segments into one, retiring the inputs — [STL-231]). The
+    /// outcome reuses [`StatementOutcome::Ddl`] purely to carry the static tag
+    /// the wire layer renders — no catalog change happens.
     ///
     /// [STL-219]: https://allegromusic.atlassian.net/browse/STL-219
+    /// [STL-231]: https://allegromusic.atlassian.net/browse/STL-231
     ///
     /// # Errors
     ///
-    /// [`EngineError::Storage`] if a table's checkpoint or flush fails.
+    /// [`EngineError::Storage`] if a table's checkpoint, flush, or compaction
+    /// fails.
     fn apply_admin(&mut self, cmd: AdminCommand) -> Result<StatementOutcome, EngineError> {
         let tag = match cmd {
             AdminCommand::Checkpoint => {
@@ -1859,6 +1900,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             AdminCommand::Flush => {
                 self.flush()?;
                 "FLUSH"
+            }
+            AdminCommand::Compact => {
+                self.compact()?;
+                "COMPACT"
             }
         };
         Ok(StatementOutcome::Ddl { tag })
@@ -8491,6 +8536,43 @@ mod tests {
             st.engine.replay_floor() > LogOffset::ZERO,
             "FLUSH advanced the recovery floor off the origin",
         );
+    }
+
+    #[test]
+    fn execute_routes_compact_and_it_consolidates_segments() {
+        // STL-231: COMPACT routes through `execute` like the other admin
+        // commands, folds the staged delta in (the internal flush), merges the
+        // accumulated segments into one, and the table reads identically after.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+        engine.execute(&parse_one("FLUSH")).expect("flush");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (2, 250)"))
+            .expect("insert");
+        engine.execute(&parse_one("FLUSH")).expect("flush");
+        engine
+            .execute(&parse_one("UPDATE account SET balance = 175 WHERE id = 1"))
+            .expect("update staged in the delta");
+        {
+            let st = engine.tables.get("account").expect("tier resident");
+            assert_eq!(st.engine.segment_names().len(), 2, "two flushed segments");
+        }
+        let before = sorted(select(&mut engine, "SELECT id, balance FROM account").rows);
+
+        let outcome = engine.execute(&parse_one("COMPACT")).expect("compact");
+        assert_eq!(outcome, StatementOutcome::Ddl { tag: "COMPACT" });
+        let st = engine.tables.get("account").expect("tier resident");
+        assert_eq!(
+            st.engine.segment_names().len(),
+            1,
+            "COMPACT consolidated the segments (delta folded in via flush)",
+        );
+        let after = sorted(select(&mut engine, "SELECT id, balance FROM account").rows);
+        assert_eq!(before, after, "the read surface is unchanged by COMPACT");
+        assert_eq!(before, vec![vec![i4(1), i4(175)], vec![i4(2), i4(250)]]);
     }
 
     #[test]

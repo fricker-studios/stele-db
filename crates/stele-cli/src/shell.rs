@@ -641,6 +641,8 @@ fn sql_help(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
             (Role::Kw, "CHECKPOINT".to_owned()),
             (Role::Mut, ";   ".to_owned()),
             (Role::Kw, "FLUSH".to_owned()),
+            (Role::Mut, ";   ".to_owned()),
+            (Role::Kw, "COMPACT".to_owned()),
             (Role::Dim, ";".to_owned()),
         ],
         vec![(
@@ -1195,6 +1197,7 @@ const SQL_KEYWORDS: &[&str] = &[
     "SAVEPOINT",
     "CHECKPOINT",
     "FLUSH",
+    "COMPACT",
     "PERIOD",
     "now()",
     "interval",

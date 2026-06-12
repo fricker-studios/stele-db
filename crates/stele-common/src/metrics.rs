@@ -262,6 +262,11 @@ pub struct Metrics {
     pub flush_seconds: Histogram,
     /// Checkpoint (durability fence) duration; `_count` is successful runs.
     pub checkpoint_seconds: Histogram,
+    /// Compaction (merge sealed segments, swap live set) duration; `_count` is
+    /// successful runs ([STL-231]).
+    ///
+    /// [STL-231]: https://allegromusic.atlassian.net/browse/STL-231
+    pub compaction_seconds: Histogram,
 
     /// Sealed segments actually scanned by snapshot reads.
     pub scan_segments_scanned: Counter,
@@ -426,6 +431,18 @@ impl Metrics {
             "stele_checkpoint_seconds",
             None,
             &self.checkpoint_seconds,
+        );
+        header(
+            &mut out,
+            "stele_compaction_seconds",
+            "Compaction (merge sealed segments into one, retiring inputs) duration.",
+            "histogram",
+        );
+        histogram_series(
+            &mut out,
+            "stele_compaction_seconds",
+            None,
+            &self.compaction_seconds,
         );
 
         counter(

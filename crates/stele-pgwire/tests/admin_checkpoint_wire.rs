@@ -1,8 +1,8 @@
-//! The operator-facing storage admin commands over the wire (STL-219).
+//! The operator-facing storage admin commands over the wire (STL-219, STL-231).
 //!
 //! A stock `tokio-postgres` client connects to a live [`Server`] and issues
-//! `CHECKPOINT` / `FLUSH` over the **simple-query** protocol. The test proves the
-//! two halves of the ticket's Definition of Done:
+//! `CHECKPOINT` / `FLUSH` / `COMPACT` over the **simple-query** protocol. The
+//! tests prove the two halves of each ticket's Definition of Done:
 //!
 //! * **Returns cleanly.** Each command completes without a wire error and the
 //!   driver receives a `CommandComplete` (no rows) — the full parse → route →
@@ -12,9 +12,15 @@
 //!   seals each table's delta into a `seg-*.seg` segment (bounded recovery,
 //!   STL-177/195), while the lightweight `CHECKPOINT` seals nothing.
 //!
-//! The exact `CommandComplete` tag strings (`CHECKPOINT` / `FLUSH`) are pinned by
-//! the `stele-engine` unit test; `tokio-postgres` surfaces a tag's row count, not
-//! its text, so the wire assertion here is "completed, no rows".
+//! * **Compacts.** `COMPACT` (STL-231) folds the delta in and merges the
+//!   accumulated `seg-*.seg` files into one consolidated segment, retiring the
+//!   inputs — observed as the file count dropping to one per table — while the
+//!   table reads back identically.
+//!
+//! The exact `CommandComplete` tag strings (`CHECKPOINT` / `FLUSH` / `COMPACT`)
+//! are pinned by the `stele-engine` unit tests; `tokio-postgres` surfaces a
+//! tag's row count, not its text, so the wire assertion here is "completed, no
+//! rows".
 
 use std::sync::{Arc, Mutex};
 
@@ -104,4 +110,80 @@ async fn checkpoint_and_flush_drive_the_engine_over_the_wire() {
 
     drop(client);
     let _ = driver.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_merges_segments_over_the_wire_and_reads_are_unchanged() {
+    // STL-231: the manual admin trigger. Two FLUSHes accumulate two sealed
+    // segments; COMPACT swaps them for one consolidated segment (retiring the
+    // inputs from the backing disk) without changing a single visible row.
+    let disk = MemDisk::new();
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(disk.clone(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+
+    let (client, connection) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect to the stele pgwire server");
+    let driver = tokio::spawn(connection);
+
+    client
+        .batch_execute(
+            "CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+        )
+        .await
+        .expect("create table");
+    client
+        .simple_query("INSERT INTO account VALUES (1, 100)")
+        .await
+        .expect("insert");
+    client.simple_query("FLUSH").await.expect("first flush");
+    client
+        .simple_query("INSERT INTO account VALUES (2, 250)")
+        .await
+        .expect("insert");
+    client.simple_query("FLUSH").await.expect("second flush");
+    client
+        .simple_query("UPDATE account SET balance = 175 WHERE id = 1")
+        .await
+        .expect("update staged in the delta");
+    assert_eq!(segment_files(&disk), 2, "two flushed segments accumulated");
+
+    let before = read_account(&client).await;
+
+    let messages = client.simple_query("COMPACT").await.expect("compact");
+    assert_completed_no_rows(&messages, "COMPACT");
+    assert_eq!(
+        segment_files(&disk),
+        1,
+        "COMPACT merged the segments (and the flushed delta) into one, retiring the inputs",
+    );
+    assert_eq!(
+        read_account(&client).await,
+        before,
+        "the visible rows are unchanged by COMPACT",
+    );
+
+    drop(client);
+    let _ = driver.await;
+}
+
+/// Read `account` sorted by id as `(id, balance)` text cells.
+async fn read_account(client: &tokio_postgres::Client) -> Vec<(String, String)> {
+    let messages = client
+        .simple_query("SELECT id, balance FROM account")
+        .await
+        .expect("select");
+    let mut rows: Vec<(String, String)> = messages
+        .iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(row) => Some((
+                row.get(0).expect("id cell").to_owned(),
+                row.get(1).expect("balance cell").to_owned(),
+            )),
+            _ => None,
+        })
+        .collect();
+    rows.sort();
+    rows
 }
