@@ -14,7 +14,7 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     image: stele:dev
-    # command: ["--dev"]
+    command: ["--dev"]
     ports:
       - "5454:5454"
     volumes:

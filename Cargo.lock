@@ -2372,7 +2372,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stele-catalog"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "stele-common",
  "thiserror",
@@ -2380,7 +2380,7 @@ dependencies = [
 
 [[package]]
 name = "stele-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2399,14 +2399,14 @@ dependencies = [
 
 [[package]]
 name = "stele-common"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "stele-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "stele-catalog",
  "stele-common",
@@ -2418,7 +2418,7 @@ dependencies = [
 
 [[package]]
 name = "stele-exec"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "stele-common",
  "stele-storage",
@@ -2428,7 +2428,7 @@ dependencies = [
 
 [[package]]
 name = "stele-exec-oracle"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "duckdb",
  "stele-common",
@@ -2440,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "stele-lineage"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "stele-common",
  "stele-txn",
@@ -2448,7 +2448,7 @@ dependencies = [
 
 [[package]]
 name = "stele-pgwire"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "rcgen",
@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "stele-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2489,7 +2489,7 @@ dependencies = [
 
 [[package]]
 name = "stele-sim"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "stele-catalog",
@@ -2502,7 +2502,7 @@ dependencies = [
 
 [[package]]
 name = "stele-sql"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "sqlparser",
  "stele-catalog",
@@ -2512,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "stele-storage"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "stele-common",
  "thiserror",
@@ -2520,7 +2520,7 @@ dependencies = [
 
 [[package]]
 name = "stele-txn"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "stele-common",
  "stele-storage",
