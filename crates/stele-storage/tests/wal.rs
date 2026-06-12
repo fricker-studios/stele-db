@@ -562,19 +562,30 @@ fn a_failed_rotation_directory_fence_poisons_the_wal() {
 /// fence fails `open`; the entry it could not vouch for is rediscovered (or
 /// recreated) by the next open once the disk behaves.
 #[test]
-fn opening_a_fresh_wal_fences_the_directory() {
+fn opening_a_wal_fences_the_directory_on_both_paths() {
     use stele_storage::backend::{FaultOp, Faults, MemDisk as BackendMemDisk};
 
     let faults = Faults::new();
     faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
-    let disk = BackendMemDisk::with_faults(faults);
+    let disk = BackendMemDisk::with_faults(faults.clone());
     assert!(
         Wal::open(disk.clone(), WalConfig::default()).is_err(),
         "a failed segment-0 fence fails open"
     );
-    // The fault is consumed; a reopen finds the created segment (or would
-    // recreate it) and succeeds.
-    let wal = Wal::open(disk, WalConfig::default()).expect("reopen");
+    // The fault is consumed; a reopen finds the created segment and the
+    // boot-time fence vouches for it — exactly the heal for an entry a prior
+    // incarnation created but never fenced.
+    let wal = Wal::open(disk.clone(), WalConfig::default()).expect("reopen");
     wal.append(b"x").expect("append");
     wal.tick().expect("tick");
+    drop(wal);
+
+    // The fence runs on the *reopen* path too (no create involved): a
+    // scheduled fault fails this open as well.
+    faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
+    assert!(
+        Wal::open(disk.clone(), WalConfig::default()).is_err(),
+        "a failed reopen fence fails open"
+    );
+    Wal::open(disk, WalConfig::default()).expect("reopen after fault clears");
 }

@@ -143,8 +143,16 @@ pub(crate) fn store<D: Disk>(disk: &D, point: RecoveryPoint) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let file = disk.create(CHECKPOINT_FILENAME)?;
             // Directory fence ([STL-232]): the first checkpoint's claim is
-            // only as durable as the file's directory entry.
-            disk.sync_dir()?;
+            // only as durable as the file's directory entry. On fence failure,
+            // undo the create (best-effort) so a retry re-creates and
+            // re-fences — otherwise the retry would take the `open` path,
+            // which never fences, and could claim durability for an entry no
+            // fence ever vouched for.
+            if let Err(e) = disk.sync_dir() {
+                drop(file);
+                let _ = disk.remove(CHECKPOINT_FILENAME);
+                return Err(e);
+            }
             file
         }
         Err(e) => return Err(e),
@@ -245,11 +253,12 @@ mod tests {
     }
 
     #[test]
-    fn the_first_store_fences_the_directory_and_later_stores_do_not() {
-        // STL-232: the file's directory entry is fenced exactly once, at
-        // creation — a failed fence fails the first checkpoint before anything
-        // is acknowledged; append-path stores never consult the fence again.
-        use crate::backend::{FaultOp, Faults};
+    fn the_creating_store_fences_the_directory_and_append_stores_do_not() {
+        // STL-232: the file's directory entry is fenced at creation — a failed
+        // fence fails the checkpoint before anything is acknowledged AND undoes
+        // the create, so a retry re-creates and re-fences rather than slipping
+        // through the fence-free append path on an unvouched entry.
+        use crate::backend::{Disk as _, FaultOp, Faults};
 
         let faults = Faults::new();
         let disk = MemDisk::with_faults(faults.clone());
@@ -261,9 +270,21 @@ mod tests {
             "a failed creation fence fails the checkpoint"
         );
         assert_eq!(load(&disk).expect("load"), None, "nothing acknowledged");
+        assert!(
+            disk.list().expect("list").is_empty(),
+            "the failed create was undone — no unfenced entry lingers"
+        );
 
-        // The file exists now; later stores append without re-fencing, so a
-        // pending SyncDir fault is never consumed.
+        // Because the create was undone, a retry goes through create + fence
+        // again — a second scheduled fault fails it again (and is consumed).
+        faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
+        assert!(store(&disk, p).is_err(), "the retry re-fences");
+        assert_eq!(faults.pending(), 0);
+
+        // Healthy disk: the store creates, fences, appends, and is loadable.
+        store(&disk, p).expect("store");
+        // Later stores append without re-fencing, so a pending SyncDir fault
+        // is never consumed.
         faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
         store(&disk, p).expect("append-path store");
         assert_eq!(faults.pending(), 1, "no fence on the append path");

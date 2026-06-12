@@ -347,8 +347,16 @@ pub(crate) fn append<D: Disk>(disk: &D, record: &CatalogRecord) -> io::Result<()
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let file = disk.create(CATALOG_LOG_FILENAME)?;
             // Directory fence ([STL-232]): the first acknowledged DDL is only
-            // as durable as the log file's directory entry.
-            disk.sync_dir()?;
+            // as durable as the log file's directory entry. On fence failure,
+            // undo the create (best-effort) so a retry re-creates and
+            // re-fences — otherwise the retry would take the `open` path,
+            // which never fences, and could acknowledge onto an entry no
+            // fence ever vouched for.
+            if let Err(e) = disk.sync_dir() {
+                drop(file);
+                let _ = disk.remove(CATALOG_LOG_FILENAME);
+                return Err(e);
+            }
             file
         }
         Err(e) => return Err(e),
@@ -480,7 +488,9 @@ mod tests {
     #[test]
     fn the_first_record_fences_the_directory_entry() {
         // STL-232: the log file's directory entry is fenced at creation — a
-        // failed fence fails the append before any DDL is acknowledged.
+        // failed fence fails the append before any DDL is acknowledged and
+        // undoes the create, so a retry re-creates and re-fences rather than
+        // acknowledging onto an entry no fence ever vouched for.
         use stele_storage::backend::{FaultOp, Faults};
 
         let faults = Faults::new();
@@ -492,11 +502,25 @@ mod tests {
         );
         assert_eq!(replay(&disk).expect("replay"), Vec::new());
 
-        // The file exists now; append-path records never re-fence.
+        // The failed create was undone — the retry re-creates and re-fences,
+        // consuming a second scheduled fault.
+        faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
+        assert!(
+            append(&disk, &create_record()).is_err(),
+            "the retry re-fences"
+        );
+        assert_eq!(faults.pending(), 0);
+
+        // Healthy disk: create + fence + acknowledge; append-path records
+        // never re-fence (a pending SyncDir fault stays unconsumed).
+        append(&disk, &create_record()).expect("record");
         faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
         append(&disk, &create_record()).expect("append-path record");
         assert_eq!(faults.pending(), 1, "no fence on the append path");
-        assert_eq!(replay(&disk).expect("replay"), vec![create_record()]);
+        assert_eq!(
+            replay(&disk).expect("replay"),
+            vec![create_record(), create_record()]
+        );
     }
 
     #[test]
