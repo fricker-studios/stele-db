@@ -30,7 +30,7 @@ Detail on the *products* (desktop app, operator, SDKs, sites, playground) lives 
 
 The container image is the canonical "run Stele without a toolchain" path ([05](05-dev-environment.md#the-canonical-docker-image)).
 
-**Registries:** `ghcr.io/<org>/stele` is canonical; Docker Hub (`steledb/stele`) is a mirror. Both receive identical, signed, multi-arch (`linux/amd64`, `linux/arm64`) images.
+**Registries:** `ghcr.io/fricker-studios/stele` is canonical; Docker Hub ([`frickerstudios/stele`](https://hub.docker.com/r/frickerstudios/stele) — Hub namespaces can't carry the hyphen) is a mirror. Both receive identical, signed, multi-arch (`linux/amd64`, `linux/arm64`) images from the same buildx push, so digests match across registries. The Hub landing page is `docker/README.md`, re-synced by the release pipeline on every tag.
 
 **Image variants:**
 
@@ -85,7 +85,7 @@ The goal: every platform has a *native* install path, not just "download a tarba
 | **crates.io** | `stele-client` (+ libraries) | Rust SDK and reusable crates only — not the server. |
 | **Helm repo** (OCI) | Helm chart | `helm install` path ([09 §operator](09-ecosystem-and-products.md#5-kubernetes--openshift-operator)). |
 | **OperatorHub / Red Hat Catalog** | operator (OLM bundle) | Certified OpenShift listing ([ADR-0013](adr/0013-kubernetes-openshift-operator.md)). |
-| **Container registries** | images | `ghcr.io` canonical + Docker Hub mirror. |
+| **Container registries** | images | `ghcr.io` canonical + Docker Hub mirror (`frickerstudios/stele`). |
 | **GitHub Releases** | everything (source of truth) | Signed artifacts, checksums, SBOM, changelog. |
 | **Cloud marketplaces** | VM images | Later ([09 §8](09-ecosystem-and-products.md#8-cloud-marketplace-images)). |
 

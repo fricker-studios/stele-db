@@ -180,7 +180,7 @@ The shell speaks to the engine over pg-wire (so it's also a reference client), a
 
 ## The canonical Docker image
 
-The single blessed way to run Stele without a Rust toolchain. Multi-stage, minimal final image, multi-arch, published to `ghcr.io` on release ([04](04-cicd.md)).
+The single blessed way to run Stele without a Rust toolchain. Multi-stage, minimal final image, multi-arch, published on release ([04](04-cicd.md)) to `ghcr.io/fricker-studios/stele` (canonical) and mirrored to Docker Hub as [`frickerstudios/stele`](https://hub.docker.com/r/frickerstudios/stele).
 
 ```dockerfile
 # docker/Dockerfile
@@ -200,9 +200,9 @@ CMD ["--config", "/etc/stele/stele.toml"]
 Run it:
 
 ```bash
-docker run --rm -p 5454:5454 ghcr.io/<org>/stele:latest --dev
-# or pin a release:
-docker run --rm -p 5454:5454 ghcr.io/<org>/stele:v0.1.0 --dev
+docker run --rm -p 5454:5454 frickerstudios/stele:latest --dev
+# or from the canonical registry, pinned to a release:
+docker run --rm -p 5454:5454 ghcr.io/fricker-studios/stele:v0.2.0 --dev
 ```
 
 A `docker-compose.yml` is provided for a one-command local stack (engine + MinIO as an S3-compatible store once tiering lands):
@@ -211,7 +211,7 @@ A `docker-compose.yml` is provided for a one-command local stack (engine + MinIO
 # docker-compose.yml (excerpt)
 services:
   stele:
-    image: ghcr.io/<org>/stele:latest
+    image: ghcr.io/fricker-studios/stele:latest
     command: ["--dev"]
     ports: ["5454:5454"]
     depends_on: [minio]
