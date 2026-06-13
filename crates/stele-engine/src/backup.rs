@@ -216,6 +216,15 @@ impl BackupManifest {
                 files.len()
             )));
         }
+        // Reject duplicate names: the inventory must be unambiguous, and a duplicate
+        // would otherwise surface late and opaquely as `AlreadyExists` when restore
+        // re-creates the name.
+        let mut seen = std::collections::BTreeSet::new();
+        for f in &files {
+            if !seen.insert(f.name.as_str()) {
+                return Err(malformed(&format!("duplicate file name {:?}", f.name)));
+            }
+        }
 
         Ok(Self {
             manifest_version,
@@ -300,11 +309,20 @@ pub(crate) fn read_all<D: Disk>(disk: &D, name: &str) -> io::Result<Vec<u8>> {
     while off < len {
         let read = file.read_at(off, &mut buf[usize::try_from(off).unwrap_or(usize::MAX)..])?;
         if read == 0 {
-            break; // short read at EOF (e.g. the file shrank); stop at what we have.
+            // A 0-byte read before reaching `len` means the file is shorter than it
+            // reported — it changed under us, or the read was inconsistent. On the
+            // backup/restore integrity path that must fail closed: hashing a
+            // truncated buffer would otherwise produce a "valid" backup missing
+            // data. (Backup holds the session lock and the set is append-only, so
+            // this should not happen — but a silent truncation here is exactly the
+            // class of bug a backup tool must never have.)
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("short read on {name:?}: expected {len} bytes, got {off}"),
+            ));
         }
         off += read as u64;
     }
-    buf.truncate(usize::try_from(off).unwrap_or(cap));
     Ok(buf)
 }
 
@@ -488,6 +506,24 @@ mod tests {
             BackupManifest::decode(tampered.as_bytes()),
             Err(RestoreError::ManifestDigestMismatch)
         ));
+    }
+
+    #[test]
+    fn decode_rejects_duplicate_file_names() {
+        // A well-formed-looking manifest that lists the same file twice is
+        // ambiguous; decode rejects it rather than letting restore fail late and
+        // opaquely on the second create.
+        let mut m = sample_manifest();
+        m.files.push(FileEntry {
+            name: m.files[0].name.clone(),
+            len: 1,
+            sha256: sha256(b"x"),
+        });
+        let err = BackupManifest::decode(m.encode().as_bytes()).unwrap_err();
+        assert!(
+            matches!(&err, RestoreError::ManifestMalformed(msg) if msg.contains("duplicate")),
+            "expected a duplicate-name error, got {err:?}"
+        );
     }
 
     #[test]

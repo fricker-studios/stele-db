@@ -168,7 +168,7 @@ fn run_restore(args: &RestoreArgs) -> anyhow::Result<()> {
 
     anyhow::ensure!(
         args.from.is_dir(),
-        "backup directory {} does not exist",
+        "backup directory {} does not exist or is not a directory",
         args.from.display()
     );
     let src = LocalDisk::open(&args.from)

@@ -240,7 +240,9 @@ fn parses_checkpoint_and_flush_as_admin_commands() {
         );
         assert!(stmts[0].sql().is_none(), "{sql:?} has no SQL body");
         match &stmts[0].body {
-            StatementBody::Admin(cmd) => assert_eq!(*cmd, want, "{sql:?}"),
+            // `AdminCommand` is no longer `Copy` (the `Backup` variant owns a
+            // path), so compare by reference rather than dereferencing.
+            StatementBody::Admin(cmd) => assert_eq!(cmd, &want, "{sql:?}"),
             other => panic!("{sql:?} must be an admin command, got {other:?}"),
         }
     }
