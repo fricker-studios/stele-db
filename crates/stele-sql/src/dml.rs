@@ -1029,7 +1029,7 @@ fn dml_selection(
 
 /// Which boundary of a table's valid-time period a column is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PeriodRole {
+pub(crate) enum PeriodRole {
     /// The period's `from` (inclusive start) column.
     From,
     /// The period's `to` (exclusive end) column.
@@ -1038,7 +1038,7 @@ enum PeriodRole {
 
 /// The valid-time role of `column`, or `None` when the table has no valid axis or
 /// the column is an ordinary value column.
-fn period_role(period: Option<&ValidTimeSpec>, column: &str) -> Option<PeriodRole> {
+pub(crate) fn period_role(period: Option<&ValidTimeSpec>, column: &str) -> Option<PeriodRole> {
     let period = period?;
     if period.from_column() == column {
         Some(PeriodRole::From)
@@ -1100,7 +1100,7 @@ fn fold_value_columns(
 /// table's valid-time policy: `None` for a system-only table; for a valid-time
 /// table the `from` bound is mandatory ([`DmlError::ValidTimeStartRequired`]) and
 /// the `to` bound defaults to [`VALID_TIME_OPEN`].
-fn build_interval(
+pub(crate) fn build_interval(
     table: &str,
     period: Option<&ValidTimeSpec>,
     from: Option<i64>,
@@ -1126,7 +1126,7 @@ fn build_interval(
 /// Fold a valid-time `from` (period start) bound to its microsecond instant. The
 /// start is mandatory — an omitted column (`None`) or a SQL `NULL` is
 /// [`DmlError::ValidTimeStartRequired`].
-fn fold_from_bound(
+pub(crate) fn fold_from_bound(
     expr: Option<&Expr>,
     table: &str,
     column: &str,
@@ -1143,7 +1143,7 @@ fn fold_from_bound(
 
 /// Fold a valid-time `to` (period end) bound. An omitted column (`None`) or a SQL
 /// `NULL` opens the period ([`VALID_TIME_OPEN`]).
-fn fold_to_bound(
+pub(crate) fn fold_to_bound(
     expr: Option<&Expr>,
     table: &str,
     column: &str,

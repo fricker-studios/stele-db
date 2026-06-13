@@ -458,10 +458,39 @@ Semantics, pinned:
   SQLSTATE `21000` (`cardinality_violation`) before any write applies — the
   standard's deterministic posture; so do `NULL` flowing into the inserted
   business key (a `NULL` join key itself simply never matches).
-- A `MERGE` into a **valid-time table** is rejected: valid-period close/open
-  semantics are the temporal-MERGE sibling (STL-235). `WHEN NOT MATCHED BY
-  SOURCE`, `WHEN MATCHED THEN DELETE`, clause predicates (`WHEN … AND <expr>`),
-  and `OUTPUT` are rejected.
+- `WHEN NOT MATCHED BY SOURCE`, `WHEN MATCHED THEN DELETE`, clause predicates
+  (`WHEN … AND <expr>`), and `OUTPUT` are rejected.
+
+### Valid-time historization (STL-235)
+
+On a table with a valid axis (`… VALID TIME (vf, vt)`) `MERGE` is the
+historization workhorse: the arms carry the period columns exactly as a plain
+`INSERT` / `UPDATE` does (STL-194), and each arm's bounds are lifted into the
+`[from, to)` interval the new version asserts.
+
+```sql
+MERGE INTO acct USING (VALUES (1, 200), (3, 300)) AS s (id, balance)
+ON acct.id = s.id
+WHEN MATCHED THEN UPDATE SET balance = s.balance, vf = now()        -- close prior, open [now, +∞)
+WHEN NOT MATCHED THEN INSERT (id, balance, vf) VALUES (s.id, s.balance, now());
+```
+
+- A **matched** row gets the joint system+valid **close/open** (STL-166): the
+  prior version is closed on the system axis and a new one opens carrying the
+  matched arm's interval. An **unmatched** row inserts with the not-matched arm's
+  interval. The two arms may name different intervals.
+- The period bounds fold as **instants** — an integer microsecond value, `now()`,
+  or `now() ± interval` (not civil-time literals), the same surface as a plain
+  valid-time write. The start (`vf`) is mandatory; the end (`vt`) defaults to an
+  open period when omitted.
+- The bound must be a **statement-level instant**, not a source column: a
+  per-source-row valid interval (`… vf = s.valid_from`) is rejected for now (a
+  deferred follow-up), so the close/open instant is fixed at bind.
+- No auto-coalescing (assumption A40): facts are stored exactly as asserted, and
+  the 2-D `(system × valid)` tiling holds — at most one live version per key at
+  any `(sys, valid)` point, with deletion gaps only where a `DELETE` intends one
+  ([16 §5](16-bitemporal-semantics.md#5-the-2d-tiling-invariant),
+  [§9](16-bitemporal-semantics.md#9-coalescing-a-documented-choice)).
 
 ## Provenance pseudo-columns (STL-247)
 
