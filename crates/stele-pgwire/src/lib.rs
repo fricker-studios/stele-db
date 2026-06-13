@@ -1680,6 +1680,10 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
         // tampered/forged commit log (ADR-0031). Internal, like the other
         // durability-point faults.
         | EngineError::CommitChain(_)
+        // A `BACKUP TO` admin command that failed on its target (non-empty
+        // directory or an I/O error — STL-249). Operational, like the other
+        // durability/infra faults; the message carries the specific cause.
+        | EngineError::Backup(_)
         | EngineError::Scan(_)
         | EngineError::RowCodec(_)
         | EngineError::SchemaChanged { .. }

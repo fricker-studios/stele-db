@@ -39,6 +39,7 @@ Use the [template](_template.md) for new records. Number sequentially.
 | [0029](0029-cross-table-commit-marker.md) | Cross-table commit atomicity: a transaction commit-marker over the per-table WALs | Accepted |
 | [0030](0030-segment-manifest-retirement.md) | Segment manifest & retirement: the checkpoint record names the live segment set | Accepted |
 | [0031](0031-live-server-verifiable-commit-log.md) | Live-server verifiable commit log: hash-chain `SessionEngine`'s commit log | Accepted |
+| [0032](0032-backup-manifest-format.md) | Backup manifest: a self-describing, tamper-evident inventory of a fenced snapshot | Accepted |
 
 ## Conventions
 

@@ -559,7 +559,7 @@ rather than silently coerced; these are deliberate later additions.
 Statement
 ├── body: StatementBody
 │   ├── Sql(sqlparser::ast::Statement)   // standard SQL, clauses stripped
-│   ├── Admin(AdminCommand)              // CHECKPOINT | FLUSH | COMPACT — no sqlparser grammar
+│   ├── Admin(AdminCommand)              // CHECKPOINT | FLUSH | COMPACT | BACKUP TO '<path>' — no sqlparser grammar
 │   └── User(UserDdl)                    // CREATE | ALTER | DROP USER (STL-252)
 └── temporal: Temporal
     ├── system_versioning: bool         // WITH SYSTEM VERSIONING
@@ -579,12 +579,13 @@ standard-SQL body, or `None` for an admin command or user DDL — the seam the
 binders and the wire layer read so a lifted statement cleanly classifies as
 "none of the SQL routes".
 
-## Admin commands (STL-219, STL-231)
+## Admin commands (STL-219, STL-231, STL-249)
 
 Operator-facing storage commands. `sqlparser` has no grammar for them,
 so they are recognized at the token level — the same lift the temporal clauses use
 — and represented as a `StatementBody::Admin` body rather than a `sqlparser` node.
-All take no arguments; a trailing token is an error. The engine routes each to the
+All but `BACKUP` take no arguments; a trailing token (or, for `BACKUP`, a missing
+`TO '<path>'`) is an error, never a silent strip. The engine routes each to the
 matching session-wide operation and replies with the command's own
 `CommandComplete` tag.
 
@@ -593,6 +594,7 @@ matching session-wide operation and replies with the command's own
 | `CHECKPOINT` | `SessionEngine::checkpoint` | Lightweight WAL fence over every table — fsync + record the fence, no seal. |
 | `FLUSH` | `SessionEngine::flush` | Seal every table's delta into a segment and advance its replay floor (bounded recovery — STL-177 / STL-195). |
 | `COMPACT` | `SessionEngine::compact` | Flush, then merge every table's sealed segments into one read-optimized segment, retiring the inputs — history-preserving (STL-231, ADR-0030). |
+| `BACKUP TO '<path>'` | `SessionEngine::backup` | Fence (flush + checkpoint), then copy the immutable set + a manifest into the local directory `<path>` — a consistent, online full backup (STL-249, ADR-0032). Restore with the `stele restore` CLI verb. |
 
 ## Not yet supported (deferred)
 
