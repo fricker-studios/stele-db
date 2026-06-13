@@ -4573,8 +4573,9 @@ fn stele_segments_call(stmt: &Statement) -> Option<String> {
 /// grouping, ordering, or limit — this path bypasses the binder/planner, so any
 /// shaping clause would be silently dropped. A shaped query (`SELECT id … WHERE …
 /// ORDER BY …`) instead falls through to the binders, which reject the unknown
-/// relation with a normal error. A `JOIN`, a non-function relation, or a name
-/// mismatch all return `None`.
+/// relation with a normal error. A `JOIN`, a non-function relation, a name
+/// mismatch, or any non-unnamed-expression argument (a named `key => 1`, a
+/// wildcard) all return `None`.
 fn stele_native_args<'a>(
     stmt: &'a Statement,
     name: &str,
@@ -4623,15 +4624,18 @@ fn stele_native_args<'a>(
     if !unshaped {
         return None;
     }
-    Some(
-        args.args
-            .iter()
-            .filter_map(|arg| match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
-                _ => None,
-            })
-            .collect(),
-    )
+    // Every argument must be a plain unnamed expression. A named argument
+    // (`key => 1`), a wildcard, or any other shape collapses the whole `collect`
+    // to `None` so the statement falls through to the binders — rather than being
+    // silently dropped, which would route a malformed call as if the extra
+    // argument were absent.
+    args.args
+        .iter()
+        .map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The owned `String` of a single-quoted string-literal argument, or `None` for
@@ -5975,6 +5979,9 @@ mod tests {
             "SELECT * FROM stele_history('account', 1) WHERE id = 1",
             "SELECT * FROM stele_history('account', 1) ORDER BY id",
             "SELECT * FROM stele_history('account', 1, 2)",
+            // A named argument is malformed — never silently dropped to route as
+            // the bare `stele_history('account')`.
+            "SELECT * FROM stele_history('account', key => 1)",
         ] {
             assert!(
                 engine.execute(&parse_one(shaped)).is_err(),
@@ -6087,6 +6094,7 @@ mod tests {
             "SELECT segment FROM stele_segments('account')",
             "SELECT * FROM stele_segments('account') WHERE rows = 2",
             "SELECT * FROM stele_segments('account', 1)",
+            "SELECT * FROM stele_segments('account', n => 1)",
             "SELECT * FROM stele_segments()",
         ] {
             assert!(
