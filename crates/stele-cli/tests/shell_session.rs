@@ -464,3 +464,49 @@ async fn tls_require_fails_loudly_against_a_plaintext_server() {
     );
     assert!(stderr.contains("refused TLS"), "{stderr}");
 }
+
+/// `\segments` (STL-301) renders the columnar segment + zone-map table end to
+/// end: a sealed segment (after `FLUSH`) plus the resident hot tier, the key zone
+/// over the flushed range, and the inspect-segment trailer. A bare `\segments`
+/// with no table is a usage error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn segments_introspection_renders_sealed_and_hot() {
+    let addr = spawn_server().await;
+    let script = "\
+CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING;
+INSERT INTO account VALUES (1, 100);
+INSERT INTO account VALUES (2, 200);
+FLUSH;
+INSERT INTO account VALUES (3, 300);
+\\segments account
+\\segments
+\\q
+";
+    let output = tokio::task::spawn_blocking(move || run_shell(addr, script, &[]))
+        .await
+        .expect("shell task");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // The titled table with both tiers: one sealed segment, one hot.
+    assert!(stdout.contains("Segments — public.account"), "{stdout}");
+    assert!(stdout.contains("sealed"), "{stdout}");
+    assert!(stdout.contains("hot"), "{stdout}");
+    // The zone-map cell over the key column, spanning the two flushed keys.
+    assert!(stdout.contains("id ∈ [1, 2]"), "{stdout}");
+    // The sealed segment has an on-disk size; the inspect-segment trailer points
+    // at its footer.
+    assert!(stdout.contains("KB"), "{stdout}");
+    assert!(
+        stdout.contains("stele admin inspect-segment seg-"),
+        "{stdout}"
+    );
+
+    // A bare \segments (no table) is a usage error on stderr.
+    assert!(stderr.contains("\\segments needs a table"), "{stderr}");
+}

@@ -39,9 +39,9 @@ pub struct Opts {
 }
 
 /// Follow-up tickets the not-yet-wired command tiers point at. The version-history
-/// temporal commands (`\asof` / `\history` / `\timeline` / `\lineage`) are live
-/// (STL-199); these are the remaining tiers.
-const SEGMENTS_TICKET: &str = "STL-301";
+/// temporal commands (`\asof` / `\history` / `\timeline` / `\lineage`, STL-199)
+/// and segment introspection (`\segments`, STL-301) are live; these are the
+/// remaining tiers.
 const AUDIT_TICKET: &str = "STL-302";
 const ADMIN_TICKET: &str = "STL-200";
 
@@ -369,6 +369,10 @@ enum Meta<'a> {
         table: &'a str,
         key: &'a str,
     },
+    /// `\segments T` — columnar segment + zone-map introspection.
+    Segments {
+        table: &'a str,
+    },
     Clear,
     Connect,
     /// A designed-but-not-yet-wired command (temporal or admin tier).
@@ -463,16 +467,18 @@ fn parse_meta(line: &str) -> Option<Meta<'_>> {
                 hint: r"e.g. \lineage account 1",
             },
         },
-        // The remaining temporal-tier commands, still stubbed at their tickets.
+        "segments" => arg.map_or_else(
+            || Meta::BadArgs {
+                message: r"\segments needs a table".to_owned(),
+                hint: r"e.g. \segments account",
+            },
+            |table| Meta::Segments { table },
+        ),
+        // The remaining temporal-tier command, still stubbed at its ticket.
         "audit" => Meta::NotYet {
             cmd,
             ticket: AUDIT_TICKET,
             why: "verifies the tamper-evident commit hash chain",
-        },
-        "segments" => Meta::NotYet {
-            cmd,
-            ticket: SEGMENTS_TICKET,
-            why: "introspects columnar segments + zone maps",
         },
         "status" | "backup" | "restore" | "pitr" | "inspect-segment" | "inspect" => Meta::NotYet {
             cmd,
@@ -541,6 +547,7 @@ fn dispatch_meta(
         Meta::History { table, key } => history(client, session, table, *key, out)?,
         Meta::Timeline { table, key } => timeline(client, session, table, key, out)?,
         Meta::Lineage { table, key } => lineage(client, session, table, key, out)?,
+        Meta::Segments { table } => segments(client, session, table, out)?,
         Meta::Clear => {
             if session.interactive {
                 // Clear screen + scrollback, home the cursor.
@@ -615,7 +622,7 @@ fn help(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
             "provenance — which txn wrote each version",
         ),
         (r"\audit [T]", "verify the tamper-evident hash chain"),
-        (r"\segments [T]", "columnar segments + zone maps"),
+        (r"\segments T", "columnar segments + zone maps"),
     ] {
         lines.push(entry(cmd, desc));
     }
@@ -1251,6 +1258,129 @@ fn lineage(
     write_lines(session, out, &lines)
 }
 
+/// `\segments T` — per-table columnar segment + zone-map introspection ([STL-301]),
+/// reading the `stele_segments` wire surface: one row per sealed segment (oldest
+/// first) then the resident delta (hot) tier, the `hot` row highlighted and an
+/// inspect-segment trailer pointing at the newest sealed segment's footer.
+fn segments(
+    client: &mut Client,
+    session: &Session,
+    table: &str,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    // The table name is a string literal (single quotes doubled), like `\history`.
+    let table_lit = table.replace('\'', "''");
+    let replies = client.simple_query(&format!("SELECT * FROM stele_segments('{table_lit}')"))?;
+    if let Some(err) = first_error(&replies) {
+        print_error(session, err);
+        return Ok(());
+    }
+    let set = first_result_set(&replies).cloned().unwrap_or(ResultSet {
+        columns: Vec::new(),
+        rows: Vec::new(),
+    });
+    // No segments and no resident delta — the table is empty.
+    if set.rows.is_empty() {
+        return write_segs(
+            session,
+            out,
+            &[(Role::Mut, format!("No segments — {table} is empty."))],
+        );
+    }
+
+    // The wire reply's fixed columns, in order: segment, state, rows, sys_min,
+    // sys_max, key_column, key_min, key_max, bytes ([STL-301]).
+    let columns = vec![
+        text_col("Segment"),
+        text_col("State"),
+        Column {
+            name: "Rows".to_owned(),
+            type_oid: 20, // int8 — right-aligned
+        },
+        text_col("Sys-time range"),
+        text_col("Zone map"),
+        text_col("Size"),
+    ];
+    let rows: Vec<Vec<Option<String>>> = set
+        .rows
+        .iter()
+        .map(|r| {
+            let cell = |i: usize| r.get(i).and_then(Option::as_deref);
+            vec![
+                Some(cell(0).unwrap_or("").to_owned()),
+                Some(cell(1).unwrap_or("").to_owned()),
+                Some(cell(2).unwrap_or("0").to_owned()),
+                Some(sys_range(cell(3), cell(4))),
+                Some(zone_map_cell(cell(5).unwrap_or("key"), cell(6), cell(7))),
+                Some(size_cell(cell(8))),
+            ]
+        })
+        .collect();
+
+    let mut lines = vec![vec![
+        (Role::Head, "Segments — ".to_owned()),
+        (Role::Acc, format!("public.{table}")),
+        (Role::Dim, "   columnar · append-only".to_owned()),
+    ]];
+    // The hot (un-flushed delta) row is highlighted — the prototype's warn-on-hot.
+    lines.extend(render::table_lines_warn(
+        &columns,
+        &rows,
+        session.table_opts(false),
+        |r| r.get(1).and_then(Option::as_deref) == Some("hot"),
+    ));
+    // Trailer: the newest sealed segment, the one with a footer to inspect. A
+    // table with only a hot tier has none yet, so the hint is omitted.
+    if let Some(last_sealed) = set
+        .rows
+        .iter()
+        .rev()
+        .find(|r| r.get(1).and_then(Option::as_deref) == Some("sealed"))
+    {
+        let id = last_sealed.first().and_then(Option::as_deref).unwrap_or("");
+        lines.push(vec![
+            (Role::Dim, "  inspect a segment footer: ".to_owned()),
+            (Role::Mut, format!("stele admin inspect-segment {id}")),
+        ]);
+    }
+    write_lines(session, out, &lines)
+}
+
+/// The `\segments` system-time range cell: each endpoint's time-of-day, the
+/// prototype's compact `min … max`.
+fn sys_range(min: Option<&str>, max: Option<&str>) -> String {
+    format!("{} … {}", time_of_day(min), time_of_day(max))
+}
+
+/// The `HH:MM:SS` of a wire `timestamptz` (`YYYY-MM-DD HH:MM:SS[.frac]+00`), or
+/// an em dash when absent — the prototype's time-of-day slice, trimming the date,
+/// fractional seconds, and zone.
+fn time_of_day(ts: Option<&str>) -> String {
+    let Some(ts) = ts else {
+        return "—".to_owned();
+    };
+    ts.split_once(' ')
+        .map_or(ts, |(_, time)| time)
+        .split(['.', '+'])
+        .next()
+        .unwrap_or(ts)
+        .to_owned()
+}
+
+/// The `\segments` zone-map cell: `<col> ∈ [<min>, <max>]` over the segment's key
+/// column. A missing bound shows an em dash.
+fn zone_map_cell(col: &str, min: Option<&str>, max: Option<&str>) -> String {
+    format!("{col} ∈ [{}, {}]", min.unwrap_or("—"), max.unwrap_or("—"))
+}
+
+/// The `\segments` size cell: kibibytes to one decimal (the prototype's `X.X KB`),
+/// or an em dash for the in-memory hot tier (a `NULL` byte size).
+fn size_cell(bytes: Option<&str>) -> String {
+    bytes
+        .and_then(|b| b.parse::<f64>().ok())
+        .map_or_else(|| "—".to_owned(), |b| format!("{:.1} KB", b / 1024.0))
+}
+
 // ---------------------------------------------------------------------------
 // SQL execution + rendering
 // ---------------------------------------------------------------------------
@@ -1786,12 +1916,8 @@ mod tests {
 
     #[test]
     fn designed_tiers_resolve_to_their_tickets() {
-        // The still-stubbed temporal-tier commands point at their split-out
-        // follow-ups; the admin tier at STL-200.
-        let Some(Meta::NotYet { ticket, .. }) = parse_meta(r"\segments account") else {
-            panic!("expected NotYet");
-        };
-        assert_eq!(ticket, SEGMENTS_TICKET);
+        // The still-stubbed temporal-tier command points at its split-out
+        // follow-up; the admin tier at STL-200.
         let Some(Meta::NotYet { ticket, .. }) = parse_meta(r"\audit account") else {
             panic!("expected NotYet");
         };
@@ -1833,13 +1959,22 @@ mod tests {
                 key: "1",
             })
         );
-        // \timeline / \lineage require a key.
+        // \segments takes a bare table.
+        assert_eq!(
+            parse_meta(r"\segments account"),
+            Some(Meta::Segments { table: "account" })
+        );
+        // \timeline / \lineage require a key; \history / \segments a table.
         assert!(matches!(
             parse_meta(r"\timeline account"),
             Some(Meta::BadArgs { .. })
         ));
         assert!(matches!(
             parse_meta(r"\history"),
+            Some(Meta::BadArgs { .. })
+        ));
+        assert!(matches!(
+            parse_meta(r"\segments"),
             Some(Meta::BadArgs { .. })
         ));
     }

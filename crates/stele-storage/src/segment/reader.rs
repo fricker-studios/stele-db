@@ -149,6 +149,14 @@ impl<F: DiskFile> SegmentReader<F> {
             .collect()
     }
 
+    /// The segment file's total size in bytes — the on-disk footprint reported
+    /// by the shell's `\segments` introspection ([STL-301]). Read straight from
+    /// the open file handle ([`DiskFile::len`]), so it costs no column-chunk I/O.
+    #[must_use]
+    pub fn byte_size(&self) -> u64 {
+        self.file.len()
+    }
+
     /// The segment's resident [`ZoneMap`], decoded once at open from the
     /// footer's per-column min/max stats.
     ///
