@@ -96,8 +96,12 @@ tokio-rustls       = { version = "0.26", default-features = false, features = ["
 # PEM loading for cert/key/CA files (`CertificateDer::pem_file_iter` & co. —
 # the `std` feature carries the PEM/file APIs).
 rustls-pki-types   = { version = "1.14", features = ["std"] }
-# Dev-only: self-signed CA/server/client certificates generated at test time for
-# the TLS handshake + mTLS tests. Never a dependency of a shipped binary.
+# Self-signed certificate generation. In stele-pgwire's production deps since
+# STL-304: a non-dev server started without [tls] on a non-loopback bind mints
+# an ephemeral self-signed cert (encryption without authentication) instead of
+# refusing to boot. Also mints the per-test CA/server/client PKI for the TLS +
+# mTLS handshake tests (STL-251). `ring` provider — no new crates over what
+# rustls already pulls; default features off keeps aws-lc out of the tree.
 rcgen              = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 # Dev-only: a real Postgres client driving the pgwire front end end-to-end in an
 # integration test (STL-147 DoD). Never a runtime dependency of a shipped crate.

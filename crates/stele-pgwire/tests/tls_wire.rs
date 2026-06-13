@@ -168,6 +168,73 @@ fn client_config(ca_pem: &str, identity: Option<&(String, String)>) -> rustls::C
     }
 }
 
+/// A rustls client config that accepts ANY server certificate — used only to
+/// drive the self-signed-fallback server (STL-304), whose CA-less certificate
+/// cannot be chained to a trust anchor. This mirrors a `sslmode=require` client:
+/// encrypt the connection, but do not authenticate the server. NEVER a posture
+/// real clients should use against a CA-issued cert.
+fn insecure_client_config() -> rustls::ClientConfig {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::UnixTime;
+    use rustls::{DigitallySignedStruct, SignatureScheme};
+
+    #[derive(Debug)]
+    struct AcceptAny(Arc<rustls::crypto::CryptoProvider>);
+
+    impl ServerCertVerifier for AcceptAny {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+        .expect("protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAny(provider)))
+        .with_no_client_auth()
+}
+
 /// The 8-byte `SSLRequest` startup-shape message.
 const fn ssl_request() -> [u8; 8] {
     let mut buf = [0u8; 8];
@@ -296,6 +363,27 @@ async fn select_one_round_trips_over_tls() {
     let mut stream = tls_connect(addr, client_config(&pki.ca_pem, None))
         .await
         .expect("TLS handshake");
+    complete_startup(&mut stream).await.expect("startup");
+    assert_eq!(select_one(&mut stream).await, "1");
+}
+
+#[tokio::test]
+async fn self_signed_server_round_trips_select_one() {
+    // STL-304: a server booted with an ephemeral self-signed cert (the non-dev
+    // no-TLS non-loopback fallback) still completes the TLS handshake and serves
+    // queries. The client cannot verify the CA-less certificate, so it uses a
+    // no-verification verifier — exactly a `sslmode=require` client.
+    let bound = Server::new("127.0.0.1:0".parse().unwrap(), fresh_session())
+        .with_tls(ServerTls::self_signed(TlsMode::Required).expect("self-signed TLS"))
+        .bind()
+        .await
+        .expect("bind ephemeral port");
+    let addr = bound.local_addr();
+    tokio::spawn(bound.serve());
+
+    let mut stream = tls_connect(addr, insecure_client_config())
+        .await
+        .expect("TLS handshake against the self-signed server");
     complete_startup(&mut stream).await.expect("startup");
     assert_eq!(select_one(&mut stream).await, "1");
 }

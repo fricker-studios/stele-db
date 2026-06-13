@@ -27,11 +27,13 @@ tracing       = { workspace = true }
 rustls           = { workspace = true }
 tokio-rustls     = { workspace = true }
 rustls-pki-types = { workspace = true }
+# Self-signed certificate generation for the non-dev no-TLS fallback (STL-304):
+# rather than refuse to boot, the daemon mints an ephemeral cert so the listener
+# is encrypted. Also mints the per-test PKI in tests/tls_wire.rs (STL-251).
+rcgen            = { workspace = true }
 # Fresh per-connection SASL server nonces (STL-252).
 getrandom        = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt", "rt-multi-thread", "macros"] }
 tokio-postgres = { workspace = true }
-# Self-signed CA / server / client certs minted per test (STL-251).
-rcgen = { workspace = true }

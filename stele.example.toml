@@ -20,12 +20,14 @@
 # Postgres-wire port (ADR-0017). A bare `--listen` flag is ignored when a config
 # file is given; this key wins.
 #
-# Secure defaults (STL-251, docs/10 §4): a non-dev server WITHOUT a [tls]
-# section may only bind loopback — it refuses to start on a non-loopback
-# address rather than silently serve plaintext beyond the local machine. To
-# listen on "0.0.0.0:5454", configure the [tls] section below. (In a container
-# the listener must be reachable through the port mapping: use "0.0.0.0:5454"
-# plus [tls], or run the container with `--dev` instead of a config file.)
+# Secure defaults (STL-251/STL-304, docs/10 §4): a non-dev server WITHOUT a
+# [tls] section binds loopback as plaintext (a warning); on a non-loopback
+# address it generates an EPHEMERAL self-signed cert so the listener is
+# encrypted (warning loudly) rather than serving plaintext beyond the local
+# machine — that cert is unauthenticated and regenerated each restart, so
+# configure the [tls] section below with a CA-issued cert for production. (In a
+# container the listener must be reachable through the port mapping: use
+# "0.0.0.0:5454" plus [tls], or run the container with `--dev` instead.)
 listen = "127.0.0.1:5454"
 
 # Directory the `local` backend roots its data at (created if absent). (active)
