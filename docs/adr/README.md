@@ -38,6 +38,7 @@ Use the [template](_template.md) for new records. Number sequentially.
 | [0028](0028-durable-catalog-log.md) | Durable catalog: a dedicated append-only DDL log at the session level | Accepted |
 | [0029](0029-cross-table-commit-marker.md) | Cross-table commit atomicity: a transaction commit-marker over the per-table WALs | Accepted |
 | [0030](0030-segment-manifest-retirement.md) | Segment manifest & retirement: the checkpoint record names the live segment set | Accepted |
+| [0031](0031-live-server-verifiable-commit-log.md) | Live-server verifiable commit log: hash-chain `SessionEngine`'s commit log | Accepted |
 
 ## Conventions
 

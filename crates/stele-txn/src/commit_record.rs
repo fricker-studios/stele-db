@@ -75,7 +75,13 @@ use stele_common::time::SystemTimeMicros;
 
 /// The number of bytes a [`CommitRecord`] encodes to: a `u64` txn id, an `i64`
 /// commit timestamp, a `u64` sequence number, and a 32-byte predecessor hash.
-pub(crate) const COMMIT_RECORD_LEN: usize = 8 + 8 + 8 + SHA256_LEN;
+///
+/// Public so a chain *writer* other than [`TxnManager`](crate::TxnManager) — the
+/// live `SessionEngine`'s commit log ([ADR-0031]) — can frame the fixed-size
+/// record.
+///
+/// [ADR-0031]: ../../../docs/adr/0031-live-server-verifiable-commit-log.md
+pub const COMMIT_RECORD_LEN: usize = 8 + 8 + 8 + SHA256_LEN;
 
 /// A durable record of one transaction's commit: which transaction, the
 /// system-time coordinate it was assigned, its per-commit sequence number, and
@@ -106,8 +112,14 @@ pub struct CommitRecordError(usize);
 
 impl CommitRecord {
     /// Encode into the fixed 56-byte WAL frame.
+    ///
+    /// Public so the live `SessionEngine`'s commit log ([ADR-0031]) can append the
+    /// same chain frame `TxnManager` writes, reusing this crate's
+    /// [`verify_chain`](crate::chain::verify_chain) to check it.
+    ///
+    /// [ADR-0031]: ../../../docs/adr/0031-live-server-verifiable-commit-log.md
     #[must_use]
-    pub(crate) fn encode(&self) -> [u8; COMMIT_RECORD_LEN] {
+    pub fn encode(&self) -> [u8; COMMIT_RECORD_LEN] {
         let mut buf = [0u8; COMMIT_RECORD_LEN];
         buf[..8].copy_from_slice(&self.txn_id.0.to_le_bytes());
         buf[8..16].copy_from_slice(&self.commit_ts.0.to_le_bytes());

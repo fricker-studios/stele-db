@@ -1676,6 +1676,10 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
         EngineError::Storage(_)
         | EngineError::CatalogLog(_)
         | EngineError::CommitLog(_)
+        // A commit-log hash-chain verification failure surfaced past recovery — a
+        // tampered/forged commit log (ADR-0031). Internal, like the other
+        // durability-point faults.
+        | EngineError::CommitChain(_)
         | EngineError::Scan(_)
         | EngineError::RowCodec(_)
         | EngineError::SchemaChanged { .. }

@@ -63,6 +63,7 @@ use crate::catalog_log::CatalogRecord;
 use crate::secondary::{IndexState, Probe};
 
 use stele_catalog::{Catalog, CatalogError, IndexDef, IndexKind, TableSchema};
+use stele_common::hash::Digest;
 use stele_common::metrics::{SharedMetrics, StatementKind};
 use stele_common::period::Interval;
 use stele_common::provenance::{self, Principal, TxnId};
@@ -96,6 +97,8 @@ use stele_storage::dml::{CommittedTxns, DmlOutcome};
 use stele_storage::engine::{Engine, EngineError as StorageError};
 use stele_storage::segment::{ColumnId, Predicate, ZoneBound};
 use stele_storage::validtime::ValidInterval;
+use stele_storage::wal::WalError;
+use stele_txn::{ChainError, CommitRecord, verify_chain_recover, verify_chain_to};
 
 /// A monotonic, globally-shared commit clock.
 ///
@@ -620,6 +623,17 @@ pub enum EngineError {
     #[error("commit log: {0}")]
     CommitLog(#[source] io::Error),
 
+    /// The durable commit log's hash chain failed to verify on recovery — a
+    /// historical commit record was tampered with (a broken link), forged
+    /// (a head mismatch against nothing to anchor here), or malformed. Recovery
+    /// fails closed rather than serving forged history; the tamper-evidence
+    /// invariant 10 promises ([ADR-0026], [ADR-0031], STL-302).
+    ///
+    /// [ADR-0026]: ../../../docs/adr/0026-verifiable-audit-log.md
+    /// [ADR-0031]: ../../../docs/adr/0031-live-server-verifiable-commit-log.md
+    #[error("commit log chain verification failed: {0}")]
+    CommitChain(#[source] ChainError),
+
     /// Executing the snapshot scan failed.
     #[error(transparent)]
     Scan(#[from] ScanError),
@@ -812,6 +826,20 @@ pub struct SessionEngine<C: Clock + Clone, D: Disk + Clone> {
     /// transaction manager yet ([STL-99]); a per-session monotonic counter gives
     /// each `INSERT` / `UPDATE` / `DELETE` distinct provenance until one exists.
     next_txn: u64,
+    /// The running head of the durable hash-chained commit log — the SHA-256 of the
+    /// last [`CommitRecord`] appended to `stele.commits`, i.e. the `prev_hash` of
+    /// the next one ([ADR-0031], STL-302). [`Digest::ZERO`] for a fresh session;
+    /// recovered from the verified chain on restart. Reading the **durable** log and
+    /// anchoring its verify against this in-memory head is what makes `\audit`'s
+    /// verdict catch both an interior tamper (a broken link) and a wholesale tail
+    /// rewrite (a head mismatch).
+    ///
+    /// [ADR-0031]: ../../../docs/adr/0031-live-server-verifiable-commit-log.md
+    commit_head: Digest,
+    /// The per-commit sequence number the next commit record takes — a dense,
+    /// monotonic session counter, the [`CommitRecord::seq`] tiebreak ([ADR-0024]).
+    /// Starts at `1` on a fresh session; recovered as `last seq + 1`.
+    commit_seq: u64,
     /// The MVCC write index: per-`(table, key)`, the commit instant of the most
     /// recent committed write. Every applied write records its commit instant
     /// here, and a multi-statement [`commit`](Self::commit) checks its write set
@@ -897,6 +925,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             tables: BTreeMap::new(),
             next_namespace: 0,
             next_txn: 1,
+            commit_head: Digest::ZERO,
+            commit_seq: 1,
             write_index: BTreeMap::new(),
             open_snapshots: OpenSnapshots::default(),
             pruned_below: SystemTimeMicros(0),
@@ -958,12 +988,32 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// closed); [`EngineError::Storage`] if a table's tiers cannot be recovered.
     pub fn recover(disk: D, clock: C) -> Result<Self, EngineError> {
         let records = catalog_log::replay(&disk).map_err(EngineError::CatalogLog)?;
-        // The transactions whose multi-table commit marker is durable ([STL-215]):
-        // recovery replays a table's two-phase leg only if its transaction committed,
-        // so a crash between the per-table commits and the marker recovers the whole
-        // transaction all-or-none across every table it wrote.
-        let committed =
-            CommittedTxns::Only(commit_log::replay(&disk).map_err(EngineError::CommitLog)?);
+        // The durable hash-chained commit log ([ADR-0031], STL-302). Replay its
+        // ordered commit-record payloads, then:
+        //  - verify the chain fails-closed — a tampered historical record refuses
+        //    recovery rather than serving forged history, extending STL-178's
+        //    recovery verification to the live server — and recover its tail
+        //    (`commit_head` / `commit_seq`) so post-restart commits chain on,
+        //  - derive the committed-`txn_id` set that gates each table's two-phase
+        //    legs ([STL-215]): a leg is replayed only if its transaction
+        //    committed, so a crash between the per-table commits and the commit
+        //    record recovers all-or-none across every table the transaction wrote.
+        let commit_records = commit_log::replay(&disk).map_err(EngineError::CommitLog)?;
+        let recovered_chain =
+            verify_chain_recover(commit_records.iter().cloned().map(Ok::<_, WalError>))
+                .map_err(EngineError::CommitChain)?;
+        let committed = CommittedTxns::Only(
+            commit_records
+                .iter()
+                .map(|payload| CommitRecord::decode(payload).map(|record| record.txn_id))
+                .collect::<Result<_, _>>()
+                .map_err(|e| {
+                    EngineError::CommitLog(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        e.to_string(),
+                    ))
+                })?,
+        );
         let clock = MonotonicClock::new(clock);
 
         // 1. Rebuild the catalog (and the user store) by replaying the DDL
@@ -1000,9 +1050,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
 
         // 3. Position the allocators past everything recovered. Saturating: a
         //    recovered id at the u64 ceiling must not wrap the allocator back
-        //    into recovered provenance.
+        //    into recovered provenance. The commit log's greatest `txn_id` is folded
+        //    in alongside the tiers' marks — they agree (both come from commits),
+        //    but a committed transaction whose data was pruned would live only in the
+        //    chain, so honoring it keeps `next_txn` past every recorded commit.
         clock.advance_to(max_commit);
-        let mut next_txn = max_txn_id.saturating_add(1);
+        let mut next_txn = max_txn_id
+            .max(recovered_chain.max_txn_id.0)
+            .saturating_add(1);
 
         // 4. Re-derive each dropped era's storage closes from the durable
         //    catalog drop record ([STL-220], [`close_dropped_eras`](Self::close_dropped_eras)).
@@ -1016,6 +1071,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             tables,
             next_namespace,
             next_txn,
+            commit_head: recovered_chain.head,
+            commit_seq: recovered_chain.seq.saturating_add(1),
             write_index: BTreeMap::new(),
             open_snapshots: OpenSnapshots::default(),
             pruned_below: SystemTimeMicros(0),
@@ -1537,6 +1594,139 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         Ok(SelectResult { columns, rows })
     }
 
+    /// The tamper-evident commit-chain audit of `table` — or of every key when
+    /// `key` is `None` — for the shell's `\audit` and `\lineage` ([STL-302],
+    /// [ADR-0031]).
+    ///
+    /// Reads the **durable** hash-chained commit log (`stele.commits`) — so on-disk
+    /// tampering is what the verdict reflects — and verifies it with
+    /// [`verify_chain_to`] **anchored against the live in-memory chain head**,
+    /// catching both an interior broken link (a mutated historical record) and a
+    /// wholesale tail rewrite (a re-linked forgery). A CRC-failing record is
+    /// corruption and surfaces as [`EngineError::CommitLog`] from the commit-log
+    /// replay; a well-framed forgery whose chain link is wrong surfaces as a `false`
+    /// verdict here.
+    ///
+    /// The result is a [`SelectResult`]: one row per version of `table` carrying
+    /// `(txid, op, hash, prev_hash)` — its commit's chain hash and that record's
+    /// predecessor — then the global verdict columns `(chain_ok, chain_len,
+    /// chain_head)`, repeated on every row so a renderer reads it off any one. When
+    /// `table` has no versions a single verdict-only row (null version cells) still
+    /// carries the verdict. `op` and the per-version order match
+    /// [`version_history`](Self::version_history) exactly, so `\lineage` zips the two
+    /// replies positionally. Read-only: it makes no commit and mutates nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::UnknownTable`] if `table` is not live;
+    /// [`EngineError::IntrospectionKey`] if `key` cannot be folded to the key
+    /// column's type; [`EngineError::CommitLog`] if the commit log cannot be read or
+    /// holds a corrupt record; [`EngineError::Storage`] / [`EngineError::RowCodec`]
+    /// if a tier read fails.
+    pub fn audit_chain(
+        &self,
+        table: &str,
+        key: Option<&stele_sql::sqlparser::ast::Expr>,
+    ) -> Result<SelectResult, EngineError> {
+        let state = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
+        let schema = self
+            .catalog
+            .resolve(table, self.clock.current())
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
+        // Fold the introspection key exactly as `version_history` (and `bind_dml`)
+        // do, so the business-key bytes match what was written.
+        let key_ty = schema
+            .columns()
+            .first()
+            .map_or(LogicalType::Int8, stele_catalog::ColumnDef::ty);
+        let business_key = match key {
+            Some(expr) => Some(business_key(
+                &stele_sql::fold_literal(expr, key_ty).map_err(EngineError::IntrospectionKey)?,
+            )),
+            None => None,
+        };
+        let versions = state.engine.version_history(business_key.as_ref())?;
+
+        // The durable commit log is the witness: read it back, map every committed
+        // transaction to its record's (hash, prev_hash), and form the verdict.
+        let payloads = commit_log::replay(&self.disk).map_err(EngineError::CommitLog)?;
+        let mut by_txn: BTreeMap<u64, (Digest, Digest)> = BTreeMap::new();
+        for payload in &payloads {
+            let record = CommitRecord::decode(payload).map_err(|e| {
+                EngineError::CommitLog(io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+            })?;
+            by_txn.insert(record.txn_id.0, (record.hash(), record.prev_hash));
+        }
+        // Anchor the verify against the in-memory head — the trusted witness from
+        // this live session (or the verified-on-recovery tail) — so a rewrite of the
+        // last record is caught too, not only an interior link break.
+        let chain_ok = verify_chain_to(
+            payloads.iter().cloned().map(Ok::<_, WalError>),
+            self.commit_head,
+        )
+        .is_ok();
+        let chain_len = i64::try_from(payloads.len()).unwrap_or(i64::MAX);
+        let chain_head = self.commit_head.to_hex();
+
+        let columns = vec![
+            ("txid".to_owned(), LogicalType::Int8),
+            ("op".to_owned(), LogicalType::Text),
+            ("hash".to_owned(), LogicalType::Text),
+            ("prev_hash".to_owned(), LogicalType::Text),
+            ("chain_ok".to_owned(), LogicalType::Bool),
+            ("chain_len".to_owned(), LogicalType::Int8),
+            ("chain_head".to_owned(), LogicalType::Text),
+        ];
+        // The verdict cells ride on every row, so a renderer reads them off row 0
+        // without a second reply.
+        let verdict = |row: &mut Vec<Option<Vec<u8>>>| {
+            row.push(Some(encode_value(&ScalarValue::Bool(chain_ok))));
+            row.push(Some(encode_value(&ScalarValue::Int8(chain_len))));
+            row.push(Some(encode_value(&ScalarValue::Text(chain_head.clone()))));
+        };
+
+        let mut rows = Vec::with_capacity(versions.len().max(1));
+        let mut prev: Option<&Version> = None;
+        for v in &versions {
+            let op = version_op(prev, v);
+            prev = Some(v);
+            // A version's commit hash is its transaction's chain record. A version
+            // with no record is the rare unchained commit (a crash between the data
+            // fsync and the commit-record fsync, [ADR-0031]); its hash is NULL rather
+            // than a fabricated value.
+            let (hash, prev_hash) =
+                by_txn
+                    .get(&v.provenance.txn_id.0)
+                    .map_or((None, None), |(h, p)| {
+                        (
+                            Some(encode_value(&ScalarValue::Text(h.to_hex()))),
+                            Some(encode_value(&ScalarValue::Text(p.to_hex()))),
+                        )
+                    });
+            let mut row = vec![
+                Some(encode_value(&ScalarValue::Int8(txid_as_i64(
+                    v.provenance.txn_id,
+                )))),
+                Some(encode_value(&ScalarValue::Text(op.to_owned()))),
+                hash,
+                prev_hash,
+            ];
+            verdict(&mut row);
+            rows.push(row);
+        }
+        // An empty timeline still reports the (global) chain verdict — one row whose
+        // version cells are NULL.
+        if rows.is_empty() {
+            let mut row = vec![None, None, None, None];
+            verdict(&mut row);
+            rows.push(row);
+        }
+        Ok(SelectResult { columns, rows })
+    }
+
     /// Execute one parsed [`Statement`] against the session.
     ///
     /// Routes by binding, in order: a `CREATE TABLE` / `DROP TABLE` applies to the
@@ -1855,6 +2045,15 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // the-overlay semantics as the history surface.
         if let Some(table) = stele_segments_call(stmt) {
             return self.segment_metadata(&table).map(StatementOutcome::Rows);
+        }
+
+        // Its audit sibling: `SELECT * FROM stele_audit('t'[, key])` is the wire
+        // surface the shell's `\audit` reads — per-version commit-chain hashes plus
+        // an intact/broken verdict over the durable hash-chained commit log
+        // ([STL-302], [ADR-0031]), and the `hash ← prevHash` source for `\lineage`.
+        // Same structural recognition and read-only semantics as `stele_history`.
+        if let Some((table, key)) = stele_audit_call(stmt) {
+            return self.audit_chain(&table, key).map(StatementOutcome::Rows);
         }
 
         // DDL first: `bind_ddl` cleanly rejects non-DDL with `NotDdl`, which we
@@ -3105,6 +3304,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         self.next_txn += 1;
         let principal = Principal::new(WIRE_PRINCIPAL.to_vec());
         let summary = self.apply_bound_dml(dml, txn_id, &principal)?;
+        // The write's data is durable; append this commit's link to the
+        // hash-chained commit log ([ADR-0031], STL-302). A single-statement
+        // auto-commit bypasses the group-commit path, so it records its commit here
+        // rather than in `finish_group_commit`.
+        self.record_commit(txn_id)?;
         // An auto-committed write pins no snapshot, so this is the steady-state
         // prune point under auto-commit traffic — without it the index would grow
         // with distinct keys on a server that never opens a transaction ([STL-204]).
@@ -4254,23 +4458,31 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         touched: &[String],
     ) -> Result<(), EngineError> {
         // Fast path: zero or one table — no cross-table coordination needed, so the
-        // plain single-record commit stands as the atomic boundary (one fsync, no
-        // marker). Recovery applies a plain record unconditionally. A touched table
-        // that no longer resolves is an invariant break (`apply_group` already
-        // resolved and wrote it, and no DDL interleaves a commit) — fail closed via
-        // `?` rather than silently acknowledge a commit that never reached the WAL.
+        // plain single-record commit stands as the atomic boundary. Recovery applies
+        // a plain record unconditionally. A touched table that no longer resolves is
+        // an invariant break (`apply_group` already resolved and wrote it, and no DDL
+        // interleaves a commit) — fail closed via `?` rather than silently
+        // acknowledge a commit that never reached the WAL.
         if touched.len() <= 1 {
-            if let Some(table) = touched.first() {
-                self.table_mut(table)?.engine.commit_group()?;
-            }
-            return Ok(());
+            let Some(table) = touched.first() else {
+                // A no-write COMMIT commits nothing — no chain record (the chain
+                // covers data commits, [ADR-0031]).
+                return Ok(());
+            };
+            self.table_mut(table)?.engine.commit_group()?;
+            // The data record is durable; append this commit's hash-chain record
+            // ([ADR-0031]). For a single-table commit the record is *additive* —
+            // recovery applies the plain WAL record unconditionally, so the record
+            // never gates that write — it makes the live commit log verifiable
+            // end-to-end (the cost being the extra fsync [ADR-0031] accepts).
+            return self.record_commit(txn_id);
         }
 
         // Multi-table: make every leg durable as a two-phase record first. Once any
-        // leg fails the rest are discarded and no marker is written, so the
+        // leg fails the rest are discarded and no commit record is written, so the
         // transaction recovers all-or-none. A touched table that no longer resolves
         // is the same invariant break as above — treat it as a leg failure rather
-        // than skip it and then vouch a marker for a leg that was never committed.
+        // than skip it and then vouch a record for a leg that was never committed.
         let mut error: Option<EngineError> = None;
         for table in touched {
             match self.table_mut(table) {
@@ -4284,12 +4496,46 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             }
         }
         if let Some(e) = error {
-            // A leg failed: no marker, so recovery discards every leg — all-or-none.
+            // A leg failed: no commit record, so recovery discards every leg.
             return Err(e);
         }
 
-        // Every per-table leg is durable; the marker's fsync is the commit point.
-        commit_log::append(&self.disk, txn_id).map_err(EngineError::CommitLog)?;
+        // Every per-table leg is durable; the commit record's fsync is the commit
+        // point — and this transaction's link in the tamper-evident chain. Its
+        // `txn_id` is the marker recovery gates the two-phase legs on ([STL-215]);
+        // the record's hash chain is [ADR-0031].
+        self.record_commit(txn_id)
+    }
+
+    /// Append one [`CommitRecord`] for transaction `txn_id` to the durable
+    /// hash-chained commit log (`stele.commits`) and advance the in-memory chain
+    /// head / seq ([ADR-0031], STL-302).
+    ///
+    /// Called once per data-mutating commit, *after* that write's own data is
+    /// durable, so the commit-record fsync is the commit point and the head only
+    /// advances for a durably-recorded commit. The record links to `commit_head`
+    /// (the prior record's hash, [`Digest::ZERO`] for the first) and takes the next
+    /// `commit_seq`; the commit timestamp is the commit clock's current instant,
+    /// monotonic across commits. This is the live-server writer of the same chain
+    /// [`TxnManager`](stele_txn::TxnManager) maintains in `stele-txn` (STL-178).
+    ///
+    /// [ADR-0031]: ../../../docs/adr/0031-live-server-verifiable-commit-log.md
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::CommitLog`] if the record cannot be appended or fsynced — the
+    /// commit is refused; nothing further was acknowledged and the head does not
+    /// advance.
+    fn record_commit(&mut self, txn_id: TxnId) -> Result<(), EngineError> {
+        let record = CommitRecord {
+            txn_id,
+            commit_ts: self.clock.current(),
+            seq: self.commit_seq,
+            prev_hash: self.commit_head,
+        };
+        commit_log::append(&self.disk, &record).map_err(EngineError::CommitLog)?;
+        self.commit_head = record.hash();
+        self.commit_seq = self.commit_seq.saturating_add(1);
         Ok(())
     }
 
@@ -4631,12 +4877,6 @@ fn business_key(value: &ScalarValue) -> BusinessKey {
 /// commands issue ([STL-199]) — returning the table name and the optional key
 /// literal (borrowed from `stmt`, folded to the key type later). `None` for any
 /// other statement, so the normal binders run.
-///
-/// Recognized structurally, like the `pg_catalog` shim: a single-relation `FROM`
-/// whose base is a table-valued function named `stele_history` (case-insensitive,
-/// last name part), its first unnamed argument a string literal (the table), an
-/// optional second the business key. A `JOIN`, a missing/non-string table
-/// argument, or any extra shape falls through to the binders unchanged.
 fn stele_history_call(
     stmt: &Statement,
 ) -> Option<(String, Option<&stele_sql::sqlparser::ast::Expr>)> {
@@ -4646,6 +4886,23 @@ fn stele_history_call(
     // [`SessionEngine::version_history`]); absent ⇒ every key's timeline. A third
     // (or further) argument is malformed — fall through to the binders rather than
     // silently ignoring it.
+    if args.len() > 2 {
+        return None;
+    }
+    let table = string_literal(args.first().copied()?)?;
+    let key = args.get(1).copied();
+    Some((table, key))
+}
+
+/// Recognize the Stele-native audit introspection call `stele_audit('t'[, key])` —
+/// the wire surface the shell's `\audit` command issues, and the `hash ← prevHash`
+/// source for `\lineage` ([STL-302]). The exact `('t'[, key])` shape as
+/// [`stele_history_call`], over the same [`stele_native_args`] matcher; answered by
+/// [`SessionEngine::audit_chain`].
+fn stele_audit_call(
+    stmt: &Statement,
+) -> Option<(String, Option<&stele_sql::sqlparser::ast::Expr>)> {
+    let args = stele_native_args(stmt, "stele_audit")?;
     if args.len() > 2 {
         return None;
     }
@@ -4671,7 +4928,8 @@ fn stele_segments_call(stmt: &Statement) -> Option<String> {
 
 /// The unnamed argument expressions of an **unshaped** Stele-native introspection
 /// call `SELECT * FROM <name>(...)`, or `None` for any other statement shape — the
-/// structural gate shared by [`stele_history_call`] / [`stele_segments_call`].
+/// structural gate shared by [`stele_history_call`] / [`stele_audit_call`] /
+/// [`stele_segments_call`].
 ///
 /// Recognized structurally, like the `pg_catalog` shim: a single-relation `FROM`
 /// whose base is a table-valued function named `<name>` (case-insensitive, last
@@ -6208,6 +6466,194 @@ mod tests {
                 "shaped/over-argument call must not route: {shaped}",
             );
         }
+    }
+
+    /// The clean `\audit` surface ([STL-302]): `SELECT * FROM stele_audit('t')`
+    /// returns per-version `(txid, op, hash, prev_hash)` over the durable hash chain
+    /// plus the global verdict columns, the chain verifies, and the per-version links
+    /// chain (first from genesis, each later `prev_hash` the previous `hash`).
+    #[test]
+    fn stele_audit_query_routes_through_execute() {
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk, ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        for sql in [
+            "INSERT INTO account (id, balance) VALUES (1, 100)",
+            "UPDATE account SET balance = 250 WHERE id = 1",
+            "INSERT INTO account (id, balance) VALUES (2, 500)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("write");
+        }
+
+        let StatementOutcome::Rows(audit) = engine
+            .execute(&parse_one("SELECT * FROM stele_audit('account')"))
+            .expect("audit")
+        else {
+            panic!("stele_audit returns rows");
+        };
+        assert_eq!(
+            audit
+                .columns
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "txid",
+                "op",
+                "hash",
+                "prev_hash",
+                "chain_ok",
+                "chain_len",
+                "chain_head",
+            ],
+        );
+
+        let text = |cell: &Option<Vec<u8>>| -> String {
+            match ScalarValue::decode(LogicalType::Text, cell.as_ref().expect("text cell")) {
+                Ok(ScalarValue::Text(s)) => s,
+                _ => panic!("expected a text cell"),
+            }
+        };
+        let flag = |cell: &Option<Vec<u8>>| -> bool {
+            matches!(
+                ScalarValue::decode(LogicalType::Bool, cell.as_ref().expect("bool cell")),
+                Ok(ScalarValue::Bool(true)),
+            )
+        };
+
+        // Three versions (key 1 insert+update, key 2 insert), oldest first; the
+        // verdict rides every row — the chain is intact, three links.
+        assert_eq!(audit.rows.len(), 3);
+        for row in &audit.rows {
+            assert!(flag(&row[4]), "clean chain verifies");
+        }
+        assert!(
+            matches!(
+                ScalarValue::decode(LogicalType::Int8, audit.rows[0][5].as_ref().expect("len")),
+                Ok(ScalarValue::Int8(3)),
+            ),
+            "three commit records in the chain",
+        );
+
+        // This workload's key order matches its commit order, so the version rows are
+        // in chain order: the first chains from genesis, and each later version's
+        // `prev_hash` is the previous version's `hash` — the links the renderer draws.
+        assert_eq!(
+            text(&audit.rows[0][3]),
+            Digest::ZERO.to_hex(),
+            "the first commit chains from genesis",
+        );
+        assert_eq!(text(&audit.rows[1][3]), text(&audit.rows[0][2]));
+        assert_eq!(text(&audit.rows[2][3]), text(&audit.rows[1][2]));
+    }
+
+    /// Tamper-evidence ([ADR-0031], testing-strategy §4): a clean session audits
+    /// intact; rewriting a historical commit record on disk — well-framed and
+    /// re-CRC'd, the forgery an operator could attempt — flips the `\audit` verdict
+    /// to broken, because the next record's `prev_hash` no longer matches.
+    #[test]
+    fn audit_detects_a_tampered_commit_record() {
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        for sql in [
+            "INSERT INTO account (id, balance) VALUES (1, 100)",
+            "UPDATE account SET balance = 250 WHERE id = 1",
+            "INSERT INTO account (id, balance) VALUES (2, 500)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("write");
+        }
+
+        let verdict = |engine: &mut SessionEngine<ZeroClock, MemDisk>| -> bool {
+            let StatementOutcome::Rows(r) = engine
+                .execute(&parse_one("SELECT * FROM stele_audit('account')"))
+                .expect("audit")
+            else {
+                panic!("rows");
+            };
+            matches!(
+                ScalarValue::decode(LogicalType::Bool, r.rows[0][4].as_ref().expect("verdict")),
+                Ok(ScalarValue::Bool(true)),
+            )
+        };
+        assert!(verdict(&mut engine), "the clean chain verifies");
+
+        forge_first_commit_record(&disk);
+
+        assert!(
+            !verdict(&mut engine),
+            "the tampered chain is detected — the verdict flips to broken",
+        );
+    }
+
+    /// Recovery re-verifies the commit chain (extending STL-178's recovery
+    /// verification to the live server, [ADR-0031]): a tampered historical record
+    /// refuses recovery rather than serving forged history.
+    #[test]
+    fn recovery_fails_closed_on_a_tampered_commit_chain() {
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        for sql in [
+            "INSERT INTO account (id, balance) VALUES (1, 100)",
+            "INSERT INTO account (id, balance) VALUES (2, 500)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("write");
+        }
+        drop(engine);
+
+        forge_first_commit_record(&disk);
+
+        assert!(
+            matches!(
+                SessionEngine::recover(disk, ZeroClock),
+                Err(EngineError::CommitChain(_)),
+            ),
+            "recovery fails closed on a broken commit chain",
+        );
+    }
+
+    /// Rewrite the first commit record on disk as a well-framed, correctly-CRC'd but
+    /// *different* record — the forgery an operator could attempt. The frame still
+    /// parses and passes CRC, so [`commit_log::replay`] accepts it; its hash no
+    /// longer matches record 1's `prev_hash`, so the chain breaks at record 1.
+    fn forge_first_commit_record(disk: &MemDisk) {
+        use stele_storage::backend::DiskFile as _;
+        use stele_storage::checksum::crc32c;
+
+        const FRAME: usize = 8 + stele_txn::COMMIT_RECORD_LEN + 4;
+        let file = disk
+            .open(crate::commit_log::COMMIT_LOG_FILENAME)
+            .expect("open");
+        let len = usize::try_from(file.len()).expect("small file");
+        assert!(len >= FRAME, "at least one record on disk to forge");
+        let mut bytes = vec![0u8; len];
+        file.read_at(0, &mut bytes).expect("read");
+
+        let forged = CommitRecord {
+            txn_id: TxnId(9_999),
+            commit_ts: SystemTimeMicros(42),
+            seq: 1,
+            prev_hash: Digest::ZERO,
+        };
+        let mut frame = Vec::with_capacity(FRAME);
+        frame.extend_from_slice(b"STCM");
+        frame.extend_from_slice(
+            &u32::try_from(stele_txn::COMMIT_RECORD_LEN)
+                .expect("fits u32")
+                .to_le_bytes(),
+        );
+        frame.extend_from_slice(&forged.encode());
+        let crc = crc32c(&frame);
+        frame.extend_from_slice(&crc.to_le_bytes());
+
+        bytes.splice(0..FRAME, frame);
+        disk.remove(crate::commit_log::COMMIT_LOG_FILENAME)
+            .expect("remove");
+        disk.create(crate::commit_log::COMMIT_LOG_FILENAME)
+            .expect("create")
+            .append(&bytes)
+            .expect("append");
     }
 
     /// Observing the clock for a read snapshot must not let a later commit slide
@@ -10584,10 +11030,11 @@ mod tests {
         let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
         two_tables_with_baseline(&mut engine);
         commit_two_table_txn(&mut engine).expect("commit");
-        // A multi-table commit is not the fast path: it writes a marker.
+        // The multi-table commit's record is the marker recovery gates its two-phase
+        // legs on (and, post-ADR-0031, its link in the hash chain).
         assert!(
             disk.open(crate::commit_log::COMMIT_LOG_FILENAME).is_ok(),
-            "a multi-table commit writes a commit marker",
+            "a multi-table commit writes a commit record",
         );
         drop(engine);
 
@@ -10668,10 +11115,13 @@ mod tests {
     }
 
     #[test]
-    fn the_single_table_fast_path_writes_no_commit_marker() {
-        // A single-table COMMIT keeps the STL-192 fast path: one record + one fsync,
-        // no marker (the DoD's "single-table fast path keeps one fsync per COMMIT").
-        // Observable proxy: no commit-marker file is created, and the writes recover.
+    fn the_single_table_fast_path_writes_a_commit_chain_record() {
+        // A single-table COMMIT keeps the STL-192 plain (unconditionally-applied)
+        // per-table record, but ADR-0031 now *also* appends a hash-chain commit
+        // record so the live commit log is verifiable end-to-end (refining
+        // ADR-0029's single-table-no-marker fast path — the deliberate extra fsync).
+        // Observable proxy: the commit log exists with one record, and the writes
+        // recover whole.
         let disk = MemDisk::new();
         let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
         engine.execute(&parse_one(CREATE)).expect("create account");
@@ -10683,12 +11133,11 @@ mod tests {
             .stage_dml(&parse_one("INSERT INTO account VALUES (2, 200)"), &mut txn)
             .expect("stage 2");
         engine.commit(txn).expect("commit");
-        assert!(
-            matches!(
-                disk.open(crate::commit_log::COMMIT_LOG_FILENAME),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound,
-            ),
-            "a single-table commit writes no commit marker",
+        let records = crate::commit_log::replay(&disk).expect("replay commit log");
+        assert_eq!(
+            records.len(),
+            1,
+            "a single-table commit writes exactly one hash-chain record",
         );
         drop(engine);
 

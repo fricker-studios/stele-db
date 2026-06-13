@@ -334,6 +334,55 @@ UPDATE account SET balance = 250 WHERE id = 1;
     );
 }
 
+/// `\audit` verifies the live commit hash chain end to end (STL-302), and
+/// `\lineage` now carries the `hash ← prevHash` line. The chain is intact on a
+/// clean session, the first version chains from genesis, and a bare `\audit`
+/// defaults to the first relation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_verifies_the_commit_chain_and_lineage_shows_hashes() {
+    let addr = spawn_server().await;
+    let script = "\
+CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING;
+INSERT INTO account VALUES (1, 100);
+UPDATE account SET balance = 250 WHERE id = 1;
+\\audit account
+\\audit
+\\lineage account 1
+\\q
+";
+    let output = tokio::task::spawn_blocking(move || run_shell(addr, script, &[]))
+        .await
+        .expect("shell task");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // \audit — the header, the intact verdict, the chain links, and the genesis
+    // anchor at the root of the chain.
+    assert!(stdout.contains("Audit — public.account"), "{stdout}");
+    assert!(stdout.contains("chain intact"), "{stdout}");
+    assert!(stdout.contains("link"), "{stdout}");
+    assert!(stdout.contains("genesis"), "{stdout}");
+    assert!(stdout.contains("←"), "{stdout}");
+    // Two versions of key 1, each its own vN line.
+    assert!(stdout.contains("v1") && stdout.contains("v2"), "{stdout}");
+    // A bare \audit defaults to the first (only) relation — account audited twice.
+    assert_eq!(
+        stdout.matches("Audit — public.account").count(),
+        2,
+        "{stdout}"
+    );
+
+    // \lineage now carries the hash ← prevHash chain line (STL-302).
+    assert!(stdout.contains("Lineage — "), "{stdout}");
+    assert!(stdout.contains("hash "), "{stdout}");
+
+    assert!(!stderr.contains("ERROR"), "no error expected:\n{stderr}");
+}
+
 /// The `\asof` time-travel context (STL-199) injects a server-accepted
 /// `FOR SYSTEM_TIME AS OF` qualifier into a subsequent bare `SELECT`, then clears
 /// it. Uses `now()` so the round-trip is deterministic on the wall clock — the
