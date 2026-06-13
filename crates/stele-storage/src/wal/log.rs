@@ -69,17 +69,26 @@ pub enum WalError {
     #[error("i/o error: {0}")]
     Io(#[from] io::Error),
 
-    /// The WAL is **poisoned**: a prior fsync ([`tick`](Wal::tick) or the
-    /// segment-boundary sync in rotation) failed, so its staged record's
-    /// durability is indeterminate. Per the WAL contract (invariant 2) a failed
-    /// fsync is a crash, not a clean abort — every subsequent
-    /// [`append`](Wal::append) / [`tick`](Wal::tick) refuses with this error so a
-    /// later successful `tick` can never flush the staged record under the guise
-    /// of an aborted op ([STL-217]). The engine must stop and restart into
-    /// recovery, which opens a fresh, unpoisoned WAL.
+    /// The WAL is **poisoned**: a prior durability hazard left the log in a state
+    /// no further write may build on, so every subsequent [`append`](Wal::append)
+    /// / [`tick`](Wal::tick) refuses with this error and the engine must stop and
+    /// restart into recovery, which opens a fresh, unpoisoned WAL. Two causes,
+    /// both crashes rather than clean aborts under the WAL contract (invariant 2):
+    ///
+    /// * a **failed fsync** ([`tick`](Wal::tick) or the segment-boundary sync in
+    ///   rotation) leaves the staged record's durability indeterminate — poison so
+    ///   a later successful `tick` can never flush it under the guise of an aborted
+    ///   op ([STL-217]); and
+    /// * a **torn append** — bytes physically landed past the staged end yet
+    ///   [`append`](Wal::append) returned `Err` — leaves stray bytes a later append
+    ///   would build past, desyncing the WAL's offset bookkeeping from the file and
+    ///   shearing recovery at the torn frame. Poison so the garbage is never built
+    ///   on ([STL-299]). A *clean* append failure (nothing landed) is not a crash
+    ///   and does not poison.
     ///
     /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
-    #[error("WAL is poisoned: a prior fsync failed; the engine must recover")]
+    /// [STL-299]: https://allegromusic.atlassian.net/browse/STL-299
+    #[error("WAL is poisoned: a prior fsync failed or an append tore; the engine must recover")]
     Poisoned,
 }
 
@@ -111,12 +120,15 @@ pub(super) struct Inner<D: Disk> {
     /// every waiter whose target is now durable (the *order* of waking is
     /// unspecified — `swap_remove` is used internally).
     waiters: Vec<Waiter>,
-    /// Set once an fsync fails inside [`drain_tick`] or [`rotate`]. A failed
-    /// fsync leaves the just-appended record *staged* but of indeterminate
-    /// durability, so the WAL refuses every further [`append`](Wal::append) /
-    /// [`tick`](Wal::tick) ([`WalError::Poisoned`]) rather than let a later
-    /// successful `tick` flush it ([STL-217]). Reads (replay) stay available so
-    /// recovery can run; recovery opens a fresh WAL, which starts unpoisoned.
+    /// Set once a durability hazard makes further writes unsafe: an fsync fails
+    /// inside [`drain_tick`] or [`rotate`] (the staged record's durability is then
+    /// indeterminate, [STL-217]), or an [`append`](Wal::append) *tears* — bytes
+    /// land past `staged_end` yet the call fails ([STL-299]). Either way the WAL
+    /// refuses every further [`append`](Wal::append) / [`tick`](Wal::tick)
+    /// ([`WalError::Poisoned`]) so a later op can neither flush the staged record
+    /// under the guise of an aborted op nor build past the torn frame. Reads
+    /// (replay) stay available so recovery can run; recovery opens a fresh WAL,
+    /// which starts unpoisoned.
     poisoned: bool,
     /// The session's shared metric registry, when one has been installed
     /// ([`Wal::set_metrics`], [STL-253]): appends and fsyncs report into it.
@@ -202,11 +214,15 @@ impl<D: Disk> Wal<D> {
     /// # Errors
     ///
     /// [`WalError::PayloadTooLarge`] if `payload` exceeds the record limit;
-    /// [`WalError::Poisoned`] if a prior fsync failed (the WAL refuses further
-    /// writes until recovery, [STL-217]); [`WalError::Io`] on a backing write
-    /// failure.
+    /// [`WalError::Poisoned`] if a prior fsync failed or an append tore (the WAL
+    /// refuses further writes until recovery, [STL-217] / [STL-299]);
+    /// [`WalError::Io`] on a backing write failure. A backing-write failure that
+    /// *tore* — bytes physically landed past the staged end — additionally poisons
+    /// the WAL before surfacing the [`WalError::Io`] ([STL-299]); a clean failure
+    /// (nothing landed) does not.
     ///
     /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
+    /// [STL-299]: https://allegromusic.atlassian.net/browse/STL-299
     // The guard is held across rotate + append + the `staged_end` bump and dropped
     // at the block's end *before* the wakers fire (waking can re-enter the mutex) —
     // the tightening clippy suggests would break that ordering. Same shape, and
@@ -218,11 +234,14 @@ impl<D: Disk> Wal<D> {
         }
         let record_len = HEADER_LEN as u64 + payload.len() as u64;
 
-        let mut rotation_wakers = Vec::new();
+        // Wakers to fire after the lock drops: a rotation's group-commit fsync may
+        // wake covered waiters, and a torn append (or poisoning rotation) hands its
+        // parked waiters back here so each re-polls and observes the poison.
+        let mut wakers = Vec::new();
         let result = {
             let mut g = self.inner.lock().expect("wal mutex poisoned");
 
-            // A poisoned WAL (a prior fsync failed) refuses every write, so a
+            // A poisoned WAL (a prior fsync or torn append) refuses every write, so a
             // later `tick` can never flush a staged record as a clean op ([STL-217]).
             if g.poisoned {
                 Err(WalError::Poisoned)
@@ -230,11 +249,11 @@ impl<D: Disk> Wal<D> {
                 // Rotate if appending this record would overflow the current
                 // segment. A record is never split across segments. A rotation
                 // fsync failure poisons and drains its parked waiters into
-                // `rotation_wakers`, which the post-lock loop still fires.
+                // `wakers`, which the post-lock loop still fires.
                 let projected = g.staged_end.byte_offset + record_len;
                 let rotated =
                     if projected > g.config.segment_size_bytes && g.staged_end.byte_offset > 0 {
-                        rotate(&mut g, &mut rotation_wakers)
+                        rotate(&mut g, &mut wakers)
                     } else {
                         Ok(())
                     };
@@ -242,7 +261,33 @@ impl<D: Disk> Wal<D> {
                 rotated.and_then(|()| {
                     let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
                     encode(payload, &mut frame);
-                    g.current.append(&frame).map_err(WalError::Io)?;
+                    if let Err(e) = g.current.append(&frame) {
+                        // A *torn* append physically landed some bytes past
+                        // `staged_end` — the segment is now longer than the WAL's
+                        // bookkeeping records. Those stray bytes can never be safely
+                        // built on: a later append would land at the physical EOF
+                        // (past them) while `staged_end` advances from its stale
+                        // value, desyncing the two, and recovery would shear at the
+                        // torn frame and drop every record written after it. So
+                        // poison the WAL — exactly like a failed fsync ([STL-299],
+                        // [STL-217]) — and hand back every parked waiter so each
+                        // re-polls to `Err(Poisoned)` rather than hanging. A *clean*
+                        // failure (nothing landed; `len()` still equals `staged_end`)
+                        // leaves the WAL consistent and is *not* poisoned — the caller
+                        // rolls its resident writes back and keeps running ([STL-295]).
+                        //
+                        // This keys off the backend reporting its *actual* post-error
+                        // length. `MemDisk` does (a torn fault advances `len()` by what
+                        // landed); the real `LocalFile::append` does not yet advance its
+                        // cached `len` on a partial `write_all`, so a torn append there
+                        // currently reads as clean and degrades to the [STL-295] path
+                        // (still consistent, but not poisoned) — surfacing it is [STL-305].
+                        if g.current.len() > g.staged_end.byte_offset {
+                            g.poisoned = true;
+                            wakers.extend(drain_all_waiters(&mut g));
+                        }
+                        return Err(WalError::Io(e));
+                    }
                     g.staged_end.byte_offset += record_len;
                     if let Some(m) = &g.metrics {
                         m.wal_appends.inc();
@@ -251,11 +296,11 @@ impl<D: Disk> Wal<D> {
                 })
             }
         };
-        // Wake any commit futures the rotation touched — outside the lock, since
+        // Wake any commit futures the lock scope touched — outside the lock, since
         // `wake` can re-enter the same mutex. A successful rotation made them
-        // durable; a poisoning rotation hands them here so they re-poll and observe
-        // the poison instead of hanging.
-        for w in rotation_wakers {
+        // durable; a poisoning rotation or torn append hands them here so they
+        // re-poll and observe the poison instead of hanging.
+        for w in wakers {
             w.wake();
         }
         result
@@ -321,11 +366,14 @@ impl<D: Disk> Wal<D> {
     }
 
     /// Whether the WAL is **poisoned** — a prior fsync ([`tick`](Self::tick) or
-    /// the segment-boundary sync in rotation) failed, so every further
-    /// [`append`](Self::append) / [`tick`](Self::tick) is refused with
-    /// [`WalError::Poisoned`] until the engine restarts into recovery ([STL-217]).
+    /// the segment-boundary sync in rotation) failed ([STL-217]), or an
+    /// [`append`](Self::append) tore (bytes landed past the staged end yet the
+    /// call failed, [STL-299]) — so every further [`append`](Self::append) /
+    /// [`tick`](Self::tick) is refused with [`WalError::Poisoned`] until the engine
+    /// restarts into recovery.
     ///
     /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
+    /// [STL-299]: https://allegromusic.atlassian.net/browse/STL-299
     pub fn is_poisoned(&self) -> bool {
         self.inner.lock().expect("wal mutex poisoned").poisoned
     }
@@ -728,6 +776,87 @@ mod tests {
                 Poll::Ready(Err(WalError::Poisoned))
             ),
             "the woken waiter resolves Poisoned",
+        );
+    }
+
+    /// A **torn** append — bytes physically land past the staged end, yet the
+    /// call fails — poisons the WAL ([STL-299]): the stray bytes can never be
+    /// built on, so every further append/tick is refused. This is the append-side
+    /// analogue of the fsync poison ([STL-217]). The first failure surfaces the
+    /// concrete I/O error; subsequent calls report [`WalError::Poisoned`].
+    #[test]
+    fn a_torn_append_poisons_and_refuses_further_writes() {
+        let faults = Faults::new();
+        let wal =
+            Wal::open(MemDisk::with_faults(faults.clone()), WalConfig::default()).expect("open");
+
+        // One clean, durable record establishes a committed prefix the poison must
+        // leave untouched (it is the consistent state recovery converges to).
+        let durable = wal.append(b"committed").expect("append");
+        wal.tick().expect("fsync");
+        assert_eq!(wal.durable_end(), durable);
+
+        // The next append is torn: it lands a few stray bytes, then fails. The
+        // first failure is the concrete I/O error, and the WAL is now poisoned with
+        // nothing past the committed prefix made durable.
+        faults.schedule_torn_append(io::ErrorKind::Other, 4);
+        let err = wal
+            .append(b"torn-record")
+            .expect_err("the torn append fails");
+        assert!(
+            matches!(err, WalError::Io(_)),
+            "first failure is the io error",
+        );
+        assert!(wal.is_poisoned(), "a torn append poisons the WAL");
+        assert_eq!(
+            wal.durable_end(),
+            durable,
+            "nothing past the committed prefix became durable",
+        );
+
+        // The crux: no later write may build on the staged garbage. A subsequent
+        // append lands at the physical EOF (past the stray bytes) while `staged_end`
+        // still points before them — exactly the desync the poison forecloses.
+        let err = wal
+            .append(b"after")
+            .expect_err("a poisoned append is refused");
+        assert!(matches!(err, WalError::Poisoned));
+        let err = wal.tick().expect_err("a poisoned tick is refused");
+        assert!(matches!(err, WalError::Poisoned));
+    }
+
+    /// A **clean** append failure — the fault fires before any byte lands — does
+    /// **not** poison: the WAL's bookkeeping still matches the file, so the caller
+    /// rolls its resident writes back and keeps running ([STL-295]). This pins the
+    /// boundary the torn-append poison must not cross — only a *detectably-torn*
+    /// append (bytes landed) is a crash.
+    #[test]
+    fn a_clean_append_failure_does_not_poison() {
+        let faults = Faults::new();
+        let wal =
+            Wal::open(MemDisk::with_faults(faults.clone()), WalConfig::default()).expect("open");
+
+        let durable = wal.append(b"committed").expect("append");
+        wal.tick().expect("fsync");
+
+        // A clean append failure: nothing lands (the default schedule's prefix is 0).
+        faults.schedule(FaultOp::Append, io::ErrorKind::Other);
+        let err = wal.append(b"refused").expect_err("the clean append fails");
+        assert!(matches!(err, WalError::Io(_)));
+        assert!(
+            !wal.is_poisoned(),
+            "a clean append failure leaves the WAL healthy",
+        );
+
+        // The WAL keeps working: a subsequent append lands at the right offset and
+        // a fsync makes it durable — proving its bookkeeping never desynced.
+        let next = wal.append(b"next").expect("a healthy WAL still appends");
+        assert!(next > durable);
+        wal.tick().expect("fsync");
+        assert_eq!(
+            wal.durable_end(),
+            next,
+            "the post-failure write is durable — no stray bytes were skipped",
         );
     }
 }

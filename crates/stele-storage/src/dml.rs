@@ -347,16 +347,24 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     ///
     /// # Errors
     ///
-    /// [`DmlError::Wal`] if the append or fsync fails. Two cases, per the WAL
-    /// durability contract:
+    /// [`DmlError::Wal`] if the append or fsync fails. Three cases, per the WAL
+    /// durability contract — all roll the resident writes back, but only the last
+    /// two stop the engine:
     ///
-    /// * **the append fails / is torn** — no complete record reaches the log, so
-    ///   recovery finds nothing of the transaction (a torn frame fails its CRC and
-    ///   is dropped at the fence). The buffered writes already applied *resident* to
-    ///   `delta`/`index`, so they are rolled back **in place** (the [STL-216] in-memory
-    ///   undo) before the error is surfaced — a refused commit therefore leaves the live
-    ///   engine matching what recovery reconstructs (none of the transaction), with no
-    ///   restart ([STL-295]); and
+    /// * **the append fails cleanly** (nothing written) — no record reaches the log,
+    ///   so recovery finds nothing of the transaction. The buffered writes already
+    ///   applied *resident* to `delta`/`index`, so they are rolled back **in place**
+    ///   (the [STL-216] in-memory undo) before the error is surfaced — a refused commit
+    ///   therefore leaves the live engine matching what recovery reconstructs (none of
+    ///   the transaction), and the WAL is **not** poisoned, so the engine keeps running
+    ///   ([STL-295]);
+    /// * **the append tears** (bytes physically landed past the staged end yet it
+    ///   failed) — recovery still finds nothing of the transaction (the torn frame fails
+    ///   its CRC and is dropped at the durable fence), so the resident writes are rolled
+    ///   back in place exactly as above. But the stray bytes can never be safely built
+    ///   on, so the torn append **poisons** the WAL ([`WalError::Poisoned`], [STL-299]):
+    ///   every later `append`/`tick` is refused and the engine stops and recovers,
+    ///   converging to the committed-transaction prefix; and
     /// * **the append succeeds but the fsync ([`Wal::tick`]) fails** — the complete
     ///   record is already *staged* in the WAL, so its durability is **indeterminate**:
     ///   a later successful `tick` (e.g. a [`checkpoint`](crate::engine::Engine::checkpoint))
@@ -371,6 +379,7 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     /// [STL-216]: https://allegromusic.atlassian.net/browse/STL-216
     /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
     /// [STL-295]: https://allegromusic.atlassian.net/browse/STL-295
+    /// [STL-299]: https://allegromusic.atlassian.net/browse/STL-299
     pub fn commit_group<I: Disk>(
         &mut self,
         delta: &mut Delta<D>,
@@ -424,24 +433,31 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     ///   at the fence), so recovery reconstructs *none* of the transaction. The
     ///   resident writes are therefore rolled back **in place** ([`crate::systime::undo`],
     ///   the [STL-216] inverse of `apply_resident`) before the error is surfaced — the
-    ///   live engine matches the recovered state without a restart. The append did not
-    ///   poison the WAL, so the engine stays healthy and serves the rolled-back state.
+    ///   live engine matches the recovered state without a restart. A *clean* failure
+    ///   leaves the WAL un-poisoned, so the engine stays healthy and serves the
+    ///   rolled-back state ([STL-295]); a *torn* failure (bytes physically landed past
+    ///   the staged end) additionally **poisons** the WAL ([STL-299]), since those stray
+    ///   bytes can never be safely built on — the resident rollback still applies, but
+    ///   the engine now also stops and recovers rather than continuing on a corrupt log.
     /// * **the fsync ([`Wal::tick`]) fails** — the complete record is already *staged*,
     ///   so its durability is indeterminate and recovery may replay it. This is a crash,
     ///   not a clean abort: the resident writes are left in place, the WAL poisons
     ///   ([STL-217]), and the engine recovers.
     ///
-    /// A torn (partially-written) append is *also* dropped at recovery, so the resident
-    /// rollback above is correct for it too; whether the WAL should additionally poison
-    /// on a detectably-torn append (the stray bytes are unsafe to append past) is a
-    /// separate WAL-durability concern — no current backend models a partial write
-    /// (`MemDisk` faults fire before the write; `LocalFile::append` does not advance its
-    /// tracked length on a partial `write_all`), so it is not detectable or testable
-    /// here and is left to a follow-up.
+    /// The torn-append detection lives in [`Wal::append`]: it compares the segment's
+    /// post-failure length against the staged end, so a partial physical write is
+    /// distinguished from a clean one and only the former poisons. A backend that
+    /// cannot surface a partial write (a clean-failure-only fault) simply never trips
+    /// the poison — the resident rollback above still keeps it consistent. The real
+    /// `LocalFile::append` does not yet advance its tracked length on a partial
+    /// `write_all`, so surfacing the poison there is the follow-up [STL-305].
+    ///
+    /// [STL-305]: https://allegromusic.atlassian.net/browse/STL-305
     ///
     /// [STL-216]: https://allegromusic.atlassian.net/browse/STL-216
     /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
     /// [STL-295]: https://allegromusic.atlassian.net/browse/STL-295
+    /// [STL-299]: https://allegromusic.atlassian.net/browse/STL-299
     fn finish_group<I: Disk>(
         &mut self,
         delta: &mut Delta<D>,
@@ -455,7 +471,11 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
         // Encode + append are the "did a complete record reach the log?" step. Any
         // failure here means recovery reconstructs none of the transaction, so undo
         // the resident writes in place to match — otherwise a refused commit leaves
-        // undurable rows a live SELECT can see but a restart erases (STL-295).
+        // undurable rows a live SELECT can see but a restart erases (STL-295). This
+        // holds for a *torn* append too — recovery drops the torn frame at the fence
+        // — except `Wal::append` has then also poisoned the WAL (STL-299), so the
+        // poisoned engine refuses further writes and stops; the rollback keeps the
+        // reads it still serves before recovery consistent.
         if let Err(e) = self.append_group_record(txn_id, &redos) {
             crate::systime::undo(delta, index, redos);
             return Err(e);

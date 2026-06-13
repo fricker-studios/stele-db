@@ -13,8 +13,16 @@
 //! in a reproducible order — e.g. "the next `sync` returns `Other`" to model a
 //! lost write. The schedule is a FIFO consulted per operation, so a given seed
 //! always injects the same faults at the same points; there is no internal
-//! randomness. The richer seeded-fault virtual disk (latency, partial writes,
-//! reordering) is [STL-109] — this is the minimal seam it builds on.
+//! randomness. One append fault carries a *torn* prefix
+//! ([`Faults::schedule_torn_append`], [STL-299]): the append physically lands a
+//! leading slice of the bytes passed to it before failing, modelling a partial
+//! physical write the WAL must detect and poison on. (At this layer the appended
+//! slice is the caller's raw bytes — for the WAL, the framed record's header +
+//! payload — not an application-level "payload".) The richer seeded-fault virtual disk
+//! (latency, reordering, bit-flips) is [STL-109] — this is the minimal seam it
+//! builds on.
+//!
+//! [STL-299]: https://allegromusic.atlassian.net/browse/STL-299
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -52,6 +60,19 @@ pub struct Fault {
     pub op: FaultOp,
     /// The [`io::ErrorKind`] the failing operation reports.
     pub kind: io::ErrorKind,
+    /// For a [`FaultOp::Append`] fault: how many leading bytes of the appended
+    /// slice the append physically writes *before* failing — modelling a **torn**
+    /// append (a partial physical write that then errors, [STL-299]). The slice is
+    /// whatever the caller passed to [`DiskFile::append`] (for the WAL, a framed
+    /// record — header + payload — not an application "payload"). `0` (the default for
+    /// every fault scheduled via [`Faults::schedule`]) is a *clean* failure:
+    /// nothing lands, so the WAL stays consistent and is not poisoned ([STL-295]).
+    /// A non-zero prefix leaves stray bytes past the WAL's staged end — the case
+    /// the WAL must detect and poison on. Ignored for non-`Append` ops.
+    ///
+    /// [STL-295]: https://allegromusic.atlassian.net/browse/STL-295
+    /// [STL-299]: https://allegromusic.atlassian.net/browse/STL-299
+    pub torn_prefix: usize,
 }
 
 /// A deterministic, FIFO schedule of [`Fault`]s shared by a [`MemDisk`] and all
@@ -73,9 +94,33 @@ impl Faults {
         Self::default()
     }
 
-    /// Append a fault: the next `op` to run will fail with `kind`.
+    /// Append a fault: the next `op` to run will fail *cleanly* with `kind` —
+    /// nothing is written (the [`torn_prefix`](Fault::torn_prefix) is `0`). For a
+    /// partial physical write, use [`schedule_torn_append`](Self::schedule_torn_append).
     pub fn schedule(&self, op: FaultOp, kind: io::ErrorKind) {
-        self.queue.lock().unwrap().push_back(Fault { op, kind });
+        self.queue.lock().unwrap().push_back(Fault {
+            op,
+            kind,
+            torn_prefix: 0,
+        });
+    }
+
+    /// Schedule a **torn** append: the next [`append`](DiskFile::append)
+    /// physically writes `prefix_len` leading bytes of the slice passed to it,
+    /// then fails with `kind`. This models a partial physical write — bytes land
+    /// on disk past the WAL's staged end, yet the call returns `Err` — which the
+    /// WAL must detect and treat as a crash by poisoning, unlike a clean append
+    /// failure that writes nothing ([STL-299]). `prefix_len` is capped at the
+    /// appended slice's length by [`MemFile::append`], so an over-long value
+    /// writes the whole slice and still fails.
+    ///
+    /// [STL-299]: https://allegromusic.atlassian.net/browse/STL-299
+    pub fn schedule_torn_append(&self, kind: io::ErrorKind, prefix_len: usize) {
+        self.queue.lock().unwrap().push_back(Fault {
+            op: FaultOp::Append,
+            kind,
+            torn_prefix: prefix_len,
+        });
     }
 
     /// How many scheduled faults have not yet fired.
@@ -84,17 +129,23 @@ impl Faults {
         self.queue.lock().unwrap().len()
     }
 
+    /// If the head fault targets `op`, consume and return it; otherwise leave the
+    /// schedule untouched and return `None`. [`MemFile::append`] consumes the
+    /// whole [`Fault`] this way so it can honour a torn append's
+    /// [`torn_prefix`](Fault::torn_prefix); ops with no partial-write modelling
+    /// go through [`check`](Self::check).
+    fn take(&self, op: FaultOp) -> Option<Fault> {
+        let mut queue = self.queue.lock().unwrap();
+        if queue.front().is_some_and(|f| f.op == op) {
+            queue.pop_front()
+        } else {
+            None
+        }
+    }
+
     /// If the head fault targets `op`, consume it and return its error.
     fn check(&self, op: FaultOp) -> io::Result<()> {
-        let fault = {
-            let mut queue = self.queue.lock().unwrap();
-            if queue.front().is_some_and(|f| f.op == op) {
-                queue.pop_front()
-            } else {
-                None
-            }
-        };
-        fault.map_or(Ok(()), |f| {
+        self.take(op).map_or(Ok(()), |f| {
             Err(io::Error::new(f.kind, "stele-sim: injected fault"))
         })
     }
@@ -209,7 +260,23 @@ pub struct MemFile {
 
 impl DiskFile for MemFile {
     fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.faults.check(FaultOp::Append)?;
+        if let Some(fault) = self.faults.take(FaultOp::Append) {
+            // Model a *torn* append: physically land `torn_prefix` leading bytes
+            // (capped at `bytes`), then fail. The default `torn_prefix == 0`
+            // is a *clean* failure — nothing lands, leaving the WAL's bookkeeping
+            // consistent with the file (STL-295); a non-zero prefix leaves stray
+            // bytes past the staged end that the WAL detects and poisons on
+            // (STL-299). Like a real partial write, this advances the file's
+            // `len()` by exactly what landed — the signal the WAL keys off.
+            let landed = fault.torn_prefix.min(bytes.len());
+            if landed > 0 {
+                self.bytes
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&bytes[..landed]);
+            }
+            return Err(io::Error::new(fault.kind, "stele-sim: injected fault"));
+        }
         self.bytes.lock().unwrap().extend_from_slice(bytes);
         Ok(())
     }
