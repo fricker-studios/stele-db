@@ -3761,7 +3761,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                         schema_id: merge.schema_id,
                         key: (*key).clone(),
                         assignments,
-                        valid: None,
+                        // On a valid-time table the matched arm closes the prior
+                        // version and opens a new one over this interval ([STL-235]);
+                        // `None` for a system-only table.
+                        valid: merge.matched_valid,
                     },
                 )
             } else {
@@ -3786,7 +3789,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                         schema_id: merge.schema_id,
                         key,
                         values,
-                        valid: None,
+                        // The not-matched arm inserts with the arm's valid interval
+                        // ([STL-235]); `None` for a system-only table.
+                        valid: merge.not_matched_valid,
                     },
                 )
             };
@@ -7642,6 +7647,219 @@ mod tests {
         assert!(
             total_probes > 5_000,
             "differential probed only {total_probes} (s,v) cells — widen the sweep"
+        );
+    }
+
+    // --- STL-235: the temporal-MERGE historization oracle --------------------
+
+    /// Sweep an exhaustive `(system, valid)` AS OF grid and diff the engine's rows
+    /// against the naïve reference. Returns `(probes, rows_seen, teeth)`; the
+    /// teeth flag records whether an inclusive-`vto` reference would have diverged
+    /// at least once, proving the half-open valid boundary is really probed. The
+    /// per-cell `read_valid_cells` assertion that a key never resolves to two live
+    /// versions is the **no-overlap** check; this diff is the **no-gap** check.
+    fn merge_sweep_grid(
+        engine: &mut SessionEngine<ZeroClock, MemDisk>,
+        model: &ValidRefModel,
+        span: (i64, i64, i64),
+        label: &str,
+        seed: u64,
+    ) -> (u64, u64, bool) {
+        let (create_c, hi, vmax) = span;
+        let (mut probes, mut rows, mut teeth) = (0u64, 0u64, false);
+        for s in create_c..=(hi + 1) {
+            for v in 0..=(vmax + 1) {
+                let got = read_valid_cells(engine, s, v);
+                let want = model.cell(s, v, false);
+                assert_eq!(
+                    got, want,
+                    "seed {seed} [{label}]: engine diverged from the reference at (s={s}, v={v})"
+                );
+                if got != model.cell(s, v, true) {
+                    teeth = true;
+                }
+                rows += u64::try_from(got.len()).expect("fits");
+                probes += 1;
+            }
+        }
+        (probes, rows, teeth)
+    }
+
+    const MERGE_KEY_POOL: i64 = 4;
+    const MERGE_VMAX: i64 = 9;
+
+    /// One seeded random bitemporal-MERGE history plus the naïve reference it was
+    /// mirrored into, ready for the AS OF grid sweep.
+    struct MergeHistory {
+        engine: SessionEngine<ZeroClock, MemDisk>,
+        disk: MemDisk,
+        model: ValidRefModel,
+        create_c: i64,
+        hi: i64,
+        merges: u64,
+        deletes: u64,
+    }
+
+    /// Apply a seeded random workload of **single-key** bitemporal `MERGE`
+    /// statements (one source row ⇒ one write at one commit instant) to a fresh
+    /// valid-time table, with an occasional `DELETE` for an intentional deletion
+    /// gap, mirroring every write into the naïve [`ValidRefModel`].
+    fn build_merge_history(seed: u64) -> MergeHistory {
+        // A stream distinct from the plain-DML oracle's same-seed stream.
+        let mut rng = ValidOracleRng::new(seed ^ 0x5713_2735_0BAD_F00D);
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE acct (id INT PRIMARY KEY, balance INT, vf TIMESTAMP, vt TIMESTAMP) \
+                 WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+            ))
+            .expect("create valid-time table");
+        let create_c = engine.clock.current().0;
+        let mut model = ValidRefModel::default();
+        let mut alive = vec![false; usize::try_from(MERGE_KEY_POOL).expect("fits")];
+        let mut hi = create_c;
+        let (mut merges, mut deletes) = (0u64, 0u64);
+
+        let ops = 6 + rng.below(10);
+        for op in 0..ops {
+            let k = rng.below(MERGE_KEY_POOL);
+            let ku = usize::try_from(k).expect("fits");
+            let ki = i32::try_from(k).expect("key fits i32");
+            let balance = i32::try_from(op + 1).expect("balance fits i32");
+            let from = rng.below(MERGE_VMAX);
+            let open = rng.below(4) == 0;
+            let to = if open {
+                i64::MAX
+            } else {
+                from + 1 + rng.below(MERGE_VMAX - from)
+            };
+
+            // 1-in-5 on a live key: a DELETE, the intentional deletion gap a later
+            // MERGE re-opens (not-matched ⇒ insert). The gap must survive.
+            if alive[ku] && rng.below(5) == 0 {
+                dml(&mut engine, &format!("DELETE FROM acct WHERE id = {ki}"));
+                model.close(ki, engine.clock.current().0);
+                alive[ku] = false;
+                deletes += 1;
+                hi = hi.max(engine.clock.current().0);
+                continue;
+            }
+
+            let set = if open {
+                format!("SET balance = s.bal, vf = {from}")
+            } else {
+                format!("SET balance = s.bal, vf = {from}, vt = {to}")
+            };
+            let (cols, vals) = if open {
+                ("(id, balance, vf)", format!("(s.id, s.bal, {from})"))
+            } else {
+                (
+                    "(id, balance, vf, vt)",
+                    format!("(s.id, s.bal, {from}, {to})"),
+                )
+            };
+            let sql = format!(
+                "MERGE INTO acct USING (VALUES ({ki}, {balance})) AS s (id, bal) ON acct.id = s.id \
+                 WHEN MATCHED THEN UPDATE {set} \
+                 WHEN NOT MATCHED THEN INSERT {cols} VALUES {vals}"
+            );
+            assert_eq!(
+                dml(&mut engine, &sql),
+                DmlSummary::Merge(1),
+                "one row acted on"
+            );
+            let c = engine.clock.current().0;
+            if alive[ku] {
+                model.update(ki, c, from, to, balance);
+            } else {
+                model.insert(ki, c, from, to, balance);
+                alive[ku] = true;
+            }
+            merges += 1;
+            hi = hi.max(c);
+        }
+        MergeHistory {
+            engine,
+            disk,
+            model,
+            create_c,
+            hi,
+            merges,
+            deletes,
+        }
+    }
+
+    #[test]
+    fn sql_temporal_merge_historization_matches_a_naive_reference() {
+        // STL-235's historization oracle ([06 §4]). A random workload of bitemporal
+        // `MERGE` statements is applied to a valid-time table entirely over SQL: a
+        // matched row gets the joint system+valid close/open and an unmatched row
+        // inserts, each carrying the statement's valid interval. The reference is
+        // the **same** naïve list-of-versions the plain valid-time DML oracle uses
+        // — a MERGE arm *is* an UPDATE / INSERT — so agreement isolates the new
+        // code: the binder's arm-interval lift and the engine's thread of it.
+        //
+        // The named property (no gaps / no overlaps unless intended) is asserted
+        // three ways, each over an exhaustive `(system, valid)` grid:
+        //   * **no overlaps** — `read_valid_cells` refuses to resolve a key to two
+        //     live versions at any `(s, v)` (the at-most-one-live invariant);
+        //   * **no unintended gaps** — the grid diff: the engine resolves a row
+        //     wherever the model does and nowhere it does not, so a DELETE leaves a
+        //     gap exactly where intended and a MERGE leaves none;
+        //   * **survives flush + index rebuild** — the grid is re-swept after
+        //     `flush()` (delta sealed into segments) and after cold-boot `recover()`
+        //     (validity index rebuilt from the durable segments + WAL).
+        //
+        // Re-reading every system instant `< hi` after later writes also asserts the
+        // bedrock audit property — a later MERGE never changes an AS OF read of
+        // pre-MERGE history ([16 §7] monotonicity).
+        const SEEDS: u64 = 24;
+        let (mut total_probes, mut rows_seen, mut teeth) = (0u64, 0u64, false);
+        let (mut merges, mut deletes) = (0u64, 0u64);
+
+        for seed in 0..SEEDS {
+            let MergeHistory {
+                mut engine,
+                disk,
+                model,
+                create_c,
+                hi,
+                merges: m,
+                deletes: d,
+            } = build_merge_history(seed);
+            merges += m;
+            deletes += d;
+            let span = (create_c, hi, MERGE_VMAX);
+            // (1) Live, from the delta tier.
+            let (p1, r, t) = merge_sweep_grid(&mut engine, &model, span, "live", seed);
+            // (2) After flush: the delta is sealed into columnar segments.
+            engine.flush().expect("flush");
+            let (p2, _, _) = merge_sweep_grid(&mut engine, &model, span, "post-flush", seed);
+            // (3) After cold-boot recovery: the validity index is rebuilt from the
+            // durable segments + WAL tail — the timeline survives the rebuild.
+            let mut recovered = SessionEngine::recover(disk.clone(), ZeroClock).expect("recover");
+            let (p3, _, _) = merge_sweep_grid(&mut recovered, &model, span, "recovered", seed);
+            total_probes += p1 + p2 + p3;
+            rows_seen += r;
+            teeth |= t;
+        }
+
+        assert!(
+            rows_seen > 0,
+            "every probe was empty — the workload resolved nothing"
+        );
+        assert!(
+            teeth,
+            "the differential never hit a half-open valid boundary — it cannot detect an off-by-one"
+        );
+        assert!(
+            merges > 0 && deletes > 0,
+            "the workload must exercise both MERGE and an intentional deletion gap (merges={merges}, deletes={deletes})"
+        );
+        assert!(
+            total_probes > 10_000,
+            "differential probed only {total_probes} (s,v) cells across live/flush/recover — widen the sweep"
         );
     }
 
@@ -13648,6 +13866,150 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- STL-235: temporal MERGE historization (close/open over both axes) ----
+
+    const CREATE_VACCT: &str = "CREATE TABLE vacct (id INT PRIMARY KEY, balance INT, vf TIMESTAMP, vt TIMESTAMP) \
+         WITH SYSTEM VERSIONING VALID TIME (vf, vt)";
+
+    /// `SELECT id, balance FROM vacct` pinned at `(system, valid)`, sorted.
+    fn vt_asof(
+        engine: &mut SessionEngine<ZeroClock, MemDisk>,
+        s: i64,
+        v: i64,
+    ) -> Vec<Vec<Option<Vec<u8>>>> {
+        let sql = format!(
+            "SELECT id, balance FROM vacct FOR SYSTEM_TIME AS OF {s} FOR VALID_TIME AS OF {v}"
+        );
+        sorted(select(engine, &sql).rows)
+    }
+
+    #[test]
+    fn merge_historizes_a_matched_valid_time_row() {
+        // A matched MERGE closes the prior version on the system axis and opens a
+        // new one over the arm's valid interval ([STL-166] close/open): the new
+        // fact is valid only over [5, 10), and the pre-MERGE history is untouched.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_VACCT)).expect("create");
+        // Key 1 valid [0, +∞), balance 100.
+        dml(
+            &mut engine,
+            "INSERT INTO vacct (id, balance, vf) VALUES (1, 100, 0)",
+        );
+        let s1 = engine.clock.current().0;
+        assert_eq!(
+            dml(
+                &mut engine,
+                "MERGE INTO vacct USING (VALUES (1, 200)) AS s (id, bal) ON vacct.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET balance = s.bal, vf = 5, vt = 10 \
+                 WHEN NOT MATCHED THEN INSERT (id, balance, vf, vt) VALUES (s.id, s.bal, 5, 10)"
+            ),
+            DmlSummary::Merge(1),
+        );
+        let now = engine.clock.current().0;
+        // Pre-MERGE history is immutable: AS OF s1 still sees the wide [0, +∞) fact.
+        assert_eq!(
+            vt_asof(&mut engine, s1, 0),
+            vec![vec![i4(1), i4(100)]],
+            "pre-MERGE v=0 unchanged"
+        );
+        assert_eq!(
+            vt_asof(&mut engine, s1, 7),
+            vec![vec![i4(1), i4(100)]],
+            "pre-MERGE v=7 unchanged"
+        );
+        // Now the fact is valid only over [5, 10): inside sees the new value;
+        // outside is absent (the close/open narrowed the period — no overlap, no
+        // resurrection at v=0), and the half-open upper bound excludes v=10.
+        assert!(
+            vt_asof(&mut engine, now, 0).is_empty(),
+            "v=0 no longer covered after the close/open"
+        );
+        assert_eq!(
+            vt_asof(&mut engine, now, 7),
+            vec![vec![i4(1), i4(200)]],
+            "v=7 sees the new fact"
+        );
+        assert!(
+            vt_asof(&mut engine, now, 10).is_empty(),
+            "half-open: v=10 is excluded from [5, 10)"
+        );
+    }
+
+    #[test]
+    fn merge_not_matched_inserts_with_the_valid_interval() {
+        // An unmatched source row inserts with the arm's valid interval — here an
+        // open period [3, +∞).
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_VACCT)).expect("create");
+        assert_eq!(
+            dml(
+                &mut engine,
+                "MERGE INTO vacct USING (VALUES (2, 50)) AS s (id, bal) ON vacct.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET balance = s.bal, vf = 3 \
+                 WHEN NOT MATCHED THEN INSERT (id, balance, vf) VALUES (s.id, s.bal, 3)"
+            ),
+            DmlSummary::Merge(1),
+        );
+        let now = engine.clock.current().0;
+        assert!(
+            vt_asof(&mut engine, now, 2).is_empty(),
+            "before the valid start the row is absent"
+        );
+        assert_eq!(
+            vt_asof(&mut engine, now, 3),
+            vec![vec![i4(2), i4(50)]],
+            "the open period covers its start"
+        );
+        assert_eq!(
+            vt_asof(&mut engine, now, 1_000),
+            vec![vec![i4(2), i4(50)]],
+            "the open period extends to +∞"
+        );
+    }
+
+    #[test]
+    fn merge_mixed_batch_on_a_valid_time_table() {
+        // One MERGE over a mixed batch: key 1 exists (matched ⇒ close/open) and key
+        // 3 is new (not-matched ⇒ insert), both opening valid [5, +∞). Key 1's
+        // pre-MERGE history stays readable AS OF the past.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_VACCT)).expect("create");
+        dml(
+            &mut engine,
+            "INSERT INTO vacct (id, balance, vf) VALUES (1, 100, 0)",
+        );
+        let s1 = engine.clock.current().0;
+        assert_eq!(
+            dml(
+                &mut engine,
+                "MERGE INTO vacct USING (VALUES (1, 111), (3, 333)) AS s (id, bal) \
+                 ON vacct.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET balance = s.bal, vf = 5 \
+                 WHEN NOT MATCHED THEN INSERT (id, balance, vf) VALUES (s.id, s.bal, 5)"
+            ),
+            DmlSummary::Merge(2),
+        );
+        let now = engine.clock.current().0;
+        // Both new facts are valid [5, +∞): a current read at v=7 sees both.
+        assert_eq!(
+            vt_asof(&mut engine, now, 7),
+            sorted(vec![vec![i4(1), i4(111)], vec![i4(3), i4(333)]]),
+            "both the updated and inserted facts are live at v=7"
+        );
+        // Key 1's pre-MERGE fact (valid [0, +∞), balance 100) is unchanged AS OF s1.
+        assert_eq!(
+            vt_asof(&mut engine, s1, 0),
+            vec![vec![i4(1), i4(100)]],
+            "the pre-MERGE history is immutable"
+        );
+        // …and at v=0 *now* both keys are absent: the matched close/open narrowed
+        // key 1 to [5, +∞), and key 3 was inserted there — neither covers v=0.
+        assert!(
+            vt_asof(&mut engine, now, 0).is_empty(),
+            "neither new fact covers v=0"
+        );
     }
 
     // ---- STL-234: uncorrelated subqueries (scalar, IN, EXISTS) ----

@@ -62,6 +62,8 @@ Each key occupies a set of **rectangles** in (system-time × valid-time) space. 
 
 A correction must **clip** the prior rectangle (close it on the system axis, and on the valid axis open the corrected region) — failure to clip leaves overlaps (double-counting) or gaps (data vanishes at some as-of points). Property-based and differential tests assert this over millions of random `(S, V)` probes ([06](06-testing-strategy.md)).
 
+A bulk **`MERGE`** is the historization path that performs this close/open at scale ([sql-grammar.md](sql-grammar.md#valid-time-historization-stl-235), STL-235): a matched row closes the prior version and opens a new one over the supplied valid interval, an unmatched row inserts. The no-gaps/no-overlaps invariant above, swept over an exhaustive `(S, V)` grid and surviving flush + index rebuild, is the MERGE historization oracle named in [06 §4](06-testing-strategy.md#4-correctness-oracles-the-temporal-heart).
+
 ## 6. Snapshots
 
 A query fixes one `(S, V)` pair **at query start** and uses it for every row — a 10-minute scan sees a single coherent system-time slice even as ingestion continues. "As of now" is *now-at-query-start*, never now-at-each-row.
