@@ -161,3 +161,47 @@ async fn predicate_dml_in_a_transaction_sees_its_own_writes() {
     drop(client);
     let _ = driver.await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn point_dml_on_an_absent_key_tags_zero_over_the_wire() {
+    // STL-294: `UPDATE` / `DELETE … WHERE <key> = <absent>` reports `UPDATE 0` /
+    // `DELETE 0` over the wire instead of failing the statement — both in
+    // auto-commit and inside a transaction, where the block's other writes still
+    // commit.
+    let (client, driver) = connect().await;
+    client
+        .batch_execute("CREATE TABLE t (id INT PRIMARY KEY, v INT) WITH SYSTEM VERSIONING")
+        .await
+        .expect("create");
+    client
+        .simple_query("INSERT INTO t VALUES (1, 10)")
+        .await
+        .expect("insert");
+
+    // Auto-commit: an absent key tags zero and changes nothing — no error.
+    assert_eq!(
+        tag_count(&client, "UPDATE t SET v = 0 WHERE id = 99").await,
+        0
+    );
+    assert_eq!(tag_count(&client, "DELETE FROM t WHERE id = 99").await, 0);
+    assert_eq!(rows(&client, "t").await, vec![(1, Some(10))]);
+
+    // Inside a transaction: the absent-key no-ops tag zero and do not abort the
+    // block, so the sibling INSERT still commits.
+    client.batch_execute("BEGIN").await.expect("begin");
+    assert_eq!(tag_count(&client, "INSERT INTO t VALUES (2, 20)").await, 1);
+    assert_eq!(tag_count(&client, "DELETE FROM t WHERE id = 99").await, 0);
+    assert_eq!(
+        tag_count(&client, "UPDATE t SET v = 5 WHERE id = 99").await,
+        0
+    );
+    client.batch_execute("COMMIT").await.expect("commit");
+    assert_eq!(
+        rows(&client, "t").await,
+        vec![(1, Some(10)), (2, Some(20))],
+        "the sibling INSERT committed despite the absent-key no-ops"
+    );
+
+    drop(client);
+    let _ = driver.await;
+}

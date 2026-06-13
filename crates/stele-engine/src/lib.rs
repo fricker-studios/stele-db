@@ -2998,7 +2998,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// and report the affected-row count. The encoding details (key + value
     /// columns through the row codec, `UPDATE`'s read-modify-write merge) live in
     /// [`apply_bound_dml`](Self::apply_bound_dml).
+    ///
+    /// This is the **auto-commit direct point path**. A key-equality `UPDATE` /
+    /// `DELETE` whose key has no live row is a 0-row no-op (`UPDATE 0` /
+    /// `DELETE 0`, Postgres set semantics) rather than the storage writers'
+    /// `KeyNotFound` ([STL-294], [`absent_point_tag`](Self::absent_point_tag)) —
+    /// no write, no transaction id consumed.
     fn apply_dml(&mut self, dml: BoundDml) -> Result<StatementOutcome, EngineError> {
+        // An absent-key point UPDATE/DELETE reports zero rows and writes nothing
+        // ([STL-294]); probe against the committed state (no overlay).
+        if let Some(summary) = self.absent_point_tag(&dml, self.clock.current(), &[])? {
+            return Ok(StatementOutcome::Dml(summary));
+        }
         let txn_id = TxnId(self.next_txn);
         self.next_txn += 1;
         let principal = Principal::new(WIRE_PRINCIPAL.to_vec());
@@ -3008,6 +3019,89 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // with distinct keys on a server that never opens a transaction ([STL-204]).
         self.prune_write_index();
         Ok(StatementOutcome::Dml(summary))
+    }
+
+    /// The 0-row command tag a point `UPDATE` / `DELETE` of an **absent key**
+    /// should report — `Some(Update(0))` / `Some(Delete(0))` — or `None` when the
+    /// key is live (proceed with the write) or `dml` is not a point UPDATE/DELETE.
+    ///
+    /// STL-229 made predicate `UPDATE` / `DELETE` count matched live rows, but the
+    /// key-equality fast path kept its pre-existing contract and *errored* on a
+    /// missing key. STL-294 aligns it with set semantics: an absent key is a 0-row
+    /// no-op (Postgres `UPDATE 0` / `DELETE 0`) on both the auto-commit path
+    /// ([`apply_dml`](Self::apply_dml)) and at in-transaction staging
+    /// ([`stage_dml`](Self::stage_dml)). The typed in-process
+    /// [`update`](Self::update) / [`delete`](Self::delete) and the storage writers
+    /// keep `KeyNotFound` — only the SQL-bound point path softens.
+    ///
+    /// Liveness is the scan-then-write plan's own answer for the single-key
+    /// predicate: `SELECT <key> FROM t WHERE <key> = <literal>` through
+    /// [`run_select`](Self::run_select), so it sees the in-transaction overlay
+    /// (read-your-own-writes, [STL-203]) and pushes the key equality down to
+    /// zone-map pruning ([`BoundPredicate::key_equality`]) rather than full-scanning.
+    /// The scan-then-write and `MERGE` expansions only ever emit point writes for
+    /// keys they already enumerated live, so they never reach this — they call
+    /// [`apply_bound_dml`](Self::apply_bound_dml) directly and pay no per-key
+    /// re-probe.
+    ///
+    /// [STL-294]: https://allegromusic.atlassian.net/browse/STL-294
+    fn absent_point_tag(
+        &self,
+        dml: &BoundDml,
+        snapshot: SystemTimeMicros,
+        overlay: &[BoundDml],
+    ) -> Result<Option<DmlSummary>, EngineError> {
+        let (table, schema_id, key, zero) = match dml {
+            BoundDml::Update {
+                table,
+                schema_id,
+                key,
+                ..
+            } => (table, *schema_id, key, DmlSummary::Update(0)),
+            BoundDml::Delete {
+                table,
+                schema_id,
+                key,
+            } => (table, *schema_id, key, DmlSummary::Delete(0)),
+            _ => return Ok(None),
+        };
+        let schema = self
+            .catalog
+            .resolve(table, snapshot)
+            .ok_or_else(|| EngineError::UnknownTable(table.clone()))?;
+        let key_col = schema
+            .columns()
+            .first()
+            .ok_or_else(|| EngineError::UnknownTable(table.clone()))?;
+        // `SELECT <key> FROM t WHERE <key> = <literal>`, read exactly as the
+        // scan-then-write plan reads its predicate — so the single-key answer
+        // matches the predicate path (overlay, key-equality zone-map push-down).
+        let probe = BoundSelect {
+            table: table.clone(),
+            schema_id,
+            snapshot,
+            valid_snapshot: None,
+            projection: Projection::Columns(vec![key_col.name().to_owned()]),
+            filter: Some(BoundPredicate {
+                left: BoundScalar::Column(0),
+                op: CompareOp::Eq,
+                right: BoundScalar::Literal(key.clone()),
+            }),
+            period_filter: None,
+            subquery_filter: None,
+            aggregate: None,
+            join: None,
+            distinct: false,
+            order_by: Vec::new(),
+            offset: 0,
+            limit: None,
+        };
+        let StatementOutcome::Rows(matched) = self.run_select(&probe, overlay)? else {
+            return Err(EngineError::Unsupported(
+                "the point-DML liveness probe returned no row set",
+            ));
+        };
+        Ok(matched.rows.is_empty().then_some(zero))
     }
 
     /// Apply an auto-committed **scan-then-write** `UPDATE` / `DELETE`
@@ -3894,6 +3988,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 Ok(Some(summary))
             }
             Ok(dml) => {
+                // A point UPDATE / DELETE reports the rows it will affect: an
+                // absent key is a 0-row no-op (`UPDATE 0` / `DELETE 0`, [STL-294]),
+                // not the storage writers' `KeyNotFound`. Probe at the pinned
+                // snapshot with the transaction's own buffered writes overlaid
+                // (read-your-own-writes, [STL-203]) so the staged tag is exact, and
+                // leave a no-op **unbuffered** — it stays out of the write set, so
+                // COMMIT neither applies it nor lets it abort the block on a
+                // concurrent writer. A point INSERT (and a live point write) buffers
+                // as before.
+                if let Some(summary) = self.absent_point_tag(&dml, txn.snapshot, &txn.writes)? {
+                    return Ok(Some(summary));
+                }
                 let summary = dml_summary(&dml);
                 txn.writes.push(dml);
                 Ok(Some(summary))
@@ -11701,6 +11807,109 @@ mod tests {
     }
 
     #[test]
+    fn point_dml_on_an_absent_key_reports_zero_rows() {
+        // STL-294: a key-equality WHERE on an absent key is a 0-row no-op
+        // (Postgres `UPDATE 0` / `DELETE 0`) on the auto-commit point fast path,
+        // not the storage writers' `KeyNotFound`.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+
+        assert_eq!(
+            dml(&mut engine, "UPDATE account SET balance = 0 WHERE id = 99"),
+            DmlSummary::Update(0)
+        );
+        assert_eq!(
+            dml(&mut engine, "DELETE FROM account WHERE id = 99"),
+            DmlSummary::Delete(0)
+        );
+        // Reversed operand order is still the point fast path (STL-229).
+        assert_eq!(
+            dml(&mut engine, "DELETE FROM account WHERE 99 = id"),
+            DmlSummary::Delete(0)
+        );
+        assert_eq!(
+            select(&mut engine, "SELECT * FROM account").rows,
+            vec![vec![i4(1), i4(100)]],
+            "an absent-key point write changes nothing"
+        );
+
+        // A live key still acts — the fast path is unchanged for a present row.
+        assert_eq!(
+            dml(&mut engine, "UPDATE account SET balance = 5 WHERE id = 1"),
+            DmlSummary::Update(1)
+        );
+        assert_eq!(
+            dml(&mut engine, "DELETE FROM account WHERE id = 1"),
+            DmlSummary::Delete(1)
+        );
+        // Now that key is absent too, so a repeat point delete is also a no-op.
+        assert_eq!(
+            dml(&mut engine, "DELETE FROM account WHERE id = 1"),
+            DmlSummary::Delete(0)
+        );
+    }
+
+    #[test]
+    fn an_absent_key_point_write_in_a_transaction_is_zero_and_commits_siblings() {
+        // STL-294 in-transaction: the staged tag is exact (0 for an absent key,
+        // via the read-your-own-writes probe), the COMMIT is not aborted by it,
+        // and the block's other writes still land.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+
+        let mut txn = engine.begin();
+        // A sibling write that must survive the block.
+        assert_eq!(
+            engine
+                .stage_dml(&parse_one("INSERT INTO account VALUES (2, 200)"), &mut txn)
+                .expect("stage insert"),
+            Some(DmlSummary::Insert(1))
+        );
+        // Absent key → staged tag 0, nothing buffered.
+        assert_eq!(
+            engine
+                .stage_dml(
+                    &parse_one("UPDATE account SET balance = 0 WHERE id = 99"),
+                    &mut txn
+                )
+                .expect("stage update"),
+            Some(DmlSummary::Update(0))
+        );
+        assert_eq!(
+            engine
+                .stage_dml(&parse_one("DELETE FROM account WHERE id = 99"), &mut txn)
+                .expect("stage delete"),
+            Some(DmlSummary::Delete(0))
+        );
+        // Read-your-own-writes: the key inserted earlier in the block is live, so
+        // a point UPDATE of it reports 1 and buffers (the probe sees the overlay).
+        assert_eq!(
+            engine
+                .stage_dml(
+                    &parse_one("UPDATE account SET balance = 222 WHERE id = 2"),
+                    &mut txn
+                )
+                .expect("stage update of buffered insert"),
+            Some(DmlSummary::Update(1))
+        );
+        engine
+            .commit(txn)
+            .expect("commit despite the absent-key no-ops");
+
+        assert_eq!(
+            sorted(select(&mut engine, "SELECT * FROM account").rows),
+            sorted(vec![vec![i4(1), i4(100)], vec![i4(2), i4(222)]]),
+            "the absent-key writes were no-ops; the block's real writes committed"
+        );
+    }
+
+    #[test]
     fn a_committed_transaction_maintains_the_index_and_ryow_reads_never_probe() {
         let mut engine = session();
         run_sql(&mut engine, CREATE);
@@ -12258,7 +12467,7 @@ mod tests {
                     }
                     // Predicate (or whole-table) UPDATE / DELETE.
                     kind => {
-                        let (where_sql, matched, absent_point) = random_predicate(&mut rng, &model);
+                        let (where_sql, matched) = random_predicate(&mut rng, &model);
                         let is_update = kind <= 7;
                         let new = i32::try_from(rng.below(100)).expect("small value");
                         let sql = if is_update {
@@ -12266,36 +12475,29 @@ mod tests {
                         } else {
                             format!("DELETE FROM o{where_sql}")
                         };
-                        // A key-equality WHERE on an absent key takes the point
-                        // fast path, whose existing contract *errors* on a
-                        // missing key rather than reporting 0 rows (kept as-is
-                        // by STL-229; aligning it is a tracked follow-up). The
-                        // oracle pins that behavior: the statement fails and
-                        // nothing changes.
-                        if absent_point {
-                            assert!(
-                                engine.execute(&parse_one(&sql)).is_err(),
-                                "seed {seed} op {op}: the point fast path errors on an absent key"
-                            );
+                        // Every shape — including a key-equality WHERE on an absent
+                        // key, which takes the point fast path — reports the matched
+                        // live-row count. STL-294 aligned that fast path with set
+                        // semantics: an absent key is `UPDATE 0` / `DELETE 0`, the
+                        // same 0-count this `matched.is_empty()` branch expects, with
+                        // no special-case error arm.
+                        let got = dml(&mut engine, &sql);
+                        let count = matched.len() as u64;
+                        let want = if is_update {
+                            for key in &matched {
+                                model.insert(*key, Some(new));
+                            }
+                            DmlSummary::Update(count)
                         } else {
-                            let got = dml(&mut engine, &sql);
-                            let count = matched.len() as u64;
-                            let want = if is_update {
-                                for key in &matched {
-                                    model.insert(*key, Some(new));
-                                }
-                                DmlSummary::Update(count)
-                            } else {
-                                for key in &matched {
-                                    model.remove(key);
-                                }
-                                DmlSummary::Delete(count)
-                            };
-                            assert_eq!(
-                                got, want,
-                                "seed {seed} op {op}: tag must count the matched live rows"
-                            );
-                        }
+                            for key in &matched {
+                                model.remove(key);
+                            }
+                            DmlSummary::Delete(count)
+                        };
+                        assert_eq!(
+                            got, want,
+                            "seed {seed} op {op}: tag must count the matched live rows"
+                        );
                     }
                 }
 
@@ -12318,13 +12520,13 @@ mod tests {
     /// predicate. A NULL value cell never matches a predicate (the evaluator's
     /// three-valued logic keeps only TRUE rows) but is matched by no-WHERE.
     ///
-    /// The third return is `true` when the WHERE is a key **equality on an
-    /// absent key** — the one shape that lowers to the point fast path, whose
-    /// existing contract errors (`KeyNotFound`) instead of reporting 0 rows.
+    /// A key **equality on an absent key** lowers to the point fast path, which
+    /// since STL-294 reports the matched-row count like every other shape — an
+    /// empty match here, so no special-case arm.
     fn random_predicate(
         rng: &mut TestRng,
         model: &BTreeMap<i32, Option<i32>>,
-    ) -> (String, Vec<i32>, bool) {
+    ) -> (String, Vec<i32>) {
         const OPS: [&str; 6] = ["=", "<>", "<", "<=", ">", ">="];
         let cmp = |op: &str, lhs: i64, rhs: i64| match op {
             "=" => lhs == rhs,
@@ -12336,7 +12538,7 @@ mod tests {
         };
         match rng.below(8) {
             // Whole-table: no WHERE — NULL-valued rows match too.
-            0 => (String::new(), model.keys().copied().collect(), false),
+            0 => (String::new(), model.keys().copied().collect()),
             // Arithmetic over the value column: `v % 2 = 0`.
             1 => (
                 " WHERE v % 2 = 0".to_owned(),
@@ -12345,10 +12547,9 @@ mod tests {
                     .filter(|(_, v)| v.is_some_and(|v| v % 2 == 0))
                     .map(|(k, _)| *k)
                     .collect(),
-                false,
             ),
-            // A comparison anchored on the key column. Equality is the point
-            // fast path ([STL-229] keeps its existing absent-key error).
+            // A comparison anchored on the key column. Equality is the point fast
+            // path (an absent key reports 0 rows, [STL-294]).
             2 | 3 => {
                 let op = OPS[usize::try_from(rng.below(6)).expect("op index")];
                 let lit = i64::try_from(rng.below(20)).expect("small literal");
@@ -12357,8 +12558,7 @@ mod tests {
                     .filter(|k| cmp(op, i64::from(**k), lit))
                     .copied()
                     .collect();
-                let absent_point = op == "=" && matched.is_empty();
-                (format!(" WHERE id {op} {lit}"), matched, absent_point)
+                (format!(" WHERE id {op} {lit}"), matched)
             }
             // A comparison anchored on the value column; NULL never matches.
             _ => {
@@ -12371,7 +12571,6 @@ mod tests {
                         .filter(|(_, v)| v.is_some_and(|v| cmp(op, i64::from(v), lit)))
                         .map(|(k, _)| *k)
                         .collect(),
-                    false,
                 )
             }
         }
