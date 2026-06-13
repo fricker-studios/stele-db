@@ -124,10 +124,10 @@ commit-chain head, and is closed by a self-digest over its own body.**
   parent reference so an incremental backup names only the segments added since
   its base; the `commit-head` and `fence-micros` already anchor a backup in the
   chain's timeline, which is the hook PITR needs.
-- **Streaming / non-blocking online backup.** v0.3 takes the backup synchronously
-  under the session lock (the brief stop-the-world `FLUSH`/`COMPACT` already are);
-  the recorded fence makes a future lock-free copy (read prefixes at the fence
-  while writers proceed) a format-compatible change, not a new contract.
+- **Streaming / non-blocking online backup** ([STL-309]). v0.3 takes the backup
+  synchronously under the session lock (the brief stop-the-world `FLUSH`/`COMPACT`
+  already are); the recorded fence makes a future lock-free copy (read prefixes at
+  the fence while writers proceed) a format-compatible change, not a new contract.
 - **Encryption** of backups end-to-end ([10 §4](../10-security-and-compliance.md#4-data-protection--encryption)) is a v0.7 concern; the manifest's per-file hashes verify integrity, not confidentiality.
 
 [ADR-0007]: 0007-storage-compute-separation.md
@@ -139,3 +139,4 @@ commit-chain head, and is closed by a self-digest over its own body.**
 [02 §3.2]: ../02-architecture.md#32-on-disk-segment-format
 [STL-178]: https://allegromusic.atlassian.net/browse/STL-178
 [STL-232]: https://allegromusic.atlassian.net/browse/STL-232
+[STL-309]: https://allegromusic.atlassian.net/browse/STL-309
