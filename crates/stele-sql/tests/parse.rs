@@ -240,7 +240,9 @@ fn parses_checkpoint_and_flush_as_admin_commands() {
         );
         assert!(stmts[0].sql().is_none(), "{sql:?} has no SQL body");
         match &stmts[0].body {
-            StatementBody::Admin(cmd) => assert_eq!(*cmd, want, "{sql:?}"),
+            // `AdminCommand` is no longer `Copy` (the `Backup` variant owns a
+            // path), so compare by reference rather than dereferencing.
+            StatementBody::Admin(cmd) => assert_eq!(cmd, &want, "{sql:?}"),
             other => panic!("{sql:?} must be an admin command, got {other:?}"),
         }
     }
@@ -252,6 +254,42 @@ fn admin_commands_take_no_arguments() {
     assert!(parse("CHECKPOINT 5").is_err());
     assert!(parse("FLUSH TABLES").is_err());
     assert!(parse("COMPACT t").is_err());
+}
+
+#[test]
+fn parses_backup_to_a_quoted_path() {
+    // BACKUP is the one admin command that takes an argument: `BACKUP TO '<path>'`,
+    // lifted at the token level (case-insensitive keyword, trailing `;` ok).
+    for sql in [
+        "BACKUP TO '/srv/backups/2026-06-13'",
+        "backup TO '/srv/backups/2026-06-13' ;",
+    ] {
+        let stmts = parse(sql).unwrap_or_else(|e| panic!("parse {sql:?}: {e}"));
+        assert_eq!(stmts.len(), 1, "{sql:?} is one statement");
+        assert!(stmts[0].sql().is_none(), "{sql:?} has no SQL body");
+        match &stmts[0].body {
+            StatementBody::Admin(AdminCommand::Backup { path }) => {
+                assert_eq!(path, "/srv/backups/2026-06-13", "{sql:?}");
+            }
+            other => panic!("{sql:?} must be a BACKUP admin command, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn malformed_backup_is_rejected() {
+    // Each of these is a loud syntax error, never a silent fall-through.
+    for sql in [
+        "BACKUP",               // no target
+        "BACKUP TO",            // TO without a path
+        "BACKUP '/x'",          // missing TO
+        "BACKUP TO ''",         // empty path
+        "BACKUP TO /srv/x",     // unquoted path
+        "BACKUP TO '/x' EXTRA", // trailing token
+        "BACKUP INTO '/x'",     // wrong keyword
+    ] {
+        assert!(parse(sql).is_err(), "expected a parse error for: {sql:?}");
+    }
 }
 
 // --- user DDL (STL-252) ----------------------------------------------------

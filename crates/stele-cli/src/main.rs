@@ -3,9 +3,11 @@
 //! `stele server` starts the daemon (so the single binary covers the
 //! "five-minute path" in [`docs/05-dev-environment.md`](../../../docs/05-dev-environment.md)),
 //! `stele shell` opens the interactive query shell over pg-wire (STL-185),
+//! `stele restore` rebuilds a data directory from a backup (STL-249),
 //! `stele version` reports the build, and every other subcommand is a polite
 //! "not yet" with a doc link.
 
+use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
 mod client;
@@ -31,6 +33,8 @@ enum Cmd {
     Server(ServerArgs),
     /// Interactive SQL shell over pg-wire.
     Shell(ShellArgs),
+    /// Rebuild a data directory from a backup, then verify it (STL-249).
+    Restore(RestoreArgs),
     /// One-shot query. Not implemented in v0.1.
     Query { sql: String },
     /// Print version + build metadata.
@@ -68,6 +72,18 @@ struct ShellArgs {
     /// Disable ANSI color even on a terminal (NO_COLOR is also honored).
     #[arg(long)]
     no_color: bool,
+}
+
+#[derive(clap::Args, Debug)]
+struct RestoreArgs {
+    /// The backup directory to restore from — a directory produced by
+    /// `BACKUP TO '<path>'`, containing a `MANIFEST` and the backed-up files.
+    #[arg(long)]
+    from: std::path::PathBuf,
+    /// The data directory to materialize into. Must be empty (or not yet exist);
+    /// restore refuses to merge into a directory that already holds data.
+    #[arg(long)]
+    to: std::path::PathBuf,
 }
 
 #[derive(clap::Args, Debug)]
@@ -123,6 +139,7 @@ fn main() -> anyhow::Result<()> {
             row_nums: s.row_numbers,
             no_color: s.no_color,
         }),
+        Cmd::Restore(r) => run_restore(&r),
         Cmd::Query { .. } => {
             anyhow::bail!(
                 "not implemented yet — see docs/03-roadmap.md. Use `stele shell` or `psql -h localhost -p 5454 -d stele` for now."
@@ -133,6 +150,59 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Rebuild a data directory from a backup, then verify it by running normal
+/// recovery ([STL-249]).
+///
+/// This is the **offline** half of backup/restore (the online half is the
+/// `BACKUP TO '<path>'` admin command). It [`restore_disk`](stele_engine::backup::restore_disk)s
+/// the backup — checking the manifest's self-digest and every file's SHA-256
+/// before writing it, so a single flipped byte is refused — then boots
+/// [`SessionEngine::recover`](stele_engine::SessionEngine::recover) against the
+/// materialized directory, which re-verifies segment checksums and the commit-log
+/// hash chain (STL-178). On success the data directory is ready for
+/// `stele server --config …` to point at.
+fn run_restore(args: &RestoreArgs) -> anyhow::Result<()> {
+    use stele_storage::backend::LocalDisk;
+
+    anyhow::ensure!(
+        args.from.is_dir(),
+        "backup directory {} does not exist or is not a directory",
+        args.from.display()
+    );
+    let src = LocalDisk::open(&args.from)
+        .with_context(|| format!("opening backup directory {}", args.from.display()))?;
+    let dst = LocalDisk::open(&args.to)
+        .with_context(|| format!("opening target data directory {}", args.to.display()))?;
+
+    let manifest = stele_engine::backup::restore_disk(&src, &dst).with_context(|| {
+        format!(
+            "restoring backup {} into {}",
+            args.from.display(),
+            args.to.display()
+        )
+    })?;
+
+    // Validate the materialized directory by running normal recovery: segment
+    // checksums and the STL-178 commit-log hash chain re-verify, and every table
+    // reopens. A corrupt-but-checksum-matching backup is caught here.
+    let engine = stele_engine::SessionEngine::recover(dst, stele_common::time::SystemClock)
+        .with_context(|| {
+            format!(
+                "recovering the restored data directory {}",
+                args.to.display()
+            )
+        })?;
+
+    println!(
+        "restored {} file(s) into {} (backup fence {}µs); recovered {} table(s)",
+        manifest.files.len(),
+        args.to.display(),
+        manifest.fence_micros,
+        engine.describe_live_tables().len(),
+    );
+    Ok(())
 }
 
 /// The line `stele version` prints: the crate version plus the git commit the
@@ -176,6 +246,145 @@ mod tests {
             Cmd::Query { .. }
         ));
         assert!(matches!(parse(&["stele", "server"]), Cmd::Server(_)));
+        assert!(matches!(
+            parse(&["stele", "restore", "--from", "/b", "--to", "/d"]),
+            Cmd::Restore(_)
+        ));
+    }
+
+    #[test]
+    fn restore_parses_from_and_to() {
+        let Cmd::Restore(r) = parse(&[
+            "stele",
+            "restore",
+            "--from",
+            "/srv/backup",
+            "--to",
+            "/var/lib/stele",
+        ]) else {
+            panic!("expected restore subcommand");
+        };
+        assert_eq!(r.from, std::path::PathBuf::from("/srv/backup"));
+        assert_eq!(r.to, std::path::PathBuf::from("/var/lib/stele"));
+    }
+
+    #[test]
+    fn restore_requires_both_from_and_to() {
+        assert!(Args::try_parse_from(["stele", "restore", "--from", "/b"]).is_err());
+        assert!(Args::try_parse_from(["stele", "restore", "--to", "/d"]).is_err());
+    }
+
+    #[test]
+    fn restore_errors_when_the_backup_directory_is_missing() {
+        let dirs = Scratch::new("restore-missing");
+        let err = run_restore(&RestoreArgs {
+            from: dirs.path().join("nonexistent-backup"),
+            to: dirs.path().join("data"),
+        })
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not exist"),
+            "expected a clear missing-backup error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn restore_round_trips_a_real_backup_and_recovers() {
+        use stele_common::time::SystemClock;
+        use stele_engine::SessionEngine;
+        use stele_storage::backend::LocalDisk;
+
+        let dirs = Scratch::new("restore-round-trip");
+        let data = dirs.path().join("data");
+        let backup = dirs.path().join("backup");
+        let restored = dirs.path().join("restored");
+
+        // Produce a real backup from a live engine on local disk.
+        let mut engine =
+            SessionEngine::open(LocalDisk::open(&data).expect("data disk"), SystemClock);
+        let target = LocalDisk::open(&backup).expect("backup disk");
+        let manifest = engine.backup(&target).expect("backup");
+        drop(engine);
+        // The backup directory carries a manifest the CLI will read.
+        assert!(backup.join("MANIFEST").is_file(), "manifest was written");
+
+        // The CLI restore verb materializes + verifies + recovers without error.
+        run_restore(&RestoreArgs {
+            from: backup.clone(),
+            to: restored.clone(),
+        })
+        .expect("restore");
+
+        // Every file the manifest lists is materialized byte-for-byte; the manifest
+        // itself is a backup artifact and is not copied into the data dir.
+        assert!(!restored.join("MANIFEST").exists());
+        for entry in &manifest.files {
+            let original = std::fs::read(backup.join(&entry.name)).expect("read backup file");
+            let copy = std::fs::read(restored.join(&entry.name)).expect("read restored file");
+            assert_eq!(copy, original, "{} restored byte-for-byte", entry.name);
+        }
+    }
+
+    #[test]
+    fn restore_refuses_a_tampered_backup() {
+        use stele_common::time::SystemClock;
+        use stele_engine::SessionEngine;
+        use stele_storage::backend::LocalDisk;
+
+        let dirs = Scratch::new("restore-tamper");
+        let data = dirs.path().join("data");
+        let backup = dirs.path().join("backup");
+
+        let mut engine =
+            SessionEngine::open(LocalDisk::open(&data).expect("data disk"), SystemClock);
+        engine
+            .backup(&LocalDisk::open(&backup).expect("backup disk"))
+            .expect("backup");
+        drop(engine);
+
+        // Flip a byte in the manifest: restore must refuse before touching the target.
+        let manifest_path = backup.join("MANIFEST");
+        let mut bytes = std::fs::read(&manifest_path).expect("read manifest");
+        let last = bytes.len() - 2; // a hex digit inside the trailing digest line
+        bytes[last] ^= 0x01;
+        std::fs::write(&manifest_path, &bytes).expect("rewrite manifest");
+
+        let err = run_restore(&RestoreArgs {
+            from: backup,
+            to: dirs.path().join("restored"),
+        })
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("tamper") || format!("{err:#}").contains("digest"),
+            "a tampered backup must be refused, got: {err:#}"
+        );
+    }
+
+    /// A unique scratch directory under the OS temp dir, removed on drop — the
+    /// CLI restore tests need real local directories but must leave nothing behind.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("stele-cli-{label}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create scratch dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]

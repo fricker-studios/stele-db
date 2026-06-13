@@ -48,6 +48,7 @@
 //! [ADR-0010]: ../../../docs/adr/0010-deterministic-simulation-testing.md
 //! [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
 
+pub mod backup;
 mod catalog_log;
 mod commit_log;
 mod secondary;
@@ -603,6 +604,15 @@ pub enum EngineError {
     /// errored on open, write, or recovery.
     #[error(transparent)]
     Storage(#[from] StorageError),
+
+    /// Taking an online backup ([STL-249]) failed — the target directory was not
+    /// empty, or an I/O error reading the live disk or writing the target. The
+    /// fence (flush + checkpoint) had already succeeded, so a re-run into a fresh
+    /// target retries cleanly.
+    ///
+    /// [STL-249]: https://allegromusic.atlassian.net/browse/STL-249
+    #[error("backup: {0}")]
+    Backup(#[from] backup::BackupError),
 
     /// The durable catalog log ([ADR-0028]) could not be appended (the DDL is
     /// refused — nothing was acknowledged) or replayed at recovery (the log
@@ -1323,6 +1333,50 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         Ok(())
     }
 
+    /// Take a consistent, online full **backup** into the (empty) `target` disk
+    /// ([STL-249], [ADR-0032]).
+    ///
+    /// Fences first — [`flush`](Self::flush) seals every table's delta into an
+    /// immutable segment and [`checkpoint`](Self::checkpoint) fsyncs every WAL —
+    /// so the on-disk set is a complete, recoverable snapshot, then copies the
+    /// immutable set (sealed segments, per-table WALs, the durable catalog log,
+    /// and the hash-chained commit log) verbatim into `target` with a
+    /// [`BackupManifest`](backup::BackupManifest). The *fence instant* the manifest
+    /// records is the commit clock's high-water mark: every `AS OF` read at or
+    /// before it answers identically on the restored copy
+    /// ([`backup::backup_disk`]).
+    ///
+    /// "Online" here means the server stays up: the call runs synchronously,
+    /// holding the session lock for its duration — the same brief stop-the-world
+    /// `FLUSH` / `COMPACT` already are ([STL-219]). Concurrent writers queue behind
+    /// it, and anything they commit *after* the fence is not in the backup. A
+    /// fully non-blocking streaming backup is a deliberate follow-up the recorded
+    /// fence leaves room for.
+    ///
+    /// Restore is the inverse, **offline** operation — [`backup::restore_disk`]
+    /// (verify + materialize) then [`recover`](Self::recover) (segment checksums +
+    /// the commit-log hash chain re-verify) — exposed as the `stele restore` CLI
+    /// verb. The `BACKUP TO '<path>'` admin command drives this method over the
+    /// wire ([STL-219] shape).
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] if the fence (flush / checkpoint) fails, or
+    /// [`EngineError::Backup`] if `target` is non-empty or the copy hits an I/O
+    /// error. The fence runs before any copy, so a copy failure leaves the live
+    /// engine fenced but otherwise untouched; a re-run into a fresh target retries.
+    ///
+    /// [STL-219]: https://allegromusic.atlassian.net/browse/STL-219
+    /// [STL-249]: https://allegromusic.atlassian.net/browse/STL-249
+    /// [ADR-0032]: ../../../docs/adr/0032-backup-manifest-format.md
+    pub fn backup<T: Disk>(&mut self, target: &T) -> Result<backup::BackupManifest, EngineError> {
+        self.flush()?;
+        self.checkpoint()?;
+        let fence = self.clock.current();
+        let manifest = backup::backup_disk(&self.disk, target, fence.0, self.commit_head)?;
+        Ok(manifest)
+    }
+
     /// Whether any resident table's WAL is **poisoned** — a prior fsync failed on
     /// that table, so its staged record's durability is indeterminate and the
     /// per-table engine now refuses further writes ([`Engine::is_poisoned`],
@@ -2017,10 +2071,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         read_snapshot: SystemTimeMicros,
         overlay: &[BoundDml],
     ) -> Result<StatementOutcome, EngineError> {
-        // Admin commands (CHECKPOINT / FLUSH / COMPACT) have no SQL body, so they
-        // are routed before the binders, which all assume one ([STL-219]).
+        // Admin commands (CHECKPOINT / FLUSH / COMPACT / BACKUP) have no SQL body,
+        // so they are routed before the binders, which all assume one ([STL-219]).
+        // `clone` (not `Copy`) because `BACKUP` carries an owned path.
         if let StatementBody::Admin(cmd) = &stmt.body {
-            return self.apply_admin(*cmd);
+            return self.apply_admin(cmd.clone());
         }
 
         // Stele-native temporal introspection: `SELECT * FROM stele_history('t'[, key])`
@@ -2450,7 +2505,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// # Errors
     ///
     /// [`EngineError::Storage`] if a table's checkpoint, flush, or compaction
-    /// fails.
+    /// fails; [`EngineError::Backup`] if a `BACKUP` cannot open or write its
+    /// target directory.
     fn apply_admin(&mut self, cmd: AdminCommand) -> Result<StatementOutcome, EngineError> {
         let tag = match cmd {
             AdminCommand::Checkpoint => {
@@ -2464,6 +2520,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             AdminCommand::Compact => {
                 self.compact()?;
                 "COMPACT"
+            }
+            AdminCommand::Backup { path } => {
+                // The target is a local filesystem directory (object-store targets
+                // are v0.4 — [STL-249] scope); `LocalDisk::open` creates it if
+                // absent. `backup` itself refuses a non-empty target. The wire
+                // path always backs up to local disk regardless of the engine's
+                // own backend, so this is the one place the generic engine names a
+                // concrete backend.
+                let target = stele_storage::backend::LocalDisk::open(&path)
+                    .map_err(backup::BackupError::Io)?;
+                self.backup(&target)?;
+                "BACKUP"
             }
         };
         Ok(StatementOutcome::Ddl { tag })
@@ -10969,6 +11037,306 @@ mod tests {
             "the AS OF read answers as the live session did"
         );
         assert_eq!(live_as_of, vec![vec![i4(1), i4(100)]]);
+    }
+
+    // ---- online backup + restore (STL-249) ----
+    //
+    // The v0.3 exit criterion's second clause: a backup taken under live write
+    // load, restored into a fresh data dir, is byte-for-byte identical for the
+    // immutable set, and every AS OF read at or before the fence answers
+    // identically pre/post restore. This is a SessionEngine-level differential
+    // oracle (in-process MemDisk sweep, the same home as the STL-210/215 recovery
+    // coverage) — backup is the multi-table, shared-log operation SessionEngine
+    // owns, and the oracle drives the whole SQL bind→exec→storage path.
+
+    /// A small, dependency-free deterministic PRNG (SplitMix64) so the backup
+    /// oracle's write load varies per seed yet replays identically — the same
+    /// determinism the simulation harness relies on, without pulling stele-sim in.
+    fn split_mix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Apply one random, always-valid bitemporal op against `account`, keeping
+    /// `live` (the currently-present business keys) in sync. Inserts use a fresh,
+    /// never-reused id (`next_id`) so there is never a primary-key conflict;
+    /// updates and deletes target a currently-live id. The mix builds genuine
+    /// system-time history — supersessions and deletion gaps — for `AS OF` to read.
+    fn apply_random_op(
+        engine: &mut SessionEngine<ZeroClock, MemDisk>,
+        rng: &mut u64,
+        next_id: &mut u64,
+        live: &mut std::collections::BTreeSet<u64>,
+    ) {
+        let roll = split_mix(rng) % 3;
+        if live.is_empty() || roll == 0 {
+            let id = *next_id;
+            *next_id += 1;
+            let bal = split_mix(rng) % 1000;
+            engine
+                .execute(&parse_one(&format!(
+                    "INSERT INTO account VALUES ({id}, {bal})"
+                )))
+                .expect("insert");
+            live.insert(id);
+        } else if roll == 1 {
+            let id = nth_live(live, split_mix(rng));
+            let bal = split_mix(rng) % 1000;
+            engine
+                .execute(&parse_one(&format!(
+                    "UPDATE account SET balance = {bal} WHERE id = {id}"
+                )))
+                .expect("update");
+        } else {
+            let id = nth_live(live, split_mix(rng));
+            engine
+                .execute(&parse_one(&format!("DELETE FROM account WHERE id = {id}")))
+                .expect("delete");
+            live.remove(&id);
+        }
+    }
+
+    /// The `r`-th currently-live id (wrapping) — a deterministic pick from the set.
+    fn nth_live(live: &std::collections::BTreeSet<u64>, r: u64) -> u64 {
+        let idx = usize::try_from(r % live.len() as u64).expect("index fits usize");
+        *live.iter().nth(idx).expect("live is non-empty")
+    }
+
+    #[test]
+    fn backup_under_write_load_round_trips_byte_for_byte_and_preserves_as_of() {
+        const NOW_SQL: &str = "SELECT id, balance FROM account";
+        for seed in 0..24u64 {
+            let mut rng = seed.wrapping_add(1);
+            let mut next_id = 1u64;
+            let mut live = std::collections::BTreeSet::new();
+
+            // The byte-for-byte check compares the restored disk against the
+            // backup; the live engine's own disk is internal.
+            let mut engine = SessionEngine::open(MemDisk::new(), ZeroClock);
+            engine.execute(&parse_one(CREATE)).expect("create");
+
+            // Phase 1: pre-fence write load, sampling AS OF probe instants along
+            // the way.
+            let mut probes: Vec<SystemTimeMicros> = Vec::new();
+            let pre_ops = 12 + split_mix(&mut rng) % 18;
+            for _ in 0..pre_ops {
+                apply_random_op(&mut engine, &mut rng, &mut next_id, &mut live);
+                if split_mix(&mut rng) % 3 == 0 {
+                    probes.push(engine.clock.current());
+                }
+            }
+            probes.push(engine.clock.current()); // always probe the latest pre-fence instant
+
+            // Fence + backup, under (the absence of) concurrent writes — the admin
+            // command holds the session lock, so the on-disk set is the fence state.
+            let backup = MemDisk::new();
+            let manifest = engine.backup(&backup).expect("backup");
+            let fence = SystemTimeMicros(manifest.fence_micros);
+            probes.push(fence);
+            assert!(
+                !manifest.files.is_empty(),
+                "seed {seed}: the backup captured a non-empty immutable set"
+            );
+
+            // The live engine's answers at the fence: current state (== AS OF
+            // fence, since nothing has committed past it yet) and each probe.
+            let live_at_fence = sorted(select(&mut engine, NOW_SQL).rows);
+            let live_as_of: Vec<_> = probes
+                .iter()
+                .map(|t| {
+                    sorted(
+                        select(
+                            &mut engine,
+                            &format!("{NOW_SQL} FOR SYSTEM_TIME AS OF {}", t.0),
+                        )
+                        .rows,
+                    )
+                })
+                .collect();
+
+            // Phase 2: post-fence write load — these commits must NOT survive into
+            // the restore (the backup is a clean prefix cut at the fence).
+            let post_ops = 5 + split_mix(&mut rng) % 12;
+            for _ in 0..post_ops {
+                apply_random_op(&mut engine, &mut rng, &mut next_id, &mut live);
+            }
+
+            // Restore into a fresh disk and boot it through normal recovery.
+            let restored_disk = MemDisk::new();
+            crate::backup::restore_disk(&backup, &restored_disk).expect("restore");
+            let mut restored = recover_session(&restored_disk);
+
+            // (1) Every AS OF read at or before the fence is identical pre/post
+            // restore — system-time history is immutable, so the cut is exact.
+            for (t, expected) in probes.iter().zip(&live_as_of) {
+                assert_eq!(
+                    &sorted(
+                        select(
+                            &mut restored,
+                            &format!("{NOW_SQL} FOR SYSTEM_TIME AS OF {}", t.0)
+                        )
+                        .rows
+                    ),
+                    expected,
+                    "seed {seed}: AS OF {} diverged after restore",
+                    t.0
+                );
+            }
+
+            // (2) The restored "now" is exactly the live AS-OF-fence state: the
+            // post-fence writes are absent.
+            assert_eq!(
+                sorted(select(&mut restored, NOW_SQL).rows),
+                live_at_fence,
+                "seed {seed}: restored current state is not the fence state (post-fence writes leaked in, or data was lost)"
+            );
+
+            // (3) Byte-for-byte: every file the manifest lists is identical in the
+            // restored dir (independently re-read, not just trusting restore's own
+            // checksum pass), and the manifest itself is not materialized into the
+            // data dir.
+            assert!(
+                restored_disk
+                    .list()
+                    .unwrap()
+                    .iter()
+                    .all(|n| n != "MANIFEST")
+            );
+            for entry in &manifest.files {
+                let restored_bytes =
+                    crate::backup::read_all(&restored_disk, &entry.name).expect("read restored");
+                let backup_bytes =
+                    crate::backup::read_all(&backup, &entry.name).expect("read backup");
+                assert_eq!(
+                    restored_bytes, backup_bytes,
+                    "seed {seed}: {} is not byte-for-byte identical after restore",
+                    entry.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restore_refuses_a_tampered_commit_log() {
+        // A flipped byte in the backed-up commit log is caught at restore by the
+        // manifest's per-file checksum (the first of the two tamper layers; the
+        // STL-178 hash chain re-verifies on the recover that follows). Build real
+        // committed history so `stele.commits` is non-trivial.
+        let mut engine = SessionEngine::open(MemDisk::new(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("insert");
+        engine
+            .execute(&parse_one("UPDATE account SET balance = 200 WHERE id = 1"))
+            .expect("update");
+
+        let backup = MemDisk::new();
+        let manifest = engine.backup(&backup).expect("backup");
+        assert!(
+            manifest.files.iter().any(|f| f.name == "stele.commits"),
+            "the commit log is part of the immutable set"
+        );
+
+        // Flip a byte in the backed-up commit log (same length, different content).
+        use stele_storage::backend::DiskFile as _;
+        let mut tampered = crate::backup::read_all(&backup, "stele.commits").expect("read commits");
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        backup.remove("stele.commits").expect("remove");
+        {
+            let mut f = backup.create("stele.commits").expect("recreate");
+            f.append(&tampered).expect("append");
+            f.sync().expect("sync");
+        }
+
+        let restored = MemDisk::new();
+        let err = crate::backup::restore_disk(&backup, &restored).expect_err("tamper refused");
+        assert!(
+            matches!(err, crate::backup::RestoreError::ChecksumMismatch { name } if name == "stele.commits"),
+            "a flipped byte in the commit log must be refused at restore"
+        );
+    }
+
+    #[test]
+    fn backup_to_admin_command_produces_a_restorable_backup() {
+        // The wire trigger ([STL-219] shape): `BACKUP TO '<dir>'` routes through
+        // `execute` → `apply_admin`, fences, and writes a backup to a *local*
+        // directory regardless of the engine's own backend. Exercises the one
+        // place the generic engine names a concrete backend, so it uses the real
+        // filesystem (cleaned up on drop).
+        let dirs = Scratch::new("engine-backup-admin");
+        let backup_dir = dirs.path().join("backup");
+
+        let mut engine = SessionEngine::open(MemDisk::new(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (7, 70)"))
+            .expect("insert");
+
+        let backup_sql = format!("BACKUP TO '{}'", backup_dir.display());
+        let outcome = engine
+            .execute(&parse_one(&backup_sql))
+            .expect("backup command");
+        assert_eq!(
+            outcome,
+            StatementOutcome::Ddl { tag: "BACKUP" },
+            "BACKUP reports its CommandComplete tag"
+        );
+        assert!(
+            backup_dir.join("MANIFEST").is_file(),
+            "a manifest was written"
+        );
+
+        // The on-disk backup restores and recovers, and the row survives.
+        let src = stele_storage::backend::LocalDisk::open(&backup_dir).expect("open backup");
+        let restored_dir = dirs.path().join("restored");
+        let dst = stele_storage::backend::LocalDisk::open(&restored_dir).expect("open restored");
+        crate::backup::restore_disk(&src, &dst).expect("restore");
+        let mut restored = SessionEngine::recover(dst, ZeroClock).expect("recover");
+        // `select` is MemDisk-typed; this engine is LocalDisk-backed, so read directly.
+        let StatementOutcome::Rows(result) = restored
+            .execute(&parse_one("SELECT id, balance FROM account"))
+            .expect("select")
+        else {
+            panic!("SELECT must return rows");
+        };
+        assert_eq!(
+            sorted(result.rows),
+            vec![vec![i4(7), i4(70)]],
+            "the restored engine serves the backed-up row"
+        );
+    }
+
+    /// A unique scratch directory under the OS temp dir, removed on drop. The
+    /// backup oracle is otherwise all-`MemDisk`; only the `BACKUP TO '<path>'`
+    /// wire path needs a real local directory (its target is always local disk).
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("stele-engine-{label}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create scratch dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     // ---- cross-table crash-atomic commit (STL-215) ----

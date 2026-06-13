@@ -155,6 +155,52 @@ flowchart LR
 - **Restore:** re-point compute at the backup's manifest, verify segment checksums, replay WAL to the target consistency point. Restore = source, **byte-for-byte and including full history + provenance** ([06](06-testing-strategy.md)).
 - **Verify:** every restore drill checks an integrity oracle + a known as-of query, not just "it started."
 
+### 5.1 Full backup & restore today (v0.3, local backend — STL-249)
+
+What ships now is the **full** (not yet incremental) form of the above, on the
+local backend, with the byte-for-byte round-trip proven by a differential oracle
+([06](06-testing-strategy.md)). Incremental backup + PITR land in v0.4; object-store
+targets ride the same `Disk` seam.
+
+**Take a backup** — online, while the server serves traffic — over any SQL client
+(`psql`, `stele shell`, a driver):
+
+```sql
+BACKUP TO '/srv/backups/stele-2026-06-13';
+```
+
+The command fences (flush + checkpoint), then copies the **immutable set** —
+sealed segments, every per-table WAL, the durable catalog log, and the
+hash-chained commit log — verbatim into the target directory, alongside a
+`MANIFEST` ([ADR-0032](adr/0032-backup-manifest-format.md)). The manifest is plain
+text: `cat MANIFEST` shows the format version, the fence instant, the commit-chain
+head the backup vouches for, and a SHA-256 for every file. The target directory
+must be empty. Like `FLUSH`/`COMPACT`, `BACKUP` briefly serializes with other
+statements for its duration (the server stays up; a non-blocking streaming backup
+is a planned follow-up) — and **do not run `COMPACT` concurrently with a backup**,
+which could retire a segment mid-copy.
+
+**Restore** — offline, into a fresh data directory — with the CLI:
+
+```sh
+stele restore --from /srv/backups/stele-2026-06-13 --to /var/lib/stele
+```
+
+Restore verifies the manifest's self-digest and every file's SHA-256 *before*
+writing it (a single flipped byte in any backed-up file is refused), materializes
+the data directory, then boots it through normal recovery — which independently
+re-verifies segment checksums and the commit-log hash chain ([STL-178](https://allegromusic.atlassian.net/browse/STL-178)).
+On success, point the server at the restored directory:
+
+```sh
+stele server --config stele.toml   # with [server] data_dir = "/var/lib/stele"
+```
+
+**Verify the restore, don't assume it:** a restore that materialized is not yet a
+restore that *recovered* — `stele restore` returns non-zero and names the offending
+file if any check fails. After it, run a known `AS OF` query against the restored
+server and confirm it matches the source at the backup's fence instant.
+
 ## 6. Upgrades
 
 - **Format-compatibility-aware rolling upgrades** via the [operator](09-ecosystem-and-products.md#5-kubernetes--openshift-operator): a newer engine always reads older [on-disk format](adr/0002-on-disk-storage-format.md) (forward-compatible from v1.0), so nodes upgrade one at a time with no data rewrite.

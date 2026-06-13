@@ -115,7 +115,9 @@ impl std::fmt::Debug for Password {
 /// engine to the matching `SessionEngine` durability operation ([STL-219]).
 ///
 /// [STL-219]: https://allegromusic.atlassian.net/browse/STL-219
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Not `Copy`: `Backup` carries an owned path. The other variants are unit, so a
+// clone is a single allocation only on the (rare, operator-issued) admin path.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdminCommand {
     /// `CHECKPOINT` — the lightweight durability fence: fsync every table's WAL
     /// and record its fence, without sealing the delta. Maps to
@@ -131,6 +133,17 @@ pub enum AdminCommand {
     /// [STL-231]: https://allegromusic.atlassian.net/browse/STL-231
     /// [ADR-0030]: ../../../docs/adr/0030-segment-manifest-retirement.md
     Compact,
+    /// `BACKUP TO '<path>'` — take a consistent, online full backup into the
+    /// directory `path`: fence (flush + checkpoint), then copy the immutable set
+    /// with a manifest. Maps to `SessionEngine::backup` ([STL-249], [ADR-0032]).
+    /// The one admin command that takes an argument.
+    ///
+    /// [STL-249]: https://allegromusic.atlassian.net/browse/STL-249
+    /// [ADR-0032]: ../../../docs/adr/0032-backup-manifest-format.md
+    Backup {
+        /// The destination directory for the backup (a local filesystem path).
+        path: String,
+    },
 }
 
 impl Statement {

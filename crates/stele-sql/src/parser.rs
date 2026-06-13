@@ -163,14 +163,20 @@ fn parse_one(mut tokens: Vec<Token>) -> Result<Statement, ParseError> {
     })
 }
 
-/// Recognize a bare Stele admin command (`CHECKPOINT` / `FLUSH` / `COMPACT`) — a
-/// single keyword that `sqlparser` has no grammar for ([STL-219], [STL-231]).
-/// Returns the command, `None` if the tokens are not an admin command, or an
-/// error if the keyword carries trailing tokens (the commands take no arguments).
+/// Recognize a Stele admin command — `CHECKPOINT` / `FLUSH` / `COMPACT` (a bare
+/// keyword) or `BACKUP TO '<path>'` — which `sqlparser` has no grammar for
+/// ([STL-219], [STL-231], [STL-249]). Returns the command, `None` if the tokens
+/// are not an admin command, or an error if the syntax is malformed (a trailing
+/// token on a no-argument command, or a missing/ill-formed `BACKUP` target).
 fn lift_admin_command(tokens: &[Token]) -> Result<Option<AdminCommand>, ParseError> {
     let Some(first) = tokens.first() else {
         return Ok(None);
     };
+    // `BACKUP TO '<path>'` is the one admin command that takes an argument, so it
+    // gets its own shape check rather than the no-arguments rule below.
+    if word_is(first, "BACKUP") {
+        return lift_backup(tokens).map(Some);
+    }
     let (cmd, name) = if word_is(first, "CHECKPOINT") {
         (AdminCommand::Checkpoint, "CHECKPOINT")
     } else if word_is(first, "FLUSH") {
@@ -186,6 +192,24 @@ fn lift_admin_command(tokens: &[Token]) -> Result<Option<AdminCommand>, ParseErr
         ))));
     }
     Ok(Some(cmd))
+}
+
+/// Parse `BACKUP TO '<path>'` into [`AdminCommand::Backup`] ([STL-249]). The
+/// caller has already matched the leading `BACKUP`; the rest must be exactly `TO`
+/// followed by a non-empty single-quoted path.
+fn lift_backup(tokens: &[Token]) -> Result<AdminCommand, ParseError> {
+    let syntax = |msg: &str| ParseError::Syntax(ParserError::ParserError(msg.to_owned()));
+    const USAGE: &str = "BACKUP syntax: BACKUP TO '<path>'";
+    if tokens.len() != 3 || !word_is(&tokens[1], "TO") {
+        return Err(syntax(USAGE));
+    }
+    match &tokens[2] {
+        Token::SingleQuotedString(path) if !path.is_empty() => {
+            Ok(AdminCommand::Backup { path: path.clone() })
+        }
+        Token::SingleQuotedString(_) => Err(syntax("BACKUP target path must not be empty")),
+        _ => Err(syntax(USAGE)),
+    }
 }
 
 /// Recognize Stele's user-administration DDL ([STL-252]):

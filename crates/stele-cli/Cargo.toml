@@ -19,6 +19,12 @@ path = "src/main.rs"
 [dependencies]
 stele-server = { workspace = true }
 stele-common = { workspace = true }
+# `stele restore` (STL-249) materializes a data dir from a backup and validates
+# it through normal recovery — the engine's restore helper + `recover`, over a
+# local disk. Both are already in the graph via stele-server, so this adds no new
+# external dependency.
+stele-engine  = { workspace = true }
+stele-storage = { workspace = true }
 anyhow       = { workspace = true }
 clap         = { workspace = true }
 tokio        = { workspace = true }
@@ -32,9 +38,7 @@ rustls-pki-types = { workspace = true }
 [dev-dependencies]
 # The scripted-shell integration test boots an in-process engine + pgwire
 # server on an ephemeral port, then drives the real `stele` binary against it.
-stele-engine  = { workspace = true }
 stele-pgwire  = { workspace = true }
-stele-storage = { workspace = true }
 tokio         = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # Self-signed certs for the TLS shell-session tests (STL-251).
 rcgen         = { workspace = true }
