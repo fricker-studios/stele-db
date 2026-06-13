@@ -25,6 +25,8 @@ flowchart LR
 | **External tables** | read Parquet/CSV/Iceberg in place, no copy | v1.0+ |
 | **CDC / streaming** | continuous apply from a change stream | v1.0+ |
 
+The **wire half of bulk load is live** ([STL-236](https://allegromusic.atlassian.net/browse/STL-236)): `COPY <table> [(cols)] FROM STDIN` in text and CSV formats, the door `psql \copy` and psycopg `copy()` already know. The whole load is one crash-atomic group — a parse failure on any row leaves zero rows — and works inside a `BEGIN … COMMIT` block (read-your-own-writes). The grammar and options are in [sql-grammar.md](sql-grammar.md#bulk-load--copy--from-stdin-stl-236). Out of scope for now: `COPY TO` (export), binary format, valid-time-bound `COPY`, and the batched append fast path feeding the columnar writer directly (the sibling storage ticket).
+
 ## 2. Importing from Postgres
 
 Because Stele speaks the [Postgres wire protocol](adr/0003-postgres-wire-protocol-early.md), the existing tooling mostly *works*:

@@ -84,6 +84,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 mod binary_format;
+mod copy;
 mod extended;
 mod pg_catalog;
 mod scram;
@@ -119,10 +120,10 @@ use stele_storage::backend::Disk;
 // from there, so matching on the AST adds no new dependency.
 use stele_sql::select::SelectError;
 use stele_sql::sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr,
+    CopyTarget, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr,
     Statement as SqlStatement, UnaryOperator, Value,
 };
-use stele_sql::{BindError, DmlError, Statement, bind_ddl};
+use stele_sql::{BindError, CopyError, CopyShape, DmlError, Statement, bind_ddl};
 
 use pg_catalog::Introspection;
 
@@ -172,6 +173,15 @@ const MSG_PARAMETER_DESCRIPTION: u8 = b't';
 const MSG_NO_DATA: u8 = b'n';
 const MSG_PORTAL_SUSPENDED: u8 = b's';
 
+// COPY sub-protocol message types ([STL-236]). The backend opens copy-in mode
+// with `CopyInResponse` ('G'); the frontend then streams `CopyData` ('d') chunks
+// and ends with `CopyDone` ('c') or aborts with `CopyFail` ('f'). `d`/`c` are
+// used in both directions (only `d`/`c`/`f` inbound concern us here).
+const MSG_COPY_IN_RESPONSE: u8 = b'G';
+const MSG_COPY_DATA: u8 = b'd';
+const MSG_COPY_DONE: u8 = b'c';
+const MSG_COPY_FAIL: u8 = b'f';
+
 // SQLSTATE codes we return.
 const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
 const SQLSTATE_PROTOCOL_VIOLATION: &str = "08P01";
@@ -202,6 +212,10 @@ const SQLSTATE_INVALID_TEXT_REPRESENTATION: &str = "22P02";
 // A statement issued while the transaction is already aborted — Postgres ignores
 // commands until the block ends (`COMMIT`/`ROLLBACK`), STL-174.
 const SQLSTATE_IN_FAILED_TRANSACTION: &str = "25P02";
+// The client aborted a `COPY FROM STDIN` with `CopyFail` — the exact code
+// Postgres returns ("COPY from stdin failed"), so a stock client classifies the
+// aborted load natively ([STL-236]).
+const SQLSTATE_QUERY_CANCELED: &str = "57014";
 // A snapshot-isolation write-write conflict (`COMMIT` lost a first-committer-wins
 // race) — Postgres's `serialization_failure`, which stock clients retry (STL-175).
 const SQLSTATE_SERIALIZATION_FAILURE: &str = "40001";
@@ -326,6 +340,51 @@ pub trait SessionHandle: Send {
     /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
     fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError>;
 
+    /// Resolve a `COPY ... FROM STDIN`'s shape (column count + stream format)
+    /// before its data streams — see [`SessionEngine::copy_shape`] ([STL-236]).
+    /// `txn` is the open transaction, if any, so the target binds at its pinned
+    /// snapshot. Defaults to "unsupported" so a session fake that serves no bulk
+    /// load need not implement the COPY trio.
+    ///
+    /// [STL-236]: https://allegromusic.atlassian.net/browse/STL-236
+    fn copy_shape(
+        &self,
+        stmt: &Statement,
+        txn: Option<&SessionTransaction>,
+    ) -> Result<CopyShape, EngineError> {
+        let _ = (stmt, txn);
+        Err(EngineError::Unsupported(
+            "COPY is not supported by this session",
+        ))
+    }
+
+    /// Apply a streamed `COPY ... FROM STDIN` as an auto-commit bulk load — see
+    /// [`SessionEngine::copy_apply`] ([STL-236]).
+    fn copy_apply(
+        &mut self,
+        stmt: &Statement,
+        rows: &[Vec<Option<String>>],
+    ) -> Result<u64, EngineError> {
+        let _ = (stmt, rows);
+        Err(EngineError::Unsupported(
+            "COPY is not supported by this session",
+        ))
+    }
+
+    /// Stage a streamed `COPY ... FROM STDIN` into an open transaction's buffer —
+    /// see [`SessionEngine::copy_stage`] ([STL-236]).
+    fn copy_stage(
+        &self,
+        stmt: &Statement,
+        rows: &[Vec<Option<String>>],
+        txn: &mut SessionTransaction,
+    ) -> Result<u64, EngineError> {
+        let _ = (stmt, rows, txn);
+        Err(EngineError::Unsupported(
+            "COPY is not supported by this session",
+        ))
+    }
+
     /// Whether the engine has **poisoned** — a WAL fsync failed, durability is
     /// indeterminate, and the session must restart into recovery — see
     /// [`SessionEngine::is_poisoned`] ([STL-217]). The ops listener's `/readyz`
@@ -408,6 +467,31 @@ where
 
     fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError> {
         Self::commit(self, txn)
+    }
+
+    fn copy_shape(
+        &self,
+        stmt: &Statement,
+        txn: Option<&SessionTransaction>,
+    ) -> Result<CopyShape, EngineError> {
+        Self::copy_shape(self, stmt, txn)
+    }
+
+    fn copy_apply(
+        &mut self,
+        stmt: &Statement,
+        rows: &[Vec<Option<String>>],
+    ) -> Result<u64, EngineError> {
+        Self::copy_apply(self, stmt, rows)
+    }
+
+    fn copy_stage(
+        &self,
+        stmt: &Statement,
+        rows: &[Vec<Option<String>>],
+        txn: &mut SessionTransaction,
+    ) -> Result<u64, EngineError> {
+        Self::copy_stage(self, stmt, rows, txn)
     }
 
     fn is_poisoned(&self) -> bool {
@@ -1006,6 +1090,10 @@ pub enum CommandTag {
     ///
     /// [STL-230]: https://allegromusic.atlassian.net/browse/STL-230
     Merge(u64),
+    /// `COPY n` — `n` rows bulk-loaded by `COPY ... FROM STDIN` ([STL-236]).
+    ///
+    /// [STL-236]: https://allegromusic.atlassian.net/browse/STL-236
+    Copy(u64),
     /// `CREATE TABLE`.
     CreateTable,
     /// `DROP TABLE`.
@@ -1022,6 +1110,7 @@ impl CommandTag {
             Self::Update(n) => format!("UPDATE {n}"),
             Self::Delete(n) => format!("DELETE {n}"),
             Self::Merge(n) => format!("MERGE {n}"),
+            Self::Copy(n) => format!("COPY {n}"),
             Self::CreateTable => "CREATE TABLE".to_owned(),
             Self::DropTable => "DROP TABLE".to_owned(),
         }
@@ -1077,7 +1166,7 @@ struct ResultColumn {
 // batch's parse → route → reply step sequence into helpers would scatter its
 // control flow without making it clearer — a readability follow-up, not an
 // MSRV-bump concern.
-#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn handle_simple_query<S: Wire>(
     stream: &mut S,
     sql: &str,
@@ -1161,6 +1250,25 @@ async fn handle_simple_query<S: Wire>(
             )
             .await?;
             return Ok(());
+        }
+
+        // (0c) `COPY ... FROM STDIN` — the bulk-load sub-protocol ([STL-236]).
+        // It reads its own `CopyData` stream off the wire, so it is driven here
+        // rather than routed through the engine's statement router. The trailing
+        // ReadyForQuery is the caller's, as for every other simple-query statement.
+        if is_copy_from_stdin(stmt) {
+            match run_copy_in(stream, stmt, session, txn).await? {
+                CopyOutcome::Loaded => continue,
+                // The load errored (reply already on the wire): abort the batch and
+                // leave an open transaction aborted, like any other statement error.
+                CopyOutcome::Failed => {
+                    txn.mark_failed();
+                    return Ok(());
+                }
+                // The client vanished mid-stream — stop processing the batch; the
+                // connection is ending (a dead-socket trailing reply just closes it).
+                CopyOutcome::Closed => return Ok(()),
+            }
         }
 
         // (1) `pg_catalog` introspection (`psql \d`) — answered from the live
@@ -1585,6 +1693,153 @@ fn run_query(
     }
 }
 
+// ---------------------------------------------------------------------------
+// COPY ... FROM STDIN sub-protocol ([STL-236])
+// ---------------------------------------------------------------------------
+
+/// Whether `stmt` is a `COPY <table> FROM STDIN` — the COPY form this server
+/// serves over the wire ([STL-236]). `COPY TO`, or `COPY FROM` a file/program, is
+/// left to the engine binder to reject with a clear error, so it is *not* matched
+/// here (it never enters copy-in mode).
+const fn is_copy_from_stdin(stmt: &Statement) -> bool {
+    matches!(
+        stmt.sql(),
+        Some(SqlStatement::Copy {
+            to: false,
+            target: CopyTarget::Stdin,
+            ..
+        })
+    )
+}
+
+/// How a [`run_copy_in`] drive ended, so its two callers (simple-query and
+/// extended-`Execute`) sequence the trailing protocol correctly.
+enum CopyOutcome {
+    /// The load committed (auto-commit) or staged (in a `BEGIN` block);
+    /// `CommandComplete COPY n` was already written.
+    Loaded,
+    /// The load failed — a bind error, bad data, or a client `CopyFail` — and an
+    /// `ErrorResponse` was already written. The caller aborts the batch / latches
+    /// until `Sync`.
+    Failed,
+    /// The client closed the connection (clean EOF or `Terminate`) mid-stream; the
+    /// session should end with no further replies.
+    Closed,
+}
+
+/// Drive one `COPY <table> FROM STDIN` over the wire ([STL-236]): bind the target,
+/// open copy-in mode (`CopyInResponse`), read the `CopyData` stream to `CopyDone`
+/// (or `CopyFail`), lex it, and apply it — auto-committed, or staged into an open
+/// transaction.
+///
+/// The whole data stream is reassembled into one buffer (a row may span several
+/// `CopyData` messages) and applied as one crash-atomic group, so a parse failure
+/// on any row leaves **zero** rows ([STL-216]). The session lock is taken only for
+/// the synchronous bind and apply, never across the wire reads, like every other
+/// statement path.
+async fn run_copy_in<S: Wire>(
+    stream: &mut S,
+    stmt: &Statement,
+    session: &SharedSession,
+    txn: &mut ConnTxn,
+) -> Result<CopyOutcome, WireError> {
+    // 1. Bind the target (at the transaction's snapshot, if any) to learn the
+    //    column count + stream format. A bind failure is reported before copy-in
+    //    mode opens — the client never streams data for a doomed COPY.
+    let shape = {
+        let engine = session.lock().unwrap_or_else(PoisonError::into_inner);
+        let txn_ref = match txn {
+            ConnTxn::Active(buffered) => Some(&*buffered),
+            _ => None,
+        };
+        engine.copy_shape(stmt, txn_ref)
+    };
+    let shape = match shape {
+        Ok(shape) => shape,
+        Err(e) => {
+            info!(error = %e, "COPY bind failed");
+            write_error_response(stream, "ERROR", sqlstate_for_query(&e), &e.to_string()).await?;
+            return Ok(CopyOutcome::Failed);
+        }
+    };
+
+    // 2. Open copy-in mode and read the data stream.
+    write_copy_in_response(stream, shape.columns).await?;
+    let mut data: Vec<u8> = Vec::new();
+    loop {
+        let Some(msg) = read_typed_message(stream).await? else {
+            // Clean EOF mid-COPY: the client promised CopyDone/CopyFail and
+            // vanished. End the session quietly — nothing was committed.
+            return Ok(CopyOutcome::Closed);
+        };
+        match msg.kind {
+            MSG_COPY_DATA => data.extend_from_slice(&msg.payload),
+            MSG_COPY_DONE => break,
+            MSG_COPY_FAIL => {
+                // The client aborted the load — discard everything and report the
+                // canonical Postgres error. Nothing was applied.
+                let why = cstring_from(&msg.payload).unwrap_or_default();
+                write_error_response(
+                    stream,
+                    "ERROR",
+                    SQLSTATE_QUERY_CANCELED,
+                    &format!("COPY from stdin failed: {why}"),
+                )
+                .await?;
+                return Ok(CopyOutcome::Failed);
+            }
+            // Flush ('H') and Sync ('S') are ignored during copy-in, exactly as
+            // Postgres does: client libraries (libpq, tokio-postgres) pipeline a
+            // Sync straight after the COPY's Execute without noticing it entered
+            // copy-in mode. The real Sync that drives ReadyForQuery is the one
+            // *after* CopyDone, handled by the main loop.
+            MSG_FLUSH | MSG_SYNC => {}
+            MSG_TERMINATE => return Ok(CopyOutcome::Closed),
+            other => {
+                // Any other message in copy-in mode desyncs the stream — fail the
+                // connection rather than guess where the next message starts.
+                warn!(message_type = %char::from(other), "unexpected message during COPY");
+                return Err(WireError::Protocol("unexpected message during COPY"));
+            }
+        }
+    }
+
+    // 3. Lex the reassembled buffer into rows of fields (a pure step, no lock).
+    let rows = match copy::lex(&data, &shape.format) {
+        Ok(rows) => rows,
+        Err(message) => {
+            write_error_response(
+                stream,
+                "ERROR",
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                &message,
+            )
+            .await?;
+            return Ok(CopyOutcome::Failed);
+        }
+    };
+
+    // 4. Apply (auto-commit) or stage (in a transaction) as one atomic group.
+    let applied = {
+        let mut engine = session.lock().unwrap_or_else(PoisonError::into_inner);
+        match txn {
+            ConnTxn::Active(buffered) => engine.copy_stage(stmt, &rows, buffered),
+            _ => engine.copy_apply(stmt, &rows),
+        }
+    };
+    match applied {
+        Ok(n) => {
+            write_command_complete(stream, &CommandTag::Copy(n)).await?;
+            Ok(CopyOutcome::Loaded)
+        }
+        Err(e) => {
+            info!(error = %e, "COPY apply failed");
+            write_error_response(stream, "ERROR", sqlstate_for_query(&e), &e.to_string()).await?;
+            Ok(CopyOutcome::Failed)
+        }
+    }
+}
+
 /// The `RowDescription` field descriptors for a [`SelectResult`] — one per
 /// projected column, named and typed from the engine's projection.
 fn result_header(result: &SelectResult) -> Vec<ResultColumn> {
@@ -1640,9 +1895,13 @@ const fn command_tag_for(summary: DmlSummary) -> CommandTag {
 /// and a bad literal in a `WHERE` or `VALUES` (`22P02`, invalid text
 /// representation). Shapes outside the v0.1 surface map to `0A000`
 /// (`feature_not_supported`).
-const fn sqlstate_for_query(err: &EngineError) -> &'static str {
+fn sqlstate_for_query(err: &EngineError) -> &'static str {
     match err {
         EngineError::Bind(_) => SQLSTATE_SYNTAX_ERROR,
+        // A `COPY ... FROM STDIN` bulk-load failure ([STL-236]) — mapped per its
+        // own variant (a row/field problem is invalid-text-representation, an
+        // unsupported shape is feature-not-supported, …).
+        EngineError::Copy(e) => sqlstate_for_copy(e),
         EngineError::Select(SelectError::UnknownTable(_) | SelectError::TableNotLive { .. })
         | EngineError::Dml(DmlError::UnknownTable(_) | DmlError::TableNotLive { .. })
         | EngineError::UnknownTable(_) => SQLSTATE_UNDEFINED_TABLE,
@@ -1698,6 +1957,30 @@ const fn sqlstate_for_query(err: &EngineError) -> &'static str {
         }
         // A write-write conflict at COMMIT — the retryable serialization failure.
         EngineError::Conflict => SQLSTATE_SERIALIZATION_FAILURE,
+    }
+}
+
+/// SQLSTATE for a `COPY ... FROM STDIN` failure ([STL-236]), so a stock client
+/// classifies it the way it would against Postgres: an unsupported shape is
+/// feature-not-supported (`0A000`), a malformed option is a syntax error
+/// (`42601`), a bad row/field is invalid-text-representation (`22P02`), and a
+/// table/column resolution failure reuses the DML codes.
+fn sqlstate_for_copy(err: &CopyError) -> &'static str {
+    match err {
+        CopyError::Unsupported(_) => SQLSTATE_FEATURE_NOT_SUPPORTED,
+        CopyError::BadOption(_) => SQLSTATE_SYNTAX_ERROR,
+        CopyError::FieldCountMismatch { .. }
+        | CopyError::NullKey { .. }
+        | CopyError::Field { .. } => SQLSTATE_INVALID_TEXT_REPRESENTATION,
+        // The per-row wrapper carries the underlying failure's class.
+        CopyError::Row { source, .. } => sqlstate_for_copy(source),
+        // Table/column resolution reuses the DML binder's classes.
+        CopyError::Bind(e) => match e {
+            DmlError::UnknownTable(_) | DmlError::TableNotLive { .. } => SQLSTATE_UNDEFINED_TABLE,
+            DmlError::UnknownColumn { .. } => SQLSTATE_UNDEFINED_COLUMN,
+            DmlError::DuplicateColumn { .. } => SQLSTATE_DUPLICATE_COLUMN,
+            _ => SQLSTATE_FEATURE_NOT_SUPPORTED,
+        },
     }
 }
 
@@ -2488,6 +2771,31 @@ async fn handle_execute<S: Wire>(
             .await
             .map_err(WireError::Io);
     };
+
+    // `COPY ... FROM STDIN` enters copy-in mode here ([STL-236]) instead of running
+    // through the portal executor — it reads its own CopyData stream off the wire.
+    // Drivers reach COPY through the extended protocol (Bind+Execute, the statement
+    // prepared and Described as NoData), so this is the primary COPY entry point.
+    // The client pipelines CopyDone+Sync; the trailing Sync drives ReadyForQuery
+    // via the main loop, so this returns without one.
+    if is_copy_from_stdin(&stmt) {
+        match run_copy_in(stream, &stmt, session, txn).await? {
+            // Loaded (CommandComplete already sent), or the client vanished
+            // mid-stream (the main loop will see the EOF next) — either way no
+            // further reply is owed here; the client's trailing Sync drives
+            // ReadyForQuery.
+            CopyOutcome::Loaded | CopyOutcome::Closed => return Ok(()),
+            // The load errored (reply already on the wire). Latch until the client's
+            // Sync, as the protocol requires for an aborted extended batch, and
+            // abort an open transaction.
+            CopyOutcome::Failed => {
+                state.skip_until_sync = true;
+                txn.mark_failed();
+                return Ok(());
+            }
+        }
+    }
+
     if let Err(e) = ensure_executed(state, &msg.portal, session, &stmt, txn) {
         return fail_extended(stream, state, e.sqlstate, &e.message).await;
     }
@@ -2792,6 +3100,21 @@ async fn write_error_response<S: Wire>(
 async fn write_empty_query_response<S: Wire>(stream: &mut S) -> io::Result<()> {
     let buf: [u8; 5] = [MSG_EMPTY_QUERY_RESPONSE, 0, 0, 0, 4];
     stream.write_all(&buf).await
+}
+
+/// Open copy-in mode with a `CopyInResponse` ('G') for a text-format `COPY`
+/// ([STL-236]): overall format `0` (textual), the column count, then one per-column
+/// format code (all `0`). Text/CSV COPY clients ignore the per-column codes, but
+/// the field count is part of a well-formed message.
+async fn write_copy_in_response<S: Wire>(stream: &mut S, columns: usize) -> io::Result<()> {
+    let n = i16::try_from(columns).unwrap_or(0);
+    let mut payload = Vec::with_capacity(3 + columns * 2);
+    payload.push(0u8); // overall copy format: 0 = textual (text or CSV)
+    payload.extend_from_slice(&n.to_be_bytes());
+    for _ in 0..columns {
+        payload.extend_from_slice(&0i16.to_be_bytes()); // per-column: text
+    }
+    write_framed(stream, MSG_COPY_IN_RESPONSE, &payload).await
 }
 
 /// The Postgres column-count fields in `RowDescription` / `DataRow` are Int16,

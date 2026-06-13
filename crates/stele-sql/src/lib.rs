@@ -65,6 +65,7 @@
 #![allow(dead_code)]
 
 pub mod ast;
+pub mod copy;
 pub mod ddl;
 pub mod dialect;
 pub mod dml;
@@ -78,6 +79,9 @@ pub mod types;
 pub use ast::{
     AdminCommand, AsOf, Password, PeriodExpr, PeriodPredicateClause, Statement, StatementBody,
     Temporal, TimeDimension, UserDdl, ValidTimePeriod,
+};
+pub use copy::{
+    BoundCopy, CopyError, CopyFormat, CopyFormatKind, CopyShape, bind_copy, bind_copy_rows,
 };
 pub use ddl::{BindError, DdlOutcome, DdlStatement, bind_ddl};
 pub use dialect::SteleDialect;

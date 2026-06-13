@@ -37,3 +37,8 @@ getrandom        = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt", "rt-multi-thread", "macros"] }
 tokio-postgres = { workspace = true }
+# COPY end-to-end test only (STL-236): feed the `tokio-postgres` copy-in sink.
+# Both are already in the dependency tree transitively (via tokio / tokio-postgres)
+# and ship in no published artifact — dev-deps only.
+bytes = { workspace = true }
+futures-util = "0.3"
