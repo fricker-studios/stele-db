@@ -7729,8 +7729,11 @@ mod tests {
             let balance = i32::try_from(op + 1).expect("balance fits i32");
             let from = rng.below(MERGE_VMAX);
             let open = rng.below(4) == 0;
+            // The canonical open-period sentinel the engine uses when `vt` is
+            // omitted — the reference model's open marker (`vto == i64::MAX`) is the
+            // same value (`VALID_TIME_OPEN = ValidTimeMicros(i64::MAX)`).
             let to = if open {
-                i64::MAX
+                stele_common::time::VALID_TIME_OPEN.0
             } else {
                 from + 1 + rng.below(MERGE_VMAX - from)
             };

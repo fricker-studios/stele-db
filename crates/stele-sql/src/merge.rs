@@ -728,14 +728,27 @@ fn bind_period_bound(
     now: SystemTimeMicros,
     source: &SourceBinding,
 ) -> Result<i64, DmlError> {
-    if let Some(expr) = expr
-        && is_source_ref(expr, source)
-    {
-        return Err(DmlError::Unsupported(format!(
-            "a MERGE source column as the valid-time period bound {:?} (only an instant — \
-             microseconds, now(), or now() ± interval — is supported)",
-            column.name()
-        )));
+    if let Some(expr) = expr {
+        match classify_period_bound(expr, source) {
+            // An existing source column — the deferred per-source-row bound.
+            PeriodBoundRef::SourceColumn => {
+                return Err(DmlError::Unsupported(format!(
+                    "a MERGE source column as the valid-time period bound {:?} (only an instant — \
+                     microseconds, now(), or now() ± interval — is supported)",
+                    column.name()
+                )));
+            }
+            // The source qualifier naming a column it doesn't have — a typo, named
+            // precisely rather than mislabeled as a (rejected) source bound.
+            PeriodBoundRef::UnknownSourceColumn(name) => {
+                return Err(DmlError::UnknownColumn {
+                    table: source.names.table.clone(),
+                    column: name,
+                });
+            }
+            // Not a source reference — fold it as an instant below.
+            PeriodBoundRef::Instant => {}
+        }
     }
     match role {
         PeriodRole::From => fold_from_bound(expr, table, column.name(), now),
@@ -743,16 +756,39 @@ fn bind_period_bound(
     }
 }
 
-/// Whether `expr` references a column of the `MERGE` source (`s.c` or a bare
-/// source-column name) — the shape a per-source-row period bound would take,
-/// which [`bind_period_bound`] rejects.
-fn is_source_ref(expr: &Expr, source: &SourceBinding) -> bool {
+/// How a `MERGE` arm's period-bound expression relates to the source, deciding
+/// the precise rejection [`bind_period_bound`] gives.
+enum PeriodBoundRef {
+    /// An existing source column (`s.c` or a bare source-column name) — the
+    /// shape a per-source-row valid interval would take, rejected for now.
+    SourceColumn,
+    /// The source qualifier naming a column it does not have (`s.<typo>`) — an
+    /// [`UnknownColumn`](DmlError::UnknownColumn), not a source bound.
+    UnknownSourceColumn(String),
+    /// Anything else — fold it as an instant (a literal, `now()`, …).
+    Instant,
+}
+
+/// Classify a `MERGE` period-bound expression against the source columns. A bare
+/// name only counts as a source reference when it actually names a source column;
+/// a *qualified* `s.<col>` whose column is missing is reported as an
+/// [`UnknownColumn`] rather than misclassified as a (rejected) source bound.
+fn classify_period_bound(expr: &Expr, source: &SourceBinding) -> PeriodBoundRef {
     match expr {
-        Expr::Identifier(ident) => source.column(&ident.value).is_some(),
-        Expr::CompoundIdentifier(parts) => {
-            matches!(parts.as_slice(), [qualifier, _] if source.names.matches(&qualifier.value))
+        Expr::Identifier(ident) if source.column(&ident.value).is_some() => {
+            PeriodBoundRef::SourceColumn
         }
-        _ => false,
+        Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+            [qualifier, column] if source.names.matches(&qualifier.value) => {
+                if source.column(&column.value).is_some() {
+                    PeriodBoundRef::SourceColumn
+                } else {
+                    PeriodBoundRef::UnknownSourceColumn(column.value.clone())
+                }
+            }
+            _ => PeriodBoundRef::Instant,
+        },
+        _ => PeriodBoundRef::Instant,
     }
 }
 
@@ -1399,6 +1435,19 @@ mod tests {
                 "{set:?} must reject a source-column period bound"
             );
         }
+        // A *qualified* source reference whose column doesn't exist is a precise
+        // UnknownColumn, not a misleading "source column" bound.
+        assert_eq!(
+            bind(
+                "MERGE INTO vt USING (VALUES (1, 100, 5)) AS s (id, balance, vfrom) ON vt.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET balance = s.balance, vf = s.nonesuch",
+                &catalog
+            ),
+            Err(DmlError::UnknownColumn {
+                table: "s".to_owned(),
+                column: "nonesuch".to_owned(),
+            })
+        );
     }
 
     #[test]
