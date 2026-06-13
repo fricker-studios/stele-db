@@ -15,8 +15,10 @@
 //! always injects the same faults at the same points; there is no internal
 //! randomness. One append fault carries a *torn* prefix
 //! ([`Faults::schedule_torn_append`], [STL-299]): the append physically lands a
-//! leading slice of its payload before failing, modelling a partial physical
-//! write the WAL must detect and poison on. The richer seeded-fault virtual disk
+//! leading slice of the bytes passed to it before failing, modelling a partial
+//! physical write the WAL must detect and poison on. (At this layer the appended
+//! slice is the caller's raw bytes — for the WAL, the framed record's header +
+//! payload — not an application-level "payload".) The richer seeded-fault virtual disk
 //! (latency, reordering, bit-flips) is [STL-109] — this is the minimal seam it
 //! builds on.
 //!
@@ -58,9 +60,11 @@ pub struct Fault {
     pub op: FaultOp,
     /// The [`io::ErrorKind`] the failing operation reports.
     pub kind: io::ErrorKind,
-    /// For a [`FaultOp::Append`] fault: how many leading payload bytes the append
-    /// physically writes *before* failing — modelling a **torn** append (a
-    /// partial physical write that then errors, [STL-299]). `0` (the default for
+    /// For a [`FaultOp::Append`] fault: how many leading bytes of the appended
+    /// slice the append physically writes *before* failing — modelling a **torn**
+    /// append (a partial physical write that then errors, [STL-299]). The slice is
+    /// whatever the caller passed to [`DiskFile::append`] (for the WAL, a framed
+    /// record — header + payload — not an application "payload"). `0` (the default for
     /// every fault scheduled via [`Faults::schedule`]) is a *clean* failure:
     /// nothing lands, so the WAL stays consistent and is not poisoned ([STL-295]).
     /// A non-zero prefix leaves stray bytes past the WAL's staged end — the case
@@ -102,13 +106,13 @@ impl Faults {
     }
 
     /// Schedule a **torn** append: the next [`append`](DiskFile::append)
-    /// physically writes `prefix_len` leading bytes of its payload, then fails
-    /// with `kind`. This models a partial physical write — bytes land on disk
-    /// past the WAL's staged end, yet the call returns `Err` — which the WAL must
-    /// detect and treat as a crash by poisoning, unlike a clean append failure
-    /// that writes nothing ([STL-299]). `prefix_len` is capped at the payload
-    /// length by [`MemFile::append`], so an over-long value writes the whole
-    /// payload and still fails.
+    /// physically writes `prefix_len` leading bytes of the slice passed to it,
+    /// then fails with `kind`. This models a partial physical write — bytes land
+    /// on disk past the WAL's staged end, yet the call returns `Err` — which the
+    /// WAL must detect and treat as a crash by poisoning, unlike a clean append
+    /// failure that writes nothing ([STL-299]). `prefix_len` is capped at the
+    /// appended slice's length by [`MemFile::append`], so an over-long value
+    /// writes the whole slice and still fails.
     ///
     /// [STL-299]: https://allegromusic.atlassian.net/browse/STL-299
     pub fn schedule_torn_append(&self, kind: io::ErrorKind, prefix_len: usize) {
@@ -258,7 +262,7 @@ impl DiskFile for MemFile {
     fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
         if let Some(fault) = self.faults.take(FaultOp::Append) {
             // Model a *torn* append: physically land `torn_prefix` leading bytes
-            // (capped at the payload), then fail. The default `torn_prefix == 0`
+            // (capped at `bytes`), then fail. The default `torn_prefix == 0`
             // is a *clean* failure — nothing lands, leaving the WAL's bookkeeping
             // consistent with the file (STL-295); a non-zero prefix leaves stray
             // bytes past the staged end that the WAL detects and poisons on
