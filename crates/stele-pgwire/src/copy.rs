@@ -31,6 +31,13 @@ use stele_sql::{CopyFormat, CopyFormatKind};
 /// still emit it, so it is honored defensively: a `\.` line stops the data.
 const END_MARKER: &str = "\\.";
 
+/// Whether a parsed record is the lone `\.` end-of-data marker — a non-allocating
+/// check (comparing against `[Some(END_MARKER.to_owned())]` would allocate a
+/// `String` per record).
+fn is_end_marker(row: &[Option<String>]) -> bool {
+    matches!(row, [Some(field)] if field == END_MARKER)
+}
+
 /// Lex a reassembled `COPY` data buffer into rows of field values under `format`.
 ///
 /// Each row is a vector of optional field strings aligned to the COPY column list;
@@ -188,7 +195,7 @@ fn lex_csv(text: &str, format: &CopyFormat) -> Result<Vec<Vec<Option<String>>>, 
             push_field(&mut row, &mut field, &mut quoted);
             field_started = false;
             // A lone `\.` record is the defensive end-of-data marker.
-            if row.as_slice() == [Some(END_MARKER.to_owned())] {
+            if is_end_marker(&row) {
                 return Ok(rows);
             }
             rows.push(std::mem::take(&mut row));
@@ -205,7 +212,7 @@ fn lex_csv(text: &str, format: &CopyFormat) -> Result<Vec<Vec<Option<String>>>, 
     // A final record with no trailing newline still counts.
     if pending {
         push_field(&mut row, &mut field, &mut quoted);
-        if row.as_slice() != [Some(END_MARKER.to_owned())] {
+        if !is_end_marker(&row) {
             rows.push(row);
         }
     }

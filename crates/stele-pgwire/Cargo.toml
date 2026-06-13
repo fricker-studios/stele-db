@@ -39,6 +39,6 @@ tokio = { workspace = true, features = ["test-util", "rt", "rt-multi-thread", "m
 tokio-postgres = { workspace = true }
 # COPY end-to-end test only (STL-236): feed the `tokio-postgres` copy-in sink.
 # Both are already in the dependency tree transitively (via tokio / tokio-postgres)
-# and ship in no published artifact — dev-deps only.
+# and ship in no published artifact — dev-deps only, workspace-pinned.
 bytes = { workspace = true }
-futures-util = "0.3"
+futures-util = { workspace = true }

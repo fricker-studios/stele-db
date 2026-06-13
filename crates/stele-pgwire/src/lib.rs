@@ -216,6 +216,9 @@ const SQLSTATE_IN_FAILED_TRANSACTION: &str = "25P02";
 // Postgres returns ("COPY from stdin failed"), so a stock client classifies the
 // aborted load natively ([STL-236]).
 const SQLSTATE_QUERY_CANCELED: &str = "57014";
+// A `COPY` stream exceeded the buffered-size cap ([STL-236]) — Postgres's
+// program_limit_exceeded class.
+const SQLSTATE_PROGRAM_LIMIT_EXCEEDED: &str = "54000";
 // A snapshot-isolation write-write conflict (`COMMIT` lost a first-committer-wins
 // race) — Postgres's `serialization_failure`, which stock clients retry (STL-175).
 const SQLSTATE_SERIALIZATION_FAILURE: &str = "40001";
@@ -257,6 +260,12 @@ const FORMAT_BINARY: i16 = 1;
 // before allocating anything.
 const MAX_STARTUP_PAYLOAD_SIZE: usize = 64 * 1024; // 64 KiB
 const MAX_MESSAGE_PAYLOAD_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+// A `COPY FROM STDIN` reassembles its whole `CopyData` stream in memory before
+// applying (the batched, bounded-memory streaming path is STL-240). Each frame is
+// already capped at `MAX_MESSAGE_PAYLOAD_SIZE`, but a client could send unboundedly
+// many — so cap the accumulated buffer to refuse a load engineered to OOM the
+// server, failing it with a clear error rather than allocating without limit.
+const MAX_COPY_BUFFER_SIZE: usize = 1024 * 1024 * 1024; // 1 GiB
 
 // Reported server identity. We expose a real Postgres major so client-side
 // version checks don't refuse us; the build component declares Stele.
@@ -1773,7 +1782,23 @@ async fn run_copy_in<S: Wire>(
             return Ok(CopyOutcome::Closed);
         };
         match msg.kind {
-            MSG_COPY_DATA => data.extend_from_slice(&msg.payload),
+            MSG_COPY_DATA => {
+                data.extend_from_slice(&msg.payload);
+                // Refuse a stream engineered to OOM us (the bounded-memory
+                // streaming path is STL-240): report the limit and stop reading.
+                // The extended path's skip-until-Sync latch drains any trailing
+                // frames; the simple path ends the batch.
+                if data.len() > MAX_COPY_BUFFER_SIZE {
+                    write_error_response(
+                        stream,
+                        "ERROR",
+                        SQLSTATE_PROGRAM_LIMIT_EXCEEDED,
+                        "COPY data exceeds the maximum buffered size",
+                    )
+                    .await?;
+                    return Ok(CopyOutcome::Failed);
+                }
+            }
             MSG_COPY_DONE => break,
             MSG_COPY_FAIL => {
                 // The client aborted the load — discard everything and report the
@@ -3106,15 +3131,22 @@ async fn write_empty_query_response<S: Wire>(stream: &mut S) -> io::Result<()> {
 /// ([STL-236]): overall format `0` (textual), the column count, then one per-column
 /// format code (all `0`). Text/CSV COPY clients ignore the per-column codes, but
 /// the field count is part of a well-formed message.
-async fn write_copy_in_response<S: Wire>(stream: &mut S, columns: usize) -> io::Result<()> {
-    let n = i16::try_from(columns).unwrap_or(0);
+///
+/// The count is an `Int16`, so a target wider than `i16::MAX` columns is rejected
+/// (`08P01`) rather than clamped — a clamped header would disagree with the
+/// per-column body and desync the client. Like [`column_count`].
+async fn write_copy_in_response<S: Wire>(stream: &mut S, columns: usize) -> Result<(), WireError> {
+    let n = i16::try_from(columns)
+        .map_err(|_| WireError::Protocol("COPY target has more than 32767 columns"))?;
     let mut payload = Vec::with_capacity(3 + columns * 2);
     payload.push(0u8); // overall copy format: 0 = textual (text or CSV)
     payload.extend_from_slice(&n.to_be_bytes());
     for _ in 0..columns {
         payload.extend_from_slice(&0i16.to_be_bytes()); // per-column: text
     }
-    write_framed(stream, MSG_COPY_IN_RESPONSE, &payload).await
+    write_framed(stream, MSG_COPY_IN_RESPONSE, &payload)
+        .await
+        .map_err(WireError::Io)
 }
 
 /// The Postgres column-count fields in `RowDescription` / `DataRow` are Int16,
