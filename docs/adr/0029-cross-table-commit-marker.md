@@ -115,6 +115,12 @@ commit-marker log — `stele.commits` on the session's shared disk, owned by
 - Folding the marker into the `stele-txn` hash-chained commit log (option b)
   supersedes this log when `SessionEngine` adopts `TxnManager`; the recovery
   semantics fixed here (gate a leg on its transaction's marker) carry over.
+  **[ADR-0031](0031-live-server-verifiable-commit-log.md)** takes the first
+  step of that fold: it hash-chains this log (a `CommitRecord` per *data* commit
+  reusing STL-178's chain), so the single-table path now also writes a
+  commit record — refining this ADR's one-fsync-per-single-table-commit
+  optimization — while the cross-table gating fixed here (a leg applies iff its
+  `txn_id`'s marker is durable) is unchanged.
 - Cross-table coordination lives in `stele-engine`, which `stele-sim` cannot
   depend on, so the seed-reproducible crash-atomicity coverage is an in-process
   FaultDisk/MemDisk sweep in `stele-engine` (the pattern STL-210 set for

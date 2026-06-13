@@ -38,11 +38,10 @@ pub struct Opts {
     pub no_color: bool,
 }
 
-/// Follow-up tickets the not-yet-wired command tiers point at. The version-history
-/// temporal commands (`\asof` / `\history` / `\timeline` / `\lineage`, STL-199)
-/// and segment introspection (`\segments`, STL-301) are live; these are the
-/// remaining tiers.
-const AUDIT_TICKET: &str = "STL-302";
+/// Follow-up ticket the not-yet-wired command tier points at. The version-history
+/// temporal commands (`\asof` / `\history` / `\timeline` / `\lineage`, STL-199),
+/// segment introspection (`\segments`, STL-301), and the audit chain (`\audit`,
+/// STL-302) are all live; the admin tier remains.
 const ADMIN_TICKET: &str = "STL-200";
 
 /// Per-session display state (the prototype's toggles), plus the two themes —
@@ -373,6 +372,11 @@ enum Meta<'a> {
     Segments {
         table: &'a str,
     },
+    /// `\audit [T]` — verify the tamper-evident commit hash chain; `T` defaults to
+    /// the first relation when omitted.
+    Audit {
+        table: Option<&'a str>,
+    },
     Clear,
     Connect,
     /// A designed-but-not-yet-wired command (temporal or admin tier).
@@ -474,12 +478,9 @@ fn parse_meta(line: &str) -> Option<Meta<'_>> {
             },
             |table| Meta::Segments { table },
         ),
-        // The remaining temporal-tier command, still stubbed at its ticket.
-        "audit" => Meta::NotYet {
-            cmd,
-            ticket: AUDIT_TICKET,
-            why: "verifies the tamper-evident commit hash chain",
-        },
+        // `\audit [T]` — the tamper-evident commit hash chain ([STL-302]); the
+        // table is optional (defaults to the first relation).
+        "audit" => Meta::Audit { table: arg },
         "status" | "backup" | "restore" | "pitr" | "inspect-segment" | "inspect" => Meta::NotYet {
             cmd,
             ticket: ADMIN_TICKET,
@@ -548,6 +549,7 @@ fn dispatch_meta(
         Meta::Timeline { table, key } => timeline(client, session, table, key, out)?,
         Meta::Lineage { table, key } => lineage(client, session, table, key, out)?,
         Meta::Segments { table } => segments(client, session, table, out)?,
+        Meta::Audit { table } => audit(client, session, *table, out)?,
         Meta::Clear => {
             if session.interactive {
                 // Clear screen + scrollback, home the cursor.
@@ -1207,8 +1209,8 @@ fn timeline(
 }
 
 /// `\lineage T <pk>` — provenance as a tree: each version's `txn` / `op` /
-/// instant, then its measure value and the principal that wrote it. (The
-/// tamper-evident `hash ← prevHash` chain is `\audit`'s job — STL-302.)
+/// instant, then its measure value and the principal that wrote it, then its
+/// tamper-evident `hash ← prevHash` commit-chain link ([STL-302]).
 fn lineage(
     client: &mut Client,
     session: &Session,
@@ -1219,6 +1221,17 @@ fn lineage(
     let Some(set) = fetch_history(client, session, table, Some(key), out)? else {
         return Ok(());
     };
+    // The matching commit-chain hashes for the same key, in the same version order
+    // (both replies fold the one timeline), so they zip by index. Fetched quietly:
+    // the provenance tree still renders if the audit surface is unavailable — the
+    // `hash ← prevHash` line is simply omitted (the key already passed
+    // `fetch_history`'s `key_is_safe` gate, so splicing it is safe).
+    let audit = client
+        .simple_query(&audit_query(table, Some(key)))
+        .ok()
+        .filter(|replies| first_error(replies).is_none())
+        .and_then(|replies| first_result_set(&replies).cloned());
+
     let value_cols = set.columns.get(HISTORY_META_COLS..).unwrap_or(&[]);
     let (vcol_off, vcol_name) = measure_column(value_cols);
     let vcol_idx = HISTORY_META_COLS + vcol_off;
@@ -1237,6 +1250,7 @@ fn lineage(
         let principal = r.get(5).and_then(Option::as_deref).unwrap_or("");
         let value = r.get(vcol_idx).and_then(Option::as_deref).unwrap_or("");
         let op_role = if op == "INSERT" { Role::Ok } else { Role::Acc };
+        let trunk = if last { "      " } else { "  │   " };
         lines.push(vec![
             (Role::Div, (if last { "  └ " } else { "  ├ " }).to_owned()),
             (Role::Head, format!("v{}  ", i + 1)),
@@ -1245,14 +1259,210 @@ fn lineage(
             (Role::Mut, format!("  {sys_from}")),
         ]);
         lines.push(vec![
-            (
-                Role::Div,
-                (if last { "      " } else { "  │   " }).to_owned(),
-            ),
+            (Role::Div, trunk.to_owned()),
             (Role::Text, format!("{vcol_name} = {value}")),
             (Role::Dim, "   by ".to_owned()),
             (Role::Mut, principal.to_owned()),
             (Role::Dim, " via pg-wire".to_owned()),
+        ]);
+        // The commit-chain link: this version's hash and the predecessor it chains
+        // from ([STL-302]). The audit reply's version rows align 1:1 with the
+        // history rows; a row with no chain record (a rare unchained commit) shows
+        // an em dash rather than a fabricated hash.
+        if let Some(a) = audit.as_ref().and_then(|a| a.rows.get(i)) {
+            lines.push(vec![
+                (Role::Div, trunk.to_owned()),
+                (Role::Dim, "hash ".to_owned()),
+                (Role::Num, hash_cell(a, 2)),
+                (Role::Dim, " ← ".to_owned()),
+                (Role::Mut, prev_hash_cell(a, 3)),
+            ]);
+        }
+    }
+    write_lines(session, out, &lines)
+}
+
+/// The `stele_audit('t'[, key])` introspection query the `\audit` and `\lineage`
+/// commands issue — the `\audit` analogue of `fetch_history`'s `stele_history`
+/// query ([STL-302]). The table name is a string literal (single quotes doubled);
+/// the key rides verbatim, already gated by [`key_is_safe`] at its call sites.
+fn audit_query(table: &str, key: Option<&str>) -> String {
+    let table_lit = table.replace('\'', "''");
+    key.map_or_else(
+        || format!("SELECT * FROM stele_audit('{table_lit}')"),
+        |k| format!("SELECT * FROM stele_audit('{table_lit}', {k})"),
+    )
+}
+
+/// A SHA-256 hex digest is 64 chars; the shell shows a stable 12-char prefix —
+/// enough to read the chain links at a glance without wrapping the line (the
+/// server keeps the full digest). An all-zero digest is the genesis anchor.
+fn short_hash(hex: &str) -> String {
+    hex.get(..12).unwrap_or(hex).to_owned()
+}
+
+/// Whether `hex` is the genesis anchor — an all-zero digest (the chain's root,
+/// `Digest::ZERO` server-side).
+fn is_genesis(hex: &str) -> bool {
+    !hex.is_empty() && hex.bytes().all(|b| b == b'0')
+}
+
+/// Render an audit row's `hash` cell at `idx` as a short digest, or an em dash for
+/// an unchained version.
+fn hash_cell(row: &[Option<String>], idx: usize) -> String {
+    row.get(idx)
+        .and_then(Option::as_deref)
+        .map_or_else(|| "—".to_owned(), short_hash)
+}
+
+/// Render an audit row's `prev_hash` cell at `idx`: `genesis` for the anchor, a
+/// short digest otherwise, or an em dash for an unchained version.
+fn prev_hash_cell(row: &[Option<String>], idx: usize) -> String {
+    match row.get(idx).and_then(Option::as_deref) {
+        None => "—".to_owned(),
+        Some(p) if is_genesis(p) => "genesis".to_owned(),
+        Some(p) => short_hash(p),
+    }
+}
+
+/// Run `stele_audit('t')` for `table` and return its result set, or `None` after
+/// handling the error case (a server error renders the psql block). The shared
+/// fetch behind `\audit`; `\lineage` reads the same surface quietly inline.
+fn fetch_audit(
+    client: &mut Client,
+    session: &Session,
+    table: &str,
+    out: &mut impl Write,
+) -> anyhow::Result<Option<ResultSet>> {
+    let replies = client.simple_query(&audit_query(table, None))?;
+    if let Some(err) = first_error(&replies) {
+        print_error(session, err);
+        return Ok(None);
+    }
+    // `stele_audit` always returns at least the verdict row, so an empty set means
+    // the server did not recognize the call — surface that rather than a blank audit.
+    match first_result_set(&replies) {
+        Some(set) if !set.rows.is_empty() => Ok(Some(set.clone())),
+        _ => {
+            write_segs(
+                session,
+                out,
+                &[(Role::Mut, format!("No audit data for {table}."))],
+            )?;
+            Ok(None)
+        }
+    }
+}
+
+/// The first relation's name (alphabetical), via the same `pg_catalog` shim `\dt`
+/// reads — the default table for a bare `\audit`. `None` (with a notice) when the
+/// catalog is empty or the reply is unexpected.
+fn first_table(
+    client: &mut Client,
+    session: &Session,
+    out: &mut impl Write,
+) -> anyhow::Result<Option<String>> {
+    let replies =
+        client.simple_query("SELECT c.relname FROM pg_catalog.pg_class c ORDER BY c.relname")?;
+    if let Some(err) = first_error(&replies) {
+        print_error(session, err);
+        return Ok(None);
+    }
+    let name = first_result_set(&replies).and_then(|set| {
+        let idx = set.columns.iter().position(|c| c.name == "relname")?;
+        set.rows
+            .iter()
+            .find_map(|row| row.get(idx).cloned().flatten())
+    });
+    if name.is_none() {
+        write_segs(
+            session,
+            out,
+            &[(Role::Mut, "No relations to audit.".to_owned())],
+        )?;
+    }
+    Ok(name)
+}
+
+/// `\audit [T]` — verify the tamper-evident commit hash chain ([STL-302]): each
+/// version of `T` as `vN  op  hash ← prevHash`, then the `✓ chain intact` /
+/// `✗ chain broken` verdict from the server's `verify_chain` pass over the durable
+/// commit log. `T` defaults to the first relation.
+fn audit(
+    client: &mut Client,
+    session: &Session,
+    table: Option<&str>,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    let table = match table {
+        Some(t) => t.to_owned(),
+        None => match first_table(client, session, out)? {
+            Some(t) => t,
+            None => return Ok(()),
+        },
+    };
+    let Some(set) = fetch_audit(client, session, &table, out)? else {
+        return Ok(());
+    };
+    let cell =
+        |r: &[Option<String>], i: usize| r.get(i).and_then(Option::as_deref).map(str::to_owned);
+
+    // The verdict rides every row; read it off the first (always present, even when
+    // the timeline is empty).
+    let verdict_row = &set.rows[0];
+    let chain_ok = cell(verdict_row, 4).as_deref() == Some("t");
+    let chain_len = cell(verdict_row, 5).unwrap_or_else(|| "0".to_owned());
+    let chain_head = cell(verdict_row, 6).unwrap_or_default();
+
+    let mut lines = vec![vec![
+        (Role::Head, "Audit — ".to_owned()),
+        (Role::Acc, format!("public.{table}")),
+        (
+            Role::Dim,
+            "   tamper-evident commit hash chain (SHA-256)".to_owned(),
+        ),
+    ]];
+
+    // Version rows carry a txid; an empty timeline yields only the verdict row.
+    let versions: Vec<&Vec<Option<String>>> = set
+        .rows
+        .iter()
+        .filter(|r| r.first().is_some_and(Option::is_some))
+        .collect();
+    for (i, r) in versions.iter().enumerate() {
+        let op = r.get(1).and_then(Option::as_deref).unwrap_or("");
+        lines.push(vec![
+            (Role::Mut, format!("  {:<4}", format!("v{}", i + 1))),
+            (Role::Text, format!("{op:<7}")),
+            (Role::Num, hash_cell(r, 2)),
+            (Role::Dim, "  ← ".to_owned()),
+            (Role::Mut, prev_hash_cell(r, 3)),
+        ]);
+    }
+    if versions.is_empty() {
+        lines.push(vec![(
+            Role::Mut,
+            format!("  no versions in {table} to audit"),
+        )]);
+    }
+
+    if chain_ok {
+        let plural = if chain_len == "1" { "" } else { "s" };
+        lines.push(vec![
+            (Role::Ok, "  ✓ ".to_owned()),
+            (Role::Ok, "chain intact".to_owned()),
+            (
+                Role::Mut,
+                format!(
+                    " · {chain_len} link{plural} · head {}",
+                    short_hash(&chain_head)
+                ),
+            ),
+        ]);
+    } else {
+        lines.push(vec![
+            (Role::Warn, "  ✗ ".to_owned()),
+            (Role::Warn, "chain broken — tampering detected".to_owned()),
         ]);
     }
     write_lines(session, out, &lines)
@@ -1916,12 +2126,8 @@ mod tests {
 
     #[test]
     fn designed_tiers_resolve_to_their_tickets() {
-        // The still-stubbed temporal-tier command points at its split-out
-        // follow-up; the admin tier at STL-200.
-        let Some(Meta::NotYet { ticket, .. }) = parse_meta(r"\audit account") else {
-            panic!("expected NotYet");
-        };
-        assert_eq!(ticket, AUDIT_TICKET);
+        // The still-stubbed admin tier points at STL-200. (`\segments` is live as
+        // of STL-301, `\audit` as of STL-302.)
         let Some(Meta::NotYet { ticket, .. }) = parse_meta(r"\inspect seg-0002") else {
             panic!("expected NotYet");
         };
@@ -1964,6 +2170,14 @@ mod tests {
             parse_meta(r"\segments account"),
             Some(Meta::Segments { table: "account" })
         );
+        // \audit's table is optional (defaults to the first relation).
+        assert_eq!(
+            parse_meta(r"\audit account"),
+            Some(Meta::Audit {
+                table: Some("account"),
+            })
+        );
+        assert_eq!(parse_meta(r"\audit"), Some(Meta::Audit { table: None }));
         // \timeline / \lineage require a key; \history / \segments a table.
         assert!(matches!(
             parse_meta(r"\timeline account"),

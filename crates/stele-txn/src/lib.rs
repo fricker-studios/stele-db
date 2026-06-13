@@ -31,5 +31,5 @@ pub mod manager;
 pub use chain::{
     ChainError, ChainHead, RecoveredChain, verify_chain, verify_chain_recover, verify_chain_to,
 };
-pub use commit_record::{CommitRecord, CommitRecordError};
+pub use commit_record::{COMMIT_RECORD_LEN, CommitRecord, CommitRecordError};
 pub use manager::{Committed, RecoverError, Transaction, TxnError, TxnManager};

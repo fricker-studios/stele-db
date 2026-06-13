@@ -2414,6 +2414,7 @@ dependencies = [
  "stele-exec",
  "stele-sql",
  "stele-storage",
+ "stele-txn",
  "thiserror",
 ]
 

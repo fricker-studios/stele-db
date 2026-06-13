@@ -18,6 +18,10 @@ stele-storage = { workspace = true }
 stele-catalog = { workspace = true }
 stele-sql     = { workspace = true }
 stele-exec    = { workspace = true }
+# The hash-chained commit-log primitives (CommitRecord / verify_chain) the live
+# server's verifiable commit log reuses (ADR-0031, STL-302) — the chain types
+# only, not TxnManager; SessionEngine still owns its own commit path.
+stele-txn     = { workspace = true }
 thiserror     = { workspace = true }
 # Fresh per-user SCRAM salts at CREATE/ALTER USER (STL-252). The verifier math
 # is vendored in stele_common::scram; the entropy read happens only on the user
