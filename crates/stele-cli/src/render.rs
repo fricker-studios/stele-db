@@ -82,6 +82,25 @@ fn display_cells(ncols: usize, rows: &[Vec<Option<String>>], row_nums: bool) -> 
 
 /// Render a result set as an aligned table.
 pub fn table_lines(columns: &[Column], rows: &[Vec<Option<String>>], opts: TableOpts) -> Vec<Line> {
+    table_lines_warn(columns, rows, opts, |_| false)
+}
+
+/// As [`table_lines`], but every data row for which `warn` returns `true` is
+/// painted with [`Role::Warn`] instead of [`Role::Text`] — the prototype's per-
+/// row highlight (the `hot` segment in `\segments`, [STL-301]). The predicate
+/// sees the original (pre-display) row cells, so the caller tests a value column
+/// directly. Border and header styling are unchanged.
+pub fn table_lines_warn(
+    columns: &[Column],
+    rows: &[Vec<Option<String>>],
+    opts: TableOpts,
+    warn: impl Fn(&[Option<String>]) -> bool,
+) -> Vec<Line> {
+    // Per-row body role, aligned to `rows`/`data` (both 1:1 with the input rows).
+    let roles: Vec<Role> = rows
+        .iter()
+        .map(|r| if warn(r) { Role::Warn } else { Role::Text })
+        .collect();
     let mut cols: Vec<(String, bool)> = Vec::new();
     if opts.row_nums {
         cols.push(("#".to_owned(), true));
@@ -136,24 +155,24 @@ pub fn table_lines(columns: &[Column], rows: &[Vec<Option<String>>], opts: Table
         BorderStyle::Psql => {
             lines.push(vec![(Role::Head, format!(" {} ", header.join(" | ")))]);
             lines.push(vec![(Role::Div, rule("", "+", "", "-", 2))]);
-            for row in &data {
-                lines.push(vec![(Role::Text, format!(" {} ", row.join(" | ")))]);
+            for (row, &role) in data.iter().zip(&roles) {
+                lines.push(vec![(role, format!(" {} ", row.join(" | ")))]);
             }
         }
         BorderStyle::Unicode => {
             lines.push(vec![(Role::Div, rule("┌", "┬", "┐", "─", 2))]);
             lines.push(vec![(Role::Head, format!("│ {} │", header.join(" │ ")))]);
             lines.push(vec![(Role::Div, rule("├", "┼", "┤", "─", 2))]);
-            for row in &data {
-                lines.push(vec![(Role::Text, format!("│ {} │", row.join(" │ ")))]);
+            for (row, &role) in data.iter().zip(&roles) {
+                lines.push(vec![(role, format!("│ {} │", row.join(" │ ")))]);
             }
             lines.push(vec![(Role::Div, rule("└", "┴", "┘", "─", 2))]);
         }
         BorderStyle::Markdown => {
             lines.push(vec![(Role::Head, format!("| {} |", header.join(" | ")))]);
             lines.push(vec![(Role::Div, rule("| ", " | ", " |", "-", 0))]);
-            for row in &data {
-                lines.push(vec![(Role::Text, format!("| {} |", row.join(" | ")))]);
+            for (row, &role) in data.iter().zip(&roles) {
+                lines.push(vec![(role, format!("| {} |", row.join(" | ")))]);
             }
         }
         BorderStyle::Clean => {
@@ -162,8 +181,8 @@ pub fn table_lines(columns: &[Column], rows: &[Vec<Option<String>>], opts: Table
                 Role::Div,
                 format!("  {}", rule("", "   ", "", "─", 0)),
             )]);
-            for row in &data {
-                lines.push(vec![(Role::Text, format!("  {}", row.join("   ")))]);
+            for (row, &role) in data.iter().zip(&roles) {
+                lines.push(vec![(role, format!("  {}", row.join("   ")))]);
             }
         }
     }
@@ -389,6 +408,33 @@ mod tests {
         assert_eq!(
             text(&table_lines(&c, &r, opts(BorderStyle::Clean))),
             "  id   name \n  ──   ─────\n   1   alice\n  20        ".to_owned() + "\n(2 rows)"
+        );
+    }
+
+    #[test]
+    fn warn_row_paints_only_the_matching_data_rows() {
+        let (c, r) = sample();
+        // Highlight the row whose `name` is NULL (the second one).
+        let lines = table_lines_warn(&c, &r, opts(BorderStyle::Psql), |row| {
+            row.get(1).and_then(Option::as_deref).is_none()
+        });
+        // The body roles, in order: data rows carry Text or Warn; everything else
+        // (header, divider, count trailer) is untouched.
+        let body_roles: Vec<Role> = lines
+            .iter()
+            .filter_map(|segs| match segs.as_slice() {
+                [(role @ (Role::Text | Role::Warn), _)] => Some(*role),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(body_roles, vec![Role::Text, Role::Warn]);
+        // Without a predicate, no row is highlighted.
+        let plain = table_lines(&c, &r, opts(BorderStyle::Psql));
+        assert!(
+            plain
+                .iter()
+                .all(|segs| !matches!(segs.as_slice(), [(Role::Warn, _)])),
+            "table_lines never paints a Warn row",
         );
     }
 

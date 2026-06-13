@@ -76,7 +76,9 @@ use crate::delta::{BusinessKey, Delta, DeltaConfig, DeltaError, Snapshot, Versio
 use crate::dml::{self, CommittedTxns, DmlError, DmlOutcome, DmlWriter};
 use crate::merge;
 use crate::rebuild::rebuild_index_from_segments;
-use crate::segment::{SegmentError, SegmentReader, SegmentWriter};
+use crate::segment::{
+    ColumnId, SegmentError, SegmentReader, SegmentWriter, ZoneBound, ZoneEnd, ZoneMap,
+};
 use crate::systime::{SealedLookup, SealedSegments, SealedVersions};
 use crate::validity::{ClosedInterval, ValidityConfig, ValidityError, ValidityIndex};
 use crate::validtime::ValidInterval;
@@ -1224,6 +1226,127 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
             .flat_map(BTreeMap::into_values)
             .collect())
     }
+
+    /// Per-segment introspection metadata for the shell's `\segments` command
+    /// ([STL-301]): every sealed segment in `segment_names` (oldest-first) order,
+    /// then the resident delta (hot) tier as a final entry when it holds versions.
+    ///
+    /// Each sealed entry is read straight from the segment's resident footer
+    /// digest — [`SegmentReader::row_count`], its [`ZoneMap`], and the file's
+    /// [`byte_size`](SegmentReader::byte_size) — so a full pass costs no
+    /// column-chunk I/O. The system-time range and the business-key range come
+    /// from the zone map's [`ColumnId::SysFrom`] / [`ColumnId::BusinessKey`]
+    /// entries; the hot tier, which has no footer, is summarized directly from
+    /// its staged versions. Like [`version_history`](Self::version_history) this
+    /// is introspection over live state — it makes no commit and mutates nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Segment`] if a sealed segment fails to open or re-validate,
+    /// or [`EngineError::Delta`] if the delta tier cannot be read.
+    pub fn segment_metadata(&self) -> Result<Vec<SegmentMeta>, EngineError> {
+        let mut out = Vec::new();
+
+        // Sealed segments first, in the same oldest-first order
+        // `open_segment_readers` materializes them (it maps `segment_names`).
+        let readers = self.open_segment_readers()?;
+        for (name, reader) in self.segment_names.iter().zip(&readers) {
+            let zone = reader.zone_map();
+            out.push(SegmentMeta {
+                name: Some(name.clone()),
+                rows: reader.row_count(),
+                sys_min: zone_i64(zone, ColumnId::SysFrom, true).map(SystemTimeMicros),
+                sys_max: zone_i64(zone, ColumnId::SysFrom, false).map(SystemTimeMicros),
+                key_min: zone_bytes(zone, ColumnId::BusinessKey, true),
+                key_max: zone_bytes(zone, ColumnId::BusinessKey, false),
+                byte_size: Some(reader.byte_size()),
+            });
+        }
+
+        // The resident delta (hot) tier last — summarized from its staged
+        // versions, since it has no on-disk footer or byte footprint. An empty
+        // delta contributes no row (a fully-flushed table shows only sealed
+        // segments; a brand-new table with neither shows nothing at all).
+        let staged = self.delta.staged_versions()?;
+        if !staged.is_empty() {
+            let rows = u64::try_from(staged.len()).expect("a resident version count fits in u64");
+            out.push(SegmentMeta {
+                name: None,
+                rows,
+                sys_min: staged.iter().map(|v| v.sys_from).min(),
+                sys_max: staged.iter().map(|v| v.sys_from).max(),
+                key_min: staged
+                    .iter()
+                    .map(|v| v.business_key.as_bytes())
+                    .min()
+                    .map(<[u8]>::to_vec),
+                key_max: staged
+                    .iter()
+                    .map(|v| v.business_key.as_bytes())
+                    .max()
+                    .map(<[u8]>::to_vec),
+                byte_size: None,
+            });
+        }
+
+        Ok(out)
+    }
+}
+
+/// One tier's worth of introspection metadata for the shell's `\segments`
+/// command ([STL-301]) — a sealed segment, or the resident delta (hot) tier.
+///
+/// Deliberately storage-neutral: the raw figures only, with no wire shaping or
+/// type knowledge. The session engine maps these into a `SelectResult`, decoding
+/// the opaque [`key_min`](Self::key_min) / [`key_max`](Self::key_max) bytes
+/// against the table's key column type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentMeta {
+    /// The sealed segment's filename, or `None` for the in-memory delta (hot)
+    /// tier — the discriminant for the `hot`/`sealed` state the shell renders.
+    pub name: Option<String>,
+    /// Total version rows in this tier.
+    pub rows: u64,
+    /// Smallest `sys_from` observed, or `None` for an empty zone.
+    pub sys_min: Option<SystemTimeMicros>,
+    /// Largest `sys_from` observed, or `None` for an empty zone.
+    pub sys_max: Option<SystemTimeMicros>,
+    /// The business-key zone's lower bound — the encoded key bytes, or `None`
+    /// when the zone is absent or its end is open ([`ZoneEnd::Unbounded`]). These
+    /// are the zone map's *encoding-order* bounds (the bytes the pruner compares
+    /// lexicographically), exact for a fixed-width key and a possibly-truncated
+    /// prefix for a variable-width one.
+    pub key_min: Option<Vec<u8>>,
+    /// The business-key zone's upper bound — see [`key_min`](Self::key_min).
+    pub key_max: Option<Vec<u8>>,
+    /// The segment's on-disk byte size, or `None` for the resident hot tier
+    /// (which has no file footprint).
+    pub byte_size: Option<u64>,
+}
+
+/// The `i64` value at one end of `column`'s zone, or `None` when the column
+/// carries no stats or its end is open. Total over the fixed-width `i64` columns
+/// ([`ColumnId::SysFrom`] and the provenance timestamps), whose bounds are always
+/// concrete `i64`s — a bytes column never reaches the `I64` arm.
+fn zone_i64(zone: &ZoneMap, column: ColumnId, min: bool) -> Option<i64> {
+    let cz = zone.column(column)?;
+    let end = if min { &cz.min } else { &cz.max };
+    match end {
+        ZoneEnd::Value(ZoneBound::I64(v)) => Some(*v),
+        _ => None,
+    }
+}
+
+/// The encoded bytes at one end of `column`'s zone, or `None` when the column
+/// carries no stats or its end is open ([`ZoneEnd::Unbounded`]). For the
+/// variable-width bytes columns ([`ColumnId::BusinessKey`] / [`ColumnId::Payload`]).
+fn zone_bytes(zone: &ZoneMap, column: ColumnId, min: bool) -> Option<Vec<u8>> {
+    let cz = zone.column(column)?;
+    let end = if min { &cz.min } else { &cz.max };
+    match end {
+        ZoneEnd::Value(ZoneBound::Bytes(b)) => Some(b.clone()),
+        _ => None,
+    }
 }
 
 /// Build the canonical sealed-segment filename for `index`.
@@ -1414,6 +1537,94 @@ mod tests {
             .as_of(&key2, Snapshot(h2[0].sys_to))
             .expect("as_of gap");
         assert!(after_delete.is_none(), "the deletion gap is empty");
+    }
+
+    /// `segment_metadata` reports one entry per sealed segment plus the resident
+    /// delta tier — the introspection surface the shell's `\segments` command
+    /// renders ([STL-301]). The figures are footer-/delta-derived and exact: row
+    /// counts, the system-time and business-key zone ranges, and the on-disk byte
+    /// size for a sealed segment vs. `None` for the in-memory hot tier.
+    #[test]
+    fn segment_metadata_reports_sealed_segments_and_the_hot_tier() {
+        let principal = Principal::new(b"op".to_vec());
+        // Encoded `Int8` business keys (little-endian), so the zone bounds round-
+        // trip back through `ScalarValue::decode` at the session layer.
+        let key1 = BusinessKey::new(1_i64.to_le_bytes().to_vec());
+        let key2 = BusinessKey::new(2_i64.to_le_bytes().to_vec());
+        let key3 = BusinessKey::new(3_i64.to_le_bytes().to_vec());
+
+        let mut engine = Engine::open(
+            crate::backend::MemDisk::new(),
+            StepClock(std::sync::atomic::AtomicI64::new(0)),
+            false,
+        )
+        .expect("open");
+
+        // An empty table has no segments at all.
+        assert!(
+            engine.segment_metadata().expect("meta empty").is_empty(),
+            "a table with neither sealed segments nor a resident delta is empty",
+        );
+
+        // Two inserts, then a flush seals them into one segment; a third insert
+        // lands in the delta (hot) tier behind it.
+        engine
+            .insert(
+                key1,
+                None,
+                Some(b"v1".to_vec()),
+                0,
+                TxnId(1),
+                principal.clone(),
+            )
+            .expect("insert k1");
+        engine
+            .insert(
+                key2,
+                None,
+                Some(b"v2".to_vec()),
+                0,
+                TxnId(2),
+                principal.clone(),
+            )
+            .expect("insert k2");
+        engine.flush().expect("flush");
+        engine
+            .insert(key3, None, Some(b"v3".to_vec()), 0, TxnId(3), principal)
+            .expect("insert k3");
+
+        let meta = engine.segment_metadata().expect("meta");
+        assert_eq!(meta.len(), 2, "one sealed segment + the hot delta tier");
+
+        // The sealed segment: a real filename, two rows, a non-zero byte size,
+        // and the business-key zone spanning the two flushed keys.
+        let sealed = &meta[0];
+        assert_eq!(sealed.name.as_deref(), Some(segment_name(0).as_str()));
+        assert_eq!(sealed.rows, 2);
+        assert!(
+            sealed.byte_size.is_some_and(|b| b > 0),
+            "sealed has a footprint"
+        );
+        assert_eq!(sealed.key_min.as_deref(), Some(&1_i64.to_le_bytes()[..]));
+        assert_eq!(sealed.key_max.as_deref(), Some(&2_i64.to_le_bytes()[..]));
+        let (smin, smax) = (
+            sealed.sys_min.expect("sys_min"),
+            sealed.sys_max.expect("sys_max"),
+        );
+        assert!(smin <= smax, "the system-time range is ordered");
+
+        // The hot tier: no filename, no byte footprint, the one resident row.
+        let hot = &meta[1];
+        assert_eq!(hot.name, None, "the delta tier has no on-disk name");
+        assert_eq!(hot.rows, 1);
+        assert_eq!(hot.byte_size, None, "the in-memory tier has no byte size");
+        assert_eq!(hot.key_min.as_deref(), Some(&3_i64.to_le_bytes()[..]));
+        assert_eq!(hot.key_max.as_deref(), Some(&3_i64.to_le_bytes()[..]));
+        // The hot row is the newest write — strictly after the sealed range.
+        assert!(
+            hot.sys_min.expect("hot sys_min") > smax,
+            "the hot tier holds the most recent write",
+        );
     }
 
     /// A failed WAL fsync inside [`Engine::checkpoint`] poisons the engine

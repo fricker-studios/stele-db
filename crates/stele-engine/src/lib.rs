@@ -1456,6 +1456,87 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         Ok(SelectResult { columns, rows })
     }
 
+    /// The Stele-native segment-introspection result for `table` — the wire
+    /// surface the shell's `\segments` command reads ([STL-301]), mirroring
+    /// [`version_history`](Self::version_history). One row per sealed segment
+    /// (oldest first), then the resident delta (hot) tier, each shaped into the
+    /// same [`SelectResult`] an ordinary `SELECT` ships so the whole wire path
+    /// carries it unchanged.
+    ///
+    /// The user's value columns are packed into the opaque payload, so a segment
+    /// carries no per-value-column statistics; the "zone map" surfaced here is the
+    /// **business-key** zone (the column the planner prunes point lookups on). Its
+    /// opaque bound bytes are decoded against the table's key column type: a clean
+    /// round-trip ships the canonical bytes (the client renders them by the key's
+    /// type), while a bound that does not decode — a truncated variable-width
+    /// prefix — ships `NULL` rather than risk the wire text encoder on partial
+    /// bytes. Because the key encoding is little-endian (not order-preserving),
+    /// these are the zone's *encoding-order* bounds, intuitive for text keys and
+    /// small-integer keys.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::UnknownTable`] if `table` has no resident tier or does not
+    /// resolve at the current instant, or a storage error from reading the tiers.
+    pub fn segment_metadata(&self, table: &str) -> Result<SelectResult, EngineError> {
+        let state = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
+        let schema = self
+            .catalog
+            .resolve(table, self.clock.current())
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
+        // Column 0 is the business key: its name labels the zone column, its type
+        // decodes the zone bounds. `Option<&Column>` is `Copy`, so it is read
+        // twice. A schema with no columns is unreachable, but degrade gracefully.
+        let key_col = schema.columns().first();
+        let key_name = key_col.map_or_else(|| "key".to_owned(), |c| c.name().to_owned());
+        let key_ty = key_col.map_or(LogicalType::Int8, stele_catalog::ColumnDef::ty);
+
+        let metas = state.engine.segment_metadata()?;
+
+        let columns = vec![
+            ("segment".to_owned(), LogicalType::Text),
+            ("state".to_owned(), LogicalType::Text),
+            ("rows".to_owned(), LogicalType::Int8),
+            ("sys_min".to_owned(), LogicalType::TimestampTz),
+            ("sys_max".to_owned(), LogicalType::TimestampTz),
+            ("key_column".to_owned(), LogicalType::Text),
+            ("key_min".to_owned(), key_ty),
+            ("key_max".to_owned(), key_ty),
+            ("bytes".to_owned(), LogicalType::Int8),
+        ];
+
+        let rows = metas
+            .iter()
+            .map(|m| {
+                // A sealed segment is named by its file; the resident delta tier
+                // has no file and renders as the `hot` state.
+                let (id, label) = m.name.as_ref().map_or_else(
+                    || ("(hot)".to_owned(), "hot"),
+                    |name| (name.clone(), "sealed"),
+                );
+                vec![
+                    Some(encode_value(&ScalarValue::Text(id))),
+                    Some(encode_value(&ScalarValue::Text(label.to_owned()))),
+                    Some(encode_value(&ScalarValue::Int8(int8_of(m.rows)))),
+                    m.sys_min
+                        .map(|t| encode_value(&ScalarValue::TimestampTz(t.0))),
+                    m.sys_max
+                        .map(|t| encode_value(&ScalarValue::TimestampTz(t.0))),
+                    Some(encode_value(&ScalarValue::Text(key_name.clone()))),
+                    decode_key_bound(m.key_min.as_deref(), key_ty),
+                    decode_key_bound(m.key_max.as_deref(), key_ty),
+                    m.byte_size
+                        .map(|b| encode_value(&ScalarValue::Int8(int8_of(b)))),
+                ]
+            })
+            .collect();
+
+        Ok(SelectResult { columns, rows })
+    }
+
     /// Execute one parsed [`Statement`] against the session.
     ///
     /// Routes by binding, in order: a `CREATE TABLE` / `DROP TABLE` applies to the
@@ -1764,6 +1845,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             return self
                 .version_history(&table, key)
                 .map(StatementOutcome::Rows);
+        }
+
+        // Stele-native segment introspection: `SELECT * FROM stele_segments('t')`
+        // is the wire surface the shell's `\segments` command reads ([STL-301]),
+        // mirroring `stele_history` above. Recognized structurally here, ahead of
+        // the binders (which have no `stele_segments` relation), and answered from
+        // the tier metadata as an ordinary row set — same committed-state, ignore-
+        // the-overlay semantics as the history surface.
+        if let Some(table) = stele_segments_call(stmt) {
+            return self.segment_metadata(&table).map(StatementOutcome::Rows);
         }
 
         // DDL first: `bind_ddl` cleanly rejects non-DDL with `NotDdl`, which we
@@ -4403,6 +4494,25 @@ fn encode_value(value: &ScalarValue) -> Vec<u8> {
     bytes
 }
 
+/// A `u64` row count / byte size as an `int8` cell value for `\segments`
+/// ([STL-301]). A figure beyond `i64::MAX` is unreachable for either, but
+/// saturate rather than wrap so the value stays monotonic if it ever were.
+fn int8_of(n: u64) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// Decode a business-key zone bound at the key column's type for `\segments`
+/// ([STL-301]): ship the canonical bytes when they round-trip, `NULL` when the
+/// bound is absent (`None`) or does not decode — a truncated variable-width
+/// prefix the wire text encoder could otherwise choke on. A fixed-width key's
+/// bound is its exact encoding and always round-trips.
+fn decode_key_bound(bound: Option<&[u8]>, key_ty: LogicalType) -> Option<Vec<u8>> {
+    let bytes = bound?;
+    ScalarValue::decode(key_ty, bytes)
+        .ok()
+        .map(|_| bytes.to_vec())
+}
+
 /// The business key for a folded key [`ScalarValue`] — its canonical encoding, the
 /// same bytes a later `UPDATE` / `DELETE` / `SELECT` folds the literal to, so the
 /// key matches across operations.
@@ -4424,9 +4534,54 @@ fn business_key(value: &ScalarValue) -> BusinessKey {
 fn stele_history_call(
     stmt: &Statement,
 ) -> Option<(String, Option<&stele_sql::sqlparser::ast::Expr>)> {
+    let args = stele_native_args(stmt, "stele_history")?;
+    // First argument: the table name, a single-quoted string literal. An optional
+    // second is the business-key literal (folded to the key type by
+    // [`SessionEngine::version_history`]); absent ⇒ every key's timeline. A third
+    // (or further) argument is malformed — fall through to the binders rather than
+    // silently ignoring it.
+    if args.len() > 2 {
+        return None;
+    }
+    let table = string_literal(args.first().copied()?)?;
+    let key = args.get(1).copied();
+    Some((table, key))
+}
+
+/// Recognize the Stele-native segment-introspection call `stele_segments('t')` —
+/// the wire surface the shell's `\segments` command issues ([STL-301]), the exact
+/// sibling of [`stele_history_call`] — returning the table name. `None` for any
+/// other statement, so the normal binders run.
+///
+/// Takes a single string-literal argument (the table); a missing, non-string, or
+/// extra argument falls through to the binders unchanged.
+fn stele_segments_call(stmt: &Statement) -> Option<String> {
+    let args = stele_native_args(stmt, "stele_segments")?;
+    let [table] = args.as_slice() else {
+        return None;
+    };
+    string_literal(table)
+}
+
+/// The unnamed argument expressions of an **unshaped** Stele-native introspection
+/// call `SELECT * FROM <name>(...)`, or `None` for any other statement shape — the
+/// structural gate shared by [`stele_history_call`] / [`stele_segments_call`].
+///
+/// Recognized structurally, like the `pg_catalog` shim: a single-relation `FROM`
+/// whose base is a table-valued function named `<name>` (case-insensitive, last
+/// name part). "Unshaped" means a bare `SELECT *` with no projection list, filter,
+/// grouping, ordering, or limit — this path bypasses the binder/planner, so any
+/// shaping clause would be silently dropped. A shaped query (`SELECT id … WHERE …
+/// ORDER BY …`) instead falls through to the binders, which reject the unknown
+/// relation with a normal error. A `JOIN`, a non-function relation, or a name
+/// mismatch all return `None`.
+fn stele_native_args<'a>(
+    stmt: &'a Statement,
+    name: &str,
+) -> Option<Vec<&'a stele_sql::sqlparser::ast::Expr>> {
     use stele_sql::sqlparser::ast::{
-        Expr, FunctionArg, FunctionArgExpr, GroupByExpr, SelectItem, SetExpr,
-        Statement as SqlStatement, TableFactor, Value,
+        FunctionArg, FunctionArgExpr, GroupByExpr, SelectItem, SetExpr, Statement as SqlStatement,
+        TableFactor,
     };
 
     let SqlStatement::Query(query) = stmt.sql()? else {
@@ -4442,27 +4597,21 @@ fn stele_history_call(
         return None;
     }
     let TableFactor::Table {
-        name,
+        name: relation,
         args: Some(args),
         ..
     } = &from.relation
     else {
         return None;
     };
-    if !name
+    if !relation
         .0
         .last()?
         .as_ident()
-        .is_some_and(|id| id.value.eq_ignore_ascii_case("stele_history"))
+        .is_some_and(|id| id.value.eq_ignore_ascii_case(name))
     {
         return None;
     }
-    // Only the canonical **unshaped** `SELECT * FROM stele_history(...)` is answered
-    // here. This path bypasses the binder/planner, so any projection, filter, or
-    // shaping clause would be silently dropped — answering `SELECT id … WHERE … ORDER
-    // BY …` as if it were `SELECT *` would violate SQL semantics. A shaped query
-    // instead falls through to the binders, which reject the unknown `stele_history`
-    // relation with a normal error.
     let unshaped = matches!(select.projection.as_slice(), [SelectItem::Wildcard(_)])
         && select.selection.is_none()
         && select.distinct.is_none()
@@ -4474,27 +4623,28 @@ fn stele_history_call(
     if !unshaped {
         return None;
     }
-    let mut exprs = args.args.iter().filter_map(|arg| match arg {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
-        _ => None,
-    });
-    // First argument: the table name, a single-quoted string literal.
-    let table = match exprs.next()? {
+    Some(
+        args.args
+            .iter()
+            .filter_map(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+/// The owned `String` of a single-quoted string-literal argument, or `None` for
+/// any other expression — the table-name argument both Stele-native calls take.
+fn string_literal(expr: &stele_sql::sqlparser::ast::Expr) -> Option<String> {
+    use stele_sql::sqlparser::ast::{Expr, Value};
+    match expr {
         Expr::Value(v) => match &v.value {
-            Value::SingleQuotedString(s) => s.clone(),
-            _ => return None,
+            Value::SingleQuotedString(s) => Some(s.clone()),
+            _ => None,
         },
-        _ => return None,
-    };
-    // Optional second argument: the business-key literal, folded to the key type
-    // by [`SessionEngine::version_history`]. Absent ⇒ every key's timeline.
-    let key = exprs.next();
-    // A third (or further) argument is malformed — fall through to the binders
-    // rather than silently ignoring it.
-    if exprs.next().is_some() {
-        return None;
+        _ => None,
     }
-    Some((table, key))
 }
 
 /// The operation that produced `version`, for the `\history` / `\lineage`
@@ -5825,6 +5975,119 @@ mod tests {
             "SELECT * FROM stele_history('account', 1) WHERE id = 1",
             "SELECT * FROM stele_history('account', 1) ORDER BY id",
             "SELECT * FROM stele_history('account', 1, 2)",
+        ] {
+            assert!(
+                engine.execute(&parse_one(shaped)).is_err(),
+                "shaped/over-argument call must not route: {shaped}",
+            );
+        }
+    }
+
+    /// The wire-facing surface: `SELECT * FROM stele_segments('t')` routes through
+    /// `execute` as an ordinary row set ([STL-301]) — one row per sealed segment
+    /// (oldest first) then the resident delta (hot) tier, the fixed metadata
+    /// columns carrying the real footer/delta figures: state, rows, the system-
+    /// time range, the business-key zone, and the byte size (`NULL` for hot).
+    #[test]
+    fn stele_segments_query_routes_through_execute() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        // Two writes, flushed into one sealed segment; a third stays in the delta.
+        for sql in [
+            "INSERT INTO account (id, balance) VALUES (1, 100)",
+            "INSERT INTO account (id, balance) VALUES (2, 500)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("write");
+        }
+        engine.flush().expect("flush");
+        engine
+            .execute(&parse_one(
+                "INSERT INTO account (id, balance) VALUES (3, 900)",
+            ))
+            .expect("write");
+
+        let StatementOutcome::Rows(set) = engine
+            .execute(&parse_one("SELECT * FROM stele_segments('account')"))
+            .expect("segments")
+        else {
+            panic!("stele_segments returns rows");
+        };
+
+        assert_eq!(
+            set.columns
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "segment",
+                "state",
+                "rows",
+                "sys_min",
+                "sys_max",
+                "key_column",
+                "key_min",
+                "key_max",
+                "bytes",
+            ],
+        );
+        assert_eq!(set.rows.len(), 2, "one sealed segment + the hot delta tier");
+
+        let text = |cell: Option<&Vec<u8>>| match ScalarValue::decode(
+            LogicalType::Text,
+            cell.expect("text cell present"),
+        )
+        .expect("decode text")
+        {
+            ScalarValue::Text(s) => s,
+            _ => unreachable!(),
+        };
+        let int8 = |cell: Option<&Vec<u8>>| match ScalarValue::decode(
+            LogicalType::Int8,
+            cell.expect("int8 cell present"),
+        )
+        .expect("decode int8")
+        {
+            ScalarValue::Int8(v) => v,
+            _ => unreachable!(),
+        };
+
+        // The sealed segment: a real `seg-…` filename, two rows, the `id` zone
+        // spanning the two flushed keys, and a non-zero on-disk byte size.
+        let sealed = &set.rows[0];
+        assert!(
+            text(sealed[0].as_ref()).starts_with("seg-"),
+            "sealed id is the segment filename",
+        );
+        assert_eq!(text(sealed[1].as_ref()), "sealed");
+        assert_eq!(int8(sealed[2].as_ref()), 2);
+        assert_eq!(text(sealed[5].as_ref()), "id", "zone column is the key");
+        assert_eq!(decode_int(sealed[6].as_ref(), LogicalType::Int4), 1);
+        assert_eq!(decode_int(sealed[7].as_ref(), LogicalType::Int4), 2);
+        assert!(int8(sealed[8].as_ref()) > 0, "sealed has a byte footprint");
+
+        // The hot tier: the `(hot)` id, the one resident row, key 3, NULL bytes.
+        let hot = &set.rows[1];
+        assert_eq!(text(hot[0].as_ref()), "(hot)");
+        assert_eq!(text(hot[1].as_ref()), "hot");
+        assert_eq!(int8(hot[2].as_ref()), 1);
+        assert_eq!(decode_int(hot[6].as_ref(), LogicalType::Int4), 3);
+        assert_eq!(decode_int(hot[7].as_ref(), LogicalType::Int4), 3);
+        assert!(
+            hot[8].is_none(),
+            "the in-memory hot tier reports no byte size"
+        );
+
+        // An unknown table errors, never empty rows; only the unshaped `SELECT *`
+        // form routes — a projection, filter, or extra argument falls through.
+        assert!(matches!(
+            engine.execute(&parse_one("SELECT * FROM stele_segments('ghost')")),
+            Err(EngineError::UnknownTable(_)),
+        ));
+        for shaped in [
+            "SELECT segment FROM stele_segments('account')",
+            "SELECT * FROM stele_segments('account') WHERE rows = 2",
+            "SELECT * FROM stele_segments('account', 1)",
+            "SELECT * FROM stele_segments()",
         ] {
             assert!(
                 engine.execute(&parse_one(shaped)).is_err(),
