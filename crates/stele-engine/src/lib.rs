@@ -89,8 +89,8 @@ use stele_sql::select::{
     PeriodEndpoint, Projection, SelectError, SortTarget, SubqueryKind,
 };
 use stele_sql::{
-    AdminCommand, BindContext, BindError, Statement, StatementBody, TimeDimension, bind_ddl,
-    bind_dml, bind_select, without_filter,
+    AdminCommand, BindContext, BindError, CopyError, CopyShape, Statement, StatementBody,
+    TimeDimension, bind_copy, bind_copy_rows, bind_ddl, bind_dml, bind_select, without_filter,
 };
 use stele_storage::backend::Disk;
 use stele_storage::delta::{BusinessKey, Snapshot, Version};
@@ -594,6 +594,16 @@ pub enum EngineError {
     /// [STL-149]: https://allegromusic.atlassian.net/browse/STL-149
     #[error(transparent)]
     Dml(#[from] DmlError),
+
+    /// Binding or loading a `COPY ... FROM STDIN` bulk load failed ([STL-236]) —
+    /// an unsupported shape (`COPY TO`, a file/program endpoint, binary, a
+    /// valid-time target), a bad option, or a row whose fields do not bind. The
+    /// wire layer maps it to the matching SQLSTATE (feature-not-supported,
+    /// syntax-error, or invalid-text-representation).
+    ///
+    /// [STL-236]: https://allegromusic.atlassian.net/browse/STL-236
+    #[error(transparent)]
+    Copy(#[from] CopyError),
 
     /// Applying DDL to the catalog failed (name already live, non-monotonic
     /// time, …).
@@ -1967,6 +1977,145 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // Keep the open-snapshot multiset in step with the advanced pin, so the
         // prune floor reflects where this transaction now reads ([STL-204]).
         txn.lease.repin(snapshot);
+    }
+
+    // -----------------------------------------------------------------------
+    // COPY ... FROM STDIN bulk load ([STL-236])
+    //
+    // The wire half (the CopyData/CopyDone sub-protocol and the text/CSV lexing)
+    // lives in `stele-pgwire`; the engine's job is to bind the target before the
+    // data streams (so the wire layer can advertise it) and then apply the lexed
+    // field rows. A COPY is just a bulk INSERT: every row folds (via the shared
+    // text-field codec, [`bind_copy_rows`]) into the same per-row insert a
+    // multi-row INSERT produces, and rides the same crash-atomic group commit, so
+    // a parse failure or torn commit leaves zero rows ([STL-192]/[STL-216]).
+    //
+    // [STL-236]: https://allegromusic.atlassian.net/browse/STL-236
+    // -----------------------------------------------------------------------
+
+    /// Resolve a `COPY <table> FROM STDIN`'s shape before its data streams: the
+    /// column count the wire layer advertises in `CopyInResponse` and the stream
+    /// format it lexes the bytes with. Binds the target at the current committed
+    /// snapshot, or — when a transaction is open — at its pinned snapshot, so the
+    /// advertised shape matches the rows [`copy_apply`](Self::copy_apply) /
+    /// [`copy_stage`](Self::copy_stage) will load.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Copy`] if the statement is not a supported `COPY ... FROM
+    /// STDIN`, its table/columns do not resolve, or an option is malformed.
+    pub fn copy_shape(
+        &self,
+        stmt: &Statement,
+        txn: Option<&SessionTransaction>,
+    ) -> Result<CopyShape, EngineError> {
+        let snapshot = txn.map_or_else(|| self.clock.observe(), |t| t.snapshot);
+        let ctx = BindContext {
+            snapshot,
+            catalog: &self.catalog,
+        };
+        Ok(bind_copy(stmt, &ctx)?.shape())
+    }
+
+    /// Apply a streamed `COPY ... FROM STDIN` as an **auto-commit** bulk load: bind
+    /// the plan at the current snapshot, fold the field rows into per-row inserts,
+    /// and apply them as **one crash-atomic group** — the same group commit a
+    /// multi-row `INSERT` uses ([STL-192]/[STL-216]), so a parse failure on any row
+    /// leaves **zero** rows and a torn commit recovers whole or not at all. Returns
+    /// the loaded row count for the `COPY n` tag.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Copy`] if the plan does not bind or any row's fields do not
+    /// fold (nothing is applied); otherwise the storage error of a failed append.
+    pub fn copy_apply(
+        &mut self,
+        stmt: &Statement,
+        rows: &[Vec<Option<String>>],
+    ) -> Result<u64, EngineError> {
+        let started = self.metrics.now_micros();
+        let result = self.copy_apply_inner(stmt, rows);
+        self.observe_copy(started, result.as_ref().map(|n| *n));
+        result
+    }
+
+    /// The unmetered body of [`copy_apply`](Self::copy_apply).
+    fn copy_apply_inner(
+        &mut self,
+        stmt: &Statement,
+        rows: &[Vec<Option<String>>],
+    ) -> Result<u64, EngineError> {
+        let dml = self.bind_copy_insert(stmt, self.clock.observe(), rows)?;
+        let n = match &dml {
+            BoundDml::InsertRows { rows, .. } => rows.len() as u64,
+            _ => unreachable!("bind_copy_insert always yields InsertRows"),
+        };
+        self.apply_insert_rows(dml)?;
+        Ok(n)
+    }
+
+    /// Stage a streamed `COPY ... FROM STDIN` into an open transaction's buffer:
+    /// the rows ride the same per-row insert buffer a multi-row `INSERT` stages, so
+    /// read-your-own-writes ([STL-203]) sees them and `COMMIT` applies the whole
+    /// `COPY` as part of the transaction's atomic group. Returns the staged row
+    /// count for the `COPY n` tag.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Copy`] if the plan does not bind or any row does not fold —
+    /// nothing is staged (the statement errors, aborting the block).
+    pub fn copy_stage(
+        &self,
+        stmt: &Statement,
+        rows: &[Vec<Option<String>>],
+        txn: &mut SessionTransaction,
+    ) -> Result<u64, EngineError> {
+        let dml = self.bind_copy_insert(stmt, txn.snapshot, rows)?;
+        let (writes, summary) = expand_insert_rows(dml);
+        txn.writes.extend(writes);
+        match summary {
+            DmlSummary::Insert(n) => Ok(n),
+            _ => unreachable!("expand_insert_rows of InsertRows summarizes as Insert"),
+        }
+    }
+
+    /// Bind a `COPY` plan at `snapshot` and fold its streamed rows into a
+    /// [`BoundDml::InsertRows`] — the shared front half of [`copy_apply`] and
+    /// [`copy_stage`].
+    fn bind_copy_insert(
+        &self,
+        stmt: &Statement,
+        snapshot: SystemTimeMicros,
+        rows: &[Vec<Option<String>>],
+    ) -> Result<BoundDml, EngineError> {
+        let ctx = BindContext {
+            snapshot,
+            catalog: &self.catalog,
+        };
+        let plan = bind_copy(stmt, &ctx)?;
+        let bound = bind_copy_rows(&plan, rows)?;
+        Ok(BoundDml::InsertRows {
+            table: plan.table,
+            schema_id: plan.schema_id,
+            rows: bound,
+        })
+    }
+
+    /// Record a finished auto-commit `COPY` into the metric registry as a bulk
+    /// `INSERT` ([STL-253]): the loaded rows into `rows_written`, the latency under
+    /// the `INSERT` statement kind, or an error.
+    fn observe_copy(&self, started_micros: u64, result: Result<u64, &EngineError>) {
+        let m = &self.metrics;
+        match result {
+            Ok(n) => {
+                m.rows_written.add(n);
+                m.observe_statement(
+                    StatementKind::Insert,
+                    m.now_micros().saturating_sub(started_micros),
+                );
+            }
+            Err(_) => m.statement_errors.inc(),
+        }
     }
 
     /// The session's metric registry ([STL-253]) — the wire front end and the
@@ -6115,6 +6264,123 @@ mod tests {
             .into_iter()
             .next()
             .and_then(|row| row.into_iter().next().expect("the projected balance cell")))
+    }
+
+    // -- COPY ... FROM STDIN bulk load ([STL-236]) --------------------------
+
+    /// The set of `id`s currently live in `account`, sorted — for asserting which
+    /// rows a `COPY` made visible.
+    fn loaded_ids(engine: &mut SessionEngine<ZeroClock, MemDisk>) -> Vec<i32> {
+        let StatementOutcome::Rows(r) = engine
+            .execute(&parse_one("SELECT id FROM account"))
+            .expect("select")
+        else {
+            panic!("SELECT returns rows");
+        };
+        let mut ids: Vec<i32> = r
+            .rows
+            .iter()
+            .map(|row| {
+                match stele_common::types::ScalarValue::decode(
+                    LogicalType::Int4,
+                    row[0].as_ref().expect("id cell"),
+                )
+                .expect("decode id")
+                {
+                    stele_common::types::ScalarValue::Int4(v) => v,
+                    // Name the type, not the value: Debug-formatting a ScalarValue
+                    // trips CodeQL's "cleartext logging" heuristic (it can hold a
+                    // UUID) — a recurring false positive in test messages.
+                    other => panic!(
+                        "id column decoded to {:?}, expected int4",
+                        other.logical_type()
+                    ),
+                }
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// `(id, balance)` field rows in the wire-lexed shape `copy_apply` consumes.
+    fn copy_rows(specs: &[(&str, &str)]) -> Vec<Vec<Option<String>>> {
+        specs
+            .iter()
+            .map(|(id, bal)| vec![Some((*id).to_owned()), Some((*bal).to_owned())])
+            .collect()
+    }
+
+    #[test]
+    fn copy_apply_loads_every_row_auto_commit() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        let stmt = parse_one("COPY account FROM STDIN");
+        let n = engine
+            .copy_apply(
+                &stmt,
+                &copy_rows(&[("1", "100"), ("2", "200"), ("3", "300")]),
+            )
+            .expect("copy");
+        assert_eq!(n, 3);
+        assert_eq!(loaded_ids(&mut engine), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn copy_apply_is_all_or_nothing_on_a_bad_row() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        let stmt = parse_one("COPY account FROM STDIN");
+        // Row 2's balance is not an integer — the whole COPY fails and leaves zero
+        // rows ([STL-216]), not a partial prefix.
+        let err = engine
+            .copy_apply(
+                &stmt,
+                &copy_rows(&[("1", "100"), ("2", "oops"), ("3", "300")]),
+            )
+            .expect_err("bad row fails the copy");
+        assert!(matches!(err, EngineError::Copy(_)), "{err:?}");
+        assert_eq!(loaded_ids(&mut engine), Vec::<i32>::new());
+    }
+
+    #[test]
+    fn copy_stage_in_a_transaction_is_read_your_own_writes_then_commits() {
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+
+        let mut txn = engine.begin();
+        let n = engine
+            .copy_stage(
+                &parse_one("COPY account FROM STDIN"),
+                &copy_rows(&[("1", "100"), ("2", "200")]),
+                &mut txn,
+            )
+            .expect("stage copy");
+        assert_eq!(n, 2);
+        // Read-your-own-writes: a SELECT in the same block sees the staged rows
+        // ([STL-203]), before any other connection could.
+        let StatementOutcome::Rows(seen) = engine
+            .execute_in_txn(&parse_one("SELECT id FROM account"), &mut txn)
+            .expect("ryow select")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(seen.rows.len(), 2, "the txn sees its own staged COPY");
+        // Nothing is visible outside the block until COMMIT.
+        assert_eq!(loaded_ids(&mut engine), Vec::<i32>::new());
+        engine.commit(txn).expect("commit");
+        assert_eq!(loaded_ids(&mut engine), vec![1, 2]);
+    }
+
+    #[test]
+    fn copy_into_an_unknown_table_errors() {
+        let mut engine = session();
+        let err = engine
+            .copy_apply(
+                &parse_one("COPY ghost FROM STDIN"),
+                &copy_rows(&[("1", "1")]),
+            )
+            .expect_err("unknown table");
+        assert!(matches!(err, EngineError::Copy(_)), "{err:?}");
     }
 
     /// The STL-227 repro: on an idle database, `AS OF now() - interval '…'` must

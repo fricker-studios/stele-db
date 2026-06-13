@@ -106,6 +106,10 @@ rcgen              = { version = "0.14", default-features = false, features = ["
 # Dev-only: a real Postgres client driving the pgwire front end end-to-end in an
 # integration test (STL-147 DoD). Never a runtime dependency of a shipped crate.
 tokio-postgres     = "0.7"
+# Dev-only: drives the `tokio-postgres` COPY-in sink (its `Sink`/`SinkExt` API) in
+# the STL-236 COPY end-to-end test. Already in the tree transitively via tokio /
+# tokio-postgres; never a runtime dependency of a shipped crate.
+futures-util       = "0.3"
 # Dev-only: the second, independent bitemporal correctness oracle (STL-144). The
 # `bundled` feature vendors and compiles the DuckDB C++ amalgamation (MIT), so the
 # test needs no system library. Default features are empty (no polars/extensions),

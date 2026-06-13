@@ -374,6 +374,43 @@ INSERT INTO account VALUES (1, 100), (2, 200), (3, 300);  -- INSERT 0 3
 `INSERT … SELECT` stays out of scope (a clear bind error, never a wrong write).
 This is the statement-sized stepping stone to v0.3 bulk ingest (`COPY`).
 
+## Bulk load — `COPY … FROM STDIN` (STL-236)
+
+`COPY <table> [(col, …)] FROM STDIN [WITH (…)]` is the standard Postgres bulk-load
+door, spoken over the pg-wire COPY sub-protocol (`CopyInResponse` → `CopyData`* →
+`CopyDone`/`CopyFail`). It is the wire half of v0.3 bulk ingest — `psql \copy` and a
+psycopg / `tokio-postgres` `copy()` load a file straight into a table.
+
+```sql
+COPY account FROM STDIN;                       -- text: TAB-delimited, \N = NULL
+COPY account (id, balance) FROM STDIN WITH (FORMAT csv, HEADER);
+-- the data rows stream over the wire, then: COPY 3
+```
+
+- **Formats.** `text` (default — TAB delimiter, backslash escapes, `\N` for NULL)
+  and `csv` (comma delimiter, `"`-quoted fields, doubled-quote escape, empty
+  unquoted field = NULL). `WITH (…)` overrides `DELIMITER`, `NULL`, `QUOTE`,
+  `ESCAPE`, `HEADER`; the legacy `CSV [HEADER]` form is also accepted. Defaults
+  match Postgres exactly.
+- **Column mapping.** Positional by default (a row must carry one field per
+  column); an explicit `(col, …)` list maps each field to its named column, and an
+  omitted value column loads as `NULL` (the business key may not be omitted or
+  `NULL`). Each field folds through the **same per-type codec** an `INSERT`
+  literal does, so a `COPY`-loaded value is byte-identical to the inserted one.
+- **One atomic group.** Every row binds, then the whole load applies as a single
+  crash-atomic group (the STL-192 group commit): a parse failure on row *k* — a bad
+  value, wrong field count, or `NULL` key — aborts the entire `COPY` and leaves
+  **zero** rows (the STL-216 abort posture), reported as `22P02`. Inside a
+  `BEGIN … COMMIT` block the rows buffer like any other write — a `SELECT` in the
+  same transaction sees them (read-your-own-writes, STL-203) — and commit with the
+  transaction.
+- **Command tag.** `COPY n` counts the loaded rows. A client `CopyFail` aborts with
+  `57014`, leaving zero rows.
+- **Out of scope (clear errors, never a wrong load).** `COPY … TO` (export), a
+  file/program endpoint (`COPY … FROM '/path'`), binary format, and `COPY` into a
+  valid-time table — each a `0A000` (`feature_not_supported`). `COPY` carrying its
+  own valid-time interval is a follow-up.
+
 ## DML row selection (STL-229)
 
 `UPDATE` / `DELETE` select the rows they write with the **same `WHERE`

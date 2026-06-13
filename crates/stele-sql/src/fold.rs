@@ -167,6 +167,92 @@ pub fn fold_literal(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, String>
     })
 }
 
+/// Fold one **`COPY`/text-format field** — already a plain string, not a quoted
+/// SQL literal — into a typed [`ScalarValue`] of `ty`, or report why it cannot.
+///
+/// The bulk-load sibling of [`fold_scalar`] ([STL-236]): it shares the very same
+/// per-type codecs ([`str::parse`] for the integers, [`parse_uuid`] / [`parse_bytea`]
+/// for the binary types, [`stele_common::datetime`] for the civil-time types), so a
+/// value loaded by `COPY` is byte-identical to the same value written by `INSERT`
+/// and round-trips through a read unchanged. The difference from [`fold_scalar`] is
+/// only the input shape: a `COPY` field is the raw value text (`123`, `t`,
+/// `2023-11-14`), where an `INSERT` carries a parsed SQL literal (`123`, `TRUE`,
+/// `DATE '2023-11-14'`).
+///
+/// SQL `NULL` is resolved by the caller — the wire layer maps the `COPY` null
+/// marker to an absent cell upstream — so this is only ever called on a present
+/// field and never returns [`FoldError::Null`]. Whitespace is significant for
+/// `text`/`uuid`/`bytea` (taken verbatim) but trimmed for the numeric, boolean,
+/// and civil-time types, matching Postgres's input functions.
+///
+/// [STL-236]: https://allegromusic.atlassian.net/browse/STL-236
+pub(crate) fn fold_text_field(text: &str, ty: LogicalType) -> Result<ScalarValue, FoldError> {
+    let bad = |reason: &'static str| FoldError::BadLiteral {
+        literal: text.to_owned(),
+        reason: Some(reason),
+    };
+    match ty {
+        LogicalType::Int4 => text
+            .trim()
+            .parse::<i32>()
+            .map(ScalarValue::Int4)
+            .map_err(|_| FoldError::BadLiteral {
+                literal: text.to_owned(),
+                reason: None,
+            }),
+        LogicalType::Int8 => text
+            .trim()
+            .parse::<i64>()
+            .map(ScalarValue::Int8)
+            .map_err(|_| FoldError::BadLiteral {
+                literal: text.to_owned(),
+                reason: None,
+            }),
+        LogicalType::Text => Ok(ScalarValue::Text(text.to_owned())),
+        LogicalType::Bool => parse_copy_bool(text.trim())
+            .map(ScalarValue::Bool)
+            .ok_or_else(|| bad("expected a boolean: t/f, true/false, yes/no, on/off, 1/0")),
+        LogicalType::Uuid => parse_uuid(text)
+            .map(ScalarValue::Uuid)
+            .ok_or_else(|| bad("expected a UUID: 32 hex digits, optionally hyphenated")),
+        LogicalType::Bytea => parse_bytea(text)
+            .map(ScalarValue::Bytea)
+            .ok_or_else(|| bad("expected bytea hex: `\\x` then an even number of hex digits")),
+        LogicalType::TimestampTz => fold_civil_text(text, |s| {
+            stele_common::datetime::parse_timestamptz(s).map(ScalarValue::TimestampTz)
+        }),
+        LogicalType::Timestamp => fold_civil_text(text, |s| {
+            stele_common::datetime::parse_timestamp(s).map(ScalarValue::Timestamp)
+        }),
+        LogicalType::Date => fold_civil_text(text, |s| {
+            stele_common::datetime::parse_date(s).map(ScalarValue::Date)
+        }),
+        ty @ (LogicalType::Period | LogicalType::Float8) => Err(FoldError::UnsupportedType(ty)),
+    }
+}
+
+/// Parse a `COPY` boolean field, accepting the Postgres boolean input spellings
+/// case-insensitively. `None` for anything else.
+fn parse_copy_bool(text: &str) -> Option<bool> {
+    match text.to_ascii_lowercase().as_str() {
+        "t" | "true" | "yes" | "y" | "on" | "1" => Some(true),
+        "f" | "false" | "no" | "n" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// Fold a civil-time `COPY` field (the raw value text, trimmed) through one of the
+/// [`stele_common::datetime`] codecs — the [`fold_civil`] of the text-field path.
+fn fold_civil_text(
+    text: &str,
+    parse: impl Fn(&str) -> Result<ScalarValue, stele_common::datetime::DatetimeParseError>,
+) -> Result<ScalarValue, FoldError> {
+    parse(text.trim()).map_err(|e| FoldError::BadLiteral {
+        literal: e.literal,
+        reason: Some(e.reason),
+    })
+}
+
 /// Fold a civil-time literal through one of the [`stele_common::datetime`]
 /// codecs, mapping its parse error onto [`FoldError::BadLiteral`].
 fn fold_civil(
@@ -476,6 +562,69 @@ mod tests {
             matches!(err, Err(FoldError::BadLiteral { reason: Some(r), .. }) if r.contains("TIMESTAMPTZ")),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn fold_text_field_parses_each_type_from_raw_text() {
+        // Numbers parse from the bare value text (no SQL-literal wrapper), trimmed.
+        assert_eq!(
+            fold_text_field("123", LogicalType::Int4),
+            Ok(ScalarValue::Int4(123))
+        );
+        assert_eq!(
+            fold_text_field(" -5 ", LogicalType::Int8),
+            Ok(ScalarValue::Int8(-5))
+        );
+        // Text is taken verbatim — surrounding spaces are significant, unlike a
+        // quoted SQL literal.
+        assert_eq!(
+            fold_text_field("  hi  ", LogicalType::Text),
+            Ok(ScalarValue::Text("  hi  ".to_owned()))
+        );
+        // Civil-time, uuid, bytea share the literal codecs.
+        assert_eq!(
+            fold_text_field("2023-11-14", LogicalType::Date),
+            Ok(ScalarValue::Date(19_675))
+        );
+        assert_eq!(
+            fold_text_field("\\xdead", LogicalType::Bytea),
+            Ok(ScalarValue::Bytea(vec![0xDE, 0xAD]))
+        );
+    }
+
+    #[test]
+    fn fold_text_field_accepts_the_copy_boolean_spellings() {
+        for t in ["t", "true", "TRUE", "yes", "y", "on", "1"] {
+            assert_eq!(
+                fold_text_field(t, LogicalType::Bool),
+                Ok(ScalarValue::Bool(true)),
+                "{t:?}"
+            );
+        }
+        for f in ["f", "false", "FALSE", "no", "n", "off", "0"] {
+            assert_eq!(
+                fold_text_field(f, LogicalType::Bool),
+                Ok(ScalarValue::Bool(false)),
+                "{f:?}"
+            );
+        }
+        assert!(matches!(
+            fold_text_field("maybe", LogicalType::Bool),
+            Err(FoldError::BadLiteral { .. })
+        ));
+    }
+
+    #[test]
+    fn fold_text_field_rejects_a_malformed_number() {
+        assert!(matches!(
+            fold_text_field("not-an-int", LogicalType::Int4),
+            Err(FoldError::BadLiteral { .. })
+        ));
+        // An out-of-range value for the narrower integer is also rejected.
+        assert!(matches!(
+            fold_text_field("99999999999", LogicalType::Int4),
+            Err(FoldError::BadLiteral { .. })
+        ));
     }
 
     /// Folding a UUID/BYTEA literal and re-encoding it returns to the original
