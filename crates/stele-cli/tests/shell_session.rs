@@ -524,6 +524,50 @@ async fn tls_require_session_round_trips_encrypted() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_large_select_over_tls_does_not_deadlock() {
+    // Regression for the TLS reply-flush deadlock: the server wrote a whole-table
+    // SELECT reply into its `tokio_rustls` stream — which buffers plaintext until a
+    // flush — and then blocked reading the next message without flushing. So over an
+    // encrypted connection the client waited forever for rows that were never pushed
+    // to the socket while the server waited for a request that never came. A
+    // plaintext socket hid it (writes go straight out), and small replies escaped as
+    // TLS records filled, so only a result past a few hundred rows deadlocked. If
+    // this regresses, the shell never exits and `run_shell` kills it at the deadline,
+    // so `status.success()` is false.
+    use std::fmt::Write as _;
+    let (addr, _ca) = spawn_tls_server("large-select").await;
+    let mut script = String::from(
+        "CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING;\n\
+         INSERT INTO account VALUES ",
+    );
+    for i in 1..=500 {
+        if i > 1 {
+            script.push(',');
+        }
+        let _ = write!(script, "({i},{})", i * 100);
+    }
+    // The result (~500 short rows) stays well under the stdin/stdout pipe buffer, so
+    // `run_shell` itself cannot deadlock — only the TLS reply path under test can.
+    script.push_str(";\nSELECT * FROM account;\n\\q\n");
+
+    let output =
+        tokio::task::spawn_blocking(move || run_shell(addr, &script, &["--tls", "require"]))
+            .await
+            .expect("shell task");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "shell hung or errored over TLS:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("INSERT 0 500"), "{stdout}");
+    assert!(
+        stdout.contains("(500 rows)"),
+        "the whole-table SELECT must return every row over TLS:\n{stdout}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_verify_full_checks_the_server_against_the_ca() {
     let (addr, ca) = spawn_tls_server("verify-full").await;
     let ca = ca.to_str().expect("utf-8 path").to_owned();

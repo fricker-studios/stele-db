@@ -977,6 +977,12 @@ async fn negotiate_startup(
 
 /// Run the post-negotiation protocol — authentication, the OK bundle, then
 /// the message loop — over an established (plain or TLS) stream.
+// The message loop dispatches every pg-wire message kind inline; splitting the
+// match arms into helpers would scatter the connection's control flow without
+// making it clearer — the same call made for `handle_simple_query`. (The
+// flush-before-read added for the TLS reply deadlock nudged it one over the
+// threshold; the shape is unchanged.)
+#[allow(clippy::cognitive_complexity)]
 async fn run_session<S: Wire>(
     stream: &mut S,
     startup: StartupMessage,
@@ -1031,6 +1037,16 @@ async fn run_session<S: Wire>(
     // "skip until Sync" error latch live for the whole connection.
     let mut state = ConnState::default();
     loop {
+        // Flush any buffered reply before blocking for the next message. A
+        // plaintext `TcpStream` write goes straight to the OS send buffer, but a
+        // TLS stream (`tokio_rustls`) holds written plaintext in memory until it is
+        // flushed — so without this the entire response to a large `SELECT` can sit
+        // unencrypted in the server while both ends wait on each other: the client
+        // blocks reading a reply that was never pushed, the server blocks reading a
+        // request that will never come. (Small replies happened to escape as TLS
+        // records filled, which is why the bug only bit past a few hundred rows.)
+        // Postgres flushes its output the same way before reading the next command.
+        stream.flush().await?;
         let Some(msg) = read_typed_message(stream).await? else {
             debug!("peer closed connection");
             return Ok(());
@@ -1083,8 +1099,10 @@ async fn run_session<S: Wire>(
             }
             MSG_CLOSE => handle_close(stream, &mut state, &msg.payload).await?,
             MSG_FLUSH => {
-                // We write replies straight to the socket with no backend buffer,
-                // so Flush only needs to push them past the OS send buffer.
+                // Push pending replies to the client now, as the extended-protocol
+                // Flush asks. The loop already flushes before each read, so this is
+                // belt-and-suspenders for a client that wants its output mid-batch
+                // without a Sync.
                 stream.flush().await?;
             }
             MSG_QUERY => {
@@ -1893,8 +1911,12 @@ async fn run_copy_in<S: Wire>(
         }
     };
 
-    // 2. Open copy-in mode and read the data stream.
+    // 2. Open copy-in mode and read the data stream. Flush first: the client
+    // waits for this `CopyInResponse` before streaming `CopyData`, so over a TLS
+    // stream (which buffers writes until flushed) an unflushed response deadlocks
+    // exactly as a large `SELECT` reply would — both ends blocked reading.
     write_copy_in_response(stream, shape.columns).await?;
+    stream.flush().await?;
     let mut data: Vec<u8> = Vec::new();
     loop {
         let Some(msg) = read_typed_message(stream).await? else {

@@ -184,6 +184,11 @@ pub(crate) async fn authenticate<S: Wire>(
         scram::b64_encode(&verifier.server_signature(auth_message.as_bytes()))
     );
     write_auth_request(stream, AUTH_SASL_FINAL, server_final.as_bytes()).await?;
+    // Flush like the earlier challenges: this is the last auth write before control
+    // returns to the connection's message loop, and while that loop also flushes
+    // before its first read, keeping the pattern here means no auth reply is ever
+    // left buffered in a TLS stream — the deadlock class fixed for query replies.
+    stream.flush().await?;
     debug!(user = %user, "SCRAM authentication succeeded");
     Ok(user)
 }
