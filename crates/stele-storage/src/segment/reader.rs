@@ -744,8 +744,14 @@ fn parse_footer(bytes: &[u8]) -> Result<Footer, SegmentError> {
         return Err(SegmentError::Corrupt("unknown schema id in footer"));
     }
     // The flags word signals the optional trailing bloom section ([STL-238],
-    // v11). Any other bit is reserved and (in a v11 reader) must be clear.
+    // v11). Any other bit is reserved and must be clear: a set reserved bit means
+    // either corruption or a writer from a format generation that should have
+    // bumped the version, so fail closed rather than silently ignore it (the same
+    // posture the parser takes on an unknown column or schema id).
     let flags = p.u32()?;
+    if flags & !FOOTER_FLAG_BLOOM != 0 {
+        return Err(SegmentError::Corrupt("unknown footer flag bits set"));
+    }
     let row_group_count = p.u32()?;
     // No `Vec::with_capacity(row_group_count)` — the count is footer-derived
     // and an oversized value would force a giant allocation before the
@@ -1278,6 +1284,24 @@ mod tests {
         assert!(
             matches!(err, SegmentError::Corrupt(msg) if msg.contains("schema id")),
             "schema_id != 0 must be rejected with a typed schema-id error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_footer_flag_bits_are_rejected() {
+        // A v11 footer with a reserved flag bit set (beyond FOOTER_FLAG_BLOOM) is
+        // either corruption or a newer generation that should have bumped the
+        // version — the parser must fail closed rather than silently ignore it.
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u32.to_le_bytes()); // schema_id
+        out.extend_from_slice(&(FOOTER_FLAG_BLOOM << 1).to_le_bytes()); // an unknown bit
+        out.extend_from_slice(&0u32.to_le_bytes()); // row_group_count
+        out.extend_from_slice(&0u32.to_le_bytes()); // retraction_count
+        out.extend_from_slice(&0u32.to_le_bytes()); // retraction_column_count
+        let err = parse_footer(&out).unwrap_err();
+        assert!(
+            matches!(err, SegmentError::Corrupt(msg) if msg.contains("footer flag")),
+            "an unknown footer flag bit must be rejected, got {err:?}"
         );
     }
 
