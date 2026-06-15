@@ -124,7 +124,9 @@ use stele_sql::sqlparser::ast::{
     CopyTarget, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr,
     Statement as SqlStatement, UnaryOperator, Value,
 };
-use stele_sql::{BindError, CopyError, CopyShape, DmlError, Statement, bind_ddl};
+use stele_sql::{
+    BindError, CopyError, CopyShape, DmlError, Statement, bind_ddl, cap_unbounded_select,
+};
 
 use pg_catalog::Introspection;
 
@@ -1233,6 +1235,22 @@ struct ResultColumn {
 // batch's parse → route → reply step sequence into helpers would scatter its
 // control flow without making it clearer — a readability follow-up, not an
 // MSRV-bump concern.
+/// Default row cap applied to an **unbounded** `SELECT` on the simple-query path
+/// when the client gave no `LIMIT` ([STL-306]).
+///
+/// The simple protocol has no per-fetch row control — `psql`, the `stele` shell,
+/// and other ad-hoc tools type a statement and consume the whole result at once.
+/// A bare `SELECT * FROM big_table` would then stream every row, flooding the
+/// client's terminal (which on macOS drains through a ~1 KiB pty buffer) and its
+/// memory — observably hanging the shell. Treating an absent `LIMIT` as an
+/// implicit `LIMIT 1000` keeps an accidental whole-table read interactive while
+/// still letting a caller ask for more with an explicit `LIMIT`.
+///
+/// The **extended** protocol is deliberately exempt: a driver (JDBC, psycopg,
+/// pgAdmin) drives row count through the portal's `Execute` `max_rows`, so an
+/// automated consumer already fetches exactly what it asked for.
+const SIMPLE_QUERY_ROW_CAP: u64 = 1000;
+
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn handle_simple_query<S: Wire>(
     stream: &mut S,
@@ -1249,7 +1267,7 @@ async fn handle_simple_query<S: Wire>(
             .map_err(WireError::Io);
     }
 
-    let statements = match stele_sql::parse(sql) {
+    let mut statements = match stele_sql::parse(sql) {
         Ok(statements) => statements,
         Err(e) => {
             info!(query = %sql, error = %e, "simple query failed to parse");
@@ -1271,7 +1289,7 @@ async fn handle_simple_query<S: Wire>(
             .map_err(WireError::Io);
     }
 
-    for stmt in &statements {
+    for stmt in &mut statements {
         // (0) Transaction control — `BEGIN` / `COMMIT` / `ROLLBACK` manage the
         // connection's `txn` state and never reach the engine's routing. Checked
         // first so `COMMIT`/`ROLLBACK` can still end a transaction that is in the
@@ -1367,19 +1385,11 @@ async fn handle_simple_query<S: Wire>(
                 }
             },
             Err(BindError::NotDdl) => {
-                // (3) A constant `SELECT` (STL-104) is answered without touching
-                // storage. Everything else — a table read or `INSERT`/`UPDATE`/
-                // `DELETE` — routes through the session engine (STL-147), buffered
-                // into `txn` instead of committed when a transaction is open.
-                if let Some(columns) = constant_select(stmt) {
-                    write_row_description(stream, &columns, &[]).await?;
-                    write_data_row(stream, &columns, &[]).await?;
-                    write_command_complete(stream, &CommandTag::Select(1)).await?;
-                } else if !run_statement(stream, stmt, session, txn, principal).await? {
-                    // The statement errored; the reply and SQLSTATE are already on
-                    // the wire and the batch aborts (Postgres stops on the first
-                    // error), mirroring the DDL arm above. An open transaction is
-                    // now aborted.
+                // (3) A constant `SELECT`, a table read, or `INSERT`/`UPDATE`/
+                // `DELETE` — routed inline or through the session engine. On an
+                // error the reply is already on the wire and the batch aborts
+                // (Postgres stops on the first error), like the DDL arm above.
+                if !run_non_ddl(stream, stmt, session, txn, principal).await? {
                     txn.mark_failed();
                     return Ok(());
                 }
@@ -1395,6 +1405,33 @@ async fn handle_simple_query<S: Wire>(
         }
     }
     Ok(())
+}
+
+/// Route a non-DDL, non-transaction statement on the simple-query path: a
+/// constant `SELECT` ([STL-104]) answered inline, otherwise a table read or
+/// `INSERT`/`UPDATE`/`DELETE` through the session engine ([STL-147]), buffered
+/// into `txn` instead of committed when a transaction is open.
+///
+/// An unbounded table read is capped to [`SIMPLE_QUERY_ROW_CAP`] first, so an
+/// ad-hoc `SELECT * FROM big_table` cannot flood an interactive client
+/// ([STL-306]); [`cap_unbounded_select`] is a no-op for an explicit `LIMIT`, for
+/// DML, and for a constant `SELECT`. Returns `false` when the statement errored
+/// (the reply is already on the wire) and the batch must abort.
+async fn run_non_ddl<S: Wire>(
+    stream: &mut S,
+    stmt: &mut Statement,
+    session: &SharedSession,
+    txn: &mut ConnTxn,
+    principal: &Principal,
+) -> Result<bool, WireError> {
+    if let Some(columns) = constant_select(stmt) {
+        write_row_description(stream, &columns, &[]).await?;
+        write_data_row(stream, &columns, &[]).await?;
+        write_command_complete(stream, &CommandTag::Select(1)).await?;
+        return Ok(true);
+    }
+    cap_unbounded_select(stmt, SIMPLE_QUERY_ROW_CAP);
+    run_statement(stream, stmt, session, txn, principal).await
 }
 
 /// `BEGIN` / `START TRANSACTION` — open an explicit transaction block ([STL-174]).
@@ -5662,6 +5699,70 @@ mod tests {
             error_has_sqlstate(&msgs, SQLSTATE_PROTOCOL_VIOLATION),
             "mismatched result-format count is 08P01: {msgs:?}"
         );
+        terminate(server, client).await;
+    }
+
+    /// Create `big(id, v)` and seed it with `n` rows in one multi-row INSERT —
+    /// the fixture for the STL-306 simple-query row cap.
+    async fn seed_big(client: &mut TcpStream, n: usize) {
+        use std::fmt::Write as _;
+        run_simple(
+            client,
+            "CREATE TABLE big (id INT PRIMARY KEY, v INT) WITH SYSTEM VERSIONING",
+        )
+        .await;
+        let mut sql = String::from("INSERT INTO big VALUES ");
+        for i in 1..=n {
+            if i > 1 {
+                sql.push(',');
+            }
+            let _ = write!(sql, "({i},{})", i * 2);
+        }
+        let inserted = run_simple(client, &sql).await;
+        assert_eq!(command_tag(&inserted[0].1), format!("INSERT 0 {n}"));
+    }
+
+    #[tokio::test]
+    async fn simple_query_caps_an_unbounded_select_but_honors_an_explicit_limit() {
+        // STL-306: an ad-hoc `SELECT` over the simple protocol that names no LIMIT
+        // is bounded to SIMPLE_QUERY_ROW_CAP, so a whole-table read cannot flood an
+        // interactive client; an explicit LIMIT (even above the cap) still wins.
+        let (server, mut client) = connect_past_handshake().await;
+        seed_big(&mut client, 1100).await;
+
+        let capped = run_simple(&mut client, "SELECT id FROM big").await;
+        let rows = capped.iter().filter(|(k, _)| *k == MSG_DATA_ROW).count();
+        assert_eq!(rows, 1000, "a bare SELECT is capped to the default");
+        let tag = capped
+            .iter()
+            .rev()
+            .find_map(|(k, p)| (*k == MSG_COMMAND_COMPLETE).then(|| command_tag(p)))
+            .expect("CommandComplete");
+        assert_eq!(tag, "SELECT 1000", "the tag reflects the capped row count");
+
+        let explicit = run_simple(&mut client, "SELECT id FROM big LIMIT 1100").await;
+        let rows = explicit.iter().filter(|(k, _)| *k == MSG_DATA_ROW).count();
+        assert_eq!(rows, 1100, "an explicit LIMIT overrides the default cap");
+
+        terminate(server, client).await;
+    }
+
+    #[tokio::test]
+    async fn extended_execute_is_exempt_from_the_simple_query_cap() {
+        // The cap is a simple-protocol affordance: a driver on the extended
+        // protocol drives its own row count through Execute's `max_rows`, so
+        // `Execute(max_rows = 0)` returns every row, uncapped (STL-306).
+        let (server, mut client) = connect_past_handshake().await;
+        seed_big(&mut client, 1100).await;
+
+        send_parse(&mut client, "", "SELECT id FROM big", &[]).await;
+        send_bind(&mut client, "", "", &[]).await;
+        send_execute(&mut client, "", 0).await;
+        send_sync(&mut client).await;
+        let msgs = drain_to_ready(&mut client).await;
+        let rows = msgs.iter().filter(|(k, _)| *k == MSG_DATA_ROW).count();
+        assert_eq!(rows, 1100, "extended Execute(max_rows = 0) is uncapped");
+
         terminate(server, client).await;
     }
 }
