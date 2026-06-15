@@ -277,11 +277,12 @@ impl<D: Disk> Wal<D> {
                         // rolls its resident writes back and keeps running ([STL-295]).
                         //
                         // This keys off the backend reporting its *actual* post-error
-                        // length. `MemDisk` does (a torn fault advances `len()` by what
-                        // landed); the real `LocalFile::append` does not yet advance its
-                        // cached `len` on a partial `write_all`, so a torn append there
-                        // currently reads as clean and degrades to the [STL-295] path
-                        // (still consistent, but not poisoned) — surfacing it is [STL-305].
+                        // length, and both shipped backends do: `MemDisk`'s torn fault
+                        // advances `len()` by what landed, and `LocalFile::append`
+                        // accumulates the bytes its `write` loop physically wrote even
+                        // when the append then errors ([STL-305]). So a torn append now
+                        // poisons on a real filesystem too, not only under the sim — a
+                        // clean failure (`len()` still equals `staged_end`) does not.
                         if g.current.len() > g.staged_end.byte_offset {
                             g.poisoned = true;
                             wakers.extend(drain_all_waiters(&mut g));
