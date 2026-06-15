@@ -42,3 +42,11 @@ stele-pgwire  = { workspace = true }
 tokio         = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # Self-signed certs for the TLS shell-session tests (STL-251).
 rcgen         = { workspace = true }
+
+# The interactive shell only engages the rustyline editor when stdin AND stdout
+# are TTYs, so the paste-handling regression test (STL-306) drives the real binary
+# over a pseudo-terminal. `nix`'s `term` feature (which carries `openpty`) is
+# already enabled in the graph by rustyline, so this adds no new compilation; it
+# is unix-only because PTYs are.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.31", features = ["term"] }
