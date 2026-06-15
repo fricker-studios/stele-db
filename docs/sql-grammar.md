@@ -318,6 +318,30 @@ over a `JOIN`, the same posture as `WHERE` and aggregates over a join) — join
 composability is STL-264. Top-N pushdown and sort spill are performance work,
 deliberately out of v0.3 scope.
 
+### Default row cap on the simple-query path (STL-306)
+
+A `SELECT` that names **no `LIMIT`** is unbounded — `SELECT * FROM t` reads the
+whole table. Over the **simple** query protocol (`psql`, the `stele` shell, any
+ad-hoc tool) the client consumes the entire result in one shot, so an accidental
+whole-table read floods the terminal and the client's memory — observably
+hanging the shell. The wire front end therefore treats an unbounded **plain
+single-table** `SELECT` (no finite `LIMIT`/`FETCH` count) as an implicit
+**`LIMIT 1000`**, injected before binding so it rides the normal result-shaping
+path above. Any `OFFSET` the caller gave is preserved, and a **subquery is never
+touched** (capping a `WHERE … IN (SELECT …)` would change the result, not just
+truncate it). An explicit `LIMIT n` — including one above the cap — always wins;
+`LIMIT ALL` reads as unbounded and is capped like a bare read.
+
+The cap is applied only where `LIMIT` is legal — the single-table read path. A
+**`JOIN`**, a **table-valued function** (`stele_history`/`stele_audit`/
+`stele_segments` introspection), a **set operation**, an `INSERT … SELECT`
+source, and a constant `SELECT` all reject result shaping and are left intact, so
+the cap never turns a working statement into an error.
+
+The **extended** query protocol is exempt: a driver (JDBC, psycopg, pgAdmin)
+sets its own row count through the portal's `Execute` `max_rows`, so an
+automated consumer fetches exactly what it requested.
+
 ## Subquery predicates (STL-234)
 
 A `WHERE` may be a single **uncorrelated subquery** predicate — the inner query

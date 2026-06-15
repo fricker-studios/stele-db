@@ -91,9 +91,11 @@ async fn copy_in_loads_many_rows_text_format() {
     let n = sink.finish().await.expect("finish copy");
     assert_eq!(n, u64::try_from(N).unwrap(), "COPY n counts every row");
 
-    // Every row is visible, and a spot-checked row reads back its value.
+    // Every row is visible, and a spot-checked row reads back its value. The
+    // explicit `LIMIT` opts out of the STL-306 simple-query row cap (an unbounded
+    // simple `SELECT` is bounded to 1000 rows) so the full load is verifiable.
     let all = client
-        .simple_query("SELECT id FROM account")
+        .simple_query(&format!("SELECT id FROM account LIMIT {N}"))
         .await
         .expect("select all");
     assert_eq!(row_count(&all), usize::try_from(N).unwrap());

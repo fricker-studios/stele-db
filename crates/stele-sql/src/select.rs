@@ -3114,6 +3114,94 @@ fn row_count(expr: &Expr, clause: &str) -> Result<u64, SelectError> {
     }
 }
 
+/// Inject a default `LIMIT` on an unbounded **plain single-table** `SELECT` — the
+/// interactive-client result cap ([STL-306]).
+///
+/// A bare `SELECT … FROM big_table` carries no row bound, so it reads the whole
+/// table. Over the **simple** query protocol — the `stele` shell, `psql`, any
+/// ad-hoc tool that types a statement and consumes every row at once — that
+/// floods the terminal and the client's memory. When `stmt` is a plain
+/// single-table read with no **finite** `LIMIT`/`FETCH` count — a bare read, an
+/// `OFFSET`-only read, or `LIMIT ALL` all qualify — this rewrites it as if the
+/// user had written `LIMIT max_rows`, so the read returns at most `max_rows` rows
+/// (an existing `OFFSET` is kept). The wire front end applies it on the simple-query path only;
+/// the extended protocol leaves the row count to the client's `Execute`
+/// `max_rows` — a driver fetches exactly what it asked for.
+///
+/// Deliberately narrow:
+/// * **Plain single-table reads only.** Only a one-table `SELECT` over a named
+///   relation accepts a `LIMIT` in Stele. A `JOIN` and a table-valued-function
+///   read (the `stele_history`/`stele_audit`/`stele_segments` introspection calls,
+///   recognized as an *unshaped* `SELECT *`) both reject result shaping, so
+///   injecting a `LIMIT` would turn a working query into an error — they are left
+///   untouched, as are a set operation and a `FROM`-less constant `SELECT`.
+/// * **Top-level only.** It rewrites the statement's own `limit_clause`, never a
+///   subquery's — capping `WHERE id IN (SELECT … )` would change the *result*,
+///   not just truncate the output. A subquery lives inside the query body and is
+///   left untouched.
+/// * **No finite count only.** A query that already chose a finite bound — an
+///   explicit `LIMIT n` (including `LIMIT 0`) or a `FETCH FIRST … ROWS` — keeps
+///   it. Everything the binder reads as *unlimited* is capped: a bare query, an
+///   `OFFSET`-only query, and `LIMIT ALL` (which `sqlparser` collapses to no
+///   count — the binder already treats it identically to no clause). An existing
+///   `OFFSET` is preserved, and the rewrite is idempotent.
+/// * **Reads only.** A non-query statement (`INSERT`/`UPDATE`/`DELETE`, DDL, an
+///   admin command) is returned unchanged — including the `SELECT` *source* of
+///   an `INSERT … SELECT`, which is not a top-level query here.
+///
+/// [STL-306]: https://allegromusic.atlassian.net/browse/STL-306
+pub fn cap_unbounded_select(stmt: &mut Statement, max_rows: u64) {
+    let Some(SqlStatement::Query(query)) = stmt.sql_mut() else {
+        return;
+    };
+    // Only a plain single-table read accepts a `LIMIT`; everything else (a JOIN, a
+    // table-valued introspection call, a set operation, a constant) would error if
+    // one were injected, so leave it untouched.
+    if !is_plain_single_table_read(query) {
+        return;
+    }
+    // A `FETCH FIRST … ROWS` count is the caller's chosen bound.
+    if query.fetch.is_some() {
+        return;
+    }
+    let count = || Expr::Value(Value::Number(max_rows.to_string(), false).into());
+    match &mut query.limit_clause {
+        // An explicit `LIMIT n` count, or the MySQL `LIMIT a, b` form (rejected by
+        // the binder, but its own bound): leave the caller's choice in place.
+        Some(
+            LimitClause::LimitOffset { limit: Some(_), .. } | LimitClause::OffsetCommaLimit { .. },
+        ) => {}
+        // A clause with no count (`OFFSET m`, `LIMIT ALL OFFSET m`): fill in the
+        // cap and keep the offset the caller gave.
+        Some(LimitClause::LimitOffset { limit, .. }) => *limit = Some(count()),
+        // No `LIMIT`/`OFFSET` clause at all (a bare read or `LIMIT ALL`): add the cap.
+        None => {
+            query.limit_clause = Some(LimitClause::LimitOffset {
+                limit: Some(count()),
+                offset: None,
+                limit_by: Vec::new(),
+            });
+        }
+    }
+}
+
+/// Whether `query` is a one-table `SELECT` over a **named relation** — the only
+/// shape that accepts a `LIMIT` in Stele, and so the only shape
+/// [`cap_unbounded_select`] may rewrite. A `JOIN`, a table-valued function (an
+/// `args`-carrying relation, e.g. `stele_history('t')`), a set operation
+/// (`UNION`), and a `FROM`-less constant `SELECT` all return `false`. A `WHERE`
+/// (subquery included), `GROUP BY`/aggregate, `ORDER BY`, or `DISTINCT` over the
+/// one table is fine — those bind on the single-table path with `LIMIT`.
+fn is_plain_single_table_read(query: &Query) -> bool {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    let [from] = select.from.as_slice() else {
+        return false;
+    };
+    from.joins.is_empty() && matches!(&from.relation, TableFactor::Table { args: None, .. })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3701,6 +3789,117 @@ mod tests {
         assert_eq!(fetch.limit, Some(5));
         let one = bind("SELECT id FROM account FETCH FIRST ROW ONLY", &catalog).expect("bind");
         assert_eq!(one.limit, Some(1));
+    }
+
+    #[test]
+    fn cap_unbounded_select_defaults_a_missing_limit() {
+        let catalog = catalog_with_account(1_000);
+        let ctx = BindContext {
+            snapshot: NOW,
+            catalog: &catalog,
+        };
+        // A bare read gains the cap, so the binder (and executor) see `LIMIT 1000`.
+        let mut bare = parse_one("SELECT id FROM account");
+        cap_unbounded_select(&mut bare, 1000);
+        assert_eq!(bind_select(&bare, &ctx).expect("bind").limit, Some(1000));
+        // Idempotent: a second pass sees the limit already present and leaves it.
+        cap_unbounded_select(&mut bare, 1000);
+        assert_eq!(bind_select(&bare, &ctx).expect("bind").limit, Some(1000));
+    }
+
+    #[test]
+    fn cap_unbounded_select_respects_an_explicit_finite_bound() {
+        let catalog = catalog_with_account(1_000);
+        let ctx = BindContext {
+            snapshot: NOW,
+            catalog: &catalog,
+        };
+        // A finite `LIMIT`/`FETCH` count is the caller's own choice: left untouched
+        // (including `LIMIT 0`, a valid empty read).
+        for (sql, want) in [
+            ("SELECT id FROM account LIMIT 5", Some(5)),
+            ("SELECT id FROM account LIMIT 0", Some(0)),
+            ("SELECT id FROM account FETCH FIRST 3 ROWS ONLY", Some(3)),
+        ] {
+            let mut stmt = parse_one(sql);
+            cap_unbounded_select(&mut stmt, 1000);
+            assert_eq!(bind_select(&stmt, &ctx).expect("bind").limit, want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn cap_unbounded_select_caps_every_unlimited_form_and_keeps_the_offset() {
+        let catalog = catalog_with_account(1_000);
+        let ctx = BindContext {
+            snapshot: NOW,
+            catalog: &catalog,
+        };
+        // Everything the binder reads as unlimited is capped — a bare read, an
+        // `OFFSET`-only read, and `LIMIT ALL` (which the binder treats identically
+        // to no clause). Any `OFFSET` the caller gave is preserved.
+        for (sql, want) in [
+            ("SELECT id FROM account", (Some(1000), 0)),
+            ("SELECT id FROM account LIMIT ALL", (Some(1000), 0)),
+            ("SELECT id FROM account OFFSET 2", (Some(1000), 2)),
+            ("SELECT id FROM account LIMIT ALL OFFSET 7", (Some(1000), 7)),
+        ] {
+            let mut stmt = parse_one(sql);
+            cap_unbounded_select(&mut stmt, 1000);
+            let bound = bind_select(&stmt, &ctx).expect("bind");
+            assert_eq!((bound.limit, bound.offset), want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn cap_unbounded_select_touches_only_the_top_level_query() {
+        // The cap rewrites the outer query's `LIMIT`, never a subquery's: capping
+        // `WHERE … IN (SELECT …)` would change the *result*, not just truncate it.
+        let mut nested = parse_one("SELECT id FROM account WHERE id IN (SELECT id FROM account)");
+        cap_unbounded_select(&mut nested, 1000);
+        let rendered = nested.sql().expect("SQL body").to_string();
+        assert!(rendered.ends_with("LIMIT 1000"), "{rendered}");
+        assert_eq!(
+            rendered.matches("LIMIT").count(),
+            1,
+            "only the outer query is capped: {rendered}"
+        );
+
+        // A non-query statement has no `LIMIT` to set — `INSERT … SELECT` included,
+        // so a bulk load's source read is never truncated.
+        for sql in [
+            "INSERT INTO account VALUES (1, 2)",
+            "INSERT INTO account SELECT id, balance FROM account",
+        ] {
+            let mut stmt = parse_one(sql);
+            cap_unbounded_select(&mut stmt, 1000);
+            assert!(
+                !stmt.sql().expect("SQL body").to_string().contains("LIMIT"),
+                "{sql} must not gain a LIMIT"
+            );
+        }
+    }
+
+    #[test]
+    fn cap_unbounded_select_skips_shapes_that_reject_a_limit() {
+        // Only a plain single-table read accepts a `LIMIT`. A `JOIN`, a
+        // table-valued introspection call (`stele_history`/`stele_segments`/
+        // `stele_audit`, recognized by the engine as an *unshaped* `SELECT *`), and
+        // a set operation all reject result shaping, so injecting a `LIMIT` would
+        // turn a working query into a bind error — the cap must leave them alone.
+        for sql in [
+            "SELECT a.id FROM account a JOIN account b ON a.id = b.id",
+            "SELECT * FROM stele_history('account', 1)",
+            "SELECT * FROM stele_segments('account')",
+            "SELECT * FROM stele_audit('account')",
+            "SELECT id FROM account UNION SELECT id FROM account",
+        ] {
+            let mut stmt = parse_one(sql);
+            cap_unbounded_select(&mut stmt, 1000);
+            assert!(
+                !stmt.sql().expect("SQL body").to_string().contains("LIMIT"),
+                "{sql} must not gain a LIMIT"
+            );
+        }
     }
 
     #[test]

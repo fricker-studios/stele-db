@@ -187,6 +187,53 @@ SELECT id, balance
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unbounded_select_is_capped_so_a_big_table_cannot_flood_the_shell() {
+    // STL-306: a whole-table `SELECT` over the simple-query protocol the shell
+    // speaks used to stream every row at once — flooding the terminal (which
+    // drains through a tiny pty buffer) until it hung. A bare SELECT now stops at
+    // the 1000-row interactive default; an explicit LIMIT still returns exactly
+    // what the caller asked for.
+    use std::fmt::Write as _;
+    let addr = spawn_server().await;
+    let mut script = String::from(
+        "CREATE TABLE big (id INT PRIMARY KEY, v INT) WITH SYSTEM VERSIONING;\n\
+         INSERT INTO big VALUES ",
+    );
+    for i in 1..=1100 {
+        if i > 1 {
+            script.push(',');
+        }
+        let _ = write!(script, "({i},{})", i * 2);
+    }
+    // A bare read (capped) then a small explicit LIMIT (honored). Output stays
+    // well under the stdin/stdout pipe buffer so `run_shell` cannot deadlock.
+    script.push_str(";\nSELECT id FROM big;\nSELECT id FROM big LIMIT 5;\n\\q\n");
+
+    let output = tokio::task::spawn_blocking(move || run_shell(addr, &script, &[]))
+        .await
+        .expect("shell task");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // The table really holds 1100 rows…
+    assert!(stdout.contains("INSERT 0 1100"), "{stdout}");
+    // …but the unqualified SELECT stops at the 1000-row default…
+    assert!(
+        stdout.contains("(1000 rows)"),
+        "bare SELECT capped: {stdout}"
+    );
+    // …and an explicit LIMIT passes straight through, uncapped.
+    assert!(
+        stdout.contains("(5 rows)"),
+        "explicit LIMIT honored: {stdout}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sql_errors_go_to_stderr_and_the_session_continues() {
     let addr = spawn_server().await;
     // No `\q`: the EOF after the last line must also end the shell cleanly.
