@@ -3625,7 +3625,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// holds at least one sealed segment": an all-delta target is small enough
     /// that the single in-memory keyset read still wins, and keeping it on that
     /// path leaves a small-table `MERGE` byte-identical to before. (A real
-    /// cost-based choice is a follow-up.)
+    /// cost-based source-vs-keyspace choice is [STL-312].)
+    ///
+    /// [STL-312]: https://allegromusic.atlassian.net/browse/STL-312
     fn merge_should_probe_per_key(&self, table: &str) -> bool {
         self.tables
             .get(table)
