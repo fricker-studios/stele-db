@@ -70,9 +70,16 @@ impl PtyShell {
         let stdout: Stdio = pty.slave.try_clone().expect("dup slave").into();
         let stderr: Stdio = pty.slave.try_clone().expect("dup slave").into();
         // A private HOME keeps the test off the developer's real ~/.stele_history
-        // (and its file lock).
-        let home = std::env::temp_dir().join(format!("stele-pty-home-{}", std::process::id()));
-        std::fs::create_dir_all(&home).ok();
+        // (and its file lock). The ephemeral server port makes it unique per
+        // PtyShell, so two PTY tests in the same test binary never share a history
+        // file. Fail loudly rather than let a broken temp dir surface later as an
+        // inscrutable shell error.
+        let home = std::env::temp_dir().join(format!(
+            "stele-pty-home-{}-{}",
+            std::process::id(),
+            addr.port()
+        ));
+        std::fs::create_dir_all(&home).expect("create scratch HOME");
         let child = Command::new(env!("CARGO_BIN_EXE_stele"))
             .args([
                 "shell",
@@ -223,13 +230,20 @@ async fn interactive_shell_processes_a_large_pasted_block_without_losing_input()
              (is rustyline's `buffer-redux` feature enabled?)"
         );
 
-        // And the shell is still alive afterwards: a follow-up query returns.
+        // And the shell is still alive afterwards: a follow-up query returns. Look
+        // at only the output after this point and for the result's row-count
+        // trailer (`(1 row …)`) — a render artifact of a *returned* result, never
+        // echoed, so it can't be matched by the echoed query or the pasted inserts
+        // (which print `INSERT 0 1`). Matching the bare count value would: `300`
+        // already appears in the echoed `(300, 3000)` insert.
+        let mark = shell.snapshot().len();
         shell.send("SELECT count(*) FROM account;\n");
         assert!(
             shell.wait_until(Duration::from_secs(15), Duration::from_secs(12), |o| o
-                .contains(&format!("{N}"))),
+                .get(mark..)
+                .is_some_and(|tail| tail.contains("(1 row"))),
             "shell did not answer a query after the paste:\n{}",
-            shell.snapshot()
+            shell.snapshot().get(mark..).unwrap_or_default()
         );
     })
     .await
