@@ -24,18 +24,23 @@
 //! same differential catches it (the STL-168 `WrongWriter` mutation, at the SQL
 //! surface).
 //!
-//! `_stele_principal` is the writing principal stored inline on each version. The
-//! engine stamps the placeholder `stele` on every wire-issued write today;
-//! threading the connection's authenticated user into it is a tracked follow-up
-//! that changes the *value*, not this *surface* — so the oracle pins the surface
-//! (the column resolves, hides from `SELECT *`, and filters in `WHERE`) and the
-//! current value.
+//! `_stele_principal` is the writing principal stored inline on each version. A
+//! session stamps whichever identity [`SessionEngine::set_principal`] was given
+//! ([STL-300]) — the connection's authenticated user over the wire — so a row must
+//! read back *exactly* that principal, not a frozen constant. The oracle is
+//! parameterized off a swept set of identities ([`PRINCIPALS`]) and asserts the
+//! stored value tracks the one configured for the build; the `stele` engine default
+//! is one of them, the others prove the value is load-bearing rather than hard-wired
+//! (the STL-247 surface — the column resolves, hides from `SELECT *`, filters in
+//! `WHERE` — is pinned the same way across all of them).
 //!
 //! [STL-168]: https://allegromusic.atlassian.net/browse/STL-168
 //! [STL-247]: https://allegromusic.atlassian.net/browse/STL-247
+//! [STL-300]: https://allegromusic.atlassian.net/browse/STL-300
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use stele_common::provenance::Principal;
 use stele_common::time::{Clock, SystemTimeMicros};
 use stele_common::types::{LogicalType, ScalarValue};
 use stele_engine::{SelectResult, SessionEngine, StatementOutcome};
@@ -79,10 +84,19 @@ impl Rng {
     }
 }
 
-/// The writing principal the engine stamps on every wire write today — the
-/// placeholder identity surfaced by `_stele_principal` until the connection's user
-/// is threaded through (a tracked follow-up).
-const WIRE_PRINCIPAL: &str = "stele";
+/// The identities the oracle sweeps as the session's configured write principal
+/// ([STL-300]). The engine stamps whichever one [`SessionEngine::set_principal`]
+/// was given, so a row's `_stele_principal` must read back exactly that. `stele` is
+/// the engine default ([direct callers leave it there](SessionEngine::set_principal));
+/// the others are non-default identities a wire connection would supply, proving the
+/// stored value is threaded from the connection rather than a hard-coded constant.
+const PRINCIPALS: [&str; 3] = ["stele", "auditor", "alice"];
+
+/// The principal the build at `seed` configures and stamps — sweeping
+/// [`PRINCIPALS`] so the assertion is generalized off any single identity.
+fn principal_for(seed: u64) -> &'static str {
+    PRINCIPALS[usize::try_from(seed % 3).expect("0..3 fits usize")]
+}
 
 /// One committed version of a key, in write order: its commit instant (which the
 /// engine sets equal to the version's `sys_from`), its writing transaction id, and
@@ -172,8 +186,15 @@ fn cell(value: &ScalarValue) -> Option<Vec<u8>> {
 /// The reference's `[id, balance, _stele_txn_id, _stele_committed_at,
 /// _stele_principal]` row for a key live at `s`, in the five-column projection's
 /// order. `bug` adds one to the `txn_id` cell — the teeth seam; the correct
-/// reference passes `false`.
-fn full_row(model: &Reference, key: i32, s: i64, bug: bool) -> Vec<Option<Vec<u8>>> {
+/// reference passes `false`. `principal` is the identity the build configured, which
+/// every version is stamped with ([STL-300]).
+fn full_row(
+    model: &Reference,
+    key: i32,
+    s: i64,
+    bug: bool,
+    principal: &str,
+) -> Vec<Option<Vec<u8>>> {
     let event = model.live_at(key, s).expect("key is live at s");
     let txn_id = event.txn_id + i64::from(bug);
     vec![
@@ -183,16 +204,16 @@ fn full_row(model: &Reference, key: i32, s: i64, bug: bool) -> Vec<Option<Vec<u8
         )),
         cell(&ScalarValue::Int8(txn_id)),
         cell(&ScalarValue::TimestampTz(event.sys_from)),
-        cell(&ScalarValue::Text(WIRE_PRINCIPAL.to_owned())),
+        cell(&ScalarValue::Text(principal.to_owned())),
     ]
 }
 
 /// The full five-column result the reference expects at snapshot `s`, keys ascending.
-fn full_rows(model: &Reference, s: i64, bug: bool) -> Vec<Vec<Option<Vec<u8>>>> {
+fn full_rows(model: &Reference, s: i64, bug: bool, principal: &str) -> Vec<Vec<Option<Vec<u8>>>> {
     model
         .live_keys_at(s)
         .into_iter()
-        .map(|key| full_row(model, key, s, bug))
+        .map(|key| full_row(model, key, s, bug, principal))
         .collect()
 }
 
@@ -219,9 +240,14 @@ const FULL_SELECT: &str =
 /// the reference in lockstep. The workload only issues *valid* point writes — an
 /// `INSERT` of an absent key, an `UPDATE`/`DELETE` of a live one — so every write
 /// takes the single-key fast path (one transaction, one commit tick).
-fn build(seed: u64) -> (SessionEngine<ZeroClock, MemDisk>, Reference) {
+///
+/// `principal` is set on the engine up front (the wire front end's per-statement
+/// [`SessionEngine::set_principal`], minus the connection), so every committed
+/// version is stamped with it ([STL-300]).
+fn build(seed: u64, principal: &str) -> (SessionEngine<ZeroClock, MemDisk>, Reference) {
     let mut rng = Rng::new(seed);
     let mut engine = SessionEngine::open(MemDisk::new(), ZeroClock);
+    engine.set_principal(Principal::new(principal.as_bytes().to_vec()));
     let mut model = Reference::new();
 
     run(
@@ -266,15 +292,18 @@ fn build(seed: u64) -> (SessionEngine<ZeroClock, MemDisk>, Reference) {
 #[test]
 fn provenance_matches_reference_across_seeds() {
     for seed in 0..64 {
-        let (mut engine, model) = build(seed);
+        // Sweep the configured principal across seeds so the assertion is pinned to
+        // whatever identity the session was given, not the `stele` constant ([STL-300]).
+        let principal = principal_for(seed);
+        let (mut engine, model) = build(seed, principal);
 
         // 1. The live read: every present row carries its live version's writing
         //    transaction, commit instant, and principal.
         let live = select(&mut engine, &format!("{FULL_SELECT} ORDER BY id"));
         assert_eq!(
             live.rows,
-            full_rows(&model, model.high_water, false),
-            "live provenance (seed {seed})",
+            full_rows(&model, model.high_water, false, principal),
+            "live provenance (seed {seed}, principal {principal})",
         );
 
         // 2. `AS OF` every commit instant: each historical version reports its own
@@ -287,8 +316,8 @@ fn provenance_matches_reference_across_seeds() {
             );
             assert_eq!(
                 as_of.rows,
-                full_rows(&model, s, false),
-                "AS OF {s} provenance (seed {seed})",
+                full_rows(&model, s, false, principal),
+                "AS OF {s} provenance (seed {seed}, principal {principal})",
             );
         }
 
@@ -333,10 +362,11 @@ fn provenance_matches_reference_across_seeds() {
         );
 
         // 5. `_stele_principal` filters too: every live row was written by the
-        //    placeholder principal, none by any other identity.
+        //    configured principal, none by any other identity — so the filter
+        //    matches everything under the right name and nothing under a foreign one.
         let by_principal = select(
             &mut engine,
-            "SELECT id FROM t WHERE _stele_principal = 'stele' ORDER BY id",
+            &format!("SELECT id FROM t WHERE _stele_principal = '{principal}' ORDER BY id"),
         );
         let live_ids: Vec<Vec<Option<Vec<u8>>>> = model
             .live_keys_at(model.high_water)
@@ -345,15 +375,17 @@ fn provenance_matches_reference_across_seeds() {
             .collect();
         assert_eq!(
             by_principal.rows, live_ids,
-            "WHERE _stele_principal = 'stele' (seed {seed})",
+            "WHERE _stele_principal = '{principal}' (seed {seed})",
         );
+        // A name no build ever configures matches no row, whichever identity this
+        // seed used.
         let other = select(
             &mut engine,
             "SELECT id FROM t WHERE _stele_principal = 'nobody'",
         );
         assert!(
             other.rows.is_empty(),
-            "no row for a foreign principal (seed {seed})"
+            "no row for a foreign principal (seed {seed}, principal {principal})"
         );
     }
 }
@@ -366,7 +398,8 @@ fn provenance_matches_reference_across_seeds() {
 #[test]
 fn provenance_survives_flush_to_sealed_segments() {
     for seed in 0..16 {
-        let (mut engine, model) = build(seed);
+        let principal = principal_for(seed);
+        let (mut engine, model) = build(seed, principal);
 
         // Seal every delta into a segment; the version provenance now lives in the
         // segment's `TxnId` / `CommittedAt` / `Principal` columns.
@@ -375,8 +408,8 @@ fn provenance_survives_flush_to_sealed_segments() {
         let live = select(&mut engine, &format!("{FULL_SELECT} ORDER BY id"));
         assert_eq!(
             live.rows,
-            full_rows(&model, model.high_water, false),
-            "live provenance after flush (seed {seed})",
+            full_rows(&model, model.high_water, false, principal),
+            "live provenance after flush (seed {seed}, principal {principal})",
         );
         for s in 2..=model.high_water {
             let as_of = select(
@@ -385,8 +418,8 @@ fn provenance_survives_flush_to_sealed_segments() {
             );
             assert_eq!(
                 as_of.rows,
-                full_rows(&model, s, false),
-                "AS OF {s} provenance after flush (seed {seed})",
+                full_rows(&model, s, false, principal),
+                "AS OF {s} provenance after flush (seed {seed}, principal {principal})",
             );
         }
     }
@@ -398,7 +431,11 @@ fn provenance_survives_flush_to_sealed_segments() {
 /// read-your-own-writes overlay, [STL-203]).
 #[test]
 fn a_buffered_write_has_null_provenance_in_read_your_own_writes() {
+    // A non-default principal, so the committed row's `_stele_principal` proves the
+    // configured identity threads through the read-your-own-writes overlay ([STL-300]).
+    let principal = "alice";
     let mut engine = SessionEngine::open(MemDisk::new(), ZeroClock);
+    engine.set_principal(Principal::new(principal.as_bytes().to_vec()));
     run(
         &mut engine,
         "CREATE TABLE t (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
@@ -427,13 +464,14 @@ fn a_buffered_write_has_null_provenance_in_read_your_own_writes() {
     assert_eq!(
         result.rows,
         vec![
-            // The committed key 1 carries its real provenance.
+            // The committed key 1 carries its real provenance, including the
+            // configured principal.
             vec![
                 cell(&ScalarValue::Int4(1)),
                 cell(&ScalarValue::Int4(100)),
                 cell(&ScalarValue::Int8(1)),
                 cell(&ScalarValue::TimestampTz(2)),
-                cell(&ScalarValue::Text(WIRE_PRINCIPAL.to_owned())),
+                cell(&ScalarValue::Text(principal.to_owned())),
             ],
             // The buffered key 2 is visible (read-your-own-writes) but uncommitted,
             // so all three provenance cells are NULL.
@@ -455,7 +493,11 @@ fn a_buffered_write_has_null_provenance_in_read_your_own_writes() {
 /// read and under a `FOR VALID_TIME AS OF` pin.
 #[test]
 fn provenance_reads_off_a_valid_time_table() {
+    // A non-default principal, so the frame-stripped read proves the configured
+    // identity survives the valid-time delta-frame strip intact ([STL-300]).
+    let principal = "auditor";
     let mut engine = SessionEngine::open(MemDisk::new(), ZeroClock);
+    engine.set_principal(Principal::new(principal.as_bytes().to_vec()));
     run(
         &mut engine,
         "CREATE TABLE acct (id INT PRIMARY KEY, balance INT, vf TIMESTAMP, vt TIMESTAMP) \
@@ -476,7 +518,7 @@ fn provenance_reads_off_a_valid_time_table() {
             cell(&ScalarValue::Int4(1)),
             cell(&ScalarValue::Int4(50)),
             cell(&ScalarValue::Int8(1)),
-            cell(&ScalarValue::Text(WIRE_PRINCIPAL.to_owned())),
+            cell(&ScalarValue::Text(principal.to_owned())),
         ]],
     );
 
@@ -508,7 +550,8 @@ fn provenance_reads_off_a_valid_time_table() {
 fn perturbed_txn_id_is_caught() {
     // A seed whose workload leaves at least one live row, so there is a `txn_id`
     // cell to perturb.
-    let (mut engine, model) = build(7);
+    let principal = principal_for(7);
+    let (mut engine, model) = build(7, principal);
     let live = select(&mut engine, &format!("{FULL_SELECT} ORDER BY id"));
     assert!(
         !live.rows.is_empty(),
@@ -516,10 +559,13 @@ fn perturbed_txn_id_is_caught() {
     );
 
     // The correct reference matches; the perturbed one (every `txn_id + 1`) does not.
-    assert_eq!(live.rows, full_rows(&model, model.high_water, false));
+    assert_eq!(
+        live.rows,
+        full_rows(&model, model.high_water, false, principal)
+    );
     assert_ne!(
         live.rows,
-        full_rows(&model, model.high_water, true),
+        full_rows(&model, model.high_water, true, principal),
         "a wrong-writer reference must diverge from the engine",
     );
 }
