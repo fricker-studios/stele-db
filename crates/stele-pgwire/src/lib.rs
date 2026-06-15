@@ -544,6 +544,14 @@ where
 /// released entirely within synchronous helpers.
 pub type SharedSession = Arc<Mutex<dyn SessionHandle>>;
 
+/// The write principal for a connection that supplies no startup `user` — the
+/// server's own identity ([STL-300]). Real clients always send a `user`, so this
+/// only stamps a malformed startup; it mirrors the engine's default write principal
+/// (`stele`) so a principal-less connection behaves as it did before STL-300.
+///
+/// [STL-300]: https://allegromusic.atlassian.net/browse/STL-300
+const DEFAULT_WIRE_USER: &str = "stele";
+
 /// How connections authenticate before the OK bundle ([STL-252]).
 ///
 /// The server-level policy — every connection gets the same treatment
@@ -984,10 +992,15 @@ async fn run_session<S: Wire>(
     // captured once here and re-applied to the shared engine under the dispatch
     // lock before each write (see [`SessionHandle::set_principal`]) — never as a
     // single shared field, which connections sharing the engine would race.
+    //
+    // A real client always sends `user`; only a malformed startup omits it. In that
+    // degenerate case fall back to the server identity `stele` — the engine's own
+    // default write principal — rather than stamping an empty principal, so a
+    // principal-less connection behaves as it did before STL-300.
     let user = if auth == AuthMode::Scram {
         scram::authenticate(stream, &startup, &session).await?
     } else {
-        startup.user().unwrap_or_default().to_owned()
+        startup.user().unwrap_or(DEFAULT_WIRE_USER).to_owned()
     };
     tracing::Span::current().record("user", user.as_str());
     let principal = Principal::new(user.into_bytes());

@@ -1821,10 +1821,22 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// `scram`, [STL-252]) even though connections interleave on the shared engine.
     /// It changes the stored provenance *value*, not the query surface ([STL-247]).
     ///
+    /// # Panics (debug only)
+    ///
+    /// `_stele_principal` surfaces as SQL `TEXT` (read back through
+    /// [`str::from_utf8`]), so the principal must be valid UTF-8. Every production
+    /// caller supplies a `String` (the wire `user`), so this is a `debug_assert`
+    /// guarding a misusing direct caller rather than a runtime cost — a non-UTF-8
+    /// principal would otherwise read back as an internal decode error.
+    ///
     /// [STL-247]: https://allegromusic.atlassian.net/browse/STL-247
     /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
     /// [STL-300]: https://allegromusic.atlassian.net/browse/STL-300
     pub fn set_principal(&mut self, principal: Principal) {
+        debug_assert!(
+            std::str::from_utf8(principal.as_bytes()).is_ok(),
+            "write principal must be valid UTF-8 (it reads back as SQL TEXT)",
+        );
         self.write_principal = principal;
     }
 
