@@ -88,6 +88,23 @@ backend = "local"
 # config and a first dashboard.
 metrics = "0.0.0.0:9090"
 
+# [admin]                         # admin / control-plane API (active; STL-254)
+# The dedicated ops surface (ADR-0016): health, status, backup trigger,
+# restore-plan validation, and segment/version/audit introspection — a gRPC
+# service plus an HTTP/JSON gateway that shares the [telemetry] ops listener
+# under /v1alpha1. SQL stays on pg-wire (existing Postgres drivers); this is
+# ops-only. See docs/11-operations-and-runbooks.md#9-admin--control-plane-api.
+#
+# SECURE DEFAULT: with no `tokens` the API rejects every request and the gRPC
+# listener is not bound — configuring a token is what turns the surface on.
+# Tokens are static bearer secrets, sent as `Authorization: Bearer <token>`;
+# they are never logged. Until admin-surface TLS lands they travel in plaintext,
+# so bind the gRPC listener to loopback (or front it with a TLS proxy) off-box.
+#
+# tokens      = ["change-me-to-a-long-random-secret"]
+# grpc_listen = "127.0.0.1:5455"  # default "0.0.0.0:5455"; only bound when a
+#                                 # token is configured
+
 # ───────────────────────────────────────────────────────────────────────────
 # RESERVED — parsed-but-ignored today (unknown sections are skipped). These show
 # the intended shape from docs/05; uncommenting them has no effect yet.

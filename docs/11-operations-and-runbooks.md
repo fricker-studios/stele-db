@@ -219,6 +219,83 @@ server and confirm it matches the source at the backup's fence instant.
 - Alerts map to the [§1 signals](#1-health--monitoring) and the [§4 runbook rows](#4-common-failure-scenarios--remediation) so a page links straight to its remediation.
 - A `SECURITY.md` private channel handles security incidents distinctly ([10 §11](10-security-and-compliance.md#11-secure-sdlc--vulnerability-management)).
 
+## 9. Admin / control-plane API
+
+The dedicated ops surface for everything that isn't SQL — health, status, backup
+trigger, restore-plan validation, and segment / version / commit-chain
+introspection ([ADR-0016](adr/0016-admin-control-plane-api.md), STL-254). SQL
+stays on pg-wire (existing Postgres drivers); this surface is ops-only. Two
+transports over one contract — the versioned `v1alpha1` protobuf in
+[`proto/stele/admin/v1alpha1/admin.proto`](../proto/stele/admin/v1alpha1/admin.proto):
+
+- **gRPC** on its own listener (default `0.0.0.0:5455`) — typed, for the operator,
+  programmatic clients, and the `stele-client` SDK (STL-255).
+- An **HTTP/JSON gateway** on the [§1 ops listener](#1-health--monitoring) (the
+  `:9090` metrics port) under `/v1alpha1/…` — for `curl`, scripts, and the desktop
+  app.
+
+The API version graduates `v1alpha1`→`v1beta1`→`v1` Kubernetes-style with
+deprecation windows ([ADR-0014](adr/0014-release-channels-and-versioning-policy.md));
+within a version, changes are additive.
+
+### 9.1 Enabling it & authentication
+
+The API is **off by default**. It turns on when you configure at least one bearer
+token in `[admin]` ([05 — configuration](05-dev-environment.md#configuration)):
+
+```toml
+[admin]
+tokens      = ["a-long-random-secret", "another-for-rotation"]
+grpc_listen = "127.0.0.1:5455"   # default 0.0.0.0:5455; only bound when a token is set
+```
+
+With no token the gRPC listener is not bound and the HTTP gateway rejects every
+request (`401`) — a secure default, like `[tls]`/`[auth]`. Every call carries the
+token: HTTP `Authorization: Bearer <token>`, gRPC the same as `authorization`
+metadata. Tokens are **never logged**.
+
+> **Transport security.** v0 admin traffic is **plaintext** — admin-surface TLS is
+> a follow-up. Bearer tokens are only as safe as the channel, so bind the gRPC
+> listener to loopback (or front it with a TLS proxy) off-box; a non-loopback bind
+> warns at boot. Rotate by listing several tokens and removing the old one on the
+> next restart.
+
+### 9.2 Endpoints
+
+| RPC | HTTP | Body / args | Returns |
+|---|---|---|---|
+| `Health` | `GET /v1alpha1/health` | — | `{"status":"SERVING"}` (liveness) |
+| `Status` | `GET /v1alpha1/status` | — | readiness, WAL-poison, version, table/user/segment counts |
+| `Backup` | `POST /v1alpha1/backup` | `{"path":"…"}` | the backup [manifest summary](#5-backup--restore) |
+| `RestorePlan` | `POST /v1alpha1/restore-plan` | `{"path":"…"}` | `{"valid":…,"error":…,"manifest":…}` — validate a backup, read-only |
+| `Segments` | `POST /v1alpha1/segments` | `{"table":"…"}` | per-segment + zone-map rows |
+| `Versions` | `POST /v1alpha1/versions` | `{"table":"…","key":"…"?}` | per-version history; `key` is a SQL literal (`42`, `'alice'`) |
+| `AuditChain` | `POST /v1alpha1/audit-chain` | `{"table":"…","key":"…"?}` | commit hash-chain links + an intact/broken verdict |
+
+Tabular replies (`Segments`/`Versions`/`AuditChain`) carry `columns` (`name` +
+type) and `rows` of text cells (`null` for SQL `NULL`), rendered identically to the
+SQL wire. HTTP error mapping: `400` invalid argument, `401` missing/invalid token,
+`404` unknown table/endpoint, `500` engine error (gRPC `INVALID_ARGUMENT` /
+`UNAUTHENTICATED` / `NOT_FOUND` / `INTERNAL`).
+
+### 9.3 Examples
+
+```bash
+# Liveness (401 without a token):
+curl -fsS -H "Authorization: Bearer $TOKEN" http://localhost:9090/v1alpha1/health
+
+# Trigger an online backup, then validate the directory it produced:
+curl -fsS -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"path":"/srv/backups/stele-2026-06-14"}' http://localhost:9090/v1alpha1/backup
+curl -fsS -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"path":"/srv/backups/stele-2026-06-14"}' http://localhost:9090/v1alpha1/restore-plan
+```
+
+The `Backup`/`RestorePlan` pair is the API face of [§5 backup & restore](#5-backup--restore):
+`Backup` runs the same fenced online backup as the `BACKUP TO` admin statement, and
+`RestorePlan` re-runs the manifest + checksum verification a restore does, without
+materializing anything.
+
 ---
 
 *This is a planning runbook; operational specifics (exact thresholds, dashboards, escalation SLAs) are filled in as the engine approaches its first real deployment — gated by the [trust gate](06-testing-strategy.md#9-what-tested-enough-to-hold-real-data-means-the-trust-gate-operationalized).*

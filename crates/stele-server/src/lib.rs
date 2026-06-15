@@ -12,10 +12,14 @@
 //! scratch dir). [STL-116] wires the `[storage] backend` selection through to the
 //! [`AnyDisk`] the engine constructs at boot.
 
+pub mod admin;
 pub mod ops;
 
+use std::fmt;
+use std::future::{self, Future};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -26,8 +30,11 @@ use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
 use stele_pgwire::{AuthMode, Server as PgServer, ServerTls, SharedSession, TlsMode, TlsSettings};
 use stele_storage::backend::{AnyDisk, BackendKind};
+use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::{info, warn};
+
+use crate::admin::{AdminAuth, AdminService};
 
 /// Default data directory for non-dev runs that omit `[server] data_dir`
 /// (matches the `stele.toml` example in [05 — configuration](../../../docs/05-dev-environment.md#configuration)).
@@ -72,6 +79,38 @@ pub struct Config {
     ///
     /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
     pub auth: AuthMode,
+    /// Admin / control-plane API bearer tokens ([STL-254], ADR-0016): the
+    /// `[admin] tokens` list. **Secure default** — empty means the admin API
+    /// authorizes nothing (the gRPC listener is not bound and the HTTP gateway
+    /// rejects every request), so configuring a token is what turns the surface
+    /// on. Never logged.
+    ///
+    /// [STL-254]: https://allegromusic.atlassian.net/browse/STL-254
+    pub admin_tokens: AdminTokens,
+    /// The admin gRPC listen address ([STL-254]): `[admin] grpc_listen`. Only
+    /// bound when at least one token is configured. The HTTP/JSON gateway shares
+    /// the ops listener ([`metrics_listen`](Self::metrics_listen)) instead of
+    /// taking a port of its own. Default `0.0.0.0:5455`.
+    pub admin_grpc_listen: SocketAddr,
+}
+
+/// Admin bearer tokens, with a [`Debug`] that prints only their count — the
+/// secrets must never reach a log line (the `info!(?cfg)` at boot, [STL-254]).
+#[derive(Clone, Default)]
+pub struct AdminTokens(Vec<String>);
+
+impl AdminTokens {
+    /// The configured tokens.
+    #[must_use]
+    pub fn tokens(&self) -> &[String] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for AdminTokens {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "AdminTokens(<{} configured>)", self.0.len())
+    }
 }
 
 impl Config {
@@ -88,6 +127,10 @@ impl Config {
             metrics_listen: default_metrics_listen(),
             tls: None,
             auth: AuthMode::Trust,
+            // Dev is auth-free for pg-wire, but the admin API stays token-gated
+            // even in dev: no tokens means the surface is off, never open.
+            admin_tokens: AdminTokens::default(),
+            admin_grpc_listen: default_admin_grpc_listen(),
         }
     }
 
@@ -133,6 +176,7 @@ struct FileConfig {
     telemetry: TelemetrySection,
     tls: Option<TlsSection>,
     auth: Option<AuthSection>,
+    admin: Option<AdminSection>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -211,6 +255,21 @@ struct AuthSection {
     mode: Option<String>,
 }
 
+/// The `[admin]` section ([STL-254], ADR-0016): the admin / control-plane API's
+/// bearer tokens and gRPC listen address. Configuring a token **enables** the
+/// surface; with none, the API rejects every request (secure default), like
+/// `[auth]`/`[tls]` defaulting to their strict modes.
+///
+/// [STL-254]: https://allegromusic.atlassian.net/browse/STL-254
+#[derive(Debug, Default, Deserialize)]
+struct AdminSection {
+    /// Static bearer tokens accepted on the admin surface. Never logged.
+    tokens: Option<Vec<String>>,
+    /// The gRPC listen address (default `0.0.0.0:5455`); only bound when a token
+    /// is configured.
+    grpc_listen: Option<SocketAddr>,
+}
+
 impl AuthSection {
     fn resolve(self) -> anyhow::Result<AuthMode> {
         match self.mode.as_deref().unwrap_or("scram") {
@@ -233,6 +292,7 @@ impl FileConfig {
                 .map_err(|e| anyhow::anyhow!("[storage] {e}"))?,
             None => BackendKind::Local,
         };
+        let admin = self.admin.unwrap_or_default();
         Ok(Config {
             listen: self.server.listen.unwrap_or_else(default_listen),
             dev: false,
@@ -249,6 +309,8 @@ impl FileConfig {
             auth: self
                 .auth
                 .map_or(Ok(AuthMode::Trust), AuthSection::resolve)?,
+            admin_tokens: AdminTokens(admin.tokens.unwrap_or_default()),
+            admin_grpc_listen: admin.grpc_listen.unwrap_or_else(default_admin_grpc_listen),
         })
     }
 }
@@ -329,7 +391,12 @@ fn auth_posture(cfg: &Config) -> Option<String> {
 ///
 /// Install tracing, apply the plaintext posture, start the ops HTTP listener,
 /// construct the configured storage backend, recover the session engine,
-/// start the pgwire listener, wait for SIGINT.
+/// start the pgwire + admin listeners, wait for SIGINT.
+// Boot orchestration is inherently a long sequential wiring of independent
+// subsystems (tracing, secure-defaults posture, ops/pg/admin listeners,
+// recovery); the slim per-subsystem helpers are already extracted, so the
+// residual branchiness is irreducible "compose the daemon" glue.
+#[allow(clippy::cognitive_complexity)]
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     init_tracing(cfg.dev);
     info!(?cfg, "stele-server: starting");
@@ -407,11 +474,22 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // CREATE TABLE on any connection is visible to the next statement, and the
     // pgwire loop now routes DDL through `engine.execute` (table reads / DML
     // follow in STL-147). The lock is held only per synchronous statement,
-    // never across wire I/O.
-    let session: SharedSession = Arc::new(Mutex::new(engine));
+    // never across wire I/O. The admin / control-plane API ([STL-254]) shares
+    // this very engine: a typed handle for the admin core, the same handle
+    // coerced to the `SharedSession` trait object pg-wire and ops use.
+    let engine: Arc<Mutex<SessionEngine<SystemClock, AnyDisk>>> = Arc::new(Mutex::new(engine));
+    let admin_auth = Arc::new(AdminAuth::new(cfg.admin_tokens.tokens().to_vec()));
+    let admin_core = AdminService::new(Arc::clone(&engine));
+    let session: SharedSession = engine;
     // Recovery is complete: flip `/readyz` (STL-253). From here it tracks the
     // engine's WAL-poison state live.
     ops_state.set_ready(Arc::clone(&session));
+    // Mount the admin HTTP/JSON gateway on the ops listener — always present
+    // (it authenticates every request, rejecting all when no token is set).
+    ops_state.set_admin(Arc::new(admin::http::AdminHttp::new(
+        admin_core.clone(),
+        Arc::clone(&admin_auth),
+    )));
     let mut pg = PgServer::new(cfg.listen, session).with_auth(cfg.auth);
     if cfg.auth == AuthMode::Scram {
         info!("SCRAM-SHA-256 authentication enabled on pg-wire");
@@ -435,18 +513,62 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         pg = pg.with_tls(tls);
     }
 
+    // The admin / control-plane gRPC listener ([STL-254], ADR-0016) — bound only
+    // when a token is configured (secure default: no token ⇒ no surface). The
+    // HTTP/JSON gateway is already live on the ops listener regardless.
+    let admin_grpc = build_admin_grpc(&cfg, admin_core, admin_auth).await?;
+
     tokio::select! {
         res = pg.run() => res.context("pgwire listener exited")?,
         // The ops listener only exits on a bind/served I/O failure or a panic —
         // either way the operator surface is gone, so treat it as fatal rather
         // than serving on half a contract.
         res = &mut ops_task => res.context("ops listener task aborted")?.context("ops listener exited")?,
+        // The admin gRPC listener (when enabled) is the same kind of operator
+        // surface; its exit is fatal too. When disabled this never resolves.
+        res = admin_grpc => res?,
         _ = signal::ctrl_c() => {
             info!("received SIGINT, shutting down");
         }
     }
 
     Ok(())
+}
+
+/// Build the admin / control-plane gRPC listener future ([STL-254], ADR-0016).
+///
+/// Bound and serving when a token is configured; an always-pending no-op
+/// otherwise — the secure default: no token, no surface. The listener is bound
+/// eagerly so a port clash is a boot error, and a non-loopback bind warns that
+/// tokens travel plaintext until admin-surface TLS lands.
+async fn build_admin_grpc(
+    cfg: &Config,
+    admin_core: AdminService<SystemClock, AnyDisk>,
+    admin_auth: Arc<AdminAuth>,
+) -> anyhow::Result<Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>> {
+    if !admin_auth.is_enabled() {
+        info!(
+            "admin API disabled: no [admin] tokens configured (the surface rejects every request)"
+        );
+        return Ok(Box::pin(future::pending()));
+    }
+    let listener = TcpListener::bind(cfg.admin_grpc_listen)
+        .await
+        .with_context(|| format!("binding admin gRPC listener on {}", cfg.admin_grpc_listen))?;
+    let addr = listener.local_addr().unwrap_or(cfg.admin_grpc_listen);
+    info!(%addr, "admin API enabled: gRPC (v1alpha1) + HTTP/JSON gateway on the ops listener");
+    if !addr.ip().is_loopback() {
+        warn!(
+            "admin API tokens travel in PLAINTEXT on {addr}: bind loopback or front with a \
+             TLS proxy until admin-surface TLS lands"
+        );
+    }
+    let service = admin::grpc::GrpcAdmin::new(admin_core, admin_auth);
+    Ok(Box::pin(async move {
+        admin::grpc::serve(listener, service)
+            .await
+            .context("admin gRPC listener exited")
+    }))
 }
 
 const fn default_listen() -> SocketAddr {
@@ -460,6 +582,14 @@ const DEFAULT_METRICS_PORT: u16 = 9090;
 
 const fn default_metrics_listen() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_METRICS_PORT)
+}
+
+/// Stele's default admin gRPC port — `5455`, the port the CLI design prototype
+/// uses for the control-plane surface ([STL-254]; one past the pg-wire `5454`).
+const DEFAULT_ADMIN_GRPC_PORT: u16 = 5455;
+
+const fn default_admin_grpc_listen() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_ADMIN_GRPC_PORT)
 }
 
 /// Microseconds since the first call — the monotonic time source the server
@@ -764,6 +894,46 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("\"md5\""), "{msg}");
         assert!(msg.contains("scram") && msg.contains("trust"), "{msg}");
+    }
+
+    // --- [admin] section (STL-254) ------------------------------------------
+
+    #[test]
+    fn no_admin_section_means_the_api_is_disabled() {
+        // Secure default: no tokens ⇒ the surface authorizes nothing, on a default
+        // gRPC port that is never actually bound.
+        let cfg = Config::from_toml_str("").unwrap();
+        assert!(cfg.admin_tokens.tokens().is_empty());
+        assert_eq!(cfg.admin_grpc_listen, default_admin_grpc_listen());
+        assert_eq!(default_admin_grpc_listen().port(), 5455);
+        assert!(Config::dev().admin_tokens.tokens().is_empty(), "dev too");
+    }
+
+    #[test]
+    fn admin_section_parses_tokens_and_grpc_listen() {
+        let toml = "[admin]\ntokens = [\"alpha\", \"beta\"]\ngrpc_listen = \"127.0.0.1:6455\"\n";
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.admin_tokens.tokens(), ["alpha", "beta"]);
+        assert_eq!(cfg.admin_grpc_listen, "127.0.0.1:6455".parse().unwrap());
+    }
+
+    #[test]
+    fn admin_tokens_are_redacted_in_debug() {
+        // The boot-time `info!(?cfg)` must never spill a token (STL-254).
+        let cfg = Config::from_toml_str("[admin]\ntokens = [\"super-secret\"]\n").unwrap();
+        let debug = format!("{:?}", cfg.admin_tokens);
+        assert!(!debug.contains("super-secret"), "token leaked: {debug}");
+        assert!(debug.contains("1 configured"), "{debug}");
+        // …and not via the whole-Config Debug either.
+        assert!(!format!("{cfg:?}").contains("super-secret"));
+    }
+
+    #[test]
+    fn admin_section_with_only_grpc_listen_stays_disabled() {
+        // A port but no token: still off (no token ⇒ no surface).
+        let cfg = Config::from_toml_str("[admin]\ngrpc_listen = \"0.0.0.0:7000\"\n").unwrap();
+        assert!(cfg.admin_tokens.tokens().is_empty());
+        assert_eq!(cfg.admin_grpc_listen, "0.0.0.0:7000".parse().unwrap());
     }
 
     #[test]

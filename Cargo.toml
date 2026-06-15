@@ -125,6 +125,34 @@ tracing            = "0.1"
 # `json` enables the line-delimited JSON formatter for production
 # (`STELE_LOG_FORMAT=json`, STL-107); it pulls in `serde_json` + `tracing-serde`.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+# JSON bodies for the admin HTTP/JSON gateway (STL-254). Already compiled in the
+# tree (tracing-subscriber's `json` feature pulls it in); naming it directly is a
+# shipped dependency of `stele-server` only, never of the runtime-agnostic core.
+serde_json         = "1.0"
+# Admin / control-plane API (STL-254, ADR-0016): a dedicated gRPC surface with an
+# HTTP/JSON gateway. `tonic` is the gRPC server+client over HTTP/2; `tonic-prost`
+# wires prost-encoded messages into tonic's codec; `prost` is the protobuf runtime
+# (the generated message structs). All MIT / Apache-2.0 (already cargo-deny
+# allow-listed). Default features give server + client (`transport` = `server` +
+# `channel`); TLS is deferred (the v0 surface is plaintext/loopback like the ops
+# listener), so no `tls-*` feature is enabled. `stele-server` only — never the
+# runtime-agnostic core ([ADR-0010]).
+tonic              = "0.14"
+tonic-prost        = "0.14"
+prost              = "0.14"
+# `TcpListenerStream` — lets the admin gRPC server bind its own listener first
+# (reporting the bound address, the same no-race ephemeral-port shape as the
+# pg-wire/ops listeners, STL-152) and feed it to tonic's `serve_with_incoming`.
+# Already compiled in the tree (tonic's `server` feature enables `tokio-stream/net`);
+# naming it directly costs no new crate.
+tokio-stream       = { version = "0.1", features = ["net"] }
+# Build-time codegen for the .proto contract. `tonic-prost-build` generates the
+# service + message code; `protoc-bin-vendored` ships a `protoc` for every host
+# target (incl. the Windows + MSRV build legs), so codegen needs NO system
+# protobuf compiler and the build stays hermetic. Build-dependencies of
+# `stele-server` only.
+tonic-prost-build   = "0.14"
+protoc-bin-vendored = "3.2"
 
 [workspace.lints.rust]
 unsafe_code     = "warn"
