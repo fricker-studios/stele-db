@@ -14,6 +14,7 @@
 use std::io;
 
 use crate::backend::{Disk, DiskFile};
+use crate::bloom::{DEFAULT_BITS_PER_KEY, KeyBloom};
 use crate::delta::BusinessKey;
 
 use super::index::{Close, ValidityError};
@@ -52,71 +53,6 @@ impl SpillMeta {
     pub(super) fn may_contain(&self, key: &BusinessKey) -> bool {
         key >= &self.min_key && key <= &self.max_key && self.bloom.maybe_contains(key.as_bytes())
     }
-}
-
-/// Number of bit probes per key in [`KeyBloom`]. Four keeps the false-positive
-/// rate low at the ~12-bits-per-key sizing below without over-hashing.
-const BLOOM_HASHES: usize = 4;
-
-/// A tiny Bloom filter over a spill's business keys, held in memory only. It has
-/// **no false negatives**, so a negative answer is a sound "this spill cannot
-/// hold the key, don't read it." A positive answer may be wrong (the caller then
-/// reads the spill and finds nothing — correct, just not free).
-///
-/// Hashing is FNV-1a with two independent seeds combined by double hashing
-/// (`h1 + i·h2`), which is fully deterministic — the same key set always yields
-/// the same filter, so it never perturbs the sim digest (and, being read-gating
-/// only, could not change a result even if it did).
-struct KeyBloom {
-    /// Bit storage; the number of addressable bits is `bits.len() * 64`, always
-    /// a power of two so the address mask is `bit_count - 1`.
-    bits: Vec<u64>,
-    /// `bit_count - 1`, for masking a hash down to a bit position.
-    mask: u64,
-}
-
-impl KeyBloom {
-    /// Build a filter over `keys` (duplicates are harmless — a spill names the
-    /// same key once per closed version). Sized to ~12 bits per key with a 512-bit
-    /// floor, so even a one- or two-key spill keeps the false-positive rate
-    /// negligible.
-    fn build<'a>(keys: impl ExactSizeIterator<Item = &'a [u8]>) -> Self {
-        let bit_count = keys.len().saturating_mul(12).next_power_of_two().max(512) as u64;
-        let mask = bit_count - 1;
-        let mut bits = vec![0u64; (bit_count / 64) as usize];
-        for key in keys {
-            for pos in bit_positions(mask, key) {
-                bits[(pos / 64) as usize] |= 1u64 << (pos % 64);
-            }
-        }
-        Self { bits, mask }
-    }
-
-    /// Whether every bit for `bytes` is set — `false` proves absence.
-    fn maybe_contains(&self, bytes: &[u8]) -> bool {
-        bit_positions(self.mask, bytes)
-            .into_iter()
-            .all(|pos| self.bits[(pos / 64) as usize] & (1u64 << (pos % 64)) != 0)
-    }
-}
-
-/// The `BLOOM_HASHES` bit positions `bytes` maps to under `mask`, by double
-/// hashing two independent FNV-1a seeds (`h1 + i·h2`).
-fn bit_positions(mask: u64, bytes: &[u8]) -> [u64; BLOOM_HASHES] {
-    let h1 = fnv1a(0xcbf2_9ce4_8422_2325, bytes);
-    // OR-in 1 so the stride is odd and never degenerates to a single bit.
-    let h2 = fnv1a(0x9e37_79b9_7f4a_7c15, bytes) | 1;
-    std::array::from_fn(|i| h1.wrapping_add((i as u64).wrapping_mul(h2)) & mask)
-}
-
-/// FNV-1a over `bytes`, seeded so two calls give two independent hashes.
-fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
-    let mut h = seed;
-    for &b in bytes {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
 }
 
 /// Build the canonical spill filename for an index.
@@ -181,7 +117,10 @@ pub(super) fn write_spill<D: Disk>(
         .expect("write_spill called with no closes")
         .business_key
         .clone();
-    let bloom = KeyBloom::build(closes.iter().map(|c| c.business_key.as_bytes()));
+    let bloom = KeyBloom::build(
+        DEFAULT_BITS_PER_KEY,
+        closes.iter().map(|c| c.business_key.as_bytes()),
+    );
     Ok(SpillMeta {
         index,
         min_key,
@@ -264,33 +203,6 @@ mod tests {
     }
 
     #[test]
-    fn bloom_has_no_false_negatives() {
-        let keys: Vec<&[u8]> = vec![b"alpha", b"gamma", b"omega", b"zeta"];
-        let bloom = KeyBloom::build(keys.iter().copied());
-        for k in &keys {
-            assert!(bloom.maybe_contains(k), "member must test positive");
-        }
-    }
-
-    #[test]
-    fn bloom_prunes_some_in_range_hole() {
-        // The bloom adds value beyond the key range: across many absent keys that
-        // sort *inside* `[aaa, zzz]` (so the range alone would not prune them), it
-        // must reject at least one. Asserting a *specific* key is rejected would
-        // over-constrain — a bloom is allowed false positives, so its no-false-
-        // negative contract only guarantees pruning is possible, not where.
-        let bloom = KeyBloom::build([b"aaa".as_slice(), b"zzz".as_slice()].into_iter());
-        let pruned = (0..1000)
-            .map(|i| format!("m{i:03}").into_bytes())
-            .filter(|k| !bloom.maybe_contains(k))
-            .count();
-        assert!(
-            pruned > 0,
-            "the bloom must prune at least one in-range absent key"
-        );
-    }
-
-    #[test]
     fn meta_may_contain_combines_range_and_bloom() {
         // A spill holding only the extremes of a wide range. Members pass; a key
         // outside the range is always pruned by the range; and across many absent
@@ -299,7 +211,10 @@ mod tests {
         let meta = {
             let closes = [close(b"k000", 1), close(b"k999", 1)];
             // write_spill needs a disk; build the meta directly from its parts.
-            let bloom = KeyBloom::build(closes.iter().map(|c| c.business_key.as_bytes()));
+            let bloom = KeyBloom::build(
+                DEFAULT_BITS_PER_KEY,
+                closes.iter().map(|c| c.business_key.as_bytes()),
+            );
             SpillMeta {
                 index: 0,
                 min_key: closes[0].business_key.clone(),

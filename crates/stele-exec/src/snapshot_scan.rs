@@ -534,16 +534,22 @@ impl GatheredColumns {
 
 /// Per-scan statistics — chiefly the segment-pruning accounting.
 ///
-/// A segment reaches the scan in one of three states, and the counts partition
+/// A segment reaches the scan in one of four states, and the counts partition
 /// the segment set exactly: `segments_total == segments_pruned_zone +
-/// segments_pruned_superseded + segments_scanned`.
+/// segments_pruned_bloom + segments_pruned_superseded + segments_scanned`.
 ///
-/// Two complementary prunes run before any bulk column is read (STL-146):
+/// Three complementary prunes run before any bulk column is read (STL-146,
+/// STL-238), none touching a column chunk:
 ///
 /// * **Zone-map prune** ([`segments_pruned_zone`](Self::segments_pruned_zone)) —
 ///   the zone maps prove the segment holds no row visible at the snapshot that
 ///   satisfies the predicate ("begins after the snapshot", plus value bounds).
-///   No column chunk is touched.
+/// * **Bloom-filter prune** ([`segments_pruned_bloom`](Self::segments_pruned_bloom),
+///   STL-238) — for a *point* business-key predicate the segment's footer bloom
+///   ([`SegmentReader::might_contain_key`]) proves the key is in no version of
+///   this segment. This catches the random/hash-key case the zone map cannot: a
+///   hash key scatters across the `[min, max]` range every segment spans, so the
+///   value bounds never prune it.
 /// * **Validity-index prune**
 ///   ([`segments_pruned_superseded`](Self::segments_pruned_superseded)) — the
 ///   segment survives the zone map, but reading only its narrow identity columns
@@ -574,6 +580,11 @@ pub struct ScanStats {
     /// level *and* segments every one of whose row-groups the per-row-group zone
     /// maps then ruled out (STL-173) — neither has an identity chunk read.
     pub segments_pruned_zone: usize,
+    /// Segments the footer bloom proved hold the probed point business key in no
+    /// version — skipped with no read I/O (STL-238). Only ever non-zero for a
+    /// point business-key predicate against a segment carrying a bloom; the
+    /// hash-key acceleration zone maps cannot give.
+    pub segments_pruned_bloom: usize,
     /// Segments that survived the zone map but whose every version the validity
     /// index proved superseded at the snapshot — skipped after reading only the
     /// narrow identity columns, never the bulk chunks (STL-139).
@@ -595,12 +606,12 @@ pub struct ScanStats {
 }
 
 impl ScanStats {
-    /// Segments skipped by either prune (`segments_pruned_zone +
-    /// segments_pruned_superseded`) — the count that never had its bulk columns
-    /// materialized.
+    /// Segments skipped by any prune (`segments_pruned_zone +
+    /// segments_pruned_bloom + segments_pruned_superseded`) — the count that never
+    /// had its bulk columns materialized.
     #[must_use]
     pub const fn segments_pruned(&self) -> usize {
-        self.segments_pruned_zone + self.segments_pruned_superseded
+        self.segments_pruned_zone + self.segments_pruned_bloom + self.segments_pruned_superseded
     }
 
     /// Add this run's accounting into the process-wide scan counters
@@ -614,6 +625,9 @@ impl ScanStats {
         metrics
             .scan_segments_pruned_zone
             .add(self.segments_pruned_zone as u64);
+        metrics
+            .scan_segments_pruned_bloom
+            .add(self.segments_pruned_bloom as u64);
         metrics
             .scan_segments_pruned_superseded
             .add(self.segments_pruned_superseded as u64);
@@ -837,8 +851,14 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
         // derived from STL-117's first-class valid_from / valid_to columns. See
         // [`Self::pruning_predicate`].
         let pruning_pred = self.pruning_predicate();
+        // The point business key a hash/bloom probe targets, if the predicate
+        // pins one ([STL-238]). Computed once: it is predicate-derived, not
+        // per-segment. `None` for a range or unconstrained scan, which skip the
+        // bloom stage.
+        let point_key = predicate_point_key(&pruning_pred);
 
         let mut pruned_zone = 0usize;
+        let mut pruned_bloom = 0usize;
         let mut pruned_superseded = 0usize;
         let mut rg_total = 0usize;
         let mut rg_pruned = 0usize;
@@ -850,6 +870,17 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             // column chunk.
             if !reader.might_contain(&pruning_pred, self.snapshot) {
                 pruned_zone += 1;
+                continue;
+            }
+            // Stage 1b — per-segment bloom ([STL-238]): for a point business-key
+            // probe, the footer bloom can prove the key is in no version of this
+            // segment — the random/hash-key case the zone map's `[min, max]`
+            // cannot rule out. Footer-resident, so still no chunk I/O. A segment
+            // with no bloom admits every key, so this never prunes a real match.
+            if let Some(key) = &point_key
+                && !reader.might_contain_key(key.as_bytes())
+            {
+                pruned_bloom += 1;
                 continue;
             }
             // Stage 2 — per-row-group zone maps (STL-173): rule out the
@@ -902,6 +933,7 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
         let stats = ScanStats {
             segments_total: self.segments.len(),
             segments_pruned_zone: pruned_zone,
+            segments_pruned_bloom: pruned_bloom,
             segments_pruned_superseded: pruned_superseded,
             segments_scanned: survivors.len(),
             row_groups_total: rg_total,
@@ -1524,6 +1556,20 @@ fn within(value: &ZoneBound, low: &ZoneBound, high: &ZoneBound) -> bool {
 const fn business_key_bytes(column: ColumnId, bound: &ZoneBound) -> Option<&Vec<u8>> {
     match (column, bound) {
         (ColumnId::BusinessKey, ZoneBound::Bytes(v)) => Some(v),
+        _ => None,
+    }
+}
+
+/// The single business key a predicate pins to a *point* — `Some(k)` when it
+/// constrains the business key to exactly one value (a literal `= k`, or the
+/// degenerate `[k, k]` window an index point probe produces), else `None`.
+///
+/// This is the one predicate shape the per-segment bloom can answer ([STL-238]):
+/// a bloom tests membership of a single key, so a range or an unconstrained scan
+/// has no point to probe and skips the bloom stage entirely.
+fn predicate_point_key(predicate: &Predicate) -> Option<BusinessKey> {
+    match predicate_key_range(predicate) {
+        (Bound::Included(low), Bound::Included(high)) if low == high => Some(low),
         _ => None,
     }
 }

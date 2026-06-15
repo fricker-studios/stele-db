@@ -29,6 +29,7 @@ use stele_common::provenance::{Principal, Provenance, TxnId};
 use stele_common::time::SystemTimeMicros;
 
 use crate::backend::{Disk, DiskFile};
+use crate::bloom::KeyBloom;
 use crate::checksum::crc32c;
 use crate::delta::{BusinessKey, Version};
 use crate::validity::Close;
@@ -36,8 +37,9 @@ use crate::validtime::reframe_payload;
 
 use super::SegmentError;
 use super::format::{
-    BYTES_NULL_SENTINEL, CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FORMAT_VERSION, HEADER_LEN,
-    HEADER_MAGIC, STAT_MAX_UNBOUNDED, STAT_MIN_UNBOUNDED, TRAILER_LEN, TRAILER_MAGIC,
+    BYTES_NULL_SENTINEL, CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FOOTER_FLAG_BLOOM,
+    FORMAT_VERSION, HEADER_LEN, HEADER_MAGIC, STAT_MAX_UNBOUNDED, STAT_MIN_UNBOUNDED, TRAILER_LEN,
+    TRAILER_MAGIC,
 };
 use super::zone_map::{Predicate, ZoneBound, ZoneEnd, ZoneMap};
 
@@ -79,6 +81,12 @@ struct Footer {
     /// Number of retraction tombstone rows — the shared value count for every
     /// column in [`Self::retractions`].
     retraction_count: u32,
+    /// Per-segment business-key bloom filter (format v11, [STL-238]) — `Some`
+    /// iff the footer's [`FOOTER_FLAG_BLOOM`] bit is set. A point / `MERGE` probe
+    /// consults it via [`SegmentReader::might_contain_key`]; `None` means the
+    /// segment carries no bloom and admits every key (an older or bloom-disabled
+    /// segment).
+    bloom: Option<KeyBloom>,
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +215,26 @@ impl<F: DiskFile> SegmentReader<F> {
     #[must_use]
     pub fn might_contain(&self, predicate: &Predicate, snapshot: crate::delta::Snapshot) -> bool {
         self.zone_map.might_contain(predicate, snapshot)
+    }
+
+    /// Whether this segment *might* hold a version whose business key equals
+    /// `business_key` — the per-segment bloom-filter skip test ([STL-238]).
+    ///
+    /// Consults the footer-resident `KeyBloom` (format v11) and touches **no**
+    /// column chunk. A `false` result *proves* no version in this segment carries
+    /// that key, so a point lookup or `MERGE` probe for it can prune the whole
+    /// segment — the random/hash-key case [`Self::might_contain`]'s zone maps
+    /// cannot, because a hash key scatters across the `[min, max]` range every
+    /// segment spans. A segment with no bloom (format ≤ v10, or a bloom-disabled
+    /// writer) admits every key, so this never prunes a real match. Snapshot-free
+    /// by design: a sealed segment's business keys are fixed, so absence holds at
+    /// every snapshot.
+    #[must_use]
+    pub fn might_contain_key(&self, business_key: &[u8]) -> bool {
+        self.footer
+            .bloom
+            .as_ref()
+            .is_none_or(|bloom| bloom.maybe_contains(business_key))
     }
 
     /// Read one column end-to-end across every row-group, in row order. The
@@ -715,7 +743,9 @@ fn parse_footer(bytes: &[u8]) -> Result<Footer, SegmentError> {
     if schema_id != 0 {
         return Err(SegmentError::Corrupt("unknown schema id in footer"));
     }
-    let _flags = p.u32()?;
+    // The flags word signals the optional trailing bloom section ([STL-238],
+    // v11). Any other bit is reserved and (in a v11 reader) must be clear.
+    let flags = p.u32()?;
     let row_group_count = p.u32()?;
     // No `Vec::with_capacity(row_group_count)` — the count is footer-derived
     // and an oversized value would force a giant allocation before the
@@ -764,6 +794,18 @@ fn parse_footer(bytes: &[u8]) -> Result<Footer, SegmentError> {
             "retraction section inconsistent: row count and column presence disagree",
         ));
     }
+    // Per-segment bloom section (format v11, [STL-238]) — present iff the flags
+    // word advertised it. Decoded from the bytes after the retraction section and
+    // before the trailing-bytes guard below, so a footer that claims a bloom but
+    // omits it (or carries junk after it) is rejected as corrupt.
+    let bloom = if flags & FOOTER_FLAG_BLOOM != 0 {
+        let (bloom, consumed) = KeyBloom::decode(&p.bytes[p.cursor..])
+            .map_err(|_| SegmentError::Corrupt("malformed segment bloom in footer"))?;
+        p.take(consumed)?;
+        Some(bloom)
+    } else {
+        None
+    };
     if !p.is_empty() {
         return Err(SegmentError::Corrupt("trailing bytes in footer"));
     }
@@ -772,6 +814,7 @@ fn parse_footer(bytes: &[u8]) -> Result<Footer, SegmentError> {
         row_groups,
         retractions,
         retraction_count,
+        bloom,
     })
 }
 

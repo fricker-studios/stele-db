@@ -126,7 +126,33 @@ pub(super) const TRAILER_MAGIC: [u8; 8] = *b"STLSEGFT";
 ///   length as a 4 GiB value (`Corrupt`) rather than reject cleanly at the
 ///   header; the bump restores the clean header-level reject in both directions.
 ///   Every other column and the row-group framing are byte-identical to v9.
-pub(super) const FORMAT_VERSION: u16 = 10;
+///
+/// * **v11** — **adds a per-segment business-key bloom filter** ([STL-238]). The
+///   footer gains an optional trailing section — gated by [`FOOTER_FLAG_BLOOM`]
+///   in the footer's flags word — holding a [`KeyBloom`](crate::bloom::KeyBloom)
+///   over the segment's version business keys. It lets a point lookup or `MERGE`
+///   probe skip a whole segment whose bloom *proves* the key absent: the
+///   random/hash-key case zone maps cannot prune, because a hash key scatters
+///   across the `[min, max]` business-key range every segment spans. The bloom is
+///   **advisory** — read-gating only, never consulted for a result — and rides
+///   the immutable segment it summarizes, so it survives flush, compaction, and
+///   recovery with no separate derived structure to rebuild. The version
+///   row-group and retraction section are byte-identical to v10; the bump is
+///   because a v10 reader would read the trailing bloom section as
+///   `Corrupt("trailing bytes in footer")`, so it makes the reject clean at the
+///   header in both directions — the same reasoning as every prior bump.
+pub(super) const FORMAT_VERSION: u16 = 11;
+
+/// Footer-level flag bits — the `u32` flags word that follows the schema id in
+/// the footer. Additive: an unset bit is the pre-v11 behavior, and the only bit
+/// defined so far gates an *optional trailing section*, so a flags word of `0`
+/// is byte-identical to every prior generation's footer.
+///
+/// * [`FOOTER_FLAG_BLOOM`] — a per-segment business-key bloom section
+///   ([`KeyBloom`](crate::bloom::KeyBloom)) follows the retraction section
+///   ([STL-238], [`FORMAT_VERSION`] v11). Clear for an empty segment (no keys to
+///   summarize) or when the writer's bloom is disabled.
+pub(super) const FOOTER_FLAG_BLOOM: u32 = 0b0000_0001;
 
 /// The per-value length reserved in a bytes column to mean "this cell is SQL
 /// `NULL`" ([STL-154], [`FORMAT_VERSION`] v10). Only the `payload` column ever

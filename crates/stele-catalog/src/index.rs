@@ -23,18 +23,23 @@ use crate::CatalogError;
 
 /// The access-structure family an index is built with.
 ///
-/// The v0.3 substrate ships the default ordered structure; the hash/bloom and
-/// valid-time interval families plug in as further variants ([STL-238],
-/// [STL-241]) without touching the lifecycle around them.
+/// The v0.3 substrate ships the default ordered structure and the equality-only
+/// hash family ([STL-238]); the valid-time interval family plugs in as a further
+/// variant ([STL-241]) without touching the lifecycle around them.
 ///
 /// [STL-238]: https://allegromusic.atlassian.net/browse/STL-238
 /// [STL-241]: https://allegromusic.atlassian.net/browse/STL-241
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IndexKind {
     /// An ordered (B-tree-shaped) index over one value column — the default,
-    /// as in Postgres' bare `CREATE INDEX`.
+    /// as in Postgres' bare `CREATE INDEX`. Serves equality *and* range probes.
     #[default]
     BTree,
+    /// A hash index over one value column (`CREATE INDEX … USING HASH`) — serves
+    /// equality probes only (it cannot walk its keys in value order, so it
+    /// declines ranges), and pairs with the per-segment bloom filters that
+    /// accelerate hash-key point lookups and `MERGE` probes ([STL-238]).
+    Hash,
 }
 
 /// One live secondary index: its name, the table it accelerates, its

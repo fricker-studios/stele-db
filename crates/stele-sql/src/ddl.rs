@@ -33,8 +33,10 @@
 //! `DROP … CASCADE`. `PRIMARY KEY` is **accepted but not enforced** in v0.1
 //! (uniqueness/indexing is a later ticket) so the identity-demo
 //! `CREATE TABLE account (id INT PRIMARY KEY, balance INT) …` binds. On the
-//! index side: `UNIQUE`, `USING <kind>`, multi-column, expression, and partial
-//! (`WHERE`) indexes are rejected until their sibling tickets land — as are
+//! index side: the bare/`USING BTREE` ordered kind and the `USING HASH`
+//! equality kind ([STL-238]) bind; `UNIQUE`, other `USING` kinds, multi-column,
+//! expression, and partial (`WHERE`) indexes are rejected until their sibling
+//! tickets land — as are
 //! `CONCURRENTLY`, `IF NOT EXISTS`, `INCLUDE`, `NULLS [NOT] DISTINCT`,
 //! `WITH (…)`, per-column `ASC`/`DESC`/`NULLS` ordering and operator classes,
 //! an unnamed `CREATE INDEX`, and `DROP INDEX … CASCADE` / multi-index drops.
@@ -43,7 +45,7 @@
 
 use sqlparser::ast::{
     ColumnDef as SqlColumnDef, ColumnOption, CreateIndex, CreateTable, Expr, IndexColumn,
-    ObjectName, ObjectType, Statement as SqlStatement,
+    IndexType as SqlIndexType, ObjectName, ObjectType, Statement as SqlStatement,
 };
 use stele_catalog::{
     Catalog, CatalogError, ColumnDef, IndexDef, IndexKind, SchemaId, TableTemporal, ValidTimeSpec,
@@ -143,16 +145,19 @@ pub enum DdlStatement {
         if_exists: bool,
     },
     /// `CREATE INDEX <name> ON <table> (<column>)` — register a secondary
-    /// index ([STL-233]). The substrate binds the bare (B-tree-kind,
-    /// single-column) form; `USING`, multi-column, `UNIQUE`, and partial
-    /// indexes are sibling/later tickets.
+    /// index ([STL-233]). The substrate binds the single-column form in the
+    /// default B-tree kind or the equality-only hash kind (`USING HASH`,
+    /// [STL-238]); multi-column, `UNIQUE`, and partial indexes are later tickets.
     ///
     /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+    /// [STL-238]: https://allegromusic.atlassian.net/browse/STL-238
     CreateIndex {
         /// The index name — unique across the live index set.
         name: String,
         /// The table the index accelerates.
         table: String,
+        /// The access-structure family — B-tree (default) or hash (`USING HASH`).
+        kind: IndexKind,
         /// The indexed value column names, in declaration order.
         columns: Vec<String>,
     },
@@ -450,13 +455,15 @@ fn bind_drop_table(names: &[ObjectName], if_exists: bool) -> Result<DdlStatement
     })
 }
 
-/// Lower a parsed `CREATE INDEX` to the substrate surface ([STL-233]): a named,
-/// single-column index in the default (B-tree) kind. Everything richer —
-/// `USING <kind>`, multi-column, `UNIQUE`, partial (`WHERE`), `INCLUDE`,
-/// expression columns — is rejected with a roadmap pointer; the sibling index
-/// tickets lift those as their access structures land.
+/// Lower a parsed `CREATE INDEX` to the substrate surface: a named,
+/// single-column index in the default B-tree kind or the hash kind
+/// (`USING HASH`, [STL-238]). Everything richer — other `USING` kinds,
+/// multi-column, `UNIQUE`, partial (`WHERE`), `INCLUDE`, expression columns — is
+/// rejected with a roadmap pointer; the sibling index tickets lift those as
+/// their access structures land.
 ///
 /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
+/// [STL-238]: https://allegromusic.atlassian.net/browse/STL-238
 fn bind_create_index(create: &CreateIndex) -> Result<DdlStatement, BindError> {
     let unsupported = |what: &str| Err(BindError::Unsupported(what.to_owned()));
     if create.unique {
@@ -468,9 +475,14 @@ fn bind_create_index(create: &CreateIndex) -> Result<DdlStatement, BindError> {
     if create.if_not_exists {
         return unsupported("CREATE INDEX IF NOT EXISTS");
     }
-    if create.using.is_some() {
-        return unsupported("CREATE INDEX … USING <kind> (the default kind only)");
-    }
+    // The access method selects the structure: bare / `USING BTREE` is the
+    // ordered default ([STL-237]); `USING HASH` is the equality-only hash family
+    // ([STL-238]). Any other method (GIN, GiST, …) has no structure yet.
+    let kind = match &create.using {
+        None | Some(SqlIndexType::BTree) => IndexKind::BTree,
+        Some(SqlIndexType::Hash) => IndexKind::Hash,
+        Some(other) => return unsupported(&format!("CREATE INDEX … USING {other:?}")),
+    };
     if !create.include.is_empty() {
         return unsupported("CREATE INDEX … INCLUDE");
     }
@@ -501,6 +513,7 @@ fn bind_create_index(create: &CreateIndex) -> Result<DdlStatement, BindError> {
     Ok(DdlStatement::CreateIndex {
         name,
         table,
+        kind,
         columns: vec![index_column(column)?],
     })
 }
@@ -591,9 +604,10 @@ impl DdlStatement {
             Self::CreateIndex {
                 name,
                 table,
+                kind,
                 columns,
             } => catalog
-                .create_index(IndexDef::new(name, table, IndexKind::BTree, columns)?)
+                .create_index(IndexDef::new(name, table, kind, columns)?)
                 .map(|()| DdlOutcome::CreatedIndex),
             Self::DropIndex { name, if_exists } => match catalog.drop_index(&name) {
                 Ok(_) => Ok(DdlOutcome::DroppedIndex),

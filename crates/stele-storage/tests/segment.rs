@@ -790,3 +790,57 @@ fn scoped_column_read_skips_unselected_row_group_chunks() {
         .expect("sys_from chunks are clean");
     assert_eq!(sf, ColumnData::I64(vec![12, 13]));
 }
+
+#[test]
+fn segment_bloom_round_trips_and_never_drops_a_present_key() {
+    // The per-segment business-key bloom (format v11, STL-238) survives the
+    // write→seal→reopen cycle (exactly the recovery path: a reopened segment is
+    // a recovered one), keeps every present key (no false negatives), and prunes
+    // at least one absent key — the existential check a bloom's allowed
+    // false-positives permit.
+    let disk = MemDisk::new();
+    let keys: Vec<Vec<u8>> = (0..200)
+        .map(|i| format!("hash-{i:04}").into_bytes())
+        .collect();
+    let versions: Vec<Version> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| version(k, 10 + i as i64, b"v"))
+        .collect();
+    write_segment(&disk, "bloom.seg", &versions);
+
+    let reader = SegmentReader::open(&disk, "bloom.seg").expect("reopen recovers the bloom");
+    for k in &keys {
+        assert!(
+            reader.might_contain_key(k),
+            "a present key must never be pruned (no false negatives)",
+        );
+    }
+    let pruned = (0..2000)
+        .map(|i| format!("absent-{i:05}").into_bytes())
+        .filter(|k| !reader.might_contain_key(k))
+        .count();
+    assert!(pruned > 0, "the bloom must prune at least one absent key");
+}
+
+#[test]
+fn a_bloom_disabled_segment_admits_every_key() {
+    // `with_bloom_bits_per_key(0)` writes no bloom section, so the reader admits
+    // every key — the bloom is purely additive and never the source of a prune
+    // when absent (the same posture a pre-v11 segment has).
+    let disk = MemDisk::new();
+    let mut w = SegmentWriter::create(&disk, "nobloom.seg")
+        .expect("create")
+        .with_bloom_bits_per_key(0);
+    for v in [version(b"a", 10, b"a"), version(b"b", 11, b"b")] {
+        w.push(v).expect("push");
+    }
+    w.finish().expect("finish");
+
+    let reader = SegmentReader::open(&disk, "nobloom.seg").expect("open");
+    assert!(reader.might_contain_key(b"a"), "present key admitted");
+    assert!(
+        reader.might_contain_key(b"definitely-absent"),
+        "no bloom ⇒ every key admitted, never a prune",
+    );
+}

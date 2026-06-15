@@ -171,17 +171,19 @@ into a `DdlStatement` that `apply`s to a `stele-catalog` `Catalog`:
   the identity-demo `CREATE TABLE account (id INT PRIMARY KEY, balance INT) …`
   binds.
 
-### `CREATE INDEX` / `DROP INDEX` — secondary indexes (STL-233, STL-237)
+### `CREATE INDEX` / `DROP INDEX` — secondary indexes (STL-233, STL-237, STL-238)
 
 ```sql
-CREATE INDEX i_balance ON account (balance);
+CREATE INDEX i_balance ON account (balance);            -- ordered (B-tree) default
+CREATE INDEX i_balance ON account USING HASH (balance); -- equality-only hash kind
 DROP INDEX i_balance;
 DROP INDEX IF EXISTS i_balance;
 ```
 
 The v0.3 secondary-index substrate: a **named, single-column** index in the
-default (B-tree) kind on a **value column** — the business key (the table's
-first column) is always indexed by storage and is refused. An index is
+default (B-tree) kind or the `USING HASH` equality kind (STL-238), on a **value
+column** — the business key (the table's first column) is always indexed by
+storage and is refused. An index is
 *derived, rebuildable* state (ADR-0023): only the DDL metadata is durable
 (ADR-0028 catalog log), the access structure is built from the table's tiers,
 maintained on every committed write, and rebuilt on cold boot. It can change a
@@ -195,13 +197,23 @@ A read uses the index rule-based, when the `WHERE` is a bare
 (STL-233), and `<` `<=` `>` `>=` probe a candidate range walked in the
 column type's *value* order (STL-237) — the ordered structure keys its
 entries memcomparably, so integer and temporal columns range correctly
-across the sign boundary. `FLOAT8` and `PERIOD` columns decline range
-service (their encodings don't byte-order by value; equality still probes),
-`<>` never probes (no window covers a complement), and a predicate-driven
-`UPDATE`/`DELETE` (STL-229) routes its scan through the same probe.
+across the sign boundary. A `USING HASH` index serves only `=` (it cannot walk
+its keys in value order, so a range probe on it falls back to a full scan);
+`FLOAT8` and `PERIOD` columns decline range service (their encodings don't
+byte-order by value; equality still probes), `<>` never probes (no window
+covers a complement), and a predicate-driven `UPDATE`/`DELETE` (STL-229) routes
+its scan through the same probe.
+
+Independently of any declared index, every sealed segment carries a **per-segment
+bloom filter over the business key** (STL-238): a point read or `MERGE` probe by
+business key skips a whole segment whose bloom proves the key absent — the
+hash/scatter-key case zone maps cannot prune. It is advisory (read-gating only,
+configurable false-positive rate) and rides the immutable segment, so it survives
+flush, compaction, and recovery. The skips surface as
+`stele_scan_segments_pruned_bloom_total` in the metrics.
 
 Rejected with a roadmap pointer until their sibling tickets land: `UNIQUE`,
-`USING <kind>` (hash/bloom is STL-238, the valid-time interval kind STL-241),
+other `USING <kind>` (GIN/GiST/BRIN; the valid-time interval kind is STL-241),
 multi-column and expression columns, partial indexes (`… WHERE`), `INCLUDE`,
 `CONCURRENTLY`, `IF NOT EXISTS`, and per-column `ASC`/`DESC`/`NULLS` ordering.
 

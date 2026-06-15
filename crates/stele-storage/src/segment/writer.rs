@@ -15,6 +15,7 @@
 //! ([architecture §12 invariant 1](../../../../../docs/02-architecture.md#12-cross-cutting-architectural-invariants)).
 
 use crate::backend::{Disk, DiskFile};
+use crate::bloom::{DEFAULT_BITS_PER_KEY, KeyBloom};
 use crate::checksum::crc32c;
 use crate::delta::Version;
 use crate::validity::Close;
@@ -22,9 +23,9 @@ use crate::validtime::{VALID_TIME_PREFIX_LEN, unframe_payload};
 
 use super::SegmentError;
 use super::format::{
-    BYTES_NULL_SENTINEL, CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FORMAT_VERSION, HEADER_LEN,
-    HEADER_MAGIC, MAX_BYTES_STAT_PREFIX_LEN, SCHEMA_ID_IMPLICIT_VERSION, STAT_MAX_UNBOUNDED,
-    STAT_MIN_UNBOUNDED, TRAILER_LEN, TRAILER_MAGIC,
+    BYTES_NULL_SENTINEL, CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FOOTER_FLAG_BLOOM,
+    FORMAT_VERSION, HEADER_LEN, HEADER_MAGIC, MAX_BYTES_STAT_PREFIX_LEN,
+    SCHEMA_ID_IMPLICIT_VERSION, STAT_MAX_UNBOUNDED, STAT_MIN_UNBOUNDED, TRAILER_LEN, TRAILER_MAGIC,
 };
 
 /// Streaming writer over a single sealed-segment file.
@@ -55,6 +56,12 @@ pub struct SegmentWriter<F: DiskFile> {
     /// keeps the v0.1 shape: every pushed row lands in one row-group, so the
     /// emitted bytes are identical to what earlier writers produced.
     max_row_group_rows: Option<usize>,
+    /// Bits per key for the per-segment business-key bloom filter ([STL-238],
+    /// format v11). Defaults to [`DEFAULT_BITS_PER_KEY`]; `0` disables the bloom
+    /// (the footer's [`FOOTER_FLAG_BLOOM`] stays clear). Higher values trade
+    /// footer bytes for a lower false-positive rate — the configurable bound the
+    /// hash/bloom index family exposes.
+    bloom_bits_per_key: usize,
 }
 
 impl<F: DiskFile> SegmentWriter<F> {
@@ -103,7 +110,20 @@ impl<F: DiskFile> SegmentWriter<F> {
             retractions: Vec::new(),
             valid_time,
             max_row_group_rows: None,
+            bloom_bits_per_key: DEFAULT_BITS_PER_KEY,
         })
+    }
+
+    /// Size (or disable) the per-segment business-key bloom filter ([STL-238]).
+    /// `bits` bits per key trades footer size against the false-positive rate
+    /// (the default is ~12 bits/key, near a 1% rate); `0` disables the bloom
+    /// entirely, leaving the footer byte-identical to a pre-v11 segment apart from
+    /// the header version. Purely a writer-side choice — a reader admits any
+    /// segment whether or not it carries a bloom.
+    #[must_use]
+    pub const fn with_bloom_bits_per_key(mut self, bits: usize) -> Self {
+        self.bloom_bits_per_key = bits;
+        self
     }
 
     /// Bound each row-group to at most `rows` rows, so
@@ -165,6 +185,21 @@ impl<F: DiskFile> SegmentWriter<F> {
     /// bounded them), then write the footer and trailer and `sync`. After
     /// return the file is immutable in the format's sense — no writer API can
     /// reach it.
+    /// The per-segment business-key bloom ([STL-238], format v11): a membership
+    /// filter over every version's business key, so a point / `MERGE` probe can
+    /// skip this whole segment when the bloom proves the key absent — the
+    /// random/hash-key case zone maps cannot prune. `None` when the bloom is
+    /// disabled (`bits_per_key == 0`) or the segment holds no version — an empty
+    /// segment has no keys to summarize and is already pruned by its zone maps.
+    fn business_key_bloom(&self) -> Option<KeyBloom> {
+        (self.bloom_bits_per_key > 0 && !self.rows.is_empty()).then(|| {
+            KeyBloom::build(
+                self.bloom_bits_per_key,
+                self.rows.iter().map(|v| v.business_key.as_bytes()),
+            )
+        })
+    }
+
     pub fn finish(mut self) -> Result<(), SegmentError> {
         // Per-column buffers. Row order is preserved: column i's k-th value
         // came from `self.rows[k]`. A valid-time table's schema carries the
@@ -283,7 +318,8 @@ impl<F: DiskFile> SegmentWriter<F> {
             self.file.append(&chunk.payload)?;
         }
 
-        let footer = encode_footer(&row_groups, &retraction_chunks)?;
+        let bloom = self.business_key_bloom();
+        let footer = encode_footer(&row_groups, &retraction_chunks, bloom.as_ref())?;
         let footer_crc = crc32c(&footer);
         let footer_len = u32::try_from(footer.len())
             .map_err(|_| SegmentError::TooLarge("footer exceeds u32::MAX bytes"))?;
@@ -703,12 +739,20 @@ fn decode_valid_pairs(rows: &[Version]) -> Result<Vec<(i64, i64)>, SegmentError>
 fn encode_footer(
     row_groups: &[RowGroupChunks],
     retraction_chunks: &[EncodedChunk],
+    bloom: Option<&KeyBloom>,
 ) -> Result<Vec<u8>, SegmentError> {
     let row_group_count = u32::try_from(row_groups.len())
         .map_err(|_| SegmentError::TooLarge("row-group count exceeds u32::MAX"))?;
     let mut out = Vec::new();
     out.extend_from_slice(&SCHEMA_ID_IMPLICIT_VERSION.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes()); // flags
+    // The flags word signals the optional trailing bloom section ([STL-238]); a
+    // bloom-less footer writes `0` here and is byte-identical to a v10 footer.
+    let flags = if bloom.is_some() {
+        FOOTER_FLAG_BLOOM
+    } else {
+        0
+    };
+    out.extend_from_slice(&flags.to_le_bytes());
     // One by default; several when the writer was bounded ([STL-155]). The
     // footer has carried this count since v1, so a multi-row-group segment is
     // not a format change.
@@ -734,6 +778,12 @@ fn encode_footer(
     out.extend_from_slice(&retraction_column_count.to_le_bytes());
     for chunk in retraction_chunks {
         encode_chunk_meta(&mut out, chunk)?;
+    }
+    // Per-segment bloom section ([STL-238], v11) — present iff `FOOTER_FLAG_BLOOM`
+    // was set above. Trailing, so a footer with no bloom is byte-identical to v10
+    // and the reader only reaches this section when the flag tells it to.
+    if let Some(bloom) = bloom {
+        bloom.encode(&mut out);
     }
     Ok(out)
 }

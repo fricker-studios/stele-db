@@ -29,10 +29,14 @@
 //! zero so the memcomparable transform's sign handling is pinned (raw
 //! little-endian cell order would sort `-2` above every positive) — and
 //! range-driven `UPDATE`/`DELETE` in the workload, whose scan-then-write
-//! expansion ([STL-229]) routes through the same probe. Remaining sibling
-//! tickets ([STL-238] hash/bloom, [STL-241] valid-time) wire in the same way:
-//! add their `CREATE INDEX` forms to [`IndexScript`] and their predicate
-//! shapes to [`probes`] rather than writing their own harness.
+//! expansion ([STL-229]) routes through the same probe. The hash/bloom ticket
+//! ([STL-238]) wired in next, the same way: [`IndexScript`] builds `i_a` / `i_c`
+//! as `USING HASH` indexes on some seeds (equality-only — a range probe on one
+//! correctly falls back to a full scan), and the always-on per-segment bloom is
+//! exercised by the existing `WHERE id = …` business-key probe on *both* engines.
+//! The valid-time ticket ([STL-241]) wires in the same way: add its `CREATE
+//! INDEX` form to [`IndexScript`] and its predicate shapes to [`probes`] rather
+//! than writing its own harness.
 //!
 //! [STL-229]: https://allegromusic.atlassian.net/browse/STL-229
 //! [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
@@ -148,8 +152,15 @@ impl Db {
 struct IndexScript {
     /// Workload position to `CREATE INDEX i_a ON t (a)` at.
     create_a: usize,
+    /// Build `i_a` as a hash index (`USING HASH`, equality-only, [STL-238])
+    /// rather than the ordered default — so the sweep proves the hash structure
+    /// is result-identical too, and a *range* probe on a hash-indexed column
+    /// correctly falls back to a full scan (its `range_candidates` declines).
+    hash_a: bool,
     /// Workload position to also `CREATE INDEX i_c ON t (c)` at, if any.
     create_c: Option<usize>,
+    /// Build `i_c` as a hash index — see [`Self::hash_a`].
+    hash_c: bool,
     /// Workload position to `DROP INDEX i_a` at, if any (only scheduled when
     /// `i_c` exists by then, so at least one index is live at the end).
     drop_a: Option<usize>,
@@ -158,7 +169,9 @@ struct IndexScript {
 impl IndexScript {
     fn draw(rng: &mut Rng, ops: usize) -> Self {
         let create_a = rng.index(ops / 2);
+        let hash_a = rng.one_in(2);
         let create_c = rng.one_in(2).then(|| ops / 2 + rng.index(ops / 2));
+        let hash_c = rng.one_in(2);
         let drop_a = match create_c {
             Some(c_at) if rng.one_in(3) => {
                 Some(c_at + 1 + rng.index(ops.saturating_sub(c_at + 1).max(1)))
@@ -167,19 +180,31 @@ impl IndexScript {
         };
         Self {
             create_a,
+            hash_a,
             create_c,
+            hash_c,
             drop_a,
         }
     }
 
-    /// The DDL to run when the workload reaches position `op`.
+    /// The DDL to run when the workload reaches position `op`. The index *kind*
+    /// (B-tree vs hash) varies by seed: both must leave every read result-identical
+    /// to the unindexed engine — an index changes speed, never the answer.
     fn ddl_at(&self, op: usize) -> Vec<&'static str> {
         let mut out = Vec::new();
         if op == self.create_a {
-            out.push("CREATE INDEX i_a ON t (a)");
+            out.push(if self.hash_a {
+                "CREATE INDEX i_a ON t USING HASH (a)"
+            } else {
+                "CREATE INDEX i_a ON t (a)"
+            });
         }
         if self.create_c == Some(op) {
-            out.push("CREATE INDEX i_c ON t (c)");
+            out.push(if self.hash_c {
+                "CREATE INDEX i_c ON t USING HASH (c)"
+            } else {
+                "CREATE INDEX i_c ON t (c)"
+            });
         }
         if self.drop_a == Some(op) {
             out.push("DROP INDEX i_a");

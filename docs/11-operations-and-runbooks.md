@@ -62,7 +62,7 @@ discipline as a SQL surface change ([ADR-0014](adr/0014-release-channels-and-ver
 | `stele_wal_fsync_seconds` | histogram | **The durability point** ([02 §3.4](02-architecture.md#34-write-path-sequence)): group-commit and segment-rotation fsync latency; `_count` is the fsync count. |
 | `stele_flush_seconds` / `stele_checkpoint_seconds` | histogram | Flush (seal delta → segment) and checkpoint (durability fence) durations; `_count` is successful runs. |
 | `stele_compaction_seconds` | histogram | Compaction (merge sealed segments into one, retiring inputs — STL-231) duration; `_count` is successful runs. |
-| `stele_scan_segments_scanned_total`, `stele_scan_segments_pruned_zone_total`, `stele_scan_segments_pruned_superseded_total`, `stele_scan_row_groups_scanned_total`, `stele_scan_row_groups_pruned_zone_total` | counter | Snapshot-scan pruning accounting (STL-146/STL-173): how much sealed data reads actually touch vs. skip. |
+| `stele_scan_segments_scanned_total`, `stele_scan_segments_pruned_zone_total`, `stele_scan_segments_pruned_bloom_total`, `stele_scan_segments_pruned_superseded_total`, `stele_scan_row_groups_scanned_total`, `stele_scan_row_groups_pruned_zone_total` | counter | Snapshot-scan pruning accounting (STL-146/STL-173/STL-238): how much sealed data reads actually touch vs. skip — including per-segment bloom-filter skips on point business-key probes. |
 
 Compaction and backup series land with their features (STL-231 / STL-249).
 
