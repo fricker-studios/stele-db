@@ -331,7 +331,7 @@ where
         Ok(ManifestSummary::from(&manifest))
     }
 
-    /// Validate a backup directory without applying it ([`engine_backup::verify_disk`]).
+    /// Validate a backup directory without applying it ([`engine_backup::inspect_backup`]).
     /// A missing directory or a failed check is a *valid response* with
     /// `valid = false`, not an error.
     ///
@@ -351,16 +351,21 @@ where
         }
         let src = LocalDisk::open(path)
             .map_err(|e| AdminError::Internal(format!("opening backup {path:?}: {e}")))?;
-        Ok(match engine_backup::verify_disk(&src) {
-            Ok(manifest) => RestorePlan {
+        // `inspect_backup` returns the decoded manifest whenever it was readable —
+        // even on a per-file checksum failure — so the verdict carries what the
+        // backup claims to be alongside any failure.
+        let inspection = engine_backup::inspect_backup(&src);
+        let manifest = inspection.manifest.as_ref().map(ManifestSummary::from);
+        Ok(match inspection.result {
+            Ok(()) => RestorePlan {
                 valid: true,
                 error: None,
-                manifest: Some(ManifestSummary::from(&manifest)),
+                manifest,
             },
             Err(e) => RestorePlan {
                 valid: false,
                 error: Some(e.to_string()),
-                manifest: None,
+                manifest,
             },
         })
     }

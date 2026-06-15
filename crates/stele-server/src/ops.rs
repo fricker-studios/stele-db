@@ -311,13 +311,17 @@ fn route(request: &RawRequest, state: &OpsState) -> Response {
         return state.admin().map_or_else(
             || Response::text("503 Service Unavailable", "admin API not ready\n"),
             |admin| {
-                let authorization = header(&request.head, "authorization").map(str::to_owned);
-                let reply = admin.respond(&HttpRequest {
+                let request = HttpRequest {
                     method: method.to_owned(),
                     path: path.to_owned(),
-                    authorization,
+                    authorization: header(&request.head, "authorization").map(str::to_owned),
                     body: request.body.clone(),
-                });
+                };
+                // An admin handler may do slow, blocking engine work (backup, disk
+                // reads). Run it with `block_in_place` so it does not starve the
+                // shared ops runtime (metrics scrapes, probes, other admin calls) —
+                // the gRPC transport offloads the same work with `spawn_blocking`.
+                let reply = tokio::task::block_in_place(|| admin.respond(&request));
                 Response {
                     status: reply.status,
                     content_type: reply.content_type,

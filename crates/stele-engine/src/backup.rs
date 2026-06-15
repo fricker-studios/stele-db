@@ -420,26 +420,65 @@ pub fn restore_disk<S: Disk, T: Disk>(src: &S, dst: &T) -> Result<BackupManifest
     Ok(manifest)
 }
 
+/// The outcome of inspecting a backup without applying it ([`inspect_backup`]).
+#[derive(Debug)]
+pub struct BackupInspection {
+    /// The decoded manifest — `Some` whenever the manifest itself was readable
+    /// (valid magic, version, and self-digest), **even if a listed file later
+    /// failed its checksum**, so a caller can report what the backup claims to be
+    /// alongside the failure. `None` only when the manifest is missing, malformed,
+    /// or its own digest fails.
+    pub manifest: Option<BackupManifest>,
+    /// `Ok(())` if every listed file verified; the first failure otherwise.
+    pub result: Result<(), RestoreError>,
+}
+
+impl BackupInspection {
+    /// Whether the backup is fully valid: the manifest decoded and every file
+    /// matched its recorded checksum.
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        self.result.is_ok()
+    }
+}
+
 /// Validate the backup in `src` **without** materializing it — the read-only
 /// sibling of [`restore_disk`], behind the admin API's `RestorePlan` ([STL-254]).
 ///
 /// Runs exactly the verification a restore does — decode the manifest (its
 /// self-digest), then check every listed file's length and SHA-256 — but writes
-/// nothing and needs no target. Returns the decoded [`BackupManifest`] so the
-/// caller can report what the backup vouches for.
-///
-/// # Errors
-///
-/// [`RestoreError`] if the manifest is missing/malformed/tampered, a listed file
-/// is absent, or any file fails its checksum.
+/// nothing and needs no target. Unlike a restore (which fails closed and tells
+/// you nothing), it returns the decoded [`BackupManifest`] **whenever the manifest
+/// itself was readable**, even if a later file fails its checksum, so an operator
+/// can see what the backup claims to be next to the failure.
 ///
 /// [STL-254]: https://allegromusic.atlassian.net/browse/STL-254
-pub fn verify_disk<S: Disk>(src: &S) -> Result<BackupManifest, RestoreError> {
-    let manifest = read_manifest(src)?;
+#[must_use]
+pub fn inspect_backup<S: Disk>(src: &S) -> BackupInspection {
+    let manifest = match read_manifest(src) {
+        Ok(manifest) => manifest,
+        // A missing / malformed / digest-tampered manifest: nothing trustworthy
+        // to report.
+        Err(e) => {
+            return BackupInspection {
+                manifest: None,
+                result: Err(e),
+            };
+        }
+    };
     for entry in &manifest.files {
-        read_verified(src, entry)?;
+        if let Err(e) = read_verified(src, entry) {
+            // The manifest decoded; a file under it did not verify. Report both.
+            return BackupInspection {
+                manifest: Some(manifest),
+                result: Err(e),
+            };
+        }
     }
-    Ok(manifest)
+    BackupInspection {
+        manifest: Some(manifest),
+        result: Ok(()),
+    }
 }
 
 /// Read and decode the backup manifest from `src` (verifying its self-digest).
@@ -649,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_validates_a_good_backup_and_catches_tampering() {
+    fn inspect_validates_a_good_backup_and_catches_tampering() {
         // RestorePlan's primitive ([STL-254]): the same checks restore runs, but
         // read-only — no target written.
         let src = MemDisk::new();
@@ -658,21 +697,31 @@ mod tests {
         let backup = MemDisk::new();
         let taken = backup_disk(&src, &backup, 7, sha256(b"head")).expect("backup");
 
-        // A clean backup verifies and returns the same manifest the backup wrote.
-        assert_eq!(verify_disk(&backup).expect("verify"), taken);
+        // A clean backup is valid and reports the same manifest the backup wrote.
+        let ok = inspect_backup(&backup);
+        assert!(ok.is_valid());
+        assert_eq!(ok.manifest.as_ref(), Some(&taken));
 
-        // A flipped byte in a data file is caught — exactly like restore.
+        // A flipped byte in a data file is caught — exactly like restore — but the
+        // decoded manifest is still reported (the manifest itself was readable).
         backup.remove("stele.catalog").unwrap();
         write_all(&backup, "stele.catalog", b"catalog-XXXXX").unwrap();
+        let tampered = inspect_backup(&backup);
+        assert!(!tampered.is_valid());
         assert!(
-            matches!(verify_disk(&backup), Err(RestoreError::ChecksumMismatch { name }) if name == "stele.catalog"),
-            "verify must catch a flipped data byte"
+            matches!(tampered.result, Err(RestoreError::ChecksumMismatch { name }) if name == "stele.catalog"),
+            "inspect must catch a flipped data byte"
+        );
+        assert_eq!(
+            tampered.manifest,
+            Some(taken),
+            "the manifest decoded, so it is reported alongside the file failure"
         );
     }
 
     #[test]
-    fn verify_refuses_a_tampered_manifest_and_a_missing_one() {
-        // A tampered manifest body fails its self-digest.
+    fn inspect_refuses_a_tampered_manifest_and_a_missing_one() {
+        // A tampered manifest body fails its self-digest — and reports no manifest.
         let src = MemDisk::new();
         write_all(&src, "stele.catalog", b"x").unwrap();
         let backup = MemDisk::new();
@@ -682,16 +731,20 @@ mod tests {
         assert_ne!(original, tampered);
         backup.remove(MANIFEST_FILENAME).unwrap();
         write_all(&backup, MANIFEST_FILENAME, tampered.as_bytes()).unwrap();
+        let bad = inspect_backup(&backup);
         assert!(matches!(
-            verify_disk(&backup),
+            bad.result,
             Err(RestoreError::ManifestDigestMismatch)
         ));
+        assert!(
+            bad.manifest.is_none(),
+            "a tampered manifest is not reported"
+        );
 
-        // No manifest at all is a missing-manifest error.
-        assert!(matches!(
-            verify_disk(&MemDisk::new()),
-            Err(RestoreError::ManifestMissing)
-        ));
+        // No manifest at all is a missing-manifest error, no manifest reported.
+        let missing = inspect_backup(&MemDisk::new());
+        assert!(matches!(missing.result, Err(RestoreError::ManifestMissing)));
+        assert!(missing.manifest.is_none());
     }
 
     #[test]
