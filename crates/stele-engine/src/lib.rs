@@ -925,6 +925,19 @@ pub struct SessionEngine<C: Clock + Clone, D: Disk + Clone> {
     ///
     /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
     users: BTreeMap<String, ScramVerifier>,
+    /// The principal stamped on every version this session commits ([STL-300]).
+    ///
+    /// Provenance is captured inline at commit (invariant 5); this is its identity
+    /// half. A fresh or recovered session defaults to [`WIRE_PRINCIPAL`] (`stele`),
+    /// and direct, non-wire callers (engine and oracle tests, recovery's re-derived
+    /// closes) leave it there. The pg-wire front end — where one engine is shared
+    /// across connections behind a single mutex — overrides it per statement via
+    /// [`set_principal`](Self::set_principal), **under the same lock as the dispatch
+    /// that follows**, so each committed write records the connection's
+    /// authenticated identity even as connections interleave on the shared engine.
+    ///
+    /// [STL-300]: https://allegromusic.atlassian.net/browse/STL-300
+    write_principal: Principal,
 }
 
 impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
@@ -954,6 +967,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             index_probes: Cell::new(0),
             metrics: SharedMetrics::default(),
             users: BTreeMap::new(),
+            write_principal: Principal::new(WIRE_PRINCIPAL.to_vec()),
         }
     }
 
@@ -1100,6 +1114,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             index_probes: Cell::new(0),
             metrics: SharedMetrics::default(),
             users,
+            write_principal: Principal::new(WIRE_PRINCIPAL.to_vec()),
         };
         // Recovered tiers were opened before the session's registry existed;
         // point their WALs at it now ([STL-253]).
@@ -1142,6 +1157,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         now: Snapshot,
         next_txn: &mut u64,
     ) -> Result<(), EngineError> {
+        // Recovery has no connection identity to attribute these re-derived closes
+        // to, so they carry the default [`WIRE_PRINCIPAL`] rather than a per-session
+        // principal ([STL-300] threads identity into *live* writes, not recovery).
         let principal = Principal::new(WIRE_PRINCIPAL.to_vec());
         for (name, drop_at) in latest_drop {
             if let Some(state) = tables.get_mut(&name) {
@@ -1789,6 +1807,25 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             rows.push(row);
         }
         Ok(SelectResult { columns, rows })
+    }
+
+    /// Set the **write principal** stamped on every version subsequently committed
+    /// through this session ([STL-300]).
+    ///
+    /// A fresh or recovered session defaults to the server identity `stele`, which
+    /// direct, non-wire callers (engine and oracle tests) leave untouched. The
+    /// pg-wire front end — where one engine is shared across connections behind a
+    /// single mutex — calls this **under the same lock as the dispatch that
+    /// follows**, so each statement stamps the connection's authenticated user (the
+    /// unauthenticated startup `user` under `trust`, the SCRAM-verified user under
+    /// `scram`, [STL-252]) even though connections interleave on the shared engine.
+    /// It changes the stored provenance *value*, not the query surface ([STL-247]).
+    ///
+    /// [STL-247]: https://allegromusic.atlassian.net/browse/STL-247
+    /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+    /// [STL-300]: https://allegromusic.atlassian.net/browse/STL-300
+    pub fn set_principal(&mut self, principal: Principal) {
+        self.write_principal = principal;
     }
 
     /// Execute one parsed [`Statement`] against the session.
@@ -2456,7 +2493,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     if let Some(state) = self.tables.get_mut(&name) {
                         let txn_id = TxnId(self.next_txn);
                         self.next_txn += 1;
-                        let principal = Principal::new(WIRE_PRINCIPAL.to_vec());
+                        let principal = self.write_principal.clone();
                         state
                             .engine
                             .close_all_open(Snapshot(at), txn_id, &principal)?;
@@ -3519,7 +3556,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         }
         let txn_id = TxnId(self.next_txn);
         self.next_txn += 1;
-        let principal = Principal::new(WIRE_PRINCIPAL.to_vec());
+        let principal = self.write_principal.clone();
         let summary = self.apply_bound_dml(dml, txn_id, &principal)?;
         // The write's data is durable; append this commit's link to the
         // hash-chained commit log ([ADR-0031], STL-302). A single-statement
@@ -3703,7 +3740,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         if !writes.is_empty() {
             let txn_id = TxnId(self.next_txn);
             self.next_txn += 1;
-            let principal = Principal::new(WIRE_PRINCIPAL.to_vec());
+            let principal = self.write_principal.clone();
             let mut touched: Vec<String> = Vec::new();
             let result = match self.apply_group(writes, txn_id, &principal, &mut touched) {
                 Ok(()) => self.finish_group_commit(txn_id, &touched),
@@ -4601,7 +4638,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         }
         let txn_id = TxnId(self.next_txn);
         self.next_txn += 1;
-        let principal = Principal::new(WIRE_PRINCIPAL.to_vec());
+        let principal = self.write_principal.clone();
 
         // The conflict window is closed; take the buffered writes and the snapshot
         // lease out of the transaction. Releasing the lease (below) before pruning
@@ -4871,16 +4908,20 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     }
 }
 
-/// The provenance principal stamped on writes routed through the session engine.
+/// The **default** provenance principal stamped on writes routed through the
+/// session engine — [`SessionEngine::write_principal`]'s initial value.
 ///
-/// v0.1 has no authentication ([ADR-0003] defers SCRAM/TLS to v0.3), so every
-/// routed DML commit shares this fixed principal until a connection carries a real
-/// identity. Provenance is still captured inline at commit, per the architectural
-/// invariant — only the identity is a placeholder. (Authentication itself landed
-/// with [STL-252]; threading the authenticated user into write provenance is the
-/// `_stele_principal` provenance ticket's half.)
+/// Direct, non-wire callers (engine and oracle tests) and recovery's re-derived
+/// drop-era closes leave it here, so a write with no connection behind it is
+/// attributed to the server itself. The pg-wire front end overrides it per
+/// connection via [`SessionEngine::set_principal`] ([STL-300]), stamping the
+/// authenticated user — the unauthenticated startup `user` under `trust`, the
+/// SCRAM-verified user under `scram` ([STL-252]) — so a wire-issued commit records
+/// *who* wrote the row. Provenance is captured inline at commit either way, per the
+/// architectural invariant; only the identity differs.
 ///
 /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+/// [STL-300]: https://allegromusic.atlassian.net/browse/STL-300
 const WIRE_PRINCIPAL: &[u8] = b"stele";
 
 /// The in-memory state step 1 of [`SessionEngine::recover`] derives from the

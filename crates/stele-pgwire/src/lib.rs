@@ -107,6 +107,7 @@ pub use tls::{ServerTls, TlsError, TlsMode, TlsSettings};
 use stele_catalog::CatalogError;
 use stele_common::hashkey::hash_key;
 use stele_common::metrics::SharedMetrics;
+use stele_common::provenance::Principal;
 use stele_common::scram::ScramVerifier;
 use stele_common::time::Clock;
 use stele_common::types::{DecodeError, LogicalType, ScalarValue};
@@ -428,6 +429,19 @@ pub trait SessionHandle: Send {
         let _ = user;
         None
     }
+
+    /// Set the **write principal** stamped on every version the next dispatch
+    /// commits — the connection's authenticated identity ([STL-300]); see
+    /// [`SessionEngine::set_principal`]. The front end calls this **under the same
+    /// session lock** as the `execute` / `commit` / `copy_apply` that immediately
+    /// follows, so the shared engine stamps the right identity even though
+    /// connections interleave on it. Defaults to a no-op so session fakes that
+    /// record no provenance need not implement it.
+    ///
+    /// [STL-300]: https://allegromusic.atlassian.net/browse/STL-300
+    fn set_principal(&mut self, principal: Principal) {
+        let _ = principal;
+    }
 }
 
 impl<C, D> SessionHandle for SessionEngine<C, D>
@@ -437,6 +451,10 @@ where
 {
     fn execute(&mut self, stmt: &Statement) -> Result<StatementOutcome, EngineError> {
         Self::execute(self, stmt)
+    }
+
+    fn set_principal(&mut self, principal: Principal) {
+        Self::set_principal(self, principal);
     }
 
     fn describe_live_tables(&self) -> Vec<TableDescription> {
@@ -958,10 +976,21 @@ async fn run_session<S: Wire>(
     // succeed before anything else is served; the authenticated identity then
     // lands on the connection span (STL-107). `trust` skips straight to the
     // OK bundle (the v0.1 posture, and the dev default).
-    if auth == AuthMode::Scram {
-        let user = scram::authenticate(stream, &startup, &session).await?;
-        tracing::Span::current().record("user", user.as_str());
-    }
+    //
+    // Either way, capture the connection's **write principal** ([STL-300]): the
+    // identity stamped on every version this connection commits. Under `scram` it
+    // is the SCRAM-verified user; under `trust` it is the unauthenticated startup
+    // `user` (taken on faith). It is fixed for the connection's life, so it is
+    // captured once here and re-applied to the shared engine under the dispatch
+    // lock before each write (see [`SessionHandle::set_principal`]) — never as a
+    // single shared field, which connections sharing the engine would race.
+    let user = if auth == AuthMode::Scram {
+        scram::authenticate(stream, &startup, &session).await?
+    } else {
+        startup.user().unwrap_or_default().to_owned()
+    };
+    tracing::Span::current().record("user", user.as_str());
+    let principal = Principal::new(user.into_bytes());
 
     // --- 3. Send the OK bundle: AuthOk → ParameterStatus → BackendKeyData → ReadyForQuery
     write_authentication_ok(stream).await?;
@@ -1012,10 +1041,26 @@ async fn run_session<S: Wire>(
             MSG_PARSE => handle_parse(stream, &mut state, &msg.payload).await?,
             MSG_BIND => handle_bind(stream, &mut state, &msg.payload).await?,
             MSG_DESCRIBE => {
-                handle_describe(stream, &mut state, &msg.payload, &session, &mut txn).await?;
+                handle_describe(
+                    stream,
+                    &mut state,
+                    &msg.payload,
+                    &session,
+                    &mut txn,
+                    &principal,
+                )
+                .await?;
             }
             MSG_EXECUTE => {
-                handle_execute(stream, &mut state, &msg.payload, &session, &mut txn).await?;
+                handle_execute(
+                    stream,
+                    &mut state,
+                    &msg.payload,
+                    &session,
+                    &mut txn,
+                    &principal,
+                )
+                .await?;
             }
             MSG_CLOSE => handle_close(stream, &mut state, &msg.payload).await?,
             MSG_FLUSH => {
@@ -1050,7 +1095,7 @@ async fn run_session<S: Wire>(
                 // first error). `handle_simple_query` writes the per-statement
                 // replies and advances the transaction state; the trailing
                 // ReadyForQuery — carrying the resulting status byte — is ours.
-                handle_simple_query(stream, &q, &session, &mut txn, metrics).await?;
+                handle_simple_query(stream, &q, &session, &mut txn, metrics, &principal).await?;
                 write_ready_for_query(stream, txn.status_byte()).await?;
             }
             other => {
@@ -1182,6 +1227,7 @@ async fn handle_simple_query<S: Wire>(
     session: &SharedSession,
     txn: &mut ConnTxn,
     metrics: &SharedMetrics,
+    principal: &Principal,
 ) -> Result<(), WireError> {
     if sql.trim().is_empty() {
         debug!("empty simple query");
@@ -1226,7 +1272,7 @@ async fn handle_simple_query<S: Wire>(
                 // A failed COMMIT writes an ErrorResponse and returns `false`, so
                 // the batch aborts here like any other statement error — nothing
                 // more may follow an error on the wire.
-                TxnControl::Commit => run_commit(stream, session, txn, metrics).await?,
+                TxnControl::Commit => run_commit(stream, session, txn, metrics, principal).await?,
                 TxnControl::Rollback => {
                     run_rollback(stream, txn, metrics).await?;
                     true
@@ -1266,7 +1312,7 @@ async fn handle_simple_query<S: Wire>(
         // rather than routed through the engine's statement router. The trailing
         // ReadyForQuery is the caller's, as for every other simple-query statement.
         if is_copy_from_stdin(stmt) {
-            match run_copy_in(stream, stmt, session, txn).await? {
+            match run_copy_in(stream, stmt, session, txn, principal).await? {
                 CopyOutcome::Loaded => continue,
                 // The load errored (reply already on the wire): abort the batch and
                 // leave an open transaction aborted, like any other statement error.
@@ -1298,7 +1344,7 @@ async fn handle_simple_query<S: Wire>(
         // (STL-131). `bind_ddl` is the classifier: `Ok` means it is DDL, a
         // non-`NotDdl` error means it is malformed DDL we surface as such.
         match bind_ddl(stmt) {
-            Ok(_) => match run_ddl(session, stmt, txn) {
+            Ok(_) => match run_ddl(session, stmt, txn, principal) {
                 Ok(tag) => write_command_complete_tag(stream, tag).await?,
                 Err(e) => {
                     info!(query = %sql, error = %e, "DDL failed");
@@ -1316,7 +1362,7 @@ async fn handle_simple_query<S: Wire>(
                     write_row_description(stream, &columns, &[]).await?;
                     write_data_row(stream, &columns, &[]).await?;
                     write_command_complete(stream, &CommandTag::Select(1)).await?;
-                } else if !run_statement(stream, stmt, session, txn).await? {
+                } else if !run_statement(stream, stmt, session, txn, principal).await? {
                     // The statement errored; the reply and SQLSTATE are already on
                     // the wire and the batch aborts (Postgres stops on the first
                     // error), mirroring the DDL arm above. An open transaction is
@@ -1386,9 +1432,10 @@ async fn run_commit<S: Wire>(
     session: &SharedSession,
     txn: &mut ConnTxn,
     metrics: &SharedMetrics,
+    principal: &Principal,
 ) -> Result<bool, WireError> {
     match std::mem::replace(txn, ConnTxn::Idle) {
-        ConnTxn::Active(buffered) => match commit_txn(session, buffered) {
+        ConnTxn::Active(buffered) => match commit_txn(session, buffered, principal) {
             Ok(()) => write_command_complete_tag(stream, "COMMIT").await?,
             Err(e) => {
                 // The commit replay failed partway. The transaction is over (state
@@ -1580,11 +1627,18 @@ async fn no_such_savepoint<S: Wire>(
 /// Apply a transaction's buffered writes under the session lock, taking and
 /// releasing the mutex entirely within this synchronous call (never held across
 /// the caller's `await` writes). A poisoned mutex is recovered, as in [`run_ddl`].
-fn commit_txn(session: &SharedSession, txn: SessionTransaction) -> Result<(), EngineError> {
-    session
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .commit(txn)
+///
+/// The connection's `principal` is stamped on the engine **before** the commit,
+/// under the same lock, so the buffered writes record this connection's identity
+/// rather than whichever connection last held the shared engine ([STL-300]).
+fn commit_txn(
+    session: &SharedSession,
+    txn: SessionTransaction,
+    principal: &Principal,
+) -> Result<(), EngineError> {
+    let mut engine = session.lock().unwrap_or_else(PoisonError::into_inner);
+    engine.set_principal(principal.clone());
+    engine.commit(txn)
 }
 
 /// Route a bound-DDL statement through the shared session engine and return its
@@ -1606,8 +1660,12 @@ fn run_ddl(
     session: &SharedSession,
     stmt: &Statement,
     txn: &mut ConnTxn,
+    principal: &Principal,
 ) -> Result<&'static str, EngineError> {
     let mut engine = session.lock().unwrap_or_else(PoisonError::into_inner);
+    // Stamp this connection's identity before dispatch, under the same lock, so a
+    // `DROP TABLE`'s row closes record who issued them ([STL-300]).
+    engine.set_principal(principal.clone());
     let tag = match engine.execute(stmt)? {
         StatementOutcome::Ddl { tag } => {
             if let ConnTxn::Active(buffered) = txn {
@@ -1640,8 +1698,9 @@ async fn run_statement<S: Wire>(
     stmt: &Statement,
     session: &SharedSession,
     txn: &mut ConnTxn,
+    principal: &Principal,
 ) -> Result<bool, WireError> {
-    match run_query(session, stmt, txn) {
+    match run_query(session, stmt, txn, principal) {
         Ok(StatementOutcome::Rows(result)) => match decode_result_rows(&result) {
             Ok(data_rows) => {
                 write_row_description(stream, &result_header(&result), &[]).await?;
@@ -1692,8 +1751,14 @@ fn run_query(
     session: &SharedSession,
     stmt: &Statement,
     txn: &mut ConnTxn,
+    principal: &Principal,
 ) -> Result<StatementOutcome, EngineError> {
     let mut engine = session.lock().unwrap_or_else(PoisonError::into_inner);
+    // Stamp this connection's identity before dispatch, under the same lock, so an
+    // auto-committed `INSERT`/`UPDATE`/`DELETE` records who wrote it ([STL-300]). A
+    // buffered write in an open block stamps at `COMMIT` instead (see `commit_txn`),
+    // but setting it here too keeps the path uniform and harmless.
+    engine.set_principal(principal.clone());
     match txn {
         ConnTxn::Active(buffered) => engine.execute_in_txn(stmt, buffered),
         // `Idle` auto-commits; `Failed` never reaches here (the dispatch refuses
@@ -1751,6 +1816,7 @@ async fn run_copy_in<S: Wire>(
     stmt: &Statement,
     session: &SharedSession,
     txn: &mut ConnTxn,
+    principal: &Principal,
 ) -> Result<CopyOutcome, WireError> {
     // 1. Bind the target (at the transaction's snapshot, if any) to learn the
     //    column count + stream format. A bind failure is reported before copy-in
@@ -1845,8 +1911,12 @@ async fn run_copy_in<S: Wire>(
     };
 
     // 4. Apply (auto-commit) or stage (in a transaction) as one atomic group.
+    //    Stamp this connection's identity before the apply, under the same lock, so
+    //    a bulk-loaded row records who loaded it ([STL-300]); a staged load stamps
+    //    at `COMMIT` instead (`commit_txn`).
     let applied = {
         let mut engine = session.lock().unwrap_or_else(PoisonError::into_inner);
+        engine.set_principal(principal.clone());
         match txn {
             ConnTxn::Active(buffered) => engine.copy_stage(stmt, &rows, buffered),
             _ => engine.copy_apply(stmt, &rows),
@@ -2412,6 +2482,7 @@ fn execute_stmt(
     session: &SharedSession,
     stmt: &Statement,
     txn: &mut ConnTxn,
+    principal: &Principal,
 ) -> Result<Executed, ExecError> {
     if let Some(intro) = pg_catalog::classify(stmt) {
         let (header, rows) = introspection_reply(&intro, session);
@@ -2423,7 +2494,7 @@ fn execute_stmt(
     }
     match bind_ddl(stmt) {
         Ok(_) => {
-            let tag = run_ddl(session, stmt, txn).map_err(|e| ExecError {
+            let tag = run_ddl(session, stmt, txn, principal).map_err(|e| ExecError {
                 sqlstate: sqlstate_for(&e),
                 message: e.to_string(),
             })?;
@@ -2440,7 +2511,7 @@ fn execute_stmt(
                     sent: 0,
                 });
             }
-            match run_query(session, stmt, txn) {
+            match run_query(session, stmt, txn, principal) {
                 Ok(StatementOutcome::Rows(result)) => {
                     let rows = decode_result_rows(&result).map_err(|e| ExecError {
                         sqlstate: SQLSTATE_INTERNAL_ERROR,
@@ -2479,6 +2550,7 @@ fn ensure_executed(
     session: &SharedSession,
     stmt: &Statement,
     txn: &mut ConnTxn,
+    principal: &Principal,
 ) -> Result<(), ExecError> {
     if state
         .portals
@@ -2487,7 +2559,7 @@ fn ensure_executed(
     {
         return Ok(());
     }
-    let executed = execute_stmt(session, stmt, txn)?;
+    let executed = execute_stmt(session, stmt, txn, principal)?;
     if let Some(entry) = state.portals.get_mut(portal) {
         entry.executed = Some(executed);
     }
@@ -2674,6 +2746,7 @@ async fn handle_describe<S: Wire>(
     payload: &[u8],
     session: &SharedSession,
     txn: &mut ConnTxn,
+    principal: &Principal,
 ) -> Result<(), WireError> {
     let Some(target) = extended::parse_target(payload) else {
         return Err(WireError::Protocol("malformed Describe message"));
@@ -2712,7 +2785,7 @@ async fn handle_describe<S: Wire>(
             Ok(())
         }
         extended::Target::Portal(name) => {
-            handle_describe_portal(stream, state, &name, session, txn).await
+            handle_describe_portal(stream, state, &name, session, txn, principal).await
         }
     }
 }
@@ -2725,6 +2798,7 @@ async fn handle_describe_portal<S: Wire>(
     name: &str,
     session: &SharedSession,
     txn: &mut ConnTxn,
+    principal: &Principal,
 ) -> Result<(), WireError> {
     let Some(portal) = state.portals.get(name) else {
         let m = format!("portal \"{name}\" does not exist");
@@ -2736,7 +2810,10 @@ async fn handle_describe_portal<S: Wire>(
     if !returns_rows(&stmt) {
         return write_no_data(stream).await.map_err(WireError::Io);
     }
-    if let Err(e) = ensure_executed(state, name, session, &stmt, txn) {
+    // Only a row-returning (read) statement reaches here, so the principal never
+    // actually stamps a write on the Describe path; it is threaded for a uniform
+    // `ensure_executed` contract shared with `handle_execute` ([STL-300]).
+    if let Err(e) = ensure_executed(state, name, session, &stmt, txn, principal) {
         return fail_extended(stream, state, e.sqlstate, &e.message).await;
     }
     // The portal was present above and `ensure_executed` only populates its cached
@@ -2773,6 +2850,7 @@ async fn handle_execute<S: Wire>(
     payload: &[u8],
     session: &SharedSession,
     txn: &mut ConnTxn,
+    principal: &Principal,
 ) -> Result<(), WireError> {
     let Some(msg) = extended::parse_execute(payload) else {
         return Err(WireError::Protocol("malformed Execute message"));
@@ -2808,7 +2886,7 @@ async fn handle_execute<S: Wire>(
     // The client pipelines CopyDone+Sync; the trailing Sync drives ReadyForQuery
     // via the main loop, so this returns without one.
     if is_copy_from_stdin(&stmt) {
-        match run_copy_in(stream, &stmt, session, txn).await? {
+        match run_copy_in(stream, &stmt, session, txn, principal).await? {
             // Loaded (CommandComplete already sent), or the client vanished
             // mid-stream (the main loop will see the EOF next) — either way no
             // further reply is owed here; the client's trailing Sync drives
@@ -2825,7 +2903,7 @@ async fn handle_execute<S: Wire>(
         }
     }
 
-    if let Err(e) = ensure_executed(state, &msg.portal, session, &stmt, txn) {
+    if let Err(e) = ensure_executed(state, &msg.portal, session, &stmt, txn, principal) {
         return fail_extended(stream, state, e.sqlstate, &e.message).await;
     }
 
@@ -2914,6 +2992,21 @@ struct StartupMessage {
     #[allow(dead_code)]
     protocol_version: i32,
     params: Vec<(String, String)>,
+}
+
+impl StartupMessage {
+    /// The `user` startup parameter, if the client sent one. This is the identity
+    /// the connection is taken to be under `trust` — its write principal ([STL-300])
+    /// — and what SCRAM authenticates under `scram`. Every mainstream driver sends
+    /// it; `None` only for a malformed startup.
+    ///
+    /// [STL-300]: https://allegromusic.atlassian.net/browse/STL-300
+    fn user(&self) -> Option<&str> {
+        self.params
+            .iter()
+            .find(|(k, _)| k == "user")
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 /// Read the startup phase, transparently refusing repeated SSL/GSS requests.

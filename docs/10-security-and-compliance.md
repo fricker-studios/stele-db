@@ -146,8 +146,12 @@ psycopg, pgjdbc, and `tokio-postgres` all speak it natively:
   channel binding (plain SCRAM is the floor; a client demanding `p=…` is
   refused), SASLprep normalization (raw UTF-8 passwords; ASCII is unaffected),
   and client-side SCRAM in `stele shell`. The authenticated identity reaches
-  the connection trace span (STL-107); stamping it into write provenance is
-  the `_stele_principal` pseudo-column ticket.
+  the connection trace span (STL-107) **and the stored write provenance**: each
+  wire-issued write stamps the connection's identity into `_stele_principal`
+  (STL-300) — the SCRAM-verified user under `scram`, the unauthenticated startup
+  `user` under `trust` — set per statement under the engine lock so a shared engine
+  attributes each row to whoever wrote it. (mTLS-cert-identity → principal is the
+  STL-291 follow-up.)
 
 ## 6. Authorization
 

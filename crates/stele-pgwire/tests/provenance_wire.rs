@@ -10,6 +10,13 @@
 //! counter, one per committed write), so they are asserted exactly; the commit
 //! instant is wall-clock under [`SystemClock`], so it is asserted present and
 //! well-formed rather than to a fixed value.
+//!
+//! The second test is the [STL-300] end-to-end round trip: a row written over a
+//! connection that identifies as `alice` reads back `_stele_principal = 'alice'`,
+//! and a second `bob` connection sharing the one engine stamps `bob` — the
+//! connection identity is threaded into the stored write principal, not a constant.
+//!
+//! [STL-300]: https://allegromusic.atlassian.net/browse/STL-300
 
 use std::sync::{Arc, Mutex};
 
@@ -69,7 +76,8 @@ async fn tokio_postgres_reads_provenance_pseudo_columns() {
     assert_eq!(
         row.get("_stele_principal"),
         Some("stele"),
-        "the wire write principal",
+        "the write principal is the connection's user — here `stele`, from the \
+         connection string ([STL-300])",
     );
     let committed_at = row
         .get("_stele_committed_at")
@@ -134,4 +142,102 @@ async fn tokio_postgres_reads_provenance_pseudo_columns() {
         .await
         .expect("pgwire driver task did not panic")
         .expect("pgwire connection closed cleanly");
+}
+
+/// The connection's identity is stamped as the write principal ([STL-300]): a row
+/// written over a connection identifying as `alice` reports `_stele_principal =
+/// 'alice'`, while a second `bob` connection sharing the **one** engine stamps
+/// `bob`. Because the engine is shared behind a single mutex, this only holds if the
+/// principal is set per statement under the dispatch lock rather than as a single
+/// shared field — so interleaving the two connections' writes is the real test.
+///
+/// Coverage spans the live write-stamping paths: the auto-commit single write, the
+/// multi-row write group, and the multi-statement `COMMIT` (alice, simple protocol),
+/// plus an extended-protocol auto-commit write (bob).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_connection_user_is_the_stored_write_principal() {
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+
+    // Two clients on the one shared engine: alice over the simple-query protocol,
+    // bob over the extended protocol.
+    let (alice, alice_conn) = tokio_postgres::connect(&common::conn_str_as(addr, "alice"), NoTls)
+        .await
+        .expect("alice connects");
+    let alice_driver = tokio::spawn(alice_conn);
+    let (bob, bob_conn) = tokio_postgres::connect(&common::conn_str_as(addr, "bob"), NoTls)
+        .await
+        .expect("bob connects");
+    let bob_driver = tokio::spawn(bob_conn);
+
+    // alice creates the table and inserts one row (auto-commit single write).
+    alice
+        .batch_execute(
+            "CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+        )
+        .await
+        .expect("create table");
+    alice
+        .simple_query("INSERT INTO account VALUES (1, 100)")
+        .await
+        .expect("alice insert");
+
+    // bob writes *between* alice's writes (extended protocol, auto-commit): the
+    // shared engine's principal must flip to bob for this statement and back to alice
+    // for her next one — a single shared field set once at connect would get this
+    // wrong.
+    bob.execute("INSERT INTO account VALUES (10, 999)", &[])
+        .await
+        .expect("bob insert");
+
+    // alice: a multi-row write group, then a multi-statement COMMIT updating row 1.
+    alice
+        .simple_query("INSERT INTO account VALUES (2, 200), (3, 300)")
+        .await
+        .expect("alice multi-row insert");
+    alice
+        .batch_execute("BEGIN; UPDATE account SET balance = 150 WHERE id = 1; COMMIT")
+        .await
+        .expect("alice transaction");
+
+    // Read every live row's principal. alice's rows (the updated 1 and the multi-row
+    // 2, 3) report alice; bob's row 10 reports bob.
+    let read = alice
+        .simple_query("SELECT id, _stele_principal FROM account ORDER BY id")
+        .await
+        .expect("select principals");
+    let principals: Vec<(String, String)> = read
+        .iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(row) => Some((
+                row.get("id").expect("id cell").to_owned(),
+                row.get("_stele_principal")
+                    .expect("principal cell")
+                    .to_owned(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        principals,
+        vec![
+            ("1".to_owned(), "alice".to_owned()),
+            ("2".to_owned(), "alice".to_owned()),
+            ("3".to_owned(), "alice".to_owned()),
+            ("10".to_owned(), "bob".to_owned()),
+        ],
+        "each row records the identity of the connection that wrote it",
+    );
+
+    drop(alice);
+    drop(bob);
+    alice_driver
+        .await
+        .expect("alice driver task did not panic")
+        .expect("alice connection closed cleanly");
+    bob_driver
+        .await
+        .expect("bob driver task did not panic")
+        .expect("bob connection closed cleanly");
 }

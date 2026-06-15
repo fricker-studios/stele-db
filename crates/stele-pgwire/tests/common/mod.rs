@@ -31,13 +31,20 @@ pub async fn spawn_server(session: SharedSession) -> SocketAddr {
     addr
 }
 
-/// The libpq connection string for a Stele pgwire server at `addr`.
+/// The libpq connection string for a Stele pgwire server at `addr`, connecting as
+/// the conventional `stele` user.
 ///
-/// `sslmode=disable` skips negotiation (the server refuses SSL anyway); v0.1 has
-/// no auth, so any user/dbname is accepted.
+/// `sslmode=disable` skips negotiation (the server refuses SSL anyway); under
+/// `trust` (the test default) any user/dbname is accepted.
 pub fn conn_str(addr: SocketAddr) -> String {
+    conn_str_as(addr, "stele")
+}
+
+/// As [`conn_str`], but connecting as `user` — the startup-message identity the
+/// server stamps as the connection's write principal under `trust` ([STL-300]).
+pub fn conn_str_as(addr: SocketAddr, user: &str) -> String {
     format!(
-        "host=127.0.0.1 port={} user=stele dbname=stele sslmode=disable",
+        "host=127.0.0.1 port={} user={user} dbname=stele sslmode=disable",
         addr.port()
     )
 }

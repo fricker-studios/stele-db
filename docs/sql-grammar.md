@@ -563,12 +563,14 @@ Semantics, pinned:
   the version metadata / commit log, never a user column. They ride the same
   `SnapshotScan` as the data, so a future range read (`STL-244`) inherits them
   with no extra work.
-- **`_stele_principal` value.** The engine stamps the placeholder identity
-  `stele` on every wire-issued write today. Threading the connection's
-  startup-message user (and then the SCRAM-verified user — `STL-252`) into the
-  stored principal **upgrades its trustworthiness without changing this surface**
-  and is tracked separately; until then the column honestly reports the
-  server-stamped writing principal.
+- **`_stele_principal` value.** A wire-issued write stamps the **connection's
+  identity** (`STL-300`): under `auth = "trust"` the unauthenticated startup-message
+  `user`, under `auth = "scram"` the SCRAM-verified user (`STL-252`). The principal
+  is set per statement under the same engine lock as the write, so a row records
+  *who* wrote it even though connections share one engine. A direct, non-wire writer
+  (an embedded `SessionEngine`) defaults to the server identity `stele`. This changed
+  the stored *value*, not the surface above — resolution, hiding, and `WHERE`
+  usability are unchanged.
 - **Read-your-own-writes.** Inside a `BEGIN` block, a row a statement *buffered*
   but has not committed has no commit provenance yet, so its three pseudo-column
   cells read `NULL`; committed rows read their stored provenance as usual.
