@@ -279,6 +279,9 @@ pub struct Metrics {
     pub scan_segments_scanned: Counter,
     /// Sealed segments skipped by zone-map pruning.
     pub scan_segments_pruned_zone: Counter,
+    /// Sealed segments skipped by per-segment bloom-filter pruning — a point
+    /// business-key probe the footer bloom proved absent (STL-238).
+    pub scan_segments_pruned_bloom: Counter,
     /// Sealed segments skipped because every version in them is superseded at
     /// the read snapshot (validity-index prune).
     pub scan_segments_pruned_superseded: Counter,
@@ -463,6 +466,12 @@ impl Metrics {
             "stele_scan_segments_pruned_zone_total",
             "Sealed segments skipped by zone-map pruning.",
             self.scan_segments_pruned_zone.get(),
+        );
+        counter(
+            &mut out,
+            "stele_scan_segments_pruned_bloom_total",
+            "Sealed segments skipped by per-segment bloom-filter pruning.",
+            self.scan_segments_pruned_bloom.get(),
         );
         counter(
             &mut out,

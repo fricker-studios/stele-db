@@ -184,6 +184,7 @@ const KIND_DROP_USER: u8 = 7;
 const fn index_kind_tag(kind: IndexKind) -> u8 {
     match kind {
         IndexKind::BTree => 1,
+        IndexKind::Hash => 2,
     }
 }
 
@@ -192,6 +193,7 @@ const fn index_kind_tag(kind: IndexKind) -> u8 {
 const fn index_kind_from_tag(tag: u8) -> Option<IndexKind> {
     Some(match tag {
         1 => IndexKind::BTree,
+        2 => IndexKind::Hash,
         _ => return None,
     })
 }

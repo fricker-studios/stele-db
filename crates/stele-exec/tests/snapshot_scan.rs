@@ -90,6 +90,26 @@ fn seal_one(disk: &MemDisk, name: &str, key: &[u8], sys_from: i64) -> SegmentRea
     SegmentReader::open(disk, name).expect("open segment")
 }
 
+/// Seal a multi-key segment: one open version per id, all at `sys_from`. Its
+/// business-key zone map spans `[min id, max id]`, so a probe for an id *inside*
+/// that span but absent from `ids` survives the zone map and reaches the
+/// per-segment bloom (STL-238).
+fn seal_keys(disk: &MemDisk, name: &str, ids: &[i64], sys_from: i64) -> SegmentReader<MemFile> {
+    let mut w = SegmentWriter::create(disk, name).expect("create segment");
+    for &id in ids {
+        w.push(Version::open(
+            key_of(id),
+            SystemTimeMicros(sys_from),
+            0,
+            Provenance::new(TxnId(1), SystemTimeMicros(sys_from), who()),
+            Some(format!("row-{id}").into_bytes()),
+        ))
+        .expect("push");
+    }
+    w.finish().expect("finish");
+    SegmentReader::open(disk, name).expect("open segment")
+}
+
 /// Flush the delta into a fresh sealed segment and reopen it for read — the real
 /// columnar flush boundary, after which the drained versions live only in the
 /// segment.
@@ -457,6 +477,46 @@ fn segment_reads_equal_zone_map_survivors() {
     assert_eq!(out.stats.segments_pruned(), 2);
     assert_eq!(out.batch.rows, 1);
     assert_eq!(one_bytes(&out, ColumnId::BusinessKey), b"m");
+}
+
+// --- per-segment bloom prune (STL-238) -------------------------------------
+
+#[test]
+fn point_probe_prunes_by_bloom_where_zone_maps_cannot() {
+    // Both segments' business-key zone maps span [1, 100], so a point probe for
+    // id=50 — inside that span but present in only one segment — survives the
+    // zone map in *both*. The per-segment bloom then prunes the segment that does
+    // not hold 50: the hash/scatter-key acceleration zone maps cannot give.
+    let disk = MemDisk::new();
+    let delta = new_delta();
+    let index = new_index();
+    let with_50 = seal_keys(&disk, "with50.seg", &[1, 50, 100], 10);
+    let without_50 = seal_keys(&disk, "without50.seg", &[1, 100], 10);
+    let segments = vec![with_50, without_50];
+
+    let out = SnapshotScan::new(&delta, &index, &segments, Snapshot(SystemTimeMicros(1_000)))
+        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .filter(Predicate::Eq {
+            column: ColumnId::BusinessKey,
+            value: key_bound(50),
+        })
+        .execute()
+        .expect("scan id=50");
+
+    // The zone map pruned neither (both spans bracket 50); the bloom pruned
+    // exactly the segment without 50, and the other was scanned.
+    assert_eq!(out.stats.segments_pruned_zone, 0);
+    assert_eq!(out.stats.segments_pruned_bloom, 1);
+    assert_eq!(out.stats.segments_scanned, 1);
+    assert_eq!(out.stats.segments_pruned(), 1);
+    // ...and the result is exactly the one live row — the bloom changed speed,
+    // never the answer.
+    assert_eq!(out.batch.rows, 1);
+    assert_eq!(
+        one_bytes(&out, ColumnId::BusinessKey),
+        key_of(50).as_bytes()
+    );
+    assert_eq!(one_bytes(&out, ColumnId::Payload), b"row-50");
 }
 
 // --- validity-index "all superseded" prune (STL-139/146) -------------------

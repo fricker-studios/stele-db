@@ -7,7 +7,7 @@
 //! stand-in for the eventual `psql` `\d account` (wired through pg-wire as a
 //! follow-up).
 
-use stele_catalog::Catalog;
+use stele_catalog::{Catalog, IndexKind};
 use stele_common::time::SystemTimeMicros;
 use stele_common::types::LogicalType;
 use stele_sql::{BindError, DdlOutcome, DdlStatement, bind_ddl, parse};
@@ -272,9 +272,30 @@ fn binds_create_index_and_drop_index() {
         DdlStatement::CreateIndex {
             name: "i_balance".to_owned(),
             table: "account".to_owned(),
+            kind: IndexKind::BTree,
             columns: vec!["balance".to_owned()],
         }
     );
+
+    // `USING HASH` binds to the hash kind (STL-238); `USING BTREE` is the default.
+    let hash = bind_one("CREATE INDEX i_balance ON account USING HASH (balance)")
+        .expect("bind create hash index");
+    assert_eq!(
+        hash,
+        DdlStatement::CreateIndex {
+            name: "i_balance".to_owned(),
+            table: "account".to_owned(),
+            kind: IndexKind::Hash,
+            columns: vec!["balance".to_owned()],
+        }
+    );
+    assert!(matches!(
+        bind_one("CREATE INDEX i_balance ON account USING BTREE (balance)"),
+        Ok(DdlStatement::CreateIndex {
+            kind: IndexKind::BTree,
+            ..
+        })
+    ));
 
     let ddl = bind_one("DROP INDEX i_balance").expect("bind drop index");
     assert_eq!(
@@ -303,7 +324,9 @@ fn create_index_outside_the_substrate_surface_is_rejected() {
         "CREATE UNIQUE INDEX i ON t (a)",
         "CREATE INDEX CONCURRENTLY i ON t (a)",
         "CREATE INDEX IF NOT EXISTS i ON t (a)",
-        "CREATE INDEX i ON t USING hash (a)",
+        // `USING HASH` / `USING BTREE` bind (STL-238); other access methods do not.
+        "CREATE INDEX i ON t USING gin (a)",
+        "CREATE INDEX i ON t USING gist (a)",
         "CREATE INDEX i ON t (a, b)",
         "CREATE INDEX i ON t (a DESC)",
         "CREATE INDEX i ON t (a NULLS FIRST)",

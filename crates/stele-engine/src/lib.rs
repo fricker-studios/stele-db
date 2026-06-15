@@ -2518,8 +2518,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             DdlStatement::CreateIndex {
                 name,
                 table,
+                kind,
                 columns,
-            } => self.apply_create_index(name, table, columns, at),
+            } => self.apply_create_index(name, table, kind, columns, at),
             DdlStatement::DropIndex { name, if_exists } => {
                 self.apply_drop_index(&name, if_exists, at)
             }
@@ -2625,10 +2626,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         &mut self,
         name: String,
         table: String,
+        kind: IndexKind,
         columns: Vec<String>,
         at: SystemTimeMicros,
     ) -> Result<StatementOutcome, EngineError> {
-        let def = IndexDef::new(name, table, IndexKind::default(), columns)?;
+        let def = IndexDef::new(name, table, kind, columns)?;
         let mut staged = self.catalog.clone();
         staged.create_index(def.clone())?;
         let state = self
@@ -3665,6 +3667,71 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         Ok(matched.rows.is_empty().then_some(zero))
     }
 
+    /// Whether the per-source-row indexed `MERGE` probe should be used for
+    /// `table` — i.e. its keyspace is large enough *on disk* that point-probing
+    /// the always-indexed business key (per-segment bloom + zone pruning,
+    /// [STL-238]) beats reading every live key in one scan. Proxied by "the target
+    /// holds at least one sealed segment": an all-delta target is small enough
+    /// that the single in-memory keyset read still wins, and keeping it on that
+    /// path leaves a small-table `MERGE` byte-identical to before. (A real
+    /// cost-based source-vs-keyspace choice is [STL-312].)
+    ///
+    /// [STL-312]: https://allegromusic.atlassian.net/browse/STL-312
+    fn merge_should_probe_per_key(&self, table: &str) -> bool {
+        self.tables
+            .get(table)
+            .is_some_and(|state| !state.engine.segment_names().is_empty())
+    }
+
+    /// Whether `key` resolves to a live target row at the statement snapshot — the
+    /// per-source-row `MERGE` probe ([STL-238]).
+    ///
+    /// A point `SELECT <key> FROM t WHERE <key> = key` through
+    /// [`run_select`](Self::run_select), exactly as
+    /// [`absent_point_tag`](Self::absent_point_tag) probes a single key: the key
+    /// equality pushes down to the always-indexed business key, so the read prunes
+    /// to the segments whose **per-segment bloom** admits the key (and zone maps
+    /// rule out the rest) rather than scanning the keyspace, and it sees the
+    /// transaction overlay (read-your-own-writes, [STL-203]). Key for key this is
+    /// the same answer the full-keyset path's `live.contains(key)` gives, so the
+    /// two MERGE plans are result-identical — the probe changes speed, never the
+    /// upsert.
+    fn merge_key_is_live(
+        &self,
+        merge: &BoundMerge,
+        key_col: &str,
+        snapshot: SystemTimeMicros,
+        key: &ScalarValue,
+        overlay: &[BoundDml],
+    ) -> Result<bool, EngineError> {
+        let probe = BoundSelect {
+            table: merge.table.clone(),
+            schema_id: merge.schema_id,
+            snapshot,
+            valid_snapshot: None,
+            projection: Projection::Columns(vec![key_col.to_owned()]),
+            filter: Some(BoundPredicate {
+                left: BoundScalar::Column(0),
+                op: CompareOp::Eq,
+                right: BoundScalar::Literal(key.clone()),
+            }),
+            period_filter: None,
+            subquery_filter: None,
+            aggregate: None,
+            join: None,
+            distinct: false,
+            order_by: Vec::new(),
+            offset: 0,
+            limit: None,
+        };
+        let StatementOutcome::Rows(matched) = self.run_select(&probe, overlay)? else {
+            return Err(EngineError::Unsupported(
+                "the MERGE liveness probe returned no row set",
+            ));
+        };
+        Ok(!matched.rows.is_empty())
+    }
+
     /// Apply an auto-committed **scan-then-write** `UPDATE` / `DELETE`
     /// ([STL-229]): expand the predicate into one per-key write per matching live
     /// row at `read_snapshot` ([`expand_scan_dml`](Self::expand_scan_dml)), then
@@ -3922,6 +3989,72 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         Ok((writes, summary))
     }
 
+    /// The `MERGE` probe set: which target business keys (encoded) are live at
+    /// the statement snapshot, for the arm resolution in
+    /// [`expand_merge`](Self::expand_merge) to test membership against.
+    ///
+    /// For a large on-disk keyspace, probe each source key as a point read
+    /// ([`merge_key_is_live`](Self::merge_key_is_live)) — the always-indexed
+    /// business key prunes to the segments the per-segment blooms admit
+    /// ([STL-238]), so the probe reads no more of the keyspace than the source
+    /// touches. For a small all-delta target, read every live key in a single
+    /// scan (`SELECT <key> FROM t`), the original plan, byte-for-byte. Both yield
+    /// the same `live ∩ source` membership, so the upsert is identical either way.
+    fn merge_live_keys(
+        &self,
+        merge: &BoundMerge,
+        key_name: &str,
+        snapshot: SystemTimeMicros,
+        rows: &[Vec<Option<ScalarValue>>],
+        overlay: &[BoundDml],
+    ) -> Result<HashSet<Vec<u8>>, EngineError> {
+        if self.merge_should_probe_per_key(&merge.table) {
+            let mut live = HashSet::new();
+            for row in rows {
+                let Some(key) = row.get(merge.on).and_then(|c| c.as_ref()) else {
+                    continue; // a NULL join key matches nothing — never live
+                };
+                let encoded = encode_value(key);
+                if !live.contains(&encoded)
+                    && self.merge_key_is_live(merge, key_name, snapshot, key, overlay)?
+                {
+                    live.insert(encoded);
+                }
+            }
+            return Ok(live);
+        }
+        let probe = BoundSelect {
+            table: merge.table.clone(),
+            schema_id: merge.schema_id,
+            snapshot,
+            valid_snapshot: None,
+            projection: Projection::Columns(vec![key_name.to_owned()]),
+            filter: None,
+            period_filter: None,
+            subquery_filter: None,
+            aggregate: None,
+            join: None,
+            distinct: false,
+            order_by: Vec::new(),
+            offset: 0,
+            limit: None,
+        };
+        let StatementOutcome::Rows(live) = self.run_select(&probe, overlay)? else {
+            return Err(EngineError::Unsupported(
+                "the MERGE probe read returned no row set",
+            ));
+        };
+        live.rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .next()
+                    .flatten()
+                    .ok_or(EngineError::MalformedBusinessKey)
+            })
+            .collect()
+    }
+
     /// Expand a `MERGE` plan ([STL-230]) into the per-key point writes it stands
     /// for, reporting the acted-on-row summary alongside.
     ///
@@ -3929,12 +4062,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// [`run_select`](Self::run_select) path a `SELECT` takes at the statement
     /// snapshot — committed-only state on the auto-commit path, the buffered-write
     /// overlay inside a transaction (read-your-own-writes, [STL-203]). Each source
-    /// row resolves its arm against the target's live keys: matched ⇒ one
-    /// [`BoundDml::Update`] from the `WHEN MATCHED` template, unmatched ⇒ one
-    /// [`BoundDml::Insert`] from the `WHEN NOT MATCHED` template (a row whose arm
-    /// is absent is skipped). A `NULL` join key matches nothing — SQL equality —
-    /// and a `NULL` resolving into the **inserted business key** fails the
-    /// statement.
+    /// row resolves its arm against the target's live keys ([`merge_live_keys`](Self::merge_live_keys)):
+    /// matched ⇒ one [`BoundDml::Update`] from the `WHEN MATCHED` template,
+    /// unmatched ⇒ one [`BoundDml::Insert`] from the `WHEN NOT MATCHED` template (a
+    /// row whose arm is absent is skipped). A `NULL` join key matches nothing — SQL
+    /// equality — and a `NULL` resolving into the **inserted business key** fails
+    /// the statement.
     ///
     /// Two source rows resolving to the same target row are refused with
     /// [`EngineError::MergeRowTwice`] — the standard's deterministic posture —
@@ -3962,41 +4095,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .map(|c| c.name().to_owned())
             .ok_or_else(|| EngineError::UnknownTable(merge.table.clone()))?;
 
-        // The probe set: the target's live business keys at the statement
-        // snapshot, read exactly as `SELECT <key> FROM t` would be.
-        let probe = BoundSelect {
-            table: merge.table.clone(),
-            schema_id: merge.schema_id,
-            snapshot,
-            valid_snapshot: None,
-            projection: Projection::Columns(vec![key_name.clone()]),
-            filter: None,
-            period_filter: None,
-            subquery_filter: None,
-            aggregate: None,
-            join: None,
-            distinct: false,
-            order_by: Vec::new(),
-            offset: 0,
-            limit: None,
-        };
-        let StatementOutcome::Rows(live) = self.run_select(&probe, overlay)? else {
-            return Err(EngineError::Unsupported(
-                "the MERGE probe read returned no row set",
-            ));
-        };
-        let live: HashSet<Vec<u8>> = live
-            .rows
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .next()
-                    .flatten()
-                    .ok_or(EngineError::MalformedBusinessKey)
-            })
-            .collect::<Result<_, _>>()?;
-
         let rows = self.merge_source_rows(&merge.source, snapshot, overlay)?;
+        let live = self.merge_live_keys(merge, &key_name, snapshot, &rows, overlay)?;
 
         // Resolve each source row's arm. Keying the writes by the canonical key
         // encoding both rejects a second write to one target row and fixes the

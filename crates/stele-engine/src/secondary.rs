@@ -49,7 +49,7 @@
 //! [ADR-0023]: ../../../docs/adr/0023-append-only-record-model-validity-index.md
 //! [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 
 use stele_common::time::SystemTimeMicros;
@@ -255,6 +255,56 @@ impl AccessStructure for BTreeIndex {
     }
 }
 
+/// The hash access structure: an **unordered** map from each noted cell's
+/// canonical encoding to the set of keys that ever carried it. Equality probes
+/// answer from the exact entry in O(1); range probes are declined — a hash table
+/// cannot walk its cells in the column type's value order, so the planner
+/// full-scans a range over a hash-indexed column ([STL-238]).
+///
+/// Unlike [`BTreeIndex`] it keys on the **raw** canonical cell rather than the
+/// [memcomparable form](index_key): equality needs only that the encoding is
+/// injective per type (equal values encode identically, distinct values do not),
+/// which the canonical [`ScalarValue::encode`](stele_common::types::ScalarValue)
+/// form is. The order-preserving transform the B-tree needs for ranges would be
+/// dead weight here, so the hash structure carries no [`LogicalType`].
+///
+/// [STL-238]: https://allegromusic.atlassian.net/browse/STL-238
+#[derive(Debug)]
+pub(crate) struct HashIndex {
+    entries: HashMap<Vec<u8>, BTreeSet<BusinessKey>>,
+}
+
+impl HashIndex {
+    /// An empty hash structure.
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl AccessStructure for HashIndex {
+    fn note(&mut self, cell: &[u8], key: &BusinessKey) {
+        self.entries
+            .entry(cell.to_vec())
+            .or_default()
+            .insert(key.clone());
+    }
+
+    fn equality_candidates(&self, cell: &[u8]) -> Probe {
+        self.entries.get(cell).map_or(Probe::Empty, |keys| {
+            let low = keys.first().expect("noted sets are never empty").clone();
+            let high = keys.last().expect("noted sets are never empty").clone();
+            Probe::Window { low, high }
+        })
+    }
+
+    // `range_candidates` falls through to the trait default (`None` = full scan):
+    // a hash structure has no value-ordered walk to answer a range from, and the
+    // substrate's contract is that declining is always sound — never a wrong
+    // window. See the type docs.
+}
+
 /// One live index's runtime state: the access structure plus the snapshot
 /// floor its build covers from.
 #[derive(Debug)]
@@ -277,6 +327,7 @@ impl IndexState {
     ) -> Self {
         let structure: Box<dyn AccessStructure> = match kind {
             stele_catalog::IndexKind::BTree => Box::new(BTreeIndex::new(ty)),
+            stele_catalog::IndexKind::Hash => Box::new(HashIndex::new()),
         };
         Self { floor, structure }
     }
@@ -444,6 +495,52 @@ mod tests {
                 low: key(b"k1"),
                 high: key(b"k1"),
             }
+        );
+    }
+
+    #[test]
+    fn hash_index_windows_equality_and_declines_every_range() {
+        // The hash structure answers equality exactly like the B-tree — an
+        // unnoted cell is `Empty`, a noted one windows its keys — but declines
+        // ranges outright (`None` = full scan, never a wrong window), the
+        // substrate's "decline rather than answer from the wrong order" rule.
+        let mut index = HashIndex::new();
+        assert_eq!(index.equality_candidates(b"v"), Probe::Empty);
+
+        index.note(b"v", &key(b"k2"));
+        index.note(b"v", &key(b"k0"));
+        index.note(b"w", &key(b"k5"));
+        assert_eq!(
+            index.equality_candidates(b"v"),
+            Probe::Window {
+                low: key(b"k0"),
+                high: key(b"k2"),
+            }
+        );
+
+        // Add-only: an UPDATE away from `v` (noting k0 under `w`) keeps k0 in
+        // v's candidate set — a past snapshot may still see it carrying `v`.
+        index.note(b"w", &key(b"k0"));
+        assert_eq!(
+            index.equality_candidates(b"v"),
+            Probe::Window {
+                low: key(b"k0"),
+                high: key(b"k2"),
+            }
+        );
+
+        // Every range bound shape is declined.
+        assert_eq!(
+            index.range_candidates(Bound::Included(b"v"), Bound::Unbounded),
+            None
+        );
+        assert_eq!(
+            index.range_candidates(Bound::Unbounded, Bound::Excluded(b"w")),
+            None
+        );
+        assert_eq!(
+            index.range_candidates(Bound::Unbounded, Bound::Unbounded),
+            None
         );
     }
 }
