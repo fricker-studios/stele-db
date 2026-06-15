@@ -71,10 +71,16 @@ sqlparser          = { version = "0.62", default-features = false, features = ["
 # default features off — no fuzzy matcher, no dirs probe. `with-file-history`
 # (STL-221) gives cross-process history locking + append-on-exit via the
 # `file_lock` std API (stable in Rust 1.89, our MSRV) and a native 0600 file mode;
-# the feature pulls **no new crates** — it only activates rustyline's own `log` +
-# `nix` code already in the tree. CLI-only: never a dependency of the server or
-# the runtime-agnostic core.
-rustyline          = { version = "18.0", default-features = false, features = ["with-file-history"] }
+# it pulls no new crates — only rustyline's own `log` + `nix` code already in the
+# tree. `buffer-redux` (STL-306) is **load-bearing for correctness**: without it
+# rustyline allocates a fresh 1 KiB input `BufReader` per `readline()` and *drops*
+# whatever it read past the first line, so any typed-ahead — most visibly a pasted
+# block of statements — is silently swallowed after a line or two and the shell
+# wedges in `read()` waiting for input that is already gone. The feature makes
+# rustyline carry the leftover buffer across calls instead; it adds the small
+# `buffer-redux` crate, a deliberate (and cheap) trade for a non-hanging shell.
+# CLI-only: never a dependency of the server or the runtime-agnostic core.
+rustyline          = { version = "18.0", default-features = false, features = ["with-file-history", "buffer-redux"] }
 # Terminal display width (CJK/emoji are 2 columns) for the shell's table
 # alignment. Already in the tree as rustyline's own width dep — zero new surface.
 unicode-width      = "0.2"

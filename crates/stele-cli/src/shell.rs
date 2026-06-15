@@ -68,9 +68,17 @@ struct Session {
     dbname: String,
 }
 
-/// What a handled line tells the loop to do next.
+/// What a handled line tells the loop to do next. `Continue.catalog_changed` is
+/// set when the statement that ran may have moved the catalog (DDL — `CREATE` /
+/// `DROP` / `ALTER`): the interactive loop re-reads its ⇥-completion identifiers
+/// only then. Refreshing after *every* statement would add catalog round-trips to
+/// every `INSERT`/`SELECT` and, during a paste, starve the shell of stdin time
+/// ([STL-306]); DML, `SELECT`, transaction control, and meta-commands never change
+/// what completes.
+///
+/// [STL-306]: https://allegromusic.atlassian.net/browse/STL-306
 enum Flow {
-    Continue,
+    Continue { catalog_changed: bool },
     Quit,
 }
 
@@ -224,11 +232,18 @@ fn interactive_loop(
                 if buffer.trim().is_empty() && !pending.is_empty() {
                     let _ = rl.add_history_entry(pending.as_str());
                     pending.clear();
-                    // A statement just ran — CREATE/DROP/ALTER may have moved
-                    // the catalog, so re-read the identifiers ⇥ completes
-                    // against. Best-effort: a dead connection resurfaces on the
-                    // next real query rather than here.
-                    if let Ok(identifiers) = fetch_identifiers(client)
+                    // Re-read the identifiers ⇥ completes against only when the
+                    // statement could have moved the catalog (DDL). Doing it after
+                    // every statement spends catalog round-trips on each
+                    // INSERT/SELECT and, mid-paste, leaves stdin unread long enough
+                    // to drop input ([STL-306]). Best-effort: a dead connection
+                    // resurfaces on the next real query rather than here.
+                    if matches!(
+                        flow,
+                        Flow::Continue {
+                            catalog_changed: true
+                        }
+                    ) && let Ok(identifiers) = fetch_identifiers(client)
                         && let Some(helper) = rl.helper_mut()
                     {
                         helper.identifiers = identifiers;
@@ -281,11 +296,13 @@ fn handle_line(
     }
     buffer.push_str(line);
     buffer.push('\n');
-    if statement_terminated(buffer) {
+    let catalog_changed = if statement_terminated(buffer) {
         let sql = std::mem::take(buffer);
-        run_statement(client, session, sql.trim(), out)?;
-    }
-    Ok(Flow::Continue)
+        run_statement(client, session, sql.trim(), out)?
+    } else {
+        false
+    };
+    Ok(Flow::Continue { catalog_changed })
 }
 
 /// Whether the buffer ends in a statement-terminating `;` — quote- and
@@ -587,7 +604,11 @@ fn dispatch_meta(
             ),
         ),
     }
-    Ok(Flow::Continue)
+    // Meta-commands are read-only introspection — never DDL — so completion never
+    // needs refreshing on their account.
+    Ok(Flow::Continue {
+        catalog_changed: false,
+    })
 }
 
 /// The `\?` registry — the full designed surface, including the tiers that
@@ -1595,17 +1616,34 @@ fn size_cell(bytes: Option<&str>) -> String {
 // SQL execution + rendering
 // ---------------------------------------------------------------------------
 
+/// Whether a `CommandComplete` tag names a statement that can move the catalog —
+/// the only kind after which ⇥-completion must re-read its identifiers. The verb
+/// is the server's authoritative classification, so this is robust where scanning
+/// the SQL text is not (multi-statement batches, a column literally named `drop`):
+/// DDL tags (`CREATE TABLE`, `DROP TABLE`, a future `ALTER …`) qualify; `INSERT`/
+/// `UPDATE`/`DELETE`/`SELECT`, `BEGIN`/`COMMIT`/`ROLLBACK`, and admin tags
+/// (`CHECKPOINT`/`FLUSH`) do not.
+fn tag_changes_catalog(tag: &str) -> bool {
+    let verb = tag.split_whitespace().next().unwrap_or_default();
+    ["CREATE", "DROP", "ALTER"]
+        .iter()
+        .any(|ddl| verb.eq_ignore_ascii_case(ddl))
+}
+
 /// Send one buffered statement (or batch) and render every reply. With timing
 /// on, the round-trip rides the result trailer (`(N rows · X.XXX ms)`) when the
 /// batch yields exactly one row set; otherwise — DML/DDL tags, `\json` output,
 /// errors, or a multi-statement batch (one measurement cannot be attributed to
 /// any single set) — the batch gets one psql-style `Time:` line at the end.
+///
+/// Returns whether any reply was a catalog-moving DDL tag, so the interactive
+/// loop knows to refresh ⇥-completion (and only then — see [`Flow`]).
 fn run_statement(
     client: &mut Client,
     session: &Session,
     sql: &str,
     out: &mut impl Write,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     // Apply the session `\asof` time-travel context: a bare `SELECT` gains a
     // `FOR SYSTEM_TIME AS OF <expr>` qualifier the server resolves ([STL-199]).
     let sql = apply_asof(sql, session.asof.as_deref());
@@ -1622,6 +1660,7 @@ fn run_statement(
             .count()
             == 1;
     let trailer_time = if sole_row_set { timed } else { None };
+    let mut catalog_changed = false;
     for reply in replies {
         match reply {
             Reply::Rows(set) => {
@@ -1634,7 +1673,10 @@ fn run_statement(
                 };
                 write_lines(session, out, &lines)?;
             }
-            Reply::Command(tag) => write_segs(session, out, &[(Role::Text, tag)])?,
+            Reply::Command(tag) => {
+                catalog_changed |= tag_changes_catalog(&tag);
+                write_segs(session, out, &[(Role::Text, tag)])?;
+            }
             Reply::Error(err) => print_error(session, &err),
             Reply::Empty => {}
         }
@@ -1648,7 +1690,7 @@ fn run_statement(
             &[(Role::Mut, format!("Time: {}", render::fmt_elapsed(elapsed)))],
         )?;
     }
-    Ok(())
+    Ok(catalog_changed)
 }
 
 // ---------------------------------------------------------------------------
@@ -2105,6 +2147,36 @@ impl rustyline::highlight::Highlighter for ShellHelper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_ddl_tags_trigger_a_completion_refresh() {
+        // DDL moves the catalog — refresh ⇥-completion after it…
+        for ddl in [
+            "CREATE TABLE",
+            "DROP TABLE",
+            "ALTER TABLE account ADD c INT",
+        ] {
+            assert!(tag_changes_catalog(ddl), "{ddl} should refresh completion");
+        }
+        // …but DML, SELECT, transaction control, and admin tags do not, so a paste
+        // of inserts costs zero catalog round-trips ([STL-306]).
+        for other in [
+            "INSERT 0 1",
+            "UPDATE 3",
+            "DELETE 0",
+            "SELECT 42",
+            "BEGIN",
+            "COMMIT",
+            "ROLLBACK",
+            "CHECKPOINT",
+            "FLUSH",
+        ] {
+            assert!(!tag_changes_catalog(other), "{other} should not refresh");
+        }
+        // The verb match is case-insensitive and tolerates an empty tag.
+        assert!(tag_changes_catalog("create table t (id int)"));
+        assert!(!tag_changes_catalog(""));
+    }
 
     #[test]
     fn meta_commands_parse_with_aliases() {
