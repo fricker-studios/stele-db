@@ -168,17 +168,19 @@ impl DiskFile for LocalFile {
     }
 }
 
-/// [`std::io::Write::write_all`], but reports how many bytes physically reached
-/// `w` even when the write ultimately fails.
+/// [`std::io::Write::write_all`], but reports how many bytes `w` accepted — the
+/// count its `write` calls returned — even when the write ultimately fails.
 ///
 /// `write_all` returns `()` on success and discards its progress on error, so a
-/// caller cannot tell a *torn* write (a partial physical write that then errors)
-/// from a *clean* one (nothing landed). [`LocalFile::append`] needs that
-/// distinction to keep `len()` in lock-step with the file on the error path —
-/// the signal the WAL's torn-append poison keys off ([STL-299]/[STL-305]). The
-/// returned count is the total bytes accepted by `w` across the loop; on the
-/// `Ok` path it equals `bytes.len()`. `Interrupted` (EINTR) is retried, matching
-/// `write_all`.
+/// caller cannot tell a *partial* write (some bytes accepted, then an error) from
+/// one that wrote nothing. [`LocalFile::append`] needs that distinction to keep
+/// `len()` in lock-step with the file on the error path — the signal the WAL's
+/// torn-append poison keys off ([STL-299]/[STL-305]). For that caller the accepted
+/// count *is* the bytes physically at end-of-file: `w` is a `File` in append mode,
+/// so a byte the OS reports written has landed. (A buffered or otherwise indirect
+/// writer could report bytes not yet on disk, but the only caller is the direct
+/// `File`.) The count is summed across the loop; on the `Ok` path it equals
+/// `bytes.len()`. `Interrupted` (EINTR) is retried, matching `write_all`.
 ///
 /// [STL-299]: https://allegromusic.atlassian.net/browse/STL-299
 /// [STL-305]: https://allegromusic.atlassian.net/browse/STL-305
