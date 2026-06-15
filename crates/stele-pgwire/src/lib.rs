@@ -1236,15 +1236,16 @@ struct ResultColumn {
 // control flow without making it clearer — a readability follow-up, not an
 // MSRV-bump concern.
 /// Default row cap applied to an **unbounded** `SELECT` on the simple-query path
-/// when the client gave no `LIMIT` ([STL-306]).
+/// when the client gave no **finite** `LIMIT`/`FETCH` count ([STL-306]).
 ///
 /// The simple protocol has no per-fetch row control — `psql`, the `stele` shell,
 /// and other ad-hoc tools type a statement and consume the whole result at once.
 /// A bare `SELECT * FROM big_table` would then stream every row, flooding the
 /// client's terminal (which on macOS drains through a ~1 KiB pty buffer) and its
-/// memory — observably hanging the shell. Treating an absent `LIMIT` as an
-/// implicit `LIMIT 1000` keeps an accidental whole-table read interactive while
-/// still letting a caller ask for more with an explicit `LIMIT`.
+/// memory — observably hanging the shell. Treating an unbounded read — no finite
+/// count, so a bare read, an `OFFSET`-only read, or `LIMIT ALL` — as an implicit
+/// `LIMIT 1000` keeps an accidental whole-table read interactive while still
+/// letting a caller ask for more with an explicit `LIMIT`.
 ///
 /// The **extended** protocol is deliberately exempt: a driver (JDBC, psycopg,
 /// pgAdmin) drives row count through the portal's `Execute` `max_rows`, so an

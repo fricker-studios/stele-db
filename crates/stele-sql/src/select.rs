@@ -3121,9 +3121,10 @@ fn row_count(expr: &Expr, clause: &str) -> Result<u64, SelectError> {
 /// table. Over the **simple** query protocol — the `stele` shell, `psql`, any
 /// ad-hoc tool that types a statement and consumes every row at once — that
 /// floods the terminal and the client's memory. When `stmt` is a plain
-/// single-table read with no `LIMIT`/`OFFSET` clause and no `FETCH`, this rewrites
-/// it as if the user had written `LIMIT max_rows`, so the read returns at most
-/// `max_rows` rows. The wire front end applies it on the simple-query path only;
+/// single-table read with no **finite** `LIMIT`/`FETCH` count — a bare read, an
+/// `OFFSET`-only read, or `LIMIT ALL` all qualify — this rewrites it as if the
+/// user had written `LIMIT max_rows`, so the read returns at most `max_rows` rows
+/// (an existing `OFFSET` is kept). The wire front end applies it on the simple-query path only;
 /// the extended protocol leaves the row count to the client's `Execute`
 /// `max_rows` — a driver fetches exactly what it asked for.
 ///
