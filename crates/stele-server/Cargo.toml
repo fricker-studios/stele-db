@@ -21,18 +21,32 @@ stele-pgwire       = { workspace = true }
 stele-lineage      = { workspace = true }
 stele-engine       = { workspace = true }
 stele-storage      = { workspace = true }
+stele-sql          = { workspace = true }
 stele-common       = { workspace = true }
 anyhow             = { workspace = true }
 clap               = { workspace = true }
 serde              = { workspace = true }
+serde_json         = { workspace = true }
 toml               = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The admin / control-plane API (STL-254, ADR-0016): gRPC service + client over
+# HTTP/2; the HTTP/JSON gateway shares the ops listener. See the workspace
+# manifest for the supply-chain rationale.
+tonic              = { workspace = true }
+tonic-prost        = { workspace = true }
+prost              = { workspace = true }
+tokio-stream       = { workspace = true }
+
+[build-dependencies]
+# Codegen of the v1alpha1 admin .proto contract via a vendored protoc (no system
+# protobuf compiler needed on any CI target). See the workspace manifest.
+tonic-prost-build   = { workspace = true }
+protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 # The ops-endpoint integration tests drive real wire load through the server
 # (STL-253): tokio-postgres as the SQL client, stele-sql for the `Statement`
 # type a delegating test session needs in its `SessionHandle` signatures.
-stele-sql      = { workspace = true }
 tokio-postgres = { workspace = true }

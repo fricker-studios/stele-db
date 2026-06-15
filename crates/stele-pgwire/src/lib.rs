@@ -102,6 +102,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, instrument, warn};
 
 pub use stele_common::DEFAULT_PG_PORT;
+/// Render a `SelectResult`-style cell to Postgres text format — reused by the
+/// admin / control-plane API so its introspection replies match the SQL wire
+/// ([STL-254]).
+pub use text_format::render_cell;
 pub use tls::{ServerTls, TlsError, TlsMode, TlsSettings};
 
 use stele_catalog::CatalogError;

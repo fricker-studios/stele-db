@@ -36,6 +36,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, instrument, warn};
 
+use crate::admin::http::{AdminHttpResponder, HttpRequest, MAX_BODY_BYTES};
+
+/// The path prefix the admin / control-plane HTTP gateway owns ([STL-254]).
+const ADMIN_PREFIX: &str = "/v1alpha1/";
+
 /// How long a client may dribble its request head before the connection is
 /// dropped — scrapers send their `GET` in one segment, so this only bounds
 /// misbehaving peers.
@@ -60,6 +65,12 @@ pub struct OpsState {
     /// metric registry (cached here so a scrape never takes the engine lock
     /// just to reach the registry).
     ready: Mutex<Option<Ready>>,
+    /// `None` until recovery completes; then the admin / control-plane HTTP
+    /// gateway ([ADR-0016], [STL-254]) that handles `/v1alpha1/…`. Installed
+    /// alongside [`set_ready`](Self::set_ready) because it needs the recovered
+    /// engine. Always present in a running server (it authenticates every
+    /// request, rejecting all when no token is configured).
+    admin: Mutex<Option<Arc<dyn AdminHttpResponder>>>,
 }
 
 struct Ready {
@@ -72,6 +83,20 @@ impl OpsState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Install the admin / control-plane HTTP gateway that answers `/v1alpha1/…`
+    /// ([STL-254]). Done once the recovered engine is in hand.
+    pub fn set_admin(&self, admin: Arc<dyn AdminHttpResponder>) {
+        *self.admin.lock().unwrap_or_else(PoisonError::into_inner) = Some(admin);
+    }
+
+    /// The installed admin gateway, if any.
+    fn admin(&self) -> Option<Arc<dyn AdminHttpResponder>> {
+        self.admin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Mark recovery complete: `/readyz` flips to `200` (as long as `session`
@@ -189,21 +214,30 @@ impl BoundOpsServer {
 /// Serve exactly one request on `stream`, then close (`Connection: close` —
 /// scrapers reconnect per scrape, so keep-alive buys nothing here).
 async fn handle_connection(mut stream: TcpStream, state: Arc<OpsState>) -> io::Result<()> {
-    let Some(head) = read_request_head(&mut stream).await? else {
-        return Ok(()); // peer closed (or dribbled past the cap) before a full head
+    let Some(request) = read_request(&mut stream).await? else {
+        return Ok(()); // peer closed (or dribbled past a cap) before a full request
     };
-    let response = respond(&head, &state);
+    let response = route(&request, &state);
     write_response(&mut stream, &response).await?;
     stream.shutdown().await
 }
 
-/// Read until the blank line that ends the request head, returning the raw
-/// head bytes as a lossy string. `None` if the peer closes first, exceeds
-/// [`MAX_HEAD_BYTES`], or stalls past [`READ_TIMEOUT`].
-async fn read_request_head(stream: &mut TcpStream) -> io::Result<Option<String>> {
+/// A raw request: the head (everything up to and including the blank line) and
+/// the body bytes (empty unless the request carried a `Content-Length`).
+struct RawRequest {
+    head: String,
+    body: Vec<u8>,
+}
+
+/// Read one request: the head, then — if it declares a `Content-Length` — the
+/// body. `None` if the peer closes first, exceeds [`MAX_HEAD_BYTES`] /
+/// [`MAX_BODY_BYTES`], or stalls past [`READ_TIMEOUT`]. Body-less probes (the
+/// metrics/health scrapes) read exactly the head and return an empty body.
+async fn read_request(stream: &mut TcpStream) -> io::Result<Option<RawRequest>> {
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0u8; 512];
-    loop {
+    // Read until the CRLFCRLF that ends the head.
+    let head_end = loop {
         let read = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk)).await;
         let n = match read {
             Ok(result) => result?,
@@ -213,83 +247,158 @@ async fn read_request_head(stream: &mut TcpStream) -> io::Result<Option<String>>
             return Ok(None);
         }
         buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
         }
         if buf.len() > MAX_HEAD_BYTES {
             return Ok(None);
         }
+    };
+
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let mut body = buf[head_end..].to_vec();
+    // Read the rest of the body, if any, per the declared length.
+    if let Some(len) = content_length(&head) {
+        if len > MAX_BODY_BYTES {
+            return Ok(None);
+        }
+        while body.len() < len {
+            let read = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk)).await;
+            let n = match read {
+                Ok(result) => result?,
+                Err(_elapsed) => return Ok(None),
+            };
+            if n == 0 {
+                break; // peer closed early; route on what we have
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+        body.truncate(len);
     }
+    Ok(Some(RawRequest { head, body }))
 }
 
-/// A fully-formed response: status line tail, content type, body.
+/// Parse the `Content-Length` header (case-insensitive) from `head`.
+fn content_length(head: &str) -> Option<usize> {
+    head.lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse().ok())
+}
+
+/// The `(method, path)` of a request head, with any query string stripped from
+/// the path.
+fn request_line(head: &str) -> (&str, &str) {
+    let line = head.lines().next().unwrap_or_default();
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    let path = target.split('?').next().unwrap_or_default();
+    (method, path)
+}
+
+/// Route a request to either the admin gateway (`/v1alpha1/…`) or the built-in
+/// metrics/probe endpoints.
+fn route(request: &RawRequest, state: &OpsState) -> Response {
+    let (method, path) = request_line(&request.head);
+    // `/v1alpha1/…` (with a non-empty tail) belongs to the admin gateway when one
+    // is installed; a bare `/v1alpha1/` and everything else fall through to the
+    // built-in metrics/probe routes.
+    if path
+        .strip_prefix(ADMIN_PREFIX)
+        .is_some_and(|rest| !rest.is_empty())
+    {
+        return state.admin().map_or_else(
+            || Response::text("503 Service Unavailable", "admin API not ready\n"),
+            |admin| {
+                let authorization = header(&request.head, "authorization").map(str::to_owned);
+                let reply = admin.respond(&HttpRequest {
+                    method: method.to_owned(),
+                    path: path.to_owned(),
+                    authorization,
+                    body: request.body.clone(),
+                });
+                Response {
+                    status: reply.status,
+                    content_type: reply.content_type,
+                    allow: reply.allow,
+                    body: reply.body,
+                }
+            },
+        );
+    }
+    respond(method, path, state)
+}
+
+/// The first value of header `name` (case-insensitive) in `head`.
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim())
+}
+
+/// A fully-formed response: status line tail, content type, optional `Allow`
+/// (for `405`), and body.
 struct Response {
     status: &'static str,
     content_type: &'static str,
+    allow: &'static str,
     body: String,
 }
 
-/// Route one request head to its response. Pure (no I/O), so the routing
-/// table is unit-testable without sockets.
-fn respond(head: &str, state: &OpsState) -> Response {
-    let request_line = head.lines().next().unwrap_or_default();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default();
-    let target = parts.next().unwrap_or_default();
-    // Probes sometimes append cache-busting queries; route on the path alone.
-    let path = target.split('?').next().unwrap_or_default();
+impl Response {
+    /// A `text/plain` response with no `Allow` header.
+    fn text(status: &'static str, body: &str) -> Self {
+        Self {
+            status,
+            content_type: "text/plain; charset=utf-8",
+            allow: "",
+            body: body.to_owned(),
+        }
+    }
+}
 
+/// Route a built-in metrics/probe request to its response. Pure (no I/O), so the
+/// routing table is unit-testable without sockets.
+fn respond(method: &str, path: &str, state: &OpsState) -> Response {
     if method != "GET" {
         return Response {
-            status: "405 Method Not Allowed",
-            content_type: "text/plain; charset=utf-8",
-            body: "method not allowed\n".to_owned(),
+            allow: "GET",
+            ..Response::text("405 Method Not Allowed", "method not allowed\n")
         };
     }
     match path {
-        "/healthz" => Response {
-            status: "200 OK",
-            content_type: "text/plain; charset=utf-8",
-            body: "ok\n".to_owned(),
-        },
+        "/healthz" => Response::text("200 OK", "ok\n"),
         "/readyz" => match state.readiness() {
-            Ok(()) => Response {
-                status: "200 OK",
-                content_type: "text/plain; charset=utf-8",
-                body: "ready\n".to_owned(),
-            },
-            Err(reason) => Response {
-                status: "503 Service Unavailable",
-                content_type: "text/plain; charset=utf-8",
-                body: reason.to_owned(),
-            },
+            Ok(()) => Response::text("200 OK", "ready\n"),
+            Err(reason) => Response::text("503 Service Unavailable", reason),
         },
         "/metrics" => state.render_metrics().map_or_else(
-            || Response {
-                status: "503 Service Unavailable",
-                content_type: "text/plain; charset=utf-8",
-                body: "starting: recovery has not completed\n".to_owned(),
+            || {
+                Response::text(
+                    "503 Service Unavailable",
+                    "starting: recovery has not completed\n",
+                )
             },
             |body| Response {
                 status: "200 OK",
                 content_type: METRICS_CONTENT_TYPE,
+                allow: "",
                 body,
             },
         ),
-        _ => Response {
-            status: "404 Not Found",
-            content_type: "text/plain; charset=utf-8",
-            body: "not found\n".to_owned(),
-        },
+        _ => Response::text("404 Not Found", "not found\n"),
     }
 }
 
 async fn write_response(stream: &mut TcpStream, response: &Response) -> io::Result<()> {
-    // `Allow` is mandatory on 405 (RFC 9110 §15.5.6); harmless to scope it there.
-    let allow = if response.status.starts_with("405") {
-        "Allow: GET\r\n"
+    // `Allow` is mandatory on 405 (RFC 9110 §15.5.6); each route supplies the
+    // methods it accepts.
+    let allow = if response.allow.is_empty() {
+        String::new()
     } else {
-        ""
+        format!("Allow: {}\r\n", response.allow)
     };
     let head = format!(
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
@@ -310,10 +419,17 @@ mod tests {
         format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n")
     }
 
+    /// Parse a request head and route it the way [`handle_connection`] does for a
+    /// built-in (non-admin) request — exercising [`request_line`] + [`respond`].
+    fn respond_head(head: &str, state: &OpsState) -> Response {
+        let (method, path) = request_line(head);
+        respond(method, path, state)
+    }
+
     #[test]
     fn healthz_is_ok_even_before_ready() {
         let state = OpsState::new();
-        let r = respond(&get("/healthz"), &state);
+        let r = respond_head(&get("/healthz"), &state);
         assert_eq!(r.status, "200 OK");
         assert_eq!(r.body, "ok\n");
     }
@@ -321,32 +437,58 @@ mod tests {
     #[test]
     fn readyz_and_metrics_are_503_before_recovery() {
         let state = OpsState::new();
-        let r = respond(&get("/readyz"), &state);
+        let r = respond_head(&get("/readyz"), &state);
         assert_eq!(r.status, "503 Service Unavailable");
         assert!(r.body.contains("recovery"), "{}", r.body);
-        let m = respond(&get("/metrics"), &state);
+        let m = respond_head(&get("/metrics"), &state);
         assert_eq!(m.status, "503 Service Unavailable");
     }
 
     #[test]
     fn unknown_path_is_404_and_non_get_is_405() {
         let state = OpsState::new();
-        assert_eq!(respond(&get("/nope"), &state).status, "404 Not Found");
-        let r = respond("POST /metrics HTTP/1.1\r\n\r\n", &state);
+        assert_eq!(respond_head(&get("/nope"), &state).status, "404 Not Found");
+        let r = respond_head("POST /metrics HTTP/1.1\r\n\r\n", &state);
         assert_eq!(r.status, "405 Method Not Allowed");
+        assert_eq!(r.allow, "GET");
     }
 
     #[test]
     fn query_strings_are_stripped_from_the_route() {
         let state = OpsState::new();
-        let r = respond(&get("/healthz?probe=1"), &state);
+        let r = respond_head(&get("/healthz?probe=1"), &state);
         assert_eq!(r.status, "200 OK");
     }
 
     #[test]
     fn garbage_request_line_is_refused_not_a_panic() {
         let state = OpsState::new();
-        assert_eq!(respond("", &state).status, "405 Method Not Allowed");
-        assert_eq!(respond("GET\r\n\r\n", &state).status, "404 Not Found");
+        assert_eq!(respond_head("", &state).status, "405 Method Not Allowed");
+        assert_eq!(respond_head("GET\r\n\r\n", &state).status, "404 Not Found");
+    }
+
+    #[test]
+    fn content_length_is_parsed_case_insensitively() {
+        assert_eq!(
+            content_length("POST /x HTTP/1.1\r\nContent-Length: 12\r\n\r\n"),
+            Some(12)
+        );
+        assert_eq!(
+            content_length("POST /x HTTP/1.1\r\ncontent-length:  7 \r\n\r\n"),
+            Some(7)
+        );
+        assert_eq!(content_length("GET /x HTTP/1.1\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn admin_prefix_without_a_gateway_is_503() {
+        // `/v1alpha1/…` with no admin installed (the default OpsState) is a 503,
+        // distinct from a built-in 404 — the surface exists but is not ready.
+        let state = OpsState::new();
+        let req = RawRequest {
+            head: get("/v1alpha1/health"),
+            body: Vec::new(),
+        };
+        assert_eq!(route(&req, &state).status, "503 Service Unavailable");
     }
 }

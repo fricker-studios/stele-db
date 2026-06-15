@@ -409,32 +409,67 @@ pub fn restore_disk<S: Disk, T: Disk>(src: &S, dst: &T) -> Result<BackupManifest
         return Err(RestoreError::TargetNotEmpty);
     }
 
+    let manifest = read_manifest(src)?;
+    for entry in &manifest.files {
+        // Verify before writing, per file — a mismatch leaves `dst` partially
+        // written but returns an error, so the caller discards the directory.
+        let bytes = read_verified(src, entry)?;
+        write_all(dst, &entry.name, &bytes)?;
+    }
+    dst.sync_dir()?;
+    Ok(manifest)
+}
+
+/// Validate the backup in `src` **without** materializing it — the read-only
+/// sibling of [`restore_disk`], behind the admin API's `RestorePlan` ([STL-254]).
+///
+/// Runs exactly the verification a restore does — decode the manifest (its
+/// self-digest), then check every listed file's length and SHA-256 — but writes
+/// nothing and needs no target. Returns the decoded [`BackupManifest`] so the
+/// caller can report what the backup vouches for.
+///
+/// # Errors
+///
+/// [`RestoreError`] if the manifest is missing/malformed/tampered, a listed file
+/// is absent, or any file fails its checksum.
+///
+/// [STL-254]: https://allegromusic.atlassian.net/browse/STL-254
+pub fn verify_disk<S: Disk>(src: &S) -> Result<BackupManifest, RestoreError> {
+    let manifest = read_manifest(src)?;
+    for entry in &manifest.files {
+        read_verified(src, entry)?;
+    }
+    Ok(manifest)
+}
+
+/// Read and decode the backup manifest from `src` (verifying its self-digest).
+fn read_manifest<S: Disk>(src: &S) -> Result<BackupManifest, RestoreError> {
     let manifest_bytes = match src.open(MANIFEST_FILENAME) {
         Ok(_) => read_all(src, MANIFEST_FILENAME)?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(RestoreError::ManifestMissing),
         Err(e) => return Err(RestoreError::Io(e)),
     };
-    let manifest = BackupManifest::decode(&manifest_bytes)?;
+    BackupManifest::decode(&manifest_bytes)
+}
 
-    for entry in &manifest.files {
-        let bytes = match src.open(&entry.name) {
-            Ok(_) => read_all(src, &entry.name)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(RestoreError::MissingFile {
-                    name: entry.name.clone(),
-                });
-            }
-            Err(e) => return Err(RestoreError::Io(e)),
-        };
-        if bytes.len() as u64 != entry.len || sha256(&bytes) != entry.sha256 {
-            return Err(RestoreError::ChecksumMismatch {
+/// Read one backed-up file and check it against its manifest `entry` (length +
+/// SHA-256), returning its verified bytes.
+fn read_verified<S: Disk>(src: &S, entry: &FileEntry) -> Result<Vec<u8>, RestoreError> {
+    let bytes = match src.open(&entry.name) {
+        Ok(_) => read_all(src, &entry.name)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(RestoreError::MissingFile {
                 name: entry.name.clone(),
             });
         }
-        write_all(dst, &entry.name, &bytes)?;
+        Err(e) => return Err(RestoreError::Io(e)),
+    };
+    if bytes.len() as u64 != entry.len || sha256(&bytes) != entry.sha256 {
+        return Err(RestoreError::ChecksumMismatch {
+            name: entry.name.clone(),
+        });
     }
-    dst.sync_dir()?;
-    Ok(manifest)
+    Ok(bytes)
 }
 
 /// Parse a lowercase-hex SHA-256 string into a [`Digest`]; `None` if it is not
@@ -611,6 +646,52 @@ mod tests {
             matches!(err, RestoreError::ChecksumMismatch { name } if name == "stele.catalog"),
             "a flipped byte must be caught at restore"
         );
+    }
+
+    #[test]
+    fn verify_validates_a_good_backup_and_catches_tampering() {
+        // RestorePlan's primitive ([STL-254]): the same checks restore runs, but
+        // read-only — no target written.
+        let src = MemDisk::new();
+        write_all(&src, "stele.catalog", b"catalog-bytes").unwrap();
+        write_all(&src, "t00000000000000000000-seg-0.seg", b"segment").unwrap();
+        let backup = MemDisk::new();
+        let taken = backup_disk(&src, &backup, 7, sha256(b"head")).expect("backup");
+
+        // A clean backup verifies and returns the same manifest the backup wrote.
+        assert_eq!(verify_disk(&backup).expect("verify"), taken);
+
+        // A flipped byte in a data file is caught — exactly like restore.
+        backup.remove("stele.catalog").unwrap();
+        write_all(&backup, "stele.catalog", b"catalog-XXXXX").unwrap();
+        assert!(
+            matches!(verify_disk(&backup), Err(RestoreError::ChecksumMismatch { name }) if name == "stele.catalog"),
+            "verify must catch a flipped data byte"
+        );
+    }
+
+    #[test]
+    fn verify_refuses_a_tampered_manifest_and_a_missing_one() {
+        // A tampered manifest body fails its self-digest.
+        let src = MemDisk::new();
+        write_all(&src, "stele.catalog", b"x").unwrap();
+        let backup = MemDisk::new();
+        backup_disk(&src, &backup, 1234, Digest::ZERO).unwrap();
+        let original = String::from_utf8(read_all(&backup, MANIFEST_FILENAME).unwrap()).unwrap();
+        let tampered = original.replacen("1234", "4321", 1);
+        assert_ne!(original, tampered);
+        backup.remove(MANIFEST_FILENAME).unwrap();
+        write_all(&backup, MANIFEST_FILENAME, tampered.as_bytes()).unwrap();
+        assert!(matches!(
+            verify_disk(&backup),
+            Err(RestoreError::ManifestDigestMismatch)
+        ));
+
+        // No manifest at all is a missing-manifest error.
+        assert!(matches!(
+            verify_disk(&MemDisk::new()),
+            Err(RestoreError::ManifestMissing)
+        ));
     }
 
     #[test]

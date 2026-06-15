@@ -89,6 +89,31 @@ pub(crate) fn encode_text(value: &ScalarValue) -> String {
     }
 }
 
+/// Render one [`SelectResult`]-style cell — the value's canonical encoding, or
+/// `None` for SQL `NULL` — to its Postgres text form, decoding it against `ty`
+/// first ([`ScalarValue::decode`]).
+///
+/// The admin / control-plane API ([STL-254]) renders its tabular introspection
+/// replies with this so an admin client sees values **identically** to the SQL
+/// wire — one text rendering for both surfaces.
+///
+/// Returns `Ok(None)` for a NULL cell and `Ok(Some(text))` for a present value.
+///
+/// # Errors
+///
+/// [`DecodeError`](stele_common::types::DecodeError) if `cell` is `Some(bytes)`
+/// that do not decode as a `ty` value (a corrupt or mis-typed cell).
+///
+/// [`SelectResult`]: stele_engine::SelectResult
+/// [STL-254]: https://allegromusic.atlassian.net/browse/STL-254
+pub fn render_cell(
+    ty: LogicalType,
+    cell: Option<&[u8]>,
+) -> Result<Option<String>, stele_common::types::DecodeError> {
+    cell.map(|bytes| ScalarValue::decode(ty, bytes).map(|v| encode_text(&v)))
+        .transpose()
+}
+
 /// Render a `float8` in Postgres text format.
 ///
 /// Postgres (≥ 12) prints the **shortest decimal that round-trips** to the same

@@ -1,0 +1,171 @@
+// The Stele admin / control-plane API — v1alpha1 ([ADR-0016], [STL-254]).
+//
+// The dedicated ops surface for things that are not SQL: health, status,
+// backup/restore validation, and segment / version / commit-chain introspection.
+// SQL stays on pg-wire (existing Postgres drivers); this surface is ops-only.
+//
+// THIS .proto IS THE VERSIONED CONTRACT. The gRPC service is generated from it
+// (stele-server's build.rs), and the HTTP/JSON gateway maps onto the same methods
+// (docs/11 §9). The version is carried in the package name — `v1alpha1` — and
+// graduates v1alpha1 -> v1beta1 -> v1 Kubernetes-style with deprecation windows
+// ([ADR-0014]). Within v1alpha1, changes are additive (new fields / methods);
+// breaking changes mint the next version.
+//
+// Auth is a static bearer token (the `authorization: Bearer <token>` metadata on
+// gRPC, the `Authorization: Bearer <token>` header over HTTP). With no token
+// configured the surface rejects every call (secure default).
+//
+// [ADR-0016]: ../../../docs/adr/0016-admin-control-plane-api.md
+// [ADR-0014]: ../../../docs/adr/0014-release-channels-and-versioning-policy.md
+// [STL-254]: https://allegromusic.atlassian.net/browse/STL-254
+
+syntax = "proto3";
+
+package stele.admin.v1alpha1;
+
+// The admin / control-plane service. v0 (v0.3): health, status, backup trigger,
+// restore-plan validation, and the introspection the shell's temporal + admin
+// tiers consume ([STL-199]/[STL-200]). Lifecycle, users/roles, and PITR land in
+// later versions as the engine grows them ([ADR-0016] phasing).
+service AdminService {
+  // Liveness: SERVING whenever the process can answer. Says nothing about the
+  // engine — use Status for that. Unauthenticated callers are still rejected.
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // Engine state: readiness, WAL-poison, server version, and table/user/segment
+  // counts.
+  rpc Status(StatusRequest) returns (StatusResponse);
+
+  // Trigger a consistent online full backup into `path` ([STL-249]); returns the
+  // backup manifest's summary.
+  rpc Backup(BackupRequest) returns (BackupResponse);
+
+  // Validate a backup directory WITHOUT applying it: decode + checksum-verify the
+  // manifest and every file. The read-only sibling of restore.
+  rpc RestorePlan(RestorePlanRequest) returns (RestorePlanResponse);
+
+  // Per-table columnar segment + zone-map metadata ([STL-301]).
+  rpc Segments(SegmentsRequest) returns (TableResponse);
+
+  // Per-key (or whole-table) version history ([STL-199]).
+  rpc Versions(VersionsRequest) returns (TableResponse);
+
+  // Per-version commit hash-chain links + an intact/broken verdict ([STL-302]).
+  rpc AuditChain(AuditChainRequest) returns (TableResponse);
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  enum ServingStatus {
+    SERVING_STATUS_UNSPECIFIED = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+  }
+  ServingStatus status = 1;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  // Recovery complete and no table's WAL is poisoned ([STL-217]).
+  bool ready = 1;
+  // A failed fsync has poisoned a table's WAL; the engine refuses writes until
+  // restarted into recovery.
+  bool wal_poisoned = 2;
+  // The `stele-server` crate version serving this API.
+  string server_version = 3;
+  uint64 table_count = 4;
+  uint64 user_count = 5;
+  repeated TableStatus tables = 6;
+}
+
+message TableStatus {
+  string name = 1;
+  uint64 column_count = 2;
+  // Resident sealed segments + the hot delta tier ([STL-301]).
+  uint64 segment_count = 3;
+}
+
+// A backup manifest's summary ([ADR-0032]).
+message ManifestSummary {
+  uint32 manifest_version = 1;
+  // The stele-engine version that produced the backup.
+  string stele_version = 2;
+  // The fence instant: the commit clock high-water mark at backup time.
+  int64 fence_micros = 3;
+  // The hash-chained commit log's head the backup vouches for (lowercase hex).
+  string commit_head = 4;
+  uint64 file_count = 5;
+  uint64 total_bytes = 6;
+}
+
+message BackupRequest {
+  // Destination directory for the backup (a local filesystem path; created if
+  // absent, must be empty).
+  string path = 1;
+}
+
+message BackupResponse {
+  ManifestSummary manifest = 1;
+}
+
+message RestorePlanRequest {
+  // The backup directory to validate (a local filesystem path).
+  string path = 1;
+}
+
+message RestorePlanResponse {
+  // True when the manifest decoded and every file matched its recorded checksum.
+  bool valid = 1;
+  // When `valid` is false, why the backup did not validate; empty otherwise.
+  string error = 2;
+  // The manifest summary when it decoded (present even on a per-file checksum
+  // failure, since the manifest itself was readable); absent if the manifest is
+  // missing or its own self-digest failed.
+  ManifestSummary manifest = 3;
+}
+
+message SegmentsRequest {
+  string table = 1;
+}
+
+message VersionsRequest {
+  string table = 1;
+  // An optional business-key filter, written as a SQL literal (`42`, `'alice'`,
+  // `DATE '2020-01-01'`) — folded to the key column's type exactly as the SQL
+  // path folds it. Absent = every key.
+  optional string key = 2;
+}
+
+message AuditChainRequest {
+  string table = 1;
+  // See VersionsRequest.key.
+  optional string key = 2;
+}
+
+// A generic tabular introspection result — the gRPC/JSON shape of the engine's
+// SelectResult. Each cell is rendered to text by its column type, identically to
+// the SQL wire's text format, so a client renders one reply for every command.
+message TableResponse {
+  repeated Column columns = 1;
+  repeated Row rows = 2;
+}
+
+message Column {
+  string name = 1;
+  // The column's logical type name (e.g. `int8`, `text`, `timestamptz`).
+  string type = 2;
+}
+
+message Row {
+  repeated Cell cells = 1;
+}
+
+message Cell {
+  // A SQL NULL. When true, `value` is empty and meaningless.
+  bool is_null = 1;
+  // The cell's rendered text (the value's canonical text form); valid iff
+  // `is_null` is false.
+  string value = 2;
+}

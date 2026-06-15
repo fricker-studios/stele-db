@@ -328,9 +328,13 @@ fsync      = "on_commit"        # group commit; the durability point ([02 §3.4]
 [telemetry]
 metrics    = "0.0.0.0:9090"     # Prometheus/OpenMetrics
 tracing    = "info"
+
+[admin]                          # admin / control-plane API ([ADR-0016], STL-254)
+tokens      = ["change-me"]      # bearer tokens; no token ⇒ the API is OFF
+grpc_listen = "127.0.0.1:5455"   # gRPC port (HTTP/JSON gateway shares :9090)
 ```
 
-A ready-to-copy sample lives at [`stele.example.toml`](../stele.example.toml) in the repo root — `cp stele.example.toml stele.toml` and edit. Only `[server] listen`/`data_dir`, `[storage] backend`, `[tls]`, and `[telemetry] metrics` (the ops HTTP listener — `/metrics`, `/healthz`, `/readyz`; see [11 §1](11-operations-and-runbooks.md#1-health--monitoring)) are read today (STL-116, STL-251, STL-253); the other sections above are reserved (the parser ignores unknown sections) and land in later tickets.
+A ready-to-copy sample lives at [`stele.example.toml`](../stele.example.toml) in the repo root — `cp stele.example.toml stele.toml` and edit. Only `[server] listen`/`data_dir`, `[storage] backend`, `[tls]`, `[telemetry] metrics` (the ops HTTP listener — `/metrics`, `/healthz`, `/readyz`; see [11 §1](11-operations-and-runbooks.md#1-health--monitoring)), and `[admin]` (the admin / control-plane API — gRPC + an HTTP/JSON gateway on the ops listener; see [11 §9](11-operations-and-runbooks.md#9-admin--control-plane-api)) are read today (STL-116, STL-251, STL-253, STL-254); the other sections above are reserved (the parser ignores unknown sections) and land in later tickets.
 
 **Secure defaults** ([10 §4](10-security-and-compliance.md#4-data-protection--encryption), STL-251/STL-304): a config-file (non-dev) run **without `[tls]` on a non-loopback `listen` boots on an ephemeral self-signed certificate** — the listener is encrypted, but the cert is unauthenticated (clients can't verify the server) and regenerated each restart, so it warns loudly to configure real certs rather than serving plaintext beyond the local machine. Plaintext stays loopback-only (a `127.0.0.1` bind warns and proceeds). Configure `[tls]` with a CA-issued cert for production, bind `127.0.0.1`, or use `--dev`.
 
