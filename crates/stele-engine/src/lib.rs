@@ -5704,27 +5704,57 @@ fn in_subquery_plan(
 ) -> Result<FilterPlan, EngineError> {
     let values = subquery_column_values(result)?;
     if negated {
+        // `NOT IN (set containing NULL)` is never true (the NULL makes membership
+        // unknown for every outer row), so nothing passes.
         if values.iter().any(Option::is_none) {
             return Ok(FilterPlan::Empty);
         }
-        let plan = values.into_iter().flatten().fold(None::<Expr>, |acc, v| {
-            let term = Expr::col(column).compare(CmpOp::Ne, Expr::lit(v));
-            Some(match acc {
-                Some(e) => e.logic(LogicOp::And, term),
-                None => term,
-            })
-        });
-        Ok(plan.map_or(FilterPlan::KeepAll, FilterPlan::Predicate))
+        let terms = values
+            .into_iter()
+            .flatten()
+            .map(|v| Expr::col(column).compare(CmpOp::Ne, Expr::lit(v)))
+            .collect();
+        // `NOT IN ()` keeps every row.
+        Ok(balanced_logic(terms, LogicOp::And).map_or(FilterPlan::KeepAll, FilterPlan::Predicate))
     } else {
-        let plan = values.into_iter().flatten().fold(None::<Expr>, |acc, v| {
-            let term = Expr::col(column).compare(CmpOp::Eq, Expr::lit(v));
-            Some(match acc {
-                Some(e) => e.logic(LogicOp::Or, term),
-                None => term,
-            })
-        });
-        Ok(plan.map_or(FilterPlan::Empty, FilterPlan::Predicate))
+        let terms = values
+            .into_iter()
+            .flatten()
+            .map(|v| Expr::col(column).compare(CmpOp::Eq, Expr::lit(v)))
+            .collect();
+        // `IN ()` matches no row.
+        Ok(balanced_logic(terms, LogicOp::Or).map_or(FilterPlan::Empty, FilterPlan::Predicate))
     }
+}
+
+/// Combine `terms` under `op` (`AND`/`OR`) into a **balanced** expression tree of
+/// depth `⌈log₂ n⌉`, built iteratively (pairwise), rather than a left-deep chain.
+///
+/// `IN (SELECT …)` folds its inner result into an `OR` of `col = vᵢ` (and `NOT IN`
+/// into an `AND` of `col ≠ vᵢ`). A left-deep chain over a large inner result is `n`
+/// deep, and `eval_expr` (and the tree's own `Drop`) walk it **recursively**, so a
+/// few thousand inner rows overflow a runtime worker thread's stack and abort the
+/// whole server — a single well-formed query must never do that. A balanced tree
+/// caps that depth at `⌈log₂ n⌉` (~20 even for a million values). `AND`/`OR` are
+/// associative and commutative (3-valued `min`/`max`), so re-nesting cannot change
+/// the result. Returns `None` for empty `terms`.
+fn balanced_logic(terms: Vec<Expr>, op: LogicOp) -> Option<Expr> {
+    if terms.is_empty() {
+        return None;
+    }
+    let mut level = terms;
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        let mut pairs = level.into_iter();
+        while let Some(left) = pairs.next() {
+            next.push(match pairs.next() {
+                Some(right) => left.logic(op, right),
+                None => left, // an odd term carries up to the next level unchanged
+            });
+        }
+        level = next;
+    }
+    level.into_iter().next()
 }
 
 /// Overlay a transaction's buffered writes for `table` onto the snapshot-resolved
@@ -14940,6 +14970,75 @@ mod tests {
             "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s)",
         ));
         assert_eq!(not_in_got, vec![1, 2]);
+    }
+
+    #[test]
+    fn balanced_logic_builds_a_logarithmic_depth_tree() {
+        // A left-deep fold of N terms is N deep; the balanced build caps depth at
+        // ceil(log2 N) — what keeps `eval_expr` (and the tree's `Drop`) off a stack
+        // overflow when an `IN (SELECT …)` set is large.
+        fn logic_depth(e: &Expr) -> usize {
+            match e {
+                Expr::Logic { left, right, .. } => 1 + logic_depth(left).max(logic_depth(right)),
+                _ => 0,
+            }
+        }
+        let terms: Vec<Expr> = (0..1024)
+            .map(|i| Expr::col(0).compare(CmpOp::Eq, Expr::lit(ScalarValue::Int4(i))))
+            .collect();
+        let tree = balanced_logic(terms, LogicOp::Or).expect("non-empty");
+        assert_eq!(logic_depth(&tree), 10, "1024 leaves → depth 10, not 1023");
+
+        // Empty → None; a lone term is returned unwrapped (depth 0).
+        assert!(balanced_logic(Vec::new(), LogicOp::Or).is_none());
+        let one = balanced_logic(
+            vec![Expr::col(0).compare(CmpOp::Eq, Expr::lit(ScalarValue::Int4(7)))],
+            LogicOp::And,
+        )
+        .expect("one");
+        assert_eq!(logic_depth(&one), 0);
+    }
+
+    #[test]
+    fn in_subquery_over_a_large_inner_result_does_not_overflow_the_stack() {
+        // Regression: an `IN (SELECT …)` whose inner result is a few thousand rows
+        // used to fold into an N-deep OR tree that `eval_expr` walked recursively,
+        // overflowing a runtime worker thread's stack and aborting the whole server.
+        // Run the real bind→scan→eval path on a thread with a worker-sized (2 MiB)
+        // stack — the size that crashed — so a re-introduced left-deep fold fails
+        // here (a stack overflow aborts the test process) instead of in production.
+        const N: i32 = 2_000;
+        let (in_count, not_in_count) = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                use std::fmt::Write as _;
+                let mut engine = subquery_session();
+                let mut insert = String::from("INSERT INTO t VALUES ");
+                for i in 1..=N {
+                    if i > 1 {
+                        insert.push(',');
+                    }
+                    let _ = write!(insert, "({i},{})", i * 3);
+                }
+                engine.execute(&parse_one(&insert)).expect("bulk insert");
+                // Every row's `a` is in `SELECT a FROM t`: `IN` keeps all N rows,
+                // `NOT IN` (the AND-tree path) keeps none — both fold over the full set.
+                let in_rows = select(&mut engine, "SELECT id FROM t WHERE a IN (SELECT a FROM t)")
+                    .rows
+                    .len();
+                let not_in_rows = select(
+                    &mut engine,
+                    "SELECT id FROM t WHERE a NOT IN (SELECT a FROM t)",
+                )
+                .rows
+                .len();
+                (in_rows, not_in_rows)
+            })
+            .expect("spawn")
+            .join()
+            .expect("the IN-subquery must not overflow the stack");
+        assert_eq!(in_count, usize::try_from(N).unwrap(), "IN keeps every row");
+        assert_eq!(not_in_count, 0, "NOT IN over the full set keeps none");
     }
 
     #[test]
