@@ -235,3 +235,52 @@ async fn interactive_shell_processes_a_large_pasted_block_without_losing_input()
     .await
     .expect("pty shell task");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completion_still_learns_a_table_created_this_session() {
+    // The companion change to STL-306 stops refreshing ⇥-completion after *every*
+    // statement and does it only after DDL. Guard the behavior that matters: a
+    // table created in this session is immediately completable. (The refresh runs
+    // synchronously in the loop before the next `readline`, so there is no race —
+    // the editor only reads the partial line after completion has been re-read.)
+    let addr = spawn_server().await;
+
+    tokio::task::spawn_blocking(move || {
+        let mut shell = PtyShell::spawn(addr);
+        assert!(
+            shell.wait_until(Duration::from_secs(15), Duration::from_secs(12), |o| o
+                .contains("Connected to database")),
+            "interactive shell never connected:\n{}",
+            shell.snapshot()
+        );
+
+        // A distinctively named table so the completion can't be a SQL keyword or a
+        // column name, and so it cannot already be on the line from anything we typed.
+        shell.send(
+            "CREATE TABLE zqxwidget (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING;\n",
+        );
+        assert!(
+            shell.wait_until(Duration::from_secs(15), Duration::from_secs(12), |o| o
+                .contains("CREATE TABLE")),
+            "CREATE TABLE never completed:\n{}",
+            shell.snapshot()
+        );
+
+        // Everything from here is new output; the unique prefix `zqxw` should
+        // expand to the freshly-created `zqxwidget` on ⇥ — which can only happen if
+        // the DDL refreshed the completer's identifiers.
+        let mark = shell.snapshot().len();
+        shell.send("SELECT * FROM zqxw\t");
+        let completed = shell.wait_until(Duration::from_secs(15), Duration::from_secs(12), |o| {
+            o.get(mark..).is_some_and(|tail| tail.contains("zqxwidget"))
+        });
+        assert!(
+            completed,
+            "⇥ did not complete `zqxw` to the table created this session — the \
+             post-DDL completion refresh regressed:\n{}",
+            shell.snapshot().get(mark..).unwrap_or_default()
+        );
+    })
+    .await
+    .expect("pty shell task");
+}
