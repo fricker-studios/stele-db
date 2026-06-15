@@ -121,13 +121,23 @@ pub struct LocalFile {
 
 impl DiskFile for LocalFile {
     fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
-        use std::io::Write as _;
         // The file was opened in append mode (`O_APPEND` on Unix,
         // `FILE_APPEND_DATA` on Windows), so every byte lands at end-of-file
         // regardless of any prior `read_at`.
-        self.file.write_all(bytes)?;
-        self.len += bytes.len() as u64;
-        Ok(())
+        //
+        // This is `write_all` unrolled (see [`write_all_counting`]) so a *torn*
+        // append — a partial physical write that then errors, e.g. `ENOSPC`
+        // after some bytes have already landed — still advances `len` by exactly
+        // what reached the file. Plain `write_all` discards that partial count,
+        // which would leave `len()` equal to the WAL's staged end and make a tear
+        // read as a *clean* failure: `Wal::append` keys its torn-detection off
+        // `len() > staged_end` to poison the log ([STL-299]/[STL-305]). `MemFile`
+        // already advances `len()` by what a torn fault landed, so this brings the
+        // real backend to parity — a torn group-commit append now fails closed on
+        // a real filesystem, not only under the simulator.
+        let (written, result) = write_all_counting(&mut self.file, bytes);
+        self.len += written;
+        result
     }
 
     #[cfg(unix)]
@@ -155,5 +165,121 @@ impl DiskFile for LocalFile {
 
     fn len(&self) -> u64 {
         self.len
+    }
+}
+
+/// [`std::io::Write::write_all`], but reports how many bytes physically reached
+/// `w` even when the write ultimately fails.
+///
+/// `write_all` returns `()` on success and discards its progress on error, so a
+/// caller cannot tell a *torn* write (a partial physical write that then errors)
+/// from a *clean* one (nothing landed). [`LocalFile::append`] needs that
+/// distinction to keep `len()` in lock-step with the file on the error path —
+/// the signal the WAL's torn-append poison keys off ([STL-299]/[STL-305]). The
+/// returned count is the total bytes accepted by `w` across the loop; on the
+/// `Ok` path it equals `bytes.len()`. `Interrupted` (EINTR) is retried, matching
+/// `write_all`.
+///
+/// [STL-299]: https://allegromusic.atlassian.net/browse/STL-299
+/// [STL-305]: https://allegromusic.atlassian.net/browse/STL-305
+fn write_all_counting(w: &mut impl io::Write, bytes: &[u8]) -> (u64, io::Result<()>) {
+    let mut written = 0usize;
+    while written < bytes.len() {
+        match w.write(&bytes[written..]) {
+            // `write_all` treats a 0-byte write as `WriteZero`; the bytes already
+            // accepted in earlier iterations still count toward `written`.
+            Ok(0) => {
+                return (
+                    written as u64,
+                    Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to append whole buffer",
+                    )),
+                );
+            }
+            Ok(n) => written += n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return (written as u64, Err(e)),
+        }
+    }
+    (written as u64, Ok(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::write_all_counting;
+
+    /// An [`io::Write`] that accepts at most `budget` bytes (in ≤4-byte chunks,
+    /// so a multi-byte buffer drives several `write` calls), then fails — a
+    /// deterministic, portable stand-in for a torn physical write (a partial
+    /// `write` that then errors, e.g. `ENOSPC`), with no real disk-full needed.
+    struct TornWriter {
+        budget: usize,
+        landed: Vec<u8>,
+    }
+
+    impl io::Write for TornWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.budget == 0 {
+                return Err(io::Error::other("out of space"));
+            }
+            let n = buf.len().min(self.budget).min(4);
+            self.landed.extend_from_slice(&buf[..n]);
+            self.budget -= n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A *torn* append: some bytes land, then the write fails. The reported count
+    /// must equal exactly the bytes that reached the writer — that is the length
+    /// `Wal::append` compares against its staged end to detect the tear and poison
+    /// ([STL-299]/[STL-305]).
+    #[test]
+    fn write_all_counting_reports_a_torn_prefix() {
+        let mut w = TornWriter {
+            budget: 6,
+            landed: Vec::new(),
+        };
+        let (written, result) = write_all_counting(&mut w, b"hello world");
+        assert!(result.is_err(), "an exhausted budget fails the append");
+        assert_eq!(written, 6, "len advances by exactly the bytes that landed");
+        assert_eq!(
+            w.landed, b"hello ",
+            "only the landed prefix reached the file"
+        );
+    }
+
+    /// A *clean* failure — nothing lands — reports zero, so the WAL sees its
+    /// bookkeeping still matches the file and stays un-poisoned ([STL-295]).
+    #[test]
+    fn write_all_counting_clean_failure_reports_zero() {
+        let mut w = TornWriter {
+            budget: 0,
+            landed: Vec::new(),
+        };
+        let (written, result) = write_all_counting(&mut w, b"data");
+        assert!(result.is_err());
+        assert_eq!(written, 0, "a clean failure advances len by nothing");
+        assert!(w.landed.is_empty());
+    }
+
+    /// The success path writes everything and reports the full length — identical
+    /// accounting to the `write_all` it replaces.
+    #[test]
+    fn write_all_counting_full_write_reports_all() {
+        let mut w = TornWriter {
+            budget: 100,
+            landed: Vec::new(),
+        };
+        let (written, result) = write_all_counting(&mut w, b"hello world");
+        assert!(result.is_ok());
+        assert_eq!(written, 11);
+        assert_eq!(w.landed, b"hello world");
     }
 }
