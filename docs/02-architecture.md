@@ -597,7 +597,7 @@ These are test-enforced ([06](06-testing-strategy.md)) and amendable only via AD
 7. **The storage/txn core is deterministic** and runnable under the simulation scheduler.
 8. **History within a dataset is immutable; a whole namespace has a lifecycle.** Sealed segments are never rewritten (invariant 1), but creating and *dropping* an entire namespace is a legitimate, audited, coarse operation — a drop is implemented as destroying the namespace's key, not mutating segments ([ADR-0020](adr/0020-crypto-shredding-erasure.md)).
 9. **`sys_to` is never stored on a record.** The append-only log is the source of truth; a version's system-time end lives only in the *derived, rebuildable* validity index ([ADR-0023](adr/0023-append-only-record-model-validity-index.md)).
-10. **The commit log is hash-chained and verifiable.** Tampering with any historical record is detectable; an auditor can verify inclusion/consistency without trusting the operator ([ADR-0026](adr/0026-verifiable-audit-log.md)).
+10. **The commit log is hash-chained and verifiable.** Tampering with any historical record is detectable; an auditor can verify inclusion/consistency without trusting the operator ([ADR-0026](adr/0026-verifiable-audit-log.md)). The durable catalog (DDL) log is hash-chained the same way ([ADR-0031](adr/0031-live-server-verifiable-commit-log.md), STL-307), so DDL history is tamper-evident too, not just data commits.
 11. **Distributed Stele is CP.** Writes are rejected under partition; divergent histories are never reconciled ([ADR-0006](adr/0006-distribution-later-shared-storage.md)).
 
 Each box in the diagrams above traces to an [ADR](adr/README.md); each ADR traces back to the [Charter](00-charter.md).

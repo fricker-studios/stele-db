@@ -14,9 +14,10 @@
 //!
 //! ## Framing and the torn-tail contract
 //!
-//! Each record is `magic(4) | payload_len(4 LE) | payload | crc32c(4 LE)`
-//! (the CRC covers magic + length + payload). [`replay`] validates records in
-//! sequence and distinguishes two failure shapes:
+//! Each record is `magic(4) | payload_len(4 LE) | prev_hash(32) | payload |
+//! crc32c(4 LE)` (the CRC covers magic + length + prev_hash + payload).
+//! [`replay`] validates records in sequence and distinguishes two failure
+//! shapes:
 //!
 //! * a **torn tail** — the file ends mid-record, or the next bytes do not
 //!   begin with the magic (a crashed append's partial frame, or the zero/
@@ -32,13 +33,39 @@
 //! derived from anything else — and append-only: records are never rewritten,
 //! and a `DROP TABLE` is a new record, not an erasure.
 //!
+//! ## Tamper-evidence: the hash chain ([ADR-0031], [STL-307])
+//!
+//! The CRC catches *accidental* damage, but an operator forging history can
+//! recompute it — so the catalog log is also a **hash chain**, the same shape
+//! the [commit log](crate::commit_log) is ([ADR-0031], STL-302). Each frame
+//! carries the [SHA-256](stele_common::hash) `prev_hash` of the record before
+//! it — `sha256(prev_hash ‖ payload)`, the prior record's link, anchored at
+//! [`Digest::ZERO`](stele_common::hash::Digest::ZERO) for the first record.
+//! Altering any historical record changes its hash, so the *next* record's
+//! stored `prev_hash` no longer matches and [`replay`] fails closed at the
+//! break — extending invariant 10's tamper-evidence from the commit log (data
+//! commits) to the catalog log (DDL). [`SessionEngine::recover`](crate::SessionEngine::recover)
+//! verifies this chain on every boot, so a tampered DDL record refuses recovery
+//! rather than serving forged catalog history.
+//!
+//! Like the commit log, a genesis walk catches an *interior* tamper (a broken
+//! link); a **wholly rewritten** chain (every link recomputed from genesis)
+//! needs an external anchor to detect — the durably-remembered head a future
+//! catalog `\audit` surface or unified log would supply ([`chain`](stele_txn::verify_chain_to),
+//! the Merkle work of [ADR-0026], ~v0.5). Recovery walks from genesis, exactly
+//! as the commit log's does.
+//!
+//! [ADR-0026]: ../../../docs/adr/0026-verifiable-audit-log.md
 //! [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
+//! [ADR-0031]: ../../../docs/adr/0031-live-server-verifiable-commit-log.md
 //! [STL-210]: https://allegromusic.atlassian.net/browse/STL-210
+//! [STL-307]: https://allegromusic.atlassian.net/browse/STL-307
 //! [`Catalog`]: stele_catalog::Catalog
 
 use std::io;
 
 use stele_catalog::{ColumnDef, IndexKind, TableTemporal, ValidTimeSpec};
+use stele_common::hash::{Digest, SHA256_LEN, sha256};
 use stele_common::scram::ScramVerifier;
 use stele_common::time::SystemTimeMicros;
 use stele_common::types::LogicalType;
@@ -55,11 +82,26 @@ pub(crate) const CATALOG_LOG_FILENAME: &str = "stele.catalog";
 /// from a torn/zero-filled tail and is folded into the CRC.
 const MAGIC: [u8; 4] = *b"STCG";
 
-/// Bytes before the payload: magic + payload length.
+/// Bytes before the `prev_hash`: magic + payload length.
 const HEADER_LEN: usize = 8;
+
+/// Bytes of the per-record `prev_hash` link — a SHA-256 digest ([ADR-0031]).
+/// Sits between the header and the payload so the logical [`encode_payload`] /
+/// [`decode_payload`] stay purely about the record's content.
+///
+/// [ADR-0031]: ../../../docs/adr/0031-live-server-verifiable-commit-log.md
+const PREV_HASH_LEN: usize = SHA256_LEN;
 
 /// Bytes of the trailing CRC32C.
 const CRC_LEN: usize = 4;
+
+/// Upper bound on a single record's payload, enforced before [`replay`] allocates
+/// from the on-disk length field. DDL records are tiny — identifiers are
+/// `u16`-prefixed and a handful per record — so 16 MiB is orders of magnitude
+/// above any real record, yet caps a corrupt/tampered length so it fails closed
+/// rather than driving a huge recovery-time allocation. (The torn-tail check
+/// already bounds the length by the file size; this caps it well below that.)
+const MAX_RECORD_PAYLOAD: usize = 16 * 1024 * 1024;
 
 /// One durable DDL mutation — the unit [`append`] writes and [`replay`]
 /// returns. Mirrors the [`Catalog`](stele_catalog::Catalog) mutations the SQL
@@ -364,17 +406,34 @@ fn encode_payload(record: &CatalogRecord) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Encode one record as a complete frame: header, payload, trailing CRC.
-fn encode_frame(record: &CatalogRecord) -> io::Result<Vec<u8>> {
+/// The chain link a record contributes: `sha256(prev_hash ‖ payload)` — the
+/// hash the *next* record stores as its `prev_hash` ([ADR-0031]). The first
+/// record chains from [`Digest::ZERO`]. The CRC framing is deliberately *not*
+/// hashed: the chain is over the log's logical content + its back-link, so it
+/// is the same evidence whichever backend reframes it.
+///
+/// [ADR-0031]: ../../../docs/adr/0031-live-server-verifiable-commit-log.md
+fn record_hash(prev_hash: Digest, payload: &[u8]) -> Digest {
+    let mut buf = Vec::with_capacity(PREV_HASH_LEN + payload.len());
+    buf.extend_from_slice(prev_hash.as_bytes());
+    buf.extend_from_slice(payload);
+    sha256(&buf)
+}
+
+/// Encode one record as a complete frame chaining from `prev_hash`: header,
+/// `prev_hash`, payload, trailing CRC. Returns the frame and the record's own
+/// link hash — the `prev_hash` the next record chains from.
+fn encode_frame(record: &CatalogRecord, prev_hash: Digest) -> io::Result<(Vec<u8>, Digest)> {
     let payload = encode_payload(record)?;
     let len = u32::try_from(payload.len()).map_err(|_| corrupt("record payload too large"))?;
-    let mut frame = Vec::with_capacity(HEADER_LEN + payload.len() + CRC_LEN);
+    let mut frame = Vec::with_capacity(HEADER_LEN + PREV_HASH_LEN + payload.len() + CRC_LEN);
     frame.extend_from_slice(&MAGIC);
     frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(prev_hash.as_bytes());
     frame.extend_from_slice(&payload);
     let crc = crc32c(&frame);
     frame.extend_from_slice(&crc.to_le_bytes());
-    Ok(frame)
+    Ok((frame, record_hash(prev_hash, &payload)))
 }
 
 // ---------------------------------------------------------------------------
@@ -554,19 +613,26 @@ fn decode_payload(payload: &[u8]) -> io::Result<CatalogRecord> {
 // Durable log operations
 // ---------------------------------------------------------------------------
 
-/// Append one record to the catalog log and **fsync** it — the durability
-/// point for the DDL it describes. The caller acknowledges the statement only
-/// after this returns ([ADR-0028] write-ahead ordering).
+/// Append one record to the catalog log chaining from `prev_hash` and **fsync**
+/// it — the durability point for the DDL it describes. The caller acknowledges
+/// the statement only after this returns ([ADR-0028] write-ahead ordering), and
+/// adopts the returned hash as the running chain head ([ADR-0031]).
 ///
 /// [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
+/// [ADR-0031]: ../../../docs/adr/0031-live-server-verifiable-commit-log.md
 ///
 /// # Errors
 ///
 /// [`io::Error`] if the record cannot be encoded, or the log file cannot be
 /// created/opened, appended, or synced. Nothing is acknowledged on error: a
-/// partially-appended frame is exactly the torn tail [`replay`] tolerates.
-pub(crate) fn append<D: Disk>(disk: &D, record: &CatalogRecord) -> io::Result<()> {
-    let frame = encode_frame(record)?;
+/// partially-appended frame is exactly the torn tail [`replay`] tolerates, and
+/// the caller keeps its prior chain head (the record was never linked in).
+pub(crate) fn append<D: Disk>(
+    disk: &D,
+    record: &CatalogRecord,
+    prev_hash: Digest,
+) -> io::Result<Digest> {
+    let (frame, head) = encode_frame(record, prev_hash)?;
     let mut file = match disk.open(CATALOG_LOG_FILENAME) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -588,31 +654,39 @@ pub(crate) fn append<D: Disk>(disk: &D, record: &CatalogRecord) -> io::Result<()
     };
     file.append(&frame)?;
     file.sync()?;
-    Ok(())
+    Ok(head)
 }
 
-/// Replay the catalog log: every acknowledged DDL mutation, oldest first. An
-/// absent log (a fresh disk) is the empty history.
+/// Replay the catalog log: every acknowledged DDL mutation, oldest first, plus
+/// the verified chain head (the [`Digest`] the next append chains from). An
+/// absent log (a fresh disk) is the empty history chaining from [`Digest::ZERO`].
 ///
 /// Applies the torn-tail contract from the [module docs](self): a partial
 /// trailing frame — or a tail that does not begin with the record magic — is
 /// the unacknowledged debris of a crashed append and is ignored; a *complete*
 /// frame whose CRC fails is corruption of acknowledged history and fails
-/// closed.
+/// closed. A complete, CRC-valid frame whose `prev_hash` does not match the
+/// running chain head is a **tampered** record ([ADR-0031]) — an operator's
+/// re-CRC'd forgery — and also fails closed, at the break.
+///
+/// [ADR-0031]: ../../../docs/adr/0031-live-server-verifiable-commit-log.md
 ///
 /// # Errors
 ///
 /// [`io::Error`] if the file cannot be read, or holds a corrupt
-/// (CRC-failing/undecodable) complete record.
-pub(crate) fn replay<D: Disk>(disk: &D) -> io::Result<Vec<CatalogRecord>> {
+/// (CRC-failing/undecodable) or chain-broken complete record.
+pub(crate) fn replay<D: Disk>(disk: &D) -> io::Result<(Vec<CatalogRecord>, Digest)> {
     let file = match disk.open(CATALOG_LOG_FILENAME) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), Digest::ZERO)),
         Err(e) => return Err(e),
     };
     let len = file.len();
     let mut records = Vec::new();
     let mut offset = 0u64;
+    // The running chain head: the first record must chain from genesis, and each
+    // later record from the prior record's hash ([ADR-0031]).
+    let mut head = Digest::ZERO;
 
     loop {
         // Header: magic + payload length. A shorter remainder is a torn tail.
@@ -629,33 +703,58 @@ pub(crate) fn replay<D: Disk>(disk: &D) -> io::Result<Vec<CatalogRecord>> {
         let payload_len = u64::from(u32::from_le_bytes(
             header[4..8].try_into().expect("4 bytes"),
         ));
-        let frame_len = (HEADER_LEN as u64) + payload_len + (CRC_LEN as u64);
+        let frame_len =
+            (HEADER_LEN as u64) + (PREV_HASH_LEN as u64) + payload_len + (CRC_LEN as u64);
         if offset + frame_len > len {
             break; // torn tail: the frame's fsync never completed
         }
 
         // The frame is complete, so it was acknowledged — from here on,
-        // damage is corruption and fails closed.
+        // damage is corruption and fails closed. Body: prev_hash + payload + CRC.
         let payload_bytes = usize::try_from(payload_len)
             .map_err(|_| corrupt("catalog log: record too large for this platform"))?;
-        let mut body = vec![0u8; payload_bytes + CRC_LEN];
+        // Validate the length against a sane maximum *before* allocating, so a
+        // corrupt/tampered length field on a complete frame fails closed rather
+        // than driving a large allocation during recovery (cf. the commit log's
+        // fixed-size check).
+        if payload_bytes > MAX_RECORD_PAYLOAD {
+            return Err(corrupt(
+                "catalog log: a complete record's payload exceeds the maximum — corrupt length",
+            ));
+        }
+        let mut body = vec![0u8; PREV_HASH_LEN + payload_bytes + CRC_LEN];
         if file.read_at(offset + (HEADER_LEN as u64), &mut body)? < body.len() {
             return Err(corrupt("catalog log: short read inside a complete record"));
         }
-        let (payload, crc_bytes) = body.split_at(payload_bytes);
+        let (prev_hash_bytes, rest) = body.split_at(PREV_HASH_LEN);
+        let (payload, crc_bytes) = rest.split_at(payload_bytes);
         let stored = u32::from_le_bytes(crc_bytes.try_into().expect("4 bytes"));
-        let mut covered = Vec::with_capacity(HEADER_LEN + payload.len());
+        let mut covered = Vec::with_capacity(HEADER_LEN + PREV_HASH_LEN + payload.len());
         covered.extend_from_slice(&header);
+        covered.extend_from_slice(prev_hash_bytes);
         covered.extend_from_slice(payload);
         if crc32c(&covered) != stored {
             return Err(corrupt(
                 "catalog log: CRC mismatch on a complete record — acknowledged DDL is corrupt",
             ));
         }
+        // Tamper check ([ADR-0031]): the stored back-link must match the running
+        // head. A re-CRC'd forgery passes the CRC above but breaks the chain here.
+        let prev_hash = Digest(prev_hash_bytes.try_into().expect("32 bytes"));
+        if prev_hash != head {
+            return Err(corrupt(format!(
+                "catalog log: hash-chain broken at record {} — \
+                 prev_hash {} does not match predecessor {} (tampered DDL history)",
+                records.len(),
+                prev_hash.to_hex(),
+                head.to_hex(),
+            )));
+        }
+        head = record_hash(prev_hash, payload);
         records.push(decode_payload(payload)?);
         offset += frame_len;
     }
-    Ok(records)
+    Ok((records, head))
 }
 
 #[cfg(test)]
@@ -681,14 +780,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_absent_log_replays_empty() {
-        let disk = MemDisk::new();
-        assert_eq!(replay(&disk).expect("replay"), Vec::new());
+    /// Append `records` as one chain from genesis, returning the running head —
+    /// the shape `SessionEngine` drives the log with ([ADR-0031]).
+    fn append_chain(disk: &MemDisk, records: &[CatalogRecord]) -> Digest {
+        let mut head = Digest::ZERO;
+        for r in records {
+            head = append(disk, r, head).expect("append");
+        }
+        head
     }
 
     #[test]
-    fn records_round_trip_in_order() {
+    fn an_absent_log_replays_empty() {
+        let disk = MemDisk::new();
+        assert_eq!(replay(&disk).expect("replay"), (Vec::new(), Digest::ZERO));
+    }
+
+    #[test]
+    fn records_round_trip_and_advance_the_chain_head() {
         let disk = MemDisk::new();
         let records = vec![
             create_record(),
@@ -704,10 +813,13 @@ mod tests {
                 temporal: TableTemporal::system_only(),
             },
         ];
-        for r in &records {
-            append(&disk, r).expect("append");
-        }
-        assert_eq!(replay(&disk).expect("replay"), records);
+        let head = append_chain(&disk, &records);
+        let (replayed, replayed_head) = replay(&disk).expect("replay");
+        assert_eq!(replayed, records);
+        // Replay re-walks the chain and recovers the same head the appends ran to,
+        // and a non-empty log has advanced past genesis ([ADR-0031]).
+        assert_eq!(replayed_head, head);
+        assert_ne!(replayed_head, Digest::ZERO);
     }
 
     #[test]
@@ -722,28 +834,28 @@ mod tests {
         let disk = MemDisk::with_faults(faults.clone());
         faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
         assert!(
-            append(&disk, &create_record()).is_err(),
+            append(&disk, &create_record(), Digest::ZERO).is_err(),
             "fence failure surfaces"
         );
-        assert_eq!(replay(&disk).expect("replay"), Vec::new());
+        assert_eq!(replay(&disk).expect("replay"), (Vec::new(), Digest::ZERO));
 
         // The failed create was undone — the retry re-creates and re-fences,
         // consuming a second scheduled fault.
         faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
         assert!(
-            append(&disk, &create_record()).is_err(),
+            append(&disk, &create_record(), Digest::ZERO).is_err(),
             "the retry re-fences"
         );
         assert_eq!(faults.pending(), 0);
 
         // Healthy disk: create + fence + acknowledge; append-path records
         // never re-fence (a pending SyncDir fault stays unconsumed).
-        append(&disk, &create_record()).expect("record");
+        let head = append(&disk, &create_record(), Digest::ZERO).expect("record");
         faults.schedule(FaultOp::SyncDir, io::ErrorKind::Other);
-        append(&disk, &create_record()).expect("append-path record");
+        append(&disk, &create_record(), head).expect("append-path record");
         assert_eq!(faults.pending(), 1, "no fence on the append path");
         assert_eq!(
-            replay(&disk).expect("replay"),
+            replay(&disk).expect("replay").0,
             vec![create_record(), create_record()]
         );
     }
@@ -767,8 +879,8 @@ mod tests {
                 ValidTimeSpec::new("vf", "vt").expect("valid spec"),
             ),
         };
-        append(&disk, &record).expect("append");
-        assert_eq!(replay(&disk).expect("replay"), vec![record]);
+        append(&disk, &record, Digest::ZERO).expect("append");
+        assert_eq!(replay(&disk).expect("replay").0, vec![record]);
     }
 
     #[test]
@@ -795,10 +907,8 @@ mod tests {
                 name: "account".to_owned(),
             },
         ];
-        for r in &records {
-            append(&disk, r).expect("append");
-        }
-        assert_eq!(replay(&disk).expect("replay"), records);
+        append_chain(&disk, &records);
+        assert_eq!(replay(&disk).expect("replay").0, records);
     }
 
     #[test]
@@ -826,10 +936,8 @@ mod tests {
                 name: "alice".to_owned(),
             },
         ];
-        for r in &records {
-            append(&disk, r).expect("append");
-        }
-        let replayed = replay(&disk).expect("replay");
+        append_chain(&disk, &records);
+        let (replayed, _) = replay(&disk).expect("replay");
         assert_eq!(replayed, records);
         // The verifier's key material survives byte-for-byte (PartialEq above
         // covers it, but pin the fields the SASL exchange actually reads).
@@ -852,17 +960,20 @@ mod tests {
         // know) must refuse rather than silently dropping the index — the
         // sibling-kind seam mirrors the record-kind contract.
         let disk = MemDisk::new();
-        let mut frame = encode_frame(&CatalogRecord::CreateIndex {
-            at: SystemTimeMicros(1),
-            name: "i".to_owned(),
-            table: "account".to_owned(),
-            kind: IndexKind::BTree,
-            columns: vec!["balance".to_owned()],
-        })
+        let (mut frame, _) = encode_frame(
+            &CatalogRecord::CreateIndex {
+                at: SystemTimeMicros(1),
+                name: "i".to_owned(),
+                table: "account".to_owned(),
+                kind: IndexKind::BTree,
+                columns: vec!["balance".to_owned()],
+            },
+            Digest::ZERO,
+        )
         .expect("encode");
-        // The kind tag sits after the record kind byte, the i64 instant, and
-        // the two length-prefixed strings ("i", "account").
-        let tag_at = HEADER_LEN + 1 + 8 + (2 + 1) + (2 + 7);
+        // The kind tag sits after the prev_hash, the record kind byte, the i64
+        // instant, and the two length-prefixed strings ("i", "account").
+        let tag_at = HEADER_LEN + PREV_HASH_LEN + 1 + 8 + (2 + 1) + (2 + 7);
         frame[tag_at] = 0xEE;
         let crc = crc32c(&frame[..frame.len() - CRC_LEN]);
         let crc_at = frame.len() - CRC_LEN;
@@ -878,15 +989,18 @@ mod tests {
         // A crashed append leaves a partial frame; its fsync never returned,
         // so the DDL was never acknowledged — replay keeps the prior records.
         let disk = MemDisk::new();
-        append(&disk, &create_record()).expect("append");
-        let torn = encode_frame(&CatalogRecord::DropTable {
-            at: SystemTimeMicros(99),
-            name: "account".to_owned(),
-        })
+        let head = append(&disk, &create_record(), Digest::ZERO).expect("append");
+        let (torn, _) = encode_frame(
+            &CatalogRecord::DropTable {
+                at: SystemTimeMicros(99),
+                name: "account".to_owned(),
+            },
+            head,
+        )
         .expect("encode");
         let mut file = disk.open(CATALOG_LOG_FILENAME).expect("open");
         file.append(&torn[..torn.len() - 5]).expect("append torn");
-        assert_eq!(replay(&disk).expect("replay"), vec![create_record()]);
+        assert_eq!(replay(&disk).expect("replay").0, vec![create_record()]);
     }
 
     #[test]
@@ -895,10 +1009,10 @@ mod tests {
         // write on a crash; zeros are not a record boundary (and kind 0 is
         // reserved), so replay stops cleanly at the last good record.
         let disk = MemDisk::new();
-        append(&disk, &create_record()).expect("append");
+        append(&disk, &create_record(), Digest::ZERO).expect("append");
         let mut file = disk.open(CATALOG_LOG_FILENAME).expect("open");
         file.append(&[0u8; 64]).expect("append zeros");
-        assert_eq!(replay(&disk).expect("replay"), vec![create_record()]);
+        assert_eq!(replay(&disk).expect("replay").0, vec![create_record()]);
     }
 
     #[test]
@@ -907,12 +1021,14 @@ mod tests {
         // that record was acknowledged, so replay must refuse rather than
         // silently serve a different table set.
         let disk = MemDisk::new();
-        append(&disk, &create_record()).expect("append");
+        append(&disk, &create_record(), Digest::ZERO).expect("append");
         let file = disk.open(CATALOG_LOG_FILENAME).expect("open");
         let len = file.len();
         let mut bytes = vec![0u8; usize::try_from(len).expect("small file")];
         file.read_at(0, &mut bytes).expect("read");
-        bytes[HEADER_LEN + 1] ^= 0xFF;
+        // A payload byte (past the header and prev_hash); not re-CRC'd, so the
+        // CRC check — not the hash chain — is what fails it closed.
+        bytes[HEADER_LEN + PREV_HASH_LEN + 1] ^= 0xFF;
         // MemDisk files are append-only; rebuild the file with the damage.
         disk.remove(CATALOG_LOG_FILENAME).expect("remove");
         let mut rebuilt = disk.create(CATALOG_LOG_FILENAME).expect("create");
@@ -927,8 +1043,8 @@ mod tests {
         // not silently skipped: dropping an acknowledged mutation would change
         // the table set.
         let disk = MemDisk::new();
-        let mut frame = encode_frame(&create_record()).expect("encode");
-        frame[HEADER_LEN] = 0xEE; // overwrite the kind byte…
+        let (mut frame, _) = encode_frame(&create_record(), Digest::ZERO).expect("encode");
+        frame[HEADER_LEN + PREV_HASH_LEN] = 0xEE; // overwrite the kind byte…
         let crc = crc32c(&frame[..frame.len() - CRC_LEN]);
         let crc_at = frame.len() - CRC_LEN;
         frame[crc_at..].copy_from_slice(&crc.to_le_bytes()); // …with a valid CRC
@@ -936,5 +1052,52 @@ mod tests {
         file.append(&frame).expect("append");
         let err = replay(&disk).expect_err("unknown kind must fail closed");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_tampered_historical_record_breaks_the_chain() {
+        // The catalog-log tamper oracle ([ADR-0031], testing-strategy §4). Two
+        // chained records; rewrite the *first* record's payload in place and
+        // re-CRC it — the well-framed forgery a privileged operator could
+        // attempt. `replay`'s CRC check passes (the forger fixed it), but the
+        // second record's stored prev_hash still expects the original first
+        // record's hash, so the genesis walk breaks the chain at record 1.
+        let disk = MemDisk::new();
+        append_chain(
+            &disk,
+            &[
+                create_record(),
+                CatalogRecord::DropTable {
+                    at: SystemTimeMicros(100),
+                    name: "account".to_owned(),
+                },
+            ],
+        );
+
+        // Forge record 0 in place: flip a `CreateTable.at` byte (still decodes,
+        // just different content) and recompute its CRC, leaving its genesis
+        // prev_hash untouched so only the hash chain — not the CRC — catches it.
+        let file = disk.open(CATALOG_LOG_FILENAME).expect("open");
+        let len = usize::try_from(file.len()).expect("small file");
+        let mut bytes = vec![0u8; len];
+        file.read_at(0, &mut bytes).expect("read");
+        let payload_len = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")) as usize;
+        let payload_start = HEADER_LEN + PREV_HASH_LEN;
+        let crc_start = payload_start + payload_len;
+        bytes[payload_start + 1] ^= 0xFF; // a `CreateTable.at` byte
+        let crc = crc32c(&bytes[..crc_start]);
+        bytes[crc_start..crc_start + CRC_LEN].copy_from_slice(&crc.to_le_bytes());
+        disk.remove(CATALOG_LOG_FILENAME).expect("remove");
+        disk.create(CATALOG_LOG_FILENAME)
+            .expect("create")
+            .append(&bytes)
+            .expect("append");
+
+        let err = replay(&disk).expect_err("a tampered record breaks the chain");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("hash-chain broken"),
+            "the verdict names the tamper, not a generic corruption: {err}",
+        );
     }
 }
