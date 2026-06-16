@@ -47,11 +47,13 @@ fn is_end_marker(row: &[Option<String>]) -> bool {
 /// # Errors
 ///
 /// A short message if the buffer is not valid UTF-8 (the only encoding the engine
-/// stores) or, in CSV, if a quoted field is left unterminated at end of input.
+/// stores), if a text-format byte escape (`\NNN`/`\xHH`) decodes to a non-UTF-8
+/// byte sequence, or, in CSV, if a quoted field is left unterminated at end of
+/// input.
 pub(crate) fn lex(data: &[u8], format: &CopyFormat) -> Result<Vec<Vec<Option<String>>>, String> {
     let text = std::str::from_utf8(data).map_err(|_| "COPY data is not valid UTF-8".to_owned())?;
     let mut rows = match format.kind {
-        CopyFormatKind::Text => lex_text(text, format),
+        CopyFormatKind::Text => lex_text(text, format)?,
         CopyFormatKind::Csv => lex_csv(text, format)?,
     };
     if format.header && !rows.is_empty() {
@@ -63,26 +65,30 @@ pub(crate) fn lex(data: &[u8], format: &CopyFormat) -> Result<Vec<Vec<Option<Str
 /// Lex the **text** format: rows on `\n`, fields on the delimiter, `\N` for NULL,
 /// backslash escapes decoded. An embedded delimiter/newline is always escaped by
 /// `COPY TO`, so splitting on the literal byte is unambiguous.
-fn lex_text(text: &str, format: &CopyFormat) -> Vec<Vec<Option<String>>> {
+///
+/// # Errors
+///
+/// A short message if a field's byte escape (`\NNN`/`\xHH`) decodes to a non-UTF-8
+/// byte sequence (see [`unescape_text`]).
+fn lex_text(text: &str, format: &CopyFormat) -> Result<Vec<Vec<Option<String>>>, String> {
     let mut rows = Vec::new();
     for raw_line in split_lines(text) {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         if line == END_MARKER {
             break;
         }
-        let row = line
-            .split(format.delimiter)
-            .map(|field| {
-                if field == format.null {
-                    None
-                } else {
-                    Some(unescape_text(field))
-                }
-            })
-            .collect();
+        let mut row = Vec::new();
+        for field in line.split(format.delimiter) {
+            let cell = if field == format.null {
+                None
+            } else {
+                Some(unescape_text(field)?)
+            };
+            row.push(cell);
+        }
         rows.push(row);
     }
-    rows
+    Ok(rows)
 }
 
 /// Split a buffer into newline-terminated lines, dropping the empty tail a final
@@ -98,34 +104,121 @@ fn split_lines(text: &str) -> Vec<&str> {
     lines
 }
 
-/// Decode the text-format backslash escapes `COPY TO` emits: the named control
-/// escapes and `\\`; any other `\<c>` is the literal `c` (so an escaped delimiter
-/// or backslash round-trips). Octal/hex byte escapes are not decoded — a follow-up.
-fn unescape_text(field: &str) -> String {
+/// Decode the text-format backslash escapes `COPY TO` emits and return the field
+/// as a UTF-8 string. The named control escapes (`\b \f \n \r \t \v`) and `\\`
+/// decode to their one byte; `\NNN` (1–3 octal digits) and `\xHH` (1–2 hex digits)
+/// decode to the single byte they name (mod 256, like Postgres); a bare `\x` with
+/// no hex digit, and any other `\<c>`, is the literal `c` (so an escaped delimiter
+/// or backslash round-trips).
+///
+/// Decoding is byte-wise — a byte escape can name any `0x00`–`0xFF` byte, so a run
+/// of `\NNN`/`\xHH` may assemble a multi-byte UTF-8 sequence (e.g. `\303\251` →
+/// `é`). The assembled bytes are then validated as UTF-8, matching Postgres's
+/// per-attribute decode. Non-escape bytes (including the continuation bytes of a
+/// multi-byte char) pass through verbatim.
+///
+/// # Errors
+///
+/// A short message if the decoded bytes are not valid UTF-8 (the only encoding the
+/// engine stores) — e.g. a lone `\377`, which names the byte `0xFF`.
+fn unescape_text(field: &str) -> Result<String, String> {
     if !field.contains('\\') {
-        return field.to_owned();
+        return Ok(field.to_owned());
     }
-    let mut out = String::with_capacity(field.len());
-    let mut chars = field.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
+    let bytes = field.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b != b'\\' {
+            out.push(b);
+            i += 1;
             continue;
         }
-        match chars.next() {
-            Some('b') => out.push('\u{08}'),
-            Some('f') => out.push('\u{0C}'),
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some('v') => out.push('\u{0B}'),
-            // `\\` → `\`, and `\<anything-else>` → that char (Postgres's fallback).
-            Some(other) => out.push(other),
+        i += 1; // consume the backslash
+        let Some(&next) = bytes.get(i) else {
             // A trailing lone backslash: keep it verbatim.
-            None => out.push('\\'),
+            out.push(b'\\');
+            break;
+        };
+        match next {
+            // `\NNN` — 1–3 octal digits name one byte; the low 3 bits left free by
+            // each shift make `|` exactly Postgres's `(val << 3) + digit`, and the
+            // u8 shift discards the high bit of a `\4xx`–`\7xx` value (its `& 0377`).
+            b'0'..=b'7' => {
+                let mut byte = 0u8;
+                for _ in 0..3 {
+                    match bytes.get(i) {
+                        Some(&d @ b'0'..=b'7') => {
+                            byte = (byte << 3) | (d - b'0');
+                            i += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                out.push(byte);
+            }
+            // `\xHH` — `x` then 1–2 hex digits name one byte; a bare `\x` (no hex
+            // digit follows) is the literal `x`, matching Postgres.
+            b'x' => {
+                i += 1; // consume the `x` marker
+                if let Some(hi) = bytes.get(i).and_then(|&d| hex_val(d)) {
+                    i += 1;
+                    let mut byte = hi;
+                    if let Some(lo) = bytes.get(i).and_then(|&d| hex_val(d)) {
+                        byte = (byte << 4) | lo;
+                        i += 1;
+                    }
+                    out.push(byte);
+                } else {
+                    out.push(b'x');
+                }
+            }
+            b'b' => {
+                out.push(0x08);
+                i += 1;
+            }
+            b'f' => {
+                out.push(0x0C);
+                i += 1;
+            }
+            b'n' => {
+                out.push(b'\n');
+                i += 1;
+            }
+            b'r' => {
+                out.push(b'\r');
+                i += 1;
+            }
+            b't' => {
+                out.push(b'\t');
+                i += 1;
+            }
+            b'v' => {
+                out.push(0x0B);
+                i += 1;
+            }
+            // `\\` → `\`, and `\<anything-else>` → that byte (Postgres's fallback).
+            // For a backslash before a multi-byte char this pushes only the lead
+            // byte, but the continuation bytes then pass through verbatim above, so
+            // the char is reassembled intact.
+            _ => {
+                out.push(next);
+                i += 1;
+            }
         }
     }
-    out
+    String::from_utf8(out).map_err(|_| "COPY text field is not valid UTF-8".to_owned())
+}
+
+/// The value of a single ASCII hex digit, or `None` if `b` is not one.
+const fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Lex the **CSV** format with a quote-aware state machine: delimiters and
@@ -264,6 +357,71 @@ mod tests {
             lex(data, &text_format()).unwrap(),
             vec![vec![s("1"), s("a\tb")], vec![s("2"), s("c\nd\\e")],]
         );
+    }
+
+    #[test]
+    fn text_decodes_octal_byte_escapes() {
+        // 1–3 octal digits name one byte (mod 256, like Postgres); decoding stops
+        // at the third digit or the first non-octal char.
+        assert_eq!(unescape_text("\\001").unwrap(), "\u{01}");
+        assert_eq!(unescape_text("\\1").unwrap(), "\u{01}");
+        assert_eq!(unescape_text("\\12").unwrap(), "\n"); // octal 12 == 0x0A
+        assert_eq!(unescape_text("\\101").unwrap(), "A"); // octal 101 == 0x41
+        assert_eq!(unescape_text("\\0011").unwrap(), "\u{01}1"); // 3 digits, then '1'
+        assert_eq!(unescape_text("a\\176b").unwrap(), "a~b"); // octal 176 == 0x7E
+    }
+
+    #[test]
+    fn text_decodes_hex_byte_escapes() {
+        // `\x` then 1–2 hex digits (either case) name one byte; a bare `\x` (or `\x`
+        // not followed by a hex digit) is the literal `x`, matching Postgres.
+        assert_eq!(unescape_text("\\x41").unwrap(), "A");
+        assert_eq!(unescape_text("\\x4").unwrap(), "\u{04}");
+        assert_eq!(unescape_text("\\x4a").unwrap(), "J"); // 0x4A
+        assert_eq!(unescape_text("\\x4A").unwrap(), "J"); // upper-case digit
+        assert_eq!(unescape_text("\\x411").unwrap(), "A1"); // 2 digits, then '1'
+        assert_eq!(unescape_text("\\x").unwrap(), "x"); // bare marker → literal
+        assert_eq!(unescape_text("\\xg").unwrap(), "xg"); // no hex digit → literal
+    }
+
+    #[test]
+    fn text_byte_escapes_assemble_multibyte_utf8() {
+        // A run of byte escapes builds a multi-byte UTF-8 sequence: 0xC3 0xA9 == "é".
+        assert_eq!(unescape_text("\\303\\251").unwrap(), "é");
+        assert_eq!(unescape_text("\\xc3\\xa9").unwrap(), "é");
+        // Mixed with literal text around it.
+        assert_eq!(unescape_text("<\\303\\251>").unwrap(), "<é>");
+    }
+
+    #[test]
+    fn text_named_and_fallback_escapes_unchanged() {
+        // The named control escapes and the literal-char fallback still decode as
+        // before; `\X` (upper-case) is not a hex marker, so it is the literal 'X'.
+        assert_eq!(
+            unescape_text("\\b\\f\\n\\r\\t\\v").unwrap(),
+            "\u{08}\u{0C}\n\r\t\u{0B}"
+        );
+        assert_eq!(unescape_text("a\\\\b").unwrap(), "a\\b"); // `\\` → `\`
+        assert_eq!(unescape_text("a\\.b").unwrap(), "a.b"); // `\<other>` → other
+        assert_eq!(unescape_text("a\\").unwrap(), "a\\"); // trailing lone backslash
+        assert_eq!(unescape_text("\\X41").unwrap(), "X41"); // `\X` is literal 'X'
+    }
+
+    #[test]
+    fn text_row_decodes_octal_and_hex_fields() {
+        // The byte escapes flow through the full row lexer (hex 0x41='A', octal 102='B').
+        let data = b"1\t\\x41\\102\n";
+        assert_eq!(
+            lex(data, &text_format()).unwrap(),
+            vec![vec![s("1"), s("AB")]]
+        );
+    }
+
+    #[test]
+    fn text_byte_escape_to_invalid_utf8_is_an_error() {
+        // `\377` names the lone byte 0xFF, which is not valid UTF-8 — the field
+        // fails validation, matching Postgres rejecting the bad byte sequence.
+        assert!(lex(b"1\t\\377\n", &text_format()).is_err());
     }
 
     #[test]
