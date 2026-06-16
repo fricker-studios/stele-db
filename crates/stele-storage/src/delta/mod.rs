@@ -390,6 +390,28 @@ impl<D: Disk> Delta<D> {
     /// the next [`open`](Self::open) discards, so it must not abort the flush after
     /// the commit point or leave the tier half-cleared.
     pub fn discard_flushed(&mut self) {
+        self.clear_staged();
+    }
+
+    /// Drop every staged version, retraction, and spill **without** a flush having
+    /// committed them — the bulk-load abort primitive ([STL-240]).
+    ///
+    /// Identical clearing to [`discard_flushed`](Self::discard_flushed), but for the
+    /// opposite reason: those rows were never made durable (their chunk records are
+    /// inert until a commit record that an aborted/crashed load never writes), so
+    /// dropping them rolls the load back to its pre-load state. The caller flushed the
+    /// tier to a segment before the load, so the contents dropped here are exactly the
+    /// aborted load's rows.
+    pub fn discard_staged(&mut self) {
+        self.clear_staged();
+    }
+
+    /// Clear the in-memory tier and retraction buffer (infallible), then drop the
+    /// spill files **best-effort** — a removal failure only leaks a stale file the
+    /// next [`open`](Self::open) discards, so it never aborts the caller or leaves the
+    /// tier half-cleared. Shared by [`discard_flushed`](Self::discard_flushed)
+    /// (post-flush) and [`discard_staged`](Self::discard_staged) (abort).
+    fn clear_staged(&mut self) {
         self.mem = MemTier::new();
         self.retractions.clear();
         for idx in std::mem::take(&mut self.live_spills) {
