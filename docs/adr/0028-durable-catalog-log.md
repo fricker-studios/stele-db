@@ -104,17 +104,15 @@ boot `SessionEngine` through a `recover` path that replays it.**
   needs the catalog on shared storage (consistent with ADR-0006's CP posture).
 
 ### Neutral / follow-ups
-- **Hash-chained for tamper-evidence (STL-307, [ADR-0031]).** The CRC framing
-  above catches *accidental* corruption, but a privileged operator can recompute
-  it; STL-307 added a per-record SHA-256 `prev_hash` link to the catalog log (the
-  same chain shape the commit log uses), verified fail-closed on `recover`, so
-  forging catalog history is detectable — invariant 10 extended to DDL. This is a
-  framing addition (`magic | len | prev_hash | payload | crc`); the record
-  vocabulary and replay semantics here are unchanged.
+- **Hash-chained for tamper-evidence (STL-307, [ADR-0031](0031-live-server-verifiable-commit-log.md)).**
+  The CRC framing above catches *accidental* corruption, but a privileged
+  operator can recompute it; STL-307 added a per-record SHA-256 `prev_hash` link
+  to the catalog log (the same chain shape the commit log uses), verified
+  fail-closed on `recover`, so forging catalog history is detectable — invariant
+  10 extended to DDL. This is a framing addition (`magic | len | prev_hash |
+  payload | crc`); the record vocabulary and replay semantics here are unchanged.
 - `ALTER TABLE` (e.g. `add_column`) gets its record kind when it becomes
   SQL-reachable; the framing reserves the kind byte.
-
-[ADR-0031]: 0031-live-server-verifiable-commit-log.md
 - Migrating the catalog onto the sealed-segment substrate (option b) supersedes
   this log when flush/compaction mature; the replay semantics fixed here (apply
   at recorded `at`, identical id allocation) carry over unchanged.

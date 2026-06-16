@@ -95,6 +95,14 @@ const PREV_HASH_LEN: usize = SHA256_LEN;
 /// Bytes of the trailing CRC32C.
 const CRC_LEN: usize = 4;
 
+/// Upper bound on a single record's payload, enforced before [`replay`] allocates
+/// from the on-disk length field. DDL records are tiny — identifiers are
+/// `u16`-prefixed and a handful per record — so 16 MiB is orders of magnitude
+/// above any real record, yet caps a corrupt/tampered length so it fails closed
+/// rather than driving a huge recovery-time allocation. (The torn-tail check
+/// already bounds the length by the file size; this caps it well below that.)
+const MAX_RECORD_PAYLOAD: usize = 16 * 1024 * 1024;
+
 /// One durable DDL mutation — the unit [`append`] writes and [`replay`]
 /// returns. Mirrors the [`Catalog`](stele_catalog::Catalog) mutations the SQL
 /// surface can produce (`ALTER` gets its kind when it becomes SQL-reachable;
@@ -705,6 +713,15 @@ pub(crate) fn replay<D: Disk>(disk: &D) -> io::Result<(Vec<CatalogRecord>, Diges
         // damage is corruption and fails closed. Body: prev_hash + payload + CRC.
         let payload_bytes = usize::try_from(payload_len)
             .map_err(|_| corrupt("catalog log: record too large for this platform"))?;
+        // Validate the length against a sane maximum *before* allocating, so a
+        // corrupt/tampered length field on a complete frame fails closed rather
+        // than driving a large allocation during recovery (cf. the commit log's
+        // fixed-size check).
+        if payload_bytes > MAX_RECORD_PAYLOAD {
+            return Err(corrupt(
+                "catalog log: a complete record's payload exceeds the maximum — corrupt length",
+            ));
+        }
         let mut body = vec![0u8; PREV_HASH_LEN + payload_bytes + CRC_LEN];
         if file.read_at(offset + (HEADER_LEN as u64), &mut body)? < body.len() {
             return Err(corrupt("catalog log: short read inside a complete record"));
