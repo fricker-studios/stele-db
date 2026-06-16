@@ -63,7 +63,7 @@ use std::sync::{Arc, Mutex};
 use crate::catalog_log::CatalogRecord;
 use crate::secondary::{IndexState, Probe};
 
-use stele_catalog::{Catalog, CatalogError, IndexDef, IndexKind, TableSchema};
+use stele_catalog::{Catalog, CatalogError, IndexDef, IndexKind, TableSchema, ValidTimeSpec};
 use stele_common::hash::Digest;
 use stele_common::metrics::{SharedMetrics, StatementKind};
 use stele_common::period::Interval;
@@ -82,7 +82,7 @@ use stele_exec::{
 use stele_sql::Password;
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::dml::{BoundDml, DmlError, InsertRow};
-use stele_sql::merge::{BoundMerge, MergeSource, MergeValue};
+use stele_sql::merge::{BoundMerge, MergeBound, MergeSource, MergeValid, MergeValue};
 use stele_sql::select::{
     AggregateFunc, ArithOp, BoundAggregate, BoundJoin, BoundPeriod, BoundPeriodPredicate,
     BoundPredicate, BoundScalar, BoundSelect, CompareOp, JoinColumnRef, JoinType, OutputItem,
@@ -4094,6 +4094,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .first()
             .map(|c| c.name().to_owned())
             .ok_or_else(|| EngineError::UnknownTable(merge.table.clone()))?;
+        // The valid axis (if any) names the period columns the per-row interval
+        // bounds resolve against ([STL-308]); `None` on a system-only table, where
+        // both arms' `*_valid` descriptors are also `None`.
+        let period = schema.temporal().valid_time();
 
         let rows = self.merge_source_rows(&merge.source, snapshot, overlay)?;
         let live = self.merge_live_keys(merge, &key_name, snapshot, &rows, overlay)?;
@@ -4128,9 +4132,15 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                         key: (*key).clone(),
                         assignments,
                         // On a valid-time table the matched arm closes the prior
-                        // version and opens a new one over this interval ([STL-235]);
-                        // `None` for a system-only table.
-                        valid: merge.matched_valid,
+                        // version and opens a new one over this interval ([STL-235]),
+                        // derived per source row ([STL-308]); `None` for a
+                        // system-only table.
+                        valid: resolve_arm_valid(
+                            merge.matched_valid.as_ref(),
+                            period,
+                            row,
+                            &merge.table,
+                        )?,
                     },
                 )
             } else {
@@ -4156,8 +4166,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                         key,
                         values,
                         // The not-matched arm inserts with the arm's valid interval
-                        // ([STL-235]); `None` for a system-only table.
-                        valid: merge.not_matched_valid,
+                        // ([STL-235]), derived per source row ([STL-308]); `None`
+                        // for a system-only table.
+                        valid: resolve_arm_valid(
+                            merge.not_matched_valid.as_ref(),
+                            period,
+                            row,
+                            &merge.table,
+                        )?,
                     },
                 )
             };
@@ -5211,6 +5227,84 @@ fn resolve_merge_value(value: &MergeValue, row: &[Option<ScalarValue>]) -> Optio
     match value {
         MergeValue::Literal(value) => value.clone(),
         MergeValue::Source(idx) => row.get(*idx).cloned().flatten(),
+    }
+}
+
+/// Resolve a `MERGE` arm's valid-time descriptor against a concrete source row
+/// into the `[from, to)` interval the expanded write frames onto the payload, or
+/// `None` for a system-only arm ([STL-308]).
+///
+/// A `Some` descriptor only occurs on a valid-time table, where `period` is also
+/// `Some` — the binder pairs them — so the mismatched case is a contract break.
+fn resolve_arm_valid(
+    valid: Option<&MergeValid>,
+    period: Option<&ValidTimeSpec>,
+    row: &[Option<ScalarValue>],
+    table: &str,
+) -> Result<Option<Interval>, EngineError> {
+    match (valid, period) {
+        (Some(valid), Some(period)) => Ok(Some(resolve_merge_valid(valid, period, row, table)?)),
+        (Some(_), None) => Err(EngineError::MalformedMergeSource),
+        (None, _) => Ok(None),
+    }
+}
+
+/// Derive one source row's `[from, to)` valid interval from a [`MergeValid`]
+/// ([STL-308]): resolve each bound to a microsecond instant and build the
+/// half-open interval, surfacing a reversed/empty per-row interval the way the
+/// binder surfaces a statement-level one ([`DmlError::EmptyValidInterval`]).
+fn resolve_merge_valid(
+    valid: &MergeValid,
+    period: &ValidTimeSpec,
+    row: &[Option<ScalarValue>],
+    table: &str,
+) -> Result<Interval, EngineError> {
+    let from = resolve_merge_bound(valid.from, row, table, period.from_column())?;
+    let to = resolve_merge_bound(valid.to, row, table, period.to_column())?;
+    Interval::new(from, to).map_err(|_| {
+        EngineError::Dml(DmlError::EmptyValidInterval {
+            table: table.to_owned(),
+            from,
+            to,
+        })
+    })
+}
+
+/// Resolve one [`MergeBound`] against a source row to its microsecond instant: an
+/// instant passes through; a per-source-row bound reads the source cell, which
+/// the binder constrained to an instant-bearing type. A `NULL` source cell is a
+/// per-row data error — a valid-time bound has no microsecond ([STL-308]).
+fn resolve_merge_bound(
+    bound: MergeBound,
+    row: &[Option<ScalarValue>],
+    table: &str,
+    column: &str,
+) -> Result<i64, EngineError> {
+    match bound {
+        MergeBound::Instant(micros) => Ok(micros),
+        // The binder fixed every index against the source width, so the lookup is
+        // total; only the cell's nullability and (defensively) its type can vary.
+        MergeBound::Source(idx) => row.get(idx).and_then(|c| c.as_ref()).map_or_else(
+            || {
+                Err(EngineError::Dml(DmlError::NullValue {
+                    table: table.to_owned(),
+                    column: column.to_owned(),
+                }))
+            },
+            |value| instant_micros(value).ok_or(EngineError::MalformedMergeSource),
+        ),
+    }
+}
+
+/// The microsecond instant a resolved period-bound [`ScalarValue`] carries. The
+/// binder constrains a per-row period source to an instant-bearing type — a
+/// `VALUES` cell to `INT8`, a table column to `TIMESTAMP` / `TIMESTAMPTZ` — whose
+/// `i64` body is microseconds. Anything else is an internal contract break
+/// (`None`).
+const fn instant_micros(value: &ScalarValue) -> Option<i64> {
+    match value {
+        ScalarValue::Int8(v) | ScalarValue::Timestamp(v) | ScalarValue::TimestampTz(v) => Some(*v),
+        _ => None,
     }
 }
 
@@ -8205,6 +8299,18 @@ mod tests {
     const MERGE_KEY_POOL: i64 = 4;
     const MERGE_VMAX: i64 = 9;
 
+    /// Where a historizing `MERGE`'s valid-time period bounds come from — the two
+    /// surfaces the oracle sweeps, which must produce the *same* timeline.
+    #[derive(Clone, Copy)]
+    enum MergeBoundStyle {
+        /// STL-235: statement-level instant bounds (`vf = 5`), folded at bind, the
+        /// same interval for every affected key.
+        StatementInstant,
+        /// STL-308: per-source-row bounds (`vf = s.vfrom`), each affected key
+        /// carrying its own interval drawn from the source row.
+        PerRowSource,
+    }
+
     /// One seeded random bitemporal-MERGE history plus the naïve reference it was
     /// mirrored into, ready for the AS OF grid sweep.
     struct MergeHistory {
@@ -8221,7 +8327,13 @@ mod tests {
     /// statements (one source row ⇒ one write at one commit instant) to a fresh
     /// valid-time table, with an occasional `DELETE` for an intentional deletion
     /// gap, mirroring every write into the naïve [`ValidRefModel`].
-    fn build_merge_history(seed: u64) -> MergeHistory {
+    ///
+    /// `style` selects where the period bounds come from. The *same seed* drives
+    /// the identical logical workload through both surfaces (statement-level
+    /// instants and per-source-row source columns), so the per-row path
+    /// ([STL-308]) is held to the very same timeline as the instant path
+    /// ([STL-235]).
+    fn build_merge_history(seed: u64, style: MergeBoundStyle) -> MergeHistory {
         // A stream distinct from the plain-DML oracle's same-seed stream.
         let mut rng = ValidOracleRng::new(seed ^ 0x5713_2735_0BAD_F00D);
         let disk = MemDisk::new();
@@ -8266,24 +8378,42 @@ mod tests {
                 continue;
             }
 
-            let set = if open {
-                format!("SET balance = s.bal, vf = {from}")
-            } else {
-                format!("SET balance = s.bal, vf = {from}, vt = {to}")
+            let sql = match style {
+                // STL-235: statement-level instant bounds; an open period omits
+                // `vt` so the engine defaults it ([`VALID_TIME_OPEN`]).
+                MergeBoundStyle::StatementInstant => {
+                    let set = if open {
+                        format!("SET balance = s.bal, vf = {from}")
+                    } else {
+                        format!("SET balance = s.bal, vf = {from}, vt = {to}")
+                    };
+                    let (cols, vals) = if open {
+                        ("(id, balance, vf)", format!("(s.id, s.bal, {from})"))
+                    } else {
+                        (
+                            "(id, balance, vf, vt)",
+                            format!("(s.id, s.bal, {from}, {to})"),
+                        )
+                    };
+                    format!(
+                        "MERGE INTO acct USING (VALUES ({ki}, {balance})) AS s (id, bal) \
+                         ON acct.id = s.id \
+                         WHEN MATCHED THEN UPDATE {set} \
+                         WHEN NOT MATCHED THEN INSERT {cols} VALUES {vals}"
+                    )
+                }
+                // STL-308: both bounds ride source columns. An open period passes
+                // the open sentinel (`to == i64::MAX`) as the source cell, the same
+                // value the model's open marker uses — so the per-row interval
+                // resolves to open exactly as the instant path's omission does.
+                MergeBoundStyle::PerRowSource => format!(
+                    "MERGE INTO acct USING (VALUES ({ki}, {balance}, {from}, {to})) \
+                     AS s (id, bal, vfrom, vto) ON acct.id = s.id \
+                     WHEN MATCHED THEN UPDATE SET balance = s.bal, vf = s.vfrom, vt = s.vto \
+                     WHEN NOT MATCHED THEN INSERT (id, balance, vf, vt) \
+                     VALUES (s.id, s.bal, s.vfrom, s.vto)"
+                ),
             };
-            let (cols, vals) = if open {
-                ("(id, balance, vf)", format!("(s.id, s.bal, {from})"))
-            } else {
-                (
-                    "(id, balance, vf, vt)",
-                    format!("(s.id, s.bal, {from}, {to})"),
-                )
-            };
-            let sql = format!(
-                "MERGE INTO acct USING (VALUES ({ki}, {balance})) AS s (id, bal) ON acct.id = s.id \
-                 WHEN MATCHED THEN UPDATE {set} \
-                 WHEN NOT MATCHED THEN INSERT {cols} VALUES {vals}"
-            );
             assert_eq!(
                 dml(&mut engine, &sql),
                 DmlSummary::Merge(1),
@@ -8312,13 +8442,21 @@ mod tests {
 
     #[test]
     fn sql_temporal_merge_historization_matches_a_naive_reference() {
-        // STL-235's historization oracle ([06 §4]). A random workload of bitemporal
-        // `MERGE` statements is applied to a valid-time table entirely over SQL: a
-        // matched row gets the joint system+valid close/open and an unmatched row
-        // inserts, each carrying the statement's valid interval. The reference is
-        // the **same** naïve list-of-versions the plain valid-time DML oracle uses
-        // — a MERGE arm *is* an UPDATE / INSERT — so agreement isolates the new
-        // code: the binder's arm-interval lift and the engine's thread of it.
+        // STL-235's historization oracle ([06 §4]), extended for STL-308. A random
+        // workload of bitemporal `MERGE` statements is applied to a valid-time
+        // table entirely over SQL: a matched row gets the joint system+valid
+        // close/open and an unmatched row inserts, each carrying its valid
+        // interval. The reference is the **same** naïve list-of-versions the plain
+        // valid-time DML oracle uses — a MERGE arm *is* an UPDATE / INSERT — so
+        // agreement isolates the new code: the binder's arm-interval lift and the
+        // engine's thread of it.
+        //
+        // Each seed drives the identical logical workload through **two surfaces**,
+        // both held to the same model:
+        //   * `StatementInstant` — STL-235 statement-level instant bounds;
+        //   * `PerRowSource` — STL-308 per-source-row bounds (`vf = s.vfrom`),
+        //     where each affected key's interval is derived per row at execution
+        //     and an open period rides the source cell as the open sentinel.
         //
         // The named property (no gaps / no overlaps unless intended) is asserted
         // three ways, each over an exhaustive `(system, valid)` grid:
@@ -8338,31 +8476,54 @@ mod tests {
         let (mut total_probes, mut rows_seen, mut teeth) = (0u64, 0u64, false);
         let (mut merges, mut deletes) = (0u64, 0u64);
 
-        for seed in 0..SEEDS {
-            let MergeHistory {
-                mut engine,
-                disk,
-                model,
-                create_c,
-                hi,
-                merges: m,
-                deletes: d,
-            } = build_merge_history(seed);
-            merges += m;
-            deletes += d;
-            let span = (create_c, hi, MERGE_VMAX);
-            // (1) Live, from the delta tier.
-            let (p1, r, t) = merge_sweep_grid(&mut engine, &model, span, "live", seed);
-            // (2) After flush: the delta is sealed into columnar segments.
-            engine.flush().expect("flush");
-            let (p2, _, _) = merge_sweep_grid(&mut engine, &model, span, "post-flush", seed);
-            // (3) After cold-boot recovery: the validity index is rebuilt from the
-            // durable segments + WAL tail — the timeline survives the rebuild.
-            let mut recovered = SessionEngine::recover(disk.clone(), ZeroClock).expect("recover");
-            let (p3, _, _) = merge_sweep_grid(&mut recovered, &model, span, "recovered", seed);
-            total_probes += p1 + p2 + p3;
-            rows_seen += r;
-            teeth |= t;
+        for style in [
+            MergeBoundStyle::StatementInstant,
+            MergeBoundStyle::PerRowSource,
+        ] {
+            let label = match style {
+                MergeBoundStyle::StatementInstant => "instant",
+                MergeBoundStyle::PerRowSource => "per-row",
+            };
+            for seed in 0..SEEDS {
+                let MergeHistory {
+                    mut engine,
+                    disk,
+                    model,
+                    create_c,
+                    hi,
+                    merges: m,
+                    deletes: d,
+                } = build_merge_history(seed, style);
+                merges += m;
+                deletes += d;
+                let span = (create_c, hi, MERGE_VMAX);
+                // (1) Live, from the delta tier.
+                let (p1, r, t) =
+                    merge_sweep_grid(&mut engine, &model, span, &format!("{label}/live"), seed);
+                // (2) After flush: the delta is sealed into columnar segments.
+                engine.flush().expect("flush");
+                let (p2, _, _) = merge_sweep_grid(
+                    &mut engine,
+                    &model,
+                    span,
+                    &format!("{label}/post-flush"),
+                    seed,
+                );
+                // (3) After cold-boot recovery: the validity index is rebuilt from
+                // the durable segments + WAL tail — the timeline survives the rebuild.
+                let mut recovered =
+                    SessionEngine::recover(disk.clone(), ZeroClock).expect("recover");
+                let (p3, _, _) = merge_sweep_grid(
+                    &mut recovered,
+                    &model,
+                    span,
+                    &format!("{label}/recovered"),
+                    seed,
+                );
+                total_probes += p1 + p2 + p3;
+                rows_seen += r;
+                teeth |= t;
+            }
         }
 
         assert!(
@@ -14829,6 +14990,184 @@ mod tests {
         assert!(
             vt_asof(&mut engine, now, 0).is_empty(),
             "neither new fact covers v=0"
+        );
+    }
+
+    // ---- STL-308: per-source-row valid-time bounds ----
+
+    #[test]
+    fn merge_per_source_row_bounds_give_each_key_its_own_window() {
+        // STL-308: the headline shape — one MERGE whose arm takes `vf`/`vt` from the
+        // source row, so each affected key carries its own `[from, to)` interval.
+        // Two unmatched keys insert over disjoint windows drawn from their rows.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_VACCT)).expect("create");
+        assert_eq!(
+            dml(
+                &mut engine,
+                "MERGE INTO vacct USING (VALUES (1, 100, 2, 5), (2, 200, 7, 9)) \
+                 AS s (id, bal, vfrom, vto) ON vacct.id = s.id \
+                 WHEN NOT MATCHED THEN INSERT (id, balance, vf, vt) \
+                 VALUES (s.id, s.bal, s.vfrom, s.vto)"
+            ),
+            DmlSummary::Merge(2),
+        );
+        let now = engine.clock.current().0;
+        // Key 1 is valid only over [2, 5); key 2 only over [7, 9).
+        assert_eq!(
+            vt_asof(&mut engine, now, 3),
+            vec![vec![i4(1), i4(100)]],
+            "v=3 sees only key 1's window"
+        );
+        assert_eq!(
+            vt_asof(&mut engine, now, 8),
+            vec![vec![i4(2), i4(200)]],
+            "v=8 sees only key 2's window"
+        );
+        assert!(
+            vt_asof(&mut engine, now, 6).is_empty(),
+            "v=6 falls in the gap between the two per-row windows"
+        );
+        assert!(
+            vt_asof(&mut engine, now, 5).is_empty(),
+            "half-open: v=5 is excluded from key 1's [2, 5)"
+        );
+    }
+
+    #[test]
+    fn merge_matched_close_open_uses_the_per_source_row_interval() {
+        // A matched arm with a per-row bound closes the prior version on the system
+        // axis and opens the new one over the source row's own interval — the
+        // close/open at scale, but the window is data-dependent ([STL-308]).
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_VACCT)).expect("create");
+        dml(
+            &mut engine,
+            "INSERT INTO vacct (id, balance, vf) VALUES (1, 100, 0)",
+        );
+        let s1 = engine.clock.current().0;
+        assert_eq!(
+            dml(
+                &mut engine,
+                "MERGE INTO vacct USING (VALUES (1, 200, 4, 8)) AS s (id, bal, vfrom, vto) \
+                 ON vacct.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET balance = s.bal, vf = s.vfrom, vt = s.vto"
+            ),
+            DmlSummary::Merge(1),
+        );
+        let now = engine.clock.current().0;
+        // Pre-MERGE history is immutable: AS OF s1 still sees the wide [0, +∞) fact.
+        assert_eq!(
+            vt_asof(&mut engine, s1, 0),
+            vec![vec![i4(1), i4(100)]],
+            "pre-MERGE history unchanged"
+        );
+        // Now valid only over [4, 8): inside sees the new value; the close/open
+        // narrowed the window, so v=0 no longer resolves and v=8 is excluded.
+        assert!(
+            vt_asof(&mut engine, now, 0).is_empty(),
+            "v=0 no longer covered after the per-row close/open"
+        );
+        assert_eq!(
+            vt_asof(&mut engine, now, 6),
+            vec![vec![i4(1), i4(200)]],
+            "v=6 sees the new fact over its per-row window"
+        );
+        assert!(
+            vt_asof(&mut engine, now, 8).is_empty(),
+            "half-open: v=8 is excluded from [4, 8)"
+        );
+    }
+
+    #[test]
+    fn merge_table_source_timestamp_columns_feed_per_row_bounds() {
+        // STL-308 reconciliation: a *table* source's TIMESTAMP columns feed the
+        // per-row bounds — their microsecond bodies are the instants, exactly as
+        // the VALUES integer cells are. Here 5 s / 9 s past the epoch.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_VACCT)).expect("create");
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE feed (id INT PRIMARY KEY, bal INT, vfrom TIMESTAMP, vto TIMESTAMP) \
+                 WITH SYSTEM VERSIONING",
+            ))
+            .expect("create feed");
+        engine
+            .execute(&parse_one(
+                "INSERT INTO feed (id, bal, vfrom, vto) VALUES \
+                 (1, 100, TIMESTAMP '1970-01-01 00:00:05', TIMESTAMP '1970-01-01 00:00:09')",
+            ))
+            .expect("insert feed");
+        assert_eq!(
+            dml(
+                &mut engine,
+                "MERGE INTO vacct USING feed AS s ON vacct.id = s.id \
+                 WHEN NOT MATCHED THEN INSERT (id, balance, vf, vt) \
+                 VALUES (s.id, s.bal, s.vfrom, s.vto)"
+            ),
+            DmlSummary::Merge(1),
+        );
+        let now = engine.clock.current().0;
+        assert_eq!(
+            vt_asof(&mut engine, now, 5_000_000),
+            vec![vec![i4(1), i4(100)]],
+            "the row is valid from 5 s past the epoch"
+        );
+        assert!(
+            vt_asof(&mut engine, now, 9_000_000).is_empty(),
+            "half-open: 9 s is excluded from [5 s, 9 s)"
+        );
+    }
+
+    #[test]
+    fn merge_null_per_source_row_bound_is_rejected_at_execution() {
+        // A per-row bound that resolves to NULL has no microsecond instant — a
+        // valid-time version must say when it begins, so the statement fails and
+        // (atomic group) leaves the table unchanged. A NULL is data-dependent, so
+        // unlike a literal NULL key it is caught at execution, not bind.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_VACCT)).expect("create");
+        let err = engine
+            .execute(&parse_one(
+                "MERGE INTO vacct USING (VALUES (1, 100, NULL, 5)) AS s (id, bal, vfrom, vto) \
+                 ON vacct.id = s.id \
+                 WHEN NOT MATCHED THEN INSERT (id, balance, vf, vt) \
+                 VALUES (s.id, s.bal, s.vfrom, s.vto)",
+            ))
+            .expect_err("a NULL per-row start bound must be rejected");
+        assert!(
+            matches!(&err, EngineError::Dml(DmlError::NullValue { column, .. }) if column == "vf"),
+            "got {err:?}"
+        );
+        assert!(
+            select(&mut engine, "SELECT id, balance FROM vacct")
+                .rows
+                .is_empty(),
+            "the failed MERGE left no row behind"
+        );
+    }
+
+    #[test]
+    fn merge_reversed_per_source_row_interval_is_rejected_at_execution() {
+        // A reversed/empty per-row interval (`from >= to`) is rejected the way the
+        // binder rejects a statement-level one — but here at execution, since the
+        // bounds are only known per source row ([STL-308]).
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE_VACCT)).expect("create");
+        let err = engine
+            .execute(&parse_one(
+                "MERGE INTO vacct USING (VALUES (1, 100, 9, 4)) AS s (id, bal, vfrom, vto) \
+                 ON vacct.id = s.id \
+                 WHEN NOT MATCHED THEN INSERT (id, balance, vf, vt) \
+                 VALUES (s.id, s.bal, s.vfrom, s.vto)",
+            ))
+            .expect_err("a reversed per-row interval must be rejected");
+        assert!(
+            matches!(
+                &err,
+                EngineError::Dml(DmlError::EmptyValidInterval { from: 9, to: 4, .. })
+            ),
+            "got {err:?}"
         );
     }
 

@@ -534,7 +534,7 @@ Semantics, pinned:
 - `WHEN NOT MATCHED BY SOURCE`, `WHEN MATCHED THEN DELETE`, clause predicates
   (`WHEN … AND <expr>`), and `OUTPUT` are rejected.
 
-### Valid-time historization (STL-235)
+### Valid-time historization (STL-235, STL-308)
 
 On a table with a valid axis (`… VALID TIME (vf, vt)`) `MERGE` is the
 historization workhorse: the arms carry the period columns exactly as a plain
@@ -546,19 +546,30 @@ MERGE INTO acct USING (VALUES (1, 200), (3, 300)) AS s (id, balance)
 ON acct.id = s.id
 WHEN MATCHED THEN UPDATE SET balance = s.balance, vf = now()        -- close prior, open [now, +∞)
 WHEN NOT MATCHED THEN INSERT (id, balance, vf) VALUES (s.id, s.balance, now());
+
+-- STL-308: each source row asserts its own effective window.
+MERGE INTO acct USING (VALUES (1, 200, 5, 10), (3, 300, 7, 9)) AS s (id, balance, vfrom, vto)
+ON acct.id = s.id
+WHEN MATCHED THEN UPDATE SET balance = s.balance, vf = s.vfrom, vt = s.vto
+WHEN NOT MATCHED THEN INSERT (id, balance, vf, vt) VALUES (s.id, s.balance, s.vfrom, s.vto);
 ```
 
 - A **matched** row gets the joint system+valid **close/open** (STL-166): the
   prior version is closed on the system axis and a new one opens carrying the
   matched arm's interval. An **unmatched** row inserts with the not-matched arm's
   interval. The two arms may name different intervals.
-- The period bounds fold as **instants** — an integer microsecond value, `now()`,
-  or `now() ± interval` (not civil-time literals), the same surface as a plain
-  valid-time write. The start (`vf`) is mandatory; the end (`vt`) defaults to an
+- A period bound is either a **statement-level instant** — an integer microsecond
+  value, `now()`, or `now() ± interval` (not civil-time literals), the same
+  surface as a plain valid-time write, folded at bind so every affected key opens
+  the same interval — or a **per-source-row source column** (`vf = s.valid_from`,
+  STL-308), so each affected key carries its **own** `[from, to)` interval, the
+  natural shape when historizing a batch whose rows each assert a different
+  effective date. The start (`vf`) is mandatory; the end (`vt`) defaults to an
   open period when omitted.
-- The bound must be a **statement-level instant**, not a source column: a
-  per-source-row valid interval (`… vf = s.valid_from`) is rejected for now (a
-  deferred follow-up), so the close/open instant is fixed at bind.
+- A per-row source bound reconciles to a microsecond instant: a `VALUES` cell is
+  an integer (the same convention as a literal bound), a table source's column is
+  `TIMESTAMP` / `TIMESTAMPTZ`. The interval is derived per row at execution, so an
+  empty/reversed or `NULL` per-row bound is rejected there rather than at bind.
 - No auto-coalescing (assumption A40): facts are stored exactly as asserted, and
   the 2-D `(system × valid)` tiling holds — at most one live version per key at
   any `(sys, valid)` point, with deletion gaps only where a `DELETE` intends one

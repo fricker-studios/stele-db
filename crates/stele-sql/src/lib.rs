@@ -88,7 +88,7 @@ pub use dialect::SteleDialect;
 pub use dml::{BoundDml, DmlError, InsertRow, bind_dml};
 pub use error::ParseError;
 pub use fold::fold_literal;
-pub use merge::{BoundMerge, MergeSource, MergeValue};
+pub use merge::{BoundMerge, MergeBound, MergeSource, MergeValid, MergeValue};
 pub use parser::parse;
 pub use select::{
     ArithOp, AsOfError, BindContext, BoundJoin, BoundJoinSide, BoundPeriod, BoundPeriodPredicate,
