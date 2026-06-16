@@ -10,7 +10,7 @@
 
 use std::io::Write as _;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
 use stele_pgwire::{Server, ServerTls, SharedSession, TlsMode, TlsSettings};
+use stele_server::admin::http::AdminHttp;
+use stele_server::admin::{AdminAuth, AdminService};
+use stele_server::ops::{OpsServer, OpsState};
 use stele_storage::backend::MemDisk;
 
 /// Boot a fresh engine + pgwire server on an ephemeral port (STL-152: the
@@ -366,11 +369,10 @@ UPDATE account SET balance = 250 WHERE id = 1;
     assert!(stdout.contains("Lineage — "), "{stdout}");
     assert!(stdout.contains("balance = 250"), "{stdout}");
 
-    // The still-stubbed admin tier points at its ticket.
-    assert!(
-        stdout.contains("NOTICE:  \\status") && stdout.contains("STL-200"),
-        "{stdout}"
-    );
+    // The admin tier is wired (STL-200): `\status` is dispatched, not stubbed —
+    // and with no token configured on this plain server it is refused with the
+    // bearer-token hint rather than run.
+    assert!(stderr.contains("requires a bearer token"), "{stderr}");
 
     // Unknown meta-command: the psql error block, on stderr.
     assert!(stderr.contains("ERROR:  invalid command \\zz"), "{stderr}");
@@ -649,4 +651,262 @@ INSERT INTO account VALUES (3, 300);
 
     // A bare \segments (no table) is a usage error on stderr.
     assert!(stderr.contains("\\segments needs a table"), "{stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// Admin / control-plane tier ([STL-200])
+//
+// These boot the engine behind BOTH the pg-wire server (SQL + the temporal tier)
+// AND the ops listener's HTTP/JSON admin gateway (STL-254), then drive the real
+// `stele` binary against both — `--port` for pg-wire, `--admin-port` +
+// `--admin-token` for the control plane.
+// ---------------------------------------------------------------------------
+
+/// The token the admin gateway is configured with for these tests.
+const ADMIN_TOKEN: &str = "test-admin-token";
+
+/// A live server exposing both surfaces over the one engine.
+struct AdminServer {
+    /// The pg-wire listen address.
+    pg: SocketAddr,
+    /// The ops listener address (the admin HTTP/JSON gateway shares it).
+    ops: SocketAddr,
+    /// Holds the engine's data + backup scratch dir alive for the test.
+    scratch: Scratch,
+}
+
+/// Boot one engine shared by the pg-wire server and the admin HTTP/JSON gateway
+/// (the same wiring `stele_server::run` does), each on its own ephemeral port.
+async fn spawn_admin_server(label: &str) -> AdminServer {
+    let scratch = Scratch::new(label);
+    // The engine handle is shared two ways, exactly as the server does it: a typed
+    // handle for the admin core, and the same handle coerced to the pg-wire /
+    // ops `SharedSession` trait object.
+    let engine = Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    // The concrete handle coerces to the pg-wire / ops `SharedSession` trait object
+    // (a method-call clone so the unsized coercion lands at the binding).
+    let session: SharedSession = engine.clone();
+
+    let bound = Server::new("127.0.0.1:0".parse().unwrap(), Arc::clone(&session))
+        .bind()
+        .await
+        .expect("bind pg-wire port");
+    let pg = bound.local_addr();
+    tokio::spawn(bound.serve());
+
+    // The ops listener with the admin gateway mounted, token-gated.
+    let auth = Arc::new(AdminAuth::new(vec![ADMIN_TOKEN.to_owned()]));
+    let core = AdminService::new(Arc::clone(&engine));
+    let ops_state = Arc::new(OpsState::new());
+    ops_state.set_ready(Arc::clone(&session));
+    ops_state.set_admin(Arc::new(AdminHttp::new(core, auth)));
+    let ops = OpsServer::new("127.0.0.1:0".parse().unwrap(), Arc::clone(&ops_state))
+        .bind()
+        .await
+        .expect("bind ops port");
+    let ops_addr = ops.local_addr();
+    tokio::spawn(ops.serve());
+
+    AdminServer {
+        pg,
+        ops: ops_addr,
+        scratch,
+    }
+}
+
+/// Run `stele shell` wired to both surfaces (`pg` for pg-wire, the admin flags
+/// for the control plane on `ops_port`), feeding it `script`, off the async
+/// runtime so the blocking poll loop never starves the server tasks.
+async fn run_admin_shell(pg: SocketAddr, ops_port: u16, script: String) -> Output {
+    let ops_port = ops_port.to_string();
+    tokio::task::spawn_blocking(move || {
+        run_shell(
+            pg,
+            &script,
+            &["--admin-port", &ops_port, "--admin-token", ADMIN_TOKEN],
+        )
+    })
+    .await
+    .expect("shell task")
+}
+
+/// `\status` / `\backup` / `\restore` / `\pitr` end to end against the admin API.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_tier_status_backup_restore_and_pitr() {
+    let server = spawn_admin_server("admin-tier").await;
+    let backup_dir = server.scratch.path().join("snap1");
+    let backup_arg = backup_dir.display().to_string();
+    let script = format!(
+        "\
+CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING;
+INSERT INTO account VALUES (1, 100);
+UPDATE account SET balance = 200 WHERE id = 1;
+\\status
+\\backup --to {backup_arg}
+\\restore {backup_arg}
+\\pitr now() account 1
+\\pitr now() account 999
+\\q
+"
+    );
+    let output = run_admin_shell(server.pg, server.ops.port(), script).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // \status — the control-plane header, real counts, a healthy verdict.
+    assert!(stdout.contains("Engine status"), "{stdout}");
+    assert!(stdout.contains("control-plane"), "{stdout}");
+    assert!(stdout.contains("● healthy"), "{stdout}");
+    // The kv label is column-padded, so match the value side: one relation.
+    assert!(stdout.contains("1 · segments"), "{stdout}");
+    assert!(stdout.contains("account (2 cols"), "{stdout}");
+
+    // \backup — a manifest summary and the shipped verdict.
+    assert!(stdout.contains("Backup"), "{stdout}");
+    assert!(stdout.contains("commit head"), "{stdout}");
+    assert!(stdout.contains("manifest"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("backup written to {backup_arg}")),
+        "{stdout}"
+    );
+
+    // \restore — the dry-run validation of the backup just taken.
+    assert!(stdout.contains("Restore"), "{stdout}");
+    assert!(stdout.contains("sha256 verified ✓"), "{stdout}");
+    assert!(stdout.contains("would restore"), "{stdout}");
+    assert!(stdout.contains("stele restore --from"), "{stdout}");
+
+    // \pitr — the temporal-correctness hook: the AS OF value at the target is the
+    // current committed version (200, not the superseded 100), and it matches the
+    // append-only history.
+    assert!(stdout.contains("Point-in-time recovery"), "{stdout}");
+    assert!(stdout.contains("balance = 200"), "{stdout}");
+    assert!(
+        stdout.contains("FOR SYSTEM_TIME AS OF matches a committed version"),
+        "{stdout}"
+    );
+    // A key that never existed → a consistent absence.
+    assert!(stdout.contains("account 999 = ∅"), "{stdout}");
+
+    // The whole admin tier ran without a single SQL/transport error.
+    assert!(stderr.is_empty(), "admin tier wrote to stderr: {stderr}");
+}
+
+/// `\inspect-segment` renders a real footer summary for a sealed segment, and a
+/// clear not-found error for a bogus id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_inspect_segment_renders_footer() {
+    let server = spawn_admin_server("admin-inspect").await;
+
+    // First session: build a sealed segment and read its id off the \segments
+    // trailer (the engine assigns it, so the test does not hard-code the format).
+    let setup = "\
+CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING;
+INSERT INTO account VALUES (1, 100);
+INSERT INTO account VALUES (2, 200);
+FLUSH;
+INSERT INTO account VALUES (3, 300);
+\\segments account
+\\q
+";
+    let seg_out = run_admin_shell(server.pg, server.ops.port(), setup.to_owned()).await;
+    let seg_stdout = String::from_utf8_lossy(&seg_out.stdout);
+    assert!(seg_out.status.success(), "{seg_stdout}");
+    let seg_id = seg_stdout
+        .lines()
+        .find_map(|line| line.split("inspect-segment ").nth(1))
+        .map(str::trim)
+        .expect("a sealed segment id in the \\segments trailer")
+        .to_owned();
+    assert!(
+        seg_id.starts_with("seg-"),
+        "unexpected segment id: {seg_id}"
+    );
+
+    // Second session: inspect that segment, then a bogus one.
+    let script = format!(
+        "\
+\\inspect-segment {seg_id}
+\\inspect-segment account no-such-seg
+\\q
+"
+    );
+    let output = run_admin_shell(server.pg, server.ops.port(), script).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // The footer summary from real metadata: state, the sealed two-row range, the
+    // business-key zone, and a size. No fabricated per-column statistics.
+    assert!(
+        stdout.contains(&format!("Segment {seg_id} — public.account")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("sealed (immutable)"), "{stdout}");
+    assert!(stdout.contains("rows 2"), "{stdout}");
+    assert!(stdout.contains("id ∈ [1, 2]"), "{stdout}");
+    assert!(stdout.contains("KB"), "{stdout}");
+
+    // The bogus id is a clear not-found error on stderr.
+    assert!(stderr.contains("not found in account"), "{stderr}");
+}
+
+/// Without a token the admin tier is refused locally — no round-trip, an
+/// actionable hint — while SQL on pg-wire still works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_tier_without_a_token_is_refused() {
+    // A plain pg-wire server (no admin flags passed to the shell).
+    let addr = spawn_server().await;
+    let script = "\
+\\status
+SELECT 1;
+\\q
+";
+    let output = tokio::task::spawn_blocking(move || run_shell(addr, script, &[]))
+        .await
+        .expect("shell task");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // \status is refused with the token hint…
+    assert!(stderr.contains("requires a bearer token"), "{stderr}");
+    assert!(stderr.contains("STELE_ADMIN_TOKEN"), "{stderr}");
+    // …but the SQL session is unaffected.
+    assert!(stdout.contains("(1 row)"), "{stdout}");
+}
+
+/// A unique scratch directory under the OS temp dir, removed on drop.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(label: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("stele-cli-{label}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create scratch dir");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }

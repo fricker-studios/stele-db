@@ -10,6 +10,7 @@
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
+mod admin;
 mod client;
 mod highlight;
 mod render;
@@ -72,6 +73,20 @@ struct ShellArgs {
     /// Disable ANSI color even on a terminal (NO_COLOR is also honored).
     #[arg(long)]
     no_color: bool,
+    /// Admin / control-plane host for the `\status`/`\backup`/`\restore`/`\pitr`/
+    /// `\inspect-segment` tier (STL-200). Defaults to `--host`.
+    #[arg(long)]
+    admin_host: Option<String>,
+    /// Admin / control-plane (ops listener) port — where the HTTP/JSON gateway
+    /// answers (STL-254). Defaults to the documented ops port `9090`.
+    #[arg(long, default_value_t = 9090)]
+    admin_port: u16,
+    /// Bearer token for the admin / control-plane API. The server enables the API
+    /// by configuring `[admin] tokens` in `stele.toml`; without a token here the
+    /// admin tier is refused (the surface rejects every unauthenticated request).
+    /// Falls back to `STELE_ADMIN_TOKEN` when the flag is omitted.
+    #[arg(long)]
+    admin_token: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -126,19 +141,36 @@ fn main() -> anyhow::Result<()> {
                 .block_on(stele_server::run(cfg))?;
             Ok(())
         }
-        Cmd::Shell(s) => shell::run(&shell::Opts {
-            host: s.host,
-            port: s.port,
-            user: s.user,
-            dbname: s.dbname,
-            tls: client::TlsOpts {
-                mode: s.tls,
-                ca: s.tls_ca,
-            },
-            border: s.border,
-            row_nums: s.row_numbers,
-            no_color: s.no_color,
-        }),
+        Cmd::Shell(s) => {
+            // The admin tier defaults its host to the pg-wire host (the common
+            // single-node case) and its port to the ops listener's `9090`. The
+            // token falls back to STELE_ADMIN_TOKEN so it need not appear in
+            // shell history or `ps` output.
+            let admin_host = s.admin_host.unwrap_or_else(|| s.host.clone());
+            let admin_token = s.admin_token.or_else(|| {
+                std::env::var("STELE_ADMIN_TOKEN")
+                    .ok()
+                    .filter(|t| !t.is_empty())
+            });
+            shell::run(&shell::Opts {
+                host: s.host,
+                port: s.port,
+                user: s.user,
+                dbname: s.dbname,
+                tls: client::TlsOpts {
+                    mode: s.tls,
+                    ca: s.tls_ca,
+                },
+                border: s.border,
+                row_nums: s.row_numbers,
+                no_color: s.no_color,
+                admin: admin::AdminConfig {
+                    host: admin_host,
+                    port: s.admin_port,
+                    token: admin_token,
+                },
+            })
+        }
         Cmd::Restore(r) => run_restore(&r),
         Cmd::Query { .. } => {
             anyhow::bail!(

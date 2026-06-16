@@ -30,6 +30,12 @@ clap         = { workspace = true }
 tokio        = { workspace = true }
 rustyline     = { workspace = true }
 unicode-width = { workspace = true }
+# The admin / control-plane shell tier (STL-200) speaks the HTTP/JSON admin
+# gateway (STL-254) over a tiny hand-rolled blocking client; serde[_json] decode
+# its replies. Both are already in the workspace graph (stele-server's gateway
+# uses them), so this adds no new external dependency.
+serde        = { workspace = true }
+serde_json   = { workspace = true }
 # `stele shell --tls` (STL-251): the same rustls the server stack uses, driven
 # through its blocking `StreamOwned` adapter — still no async client crate.
 rustls           = { workspace = true }
