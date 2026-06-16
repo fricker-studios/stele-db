@@ -122,12 +122,17 @@ shell's `\audit` and `\lineage`.**
   fail-closed on every `SessionEngine::recover`, with a tamper oracle. Unifying
   the row WAL / catalog log / commit log under one verifiable format remains the
   longer-term follow-up.
-- Closing the commit-record crash window (a crash between the data fsync and the
-  commit-record fsync leaves a durable-but-unchained data commit) — STL-307
-  carved this out as its own ticket: the common auto-commit path bypasses the
-  two-phase commit-record gating, so closing it needs a storage-layer direct
-  two-phase append plus a crash oracle, a separate risk surface from the catalog
-  chain.
+- ~~Closing the commit-record crash window~~ — **done in STL-307 / STL-314**: every
+  single-table and auto-commit data leg is now written as a **two-phase** record
+  gated on its own commit record (reusing the cross-table gating above — the
+  point auto-commit path routes through a one-statement group commit), so the
+  commit record's fsync is the sole commit point and a crash between the data
+  fsync and the commit-record fsync discards the leg on recovery (presumed abort)
+  rather than leaving it durable-but-unchained. A seed-reproducible in-process
+  crash oracle pins it. This refines the "Negative / costs" note below: the
+  single-table path's two fsyncs are now both load-bearing (data leg, then the
+  gating commit record); batched/group commit-record fsync to amortize them stays
+  the open optimization.
 - Merkle inclusion/consistency proofs over this chain (~v0.5,
   [ADR-0026](0026-verifiable-audit-log.md)).
 - A seed-reproducible tamper sweep lives in `stele-engine` (in-process

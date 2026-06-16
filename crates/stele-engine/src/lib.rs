@@ -1795,9 +1795,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             let op = version_op(prev, v);
             prev = Some(v);
             // A version's commit hash is its transaction's chain record. A version
-            // with no record is the rare unchained commit (a crash between the data
-            // fsync and the commit-record fsync, [ADR-0031]); its hash is NULL rather
-            // than a fabricated value.
+            // with no record is one whose write was deliberately not chained — a
+            // DROP era's bulk row closes ([STL-211]/[STL-220]), recovery-re-derivable
+            // from the catalog drop record, not a data commit ([ADR-0031]). The
+            // crash-window unchained commit (data durable, no record) is closed now
+            // that every single-table/auto-commit leg is gated on its record
+            // ([STL-314]). Its hash is NULL rather than a fabricated value.
             let (hash, prev_hash) =
                 by_txn
                     .get(&v.provenance.txn_id.0)
@@ -3583,11 +3586,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// columns through the row codec, `UPDATE`'s read-modify-write merge) live in
     /// [`apply_bound_dml`](Self::apply_bound_dml).
     ///
-    /// This is the **auto-commit direct point path**. A key-equality `UPDATE` /
+    /// This is the **auto-commit point path**. A key-equality `UPDATE` /
     /// `DELETE` whose key has no live row is a 0-row no-op (`UPDATE 0` /
     /// `DELETE 0`, Postgres set semantics) rather than the storage writers'
     /// `KeyNotFound` ([STL-294], [`absent_point_tag`](Self::absent_point_tag)) —
     /// no write, no transaction id consumed.
+    ///
+    /// The write itself goes through the **group-commit path** (a one-statement
+    /// group), so its data record is the two-phase, commit-record-gated leg the
+    /// crash window ([STL-314], [ADR-0031]) requires — not a plain, unconditionally-
+    /// applied record. The trade is the same one ADR-0031 accepts for the chain: the
+    /// data fsync and the commit-record fsync (group-commit amortization is the
+    /// follow-up).
     fn apply_dml(&mut self, dml: BoundDml) -> Result<StatementOutcome, EngineError> {
         // An absent-key point UPDATE/DELETE reports zero rows and writes nothing
         // ([STL-294]); probe against the committed state (no overlay).
@@ -3597,12 +3607,28 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let txn_id = TxnId(self.next_txn);
         self.next_txn += 1;
         let principal = self.write_principal.clone();
-        let summary = self.apply_bound_dml(dml, txn_id, &principal)?;
-        // The write's data is durable; append this commit's link to the
-        // hash-chained commit log ([ADR-0031], STL-302). A single-statement
-        // auto-commit bypasses the group-commit path, so it records its commit here
-        // rather than in `finish_group_commit`.
-        self.record_commit(txn_id)?;
+        // Route the point write through the **group path** so its data record is the
+        // same two-phase, commit-record-gated leg a single-table `COMMIT` writes
+        // ([STL-314]): the leg is fsynced first, then the commit record is the commit
+        // point, so a crash between the two discards the leg on recovery rather than
+        // leaving a durable-but-unchained commit ([ADR-0031]). (Pre-STL-314 this path
+        // appended a plain record and recorded its commit separately, leaving exactly
+        // that window.)
+        let table = dml.table().to_owned();
+        self.table_mut(&table)?.engine.begin_group();
+        let summary = match self.apply_bound_dml(dml, txn_id, &principal) {
+            Ok(summary) => summary,
+            Err(e) => {
+                // The statement failed mid-apply: discard the buffered (and resident-
+                // applied) write so the table is left unchanged ([STL-216]) and no
+                // stray group buffer lingers for the next write.
+                if let Ok(state) = self.table_mut(&table) {
+                    state.engine.abort_group();
+                }
+                return Err(e);
+            }
+        };
+        self.finish_group_commit(txn_id, std::slice::from_ref(&table))?;
         // An auto-committed write pins no snapshot, so this is the steady-state
         // prune point under auto-commit traffic — without it the index would grow
         // with distinct keys on a server that never opens a transaction ([STL-204]).
@@ -4813,12 +4839,17 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// Durably commit every `touched` table, atomically across **all** of them
     /// ([`commit`](Self::commit), [STL-215]).
     ///
-    /// **Single-table (or empty) fast path.** With at most one table touched, that
-    /// table's group-commit record boundary is already the transaction's atomic
-    /// commit point ([STL-192]), so it takes the plain
-    /// [`commit_group`](stele_storage::engine::Engine::commit_group) — one WAL
-    /// record + one fsync, no marker. This keeps the common case at exactly one
-    /// fsync per `COMMIT`.
+    /// **Single-table (or empty) path.** With at most one table touched, the
+    /// table's writes are committed as a single **two-phase** record
+    /// ([`commit_group_two_phase`](stele_storage::engine::Engine::commit_group_two_phase))
+    /// gated on this commit's record, then the commit record is fsynced as the
+    /// commit point — the same gating the multi-table legs use ([STL-215]), now
+    /// applied to the single-table path so a crash between the data fsync and the
+    /// commit-record fsync discards the leg rather than leaving it durable-but-
+    /// unchained ([STL-314], [ADR-0031]). STL-302 left this path on the plain,
+    /// unconditionally-applied [`commit_group`](stele_storage::engine::Engine::commit_group)
+    /// (the data fsync + an additive commit record); gating it closes that window.
+    /// An empty (no-write) commit writes neither record.
     ///
     /// **Multi-table two-phase path.** Across several tables a single record per
     /// table is *not* atomic — a crash between two tables' commits would leave one
@@ -4866,12 +4897,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 // covers data commits, [ADR-0031]).
                 return Ok(());
             };
-            self.table_mut(table)?.engine.commit_group()?;
-            // The data record is durable; append this commit's hash-chain record
-            // ([ADR-0031]). For a single-table commit the record is *additive* —
-            // recovery applies the plain WAL record unconditionally, so the record
-            // never gates that write — it makes the live commit log verifiable
-            // end-to-end (the cost being the extra fsync [ADR-0031] accepts).
+            // Single-table commit: write the data as a **two-phase** record gated
+            // on this commit's record, exactly like the multi-table legs ([STL-215],
+            // [STL-314]). The leg is durable but inert until the commit record below
+            // vouches for it, so a crash in the window between the data fsync and the
+            // commit-record fsync discards the leg on recovery (presumed abort)
+            // rather than leaving a durable-but-unchained commit ([ADR-0031]). The
+            // commit record's fsync is the commit point.
+            self.table_mut(table)?
+                .engine
+                .commit_group_two_phase(txn_id)?;
             return self.record_commit(txn_id);
         }
 
@@ -12110,14 +12145,40 @@ mod tests {
     // record, then fsyncs one commit marker after every leg is durable. On recovery
     // a leg is replayed only if its marker is present, so a crash between the
     // per-table commits and the marker recovers the whole transaction all-or-none
-    // across every table. A single-table COMMIT skips the marker (one fsync). The
+    // across every table. A single-table / auto-commit write is the same shape now
+    // ([STL-314]): its data leg is two-phase, gated on its own commit record, so a
+    // crash between the data fsync and the commit-record fsync discards it too. The
     // cross-table coordination lives in `SessionEngine`, which stele-sim cannot
     // depend on (the per-table sims cover the storage half), so the seed-reproducible
     // crash coverage is this in-process FaultDisk/MemDisk sweep — the same pattern
     // STL-210 used for session-level kill coverage.
 
+    /// Drop the **last** commit record from `stele.commits`, keeping every earlier
+    /// one — the precise on-disk shape of a crash after a commit's data leg is
+    /// durable but before its own commit record's fsync completes ([STL-314]).
+    /// Removing the whole file would also drop the *baseline* commits' records,
+    /// which are now their own commit-record-gated legs (a single-table commit is
+    /// no longer an unconditionally-applied plain record).
+    fn truncate_last_commit_record(disk: &MemDisk) {
+        use stele_storage::backend::DiskFile as _;
+        const FRAME: usize = 8 + stele_txn::COMMIT_RECORD_LEN + 4;
+        let name = crate::commit_log::COMMIT_LOG_FILENAME;
+        let file = disk.open(name).expect("open commit log");
+        let len = usize::try_from(file.len()).expect("small file");
+        assert!(len >= FRAME, "at least one commit record to drop");
+        let mut bytes = vec![0u8; len];
+        file.read_at(0, &mut bytes).expect("read");
+        bytes.truncate(len - FRAME);
+        disk.remove(name).expect("remove");
+        disk.create(name)
+            .expect("create")
+            .append(&bytes)
+            .expect("append");
+    }
+
     /// Create two system-versioned tables `a` and `b`, then auto-commit a baseline
-    /// row into each (a plain WAL record per table — always durable on recovery).
+    /// row into each. Each baseline insert is its own commit-record-gated two-phase
+    /// leg ([STL-314]), so it survives recovery as long as *its* commit record does.
     fn two_tables_with_baseline(engine: &mut SessionEngine<ZeroClock, MemDisk>) {
         for ddl in [
             "CREATE TABLE a (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
@@ -12196,9 +12257,9 @@ mod tests {
         commit_two_table_txn(&mut engine).expect("commit");
         drop(engine);
 
-        // The marker's fsync never completed: drop it, keeping every leg on disk.
-        disk.remove(crate::commit_log::COMMIT_LOG_FILENAME)
-            .expect("remove marker");
+        // The marker's fsync never completed: drop just that last record, keeping
+        // every leg — and the baseline commits' own records — on disk.
+        truncate_last_commit_record(&disk);
 
         let mut engine = recover_session(&disk);
         assert_eq!(
@@ -12249,12 +12310,11 @@ mod tests {
 
     #[test]
     fn the_single_table_fast_path_writes_a_commit_chain_record() {
-        // A single-table COMMIT keeps the STL-192 plain (unconditionally-applied)
-        // per-table record, but ADR-0031 now *also* appends a hash-chain commit
-        // record so the live commit log is verifiable end-to-end (refining
-        // ADR-0029's single-table-no-marker fast path — the deliberate extra fsync).
-        // Observable proxy: the commit log exists with one record, and the writes
-        // recover whole.
+        // A single-table COMMIT writes one hash-chain commit record (ADR-0031) that
+        // is now *also* the marker its two-phase data leg is gated on ([STL-314]) —
+        // so the live commit log is verifiable end-to-end and the leg recovers
+        // all-or-none with its record. Observable proxy: the commit log exists with
+        // one record, and the writes recover whole.
         let disk = MemDisk::new();
         let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
         engine.execute(&parse_one(CREATE)).expect("create account");
@@ -12283,6 +12343,56 @@ mod tests {
     }
 
     #[test]
+    fn an_auto_commit_crash_before_the_commit_record_discards_the_leg() {
+        // The commit-record crash window ([STL-314], [ADR-0031]): an auto-commit
+        // write's data leg is now a two-phase record gated on its own commit record,
+        // so a crash after the leg is durable but before the commit record fsyncs
+        // recovers all-or-none — the unwitnessed leg is discarded, never left
+        // durable-but-unchained. (Before STL-314 this leg was a plain record applied
+        // unconditionally, so it would have survived as an unchained commit — the
+        // very gap this oracle pins shut.)
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("commit 1");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (2, 200)"))
+            .expect("commit 2 — its data leg is durable");
+        drop(engine);
+
+        // The crash: the 2nd commit's data leg reached the table WAL (durable,
+        // two-phase), but its commit record never fsynced — drop just that record.
+        truncate_last_commit_record(&disk);
+
+        let mut engine = recover_session(&disk);
+        assert_eq!(
+            ids(&mut engine, "account"),
+            vec![i4(1)],
+            "the chained commit survives; the unchained leg is discarded — window closed",
+        );
+        // The recovered chain still verifies clean — no leg without a record, no
+        // record without its leg.
+        let StatementOutcome::Rows(audit) = engine
+            .execute(&parse_one("SELECT * FROM stele_audit('account')"))
+            .expect("audit")
+        else {
+            panic!("rows");
+        };
+        assert!(
+            matches!(
+                ScalarValue::decode(
+                    LogicalType::Bool,
+                    audit.rows[0][4].as_ref().expect("verdict")
+                ),
+                Ok(ScalarValue::Bool(true)),
+            ),
+            "the recovered commit chain verifies",
+        );
+    }
+
+    #[test]
     fn a_multi_table_commit_under_injected_faults_recovers_all_or_none() {
         // Seed-reproducible: across crash models — a lost marker, an fsync fault on
         // the first leg, an append fault on the first leg, and a clean commit — a
@@ -12297,11 +12407,11 @@ mod tests {
 
             let model = seed % 4;
             let expect_committed = match model {
-                // All legs + marker durable, then the marker is lost.
+                // All legs + marker durable, then the marker is lost (just that
+                // last record — the baseline commits' records stay).
                 0 => {
                     commit_two_table_txn(&mut engine).expect("commit");
-                    disk.remove(crate::commit_log::COMMIT_LOG_FILENAME)
-                        .expect("remove marker");
+                    truncate_last_commit_record(&disk);
                     false
                 }
                 // The first leg's fsync fails — commit aborts before the marker.
