@@ -871,6 +871,22 @@ pub struct SessionEngine<C: Clock + Clone, D: Disk + Clone> {
     /// [ADR-0031]: ../../../docs/adr/0031-live-server-verifiable-commit-log.md
     /// [STL-307]: https://allegromusic.atlassian.net/browse/STL-307
     catalog_head: Digest,
+    /// Set when an append to the durable commit log (`stele.commits`) fails *after*
+    /// a data leg is already durable. The commit record is now the commit point and
+    /// gates recovery ([STL-314]), so a failure here leaves the just-applied
+    /// (resident) write witnessed by no record: recovery would discard it, diverging
+    /// from the live process. Per the WAL durability contract (invariant 2) that
+    /// indeterminate state is a crash, not a clean abort, so the session **poisons**
+    /// — [`is_poisoned`](Self::is_poisoned) reports it (the ops `/readyz` turns
+    /// unready) and [`execute`](Self::execute) refuses every further statement —
+    /// until a restart into [`recover`](Self::recover) drops the unwitnessed leg and
+    /// the live/recovered states reconverge. This is the per-table WAL poison's
+    /// posture ([STL-217]) for the separate commit-log WAL that [ADR-0031] left
+    /// surfaced-but-not-poisoned.
+    ///
+    /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
+    /// [STL-314]: https://allegromusic.atlassian.net/browse/STL-314
+    commit_poisoned: bool,
     /// The MVCC write index: per-`(table, key)`, the commit instant of the most
     /// recent committed write. Every applied write records its commit instant
     /// here, and a multi-statement [`commit`](Self::commit) checks its write set
@@ -972,6 +988,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             commit_head: Digest::ZERO,
             commit_seq: 1,
             catalog_head: Digest::ZERO,
+            commit_poisoned: false,
             write_index: BTreeMap::new(),
             open_snapshots: OpenSnapshots::default(),
             pruned_below: SystemTimeMicros(0),
@@ -1126,6 +1143,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             commit_head: recovered_chain.head,
             commit_seq: recovered_chain.seq.saturating_add(1),
             catalog_head,
+            commit_poisoned: false,
             write_index: BTreeMap::new(),
             open_snapshots: OpenSnapshots::default(),
             pruned_below: SystemTimeMicros(0),
@@ -1424,19 +1442,27 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         Ok(manifest)
     }
 
-    /// Whether any resident table's WAL is **poisoned** — a prior fsync failed on
-    /// that table, so its staged record's durability is indeterminate and the
-    /// per-table engine now refuses further writes ([`Engine::is_poisoned`],
-    /// [STL-217]). A poisoned session must stop serving and restart into
-    /// [`recover`](Self::recover): a failed fsync is a crash, not a clean abort, and
-    /// recovery resolves the indeterminate record from the durable log while opening
-    /// fresh, unpoisoned WALs. Spans **every** resident tier, including
-    /// dropped-but-retained ones, since each owns its own WAL.
+    /// Whether the session is **poisoned** — its durability is indeterminate and it
+    /// must stop serving and restart into [`recover`](Self::recover) (a failed fsync
+    /// is a crash, not a clean abort; recovery resolves the indeterminate record from
+    /// the durable log while opening fresh, unpoisoned WALs). Two sources:
+    ///
+    /// * **a resident table's WAL** — a prior fsync failed on that table, so its
+    ///   staged record's durability is indeterminate and the per-table engine now
+    ///   refuses further writes ([`Engine::is_poisoned`], [STL-217]). Spans every
+    ///   resident tier, including dropped-but-retained ones, since each owns its WAL.
+    /// * **the commit log** — a commit record failed to reach `stele.commits` after
+    ///   its data leg was durable (`commit_poisoned`, [STL-314]), so recovery would
+    ///   discard a write the live process applied. The commit log is a separate WAL
+    ///   ADR-0031 left surfaced-but-not-poisoned; this closes it.
+    ///
+    /// The ops `/readyz` reads this, so either source turns the server unready.
     ///
     /// [STL-217]: https://allegromusic.atlassian.net/browse/STL-217
+    /// [STL-314]: https://allegromusic.atlassian.net/browse/STL-314
     #[must_use]
     pub fn is_poisoned(&self) -> bool {
-        self.tables.values().any(|state| state.engine.is_poisoned())
+        self.commit_poisoned || self.tables.values().any(|state| state.engine.is_poisoned())
     }
 
     /// The session's catalog — schemas resolve at a snapshot through it.
@@ -2291,6 +2317,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         read_snapshot: SystemTimeMicros,
         overlay: &[BoundDml],
     ) -> Result<StatementOutcome, EngineError> {
+        // A commit-log poison is session-fatal: a prior commit record failed to reach
+        // disk *after* its data leg was durable, so the live state and what recovery
+        // would reconstruct have diverged ([STL-314]). Refuse every further statement
+        // — reads included, since a divergent write may be visible — until a restart
+        // into `recover` resolves it. (The per-table WAL poison refuses lazily at the
+        // next write; this is the more serious whole-session condition.)
+        if self.commit_poisoned {
+            return Err(EngineError::CommitLog(io::Error::other(
+                "session poisoned by a failed commit-log append; restart to recover",
+            )));
+        }
+
         // Admin commands (CHECKPOINT / FLUSH / COMPACT / BACKUP) have no SQL body,
         // so they are routed before the binders, which all assume one ([STL-219]).
         // `clone` (not `Copy`) because `BACKUP` carries an owned path.
@@ -4965,7 +5003,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             seq: self.commit_seq,
             prev_hash: self.commit_head,
         };
-        commit_log::append(&self.disk, &record).map_err(EngineError::CommitLog)?;
+        if let Err(e) = commit_log::append(&self.disk, &record) {
+            // The data leg is already durable, but its commit record is not. Since
+            // the commit record is the commit point and gates recovery ([STL-314]),
+            // recovery would discard the just-applied (resident) write — diverging
+            // from this live process. Per the WAL durability contract that is a
+            // crash, not a clean abort: poison the session so it stops serving and a
+            // restart into `recover` drops the unwitnessed leg (`commit_poisoned`).
+            self.commit_poisoned = true;
+            return Err(EngineError::CommitLog(e));
+        }
         self.commit_head = record.hash();
         self.commit_seq = self.commit_seq.saturating_add(1);
         Ok(())
@@ -12389,6 +12436,56 @@ mod tests {
                 Ok(ScalarValue::Bool(true)),
             ),
             "the recovered commit chain verifies",
+        );
+    }
+
+    #[test]
+    fn a_commit_log_failure_poisons_the_session_and_recovery_drops_the_leg() {
+        // If the commit record fails to reach disk *after* the data leg is durable
+        // (the commit record is the commit point now, [STL-314]), the just-applied
+        // write is witnessed by no record — recovery would discard it, diverging from
+        // the live process. So the session poisons (is_poisoned → ops `/readyz`
+        // unready), refuses further statements, and a restart into `recover` drops the
+        // unwitnessed leg, reconverging. (Mirrors the per-table WAL poison for the
+        // commit-log WAL ADR-0031 left surfaced-but-not-poisoned.)
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("commit 1 creates the commit log");
+
+        // Fail the *next* `Disk::open` — the commit-log append opens `stele.commits`,
+        // but the data leg's WAL is already open, so its append + fsync complete first
+        // and only the commit record fails. The write is durable but unwitnessed.
+        disk.faults().schedule(FaultOp::Open, io::ErrorKind::Other);
+        assert!(
+            engine
+                .execute(&parse_one("INSERT INTO account VALUES (2, 200)"))
+                .is_err(),
+            "a commit-log failure fails the statement",
+        );
+        assert!(
+            engine.is_poisoned(),
+            "a commit-log failure poisons the session (ops /readyz turns unready)",
+        );
+        assert!(
+            engine
+                .execute(&parse_one("SELECT id FROM account"))
+                .is_err(),
+            "a poisoned session refuses every further statement",
+        );
+        drop(engine);
+
+        let mut engine = recover_session(&disk);
+        assert!(
+            !engine.is_poisoned(),
+            "recovery opens a fresh, unpoisoned session",
+        );
+        assert_eq!(
+            ids(&mut engine, "account"),
+            vec![i4(1)],
+            "the unwitnessed leg is discarded on recovery — live and recovered converge",
         );
     }
 
