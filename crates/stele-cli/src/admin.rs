@@ -245,19 +245,21 @@ impl AdminClient {
         })?;
         stream.set_read_timeout(Some(ADMIN_TIMEOUT)).ok();
         stream.set_write_timeout(Some(ADMIN_TIMEOUT)).ok();
-        // `Connection: close` lets the read below run to EOF — the gateway closes
-        // after one request anyway (it serves one request per connection).
-        let request = format!(
-            "{method} {path} HTTP/1.1\r\n\
-             Host: {host}:{port}\r\n\
-             Authorization: Bearer {token}\r\n\
-             Accept: application/json\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: {len}\r\n\
-             Connection: close\r\n\r\n\
-             {body}",
-            len = body.len(),
-        );
+        // Build the request head from explicit header lines joined by CRLF — no
+        // continuation/indentation trickery, so there is no chance of leading
+        // whitespace folding a header. `Connection: close` lets the read below run
+        // to EOF (the gateway serves one request per connection).
+        let head = [
+            format!("{method} {path} HTTP/1.1"),
+            format!("Host: {host}:{port}"),
+            format!("Authorization: Bearer {token}"),
+            "Accept: application/json".to_owned(),
+            "Content-Type: application/json".to_owned(),
+            format!("Content-Length: {}", body.len()),
+            "Connection: close".to_owned(),
+        ]
+        .join("\r\n");
+        let request = format!("{head}\r\n\r\n{body}");
         stream
             .write_all(request.as_bytes())
             .map_err(|e| AdminError::Transport(format!("sending the admin request: {e}")))?;

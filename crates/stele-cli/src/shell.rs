@@ -2082,16 +2082,6 @@ fn pitr_verdict(
     })
 }
 
-/// Normalize a key literal to its rendered cell form for matching against a
-/// result column: a text literal `'alice'` → `alice` (outer quotes stripped,
-/// doubled quotes un-escaped); everything else (an integer, a bareword) is left
-/// as-is.
-fn normalize_key_literal(key: &str) -> String {
-    key.strip_prefix('\'')
-        .and_then(|k| k.strip_suffix('\''))
-        .map_or_else(|| key.to_owned(), |inner| inner.replace("''", "'"))
-}
-
 /// `\pitr <ts> <table> [key]` — a point-in-time-recovery **plan** (PITR proper is
 /// v0.4 / [STL-284]) whose temporal-correctness hook ([testing-strategy §4])
 /// cross-checks the value `FOR SYSTEM_TIME AS OF <ts>` recovers against the
@@ -2166,20 +2156,9 @@ fn pitr_verify(
         );
         return Ok(None);
     }
-    // The AS OF read — the query planner's time-travel to the target.
-    let as_of = format!("SELECT * FROM {table} FOR SYSTEM_TIME AS OF {ts}");
-    let Some(as_of) = run_set(client, session, &as_of)? else {
-        return Ok(None);
-    };
-    // The key's row in the AS OF result, matched on the business key (the first
-    // table column).
-    let wanted = normalize_key_literal(key);
-    let recovered = as_of
-        .rows
-        .iter()
-        .find(|r| r.first().and_then(Option::as_deref) == Some(wanted.as_str()));
-
-    // The independent path: the append-only version history for the key.
+    // The independent path first: the append-only version history for the key.
+    // Its value columns also name the business key, which we push down to the AS
+    // OF read so a single-key check never scans the whole table.
     let table_lit = table.replace('\'', "''");
     let history = format!("SELECT * FROM stele_history('{table_lit}', {key})");
     let Some(history) = run_set(client, session, &history)? else {
@@ -2194,8 +2173,27 @@ fn pitr_verify(
         .map(|r| r.get(HISTORY_META_COLS..).unwrap_or(&[]).to_vec())
         .collect();
 
-    let verdict = pitr_verdict(recovered.map(Vec::as_slice), &committed);
-    let value_cols = as_of.columns.clone();
+    // The AS OF read — the query planner's time-travel to the target. A key with
+    // no history can have no row at any instant, so skip the read; otherwise push
+    // the business key (the first value column) down as a `WHERE` so the lookup
+    // prunes to that key rather than pulling the whole table over the wire.
+    let key_col = history
+        .columns
+        .get(HISTORY_META_COLS)
+        .map(|c| c.name.clone());
+    let (recovered, value_cols) = match key_col {
+        Some(key_col) => {
+            let as_of =
+                format!("SELECT * FROM {table} FOR SYSTEM_TIME AS OF {ts} WHERE {key_col} = {key}");
+            let Some(as_of) = run_set(client, session, &as_of)? else {
+                return Ok(None);
+            };
+            (as_of.rows.into_iter().next(), as_of.columns)
+        }
+        None => (None, Vec::new()),
+    };
+
+    let verdict = pitr_verdict(recovered.as_deref(), &committed);
     let mut out_lines = Vec::new();
     match verdict {
         PitrVerdict::Absent => {
@@ -2212,7 +2210,7 @@ fn pitr_verify(
             ]);
         }
         PitrVerdict::Present { matched } => {
-            let rendered = render_row(&value_cols, recovered.expect("present ⇒ row"));
+            let rendered = render_row(&value_cols, recovered.as_deref().expect("present ⇒ row"));
             out_lines.push(vec![
                 (Role::Mut, format!("  {:<18}", "recovered")),
                 (Role::Text, format!("{table} {key} = ({rendered})")),
@@ -2943,15 +2941,6 @@ mod tests {
         );
         // No row at the target → a consistent absence.
         assert_eq!(pitr_verdict(None, &committed), PitrVerdict::Absent);
-    }
-
-    #[test]
-    fn normalize_key_literal_strips_text_quotes_only() {
-        assert_eq!(normalize_key_literal("1"), "1");
-        assert_eq!(normalize_key_literal("'alice'"), "alice");
-        assert_eq!(normalize_key_literal("'O''Brien'"), "O'Brien");
-        // A bareword (no quotes) is left untouched.
-        assert_eq!(normalize_key_literal("account"), "account");
     }
 
     #[test]
