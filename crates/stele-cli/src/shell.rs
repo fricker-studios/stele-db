@@ -21,6 +21,7 @@ use std::time::Instant;
 
 use anyhow::Context as _;
 
+use crate::admin::{AdminClient, AdminConfig, AdminError};
 use crate::client::{Client, Reply, ResultSet, ServerError};
 use crate::highlight;
 use crate::render::{self, BorderStyle, Column, TableOpts};
@@ -36,13 +37,10 @@ pub struct Opts {
     pub border: BorderStyle,
     pub row_nums: bool,
     pub no_color: bool,
+    /// Admin / control-plane connection for the `\status`/`\backup`/`\restore`/
+    /// `\pitr`/`\inspect-segment` tier ([STL-200]).
+    pub admin: AdminConfig,
 }
-
-/// Follow-up ticket the not-yet-wired command tier points at. The version-history
-/// temporal commands (`\asof` / `\history` / `\timeline` / `\lineage`, STL-199),
-/// segment introspection (`\segments`, STL-301), and the audit chain (`\audit`,
-/// STL-302) are all live; the admin tier remains.
-const ADMIN_TICKET: &str = "STL-200";
 
 /// Per-session display state (the prototype's toggles), plus the two themes —
 /// stdout and stderr detect color independently.
@@ -66,6 +64,9 @@ struct Session {
     port: u16,
     user: String,
     dbname: String,
+    /// Admin / control-plane connection ([STL-200]) — the HTTP/JSON gateway the
+    /// admin tier dials. Cloned into a fresh [`AdminClient`] per command.
+    admin: AdminConfig,
 }
 
 /// What a handled line tells the loop to do next. `Continue.catalog_changed` is
@@ -121,6 +122,7 @@ pub fn run(opts: &Opts) -> anyhow::Result<()> {
         port: opts.port,
         user: opts.user.clone(),
         dbname: opts.dbname.clone(),
+        admin: opts.admin.clone(),
     };
 
     if interactive {
@@ -396,11 +398,29 @@ enum Meta<'a> {
     },
     Clear,
     Connect,
-    /// A designed-but-not-yet-wired command (temporal or admin tier).
-    NotYet {
-        cmd: &'a str,
-        ticket: &'static str,
-        why: &'static str,
+    /// `\status` — engine health over the admin / control-plane API ([STL-200]).
+    Status,
+    /// `\backup [--to PATH]` — consistent online backup into a server-side
+    /// directory ([STL-249] via the admin API).
+    Backup {
+        dest: Option<&'a str>,
+    },
+    /// `\restore PATH` — validate a backup directory (dry-run; the apply path is
+    /// the offline `stele restore` verb).
+    Restore {
+        src: &'a str,
+    },
+    /// `\pitr <ts> <table> [key]` — a point-in-time-recovery *plan* whose value is
+    /// cross-checked against `FOR SYSTEM_TIME AS OF` ([STL-200]).
+    Pitr {
+        ts: &'a str,
+        table: &'a str,
+        key: Option<&'a str>,
+    },
+    /// `\inspect-segment [table] ID` — a single segment's footer summary ([STL-200]).
+    InspectSegment {
+        table: Option<&'a str>,
+        id: &'a str,
     },
     /// A recognized command with arguments it cannot honor.
     BadArgs {
@@ -498,13 +518,68 @@ fn parse_meta(line: &str) -> Option<Meta<'_>> {
         // `\audit [T]` — the tamper-evident commit hash chain ([STL-302]); the
         // table is optional (defaults to the first relation).
         "audit" => Meta::Audit { table: arg },
-        "status" | "backup" | "restore" | "pitr" | "inspect-segment" | "inspect" => Meta::NotYet {
-            cmd,
-            ticket: ADMIN_TICKET,
-            why: "speaks the admin control-plane API (v0.3)",
-        },
+        // The admin / control-plane tier ([STL-200]) is parsed in its own helper
+        // to keep this dispatcher under one screen.
+        c @ ("status" | "backup" | "restore" | "pitr" | "inspect-segment" | "inspect") => {
+            parse_admin_meta(c, remainder, arg, parts.next())
+        }
         _ => Meta::Unknown(trimmed),
     })
+}
+
+/// Parse the admin / control-plane tier ([STL-200]) — over the HTTP/JSON admin
+/// gateway. `\backup` takes an optional `--to PATH`; `\restore` a required backup
+/// directory; `\pitr` a single-token target time (`now()` or an integer-
+/// microsecond instant — the AS OF resolver's forms), a table, and an optional
+/// witness key; `\inspect-segment` an optional table then a segment id. `arg` is
+/// the first token and `second` the next (for `\inspect-segment table id`).
+fn parse_admin_meta<'a>(
+    cmd: &str,
+    remainder: &'a str,
+    arg: Option<&'a str>,
+    second: Option<&'a str>,
+) -> Meta<'a> {
+    match cmd {
+        "status" => Meta::Status,
+        "backup" => Meta::Backup {
+            dest: parse_backup_dest(remainder),
+        },
+        "restore" => arg.map_or(
+            Meta::BadArgs {
+                message: r"\restore needs a backup directory".to_owned(),
+                hint: r"e.g. \restore /var/lib/stele/backups/snap1",
+            },
+            |src| Meta::Restore { src },
+        ),
+        "pitr" => match remainder.split_whitespace().collect::<Vec<_>>().as_slice() {
+            [ts, table] => Meta::Pitr {
+                ts,
+                table,
+                key: None,
+            },
+            [ts, table, key] => Meta::Pitr {
+                ts,
+                table,
+                key: Some(key),
+            },
+            _ => Meta::BadArgs {
+                message: r"\pitr needs a target time and a table".to_owned(),
+                hint: r"e.g. \pitr now() account 1  (ts is now() or an instant in microseconds)",
+            },
+        },
+        // "inspect-segment" / "inspect": an optional table then the segment id.
+        _ => match (arg, second) {
+            (Some(table), Some(id)) => Meta::InspectSegment {
+                table: Some(table),
+                id,
+            },
+            (Some(id), None) => Meta::InspectSegment { table: None, id },
+            (None, _) => Meta::BadArgs {
+                message: r"\inspect-segment needs a segment id".to_owned(),
+                hint: r"e.g. \inspect-segment seg-0002  (or \inspect-segment account seg-0002)",
+            },
+        },
+    }
 }
 
 /// Execute one meta-command.
@@ -585,14 +660,11 @@ fn dispatch_meta(
                 ),
             )],
         )?,
-        Meta::NotYet { cmd, ticket, why } => write_segs(
-            session,
-            out,
-            &[(
-                Role::Note,
-                format!("NOTICE:  \\{cmd} {why} — coming with {ticket}."),
-            )],
-        )?,
+        Meta::Status => status(session, out)?,
+        Meta::Backup { dest } => backup(session, *dest, out)?,
+        Meta::Restore { src } => restore(session, src, out)?,
+        Meta::Pitr { ts, table, key } => pitr(client, session, ts, table, *key, out)?,
+        Meta::InspectSegment { table, id } => inspect_segment(client, session, *table, id, out)?,
         Meta::BadArgs { message, hint } => {
             print_error(session, &usage_error(message.clone(), hint));
         }
@@ -611,8 +683,8 @@ fn dispatch_meta(
     })
 }
 
-/// The `\?` registry — the full designed surface, including the tiers that
-/// still point at their tickets, so the design is discoverable.
+/// The `\?` registry — the full designed surface: the psql-parity tier, the
+/// temporal differentiators, and the admin / control-plane tier, all live.
 fn help(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
     let mut lines: Vec<Vec<Seg>> = vec![vec![(Role::Head, "Meta-commands".to_owned())]];
     let entry = |cmd: &str, desc: &str| -> Vec<Seg> {
@@ -653,15 +725,18 @@ fn help(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
     for (cmd, desc) in [
         (r"\status", "engine health  (control-plane)"),
         (
-            r"\backup [--to URI]",
+            r"\backup [--to PATH]",
             "consistent snapshot backup  (control-plane)",
         ),
-        (r"\restore URI", "restore from a backup  (control-plane)"),
+        (r"\restore PATH", "validate a backup  (control-plane)"),
         (
-            r"\pitr <ts>",
-            "point-in-time recovery plan  (control-plane)",
+            r"\pitr <ts> T [pk]",
+            "point-in-time recovery plan, verified vs AS OF",
         ),
-        (r"\inspect-segment ID", "dump a segment footer + zone maps"),
+        (
+            r"\inspect-segment [T] ID",
+            "a segment footer summary  (control-plane)",
+        ),
     ] {
         lines.push(entry(cmd, desc));
     }
@@ -1613,6 +1688,586 @@ fn size_cell(bytes: Option<&str>) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Admin / control-plane tier ([STL-200])
+//
+// `\status` / `\backup` / `\restore` / `\inspect-segment` speak the HTTP/JSON
+// admin gateway ([STL-254]); `\pitr` is a plan whose temporal-correctness hook
+// rides pg-wire (`FOR SYSTEM_TIME AS OF` cross-checked against the append-only
+// history). The renderers follow the prototype's `cpHead`/kv/tree/✓ layout, but
+// surface only data the server actually exposes — no fabricated per-column footer
+// statistics, S3 destinations, or fixed timings ([commands.js] was a mock).
+// ---------------------------------------------------------------------------
+
+/// A control-plane section header — the prototype's `cpHead`: the title, then a
+/// dim `— control-plane · <op> · v1alpha1` tail.
+fn cp_head(title: &str, op: &str) -> Vec<Seg> {
+    vec![
+        (Role::Head, title.to_owned()),
+        (Role::Dim, "  — control-plane · ".to_owned()),
+        (Role::Mut, op.to_owned()),
+        (Role::Dim, "  v1alpha1".to_owned()),
+    ]
+}
+
+/// A `  key              value` line — the prototype's `kv` (16-wide label).
+fn kv(key: &str, value: String) -> Vec<Seg> {
+    vec![(Role::Mut, format!("  {key:<16}")), (Role::Text, value)]
+}
+
+/// Kibibytes to one decimal — the prototype's `X.X KB`.
+fn kib(bytes: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let kb = bytes as f64 / 1024.0;
+    format!("{kb:.1} KB")
+}
+
+/// Render an [`AdminError`] as the shell's psql-style error block, mapping each
+/// kind to an actionable SQLSTATE + hint (the surface, unlike SQL errors, lives
+/// off pg-wire, so the messages name the admin flags).
+fn print_admin_error(session: &Session, err: &AdminError) {
+    let server_error = match err {
+        AdminError::NoToken => ServerError {
+            severity: "ERROR".to_owned(),
+            code: "28000".to_owned(),
+            message: "the admin control-plane API requires a bearer token".to_owned(),
+            hint: Some(
+                "pass --admin-token <token> (or set STELE_ADMIN_TOKEN); the server enables the \
+                 API via [admin] tokens in stele.toml"
+                    .to_owned(),
+            ),
+        },
+        AdminError::Transport(detail) => ServerError {
+            severity: "ERROR".to_owned(),
+            code: "08006".to_owned(),
+            message: format!("admin API unreachable: {detail}"),
+            hint: Some(
+                "is the ops/admin listener up? set its address with --admin-host / --admin-port \
+                 (default :9090)"
+                    .to_owned(),
+            ),
+        },
+        AdminError::Status { code, message } => {
+            let (sqlstate, hint) = match code.as_str() {
+                "401" => (
+                    "28000",
+                    Some(
+                        "the bearer token was rejected — check --admin-token / STELE_ADMIN_TOKEN"
+                            .to_owned(),
+                    ),
+                ),
+                "404" => (
+                    "42704",
+                    Some("no such admin endpoint — the server may predate STL-254".to_owned()),
+                ),
+                _ => ("XX000", None),
+            };
+            ServerError {
+                severity: "ERROR".to_owned(),
+                code: sqlstate.to_owned(),
+                message: format!("admin API: {message} (HTTP {code})"),
+                hint,
+            }
+        }
+        AdminError::Decode(detail) => ServerError {
+            severity: "ERROR".to_owned(),
+            code: "XX000".to_owned(),
+            message: format!("admin API reply: {detail}"),
+            hint: None,
+        },
+    };
+    print_error(session, &server_error);
+}
+
+/// `\status` — engine health over the admin / control-plane API ([STL-200]).
+/// Renders the real [`StatusReport`](crate::admin::StatusReport): version,
+/// relation/segment/user counts, and a health verdict from `ready` /
+/// `wal_poisoned`. (The prototype's WAL-LSN, system-time, and storage rows have
+/// no server field, so they are not shown.)
+fn status(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
+    let report = match AdminClient::new(session.admin.clone()).status() {
+        Ok(report) => report,
+        Err(e) => {
+            print_admin_error(session, &e);
+            return Ok(());
+        }
+    };
+    let segments: u64 = report.tables.iter().map(|t| t.segment_count).sum();
+    let mut lines = vec![
+        cp_head("Engine status", "Health · GetStatus"),
+        kv(
+            "version",
+            format!("stele {} · admin v1alpha1", report.server_version),
+        ),
+        kv(
+            "relations",
+            format!("{} · segments {segments}", report.table_count),
+        ),
+        kv("users", report.user_count.to_string()),
+    ];
+    // A compact per-table breakdown: `name (C cols · S segs)`, …
+    if !report.tables.is_empty() {
+        let breakdown = report
+            .tables
+            .iter()
+            .map(|t| {
+                format!(
+                    "{} ({} col{} · {} seg{})",
+                    t.name,
+                    t.column_count,
+                    if t.column_count == 1 { "" } else { "s" },
+                    t.segment_count,
+                    if t.segment_count == 1 { "" } else { "s" },
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(kv("tables", breakdown));
+    }
+    let health = if report.wal_poisoned {
+        (Role::Warn, "✗ WAL poisoned — restart to recover".to_owned())
+    } else if report.ready {
+        (Role::Ok, "● healthy".to_owned())
+    } else {
+        (Role::Warn, "✗ not ready — recovery in progress".to_owned())
+    };
+    lines.push(vec![(Role::Mut, format!("  {:<16}", "health")), health]);
+    write_lines(session, out, &lines)
+}
+
+/// Resolve `\backup`'s destination: `--to PATH`, a bare `PATH`, or `None`.
+fn parse_backup_dest(remainder: &str) -> Option<&str> {
+    let rest = remainder.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let path = rest.strip_prefix("--to").map_or(rest, str::trim);
+    (!path.is_empty()).then_some(path)
+}
+
+/// `\backup [--to PATH]` — trigger a consistent online backup into the
+/// server-side directory `PATH` ([STL-249] via the admin API) and render its
+/// manifest summary. `PATH` is required (object-store targets are v0.4).
+fn backup(session: &Session, dest: Option<&str>, out: &mut impl Write) -> anyhow::Result<()> {
+    let Some(dest) = dest else {
+        print_error(
+            session,
+            &usage_error(
+                r"\backup needs a target directory".to_owned(),
+                r"e.g. \backup --to /var/lib/stele/backups/snap1  (object-store targets are v0.4)",
+            ),
+        );
+        return Ok(());
+    };
+    let manifest = match AdminClient::new(session.admin.clone()).backup(dest) {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            print_admin_error(session, &e);
+            return Ok(());
+        }
+    };
+    let tree = |glyph: &str, label: &str, value: String| -> Vec<Seg> {
+        vec![
+            (Role::Div, format!("  {glyph} ")),
+            (Role::Text, format!("{label:<11}")),
+            (Role::Mut, value),
+        ]
+    };
+    let lines = vec![
+        cp_head("Backup", "BackupDatabase"),
+        vec![(
+            Role::Mut,
+            "  consistent snapshot — no locks taken (append-only)".to_owned(),
+        )],
+        tree("┌", "fence", format!("{} µs", manifest.fence_micros)),
+        tree("├", "commit head", short_hash(&manifest.commit_head)),
+        tree(
+            "├",
+            "files",
+            format!("{} · {}", manifest.file_count, kib(manifest.total_bytes)),
+        ),
+        tree(
+            "└",
+            "manifest",
+            format!(
+                "v{} · stele {}",
+                manifest.manifest_version, manifest.stele_version
+            ),
+        ),
+        vec![
+            (Role::Ok, "  ✓ ".to_owned()),
+            (Role::Mut, "backup written to ".to_owned()),
+            (Role::Acc, dest.to_owned()),
+        ],
+    ];
+    write_lines(session, out, &lines)
+}
+
+/// `\restore PATH` — validate a backup directory without applying it ([STL-200]).
+/// The dry-run plan over the admin API's `restore-plan`; the apply path is the
+/// offline `stele restore` verb (printed as the next step).
+fn restore(session: &Session, src: &str, out: &mut impl Write) -> anyhow::Result<()> {
+    let plan = match AdminClient::new(session.admin.clone()).restore_plan(src) {
+        Ok(plan) => plan,
+        Err(e) => {
+            print_admin_error(session, &e);
+            return Ok(());
+        }
+    };
+    let mut lines = vec![
+        cp_head("Restore", "RestoreDatabase"),
+        vec![
+            (Role::Warn, "  [validate only] ".to_owned()),
+            (Role::Dim, "no changes applied".to_owned()),
+        ],
+        kv("source", src.to_owned()),
+    ];
+    if plan.valid {
+        lines.push(vec![
+            (Role::Mut, format!("  {:<16}", "manifest")),
+            (Role::Ok, "sha256 verified ✓".to_owned()),
+        ]);
+        if let Some(m) = &plan.manifest {
+            lines.push(kv(
+                "would restore",
+                format!(
+                    "{} files · {} · fence {} µs · stele {}",
+                    m.file_count,
+                    kib(m.total_bytes),
+                    m.fence_micros,
+                    m.stele_version
+                ),
+            ));
+        }
+        lines.push(vec![
+            (Role::Dim, "  run ".to_owned()),
+            (
+                Role::Mut,
+                format!("stele restore --from {src} --to <data-dir>"),
+            ),
+            (Role::Dim, " to apply.".to_owned()),
+        ]);
+    } else {
+        let why = plan
+            .error
+            .unwrap_or_else(|| "the backup did not validate".to_owned());
+        lines.push(vec![
+            (Role::Mut, format!("  {:<16}", "manifest")),
+            (Role::Warn, format!("✗ {why}")),
+        ]);
+    }
+    write_lines(session, out, &lines)
+}
+
+/// `\inspect-segment [table] ID` — one segment's footer summary ([STL-200]).
+/// Reads the admin API's per-table segment metadata and renders the row for `ID`:
+/// state, row count, system-time range, the business-key zone, and size. The
+/// engine surfaces only the business-key zone (not per-value-column statistics),
+/// so the prototype's per-column zone-map table is not shown.
+fn inspect_segment(
+    client: &mut Client,
+    session: &Session,
+    table: Option<&str>,
+    id: &str,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    let table = match table {
+        Some(t) => t.to_owned(),
+        None => match first_table(client, session, out)? {
+            Some(t) => t,
+            None => return Ok(()),
+        },
+    };
+    let data = match AdminClient::new(session.admin.clone()).segments(&table) {
+        Ok(data) => data,
+        Err(e) => {
+            print_admin_error(session, &e);
+            return Ok(());
+        }
+    };
+    // The fixed segment-metadata columns, in order ([STL-301]): segment, state,
+    // rows, sys_min, sys_max, key_column, key_min, key_max, bytes.
+    let Some(row) = data
+        .rows
+        .iter()
+        .find(|r| r.first().and_then(Option::as_deref) == Some(id))
+    else {
+        print_error(
+            session,
+            &ServerError {
+                severity: "ERROR".to_owned(),
+                code: "P0002".to_owned(),
+                message: format!("segment {id:?} not found in {table}"),
+                hint: Some(format!(r"run \segments {table} to list segment ids")),
+            },
+        );
+        return Ok(());
+    };
+    let cell = |i: usize| row.get(i).and_then(Option::as_deref);
+    let state = cell(1).unwrap_or("");
+    let open = state == "hot";
+    let sys_period = format!(
+        "[{}, {})",
+        cell(3).unwrap_or("—"),
+        if open {
+            "∞"
+        } else {
+            cell(4).unwrap_or("—")
+        }
+    );
+    let lines = vec![
+        vec![
+            (Role::Head, format!("Segment {id} — ")),
+            (Role::Acc, format!("public.{table}")),
+            (Role::Dim, "   control-plane · inspect-segment".to_owned()),
+        ],
+        vec![(Role::Div, "  ── footer ───────────────".to_owned())],
+        vec![
+            (Role::Mut, format!("  {:<12}", "state")),
+            (
+                if open { Role::Warn } else { Role::Text },
+                format!("{state} ({})", if open { "open" } else { "immutable" }),
+            ),
+            (Role::Mut, format!("   rows {}", cell(2).unwrap_or("0"))),
+        ],
+        vec![
+            (Role::Mut, format!("  {:<12}", "sys_period")),
+            (Role::Text, sys_period),
+        ],
+        vec![
+            (Role::Mut, format!("  {:<12}", "key zone")),
+            (
+                Role::Text,
+                zone_map_cell(cell(5).unwrap_or("key"), cell(6), cell(7)),
+            ),
+        ],
+        vec![
+            (Role::Mut, format!("  {:<12}", "size")),
+            (Role::Text, size_cell(cell(8))),
+        ],
+        vec![
+            (Role::Dim, "  └ pruning: ".to_owned()),
+            (
+                Role::Mut,
+                "a key predicate outside this zone skips the segment entirely.".to_owned(),
+            ),
+        ],
+    ];
+    write_lines(session, out, &lines)
+}
+
+/// The verdict of [`pitr`]'s temporal cross-check.
+#[derive(Debug, PartialEq, Eq)]
+enum PitrVerdict {
+    /// No row for the key at the target — a consistent absence (pre-insert or
+    /// deleted).
+    Absent,
+    /// A row was recovered; `matched` is whether its value is one the append-only
+    /// history actually recorded (so the two paths agree).
+    Present { matched: bool },
+}
+
+/// Cross-check the value `FOR SYSTEM_TIME AS OF` recovered for the key against the
+/// committed versions the append-only history recorded — the temporal-correctness
+/// property: AS OF never returns a value the log never wrote.
+///
+/// `recovered` is the AS OF row for the key (`None` = no row); `committed` is the
+/// set of value tuples from non-delete history versions. Pure, so the comparison
+/// is unit-tested without a server.
+fn pitr_verdict(
+    recovered: Option<&[Option<String>]>,
+    committed: &[Vec<Option<String>>],
+) -> PitrVerdict {
+    recovered.map_or(PitrVerdict::Absent, |value| PitrVerdict::Present {
+        matched: committed.iter().any(|v| v.as_slice() == value),
+    })
+}
+
+/// `\pitr <ts> <table> [key]` — a point-in-time-recovery **plan** (PITR proper is
+/// v0.4 / [STL-284]) whose temporal-correctness hook ([testing-strategy §4])
+/// cross-checks the value `FOR SYSTEM_TIME AS OF <ts>` recovers against the
+/// append-only version history — two independent server paths to the same instant
+/// that must agree. `<ts>` is a single token in the AS OF resolver's forms:
+/// `now()` or an integer-microsecond instant (absolute timestamp literals are not
+/// yet an AS OF form — [STL-101]).
+fn pitr(
+    client: &mut Client,
+    session: &Session,
+    ts: &str,
+    table: &str,
+    key: Option<&str>,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    let mut lines = vec![
+        cp_head("Point-in-time recovery", "RestoreToPointInTime"),
+        vec![
+            (Role::Warn, "  [dry-run] ".to_owned()),
+            (
+                Role::Dim,
+                "replay plan only — PITR applies in v0.4 (STL-284)".to_owned(),
+            ),
+        ],
+        vec![
+            (Role::Mut, format!("  {:<18}", "target sys-time")),
+            (Role::Acc, ts.to_owned()),
+        ],
+        vec![
+            (Role::Mut, format!("  {:<18}", "replay")),
+            (
+                Role::Text,
+                "base backup + WAL up to the target (segments pruned by sys_period)".to_owned(),
+            ),
+        ],
+    ];
+    match key {
+        None => lines.push(vec![(
+            Role::Dim,
+            "  pass a key to verify a witness value against FOR SYSTEM_TIME AS OF.".to_owned(),
+        )]),
+        Some(key) => match pitr_verify(client, session, ts, table, key)? {
+            // A SQL error was already printed; abort the command quietly.
+            None => return Ok(()),
+            Some(verdict_lines) => lines.extend(verdict_lines),
+        },
+    }
+    lines.push(vec![(
+        Role::Dim,
+        "  recover history-true to any instant — the append-only log makes PITR exact.".to_owned(),
+    )]);
+    write_lines(session, out, &lines)
+}
+
+/// The `\pitr` cross-check ([`pitr`]): fetch the AS OF row for the key and the
+/// key's committed history versions, then render the `recovered = …` /
+/// `verify ✓|✗` lines. `Ok(None)` when a SQL error was already surfaced.
+fn pitr_verify(
+    client: &mut Client,
+    session: &Session,
+    ts: &str,
+    table: &str,
+    key: &str,
+) -> anyhow::Result<Option<Vec<Vec<Seg>>>> {
+    if !key_is_safe(key) {
+        print_error(
+            session,
+            &usage_error(
+                format!("invalid key {key:?}: a key may not contain ';' or control characters"),
+                r"e.g. \pitr now() account 1  ·  text keys are quoted: \pitr now() users 'alice'",
+            ),
+        );
+        return Ok(None);
+    }
+    // The independent path first: the append-only version history for the key.
+    // Its value columns also name the business key, which we push down to the AS
+    // OF read so a single-key check never scans the whole table.
+    let table_lit = table.replace('\'', "''");
+    let history = format!("SELECT * FROM stele_history('{table_lit}', {key})");
+    let Some(history) = run_set(client, session, &history)? else {
+        return Ok(None);
+    };
+    // Value tuples from non-delete versions (history value columns start past the
+    // fixed metadata prefix; op is column 1).
+    let committed: Vec<Vec<Option<String>>> = history
+        .rows
+        .iter()
+        .filter(|r| r.get(1).and_then(Option::as_deref) != Some("DELETE"))
+        .map(|r| r.get(HISTORY_META_COLS..).unwrap_or(&[]).to_vec())
+        .collect();
+
+    // The AS OF read — the query planner's time-travel to the target. A key with
+    // no history can have no row at any instant, so skip the read; otherwise push
+    // the business key (the first value column) down as a `WHERE` so the lookup
+    // prunes to that key rather than pulling the whole table over the wire.
+    let key_col = history
+        .columns
+        .get(HISTORY_META_COLS)
+        .map(|c| c.name.clone());
+    let (recovered, value_cols) = match key_col {
+        Some(key_col) => {
+            let as_of =
+                format!("SELECT * FROM {table} FOR SYSTEM_TIME AS OF {ts} WHERE {key_col} = {key}");
+            let Some(as_of) = run_set(client, session, &as_of)? else {
+                return Ok(None);
+            };
+            (as_of.rows.into_iter().next(), as_of.columns)
+        }
+        None => (None, Vec::new()),
+    };
+
+    let verdict = pitr_verdict(recovered.as_deref(), &committed);
+    let mut out_lines = Vec::new();
+    match verdict {
+        PitrVerdict::Absent => {
+            out_lines.push(vec![
+                (Role::Mut, format!("  {:<18}", "recovered")),
+                (Role::Text, format!("{table} {key} = ∅ (no row)")),
+            ]);
+            out_lines.push(vec![
+                (Role::Ok, "  ✓ ".to_owned()),
+                (
+                    Role::Mut,
+                    "no row at the target — consistent with the append-only history".to_owned(),
+                ),
+            ]);
+        }
+        PitrVerdict::Present { matched } => {
+            let rendered = render_row(&value_cols, recovered.as_deref().expect("present ⇒ row"));
+            out_lines.push(vec![
+                (Role::Mut, format!("  {:<18}", "recovered")),
+                (Role::Text, format!("{table} {key} = ({rendered})")),
+            ]);
+            out_lines.push(if matched {
+                vec![
+                    (Role::Ok, "  ✓ ".to_owned()),
+                    (
+                        Role::Mut,
+                        "FOR SYSTEM_TIME AS OF matches a committed version in the history"
+                            .to_owned(),
+                    ),
+                ]
+            } else {
+                vec![
+                    (Role::Warn, "  ✗ ".to_owned()),
+                    (
+                        Role::Warn,
+                        "recovered value is not a recorded version — AS OF disagrees with the log"
+                            .to_owned(),
+                    ),
+                ]
+            });
+        }
+    }
+    Ok(Some(out_lines))
+}
+
+/// Run a query expected to return one result set, surfacing a SQL error through
+/// [`print_error`]. `Ok(None)` on a server error (already printed); `Ok(Some(_))`
+/// with the (possibly empty) result set otherwise.
+fn run_set(client: &mut Client, session: &Session, sql: &str) -> anyhow::Result<Option<ResultSet>> {
+    let replies = client.simple_query(sql)?;
+    if let Some(err) = first_error(&replies) {
+        print_error(session, err);
+        return Ok(None);
+    }
+    Ok(Some(first_result_set(&replies).cloned().unwrap_or(
+        ResultSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        },
+    )))
+}
+
+/// Render a result row as `col = val, …` (NULLs as `NULL`) — the `\pitr` witness
+/// value line.
+fn render_row(columns: &[Column], row: &[Option<String>]) -> String {
+    columns
+        .iter()
+        .zip(row)
+        .map(|(c, v)| format!("{} = {}", c.name, v.as_deref().unwrap_or("NULL")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// ---------------------------------------------------------------------------
 // SQL execution + rendering
 // ---------------------------------------------------------------------------
 
@@ -2197,13 +2852,103 @@ mod tests {
     }
 
     #[test]
-    fn designed_tiers_resolve_to_their_tickets() {
-        // The still-stubbed admin tier points at STL-200. (`\segments` is live as
-        // of STL-301, `\audit` as of STL-302.)
-        let Some(Meta::NotYet { ticket, .. }) = parse_meta(r"\inspect seg-0002") else {
-            panic!("expected NotYet");
-        };
-        assert_eq!(ticket, ADMIN_TICKET);
+    fn admin_tier_commands_parse() {
+        // The control-plane tier ([STL-200]) is wired: each command resolves to
+        // its Meta variant rather than a "not yet" stub.
+        assert_eq!(parse_meta(r"\status"), Some(Meta::Status));
+        assert_eq!(parse_meta(r"\backup"), Some(Meta::Backup { dest: None }));
+        assert_eq!(
+            parse_meta(r"\backup --to /srv/snap1"),
+            Some(Meta::Backup {
+                dest: Some("/srv/snap1"),
+            })
+        );
+        // A bare path (no `--to`) is also accepted.
+        assert_eq!(
+            parse_meta(r"\backup /srv/snap1"),
+            Some(Meta::Backup {
+                dest: Some("/srv/snap1"),
+            })
+        );
+        assert_eq!(
+            parse_meta(r"\restore /srv/snap1"),
+            Some(Meta::Restore { src: "/srv/snap1" })
+        );
+        // `\restore` requires a directory.
+        assert!(matches!(
+            parse_meta(r"\restore"),
+            Some(Meta::BadArgs { .. })
+        ));
+        // `\pitr` takes a single-token ts, a table, and an optional key.
+        assert_eq!(
+            parse_meta(r"\pitr now() account 1"),
+            Some(Meta::Pitr {
+                ts: "now()",
+                table: "account",
+                key: Some("1"),
+            })
+        );
+        assert_eq!(
+            parse_meta(r"\pitr now() account"),
+            Some(Meta::Pitr {
+                ts: "now()",
+                table: "account",
+                key: None,
+            })
+        );
+        // A multi-word ts (`now() - interval …`) is not a single token, so it is
+        // rejected with a hint rather than silently mis-parsed.
+        assert!(matches!(
+            parse_meta(r"\pitr now() - interval '1 second' account 1"),
+            Some(Meta::BadArgs { .. })
+        ));
+        // `\inspect-segment` — the segment id alone, or a table then the id.
+        assert_eq!(
+            parse_meta(r"\inspect-segment seg-0002"),
+            Some(Meta::InspectSegment {
+                table: None,
+                id: "seg-0002",
+            })
+        );
+        assert_eq!(
+            parse_meta(r"\inspect-segment account seg-0002"),
+            Some(Meta::InspectSegment {
+                table: Some("account"),
+                id: "seg-0002",
+            })
+        );
+        assert!(matches!(
+            parse_meta(r"\inspect-segment"),
+            Some(Meta::BadArgs { .. })
+        ));
+    }
+
+    #[test]
+    fn pitr_verdict_cross_checks_against_committed_versions() {
+        let v100 = vec![Some("1".to_owned()), Some("100".to_owned())];
+        let v200 = vec![Some("1".to_owned()), Some("200".to_owned())];
+        let committed = vec![v100, v200.clone()];
+        // A recovered value that is a recorded version → matched.
+        assert_eq!(
+            pitr_verdict(Some(&v200), &committed),
+            PitrVerdict::Present { matched: true }
+        );
+        // A value the history never recorded → mismatch (AS OF disagrees).
+        let bogus = vec![Some("1".to_owned()), Some("999".to_owned())];
+        assert_eq!(
+            pitr_verdict(Some(&bogus), &committed),
+            PitrVerdict::Present { matched: false }
+        );
+        // No row at the target → a consistent absence.
+        assert_eq!(pitr_verdict(None, &committed), PitrVerdict::Absent);
+    }
+
+    #[test]
+    fn parse_backup_dest_handles_to_and_bare_paths() {
+        assert_eq!(parse_backup_dest(""), None);
+        assert_eq!(parse_backup_dest("--to"), None);
+        assert_eq!(parse_backup_dest("--to /a/b"), Some("/a/b"));
+        assert_eq!(parse_backup_dest("/a/b"), Some("/a/b"));
     }
 
     #[test]

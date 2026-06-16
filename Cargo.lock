@@ -2713,6 +2713,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustyline",
+ "serde",
+ "serde_json",
  "stele-common",
  "stele-engine",
  "stele-pgwire",
