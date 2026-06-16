@@ -24,7 +24,7 @@ use anyhow::Context as _;
 use crate::admin::{AdminClient, AdminConfig, AdminError};
 use crate::client::{Client, Reply, ResultSet, ServerError};
 use crate::highlight;
-use crate::render::{self, BorderStyle, Column, TableOpts};
+use crate::render::{self, BorderStyle, Column, StatsMode, TableOpts};
 use crate::theme::{Role, Seg, Theme, paint_segs};
 
 /// Connection + presentation options for `stele shell` (from clap in `main`).
@@ -37,6 +37,9 @@ pub struct Opts {
     pub border: BorderStyle,
     pub row_nums: bool,
     pub no_color: bool,
+    /// The query-stats footer mode ([STL-201]), or `None` to default it by session
+    /// kind (compact when interactive, off when scripted).
+    pub stats: Option<StatsMode>,
     /// Admin / control-plane connection for the `\status`/`\backup`/`\restore`/
     /// `\pitr`/`\inspect-segment` tier ([STL-200]).
     pub admin: AdminConfig,
@@ -55,6 +58,9 @@ struct Session {
     timing: bool,
     expanded: bool,
     json: bool,
+    /// The query-stats footer mode ([STL-201]) drawn under each result, set by
+    /// `--stats` and toggled with `\stats`.
+    stats: StatsMode,
     /// The session `\asof` time-travel context: a `FOR SYSTEM_TIME AS OF` expression
     /// (verbatim, server-resolved) injected into subsequent bare `SELECT`s, or
     /// `None` for the live present ([STL-199]).
@@ -116,6 +122,14 @@ pub fn run(opts: &Opts) -> anyhow::Result<()> {
         timing: interactive,
         expanded: false,
         json: false,
+        // The "see the engine" footer defaults to compact when interactive and off
+        // when scripted (so piped output stays byte-clean), mirroring `timing`;
+        // `--stats` overrides either way ([STL-201]).
+        stats: opts.stats.unwrap_or(if interactive {
+            StatsMode::Compact
+        } else {
+            StatsMode::Off
+        }),
         asof: None,
         interactive,
         host: opts.host.clone(),
@@ -368,6 +382,9 @@ enum Meta<'a> {
     Expanded(Option<&'a str>),
     /// `\json [on|off]`.
     Json(Option<&'a str>),
+    /// `\stats [off|compact|detailed]` — the query-stats footer ([STL-201]); bare
+    /// toggles between off and compact.
+    Stats(Option<&'a str>),
     /// `\asof <expr…|reset>` — set or clear the session time-travel context. The
     /// argument is the rest of the line (a multi-word `FOR SYSTEM_TIME AS OF`
     /// expression); `None` / `reset` clears it.
@@ -430,6 +447,22 @@ enum Meta<'a> {
     Unknown(&'a str),
 }
 
+/// Resolve a `\stats` argument: bare flips between off and compact; an explicit
+/// `off` / `compact` / `detailed` sets that mode ([STL-201]).
+fn stats_mode_value(current: StatsMode, arg: Option<&str>) -> Result<StatsMode, ServerError> {
+    match arg {
+        None if current == StatsMode::Off => Ok(StatsMode::Compact),
+        None => Ok(StatsMode::Off),
+        Some(a) if a.eq_ignore_ascii_case("off") => Ok(StatsMode::Off),
+        Some(a) if a.eq_ignore_ascii_case("compact") => Ok(StatsMode::Compact),
+        Some(a) if a.eq_ignore_ascii_case("detailed") => Ok(StatsMode::Detailed),
+        Some(other) => Err(usage_error(
+            format!("unrecognized value \"{other}\": expected off, compact, or detailed"),
+            r"e.g. \stats compact",
+        )),
+    }
+}
+
 /// Resolve a toggle's `[on|off]` argument: bare flips, `on`/`off` set.
 fn toggle_value(current: bool, arg: Option<&str>) -> Result<bool, ServerError> {
     match arg {
@@ -474,6 +507,7 @@ fn parse_meta(line: &str) -> Option<Meta<'_>> {
         "timing" => Meta::Timing(arg),
         "x" => Meta::Expanded(arg),
         "json" => Meta::Json(arg),
+        "stats" => Meta::Stats(arg),
         "clear" | "c!" => Meta::Clear,
         "c" | "connect" => Meta::Connect,
         // The version-history temporal tier — live (STL-199). `\asof` takes the
@@ -583,6 +617,10 @@ fn parse_admin_meta<'a>(
 }
 
 /// Execute one meta-command.
+// One match arm per meta-command; the `\stats` toggle ([STL-201]) nudged it past
+// the line limit. The arms are flat and independent, so splitting would scatter
+// the dispatch rather than clarify it.
+#[allow(clippy::too_many_lines)]
 fn dispatch_meta(
     client: &mut Client,
     session: &mut Session,
@@ -625,6 +663,18 @@ fn dispatch_meta(
                     "Output format is json."
                 } else {
                     "Output format is aligned table."
+                };
+                write_segs(session, out, &[(Role::Mut, msg.to_owned())])?;
+            }
+        },
+        Meta::Stats(arg) => match stats_mode_value(session.stats, *arg) {
+            Err(e) => print_error(session, &e),
+            Ok(v) => {
+                session.stats = v;
+                let msg = match v {
+                    StatsMode::Off => "Query stats are off.",
+                    StatsMode::Compact => "Query stats: compact.",
+                    StatsMode::Detailed => "Query stats: detailed.",
                 };
                 write_segs(session, out, &[(Role::Mut, msg.to_owned())])?;
             }
@@ -745,6 +795,7 @@ fn help(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
         (r"\timing", "toggle query timing"),
         (r"\x", "toggle expanded display"),
         (r"\json", "toggle aligned / json output"),
+        (r"\stats [off|compact|detailed]", "query-stats footer"),
         (r"\clear", "clear the screen  (⌃L)"),
         (r"\q", "quit"),
     ] {
@@ -1100,6 +1151,7 @@ fn fetch_history(
     let set = first_result_set(&replies).cloned().unwrap_or(ResultSet {
         columns: Vec::new(),
         rows: Vec::new(),
+        stats: None,
     });
     if set.rows.is_empty() {
         let what = key.map_or_else(
@@ -1584,6 +1636,7 @@ fn segments(
     let set = first_result_set(&replies).cloned().unwrap_or(ResultSet {
         columns: Vec::new(),
         rows: Vec::new(),
+        stats: None,
     });
     // No segments and no resident delta — the table is empty.
     if set.rows.is_empty() {
@@ -2252,6 +2305,7 @@ fn run_set(client: &mut Client, session: &Session, sql: &str) -> anyhow::Result<
         ResultSet {
             columns: Vec::new(),
             rows: Vec::new(),
+            stats: None,
         },
     )))
 }
@@ -2327,6 +2381,17 @@ fn run_statement(
                     render::table_lines(&set.columns, &set.rows, session.result_opts(trailer_time))
                 };
                 write_lines(session, out, &lines)?;
+                // The "see the engine" query-stats footer ([STL-201]) — drawn under
+                // the aligned/expanded table (not JSON, which stays machine-clean)
+                // when the server delivered stats and the mode is not off.
+                if !session.json
+                    && let Some(stats) = &set.stats
+                {
+                    let footer = render::stats_lines(stats, session.stats);
+                    if !footer.is_empty() {
+                        write_lines(session, out, &footer)?;
+                    }
+                }
             }
             Reply::Command(tag) => {
                 catalog_changed |= tag_changes_catalog(&tag);
@@ -2631,6 +2696,7 @@ const META_NAMES: &[&str] = &[
     r"\timing",
     r"\x",
     r"\json",
+    r"\stats",
     r"\clear",
     r"\q",
 ];

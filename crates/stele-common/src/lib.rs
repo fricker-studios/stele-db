@@ -16,6 +16,7 @@ pub mod hashkey;
 pub mod metrics;
 pub mod period;
 pub mod provenance;
+pub mod query_stats;
 pub mod row_codec;
 pub mod scram;
 pub mod time;

@@ -79,6 +79,19 @@ pub trait Operator {
     /// [`ScanError::MissingColumn`] if a shaping operator references a column its
     /// child did not emit.
     fn next(&mut self) -> Result<Option<Batch>, ScanError>;
+
+    /// The pruning [`ScanStats`] of the scan at the bottom of this pipeline, once
+    /// it has resolved (after the first [`next`](Self::next)); `None` before then,
+    /// or when no scan source feeds this operator.
+    ///
+    /// The shaping operators ([`Project`], [`ExplodePayload`], [`Filter`]) forward
+    /// their child's accounting unchanged — they reshape rows, they do not read
+    /// tiers — so a caller draining a `Box<dyn Operator>` pipeline can recover the
+    /// source's [`ScanStats`] through the erased top (STL-201). The default is
+    /// `None` for a leaf with no scan behind it.
+    fn stats(&self) -> Option<ScanStats> {
+        None
+    }
 }
 
 /// The fully resolved scan output, plus the cursor into it. Filled lazily on the
@@ -86,7 +99,7 @@ pub trait Operator {
 struct Resolved {
     /// The single batch [`SnapshotScan::execute`] produced — sliced into windows.
     batch: Batch,
-    /// The scan's pruning accounting, surfaced via [`ScanSource::stats`].
+    /// The scan's pruning accounting, surfaced via [`Operator::stats`].
     stats: ScanStats,
     /// The next unread row in [`batch`](Self::batch).
     cursor: usize,
@@ -117,13 +130,6 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> ScanSource<'a, D, I, F> {
             resolved: None,
         }
     }
-
-    /// The scan's pruning [`ScanStats`], available once the first
-    /// [`next`](Operator::next) has resolved the scan (`None` before then).
-    #[must_use]
-    pub fn stats(&self) -> Option<ScanStats> {
-        self.resolved.as_ref().map(|r| r.stats)
-    }
 }
 
 impl<D: Disk, I: Disk, F: DiskFile> Operator for ScanSource<'_, D, I, F> {
@@ -153,6 +159,12 @@ impl<D: Disk, I: Disk, F: DiskFile> Operator for ScanSource<'_, D, I, F> {
             .collect();
         resolved.cursor += len;
         Ok(Some(Batch::new(columns, len)))
+    }
+
+    /// The scan's pruning [`ScanStats`], available once the first
+    /// [`next`](Operator::next) has resolved the scan (`None` before then).
+    fn stats(&self) -> Option<ScanStats> {
+        self.resolved.as_ref().map(|r| r.stats)
     }
 }
 
@@ -218,6 +230,10 @@ impl<C: Operator> Operator for Project<C> {
             rows,
             selection,
         }))
+    }
+
+    fn stats(&self) -> Option<ScanStats> {
+        self.child.stats()
     }
 }
 
@@ -352,6 +368,10 @@ impl<C: Operator> Operator for ExplodePayload<C> {
         columns.extend(passthrough);
         Ok(Some(Batch::new(columns, rows)))
     }
+
+    fn stats(&self) -> Option<ScanStats> {
+        self.child.stats()
+    }
 }
 
 /// A **filter operator** — keeps the `TRUE` rows of its child's batches
@@ -471,6 +491,10 @@ impl<C: Operator> Operator for Filter<C> {
             // materializes once via `Batch::into_dense`.
             return Ok(Some(Batch::with_selection(batch.columns, kept.into())));
         }
+    }
+
+    fn stats(&self) -> Option<ScanStats> {
+        self.child.stats()
     }
 }
 
