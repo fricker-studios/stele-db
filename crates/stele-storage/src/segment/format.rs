@@ -141,18 +141,47 @@ pub(super) const TRAILER_MAGIC: [u8; 8] = *b"STLSEGFT";
 ///   because a v10 reader would read the trailing bloom section as
 ///   `Corrupt("trailing bytes in footer")`, so it makes the reject clean at the
 ///   header in both directions — the same reasoning as every prior bump.
-pub(super) const FORMAT_VERSION: u16 = 11;
+///
+/// * **v12** — **adds a per-segment valid-time interval summary** ([STL-241],
+///   [ADR-0025](../../../../../docs/adr/0025-valid-time-indexing.md)). The footer
+///   gains a second optional trailing section — gated by
+///   [`FOOTER_FLAG_VALID_INTERVALS`], after the bloom section — holding the
+///   coalesced union of the segment's `[valid_from, valid_to)` windows
+///   ([`ValidIntervalSummary`](crate::validtime::ValidIntervalSummary)). It lets
+///   a `FOR VALID_TIME AS OF v` read skip a whole segment whose coverage has a
+///   *gap* at `v` — the backdated-write scatter case the `valid_from` / `valid_to`
+///   zone-map min/max ([STL-173]) cannot prune, because a correction lands in
+///   today's segment carrying an old valid-time and widens the envelope to span
+///   the timeline. Like the bloom it is **advisory** — read-gating only, never
+///   consulted for a result — and rides the immutable segment it summarizes, so
+///   it survives flush, compaction, and recovery with no separate derived
+///   structure to rebuild. Present only on a valid-time table's segments (the
+///   system-only schema has no valid windows). The version row-group, retraction
+///   section, and bloom section are byte-identical to v11; the bump is because a
+///   v11 reader would read the trailing summary as `Corrupt("trailing bytes in
+///   footer")`, so it makes the reject clean at the header in both directions —
+///   the same reasoning as every prior bump.
+pub(super) const FORMAT_VERSION: u16 = 12;
 
 /// Footer-level flag bits — the `u32` flags word that follows the schema id in
-/// the footer. Additive: an unset bit is the pre-v11 behavior, and the only bit
-/// defined so far gates an *optional trailing section*, so a flags word of `0`
-/// is byte-identical to every prior generation's footer.
+/// the footer. Additive: an unset bit is the pre-v11 behavior, and each defined
+/// bit gates an *optional trailing section*, so a flags word of `0` is
+/// byte-identical to every prior generation's footer.
 ///
 /// * [`FOOTER_FLAG_BLOOM`] — a per-segment business-key bloom section
 ///   ([`KeyBloom`](crate::bloom::KeyBloom)) follows the retraction section
 ///   ([STL-238], [`FORMAT_VERSION`] v11). Clear for an empty segment (no keys to
 ///   summarize) or when the writer's bloom is disabled.
+/// * [`FOOTER_FLAG_VALID_INTERVALS`] — a per-segment valid-time interval summary
+///   ([`ValidIntervalSummary`](crate::validtime::ValidIntervalSummary)) follows
+///   the bloom section ([STL-241], [`FORMAT_VERSION`] v12). Clear for a
+///   system-only segment (no valid windows), an empty segment, or when the
+///   writer's summary is disabled.
 pub(super) const FOOTER_FLAG_BLOOM: u32 = 0b0000_0001;
+
+/// See [`FOOTER_FLAG_BLOOM`]: a per-segment valid-time interval summary section
+/// ([STL-241], [`FORMAT_VERSION`] v12), written after the bloom section.
+pub(super) const FOOTER_FLAG_VALID_INTERVALS: u32 = 0b0000_0010;
 
 /// The per-value length reserved in a bytes column to mean "this cell is SQL
 /// `NULL`" ([STL-154], [`FORMAT_VERSION`] v10). Only the `payload` column ever

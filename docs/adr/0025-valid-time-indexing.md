@@ -33,5 +33,5 @@ A dedicated benchmark builds heavy-backdated data and measures **scan amplificat
 - Valid-time clustering trades ingest write-locality for read pruning — a per-table tuning decision, not free.
 
 ### Neutral / follow-ups
-- Exact index structure (interval tree / segment-interval summaries / R-tree-like) is decided during the indexing work (v0.3–v0.5).
+- Exact index structure (interval tree / segment-interval summaries / R-tree-like) is decided during the indexing work (v0.3–v0.5). **v0.3 (STL-241)** lands the per-segment-summary form: each sealed segment's footer carries the *coalesced union* of its rows' `[valid_from, valid_to)` windows (format v12, gated by `FOOTER_FLAG_VALID_INTERVALS`), so a `FOR VALID_TIME AS OF v` read skips a whole segment whose coverage has a gap at `v` — the scatter case the `valid_from` / `valid_to` zone-map min/max cannot prune. It is advisory and derived/rebuildable like the validity index (it rides the immutable segment, so flush / compaction / recovery need no separate rebuild). A cross-segment interval/range tree and the optional per-table valid-time clustering remain open for backfill-heavy workloads.
 - Interacts with [partition hotspotting](0006-distribution-later-shared-storage.md) in the distributed phase (sharding by system-time vs valid-time) — addressed there.
