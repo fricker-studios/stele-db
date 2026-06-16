@@ -31,47 +31,58 @@
 //! * At most one `WHEN MATCHED THEN UPDATE` and one `WHEN NOT MATCHED THEN
 //!   INSERT`, either alone: a source row whose arm is absent is skipped.
 //!
-//! ## Valid-time historization ([STL-235])
+//! ## Valid-time historization ([STL-235], [STL-308])
 //!
 //! On a table with a valid axis the `MERGE` is the historization workhorse: a
 //! matched row gets the joint system+valid **close/open** ([STL-166]) — close the
 //! prior version on the system axis, open a new one carrying the arm's valid
 //! interval — and an unmatched row inserts with that interval, exactly the
 //! [STL-194] `INSERT` / `UPDATE` surface. The period columns (`vf`, `vt`) ride the
-//! arms like any other column and their bounds fold as **instants** (an integer
-//! microsecond value, `now()`, or `now() ± interval` — *not* civil-time literals),
-//! the start mandatory and the end defaulting to an open period
-//! ([`VALID_TIME_OPEN`]). The per-arm interval rides
-//! [`BoundMerge::matched_valid`] / [`BoundMerge::not_matched_valid`]; the engine
-//! frames it onto the stored payload at apply. A bound that is a **source column**
-//! (a per-source-row valid interval) is rejected for now — only statement-level
-//! instant bounds are supported.
+//! arms like any other column, the start mandatory and the end defaulting to an
+//! open period ([`VALID_TIME_OPEN`]).
+//!
+//! A period bound is one of two shapes ([`MergeBound`]), tracked per arm on
+//! [`BoundMerge::matched_valid`] / [`BoundMerge::not_matched_valid`]:
+//!
+//! * a **statement-level instant** ([STL-235]) — an integer microsecond value,
+//!   `now()`, or `now() ± interval` (*not* a civil-time literal) — folded at bind,
+//!   so every affected key opens the *same* interval; or
+//! * a **per-source-row bound** ([STL-308]) — a source-column reference (`s.c`),
+//!   so each affected key carries its *own* `[from, to)` interval, the natural
+//!   shape when historizing a batch whose rows each assert a different effective
+//!   date. A `VALUES` source cell folds as integer microseconds (the same instant
+//!   convention); a table source's column must be `TIMESTAMP` / `TIMESTAMPTZ`. The
+//!   interval is derived per row at execution, so an empty/reversed or `NULL`
+//!   per-row bound is rejected there, not at bind.
+//!
+//! Either way the engine frames the resolved interval onto the stored payload at
+//! apply.
 //!
 //! ## What this rejects (with a clear bind error, never a wrong write)
 //!
 //! `WHEN NOT MATCHED BY SOURCE`, `WHEN MATCHED THEN DELETE`, clause predicates
 //! (`WHEN MATCHED AND <expr>`), referencing the target row in an arm value,
-//! subquery sources beyond `VALUES`/table, `OUTPUT`, updating the business key,
-//! and a source column used as a valid-time period bound.
+//! subquery sources beyond `VALUES`/table, `OUTPUT`, and updating the business
+//! key.
 //!
 //! [STL-166]: https://allegromusic.atlassian.net/browse/STL-166
 //! [STL-194]: https://allegromusic.atlassian.net/browse/STL-194
 //! [STL-229]: https://allegromusic.atlassian.net/browse/STL-229
 //! [STL-230]: https://allegromusic.atlassian.net/browse/STL-230
 //! [STL-235]: https://allegromusic.atlassian.net/browse/STL-235
+//! [STL-308]: https://allegromusic.atlassian.net/browse/STL-308
 
 use sqlparser::ast::{
     Expr, Merge, MergeAction, MergeClause, MergeClauseKind, MergeInsertExpr, MergeInsertKind,
     SetExpr, TableAlias, TableFactor,
 };
 use stele_catalog::{ColumnDef, SchemaId, TableSchema, ValidTimeSpec};
-use stele_common::period::Interval;
 use stele_common::time::{SystemTimeMicros, VALID_TIME_OPEN};
 use stele_common::types::{LogicalType, ScalarValue};
 
 use crate::dml::{
-    BoundDml, DmlError, PeriodRole, assignment_column, bare_name, build_interval, fold_err_to_dml,
-    fold_from_bound, fold_to_bound, period_role, resolve_shape, validated_columns,
+    BoundDml, DmlError, PeriodRole, assignment_column, bare_name, fold_err_to_dml, fold_from_bound,
+    fold_to_bound, period_role, resolve_shape, validated_columns,
 };
 use crate::fold;
 use crate::select::BindContext;
@@ -104,19 +115,77 @@ pub struct BoundMerge {
     /// columns in declaration order (the business key first), or `None` when the
     /// statement has no not-matched arm (unmatched rows are skipped).
     pub not_matched: Option<Vec<MergeValue>>,
-    /// The `[from, to)` valid-time period each **matched** row's new version
-    /// opens, or `None` for a system-only table or an absent matched arm. `Some`
-    /// on a valid-time table: derived from the matched arm's period-column bounds
-    /// (`vf` mandatory, `vt` defaulting to [`VALID_TIME_OPEN`]), it rides down to
-    /// every expanded [`BoundDml::Update`], which closes the prior version and
-    /// opens the new one over this interval ([STL-235]).
+    /// How each **matched** row's new version derives its `[from, to)` valid-time
+    /// period, or `None` for a system-only table or an absent matched arm. `Some`
+    /// on a valid-time table: the matched arm's period-column bounds (`vf`
+    /// mandatory, `vt` defaulting to [`VALID_TIME_OPEN`]) as a [`MergeValid`] the
+    /// engine resolves **per source row**, then frames onto the expanded
+    /// [`BoundDml::Update`], which closes the prior version and opens the new one
+    /// over that interval ([STL-235], [STL-308]).
     ///
     /// [STL-235]: https://allegromusic.atlassian.net/browse/STL-235
-    pub matched_valid: Option<Interval>,
-    /// The `[from, to)` valid-time period each **not-matched** row inserts with,
-    /// or `None` for a system-only table or an absent not-matched arm — the
-    /// insert-arm counterpart of [`matched_valid`](Self::matched_valid).
-    pub not_matched_valid: Option<Interval>,
+    /// [STL-308]: https://allegromusic.atlassian.net/browse/STL-308
+    pub matched_valid: Option<MergeValid>,
+    /// How each **not-matched** row derives the `[from, to)` valid-time period it
+    /// inserts with, or `None` for a system-only table or an absent not-matched
+    /// arm — the insert-arm counterpart of [`matched_valid`](Self::matched_valid).
+    pub not_matched_valid: Option<MergeValid>,
+}
+
+/// One boundary of a `MERGE` arm's new valid-time period, resolved to a
+/// microsecond instant per source row at execution.
+///
+/// A statement-level instant ([STL-235]) is the same for every affected key; a
+/// source-column bound ([STL-308]) takes its value from each source row, so each
+/// key carries its own interval. The boundary's *cell* (the `vf` / `vt` value
+/// column packed into the stored payload) and this bound reference the **same**
+/// source, so they can never disagree.
+///
+/// [STL-235]: https://allegromusic.atlassian.net/browse/STL-235
+/// [STL-308]: https://allegromusic.atlassian.net/browse/STL-308
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeBound {
+    /// A statement-level instant folded at bind: the same `from`/`to` for every
+    /// affected key ([STL-235]).
+    Instant(i64),
+    /// The source column (by index into each source row) whose per-row value, in
+    /// microseconds, is this boundary ([STL-308]).
+    Source(usize),
+}
+
+impl MergeBound {
+    /// The period **value-column cell** this bound rides the arm as — the `vf` /
+    /// `vt` cell the row codec packs into the stored payload. An instant is a
+    /// folded [`ScalarValue::Timestamp`]; a per-row bound is the same source
+    /// column reference, so the framed interval and the stored cell stay in
+    /// lock-step.
+    const fn cell(self) -> MergeValue {
+        match self {
+            Self::Instant(micros) => MergeValue::Literal(Some(ScalarValue::Timestamp(micros))),
+            Self::Source(idx) => MergeValue::Source(idx),
+        }
+    }
+}
+
+/// A `MERGE` arm's new valid-time `[from, to)` period, resolved per source row at
+/// execution ([STL-308]).
+///
+/// Replaces STL-235's single statement-level [`Interval`](stele_common::period::Interval):
+/// when both bounds are
+/// [`MergeBound::Instant`] the interval is fixed (the STL-235 path, validated at
+/// bind) and every affected key opens it; when either is a
+/// [`MergeBound::Source`] the interval is data-dependent and derived per row by
+/// the engine, which is where an empty/reversed or `NULL` per-row bound is
+/// rejected.
+///
+/// [STL-308]: https://allegromusic.atlassian.net/browse/STL-308
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeValid {
+    /// The inclusive start (`vf`) bound.
+    pub from: MergeBound,
+    /// The exclusive end (`vt`) bound; defaults to [`VALID_TIME_OPEN`] when the
+    /// arm omits it.
+    pub to: MergeBound,
 }
 
 /// Where a [`BoundMerge`]'s source rows come from.
@@ -202,6 +271,36 @@ impl SourceBinding {
         }
     }
 
+    /// Record that source column `idx` feeds a valid-time **period bound** ([STL-308]),
+    /// reconciling the source's value type with the instant (microsecond)
+    /// semantics STL-194 uses for a literal bound:
+    ///
+    /// * a **table** source's column must be `TIMESTAMP` / `TIMESTAMPTZ` — a
+    ///   civil-time instant whose `i64` body is microseconds;
+    /// * a **`VALUES`** source's cell folds as `INT8` microseconds, the same
+    ///   integer-instant convention a literal bound (`vf = 5`) uses.
+    ///
+    /// Either way the per-row value resolves to an `i64` microsecond instant at
+    /// execution; the engine reads its body regardless of which of these the
+    /// scalar is (their encodings coincide), so the stored `vf` / `vt` cell and
+    /// the framed interval agree.
+    fn use_period_column(&mut self, idx: usize) -> Result<(), DmlError> {
+        match &self.declared {
+            Some((_, declared)) => {
+                let ty = declared[idx];
+                if !matches!(ty, LogicalType::Timestamp | LogicalType::TimestampTz) {
+                    return Err(DmlError::Unsupported(format!(
+                        "MERGE source column {:?} is a {ty}; a per-row valid-time period bound \
+                         needs a TIMESTAMP or TIMESTAMPTZ source column",
+                        self.columns[idx]
+                    )));
+                }
+                Ok(())
+            }
+            None => self.use_column(idx, LogicalType::Int8),
+        }
+    }
+
     /// The index of the source column named `name`, if any.
     fn column(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|c| c == name)
@@ -243,8 +342,8 @@ pub(crate) fn bind_merge(merge: &Merge, ctx: &BindContext) -> Result<BoundDml, D
 
     let mut matched: Option<Vec<(usize, MergeValue)>> = None;
     let mut not_matched: Option<Vec<MergeValue>> = None;
-    let mut matched_valid: Option<Interval> = None;
-    let mut not_matched_valid: Option<Interval> = None;
+    let mut matched_valid: Option<MergeValid> = None;
+    let mut not_matched_valid: Option<MergeValid> = None;
     for clause in &merge.clauses {
         bind_clause(
             clause,
@@ -500,8 +599,8 @@ fn bind_clause(
     source: &mut SourceBinding,
     matched: &mut Option<Vec<(usize, MergeValue)>>,
     not_matched: &mut Option<Vec<MergeValue>>,
-    matched_valid: &mut Option<Interval>,
-    not_matched_valid: &mut Option<Interval>,
+    matched_valid: &mut Option<MergeValid>,
+    not_matched_valid: &mut Option<MergeValid>,
 ) -> Result<(), DmlError> {
     let reject = |what: String| Err(DmlError::Unsupported(what));
     if clause.predicate.is_some() {
@@ -518,10 +617,11 @@ fn bind_clause(
             // On a valid-time table the matched arm opens a new version, so — like
             // an STL-194 `UPDATE` — its `SET` supplies the new period's bounds. The
             // period columns are assigned alongside any value column; their bounds
-            // fold as instants and are tracked into the interval below.
+            // are an instant or a per-source-row source column ([STL-308]) and are
+            // tracked into the interval below.
             let mut assignments: Vec<(usize, MergeValue)> = Vec::new();
-            let mut from: Option<i64> = None;
-            let mut to: Option<i64> = None;
+            let mut from: Option<MergeBound> = None;
+            let mut to: Option<MergeBound> = None;
             for assignment in &update.assignments {
                 let column = assignment_column(assignment)?;
                 if column == key_col.name() {
@@ -544,7 +644,7 @@ fn bind_clause(
                 }
                 let value = match period_role(period, column) {
                     Some(role) => {
-                        let micros = bind_period_bound(
+                        let bound = bind_period_bound(
                             role,
                             Some(&assignment.value),
                             table,
@@ -553,10 +653,10 @@ fn bind_clause(
                             source,
                         )?;
                         match role {
-                            PeriodRole::From => from = Some(micros),
-                            PeriodRole::To => to = Some(micros),
+                            PeriodRole::From => from = Some(bound),
+                            PeriodRole::To => to = Some(bound),
                         }
-                        MergeValue::Literal(Some(ScalarValue::Timestamp(micros)))
+                        bound.cell()
                     }
                     None => bind_value(&assignment.value, table, &value_cols[idx], target, source)?,
                 };
@@ -574,14 +674,12 @@ fn bind_clause(
                     .iter()
                     .position(|c| c.name() == period.to_column())
             {
-                assignments.push((
-                    to_idx,
-                    MergeValue::Literal(Some(ScalarValue::Timestamp(VALID_TIME_OPEN.0))),
-                ));
-                to = Some(VALID_TIME_OPEN.0);
+                let open = MergeBound::Instant(VALID_TIME_OPEN.0);
+                assignments.push((to_idx, open.cell()));
+                to = Some(open);
             }
             *matched = Some(assignments);
-            *matched_valid = build_interval(table, period, from, to)?;
+            *matched_valid = build_merge_valid(table, period, from, to)?;
             Ok(())
         }
         (MergeClauseKind::Matched, MergeAction::Delete { .. }) => {
@@ -616,11 +714,13 @@ fn bind_clause(
 /// (count must match exactly); with a list each target column takes the value at
 /// its name's position, and an omitted column is a [`DmlError::MissingColumn`].
 ///
-/// On a valid-time table the period columns ride the template as instant-folded
-/// [`ScalarValue::Timestamp`] cells and the second return is the `[from, to)`
-/// interval the engine frames onto the insert — the `from` bound mandatory, the
-/// `to` bound defaulting to an open period when omitted, exactly the STL-194
-/// `INSERT` surface. The interval is `None` for a system-only table.
+/// On a valid-time table the period columns ride the template as `vf` / `vt`
+/// cells (an instant-folded [`ScalarValue::Timestamp`] or a source-column
+/// reference, [STL-308]) and the second return is the [`MergeValid`] the engine
+/// resolves per source row and frames onto the insert — the `from` bound
+/// mandatory, the `to` bound defaulting to an open period when omitted, exactly
+/// the STL-194 `INSERT` surface. The descriptor is `None` for a system-only
+/// table.
 #[allow(clippy::too_many_arguments)]
 fn bind_insert_arm(
     insert: &MergeInsertExpr,
@@ -631,7 +731,7 @@ fn bind_insert_arm(
     period: Option<&ValidTimeSpec>,
     now: SystemTimeMicros,
     source: &mut SourceBinding,
-) -> Result<(Vec<MergeValue>, Option<Interval>), DmlError> {
+) -> Result<(Vec<MergeValue>, Option<MergeValid>), DmlError> {
     if insert.insert_predicate.is_some() {
         return Err(DmlError::Unsupported(
             "a predicate on a MERGE INSERT action".to_owned(),
@@ -679,18 +779,19 @@ fn bind_insert_arm(
     };
 
     let mut template = Vec::with_capacity(columns.len());
-    let mut from: Option<i64> = None;
-    let mut to: Option<i64> = None;
+    let mut from: Option<MergeBound> = None;
+    let mut to: Option<MergeBound> = None;
     for (column, expr) in columns.iter().zip(&exprs) {
-        // A valid-time period column folds as an instant (the `to` bound may be
-        // omitted to open the period); every other column must be supplied.
+        // A valid-time period column is an instant or a per-source-row source
+        // column ([STL-308]); the `to` bound may be omitted to open the period,
+        // every other column must be supplied.
         if let Some(role) = period_role(period, column.name()) {
-            let micros = bind_period_bound(role, *expr, table, column, now, source)?;
+            let bound = bind_period_bound(role, *expr, table, column, now, source)?;
             match role {
-                PeriodRole::From => from = Some(micros),
-                PeriodRole::To => to = Some(micros),
+                PeriodRole::From => from = Some(bound),
+                PeriodRole::To => to = Some(bound),
             }
-            template.push(MergeValue::Literal(Some(ScalarValue::Timestamp(micros))));
+            template.push(bound.cell());
             continue;
         }
         let expr = expr.ok_or_else(|| DmlError::MissingColumn {
@@ -709,37 +810,37 @@ fn bind_insert_arm(
         }
         template.push(value);
     }
-    let valid = build_interval(table, period, from, to)?;
+    let valid = build_merge_valid(table, period, from, to)?;
     Ok((template, valid))
 }
 
-/// Fold a `MERGE` arm's value for a valid-time **period** column to its
-/// microsecond instant, the same way a plain `INSERT`/`UPDATE` bound folds
-/// ([`fold_from_bound`] / [`fold_to_bound`]): an integer microsecond value,
-/// `now()`, or `now() ± interval`. A **source column** as a period bound (a
-/// per-source-row valid interval) is rejected — only statement-level instant
-/// bounds are supported for now (a deferred follow-up), so the close/open instant
-/// is fixed at bind, not data-dependent.
+/// Bind a `MERGE` arm's valid-time **period** bound to a [`MergeBound`].
+///
+/// A **source column** (`s.c` or a bare source-column name) is a per-source-row
+/// bound ([STL-308]): the column is marked used as a period bound
+/// ([`SourceBinding::use_period_column`]) and returned as
+/// [`MergeBound::Source`], its `[from, to)` derived per row at execution.
+/// Anything else folds to a statement-level instant the same way a plain
+/// `INSERT`/`UPDATE` bound does ([`fold_from_bound`] / [`fold_to_bound`]): an
+/// integer microsecond value, `now()`, or `now() ± interval` (the close/open
+/// instant fixed at bind, [STL-235]).
 fn bind_period_bound(
     role: PeriodRole,
     expr: Option<&Expr>,
     table: &str,
     column: &ColumnDef,
     now: SystemTimeMicros,
-    source: &SourceBinding,
-) -> Result<i64, DmlError> {
+    source: &mut SourceBinding,
+) -> Result<MergeBound, DmlError> {
     if let Some(expr) = expr {
         match classify_period_bound(expr, source) {
-            // An existing source column — the deferred per-source-row bound.
-            PeriodBoundRef::SourceColumn => {
-                return Err(DmlError::Unsupported(format!(
-                    "a MERGE source column as the valid-time period bound {:?} (only an instant — \
-                     microseconds, now(), or now() ± interval — is supported)",
-                    column.name()
-                )));
+            // A per-source-row bound: each affected key carries its own interval.
+            PeriodBoundRef::SourceColumn(idx) => {
+                source.use_period_column(idx)?;
+                return Ok(MergeBound::Source(idx));
             }
             // The source qualifier naming a column it doesn't have — a typo, named
-            // precisely rather than mislabeled as a (rejected) source bound.
+            // precisely rather than mislabeled as a source bound.
             PeriodBoundRef::UnknownSourceColumn(name) => {
                 return Err(DmlError::UnknownColumn {
                     table: source.names.table.clone(),
@@ -750,18 +851,20 @@ fn bind_period_bound(
             PeriodBoundRef::Instant => {}
         }
     }
-    match role {
-        PeriodRole::From => fold_from_bound(expr, table, column.name(), now),
-        PeriodRole::To => fold_to_bound(expr, table, column.name(), now),
-    }
+    let micros = match role {
+        PeriodRole::From => fold_from_bound(expr, table, column.name(), now)?,
+        PeriodRole::To => fold_to_bound(expr, table, column.name(), now)?,
+    };
+    Ok(MergeBound::Instant(micros))
 }
 
 /// How a `MERGE` arm's period-bound expression relates to the source, deciding
-/// the precise rejection [`bind_period_bound`] gives.
+/// whether [`bind_period_bound`] takes the per-row source path or the instant
+/// path.
 enum PeriodBoundRef {
-    /// An existing source column (`s.c` or a bare source-column name) — the
-    /// shape a per-source-row valid interval would take, rejected for now.
-    SourceColumn,
+    /// An existing source column (`s.c` or a bare source-column name), by index —
+    /// a per-source-row bound ([STL-308]).
+    SourceColumn(usize),
     /// The source qualifier naming a column it does not have (`s.<typo>`) — an
     /// [`UnknownColumn`](DmlError::UnknownColumn), not a source bound.
     UnknownSourceColumn(String),
@@ -772,24 +875,61 @@ enum PeriodBoundRef {
 /// Classify a `MERGE` period-bound expression against the source columns. A bare
 /// name only counts as a source reference when it actually names a source column;
 /// a *qualified* `s.<col>` whose column is missing is reported as an
-/// [`UnknownColumn`] rather than misclassified as a (rejected) source bound.
+/// [`UnknownColumn`] rather than misclassified as a source bound.
 fn classify_period_bound(expr: &Expr, source: &SourceBinding) -> PeriodBoundRef {
     match expr {
-        Expr::Identifier(ident) if source.column(&ident.value).is_some() => {
-            PeriodBoundRef::SourceColumn
-        }
+        Expr::Identifier(ident) => source
+            .column(&ident.value)
+            .map_or(PeriodBoundRef::Instant, PeriodBoundRef::SourceColumn),
         Expr::CompoundIdentifier(parts) => match parts.as_slice() {
             [qualifier, column] if source.names.matches(&qualifier.value) => {
-                if source.column(&column.value).is_some() {
-                    PeriodBoundRef::SourceColumn
-                } else {
-                    PeriodBoundRef::UnknownSourceColumn(column.value.clone())
-                }
+                source.column(&column.value).map_or_else(
+                    || PeriodBoundRef::UnknownSourceColumn(column.value.clone()),
+                    PeriodBoundRef::SourceColumn,
+                )
             }
             _ => PeriodBoundRef::Instant,
         },
         _ => PeriodBoundRef::Instant,
     }
+}
+
+/// Build a `MERGE` arm's [`MergeValid`] from its resolved period bounds and the
+/// table's valid-time policy — the [`MergeBound`] sibling of
+/// [`build_interval`](crate::dml::build_interval): `None` for a system-only
+/// table; for a valid-time table the `from` bound is mandatory
+/// ([`DmlError::ValidTimeStartRequired`]) and the `to` bound defaults to
+/// [`VALID_TIME_OPEN`].
+///
+/// When *both* bounds are statement-level instants the interval is fixed and
+/// validated here, exactly as STL-235 did (an empty/reversed interval is a bind
+/// error). When either is a per-source-row [`MergeBound::Source`] the interval is
+/// data-dependent, so the empty/reversed check is deferred to the engine, which
+/// resolves it per row ([STL-308]).
+fn build_merge_valid(
+    table: &str,
+    period: Option<&ValidTimeSpec>,
+    from: Option<MergeBound>,
+    to: Option<MergeBound>,
+) -> Result<Option<MergeValid>, DmlError> {
+    let Some(period) = period else {
+        return Ok(None);
+    };
+    let from = from.ok_or_else(|| DmlError::ValidTimeStartRequired {
+        table: table.to_owned(),
+        column: period.from_column().to_owned(),
+    })?;
+    let to = to.unwrap_or(MergeBound::Instant(VALID_TIME_OPEN.0));
+    if let (MergeBound::Instant(from), MergeBound::Instant(to)) = (from, to)
+        && from >= to
+    {
+        return Err(DmlError::EmptyValidInterval {
+            table: table.to_owned(),
+            from,
+            to,
+        });
+    }
+    Ok(Some(MergeValid { from, to }))
 }
 
 /// Bind one arm value: a source-column reference (`s.c` or a bare source column
@@ -1268,6 +1408,14 @@ mod tests {
         MergeValue::Literal(Some(ScalarValue::Timestamp(micros)))
     }
 
+    /// A [`MergeValid`] over two statement-level instants — the STL-235 shape.
+    fn instants(from: i64, to: i64) -> MergeValid {
+        MergeValid {
+            from: MergeBound::Instant(from),
+            to: MergeBound::Instant(to),
+        }
+    }
+
     #[test]
     fn valid_time_merge_lifts_each_arms_interval() {
         // STL-235: a MERGE into a valid-time table is no longer refused — the arms
@@ -1291,10 +1439,7 @@ mod tests {
             merge.matched,
             Some(vec![(0, MergeValue::Source(1)), (1, ts(10)), (2, ts(20))])
         );
-        assert_eq!(
-            merge.matched_valid,
-            Some(Interval::new(10, 20).expect("iv"))
-        );
+        assert_eq!(merge.matched_valid, Some(instants(10, 20)));
         // Not-matched: aligned to all columns, the period bounds as instants, and
         // its own interval [30, 40).
         assert_eq!(
@@ -1306,10 +1451,7 @@ mod tests {
                 ts(40),
             ])
         );
-        assert_eq!(
-            merge.not_matched_valid,
-            Some(Interval::new(30, 40).expect("iv"))
-        );
+        assert_eq!(merge.not_matched_valid, Some(instants(30, 40)));
     }
 
     #[test]
@@ -1332,10 +1474,7 @@ mod tests {
             merge.matched,
             Some(vec![(0, MergeValue::Source(1)), (1, ts(10)), (2, ts(open))])
         );
-        assert_eq!(
-            merge.matched_valid,
-            Some(Interval::new(10, open).expect("open"))
-        );
+        assert_eq!(merge.matched_valid, Some(instants(10, open)));
         assert_eq!(
             merge.not_matched,
             Some(vec![
@@ -1345,10 +1484,7 @@ mod tests {
                 ts(open)
             ])
         );
-        assert_eq!(
-            merge.not_matched_valid,
-            Some(Interval::new(10, open).expect("open"))
-        );
+        assert_eq!(merge.not_matched_valid, Some(instants(10, open)));
     }
 
     #[test]
@@ -1366,10 +1502,7 @@ mod tests {
         .expect("bind") else {
             panic!("expected a MERGE");
         };
-        assert_eq!(
-            merge.matched_valid,
-            Some(Interval::new(now, now + day).expect("iv"))
-        );
+        assert_eq!(merge.matched_valid, Some(instants(now, now + day)));
     }
 
     #[test]
@@ -1420,21 +1553,68 @@ mod tests {
     }
 
     #[test]
-    fn valid_time_merge_source_column_period_bound_is_rejected() {
-        // A per-source-row valid interval (a source column feeding a period
-        // boundary) is a deferred follow-up — rejected with a clear error, never a
-        // wrong instant. Both the qualified (`s.vfrom`) and bare (`vfrom`) shapes.
+    fn valid_time_merge_lifts_a_per_source_row_bound() {
+        // STL-308: a source column feeding a period boundary is a per-source-row
+        // bound — the period cell rides the arm as the same source reference and
+        // the arm's interval carries `MergeBound::Source`. Both the qualified
+        // (`s.vfrom`) and bare (`vfrom`) shapes bind.
         let catalog = vt_catalog();
         for set in ["vf = s.vfrom", "vf = vfrom"] {
             let sql = format!(
                 "MERGE INTO vt USING (VALUES (1, 100, 5)) AS s (id, balance, vfrom) ON vt.id = s.id \
                  WHEN MATCHED THEN UPDATE SET balance = s.balance, {set}"
             );
-            assert!(
-                matches!(bind(&sql, &catalog), Err(DmlError::Unsupported(msg)) if msg.contains("source column")),
-                "{set:?} must reject a source-column period bound"
+            let BoundDml::Merge(merge) = bind(&sql, &catalog).expect("bind") else {
+                panic!("expected a MERGE");
+            };
+            // The `vfrom` source column is index 2; vf=Source(2), the open end
+            // defaults to an instant cell, and the interval is [Source(2), open).
+            assert_eq!(
+                merge.matched,
+                Some(vec![
+                    (0, MergeValue::Source(1)),
+                    (1, MergeValue::Source(2)),
+                    (2, ts(VALID_TIME_OPEN.0)),
+                ]),
+                "{set:?}"
+            );
+            assert_eq!(
+                merge.matched_valid,
+                Some(MergeValid {
+                    from: MergeBound::Source(2),
+                    to: MergeBound::Instant(VALID_TIME_OPEN.0),
+                }),
+                "{set:?}"
+            );
+            // The folded VALUES cell is INT8 microseconds (the instant convention),
+            // not rejected as a civil-time literal.
+            assert_eq!(
+                merge.source,
+                MergeSource::Values(vec![vec![
+                    Some(ScalarValue::Int4(1)),
+                    Some(ScalarValue::Int4(100)),
+                    Some(ScalarValue::Int8(5)),
+                ]]),
+                "{set:?}"
             );
         }
+        // Both bounds from source columns: each rides its own source index.
+        let BoundDml::Merge(merge) = bind(
+            "MERGE INTO vt USING (VALUES (1, 100, 5, 9)) AS s (id, balance, vfrom, vto) \
+             ON vt.id = s.id \
+             WHEN MATCHED THEN UPDATE SET balance = s.balance, vf = s.vfrom, vt = s.vto",
+            &catalog,
+        )
+        .expect("bind") else {
+            panic!("expected a MERGE");
+        };
+        assert_eq!(
+            merge.matched_valid,
+            Some(MergeValid {
+                from: MergeBound::Source(2),
+                to: MergeBound::Source(3),
+            })
+        );
         // A *qualified* source reference whose column doesn't exist is a precise
         // UnknownColumn, not a misleading "source column" bound.
         assert_eq!(
@@ -1446,6 +1626,66 @@ mod tests {
             Err(DmlError::UnknownColumn {
                 table: "s".to_owned(),
                 column: "nonesuch".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn valid_time_merge_table_source_period_bound_must_be_temporal() {
+        // STL-308: a *table* source's period-bound column must be a temporal
+        // instant column (TIMESTAMP/TIMESTAMPTZ); an INT column is rejected at
+        // bind, before any wrong write.
+        let mut catalog = vt_catalog();
+        catalog
+            .create_table(
+                "feed_int",
+                vec![
+                    ColumnDef::new("id", LogicalType::Int4).expect("col"),
+                    ColumnDef::new("balance", LogicalType::Int4).expect("col"),
+                    ColumnDef::new("vfrom", LogicalType::Int4).expect("col"),
+                ],
+                TableTemporal::system_only(),
+                SystemTimeMicros(1_000),
+            )
+            .expect("create feed_int");
+        assert!(
+            matches!(
+                bind(
+                    "MERGE INTO vt USING feed_int AS s ON vt.id = s.id \
+                     WHEN MATCHED THEN UPDATE SET balance = s.balance, vf = s.vfrom",
+                    &catalog
+                ),
+                Err(DmlError::Unsupported(msg)) if msg.contains("TIMESTAMP")
+            ),
+            "an INT table-source period bound must be rejected"
+        );
+
+        // A TIMESTAMP table-source column is accepted as a per-row bound.
+        catalog
+            .create_table(
+                "feed_ts",
+                vec![
+                    ColumnDef::new("id", LogicalType::Int4).expect("col"),
+                    ColumnDef::new("balance", LogicalType::Int4).expect("col"),
+                    ColumnDef::new("vfrom", LogicalType::Timestamp).expect("col"),
+                ],
+                TableTemporal::system_only(),
+                SystemTimeMicros(1_000),
+            )
+            .expect("create feed_ts");
+        let BoundDml::Merge(merge) = bind(
+            "MERGE INTO vt USING feed_ts AS s ON vt.id = s.id \
+             WHEN MATCHED THEN UPDATE SET balance = s.balance, vf = s.vfrom",
+            &catalog,
+        )
+        .expect("bind") else {
+            panic!("expected a MERGE");
+        };
+        assert_eq!(
+            merge.matched_valid,
+            Some(MergeValid {
+                from: MergeBound::Source(2),
+                to: MergeBound::Instant(VALID_TIME_OPEN.0),
             })
         );
     }
