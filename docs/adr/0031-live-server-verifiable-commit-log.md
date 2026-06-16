@@ -116,8 +116,18 @@ shell's `\audit` and `\lineage`.**
   option b endgame); this ADR is the stepping stone, not that convergence.
 
 ### Neutral / follow-ups
-- Hash-chaining the catalog log (DDL verifiability) and unifying the row WAL /
-  catalog log / commit log under one verifiable format.
+- ~~Hash-chaining the catalog log (DDL verifiability)~~ — **done in STL-307**: the
+  durable catalog log carries a per-record SHA-256 `prev_hash` link (the same
+  `sha256(prev_hash ‖ payload)` shape, anchored at `Digest::ZERO`), verified
+  fail-closed on every `SessionEngine::recover`, with a tamper oracle. Unifying
+  the row WAL / catalog log / commit log under one verifiable format remains the
+  longer-term follow-up.
+- Closing the commit-record crash window (a crash between the data fsync and the
+  commit-record fsync leaves a durable-but-unchained data commit) — STL-307
+  carved this out as its own ticket: the common auto-commit path bypasses the
+  two-phase commit-record gating, so closing it needs a storage-layer direct
+  two-phase append plus a crash oracle, a separate risk surface from the catalog
+  chain.
 - Merkle inclusion/consistency proofs over this chain (~v0.5,
   [ADR-0026](0026-verifiable-audit-log.md)).
 - A seed-reproducible tamper sweep lives in `stele-engine` (in-process

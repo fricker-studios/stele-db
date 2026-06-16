@@ -860,6 +860,17 @@ pub struct SessionEngine<C: Clock + Clone, D: Disk + Clone> {
     /// monotonic session counter, the [`CommitRecord::seq`] tiebreak ([ADR-0024]).
     /// Starts at `1` on a fresh session; recovered as `last seq + 1`.
     commit_seq: u64,
+    /// The running head of the durable hash-chained **catalog** log — the
+    /// SHA-256 link of the last DDL record appended to `stele.catalog`, i.e. the
+    /// `prev_hash` of the next one ([ADR-0031], [STL-307]). [`Digest::ZERO`] for
+    /// a fresh session; recovered from the verified catalog chain on restart.
+    /// Threaded through every `catalog_log::append` so DDL history is
+    /// tamper-evident the way the commit log's data history is — the catalog-log
+    /// half of invariant 10.
+    ///
+    /// [ADR-0031]: ../../../docs/adr/0031-live-server-verifiable-commit-log.md
+    /// [STL-307]: https://allegromusic.atlassian.net/browse/STL-307
+    catalog_head: Digest,
     /// The MVCC write index: per-`(table, key)`, the commit instant of the most
     /// recent committed write. Every applied write records its commit instant
     /// here, and a multi-statement [`commit`](Self::commit) checks its write set
@@ -960,6 +971,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             next_txn: 1,
             commit_head: Digest::ZERO,
             commit_seq: 1,
+            catalog_head: Digest::ZERO,
             write_index: BTreeMap::new(),
             open_snapshots: OpenSnapshots::default(),
             pruned_below: SystemTimeMicros(0),
@@ -1021,7 +1033,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// if replaying a record is refused (a log/catalog invariant break — fails
     /// closed); [`EngineError::Storage`] if a table's tiers cannot be recovered.
     pub fn recover(disk: D, clock: C) -> Result<Self, EngineError> {
-        let records = catalog_log::replay(&disk).map_err(EngineError::CatalogLog)?;
+        // Replay the durable catalog log and verify its hash chain ([ADR-0031],
+        // [STL-307]): a tampered DDL record breaks the chain and fails closed
+        // here (mapped to `CatalogLog`), refusing recovery rather than serving
+        // forged catalog history. The verified head seeds `catalog_head` so
+        // post-restart DDL chains on.
+        let (records, catalog_head) =
+            catalog_log::replay(&disk).map_err(EngineError::CatalogLog)?;
         // The durable hash-chained commit log ([ADR-0031], STL-302). Replay its
         // ordered commit-record payloads, then:
         //  - verify the chain fails-closed — a tampered historical record refuses
@@ -1107,6 +1125,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             next_txn,
             commit_head: recovered_chain.head,
             commit_seq: recovered_chain.seq.saturating_add(1),
+            catalog_head,
             write_index: BTreeMap::new(),
             open_snapshots: OpenSnapshots::default(),
             pruned_below: SystemTimeMicros(0),
@@ -2449,7 +2468,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 };
                 let mut staged = self.catalog.clone();
                 let schema_id = staged.create_table(name.clone(), columns, temporal, at)?;
-                catalog_log::append(&self.disk, &record).map_err(EngineError::CatalogLog)?;
+                self.catalog_head = catalog_log::append(&self.disk, &record, self.catalog_head)
+                    .map_err(EngineError::CatalogLog)?;
                 self.catalog = staged;
                 if let Some(tier) = tier {
                     self.tables.insert(name, tier);
@@ -2474,7 +2494,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                         at,
                         name: name.clone(),
                     };
-                    catalog_log::append(&self.disk, &record).map_err(EngineError::CatalogLog)?;
+                    self.catalog_head = catalog_log::append(&self.disk, &record, self.catalog_head)
+                        .map_err(EngineError::CatalogLog)?;
                     self.catalog = staged;
                     // The catalog drop cascaded the table's index *metadata*
                     // away ([STL-233]); discard the orphaned access structures
@@ -2554,7 +2575,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     name: name.clone(),
                     verifier: verifier.clone(),
                 };
-                catalog_log::append(&self.disk, &record).map_err(EngineError::CatalogLog)?;
+                self.catalog_head = catalog_log::append(&self.disk, &record, self.catalog_head)
+                    .map_err(EngineError::CatalogLog)?;
                 self.users.insert(name, verifier);
                 Ok(StatementOutcome::Ddl {
                     tag: DdlOutcome::CreatedUser.command_tag(),
@@ -2573,7 +2595,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     name: name.clone(),
                     verifier: verifier.clone(),
                 };
-                catalog_log::append(&self.disk, &record).map_err(EngineError::CatalogLog)?;
+                self.catalog_head = catalog_log::append(&self.disk, &record, self.catalog_head)
+                    .map_err(EngineError::CatalogLog)?;
                 self.users.insert(name, verifier);
                 Ok(StatementOutcome::Ddl {
                     tag: DdlOutcome::AlteredUser.command_tag(),
@@ -2594,7 +2617,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     at,
                     name: name.clone(),
                 };
-                catalog_log::append(&self.disk, &record).map_err(EngineError::CatalogLog)?;
+                self.catalog_head = catalog_log::append(&self.disk, &record, self.catalog_head)
+                    .map_err(EngineError::CatalogLog)?;
                 self.users.remove(&name);
                 Ok(StatementOutcome::Ddl {
                     tag: DdlOutcome::DroppedUser.command_tag(),
@@ -2648,7 +2672,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             kind: def.kind(),
             columns: def.columns().to_vec(),
         };
-        catalog_log::append(&self.disk, &record).map_err(EngineError::CatalogLog)?;
+        self.catalog_head = catalog_log::append(&self.disk, &record, self.catalog_head)
+            .map_err(EngineError::CatalogLog)?;
         let name = def.name().to_owned();
         self.catalog = staged;
         self.index_states.insert(name, built);
@@ -2679,7 +2704,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 at,
                 name: name.to_owned(),
             };
-            catalog_log::append(&self.disk, &record).map_err(EngineError::CatalogLog)?;
+            self.catalog_head = catalog_log::append(&self.disk, &record, self.catalog_head)
+                .map_err(EngineError::CatalogLog)?;
             self.catalog = staged;
             self.index_states.remove(name);
         }
@@ -7173,6 +7199,75 @@ mod tests {
         disk.remove(crate::commit_log::COMMIT_LOG_FILENAME)
             .expect("remove");
         disk.create(crate::commit_log::COMMIT_LOG_FILENAME)
+            .expect("create")
+            .append(&bytes)
+            .expect("append");
+    }
+
+    /// Recovery re-verifies the **catalog** hash chain ([ADR-0031], [STL-307]):
+    /// the untampered catalog recovers cleanly, but a tampered DDL record refuses
+    /// recovery rather than serving forged catalog history — the catalog-log half
+    /// of the commit-chain fail-closed guarantee (invariant 10), the engine-level
+    /// tamper oracle (testing-strategy §4).
+    #[test]
+    fn recovery_fails_closed_on_a_tampered_catalog_chain() {
+        let disk = MemDisk::new();
+        let mut engine = SessionEngine::open(disk.clone(), ZeroClock);
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE ledger (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+            ))
+            .expect("create 2");
+        drop(engine);
+
+        // Baseline: the untampered two-record catalog chain recovers cleanly.
+        SessionEngine::recover(disk.clone(), ZeroClock).expect("clean catalog recovers");
+
+        forge_first_catalog_record(&disk);
+
+        assert!(
+            matches!(
+                SessionEngine::recover(disk, ZeroClock),
+                Err(EngineError::CatalogLog(_)),
+            ),
+            "recovery fails closed on a broken catalog chain",
+        );
+    }
+
+    /// Rewrite the first catalog record on disk in place — flip a payload byte
+    /// and re-CRC it, the well-framed forgery a privileged operator could
+    /// attempt. The frame still parses and passes CRC, so [`catalog_log::replay`]
+    /// gets past the CRC gate; but its hash no longer matches the *second*
+    /// record's `prev_hash`, so the chain breaks at record 1.
+    fn forge_first_catalog_record(disk: &MemDisk) {
+        use stele_storage::backend::DiskFile as _;
+        use stele_storage::checksum::crc32c;
+
+        // Frame: magic(4) | payload_len(4 LE) | prev_hash(32) | payload | crc(4).
+        const HEADER: usize = 8;
+        const PREV_HASH: usize = 32;
+        const CRC: usize = 4;
+        let file = disk
+            .open(crate::catalog_log::CATALOG_LOG_FILENAME)
+            .expect("open");
+        let len = usize::try_from(file.len()).expect("small file");
+        let mut bytes = vec![0u8; len];
+        file.read_at(0, &mut bytes).expect("read");
+
+        let payload_len = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")) as usize;
+        let payload_start = HEADER + PREV_HASH;
+        let crc_start = payload_start + payload_len;
+        // Flip a `CreateTable.at` byte (still decodes; the content just differs)
+        // and recompute the CRC, leaving the genesis prev_hash so only the hash
+        // chain — not the CRC — catches the forgery.
+        bytes[payload_start + 1] ^= 0xFF;
+        let crc = crc32c(&bytes[..crc_start]);
+        bytes[crc_start..crc_start + CRC].copy_from_slice(&crc.to_le_bytes());
+
+        disk.remove(crate::catalog_log::CATALOG_LOG_FILENAME)
+            .expect("remove");
+        disk.create(crate::catalog_log::CATALOG_LOG_FILENAME)
             .expect("create")
             .append(&bytes)
             .expect("append");
