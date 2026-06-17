@@ -273,9 +273,10 @@ live at the resolved system-time snapshot, that `snapshot`, an optional
   validity index — [ADR-0023], STL-133). The binder does not re-implement the
   prune; carrying the snapshot *is* the rewrite. Joint `(sys, valid)` version
   resolution from `valid_snapshot` is the executor's job (STL-163).
-- **Beyond the single-table scan**: a two-table join binds (STL-172) and an
-  uncorrelated `WHERE` subquery binds (STL-234, see [Subquery
-  predicates](#subquery-predicates-stl-234)). **Rejected**: set operations,
+- **Beyond the single-table scan**: a two-table join binds (STL-172) and a
+  `WHERE` subquery binds — uncorrelated (STL-234) and correlated (STL-239), see
+  [Subquery predicates](#subquery-predicates-stl-234-stl-239). **Rejected**: set
+  operations,
   schema-qualified table names, and projections other than `*` or bare column
   names (a computed or aliased select item — including a scalar subquery in the
   select list — is not yet projected). The `WHERE` clause stays on the AST for
@@ -342,11 +343,13 @@ The **extended** query protocol is exempt: a driver (JDBC, psycopg, pgAdmin)
 sets its own row count through the portal's `Execute` `max_rows`, so an
 automated consumer fetches exactly what it requested.
 
-## Subquery predicates (STL-234)
+## Subquery predicates (STL-234, STL-239)
 
-A `WHERE` may be a single **uncorrelated subquery** predicate — the inner query
-references no outer column, so it is evaluated **once** and its result folded
-into the outer row filter. Three shapes bind:
+A `WHERE` may be a single subquery predicate. An **uncorrelated** one (the inner
+query references no outer column) is evaluated **once** and its result folded
+into the outer row filter; a **correlated** one (the inner references an outer
+column, [below](#correlated-subqueries-stl-239)) is re-run per outer row. Three
+shapes bind, correlated or not:
 
 ```sql
 SELECT id FROM t WHERE a = (SELECT max(a) FROM s);             -- scalar comparison
@@ -372,16 +375,50 @@ SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s WHERE a > 100); -- [NOT] EXISTS
 **Snapshot rule.** The inner query inherits the outer statement's resolved
 `(sys, valid)` snapshot — one consistent snapshot per statement (docs/16 §6). A
 `… (SELECT … FROM s) … FOR SYSTEM_TIME AS OF p` reads `s` at `p` too; inside a
-transaction the inner also sees the read-your-own-writes buffer (STL-203).
+transaction the inner also sees the read-your-own-writes buffer (STL-203). A
+correlated inner re-runs at that **same** snapshot for every outer row, so the
+rule holds per re-execution.
 
 The outer operand of a scalar / `IN` comparison must be a bare value column, and
-the inner's single column must match its type (no implicit coercion). **Not yet
-bound** (each a tracked follow-up): a scalar subquery in the **select list**
-(needs expression projection), **correlated** subqueries (STL-239), subqueries in
-`FROM` / CTEs (STL-242), and a subquery composed with `AND` / `OR` or set over a
-join. Bound as `BoundSelect::subquery_filter` (mutually exclusive with the plain
-and period `WHERE` shapes); the engine's `resolve_filter` runs the inner once and
-folds it into the same `FilterPlan` the plain path produces.
+the inner's single column must match its type (no implicit coercion). Bound as
+`BoundSelect::subquery_filter` (mutually exclusive with the plain and period
+`WHERE` shapes); for an uncorrelated subquery the engine's `resolve_filter` runs
+the inner once and folds it into the same `FilterPlan` the plain path produces.
+
+### Correlated subqueries (STL-239)
+
+When the inner's `WHERE` relates one of its columns to an **outer** column, the
+subquery is *correlated*: its result depends on the outer row, so the engine
+re-runs the inner once per outer row with that row's value substituted, dropping
+the row unless its predicate holds. All three shapes correlate:
+
+```sql
+SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.k = t.k);       -- [NOT] EXISTS
+SELECT id FROM t WHERE a IN (SELECT a FROM s WHERE s.k = t.k);         -- [NOT] IN
+SELECT id FROM t WHERE a = (SELECT a FROM s WHERE s.id = t.id);        -- scalar lookup
+```
+
+- The correlated `WHERE` must be **one comparison** relating a bare inner column
+  to an outer column — `inner.c <cmp> outer.c`, either operand order (the engine
+  lowers a single-comparison `WHERE`, so the correlation *is* the whole inner
+  `WHERE`). The two columns must share a type. A bare name resolves to the inner
+  when the inner table has it (the innermost-scope rule); qualify with the table
+  name or alias otherwise. An alias **replaces** the table name as the relation's
+  exposed name, which is what lets a self-correlation (`FROM t … (SELECT 1 FROM t
+  inner WHERE inner.k = t.k)`) name both sides.
+- **NULL semantics carry per row.** A NULL outer correlation value makes the inner
+  empty (`inner.c = NULL` is unknown for every inner row): `EXISTS` is then false,
+  `IN` false, a scalar `NULL`. The `NOT IN`-with-a-NULL-member trap is evaluated
+  against *each* outer row's inner set. Both are checked against DuckDB in the
+  nightly differential oracle (`correlated_subquery_differential.rs`).
+- This is the **per-row** fallback the v0.3 bar permits — correctness, not
+  performance (`O(outer rows × inner cost)`). Decorrelating the common
+  `EXISTS` / `IN` cases onto a semi/anti join is a tracked follow-up.
+
+**Not yet bound** (each a tracked follow-up): a scalar subquery in the **select
+list** (needs expression projection, STL-303), subqueries in `FROM` / CTEs
+(STL-242), a subquery composed with `AND` / `OR` or set over a join, a correlated
+`WHERE` with more than the one correlation comparison, and lateral joins.
 
 ## Multi-row INSERT (STL-228)
 

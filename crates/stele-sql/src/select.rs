@@ -373,16 +373,23 @@ pub struct BoundSelect {
     pub limit: Option<u64>,
 }
 
-/// A bound `WHERE` clause whose predicate is an **uncorrelated subquery** — a
-/// scalar comparison, `[NOT] IN`, or `[NOT] EXISTS` ([STL-234]).
+/// A bound `WHERE` clause whose predicate is a subquery — a scalar comparison,
+/// `[NOT] IN`, or `[NOT] EXISTS` ([STL-234], [STL-239]).
 ///
-/// *Uncorrelated* means the inner query references no outer column, so its result
-/// is a **constant** with respect to the outer rows: the executor evaluates
+/// When [`correlation`](Self::correlation) is `None` the subquery is
+/// **uncorrelated** ([STL-234]): the inner references no outer column, so its
+/// result is a **constant** with respect to the outer rows. The executor evaluates
 /// [`subquery`](Self::subquery) **once**, at the outer statement's `(sys, valid)`
-/// snapshot (the binder binds it under the same [`BindContext`], so it inherits
-/// the one consistent per-statement snapshot — docs/16 §6), materializes the
-/// result, and folds it into the outer row filter (a folded literal, an
-/// equality-`OR` set test, or a constant keep-all/keep-none).
+/// snapshot (the binder binds it under the same [`BindContext`], so it inherits the
+/// one consistent per-statement snapshot — docs/16 §6), materializes the result,
+/// and folds it into the outer row filter (a folded literal, an equality-`OR` set
+/// test, or a constant keep-all/keep-none).
+///
+/// When `correlation` is `Some` the subquery is **correlated** ([STL-239]): the
+/// inner references an outer column, so it is re-run once per outer row with that
+/// row's value substituted (the per-row fallback the v0.3 bar permits). The inner
+/// still binds under the same snapshot, so the per-statement `(sys, valid)` rule
+/// holds for every re-execution.
 ///
 /// Mutually exclusive with [`BoundSelect::filter`] and
 /// [`BoundSelect::period_filter`]: a `WHERE` is exactly one of the three shapes.
@@ -390,8 +397,46 @@ pub struct BoundSelect {
 pub struct BoundSubqueryFilter {
     /// Which subquery predicate the `WHERE` is, and the outer column it tests.
     pub kind: SubqueryKind,
-    /// The bound inner query, evaluated once at the outer plan's snapshot.
+    /// The bound inner query. For an **uncorrelated** subquery ([STL-234]) this is
+    /// evaluated **once** at the outer plan's snapshot; for a **correlated** one
+    /// ([STL-239]) — see [`correlation`](Self::correlation) — it is re-run once per
+    /// outer row with that row's value substituted for the outer reference, so its
+    /// own [`filter`](BoundSelect::filter) is left empty (the correlation predicate
+    /// is lifted off it at bind time and re-applied per row by the executor).
     pub subquery: Box<BoundSelect>,
+    /// The outer-column correlation the inner references, or `None` when the
+    /// subquery is uncorrelated ([STL-234]). `Some` marks the per-row
+    /// re-execution path ([STL-239]): the inner is **not** constant over the outer
+    /// rows, so the executor substitutes each outer row's
+    /// [`outer_column`](Correlation::outer_column) value into the inner's filter
+    /// and re-runs it, rather than folding a once-evaluated result.
+    pub correlation: Option<Correlation>,
+}
+
+/// A single correlation between an inner subquery and its outer query ([STL-239]).
+///
+/// The inner's `WHERE` relates one of its own columns to an **outer-query** column
+/// (`… WHERE inner.k = outer.k`), so the inner is not constant over the outer rows.
+/// The binder lifts this single comparison off the inner (the inner binds with no
+/// `WHERE`, since the engine's one-comparison `WHERE` limit means the correlation
+/// *is* the whole `WHERE`) and records it here. The executor re-runs the inner once
+/// per outer row, substituting that row's [`outer_column`](Self::outer_column) value
+/// for the reference — the per-row fallback the v0.3 bar permits (correctness, not
+/// performance; decorrelating the common `EXISTS`/`IN` cases onto a semi/anti join
+/// is a tracked follow-up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Correlation {
+    /// The outer-query column the inner references, by **outer** schema index
+    /// (`0` is the business key). Read from each outer row and substituted into the
+    /// inner's per-row filter.
+    pub outer_column: usize,
+    /// The inner column the correlation constrains, by **inner** schema index.
+    pub inner_column: usize,
+    /// The comparison, normalized so the inner column is the left operand
+    /// (`inner_column <op> <outer value>`). A source comparison written outer-first
+    /// (`outer.k < inner.k`) is [mirrored](CompareOp::mirror) here so the executor
+    /// always builds `inner_column op literal`.
+    pub op: CompareOp,
 }
 
 /// The shape of an uncorrelated-subquery `WHERE` predicate ([STL-234]).
@@ -1989,11 +2034,32 @@ fn bind_where(
         snapshot,
         catalog: ctx.catalog,
     };
-    if let Some(mut subquery) = try_bind_subquery_filter(expr, schema, table, &inner_ctx)? {
+    // The outer query's single table, as the correlation resolver sees it: its name
+    // (and optional alias) qualify outer-column references the inner makes, and its
+    // schema gives them indices and types ([STL-239]).
+    let outer = OuterScope {
+        table,
+        alias: select_table_alias(select),
+        schema,
+    };
+    if let Some(mut subquery) = try_bind_subquery_filter(expr, &outer, &inner_ctx)? {
         inherit_valid_snapshot(&mut subquery.subquery, valid_snapshot, ctx.catalog)?;
         return Ok((None, Some(subquery)));
     }
     Ok((Some(bind_where_predicate(expr, schema, table)?), None))
+}
+
+/// The alias of a single-table `SELECT`'s `FROM` relation (`FROM t outer`), or
+/// `None` for an unaliased table or any non-table relation ([STL-239]).
+///
+/// Used to qualify outer-column references inside a correlated subquery: an alias,
+/// when present, is the relation's exposed name (it hides the table name, the SQL
+/// scoping rule), so `outer.k` in the inner resolves against the alias.
+fn select_table_alias(select: &Select) -> Option<&str> {
+    let [from] = select.from.as_slice() else {
+        return None;
+    };
+    table_ref(&from.relation).ok().and_then(|r| r.alias)
 }
 
 /// Pin an inner subquery's valid axis to the outer statement's `FOR VALID_TIME
@@ -2036,29 +2102,47 @@ fn inherit_valid_snapshot(
     Ok(())
 }
 
-/// Recognize and bind an uncorrelated-subquery `WHERE` ([STL-234]): `[NOT]
-/// EXISTS`, `[NOT] IN (SELECT …)`, or a comparison with a `(SELECT …)` operand.
-/// Returns `None` for every other `WHERE` — those fall through to the plain
+/// The outer query's single table during subquery binding ([STL-239]): its name,
+/// optional alias, and resolved schema. The name/alias qualify outer-column
+/// references a correlated inner makes; the schema resolves them to indices/types.
+struct OuterScope<'a> {
+    table: &'a str,
+    alias: Option<&'a str>,
+    schema: &'a TableSchema,
+}
+
+impl OuterScope<'_> {
+    /// Whether `qualifier` (a `t.c` prefix) names this scope. An alias, when
+    /// present, **replaces** the table name as the relation's exposed name (the SQL
+    /// scoping rule), so an aliased outer is reachable only through its alias — which
+    /// is what lets a self-correlated `… FROM t WHERE EXISTS (SELECT 1 FROM t inner
+    /// WHERE inner.k = t.k)` distinguish the two `t`s.
+    fn qualifier_matches(&self, qualifier: &str) -> bool {
+        self.alias
+            .map_or(self.table == qualifier, |a| a == qualifier)
+    }
+}
+
+/// Recognize and bind a subquery `WHERE` ([STL-234], [STL-239]): `[NOT] EXISTS`,
+/// `[NOT] IN (SELECT …)`, or a comparison with a `(SELECT …)` operand. Returns
+/// `None` for every other `WHERE` — those fall through to the plain
 /// [`bind_where_predicate`].
 fn try_bind_subquery_filter(
     expr: &Expr,
-    schema: &TableSchema,
-    table: &str,
+    outer: &OuterScope,
     ctx: &BindContext,
 ) -> Result<Option<BoundSubqueryFilter>, SelectError> {
     match unwrap_nested(expr) {
         Expr::Exists { subquery, negated } => {
-            Ok(Some(bind_exists_subquery(subquery, *negated, ctx)?))
+            Ok(Some(bind_exists_subquery(subquery, *negated, outer, ctx)?))
         }
         Expr::InSubquery {
             expr: lhs,
             subquery,
             negated,
-        } => Ok(Some(bind_in_subquery(
-            lhs, subquery, *negated, schema, table, ctx,
-        )?)),
+        } => Ok(Some(bind_in_subquery(lhs, subquery, *negated, outer, ctx)?)),
         Expr::BinaryOp { left, op, right } => {
-            bind_scalar_subquery_compare(left, op, right, schema, table, ctx)
+            bind_scalar_subquery_compare(left, op, right, outer, ctx)
         }
         _ => Ok(None),
     }
@@ -2066,16 +2150,19 @@ fn try_bind_subquery_filter(
 
 /// Bind `[NOT] EXISTS (SELECT …)`. `EXISTS` tests only row presence, so the
 /// inner select-list is irrelevant; the inner binds with its projection
-/// normalized (see [`bind_inner_query`]).
+/// normalized (see [`bind_inner_query`]). A correlated inner ([STL-239]) carries
+/// its [`Correlation`] out of [`bind_inner_query`] for the executor's per-row path.
 fn bind_exists_subquery(
     subquery: &Query,
     negated: bool,
+    outer: &OuterScope,
     ctx: &BindContext,
 ) -> Result<BoundSubqueryFilter, SelectError> {
-    let inner = bind_inner_query(subquery, ctx, /* exists = */ true)?;
+    let (inner, correlation) = bind_inner_query(subquery, outer, ctx, /* exists = */ true)?;
     Ok(BoundSubqueryFilter {
         kind: SubqueryKind::Exists { negated },
         subquery: Box::new(inner),
+        correlation,
     })
 }
 
@@ -2085,16 +2172,16 @@ fn bind_in_subquery(
     lhs: &Expr,
     subquery: &Query,
     negated: bool,
-    schema: &TableSchema,
-    table: &str,
+    outer: &OuterScope,
     ctx: &BindContext,
 ) -> Result<BoundSubqueryFilter, SelectError> {
-    let column = subquery_anchor_column(lhs, schema, table, "IN")?;
-    let inner = bind_inner_query(subquery, ctx, /* exists = */ false)?;
-    check_subquery_column_type(&inner, schema, column, ctx.catalog, "IN")?;
+    let column = subquery_anchor_column(lhs, outer.schema, outer.table, "IN")?;
+    let (inner, correlation) = bind_inner_query(subquery, outer, ctx, /* exists = */ false)?;
+    check_subquery_column_type(&inner, outer.schema, column, ctx.catalog, "IN")?;
     Ok(BoundSubqueryFilter {
         kind: SubqueryKind::In { column, negated },
         subquery: Box::new(inner),
+        correlation,
     })
 }
 
@@ -2109,8 +2196,7 @@ fn bind_scalar_subquery_compare(
     left: &Expr,
     op: &BinaryOperator,
     right: &Expr,
-    schema: &TableSchema,
-    table: &str,
+    outer: &OuterScope,
     ctx: &BindContext,
 ) -> Result<Option<BoundSubqueryFilter>, SelectError> {
     let left = unwrap_nested(left);
@@ -2132,14 +2218,26 @@ fn bind_scalar_subquery_compare(
             "operator `{op}` is not supported with a subquery operand"
         )));
     };
-    let column =
-        subquery_anchor_column(column_expr, schema, table, "a scalar subquery comparison")?;
-    let mut inner = bind_inner_query(subquery, ctx, /* exists = */ false)?;
-    check_subquery_column_type(&inner, schema, column, ctx.catalog, "a scalar subquery")?;
+    let column = subquery_anchor_column(
+        column_expr,
+        outer.schema,
+        outer.table,
+        "a scalar subquery comparison",
+    )?;
+    let (mut inner, correlation) =
+        bind_inner_query(subquery, outer, ctx, /* exists = */ false)?;
+    check_subquery_column_type(
+        &inner,
+        outer.schema,
+        column,
+        ctx.catalog,
+        "a scalar subquery",
+    )?;
     // A scalar subquery only needs the 0 / 1 / >1 distinction, so cap it at two
     // rows: the engine still raises the cardinality violation (≥2 rows → still 2),
     // without materializing an arbitrarily large inner result first. A user's
-    // tighter `LIMIT` (e.g. `LIMIT 1`) is kept.
+    // tighter `LIMIT` (e.g. `LIMIT 1`) is kept. The cap holds per outer row for a
+    // correlated scalar ([STL-239]) too — each re-execution still yields ≤2 rows.
     inner.limit = Some(inner.limit.map_or(2, |existing| existing.min(2)));
     Ok(Some(BoundSubqueryFilter {
         kind: SubqueryKind::Scalar {
@@ -2148,6 +2246,7 @@ fn bind_scalar_subquery_compare(
             subquery_left,
         },
         subquery: Box::new(inner),
+        correlation,
     }))
 }
 
@@ -2267,8 +2366,8 @@ fn single_output_type(columns: &[(String, LogicalType)]) -> Result<LogicalType, 
 
 /// Bind an inner (subquery) `SELECT` under the **same** [`BindContext`] as the
 /// outer query, so it inherits the one consistent per-statement snapshot
-/// (docs/16 §6) — the temporal rule that makes an uncorrelated subquery's result
-/// well-defined.
+/// (docs/16 §6) — the temporal rule that makes a subquery's result well-defined,
+/// correlated or not.
 ///
 /// The inner query carries no temporal grammar of its own ([`Temporal::default`]):
 /// the parser lifts every `FOR … AS OF` to the statement level, so a subquery is
@@ -2278,26 +2377,196 @@ fn single_output_type(columns: &[(String, LogicalType)]) -> Result<LogicalType, 
 /// ignores the select-list anyway. An aggregate inner keeps its shape (it always
 /// yields exactly one row, so the row-presence test is well-defined).
 ///
-/// A correlated subquery — the inner referencing an outer column — is not
-/// detected here; it binds as an unknown-column error against the inner schema,
-/// the sibling ticket's job ([STL-239]).
+/// **Correlation** ([STL-239]): if the inner's `WHERE` relates an inner column to
+/// an outer-query column (`… WHERE inner.k = outer.k`), that single comparison is
+/// lifted off the inner *before* it binds — otherwise the inner would reject the
+/// outer column as unknown — and returned as a [`Correlation`] for the executor's
+/// per-row path. The inner then binds with no `WHERE` (the correlation *was* the
+/// whole `WHERE`, since the engine lowers only a single-comparison `WHERE`); a
+/// `Some` return is the only thing that distinguishes a correlated subquery from an
+/// uncorrelated one downstream.
 fn bind_inner_query(
     query: &Query,
+    outer: &OuterScope,
     ctx: &BindContext,
     exists: bool,
-) -> Result<BoundSelect, SelectError> {
+) -> Result<(BoundSelect, Option<Correlation>), SelectError> {
     let mut query = query.clone();
-    if exists
-        && let SetExpr::Select(select) = query.body.as_mut()
-        && !is_aggregate_query(select)
-    {
-        select.projection = vec![SelectItem::Wildcard(WildcardAdditionalOptions::default())];
+    let mut correlation = None;
+    if let SetExpr::Select(select) = query.body.as_mut() {
+        // Lift any correlated `WHERE` off the inner before binding (an outer-column
+        // reference would otherwise be an unknown column against the inner schema).
+        correlation = strip_correlation(select, outer, ctx)?;
+        if exists && !is_aggregate_query(select) {
+            select.projection = vec![SelectItem::Wildcard(WildcardAdditionalOptions::default())];
+        }
     }
     let stmt = Statement {
         body: StatementBody::Sql(SqlStatement::Query(Box::new(query))),
         temporal: Temporal::default(),
     };
-    bind_select(&stmt, ctx)
+    Ok((bind_select(&stmt, ctx)?, correlation))
+}
+
+/// Detect a **correlated** inner `WHERE` and lift it off `select`, returning the
+/// [`Correlation`] it describes ([STL-239]); returns `None` (leaving the `WHERE`
+/// in place for the inner binder) when the subquery is uncorrelated.
+///
+/// Correlation is recognized only for a single-table inner whose `WHERE` is one
+/// comparison relating an inner column to an outer column — the engine's per-row
+/// fallback re-applies exactly that one comparison. A join inner, or a `WHERE` that
+/// is not such a comparison, is left untouched: it either binds as an uncorrelated
+/// query or surfaces its own error (a join rejects any `WHERE`; an outer reference
+/// the resolver cannot place becomes an unknown column against the inner schema).
+fn strip_correlation(
+    select: &mut Select,
+    outer: &OuterScope,
+    ctx: &BindContext,
+) -> Result<Option<Correlation>, SelectError> {
+    let Some(expr) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    // Resolve the inner's single table to give its columns indices/types. A
+    // non-single-table inner (a join) has no single inner schema to correlate
+    // against — leave its `WHERE` for the inner binder (which rejects it).
+    let Ok(inner_ref) = table_ref_of(select) else {
+        return Ok(None);
+    };
+    let TableResolution::Found(inner_schema) =
+        resolve_table_at(ctx.catalog, inner_ref.name, ctx.snapshot)
+    else {
+        return Ok(None);
+    };
+    let inner = OuterScope {
+        table: inner_ref.name,
+        alias: inner_ref.alias,
+        schema: inner_schema,
+    };
+    let Some(correlation) = match_correlation(expr, &inner, outer)? else {
+        return Ok(None);
+    };
+    // The correlation is the whole `WHERE` (the engine lowers only a single
+    // comparison), so strip it: the inner binds unfiltered and the executor
+    // re-applies the comparison per outer row.
+    select.selection = None;
+    Ok(Some(correlation))
+}
+
+/// The single-table reference of an inner `SELECT`'s `FROM` (`FROM s` / `FROM s
+/// alias`), or an error for an empty / multi-relation / non-table `FROM`.
+fn table_ref_of(select: &Select) -> Result<TableRef<'_>, SelectError> {
+    let [from] = select.from.as_slice() else {
+        return Err(SelectError::UnsupportedFrom("not exactly one table"));
+    };
+    if !from.joins.is_empty() {
+        return Err(SelectError::UnsupportedFrom("join"));
+    }
+    table_ref(&from.relation)
+}
+
+/// Match a single-comparison inner `WHERE` as a correlation: exactly one operand an
+/// inner column and the other an outer column ([STL-239]).
+///
+/// Returns `None` when no operand resolves to the outer scope (an uncorrelated
+/// `WHERE`, left for the inner binder). A comparison that *does* reference the
+/// outer but is not the supported `inner_column <op> outer_column` shape (an outer
+/// reference paired with a literal, an arithmetic, or another outer reference) is a
+/// [`SelectError::Subquery`] — recognized as correlated but not a shape the per-row
+/// fallback lowers.
+fn match_correlation(
+    expr: &Expr,
+    inner: &OuterScope,
+    outer: &OuterScope,
+) -> Result<Option<Correlation>, SelectError> {
+    let Expr::BinaryOp { left, op, right } = unwrap_nested(expr) else {
+        return Ok(None);
+    };
+    let Some(compare) = compare_op(op) else {
+        return Ok(None);
+    };
+    let left_ref = resolve_correlation_operand(left, inner, outer)?;
+    let right_ref = resolve_correlation_operand(right, inner, outer)?;
+    let (outer_column, inner_column, op) = match (left_ref, right_ref) {
+        // Inner on the left: keep the operator as written.
+        (Some(CorrRef::Inner(ic)), Some(CorrRef::Outer(oc))) => (oc, ic, compare),
+        // Outer on the left: mirror so the inner column reads as the left operand.
+        (Some(CorrRef::Outer(oc)), Some(CorrRef::Inner(ic))) => (oc, ic, compare.mirror()),
+        // References the outer, but not as `inner_column <op> outer_column`.
+        (Some(CorrRef::Outer(_)), _) | (_, Some(CorrRef::Outer(_))) => {
+            return Err(SelectError::Subquery(
+                "a correlated subquery WHERE must compare an inner column to an outer column"
+                    .to_owned(),
+            ));
+        }
+        // No outer reference: an uncorrelated WHERE, bound by the inner binder.
+        _ => return Ok(None),
+    };
+    let inner_ty = inner.schema.columns()[inner_column].ty();
+    let outer_ty = outer.schema.columns()[outer_column].ty();
+    if inner_ty != outer_ty {
+        return Err(SelectError::Subquery(format!(
+            "a correlated subquery compares {inner_ty} to the outer {outer_ty}"
+        )));
+    }
+    Ok(Some(Correlation {
+        outer_column,
+        inner_column,
+        op,
+    }))
+}
+
+/// Which scope a column reference in a correlated `WHERE` resolves to.
+#[derive(Debug, Clone, Copy)]
+enum CorrRef {
+    /// A column of the inner (subquery) table, by inner schema index.
+    Inner(usize),
+    /// A column of the outer query's table, by outer schema index.
+    Outer(usize),
+}
+
+/// Resolve one operand of an inner `WHERE` comparison to the scope it names
+/// ([STL-239]), or `None` for a non-column operand (a literal / arithmetic) or a
+/// bare name in neither scope.
+///
+/// A **bare** column resolves to the inner scope when the inner has it (the
+/// innermost-scope rule — an inner column shadows an equally-named outer one), else
+/// to the outer when only the outer has it. A **qualified** `q.c` resolves by which
+/// scope `q` names; a qualifier that names neither is not a correlation reference
+/// (`None`), and one that names a scope without the column is an unknown column.
+fn resolve_correlation_operand(
+    expr: &Expr,
+    inner: &OuterScope,
+    outer: &OuterScope,
+) -> Result<Option<CorrRef>, SelectError> {
+    match unwrap_nested(expr) {
+        Expr::Identifier(id) => Ok(column_index(inner.schema, &id.value)
+            .map(CorrRef::Inner)
+            .or_else(|| column_index(outer.schema, &id.value).map(CorrRef::Outer))),
+        Expr::CompoundIdentifier(parts) => {
+            let [qualifier, column] = parts.as_slice() else {
+                return Ok(None);
+            };
+            let (q, c) = (qualifier.value.as_str(), column.value.as_str());
+            let unknown = |scope: &OuterScope| SelectError::UnknownColumn {
+                table: scope.table.to_owned(),
+                column: c.to_owned(),
+            };
+            // The inner scope wins a tie: a self-correlation aliases one side, so an
+            // un-hidden table name that matches both is the inner's.
+            if inner.qualifier_matches(q) {
+                column_index(inner.schema, c)
+                    .map(|i| Some(CorrRef::Inner(i)))
+                    .ok_or_else(|| unknown(inner))
+            } else if outer.qualifier_matches(q) {
+                column_index(outer.schema, c)
+                    .map(|o| Some(CorrRef::Outer(o)))
+                    .ok_or_else(|| unknown(outer))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Bind one `WHERE` expression to a [`BoundPredicate`] against `table`'s schema —

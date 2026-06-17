@@ -85,8 +85,9 @@ use stele_sql::dml::{BoundDml, DmlError, InsertRow};
 use stele_sql::merge::{BoundMerge, MergeBound, MergeSource, MergeValid, MergeValue};
 use stele_sql::select::{
     AggregateFunc, ArithOp, BoundAggregate, BoundJoin, BoundPeriod, BoundPeriodPredicate,
-    BoundPredicate, BoundScalar, BoundSelect, CompareOp, JoinColumnRef, JoinType, OutputItem,
-    PeriodEndpoint, Projection, SelectError, SortTarget, SubqueryKind,
+    BoundPredicate, BoundScalar, BoundSelect, BoundSubqueryFilter, CompareOp, Correlation,
+    JoinColumnRef, JoinType, OutputItem, PeriodEndpoint, Projection, SelectError, SortTarget,
+    SubqueryKind,
 };
 use stele_sql::{
     AdminCommand, BindContext, BindError, CopyError, CopyShape, Statement, StatementBody,
@@ -3015,6 +3016,19 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             }
         };
 
+        // A **correlated** subquery `WHERE` ([STL-239]) cannot fold to a constant
+        // plan, so the scan above kept every row (`resolve_filter` → `KeepAll`); the
+        // inner is re-run once per surviving outer row, with that row's value
+        // substituted for the correlation reference, and the row is dropped unless
+        // its predicate holds. This sits before the aggregate / projection so a
+        // correlated `WHERE` filters rows *before* grouping, exactly as a plain one.
+        let rows = match &bound.subquery_filter {
+            Some(sub) if sub.correlation.is_some() => {
+                self.filter_correlated_subquery(sub, &schema_columns, &addressable, rows, overlay)?
+            }
+            _ => rows,
+        };
+
         // An aggregate query folds those rows into grouped output ([STL-171]); a
         // plain query shapes and projects them. Both paths end with the same
         // result-shaping pipeline ([STL-263]) — and because it runs over the
@@ -3060,6 +3074,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// * an **`EXISTS`** subquery becomes a constant
     ///   [`KeepAll`](FilterPlan::KeepAll) / [`Empty`](FilterPlan::Empty), since
     ///   the test is one value for the whole scan.
+    ///
+    /// A **correlated** subquery ([STL-239]) cannot fold to a constant plan — the
+    /// inner depends on each outer row — so this keeps every outer row
+    /// ([`KeepAll`](FilterPlan::KeepAll)); the per-row re-execution filter
+    /// ([`filter_correlated_subquery`](SessionEngine::filter_correlated_subquery))
+    /// decides each row after the scan.
     fn resolve_filter(
         &self,
         bound: &BoundSelect,
@@ -3068,28 +3088,75 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let Some(sub) = &bound.subquery_filter else {
             return Ok(filter_plan(bound));
         };
+        if sub.correlation.is_some() {
+            return Ok(FilterPlan::KeepAll);
+        }
         // The inner is itself a bound `SELECT`, so it always returns rows.
         let StatementOutcome::Rows(result) = self.run_select(&sub.subquery, overlay)? else {
             return Err(EngineError::Unsupported("a subquery must be a SELECT"));
         };
-        match sub.kind {
-            SubqueryKind::Scalar {
-                column,
-                op,
-                subquery_left,
-            } => scalar_subquery_plan(&result, column, op, subquery_left),
-            SubqueryKind::In { column, negated } => in_subquery_plan(&result, column, negated),
-            SubqueryKind::Exists { negated } => {
-                let exists = !result.rows.is_empty();
-                // EXISTS keeps every row when the inner has any; NOT EXISTS keeps
-                // them when it has none.
-                Ok(if exists ^ negated {
-                    FilterPlan::KeepAll
-                } else {
-                    FilterPlan::Empty
-                })
+        fold_subquery(sub.kind, &result)
+    }
+
+    /// Filter the reconstructed outer `rows` by a **correlated** subquery `WHERE`
+    /// ([STL-239]) — the per-row re-execution path.
+    ///
+    /// The inner references an outer column, so it is not constant over the outer
+    /// rows and cannot fold to one [`FilterPlan`]. Instead, for each outer row this
+    /// substitutes that row's correlation value into the inner's filter
+    /// (`inner_column <op> <value>`), re-runs the inner over the **same** `overlay`
+    /// and snapshot the outer reads (so the per-statement `(sys, valid)` and
+    /// read-your-own-writes rules hold for every re-execution — docs/16 §6), folds
+    /// the result with the same [`fold_subquery`] the uncorrelated path uses, and
+    /// evaluates that one-row plan with [`filter_rows`]. A **NULL** correlation value
+    /// makes `inner <op> NULL` unknown for every inner row, so the inner result is
+    /// empty without a run ([`empty_inner_keeps`]).
+    ///
+    /// Performance is explicitly not the v0.3 bar: this is `O(outer rows × inner
+    /// cost)`. Decorrelating the common `EXISTS`/`IN` cases onto a semi/anti join is
+    /// a tracked follow-up.
+    fn filter_correlated_subquery(
+        &self,
+        sub: &BoundSubqueryFilter,
+        schema_columns: &[(String, LogicalType)],
+        addressable: &[(String, LogicalType)],
+        rows: Vec<Vec<Option<Vec<u8>>>>,
+        overlay: &[BoundDml],
+    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+        let correlation = sub
+            .correlation
+            .expect("filter_correlated_subquery called on an uncorrelated subquery");
+        // Decode the outer correlation column once, the same way the uncorrelated
+        // fold decodes an inner column ([`subquery_column_values`]).
+        let outer_ty = schema_columns[correlation.outer_column].1;
+        let cells: Vec<Option<Vec<u8>>> = rows
+            .iter()
+            .map(|row| row.get(correlation.outer_column).cloned().flatten())
+            .collect();
+        let column = Column::Bytes(cells.into());
+        let vector = Vector::from_column(outer_ty, &column)
+            .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
+        let outer_values: Vec<Option<ScalarValue>> =
+            (0..rows.len()).map(|i| vector.get(i)).collect();
+
+        let mut kept = Vec::with_capacity(rows.len());
+        for (row, outer_value) in rows.into_iter().zip(outer_values) {
+            let matched = match outer_value {
+                None => empty_inner_keeps(sub.kind),
+                Some(value) => {
+                    let inner = correlated_inner(&sub.subquery, correlation, value);
+                    let StatementOutcome::Rows(result) = self.run_select(&inner, overlay)? else {
+                        return Err(EngineError::Unsupported("a subquery must be a SELECT"));
+                    };
+                    let plan = fold_subquery(sub.kind, &result)?;
+                    !filter_rows(&plan, addressable, vec![row.clone()])?.is_empty()
+                }
+            };
+            if matched {
+                kept.push(row);
             }
         }
+        Ok(kept)
     }
 
     /// Resolve a bound `SELECT`'s rows through the vectorized operator pipeline
@@ -5834,6 +5901,72 @@ fn filter_plan(bound: &BoundSelect) -> FilterPlan {
                 None => FilterPlan::Predicate(lower_period_predicate(period)),
             }
         })
+}
+
+/// Fold a once-materialized subquery `result` into the [`FilterPlan`] its predicate
+/// kind implies ([STL-234], [STL-239]).
+///
+/// Shared by the uncorrelated path (folded once over the whole inner result, in
+/// [`resolve_filter`](SessionEngine::resolve_filter)) and the correlated per-row
+/// path (folded over each outer row's re-execution, in
+/// [`filter_correlated_subquery`](SessionEngine::filter_correlated_subquery)): the
+/// fold is the same either way — only what it folds over differs.
+fn fold_subquery(kind: SubqueryKind, result: &SelectResult) -> Result<FilterPlan, EngineError> {
+    match kind {
+        SubqueryKind::Scalar {
+            column,
+            op,
+            subquery_left,
+        } => scalar_subquery_plan(result, column, op, subquery_left),
+        SubqueryKind::In { column, negated } => in_subquery_plan(result, column, negated),
+        SubqueryKind::Exists { negated } => {
+            let exists = !result.rows.is_empty();
+            // EXISTS keeps every row when the inner has any; NOT EXISTS keeps them
+            // when it has none.
+            Ok(if exists ^ negated {
+                FilterPlan::KeepAll
+            } else {
+                FilterPlan::Empty
+            })
+        }
+    }
+}
+
+/// Whether a correlated subquery whose inner result is **empty** keeps the outer
+/// row ([STL-239]) — the answer when the outer correlation value is `NULL`, which
+/// makes `inner <op> NULL` unknown for every inner row (an empty result, decided
+/// without re-running the inner).
+///
+/// `EXISTS` over an empty inner is false (keep iff `NOT EXISTS`); `IN ()` is false
+/// (keep iff `NOT IN`, since `NOT IN ()` is true); a scalar from an empty inner is
+/// `NULL`, so the comparison is unknown and the row is dropped.
+const fn empty_inner_keeps(kind: SubqueryKind) -> bool {
+    match kind {
+        SubqueryKind::Exists { negated } | SubqueryKind::In { negated, .. } => negated,
+        SubqueryKind::Scalar { .. } => false,
+    }
+}
+
+/// Build the inner [`BoundSelect`] for one outer row of a correlated subquery
+/// ([STL-239]): the bound inner with its (empty) filter set to the correlation
+/// comparison resolved against that row — `inner_column <op> <value>`.
+///
+/// The inner carries no filter from bind time (the correlation was lifted off it),
+/// so this is the sole place the comparison is applied. Snapshot and valid pin are
+/// inherited unchanged, so each re-execution reads the outer statement's one
+/// consistent snapshot.
+fn correlated_inner(
+    inner: &BoundSelect,
+    correlation: Correlation,
+    value: ScalarValue,
+) -> BoundSelect {
+    let mut inner = inner.clone();
+    inner.filter = Some(BoundPredicate {
+        left: BoundScalar::Column(correlation.inner_column),
+        op: correlation.op,
+        right: BoundScalar::Literal(value),
+    });
+    inner
 }
 
 /// Decode an uncorrelated subquery's single output column into typed, nullable
@@ -16003,5 +16136,368 @@ mod tests {
                 "VALID AS OF {at}: integrated subquery vs composed"
             );
         }
+    }
+
+    // --- correlated subqueries ([STL-239]) -------------------------------------
+
+    /// Two tables keyed by a **non-unique** `k`, so a correlation on `k` makes the
+    /// inner return a set (more than one row per outer value) — the substrate for
+    /// the correlated `IN` / scalar-cardinality tests, which `subquery_session`
+    /// (unique `id`) cannot express.
+    fn keyed_session() -> SessionEngine<ZeroClock, MemDisk> {
+        let mut engine = session();
+        for ddl in [
+            "CREATE TABLE t (id INT PRIMARY KEY, k INT, a INT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE s (id INT PRIMARY KEY, k INT, a INT) WITH SYSTEM VERSIONING",
+        ] {
+            engine.execute(&parse_one(ddl)).expect("create");
+        }
+        engine
+    }
+
+    #[test]
+    fn correlated_exists_filters_per_outer_row() {
+        let mut engine = subquery_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 10)",
+            "INSERT INTO t VALUES (2, 20)",
+            "INSERT INTO t VALUES (3, 30)",
+            "INSERT INTO s VALUES (1, 99)",
+            "INSERT INTO s VALUES (3, 99)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // EXISTS keeps the outer rows whose id has a matching inner row (1, 3); the
+        // correlation `s.id = t.id` is re-checked per outer row, not folded once.
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.id = t.id)",
+        ));
+        assert_eq!(got, vec![1, 3]);
+        // NOT EXISTS is the exact complement.
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM s WHERE s.id = t.id)",
+        ));
+        assert_eq!(got, vec![2]);
+    }
+
+    #[test]
+    fn correlated_in_membership_is_per_row() {
+        let mut engine = keyed_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 100, 5)",
+            "INSERT INTO t VALUES (2, 100, 7)",
+            "INSERT INTO t VALUES (3, 200, 9)",
+            "INSERT INTO s VALUES (10, 100, 5)",
+            "INSERT INTO s VALUES (11, 100, 6)",
+            "INSERT INTO s VALUES (12, 200, 8)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // Per outer row, the inner set is the `s.a` for that row's `k`:
+        //   id 1 (k=100, a=5): {5, 6} ∋ 5  → keep
+        //   id 2 (k=100, a=7): {5, 6} ∌ 7  → drop
+        //   id 3 (k=200, a=9): {8}    ∌ 9  → drop
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a IN (SELECT a FROM s WHERE s.k = t.k)",
+        ));
+        assert_eq!(got, vec![1]);
+    }
+
+    #[test]
+    fn correlated_not_in_null_member_is_the_per_row_three_valued_trap() {
+        let mut engine = keyed_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 100, 5)",
+            "INSERT INTO t VALUES (2, 200, 9)",
+            "INSERT INTO s VALUES (10, 100, NULL)",
+            "INSERT INTO s VALUES (11, 200, 8)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // The classic trap, evaluated per outer row:
+        //   id 1 (k=100): inner {NULL} → `5 NOT IN (NULL)` is unknown → drop
+        //   id 2 (k=200): inner {8}    → `9 NOT IN (8)` is true       → keep
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s WHERE s.k = t.k)",
+        ));
+        assert_eq!(got, vec![2]);
+        // Plain `IN` ignores the NULL member: id 1's `5 IN (NULL)` is also not TRUE,
+        // so it too is dropped, and id 2's `9 IN (8)` is false — neither matches.
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a IN (SELECT a FROM s WHERE s.k = t.k)",
+        ));
+        assert!(got.is_empty(), "got {got:?}");
+    }
+
+    #[test]
+    fn correlated_scalar_lookup_per_row() {
+        let mut engine = subquery_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 10)",
+            "INSERT INTO t VALUES (2, 20)",
+            "INSERT INTO t VALUES (3, 30)",
+            "INSERT INTO s VALUES (1, 10)",
+            "INSERT INTO s VALUES (2, 99)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // `a = (SELECT a FROM s WHERE s.id = t.id)`, one inner row per outer key:
+        //   id 1: inner 10 = 10 → keep
+        //   id 2: inner 99 ≠ 20 → drop
+        //   id 3: inner empty → NULL → unknown → drop
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a = (SELECT a FROM s WHERE s.id = t.id)",
+        ));
+        assert_eq!(got, vec![1]);
+    }
+
+    #[test]
+    fn correlated_scalar_more_than_one_row_is_cardinality_violation() {
+        let mut engine = keyed_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 100, 5)",
+            "INSERT INTO s VALUES (10, 100, 5)",
+            "INSERT INTO s VALUES (11, 100, 6)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // The inner for k=100 yields two rows used as a scalar → SQLSTATE 21000,
+        // raised per outer row exactly as the uncorrelated cardinality check does.
+        let err = engine
+            .execute(&parse_one(
+                "SELECT id FROM t WHERE a = (SELECT a FROM s WHERE s.k = t.k)",
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::ScalarSubqueryCardinality),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn correlated_null_outer_key_yields_an_empty_inner() {
+        let mut engine = keyed_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, NULL, 5)",
+            "INSERT INTO t VALUES (2, 100, 5)",
+            "INSERT INTO s VALUES (10, 100, 1)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // A NULL correlation value makes `s.k = NULL` unknown for every inner row →
+        // the inner is empty without a re-run: EXISTS drops id 1, keeps id 2.
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.k = t.k)",
+        ));
+        assert_eq!(got, vec![2]);
+        // NOT EXISTS over the same empty inner keeps the NULL-key row (id 1).
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM s WHERE s.k = t.k)",
+        ));
+        assert_eq!(got, vec![1]);
+    }
+
+    #[test]
+    fn self_correlated_subquery_resolves_through_the_alias() {
+        let mut engine = subquery_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 10)",
+            "INSERT INTO t VALUES (2, 20)",
+            "INSERT INTO t VALUES (3, 30)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // The same table on both sides: the inner alias `t2` and the (aliased) outer
+        // `t1` disambiguate the two scopes (an alias hides the table name). Keeps the
+        // rows that are not the maximum `a` — each has some larger peer.
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t t1 WHERE EXISTS (SELECT 1 FROM t t2 WHERE t2.a > t1.a)",
+        ));
+        assert_eq!(got, vec![1, 2]);
+    }
+
+    #[test]
+    fn correlated_subquery_rejects_an_unsupported_correlation_shape() {
+        let mut engine = subquery_session();
+        // The outer reference is paired with an inner *arithmetic*, not a bare inner
+        // column — recognized as correlated but not a shape the per-row fallback
+        // lowers, so it is rejected rather than mis-bound.
+        let err = engine
+            .execute(&parse_one(
+                "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.a + 1 = t.a)",
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::Select(SelectError::Subquery(_))),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn correlated_subquery_inherits_the_outer_statement_snapshot() {
+        // STL-239 DoD oracle (the temporal heart, docs/16 §6): a correlated subquery
+        // is re-run at the *outer statement's* snapshot, so reading the integrated
+        // `WHERE EXISTS (… s.id = t.id)` at an `AS OF` instant equals composing two
+        // independent `AS OF` reads of `t` and `s` at that same instant — the inner
+        // can never leak the present into a time-travel read.
+        let clock = SteppedClock::new(1_000);
+        let mut engine = SessionEngine::open(MemDisk::new(), clock.clone());
+        for ddl in [
+            "CREATE TABLE t (id INT PRIMARY KEY, a INT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE s (id INT PRIMARY KEY, a INT) WITH SYSTEM VERSIONING",
+        ] {
+            engine.execute(&parse_one(ddl)).expect("create");
+        }
+
+        // Era 1 @ 2_000: t = {1, 2, 3}; s carries ids {1, 3}.
+        clock.set(2_000);
+        for sql in [
+            "INSERT INTO t VALUES (1, 10)",
+            "INSERT INTO t VALUES (2, 20)",
+            "INSERT INTO t VALUES (3, 30)",
+            "INSERT INTO s VALUES (1, 0)",
+            "INSERT INTO s VALUES (3, 0)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert era1");
+        }
+
+        // Era 2 @ 5_000: s now carries ids {2, 3} — the EXISTS answer must shift.
+        clock.set(5_000);
+        for sql in ["DELETE FROM s WHERE id = 1", "INSERT INTO s VALUES (2, 0)"] {
+            engine.execute(&parse_one(sql)).expect("update era2");
+        }
+        clock.set(9_000);
+
+        let run = |engine: &mut SessionEngine<SteppedClock, MemDisk>, sql: &str| -> SelectResult {
+            let StatementOutcome::Rows(r) = engine.execute(&parse_one(sql)).expect("select") else {
+                panic!("SELECT must return rows");
+            };
+            r
+        };
+        let ids = |result: &SelectResult| -> Vec<i32> {
+            let mut out: Vec<i32> = result
+                .rows
+                .iter()
+                .map(|row| {
+                    let bytes = row[0].as_ref().expect("id");
+                    match ScalarValue::decode(LogicalType::Int4, bytes).expect("decode") {
+                        ScalarValue::Int4(v) => v,
+                        _ => panic!("INT"),
+                    }
+                })
+                .collect();
+            out.sort_unstable();
+            out
+        };
+
+        for at in [4_000_i64, 9_000] {
+            // Compose the reference: the inner's id set, then the outer ids in it.
+            let s_ids = ids(&run(
+                &mut engine,
+                &format!("SELECT id FROM s FOR SYSTEM_TIME AS OF {at}"),
+            ));
+            let mut want: Vec<i32> = ids(&run(
+                &mut engine,
+                &format!("SELECT id FROM t FOR SYSTEM_TIME AS OF {at}"),
+            ))
+            .into_iter()
+            .filter(|id| s_ids.contains(id))
+            .collect();
+            want.sort_unstable();
+            let got = subquery_ids(&run(
+                &mut engine,
+                &format!(
+                    "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.id = t.id) \
+                     FOR SYSTEM_TIME AS OF {at}"
+                ),
+            ));
+            assert_eq!(
+                got, want,
+                "AS OF {at}: correlated EXISTS vs composed reference"
+            );
+        }
+
+        // And the two eras genuinely differ, so the test cannot pass by reading the
+        // present at both: era 1 → {1, 3}, present → {2, 3}.
+        assert_eq!(
+            subquery_ids(&run(
+                &mut engine,
+                "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.id = t.id) \
+                 FOR SYSTEM_TIME AS OF 4000",
+            )),
+            vec![1, 3]
+        );
+        assert_eq!(
+            subquery_ids(&run(
+                &mut engine,
+                "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.id = t.id) \
+                 FOR SYSTEM_TIME AS OF 9000",
+            )),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn correlated_subquery_filters_before_an_outer_aggregate() {
+        // The per-row correlated filter runs *before* grouping, so an aggregate over
+        // a correlated `WHERE` counts only the rows the subquery kept ([STL-171]).
+        let mut engine = subquery_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 10)",
+            "INSERT INTO t VALUES (2, 20)",
+            "INSERT INTO t VALUES (3, 30)",
+            "INSERT INTO s VALUES (1, 0)",
+            "INSERT INTO s VALUES (3, 0)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // Only ids 1 and 3 have a matching `s` row → COUNT(*) = 2.
+        let result = select(
+            &mut engine,
+            "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.id = t.id)",
+        );
+        let ScalarValue::Int8(count) = ScalarValue::decode(
+            LogicalType::Int8,
+            result.rows[0][0].as_ref().expect("count"),
+        )
+        .expect("decode count") else {
+            panic!("COUNT is INT8");
+        };
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn correlated_subquery_reads_its_own_uncommitted_writes() {
+        // Read-your-own-writes ([STL-203]): a correlated inner re-run inside a
+        // transaction sees that transaction's buffered writes, just like the outer.
+        let mut engine = subquery_session();
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (1, 10)"))
+            .expect("insert t");
+
+        let mut txn = engine.begin();
+        engine
+            .execute_in_txn(&parse_one("INSERT INTO s VALUES (1, 99)"), &mut txn)
+            .expect("stage insert into s");
+        let StatementOutcome::Rows(result) = engine
+            .execute_in_txn(
+                &parse_one("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.id = t.id)"),
+                &mut txn,
+            )
+            .expect("select in txn")
+        else {
+            panic!("rows");
+        };
+        assert_eq!(subquery_ids(&result), vec![1]);
+        engine.commit(txn).expect("commit");
     }
 }
