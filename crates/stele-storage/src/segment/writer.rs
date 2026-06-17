@@ -19,13 +19,16 @@ use crate::bloom::{DEFAULT_BITS_PER_KEY, KeyBloom};
 use crate::checksum::crc32c;
 use crate::delta::Version;
 use crate::validity::Close;
-use crate::validtime::{VALID_TIME_PREFIX_LEN, unframe_payload};
+use crate::validtime::{
+    DEFAULT_VALID_INTERVAL_CAP, VALID_TIME_PREFIX_LEN, ValidIntervalSummary, unframe_payload,
+};
 
 use super::SegmentError;
 use super::format::{
     BYTES_NULL_SENTINEL, CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FOOTER_FLAG_BLOOM,
-    FORMAT_VERSION, HEADER_LEN, HEADER_MAGIC, MAX_BYTES_STAT_PREFIX_LEN,
-    SCHEMA_ID_IMPLICIT_VERSION, STAT_MAX_UNBOUNDED, STAT_MIN_UNBOUNDED, TRAILER_LEN, TRAILER_MAGIC,
+    FOOTER_FLAG_VALID_INTERVALS, FORMAT_VERSION, HEADER_LEN, HEADER_MAGIC,
+    MAX_BYTES_STAT_PREFIX_LEN, SCHEMA_ID_IMPLICIT_VERSION, STAT_MAX_UNBOUNDED, STAT_MIN_UNBOUNDED,
+    TRAILER_LEN, TRAILER_MAGIC,
 };
 
 /// Streaming writer over a single sealed-segment file.
@@ -62,6 +65,12 @@ pub struct SegmentWriter<F: DiskFile> {
     /// footer bytes for a lower false-positive rate — the configurable bound the
     /// hash/bloom index family exposes.
     bloom_bits_per_key: usize,
+    /// Cap on the per-segment valid-time interval summary ([STL-241], format
+    /// v12). Defaults to [`DEFAULT_VALID_INTERVAL_CAP`]; `0` disables the summary
+    /// (the footer's [`FOOTER_FLAG_VALID_INTERVALS`] stays clear). Only ever
+    /// written for a valid-time segment — a system-only table has no valid
+    /// windows to summarize.
+    valid_interval_cap: usize,
 }
 
 impl<F: DiskFile> SegmentWriter<F> {
@@ -111,6 +120,7 @@ impl<F: DiskFile> SegmentWriter<F> {
             valid_time,
             max_row_group_rows: None,
             bloom_bits_per_key: DEFAULT_BITS_PER_KEY,
+            valid_interval_cap: DEFAULT_VALID_INTERVAL_CAP,
         })
     }
 
@@ -123,6 +133,21 @@ impl<F: DiskFile> SegmentWriter<F> {
     #[must_use]
     pub const fn with_bloom_bits_per_key(mut self, bits: usize) -> Self {
         self.bloom_bits_per_key = bits;
+        self
+    }
+
+    /// Cap (or disable) the per-segment valid-time interval summary ([STL-241],
+    /// format v12). The summary coalesces the segment's `[valid_from, valid_to)`
+    /// windows into at most `cap` disjoint intervals (merging the smallest gaps
+    /// when there are more — a sound widening); `0` disables it, leaving the
+    /// footer's `FOOTER_FLAG_VALID_INTERVALS` clear so a valid-pinned read
+    /// full-scans the segment on the valid axis. Only ever written for a
+    /// valid-time segment. Purely a writer-side choice — a reader admits any
+    /// segment whether or not it carries a summary, so toggling it changes scan
+    /// *speed*, never results (the STL-241 equivalence the oracle pins).
+    #[must_use]
+    pub const fn with_valid_interval_cap(mut self, cap: usize) -> Self {
+        self.valid_interval_cap = cap;
         self
     }
 
@@ -200,6 +225,33 @@ impl<F: DiskFile> SegmentWriter<F> {
         })
     }
 
+    /// The per-segment valid-time interval summary ([STL-241], format v12): the
+    /// coalesced union of every row's `[valid_from, valid_to)` window (already
+    /// decoded once into `valid_pairs`), so a `FOR VALID_TIME AS OF v` read can
+    /// skip this whole segment when `v` falls in a coverage gap — the backdated
+    /// scatter case zone maps cannot prune. `None` when the summary is disabled
+    /// (`valid_interval_cap == 0`), the table is system-only (`valid_pairs` is
+    /// `None`), or the segment holds no row. Also `None` in the (unreachable from
+    /// well-formed valid-time DML, where every window is `from < to`) case that
+    /// every window is degenerate: an empty summary covers nothing and would
+    /// wrongly prune the segment, so the section is omitted and the valid axis
+    /// full-scans rather than dropping rows.
+    fn valid_interval_summary(
+        &self,
+        valid_pairs: Option<&[(i64, i64)]>,
+    ) -> Option<ValidIntervalSummary> {
+        if self.valid_interval_cap == 0 {
+            return None;
+        }
+        let pairs = valid_pairs?;
+        if pairs.is_empty() {
+            return None;
+        }
+        let summary = ValidIntervalSummary::build(pairs.iter().copied(), self.valid_interval_cap);
+        (!summary.is_empty()).then_some(summary)
+    }
+
+    #[allow(clippy::too_many_lines)] // one sequential seal: encode columns → write chunks → footer → trailer → sync
     pub fn finish(mut self) -> Result<(), SegmentError> {
         // Per-column buffers. Row order is preserved: column i's k-th value
         // came from `self.rows[k]`. A valid-time table's schema carries the
@@ -319,7 +371,13 @@ impl<F: DiskFile> SegmentWriter<F> {
         }
 
         let bloom = self.business_key_bloom();
-        let footer = encode_footer(&row_groups, &retraction_chunks, bloom.as_ref())?;
+        let valid_summary = self.valid_interval_summary(valid_pairs.as_deref());
+        let footer = encode_footer(
+            &row_groups,
+            &retraction_chunks,
+            bloom.as_ref(),
+            valid_summary.as_ref(),
+        )?;
         let footer_crc = crc32c(&footer);
         let footer_len = u32::try_from(footer.len())
             .map_err(|_| SegmentError::TooLarge("footer exceeds u32::MAX bytes"))?;
@@ -740,18 +798,22 @@ fn encode_footer(
     row_groups: &[RowGroupChunks],
     retraction_chunks: &[EncodedChunk],
     bloom: Option<&KeyBloom>,
+    valid_summary: Option<&ValidIntervalSummary>,
 ) -> Result<Vec<u8>, SegmentError> {
     let row_group_count = u32::try_from(row_groups.len())
         .map_err(|_| SegmentError::TooLarge("row-group count exceeds u32::MAX"))?;
     let mut out = Vec::new();
     out.extend_from_slice(&SCHEMA_ID_IMPLICIT_VERSION.to_le_bytes());
-    // The flags word signals the optional trailing bloom section ([STL-238]); a
-    // bloom-less footer writes `0` here and is byte-identical to a v10 footer.
-    let flags = if bloom.is_some() {
-        FOOTER_FLAG_BLOOM
-    } else {
-        0
-    };
+    // The flags word signals the optional trailing sections — the bloom
+    // ([STL-238]) and the valid-time interval summary ([STL-241]). A footer with
+    // neither writes `0` here and is byte-identical to a v10 footer.
+    let mut flags = 0u32;
+    if bloom.is_some() {
+        flags |= FOOTER_FLAG_BLOOM;
+    }
+    if valid_summary.is_some() {
+        flags |= FOOTER_FLAG_VALID_INTERVALS;
+    }
     out.extend_from_slice(&flags.to_le_bytes());
     // One by default; several when the writer was bounded ([STL-155]). The
     // footer has carried this count since v1, so a multi-row-group segment is
@@ -784,6 +846,13 @@ fn encode_footer(
     // and the reader only reaches this section when the flag tells it to.
     if let Some(bloom) = bloom {
         bloom.encode(&mut out);
+    }
+    // Per-segment valid-time interval summary ([STL-241], v12) — present iff
+    // `FOOTER_FLAG_VALID_INTERVALS` was set above, written *after* the bloom so a
+    // reader decodes the two trailing sections in a fixed order. A footer with no
+    // summary is byte-identical to v11.
+    if let Some(summary) = valid_summary {
+        summary.encode(&mut out);
     }
     Ok(out)
 }

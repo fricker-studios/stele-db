@@ -255,6 +255,205 @@ pub fn reframe_payload(valid_from: i64, valid_to: i64, user: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Default cap on the number of intervals a [`ValidIntervalSummary`] retains
+/// ([STL-241]). Each interval costs 16 footer bytes (two `i64` boundaries), so
+/// 256 bounds a segment's summary at ~4 KiB regardless of how many distinct
+/// valid windows its rows carry; a segment with more coalesced intervals than
+/// this has the closest-adjacent ones merged (a sound widening — see
+/// [`ValidIntervalSummary::build`]). Purely a writer-side choice: the on-disk
+/// section is length-prefixed, so changing it needs no format bump.
+///
+/// [STL-241]: https://allegromusic.atlassian.net/browse/STL-241
+pub(crate) const DEFAULT_VALID_INTERVAL_CAP: usize = 256;
+
+/// A bounded, coalesced summary of the `[valid_from, valid_to)` intervals a
+/// sealed segment's rows carry — the per-segment valid-time interval index
+/// ([ADR-0025], [STL-241]).
+///
+/// ## The scatter problem it solves
+///
+/// System-time prunes well via zone maps because it is monotonic: a segment's
+/// `sys_from` min/max is tight. **Valid-time is not** — Stele's signature
+/// workload is backdated corrections, which land in *today's* segment carrying
+/// *old* valid-times, so the segment's `valid_from` / `valid_to` min/max spans
+/// almost the whole timeline and the zone-map valid-axis skips ([STL-173])
+/// prune nothing. But the spanned envelope is mostly *gaps*: the actual covered
+/// windows are sparse. This summary records the **union** of the covered
+/// windows, so a `FOR VALID_TIME AS OF v` read whose `v` falls in a gap skips
+/// the whole segment even though its min/max envelope contains `v`.
+///
+/// ## The superset contract
+///
+/// Like the segment bloom ([`crate::bloom::KeyBloom`], [STL-238]) the summary is
+/// **advisory and read-gating only**: [`covers`](Self::covers) may answer `true`
+/// for a `v` no row actually holds (a false positive — the row-level valid
+/// filter then drops nothing extra), but it must **never** answer `false` for a
+/// `v` some row holds. [`build`](Self::build) upholds this by storing a *superset*
+/// of the rows' intervals: coalescing tiles them exactly, and the gap-merge that
+/// bounds the count only ever *widens* coverage. So a segment is pruned only when
+/// the summary proves no row is valid at `v` — never a false negative, exactly
+/// the soundness obligation the executor's correctness oracles pin.
+///
+/// ## Derived, never durable
+///
+/// The summary rides the immutable segment it summarizes — written into the
+/// footer at flush, recomputed verbatim on compaction, reloaded on cold boot —
+/// so it survives flush / compaction / recovery with **no separate derived
+/// structure to rebuild**, the same posture the validity index ([ADR-0023]) and
+/// the segment bloom take.
+///
+/// [ADR-0025]: ../../../docs/adr/0025-valid-time-indexing.md
+/// [ADR-0023]: ../../../docs/adr/0023-append-only-record-model-validity-index.md
+/// [STL-241]: https://allegromusic.atlassian.net/browse/STL-241
+/// [STL-238]: https://allegromusic.atlassian.net/browse/STL-238
+/// [STL-173]: https://allegromusic.atlassian.net/browse/STL-173
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValidIntervalSummary {
+    /// Disjoint, non-touching half-open `[from, to)` intervals, sorted ascending
+    /// by `from` — the coalesced (and, if over the cap, gap-merged) union of the
+    /// segment's row intervals. Never empty for a present summary (the writer
+    /// omits the section for a segment with no rows).
+    intervals: Vec<(i64, i64)>,
+}
+
+impl ValidIntervalSummary {
+    /// Build a summary over the segment's `(valid_from, valid_to)` pairs, capped
+    /// at `cap` intervals (clamped to at least 1).
+    ///
+    /// Empty or inverted pairs (`from >= to`) are dropped — they cover no point,
+    /// so omitting them keeps the union exact. The kept intervals are sorted and
+    /// **coalesced** (overlapping or touching windows merge into one, which tiles
+    /// them exactly), then, if more than `cap` disjoint intervals remain, the two
+    /// adjacent intervals separated by the **smallest gap** are merged repeatedly
+    /// until the count fits. Merging across a gap only *adds* coverage, so the
+    /// result stays a superset of the rows' intervals — sound for pruning, just
+    /// less selective.
+    pub(crate) fn build(pairs: impl IntoIterator<Item = (i64, i64)>, cap: usize) -> Self {
+        let mut ivs: Vec<(i64, i64)> = pairs.into_iter().filter(|&(f, t)| f < t).collect();
+        ivs.sort_unstable();
+        // Coalesce overlapping / touching intervals. `[a, b)` and `[c, d)` with
+        // `c <= b` union to `[a, max(b, d))` — half-open, so a touch (`c == b`)
+        // tiles seamlessly and merges too.
+        let mut merged: Vec<(i64, i64)> = Vec::with_capacity(ivs.len());
+        for (f, t) in ivs {
+            match merged.last_mut() {
+                Some(last) if f <= last.1 => last.1 = last.1.max(t),
+                _ => merged.push((f, t)),
+            }
+        }
+        // Bound the count by merging the smallest gaps first — the widening that
+        // adds the least phantom coverage. Each pass rescans all adjacent gaps and
+        // removes one interval, so reducing `m` coalesced intervals to `cap` is
+        // O(m·(m − cap)) (≈ O(m²) worst case). It runs only at flush time and only
+        // when a segment has more than `cap` (default 256) disjoint windows, so the
+        // simple rescan is preferred over a gap heap.
+        let cap = cap.max(1);
+        while merged.len() > cap {
+            let mut best = 0usize;
+            let mut best_gap = i128::MAX;
+            for i in 0..merged.len() - 1 {
+                // i128 so an `i64::MAX − i64::MIN` gap cannot overflow.
+                let gap = i128::from(merged[i + 1].0) - i128::from(merged[i].1);
+                if gap < best_gap {
+                    best_gap = gap;
+                    best = i;
+                }
+            }
+            merged[best].1 = merged[best].1.max(merged[best + 1].1);
+            merged.remove(best + 1);
+        }
+        Self { intervals: merged }
+    }
+
+    /// Whether some retained interval contains `point` — the `valid at V` stab.
+    /// A `false` **proves** no row in the segment is valid at `point` (the
+    /// superset contract), so the scan may skip the whole segment.
+    pub(crate) fn covers(&self, point: i64) -> bool {
+        // The intervals are disjoint and sorted by `from`, so the only candidate
+        // is the last one whose `from <= point`; check `point < to` on it.
+        let idx = self.intervals.partition_point(|&(from, _)| from <= point);
+        idx > 0 && point < self.intervals[idx - 1].1
+    }
+
+    /// Whether the summary is empty — no covered point. A built summary is empty
+    /// only when every pair was empty/inverted; the writer never persists one.
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.intervals.is_empty()
+    }
+
+    /// Append the summary to `out` for footer persistence: interval count (`u32`
+    /// LE) then that many `(valid_from: i64 LE, valid_to: i64 LE)` pairs.
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(
+            &u32::try_from(self.intervals.len())
+                .expect("interval count is capped well below u32::MAX")
+                .to_le_bytes(),
+        );
+        for (from, to) in &self.intervals {
+            out.extend_from_slice(&from.to_le_bytes());
+            out.extend_from_slice(&to.to_le_bytes());
+        }
+    }
+
+    /// The encoded length in bytes — `4 + 16 * interval_count`. Lets the footer
+    /// writer size its buffer without a trial encode.
+    pub(crate) const fn encoded_len(&self) -> usize {
+        4 + self.intervals.len() * 16
+    }
+
+    /// Decode a summary written by [`Self::encode`], returning it and the number
+    /// of bytes consumed.
+    ///
+    /// # Errors
+    ///
+    /// A static reason if the buffer is short, the count is zero (a present
+    /// section always summarizes at least one interval — the writer omits the
+    /// section otherwise), any interval is empty/inverted (`from >= to`), or the
+    /// intervals are not **strictly ascending and disjoint** (each `from` must
+    /// exceed the previous `to`). [`covers`](Self::covers) binary-searches on the
+    /// disjoint-ascending invariant [`build`](Self::build) establishes, so a
+    /// malformed footer that broke it — e.g. `[0, 100)` then `[50, 60)` — could
+    /// make `covers` miss a covered point and wrongly prune a whole segment.
+    /// The footer CRC already guards integrity, so this is a fail-closed
+    /// cross-check on a successfully-checksummed footer (mirroring the segment
+    /// bloom's decode validation) that keeps the prune sound rather than trusting
+    /// the bytes.
+    pub(crate) fn decode(bytes: &[u8]) -> Result<(Self, usize), &'static str> {
+        let count = bytes
+            .get(0..4)
+            .ok_or("missing valid-interval count")?
+            .try_into()
+            .expect("4-byte slice");
+        let count = u32::from_le_bytes(count) as usize;
+        if count == 0 {
+            return Err("zero valid-interval count");
+        }
+        let end = 4 + count * 16;
+        let body = bytes
+            .get(4..end)
+            .ok_or("truncated valid-interval section")?;
+        let mut intervals: Vec<(i64, i64)> = Vec::with_capacity(count);
+        for pair in body.chunks_exact(16) {
+            let from = i64::from_le_bytes(pair[0..8].try_into().expect("8-byte slice"));
+            let to = i64::from_le_bytes(pair[8..16].try_into().expect("8-byte slice"));
+            if from >= to {
+                return Err("empty or inverted valid interval in footer");
+            }
+            // Reject overlapping, touching, or out-of-order intervals: `build`
+            // coalesces those away, so a retained interval always starts strictly
+            // after the previous one ends. Enforcing it here keeps `covers`'s
+            // binary search sound on a corrupt footer.
+            if let Some(&(_, prev_to)) = intervals.last()
+                && from <= prev_to
+            {
+                return Err("valid intervals are not strictly ascending and disjoint");
+            }
+            intervals.push((from, to));
+        }
+        Ok((Self { intervals }, end))
+    }
+}
+
 /// Stamps both temporal axes as writes flow into the delta tier: system-time
 /// via an inner [`SysTimeWriter`], valid-time via the per-table policy enforced
 /// here.
@@ -594,5 +793,132 @@ mod tests {
         let (interval, user) = unframe_payload(true, &framed).unwrap();
         assert_eq!(interval, Some(iv(1, 2)));
         assert!(user.is_empty());
+    }
+
+    // --- ValidIntervalSummary (STL-241) ------------------------------------
+
+    fn summary(pairs: &[(i64, i64)], cap: usize) -> ValidIntervalSummary {
+        ValidIntervalSummary::build(pairs.iter().copied(), cap)
+    }
+
+    #[test]
+    fn summary_coalesces_overlapping_and_touching_windows() {
+        // [0,10) and [10,20) touch; [5,15) overlaps both. The union is one
+        // window [0,20). [100,110) is disjoint and stays separate.
+        let s = summary(&[(0, 10), (10, 20), (5, 15), (100, 110)], 256);
+        // Every original point is still covered; the gap between is not.
+        for p in [0, 9, 10, 19, 100, 109] {
+            assert!(s.covers(p), "point {p} must stay covered after coalescing");
+        }
+        assert!(!s.covers(20), "exclusive end of the merged window");
+        assert!(!s.covers(50), "the gap between disjoint windows prunes");
+        assert!(!s.covers(110), "exclusive end of the second window");
+    }
+
+    #[test]
+    fn summary_covers_is_half_open_and_empty_outside() {
+        let s = summary(&[(10, 20)], 256);
+        assert!(!s.covers(9));
+        assert!(s.covers(10)); // inclusive start
+        assert!(s.covers(19));
+        assert!(!s.covers(20)); // exclusive end
+    }
+
+    #[test]
+    fn summary_drops_empty_pairs_and_an_all_empty_input_covers_nothing() {
+        // `from >= to` pairs cover no point, so they never widen the union.
+        let s = summary(&[(5, 5), (9, 3)], 256);
+        assert!(s.is_empty());
+        assert!(!s.covers(4));
+        assert!(!s.covers(5));
+    }
+
+    #[test]
+    fn the_scatter_case_a_gap_inside_the_minmax_envelope_prunes() {
+        // The load-bearing STL-241 case the zone-map min/max cannot prune: a
+        // backdated window [0,10) and a current open window [100, +∞) share a
+        // segment, so the envelope is [0, +∞) and spans every probe — yet the
+        // summary proves the gap at 50 holds no row.
+        let s = summary(&[(0, 10), (100, i64::MAX)], 256);
+        assert!(s.covers(5));
+        assert!(
+            !s.covers(50),
+            "a point in the coverage gap is provably empty"
+        );
+        assert!(s.covers(100));
+        assert!(s.covers(i64::MAX - 1), "open-ended window covers up to +∞");
+    }
+
+    #[test]
+    fn capping_merges_the_smallest_gaps_and_never_drops_a_covered_point() {
+        // Five disjoint windows, each a single point wide, with a small gap
+        // before the last pair. Capping to 2 must keep covering every original
+        // point (the superset contract) while collapsing to 2 intervals.
+        let windows = [(0, 1), (10, 11), (20, 21), (30, 31), (31, 32)];
+        let capped = summary(&windows, 2);
+        let full = summary(&windows, 256);
+        assert!(
+            capped.encoded_len() <= full.encoded_len(),
+            "capping must not grow the summary"
+        );
+        // Soundness: every point the full (exact) summary covers, the capped one
+        // still covers — capping only ever *adds* phantom coverage.
+        for p in -5..=40 {
+            if full.covers(p) {
+                assert!(capped.covers(p), "capping dropped covered point {p}");
+            }
+        }
+    }
+
+    #[test]
+    fn summary_encode_decode_round_trips_and_reports_consumed_len() {
+        let s = summary(&[(0, 10), (100, i64::MAX)], 256);
+        let mut buf = Vec::new();
+        s.encode(&mut buf);
+        assert_eq!(buf.len(), s.encoded_len());
+        // A trailing byte proves `decode` reports the exact consumed length.
+        buf.push(0xAB);
+        let (decoded, consumed) = ValidIntervalSummary::decode(&buf).expect("round-trips");
+        assert_eq!(consumed, s.encoded_len());
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn summary_decode_rejects_malformed() {
+        assert!(ValidIntervalSummary::decode(&[]).is_err(), "empty buffer");
+        // Zero count — the writer never persists an empty summary.
+        assert!(ValidIntervalSummary::decode(&[0, 0, 0, 0]).is_err());
+        // Count claims one interval the buffer does not hold.
+        assert!(ValidIntervalSummary::decode(&[1, 0, 0, 0]).is_err());
+        // A well-formed length carrying an inverted interval (to <= from).
+        let mut bad = 1u32.to_le_bytes().to_vec();
+        bad.extend_from_slice(&20i64.to_le_bytes());
+        bad.extend_from_slice(&10i64.to_le_bytes());
+        assert!(ValidIntervalSummary::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn summary_decode_rejects_overlapping_or_unsorted_intervals() {
+        // `covers` relies on the disjoint-ascending invariant `build` guarantees:
+        // an overlapping (or out-of-order) footer like `[0,100)` then `[50,60)`
+        // would let `covers` miss a covered point and wrongly prune a segment.
+        // `decode` must fail closed rather than trust the (CRC-valid) bytes.
+        let encode = |pairs: &[(i64, i64)]| {
+            let mut buf = u32::try_from(pairs.len()).unwrap().to_le_bytes().to_vec();
+            for (from, to) in pairs {
+                buf.extend_from_slice(&from.to_le_bytes());
+                buf.extend_from_slice(&to.to_le_bytes());
+            }
+            buf
+        };
+        // Overlapping (the reviewer's example).
+        assert!(ValidIntervalSummary::decode(&encode(&[(0, 100), (50, 60)])).is_err());
+        // Out of order.
+        assert!(ValidIntervalSummary::decode(&encode(&[(100, 200), (0, 10)])).is_err());
+        // Touching — `build` coalesces these, so a retained pair never touches.
+        assert!(ValidIntervalSummary::decode(&encode(&[(0, 10), (10, 20)])).is_err());
+        // A genuinely disjoint, ascending pair still decodes.
+        let (ok, _) = ValidIntervalSummary::decode(&encode(&[(0, 10), (20, 30)])).expect("valid");
+        assert!(ok.covers(5) && !ok.covers(15) && ok.covers(25));
     }
 }

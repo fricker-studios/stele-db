@@ -285,6 +285,10 @@ pub struct Metrics {
     /// Sealed segments skipped because every version in them is superseded at
     /// the read snapshot (validity-index prune).
     pub scan_segments_pruned_superseded: Counter,
+    /// Sealed segments skipped by the per-segment valid-time interval summary —
+    /// a `FOR VALID_TIME AS OF v` read whose `v` falls in the segment's coverage
+    /// gap, the backdated scatter case zone maps cannot prune (STL-241).
+    pub scan_segments_pruned_valid: Counter,
     /// Row groups scanned within non-pruned segments.
     pub scan_row_groups_scanned: Counter,
     /// Row groups skipped by per-row-group zone-map pruning.
@@ -478,6 +482,12 @@ impl Metrics {
             "stele_scan_segments_pruned_superseded_total",
             "Sealed segments skipped as fully superseded at the read snapshot.",
             self.scan_segments_pruned_superseded.get(),
+        );
+        counter(
+            &mut out,
+            "stele_scan_segments_pruned_valid_total",
+            "Sealed segments skipped by the per-segment valid-time interval summary (STL-241).",
+            self.scan_segments_pruned_valid.get(),
         );
         counter(
             &mut out,

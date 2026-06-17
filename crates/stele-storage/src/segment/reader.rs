@@ -33,13 +33,13 @@ use crate::bloom::KeyBloom;
 use crate::checksum::crc32c;
 use crate::delta::{BusinessKey, Version};
 use crate::validity::Close;
-use crate::validtime::reframe_payload;
+use crate::validtime::{ValidIntervalSummary, reframe_payload};
 
 use super::SegmentError;
 use super::format::{
     BYTES_NULL_SENTINEL, CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FOOTER_FLAG_BLOOM,
-    FORMAT_VERSION, HEADER_LEN, HEADER_MAGIC, STAT_MAX_UNBOUNDED, STAT_MIN_UNBOUNDED, TRAILER_LEN,
-    TRAILER_MAGIC,
+    FOOTER_FLAG_VALID_INTERVALS, FORMAT_VERSION, HEADER_LEN, HEADER_MAGIC, STAT_MAX_UNBOUNDED,
+    STAT_MIN_UNBOUNDED, TRAILER_LEN, TRAILER_MAGIC,
 };
 use super::zone_map::{Predicate, ZoneBound, ZoneEnd, ZoneMap};
 
@@ -87,6 +87,13 @@ struct Footer {
     /// segment carries no bloom and admits every key (an older or bloom-disabled
     /// segment).
     bloom: Option<KeyBloom>,
+    /// Per-segment valid-time interval summary (format v12, [STL-241]) — `Some`
+    /// iff the footer's [`FOOTER_FLAG_VALID_INTERVALS`] bit is set. A
+    /// `FOR VALID_TIME AS OF v` read consults it via
+    /// [`SegmentReader::might_contain_valid`]; `None` means the segment carries no
+    /// summary (a system-only, older, or summary-disabled segment) and admits
+    /// every valid point.
+    valid_intervals: Option<ValidIntervalSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -235,6 +242,28 @@ impl<F: DiskFile> SegmentReader<F> {
             .bloom
             .as_ref()
             .is_none_or(|bloom| bloom.maybe_contains(business_key))
+    }
+
+    /// Whether this segment *might* hold a row valid at `point` — the
+    /// per-segment valid-time interval skip test ([STL-241], [ADR-0025]).
+    ///
+    /// Consults the footer-resident `ValidIntervalSummary` (format v12) and
+    /// touches **no** column chunk. A `false` result *proves* no row in this
+    /// segment is valid at `point`, so a `FOR VALID_TIME AS OF point` read can
+    /// prune the whole segment — the backdated-write scatter case
+    /// [`Self::might_contain`]'s `valid_from` / `valid_to` zone-map min/max
+    /// cannot, because a correction lands in today's segment carrying an old
+    /// valid-time and widens the envelope to span the timeline even when the
+    /// actual coverage has gaps. A segment with no summary (system-only, format
+    /// ≤ v11, or a summary-disabled writer) admits every point, so this never
+    /// prunes a real match. Snapshot-free by design: a sealed segment's valid
+    /// windows are fixed, so a coverage gap holds at every system snapshot.
+    #[must_use]
+    pub fn might_contain_valid(&self, point: i64) -> bool {
+        self.footer
+            .valid_intervals
+            .as_ref()
+            .is_none_or(|summary| summary.covers(point))
     }
 
     /// Read one column end-to-end across every row-group, in row order. The
@@ -743,13 +772,14 @@ fn parse_footer(bytes: &[u8]) -> Result<Footer, SegmentError> {
     if schema_id != 0 {
         return Err(SegmentError::Corrupt("unknown schema id in footer"));
     }
-    // The flags word signals the optional trailing bloom section ([STL-238],
-    // v11). Any other bit is reserved and must be clear: a set reserved bit means
-    // either corruption or a writer from a format generation that should have
-    // bumped the version, so fail closed rather than silently ignore it (the same
-    // posture the parser takes on an unknown column or schema id).
+    // The flags word signals the optional trailing sections — the bloom
+    // ([STL-238], v11) and the valid-time interval summary ([STL-241], v12). Any
+    // other bit is reserved and must be clear: a set reserved bit means either
+    // corruption or a writer from a format generation that should have bumped the
+    // version, so fail closed rather than silently ignore it (the same posture the
+    // parser takes on an unknown column or schema id).
     let flags = p.u32()?;
-    if flags & !FOOTER_FLAG_BLOOM != 0 {
+    if flags & !(FOOTER_FLAG_BLOOM | FOOTER_FLAG_VALID_INTERVALS) != 0 {
         return Err(SegmentError::Corrupt("unknown footer flag bits set"));
     }
     let row_group_count = p.u32()?;
@@ -812,6 +842,19 @@ fn parse_footer(bytes: &[u8]) -> Result<Footer, SegmentError> {
     } else {
         None
     };
+    // Per-segment valid-time interval summary (format v12, [STL-241]) — present
+    // iff the flags word advertised it, decoded from the bytes *after* the bloom
+    // section (the fixed write order) and before the trailing-bytes guard, so a
+    // footer that claims a summary but omits it (or carries junk after it) is
+    // rejected as corrupt.
+    let valid_intervals = if flags & FOOTER_FLAG_VALID_INTERVALS != 0 {
+        let (summary, consumed) = ValidIntervalSummary::decode(&p.bytes[p.cursor..])
+            .map_err(|_| SegmentError::Corrupt("malformed valid-interval summary in footer"))?;
+        p.take(consumed)?;
+        Some(summary)
+    } else {
+        None
+    };
     if !p.is_empty() {
         return Err(SegmentError::Corrupt("trailing bytes in footer"));
     }
@@ -821,6 +864,7 @@ fn parse_footer(bytes: &[u8]) -> Result<Footer, SegmentError> {
         retractions,
         retraction_count,
         bloom,
+        valid_intervals,
     })
 }
 
@@ -1289,12 +1333,13 @@ mod tests {
 
     #[test]
     fn unknown_footer_flag_bits_are_rejected() {
-        // A v11 footer with a reserved flag bit set (beyond FOOTER_FLAG_BLOOM) is
-        // either corruption or a newer generation that should have bumped the
-        // version — the parser must fail closed rather than silently ignore it.
+        // A footer with a reserved flag bit set (beyond the defined
+        // FOOTER_FLAG_BLOOM / FOOTER_FLAG_VALID_INTERVALS) is either corruption or
+        // a newer generation that should have bumped the version — the parser must
+        // fail closed rather than silently ignore it.
         let mut out = Vec::new();
         out.extend_from_slice(&0u32.to_le_bytes()); // schema_id
-        out.extend_from_slice(&(FOOTER_FLAG_BLOOM << 1).to_le_bytes()); // an unknown bit
+        out.extend_from_slice(&(FOOTER_FLAG_VALID_INTERVALS << 1).to_le_bytes()); // an unknown bit
         out.extend_from_slice(&0u32.to_le_bytes()); // row_group_count
         out.extend_from_slice(&0u32.to_le_bytes()); // retraction_count
         out.extend_from_slice(&0u32.to_le_bytes()); // retraction_column_count

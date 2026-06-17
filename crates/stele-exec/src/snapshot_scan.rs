@@ -589,6 +589,12 @@ pub struct ScanStats {
     /// index proved superseded at the snapshot — skipped after reading only the
     /// narrow identity columns, never the bulk chunks (STL-139).
     pub segments_pruned_superseded: usize,
+    /// Segments the per-segment valid-time interval summary proved hold no row
+    /// valid at the pinned valid instant — skipped with no read I/O (STL-241).
+    /// Only ever non-zero for a `FOR VALID_TIME AS OF v` read against a segment
+    /// carrying a summary; this is the backdated-write scatter case the
+    /// `valid_from` / `valid_to` zone-map min/max cannot prune.
+    pub segments_pruned_valid: usize,
     /// Segments that survived both prunes — their projected columns are read for
     /// any row live at the snapshot.
     pub segments_scanned: usize,
@@ -607,11 +613,14 @@ pub struct ScanStats {
 
 impl ScanStats {
     /// Segments skipped by any prune (`segments_pruned_zone +
-    /// segments_pruned_bloom + segments_pruned_superseded`) — the count that never
-    /// had its bulk columns materialized.
+    /// segments_pruned_bloom + segments_pruned_superseded + segments_pruned_valid`)
+    /// — the count that never had its bulk columns materialized.
     #[must_use]
     pub const fn segments_pruned(&self) -> usize {
-        self.segments_pruned_zone + self.segments_pruned_bloom + self.segments_pruned_superseded
+        self.segments_pruned_zone
+            + self.segments_pruned_bloom
+            + self.segments_pruned_superseded
+            + self.segments_pruned_valid
     }
 
     /// Add this run's accounting into the process-wide scan counters
@@ -631,6 +640,9 @@ impl ScanStats {
         metrics
             .scan_segments_pruned_superseded
             .add(self.segments_pruned_superseded as u64);
+        metrics
+            .scan_segments_pruned_valid
+            .add(self.segments_pruned_valid as u64);
         metrics
             .scan_row_groups_scanned
             .add(self.row_groups_scanned as u64);
@@ -838,9 +850,11 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
     /// at the snapshot, returning each survivor's candidate identities (paired
     /// with their segment-global row indices) and the pruning [`ScanStats`].
     ///
-    /// Three complementary skip stages, none of which reads a bulk column chunk:
-    /// the segment-level zone map, the per-row-group zone maps (STL-173), and the
-    /// validity index's "every surviving version superseded" bound (STL-139).
+    /// Complementary skip stages, none of which reads a bulk column chunk: the
+    /// segment-level zone map, the per-segment bloom (STL-238), the per-segment
+    /// valid-time interval summary on a valid-pinned read (STL-241), the
+    /// per-row-group zone maps (STL-173), and the validity index's "every
+    /// surviving version superseded" bound (STL-139).
     #[allow(clippy::type_complexity)]
     fn prune_segments(
         &self,
@@ -860,6 +874,7 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
         let mut pruned_zone = 0usize;
         let mut pruned_bloom = 0usize;
         let mut pruned_superseded = 0usize;
+        let mut pruned_valid = 0usize;
         let mut rg_total = 0usize;
         let mut rg_pruned = 0usize;
         let mut rg_scanned = 0usize;
@@ -881,6 +896,22 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
                 && !reader.might_contain_key(key.as_bytes())
             {
                 pruned_bloom += 1;
+                continue;
+            }
+            // Stage 1c — per-segment valid-time interval summary ([STL-241]): for
+            // a `FOR VALID_TIME AS OF v` read, the footer-resident summary can
+            // prove no row in this segment is valid at `v` even when its
+            // `valid_from` / `valid_to` zone-map min/max cannot — the backdated
+            // scatter case, where a correction lands in today's segment carrying
+            // an old valid-time and widens the envelope to span `v` though the
+            // actual coverage has a gap there. Footer-resident, so still no chunk
+            // I/O. A segment with no summary (system-only, ≤ v11, or a
+            // summary-disabled writer) admits every point, so this never prunes a
+            // real match.
+            if let Some(point) = self.valid_snapshot
+                && !reader.might_contain_valid(point.0)
+            {
+                pruned_valid += 1;
                 continue;
             }
             // Stage 2 — per-row-group zone maps (STL-173): rule out the
@@ -935,6 +966,7 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             segments_pruned_zone: pruned_zone,
             segments_pruned_bloom: pruned_bloom,
             segments_pruned_superseded: pruned_superseded,
+            segments_pruned_valid: pruned_valid,
             segments_scanned: survivors.len(),
             row_groups_total: rg_total,
             row_groups_pruned_zone: rg_pruned,
