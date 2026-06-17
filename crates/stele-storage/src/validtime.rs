@@ -342,8 +342,11 @@ impl ValidIntervalSummary {
             }
         }
         // Bound the count by merging the smallest gaps first — the widening that
-        // adds the least phantom coverage. `cap` is small and `merged` shrinks by
-        // one each pass, so the O(n·cap) loop is fine at flush time.
+        // adds the least phantom coverage. Each pass rescans all adjacent gaps and
+        // removes one interval, so reducing `m` coalesced intervals to `cap` is
+        // O(m·(m − cap)) (≈ O(m²) worst case). It runs only at flush time and only
+        // when a segment has more than `cap` (default 256) disjoint windows, so the
+        // simple rescan is preferred over a gap heap.
         let cap = cap.max(1);
         while merged.len() > cap {
             let mut best = 0usize;
@@ -405,10 +408,16 @@ impl ValidIntervalSummary {
     ///
     /// A static reason if the buffer is short, the count is zero (a present
     /// section always summarizes at least one interval — the writer omits the
-    /// section otherwise), or any interval is empty/inverted (`from >= to`,
-    /// which `build` never emits). The footer CRC already guards integrity, so
-    /// these checks are a fail-closed cross-check on a successfully-checksummed
-    /// footer, mirroring the segment bloom's decode validation.
+    /// section otherwise), any interval is empty/inverted (`from >= to`), or the
+    /// intervals are not **strictly ascending and disjoint** (each `from` must
+    /// exceed the previous `to`). [`covers`](Self::covers) binary-searches on the
+    /// disjoint-ascending invariant [`build`](Self::build) establishes, so a
+    /// malformed footer that broke it — e.g. `[0, 100)` then `[50, 60)` — could
+    /// make `covers` miss a covered point and wrongly prune a whole segment.
+    /// The footer CRC already guards integrity, so this is a fail-closed
+    /// cross-check on a successfully-checksummed footer (mirroring the segment
+    /// bloom's decode validation) that keeps the prune sound rather than trusting
+    /// the bytes.
     pub(crate) fn decode(bytes: &[u8]) -> Result<(Self, usize), &'static str> {
         let count = bytes
             .get(0..4)
@@ -423,12 +432,21 @@ impl ValidIntervalSummary {
         let body = bytes
             .get(4..end)
             .ok_or("truncated valid-interval section")?;
-        let mut intervals = Vec::with_capacity(count);
+        let mut intervals: Vec<(i64, i64)> = Vec::with_capacity(count);
         for pair in body.chunks_exact(16) {
             let from = i64::from_le_bytes(pair[0..8].try_into().expect("8-byte slice"));
             let to = i64::from_le_bytes(pair[8..16].try_into().expect("8-byte slice"));
             if from >= to {
                 return Err("empty or inverted valid interval in footer");
+            }
+            // Reject overlapping, touching, or out-of-order intervals: `build`
+            // coalesces those away, so a retained interval always starts strictly
+            // after the previous one ends. Enforcing it here keeps `covers`'s
+            // binary search sound on a corrupt footer.
+            if let Some(&(_, prev_to)) = intervals.last()
+                && from <= prev_to
+            {
+                return Err("valid intervals are not strictly ascending and disjoint");
             }
             intervals.push((from, to));
         }
@@ -877,5 +895,30 @@ mod tests {
         bad.extend_from_slice(&20i64.to_le_bytes());
         bad.extend_from_slice(&10i64.to_le_bytes());
         assert!(ValidIntervalSummary::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn summary_decode_rejects_overlapping_or_unsorted_intervals() {
+        // `covers` relies on the disjoint-ascending invariant `build` guarantees:
+        // an overlapping (or out-of-order) footer like `[0,100)` then `[50,60)`
+        // would let `covers` miss a covered point and wrongly prune a segment.
+        // `decode` must fail closed rather than trust the (CRC-valid) bytes.
+        let encode = |pairs: &[(i64, i64)]| {
+            let mut buf = u32::try_from(pairs.len()).unwrap().to_le_bytes().to_vec();
+            for (from, to) in pairs {
+                buf.extend_from_slice(&from.to_le_bytes());
+                buf.extend_from_slice(&to.to_le_bytes());
+            }
+            buf
+        };
+        // Overlapping (the reviewer's example).
+        assert!(ValidIntervalSummary::decode(&encode(&[(0, 100), (50, 60)])).is_err());
+        // Out of order.
+        assert!(ValidIntervalSummary::decode(&encode(&[(100, 200), (0, 10)])).is_err());
+        // Touching — `build` coalesces these, so a retained pair never touches.
+        assert!(ValidIntervalSummary::decode(&encode(&[(0, 10), (10, 20)])).is_err());
+        // A genuinely disjoint, ascending pair still decodes.
+        let (ok, _) = ValidIntervalSummary::decode(&encode(&[(0, 10), (20, 30)])).expect("valid");
+        assert!(ok.covers(5) && !ok.covers(15) && ok.covers(25));
     }
 }
