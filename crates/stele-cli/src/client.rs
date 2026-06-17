@@ -454,9 +454,9 @@ impl Drop for Client {
 /// the `stele_stats` opt-in for the query-stats trailer ([STL-201]).
 ///
 /// The shell always opts in so the channel is open; whether the footer is *drawn*
-/// is the client-side `--stats` setting. The server ignores the parameter unless
-/// it is the Stele front end, and no other client sends it, so psql and the driver
-/// gate are unaffected.
+/// is the client-side `--stats` setting. The server delivers the trailer to any
+/// client that sends this parameter — but no mainstream driver does, so psql and
+/// the JDBC / psycopg gate never receive it.
 fn startup_payload(user: &str, database: &str) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());

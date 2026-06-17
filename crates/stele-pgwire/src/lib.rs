@@ -1805,8 +1805,10 @@ async fn run_statement<S: Wire>(
                 // it and the read actually ran a scan (a join / overlay read leaves
                 // `stats` `None`, so the footer is suppressed).
                 if stats_enabled && let Some(stats) = &result.stats {
-                    write_notice_response(stream, "NOTICE", SQLSTATE_SUCCESS, &stats.to_notice())
-                        .await?;
+                    // Bind the serialized line to a local so it outlives the await
+                    // (rather than borrowing a temporary across it).
+                    let notice = stats.to_notice();
+                    write_notice_response(stream, "NOTICE", SQLSTATE_SUCCESS, &notice).await?;
                 }
                 let n = u64::try_from(data_rows.len()).unwrap_or(u64::MAX);
                 write_command_complete(stream, &CommandTag::Select(n)).await?;
