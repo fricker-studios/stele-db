@@ -142,6 +142,23 @@ pub struct DmlWriter<C: Clock, D: Disk> {
     /// recovery replays whole or, if a crash tears it, drops at the fence — so a
     /// committed transaction's writes recover all-or-none.
     group: Option<Vec<Redo>>,
+    /// Whether the open `group` is a **bulk load** ([`begin_bulk_group`](Self::begin_bulk_group),
+    /// [STL-240]). Meaningful only while `group` is `Some`.
+    ///
+    /// A bulk group is the same buffer-and-defer machinery with two changes that let
+    /// a million-row `COPY` stream through bounded memory: each buffered write applies
+    /// to the delta with the **spilling** [`Delta::insert`] (not the resident
+    /// [`Delta::insert_resident`] a transactional group uses), so the in-memory tier
+    /// stays bounded; and the buffer is drained per chunk by
+    /// [`commit_bulk_chunk`](Self::commit_bulk_chunk) as a two-phase WAL record + fsync
+    /// rather than once at commit. Many chunk records share one `txn_id` and are
+    /// vouched by a single commit record (the engine layer), so the load is one
+    /// crash-atomic group whose hash chain ticks once. Because spilled rows are not
+    /// removable in place, an aborted/crashed bulk load is rolled back by *discarding*
+    /// the delta wholesale ([`abort_group`](Self::abort_group)) — sound because the
+    /// engine flushes the delta to a segment before the load, so it holds only this
+    /// load's rows.
+    group_bulk: bool,
 }
 
 // `Wal` is not `Debug` (it guards a `Disk` handle behind a mutex) and the clock
@@ -153,6 +170,7 @@ impl<C: Clock, D: Disk> std::fmt::Debug for DmlWriter<C, D> {
             .field("valid_time", &self.writer.valid_time_enabled())
             .field("last_commit", &self.writer.last_commit())
             .field("group_buffered", &self.group.as_ref().map(Vec::len))
+            .field("group_bulk", &self.group_bulk)
             .finish_non_exhaustive()
     }
 }
@@ -166,6 +184,7 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
             wal,
             writer: ValidTimeWriter::new(clock, valid_time),
             group: None,
+            group_bulk: false,
         }
     }
 
@@ -311,7 +330,16 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
                 .as_mut()
                 .expect("group is open")
                 .extend(redos.clone());
-            crate::systime::apply_resident(delta, index, redos)?;
+            if self.group_bulk {
+                // A bulk load ([STL-240]) applies **spilling** so the in-memory tier
+                // stays bounded across a million-row COPY. The chunk's redos are made
+                // durable by `commit_bulk_chunk`'s two-phase record, not held resident
+                // for an in-place undo; an aborted/crashed load discards the delta
+                // wholesale instead (`abort_group`), so spilling here is safe.
+                crate::systime::apply(delta, index, redos)?;
+            } else {
+                crate::systime::apply_resident(delta, index, redos)?;
+            }
             return Ok(DmlOutcome { commit, wal });
         }
         let record = encode_redo(&redos)?;
@@ -331,6 +359,82 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     /// aborted) is discarded, never silently appended.
     pub fn begin_group(&mut self) {
         self.group = Some(Vec::new());
+        self.group_bulk = false;
+    }
+
+    /// Open a **bulk-load** group ([STL-240]): like [`begin_group`](Self::begin_group),
+    /// but each buffered write applies *spilling* (so a huge `COPY` keeps the
+    /// in-memory delta bounded) and the buffer is drained per chunk by
+    /// [`commit_bulk_chunk`](Self::commit_bulk_chunk) as a two-phase WAL record.
+    ///
+    /// The chunks share one `txn_id`; the engine layer writes a single commit record
+    /// vouching them all, so the load is one crash-atomic group whose hash chain ticks
+    /// once. Pair with one [`end_bulk_group`](Self::end_bulk_group) (success — the
+    /// chunk records are already durable) or [`abort_group`](Self::abort_group)
+    /// (discard — drops the spilled delta wholesale, since spilled rows cannot be
+    /// undone in place). The caller must flush the delta to a segment **before** the
+    /// load so the tier holds only this load's rows and the wholesale discard is exact.
+    pub fn begin_bulk_group(&mut self) {
+        self.group = Some(Vec::new());
+        self.group_bulk = true;
+    }
+
+    /// Drain the bulk group's buffered redos as **one chunk** ([STL-240]): append them
+    /// as a two-phase WAL record tagged `txn_id` and fsync once, then reopen an empty
+    /// buffer so the load keeps streaming. Returns the durable end after the fsync; an
+    /// empty buffer writes no record and skips the fsync.
+    ///
+    /// Many chunks of one load share `txn_id`; recovery replays each only once that
+    /// transaction's commit record is durable ([`recover_replay`]'s [`CommittedTxns`]
+    /// gate), so a crash mid-load — before the engine writes the commit record —
+    /// discards every chunk and the load recovers to **zero** rows. The per-chunk
+    /// fsync bounds the redo buffer and gives a load O(chunks) fsyncs, not O(rows).
+    ///
+    /// Unlike [`commit_group`](Self::commit_group) this does **not** undo on a failed
+    /// append: the buffered rows applied *spilling* and are not removable in place, so
+    /// the caller surfaces the error and rolls back via [`abort_group`](Self::abort_group)
+    /// (a wholesale delta discard). A torn append still poisons the WAL ([STL-299]) and
+    /// an fsync failure still poisons it ([STL-217]), exactly as for a group commit.
+    ///
+    /// # Panics
+    ///
+    /// If no bulk group is open ([`begin_bulk_group`](Self::begin_bulk_group) was not
+    /// called, or [`end_bulk_group`](Self::end_bulk_group)/[`abort_group`](Self::abort_group)
+    /// already closed it). A chunk commit outside a bulk group is a call-order bug, not
+    /// a recoverable state — surfacing it keeps `end_bulk_group` authoritative rather
+    /// than letting a stray chunk silently reopen a group.
+    ///
+    /// # Errors
+    ///
+    /// [`DmlError::Wal`] if the append or fsync fails.
+    pub fn commit_bulk_chunk(&mut self, txn_id: TxnId) -> Result<LogOffset, DmlError> {
+        debug_assert!(
+            self.group_bulk,
+            "commit_bulk_chunk requires an open bulk group"
+        );
+        // Drain this chunk's buffer and leave an empty one in its place, so the load
+        // keeps streaming. `expect` rather than `unwrap_or_default`: a missing buffer
+        // means the group was never opened (or already closed), which must surface as
+        // the call-order bug it is instead of silently reopening a group.
+        let redos = std::mem::take(
+            self.group
+                .as_mut()
+                .expect("commit_bulk_chunk requires an open bulk group"),
+        );
+        if redos.is_empty() {
+            return Ok(self.wal.durable_end());
+        }
+        self.append_group_record(Some(txn_id), &redos)?;
+        self.wal.tick()?;
+        Ok(self.wal.durable_end())
+    }
+
+    /// Close a bulk-load group after its last chunk committed ([STL-240]): the chunk
+    /// records are already durable, so this just returns the writer to auto-commit
+    /// mode. The engine writes the load's single commit record after this.
+    pub fn end_bulk_group(&mut self) {
+        self.group = None;
+        self.group_bulk = false;
     }
 
     /// Group-commit the open buffer: append every redo the transaction staged as a
@@ -531,8 +635,22 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     /// (a spill file is append-only). A *fsync*-failed `commit_group` is **not** a
     /// clean abort — its record's durability is indeterminate — so that path
     /// poisons the engine and recovers rather than calling this ([STL-217]).
+    ///
+    /// A **bulk-load** group ([STL-240]) cannot be undone row by row — its writes
+    /// applied *spilling*, and a spill file is append-only — so it is rolled back by
+    /// *discarding the delta's staged contents wholesale* ([`Delta::discard_staged`]).
+    /// That is exact because the engine flushes the delta to a segment before the load
+    /// (its committed rows are sealed), so the tier holds only this aborted load's
+    /// (resident **and** spilled) rows and its already-written chunk records are inert
+    /// until a commit record that is never written — recovery drops them. A bulk load
+    /// is insert-only, so it stages no closes/retractions in `index` to reverse.
     pub fn abort_group<I: Disk>(&mut self, delta: &mut Delta<D>, index: &mut ValidityIndex<I>) {
-        if let Some(redos) = self.group.take() {
+        let bulk = self.group_bulk;
+        self.group_bulk = false;
+        let buffered = self.group.take();
+        if bulk {
+            delta.discard_staged();
+        } else if let Some(redos) = buffered {
             crate::systime::undo(delta, index, redos);
         }
     }

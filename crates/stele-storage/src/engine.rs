@@ -646,6 +646,45 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         self.writer.begin_group();
     }
 
+    /// Open a **bulk-load** group ([`DmlWriter::begin_bulk_group`], [STL-240]).
+    ///
+    /// Each [`insert`](Self::insert) then applies *spilling* (bounding the delta for a
+    /// huge `COPY`) and buffers its redos; [`commit_bulk_chunk`](Self::commit_bulk_chunk)
+    /// drains the buffer per chunk as a two-phase WAL record. The caller flushes this
+    /// engine ([`flush`](Self::flush)) **before** opening the group so the delta holds
+    /// only the load's rows, then pairs the group with one
+    /// [`end_bulk_group`](Self::end_bulk_group) (success) or
+    /// [`abort_group`](Self::abort_group) (discard).
+    ///
+    /// [STL-240]: https://allegromusic.atlassian.net/browse/STL-240
+    pub fn begin_bulk_group(&mut self) {
+        self.writer.begin_bulk_group();
+    }
+
+    /// Commit one chunk of a bulk load ([`DmlWriter::commit_bulk_chunk`], [STL-240]):
+    /// append the buffered redos as a two-phase WAL record tagged `txn_id` and fsync
+    /// once, then reopen an empty buffer. Many chunks share `txn_id`; the engine layer
+    /// vouches them with one commit record, so the load recovers all-or-none and its
+    /// hash chain ticks once. Returns the durable end after the fsync.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Dml`] if the append or fsync fails. As with a group commit, a
+    /// torn append or a failed fsync poisons the WAL ([STL-299] / [STL-217]); the
+    /// caller rolls back via [`abort_group`](Self::abort_group), which discards the
+    /// delta wholesale rather than undoing the spilled rows in place.
+    pub fn commit_bulk_chunk(&mut self, txn_id: TxnId) -> Result<LogOffset, EngineError> {
+        Ok(self.writer.commit_bulk_chunk(txn_id)?)
+    }
+
+    /// Close a bulk-load group after its last chunk committed
+    /// ([`DmlWriter::end_bulk_group`], [STL-240]): the chunk records are already
+    /// durable, so this only returns the writer to auto-commit mode. The engine writes
+    /// the load's single commit record after this.
+    pub fn end_bulk_group(&mut self) {
+        self.writer.end_bulk_group();
+    }
+
     /// Group-commit the open buffer ([`DmlWriter::commit_group`], [STL-192]): append
     /// the transaction's writes as a single WAL record and fsync once. Returns the
     /// durable end after the fsync.

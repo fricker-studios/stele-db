@@ -52,7 +52,7 @@ pub use fault_disk::{FaultDisk, FaultEvent, FaultKind, FaultProfile};
 pub use index_build::run_index_build_crash_seed;
 pub use si_oracle::run_si_oracle_seed;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -3592,6 +3592,231 @@ impl Scenario for FnScenario {
 /// kill-and-recover driver and its fault-injected variant, the cooperative
 /// scheduler's interleaving demo, and the seeded-fault virtual disk.
 #[must_use]
+/// A clean chunked bulk load recovers **whole** when its commit record vouches it
+/// ([STL-240]).
+///
+/// Seeds a flushed baseline, then streams a bulk load of fresh keys through the
+/// storage bulk-group primitive (`begin_bulk_group` → per-chunk `commit_bulk_chunk` →
+/// `end_bulk_group`), and recovers with the load's transaction **present** in the
+/// committed set — the engine layer's commit record. Every baseline key *and* every
+/// loaded key must come back live with its exact payload: the many chunk records,
+/// sharing one `txn_id`, replay as one committed unit.
+pub fn run_bulk_load_recover_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut rng = Rng::new(seed);
+    let disk = MemDisk::new();
+
+    let base_count = 1 + rng.below_usize(5);
+    let load_count = 1 + rng.below_usize(40);
+    let chunk = 1 + rng.below_usize(8);
+    let load_txn = TxnId(1_000);
+    // The committed payload of every key the recovered engine must hold.
+    let mut oracle: BTreeMap<BusinessKey, Vec<u8>> = BTreeMap::new();
+
+    {
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1), false).expect("open engine");
+        // Baseline: auto-commit (plain records), sealed into a segment.
+        for i in 0..base_count {
+            let key = BusinessKey::new(format!("base-{i:04}").into_bytes());
+            let payload_len = 1 + rng.below_usize(12);
+            let payload = rng.bytes(payload_len);
+            engine
+                .insert(
+                    key.clone(),
+                    None,
+                    Some(payload.clone()),
+                    0,
+                    TxnId(i as u64),
+                    Principal::new(b"base".to_vec()),
+                )
+                .expect("baseline insert");
+            oracle.insert(key, payload);
+        }
+        engine.flush().expect("flush baseline");
+
+        // The bulk load: one chunked two-phase record per `chunk` rows.
+        engine.begin_bulk_group();
+        let mut staged = 0;
+        for i in 0..load_count {
+            let key = BusinessKey::new(format!("load-{i:04}").into_bytes());
+            let payload_len = 1 + rng.below_usize(12);
+            let payload = rng.bytes(payload_len);
+            engine
+                .insert(
+                    key.clone(),
+                    None,
+                    Some(payload.clone()),
+                    0,
+                    load_txn,
+                    Principal::new(b"bulk".to_vec()),
+                )
+                .expect("bulk insert");
+            oracle.insert(key, payload);
+            staged += 1;
+            if staged % chunk == 0 {
+                engine.commit_bulk_chunk(load_txn).expect("commit chunk");
+            }
+        }
+        // Flush the partial tail chunk (a no-op when the buffer is already empty).
+        engine
+            .commit_bulk_chunk(load_txn)
+            .expect("commit tail chunk");
+        engine.end_bulk_group();
+    }
+
+    let mut committed = BTreeSet::new();
+    committed.insert(load_txn);
+    let recovered = Engine::recover_with_commits(
+        disk,
+        StepClock::new(1_000_000),
+        false,
+        &dml::CommittedTxns::Only(committed),
+    )
+    .expect("recover");
+
+    let snap = Snapshot(SystemTimeMicros(i64::MAX - 1));
+    let mut digest = FNV_OFFSET;
+    for (key, want) in &oracle {
+        let got = recovered.as_of_payload(key, snap).expect("as_of").flatten();
+        assert_eq!(
+            got.as_deref(),
+            Some(want.as_slice()),
+            "seed {seed}: a committed bulk load must recover key {key:?}",
+        );
+        digest = fnv1a(digest, key.as_bytes());
+        digest = fold_optional_payload(digest, got.as_deref());
+    }
+    digest
+}
+
+/// A chunked bulk load **killed mid-stream recovers to zero rows**, even under fault
+/// injection ([STL-240]) — the storage half of the DoD's "a kill mid-load recovers to
+/// zero visible rows."
+///
+/// A flushed baseline, then a bulk load driven through a [`FaultDisk`] with write
+/// faults armed (torn appends, full disk, slow syncs). The load is **not** committed —
+/// recovery omits its `txn_id` from the committed set, modelling a crash before the
+/// engine's commit record — so however many chunk records reached the log, recovery
+/// drops every one and rebuilds **exactly the baseline**: no loaded key is ever live,
+/// and every baseline key survives untouched.
+pub fn run_bulk_load_recover_faults_seed(seed: u64) -> u64 {
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+
+    let mut prof_rng = Rng::new(seed ^ 0x5EED_B17C_0FFE_E240);
+    let p_torn = prob_permille(&mut prof_rng, 40, 120);
+    let p_full = prob_permille(&mut prof_rng, 10, 30);
+    let p_slow = prob_permille(&mut prof_rng, 200, 500);
+
+    let mut rng = Rng::new(seed);
+    let base_count = 1 + rng.below_usize(5);
+    let load_count = 4 + rng.below_usize(60);
+    let chunk = 1 + rng.below_usize(8);
+    let load_txn = TxnId(9_999);
+    let mut oracle: BTreeMap<BusinessKey, Vec<u8>> = BTreeMap::new();
+
+    let disk = FaultDisk::new(seed, FaultProfile::none());
+    {
+        let mut engine = Engine::open(disk.clone(), StepClock::new(1), false).expect("open engine");
+        // Baseline, sealed *before* any fault is armed — it must survive the kill.
+        for i in 0..base_count {
+            let key = BusinessKey::new(format!("base-{i:04}").into_bytes());
+            let payload_len = 1 + rng.below_usize(12);
+            let payload = rng.bytes(payload_len);
+            engine
+                .insert(
+                    key.clone(),
+                    None,
+                    Some(payload.clone()),
+                    0,
+                    TxnId(i as u64),
+                    Principal::new(b"base".to_vec()),
+                )
+                .expect("baseline insert");
+            oracle.insert(key, payload);
+        }
+        engine.flush().expect("flush baseline");
+
+        // Arm write faults, then stream the load. Any fault interrupts it — the crash.
+        disk.enable(FaultKind::TornWrite, p_torn);
+        disk.enable(FaultKind::FullDisk, p_full);
+        disk.enable(FaultKind::SlowSync, p_slow);
+
+        engine.begin_bulk_group();
+        let mut staged = 0;
+        'load: for i in 0..load_count {
+            let key = BusinessKey::new(format!("load-{i:04}").into_bytes());
+            let payload_len = 1 + rng.below_usize(12);
+            let payload = rng.bytes(payload_len);
+            if engine
+                .insert(
+                    key,
+                    None,
+                    Some(payload),
+                    0,
+                    load_txn,
+                    Principal::new(b"bulk".to_vec()),
+                )
+                .is_err()
+            {
+                break 'load;
+            }
+            staged += 1;
+            if staged % chunk == 0 && engine.commit_bulk_chunk(load_txn).is_err() {
+                break 'load;
+            }
+        }
+        // The tail chunk's commit may also fault; either way the load is uncommitted.
+        let _ = engine.commit_bulk_chunk(load_txn);
+        // Drop the engine with no commit record — the kill mid-load.
+    }
+
+    // Recover: silence write faults. The load's transaction is absent from the
+    // committed set, so every chunk record is discarded.
+    disk.disable(FaultKind::TornWrite);
+    disk.disable(FaultKind::FullDisk);
+    disk.disable(FaultKind::SlowSync);
+    let recovered = Engine::recover_with_commits(
+        disk.clone(),
+        StepClock::new(1_000_000),
+        false,
+        &dml::CommittedTxns::Only(BTreeSet::new()),
+    )
+    .expect("recover");
+
+    let snap = Snapshot(SystemTimeMicros(i64::MAX - 1));
+    let mut digest = FNV_OFFSET;
+    // Every baseline key survives with its exact payload.
+    for (key, want) in &oracle {
+        let got = recovered.as_of_payload(key, snap).expect("as_of").flatten();
+        assert_eq!(
+            got.as_deref(),
+            Some(want.as_slice()),
+            "seed {seed}: baseline key {key:?} must survive a killed bulk load",
+        );
+        digest = fnv1a(digest, key.as_bytes());
+        digest = fold_optional_payload(digest, got.as_deref());
+    }
+    // No loaded key is ever live — all-or-nothing.
+    for i in 0..load_count {
+        let key = BusinessKey::new(format!("load-{i:04}").into_bytes());
+        let got = recovered
+            .as_of_payload(&key, snap)
+            .expect("as_of")
+            .flatten();
+        assert!(
+            got.is_none(),
+            "seed {seed}: a killed bulk load leaked key {key:?}",
+        );
+    }
+    // Fold the fault trace so the sweep digest reflects the injected schedule.
+    for ev in disk.events() {
+        digest = fnv1a(digest, &ev.seq.to_le_bytes());
+        digest = fnv1a(digest, &[fault_op_tag(ev.op), fault_kind_tag(ev.kind)]);
+        digest = fnv1a(digest, &ev.detail.to_le_bytes());
+    }
+    digest
+}
+
 pub fn registry() -> Vec<Box<dyn Scenario>> {
     vec![
         FnScenario::boxed("storage", run_storage_seed),
@@ -3611,6 +3836,11 @@ pub fn registry() -> Vec<Box<dyn Scenario>> {
         FnScenario::fault(
             "engine-flush-recover-faults",
             run_engine_flush_recover_faults_seed,
+        ),
+        FnScenario::boxed("bulk-load-recover", run_bulk_load_recover_seed),
+        FnScenario::fault(
+            "bulk-load-recover-faults",
+            run_bulk_load_recover_faults_seed,
         ),
         FnScenario::fault(
             "group-commit-recover-faults",
@@ -4129,6 +4359,7 @@ mod tests {
         assert_eq!(
             gated,
             [
+                "bulk-load-recover-faults",
                 "engine-flush-recover-faults",
                 "engine-recover-faults",
                 "fault-disk",

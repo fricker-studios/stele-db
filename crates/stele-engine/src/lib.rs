@@ -91,8 +91,9 @@ use stele_sql::select::{
     SubqueryKind,
 };
 use stele_sql::{
-    AdminCommand, BindContext, BindError, CopyError, CopyShape, Statement, StatementBody,
-    TimeDimension, bind_copy, bind_copy_rows, bind_ddl, bind_dml, bind_select, without_filter,
+    AdminCommand, BindContext, BindError, BoundCopy, CopyError, CopyShape, Statement,
+    StatementBody, TimeDimension, bind_copy, bind_copy_rows, bind_ddl, bind_dml, bind_select,
+    without_filter,
 };
 use stele_storage::backend::Disk;
 use stele_storage::delta::{BusinessKey, Snapshot, Version};
@@ -2197,18 +2198,134 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     }
 
     /// The unmetered body of [`copy_apply`](Self::copy_apply).
+    ///
+    /// A load at or under [`BULK_COPY_CHUNK_ROWS`] folds and applies as one resident
+    /// atomic group (the multi-row `INSERT` path, byte-for-byte as before); a larger
+    /// load streams through the chunked bulk path ([`bulk_copy_apply`](Self::bulk_copy_apply),
+    /// [STL-240]) so a million-row `COPY` is fsync-bounded and runs in bounded memory.
     fn copy_apply_inner(
         &mut self,
         stmt: &Statement,
         rows: &[Vec<Option<String>>],
     ) -> Result<u64, EngineError> {
-        let dml = self.bind_copy_insert(stmt, self.clock.observe(), rows)?;
-        let n = match &dml {
-            BoundDml::InsertRows { rows, .. } => rows.len() as u64,
-            _ => unreachable!("bind_copy_insert always yields InsertRows"),
+        let snapshot = self.clock.observe();
+        if rows.len() <= BULK_COPY_CHUNK_ROWS {
+            let dml = self.bind_copy_insert(stmt, snapshot, rows)?;
+            let n = match &dml {
+                BoundDml::InsertRows { rows, .. } => rows.len() as u64,
+                _ => unreachable!("bind_copy_insert always yields InsertRows"),
+            };
+            self.apply_insert_rows(dml)?;
+            return Ok(n);
+        }
+        self.bulk_copy_apply(stmt, snapshot, rows)
+    }
+
+    /// Apply a large auto-commit `COPY` as a **chunked bulk load** ([STL-240]).
+    ///
+    /// Binds the plan once, flushes the target to isolate the delta, then streams the
+    /// rows through the storage bulk-group path in [`BULK_COPY_CHUNK_ROWS`]-sized
+    /// chunks: each chunk is bound + folded on its own (so only one chunk's rows and
+    /// redos are resident), its inserts apply *spilling* (so the delta stays bounded),
+    /// and it commits as one two-phase WAL record + fsync. Every chunk shares one
+    /// `txn_id`; a single commit record vouches them all, so the load is **one commit**
+    /// whose hash chain ticks once ([ADR-0031]) and a million-row load completes in
+    /// bounded memory with O(chunks) fsyncs.
+    ///
+    /// Crash-atomic and abortable as one group: a crash mid-load leaves the chunk
+    /// records inert (no commit record) and recovery discards them — zero rows; a
+    /// failure on any row (a duplicate/dead-key conflict, schema drift) discards the
+    /// whole load via [`abort_group`](stele_storage::engine::Engine::abort_group),
+    /// which drops the spilled delta wholesale — sound because the pre-load flush left
+    /// the tier holding only this load's rows. Either way the table is unchanged.
+    ///
+    /// [STL-240]: https://allegromusic.atlassian.net/browse/STL-240
+    /// [ADR-0031]: https://allegromusic.atlassian.net/browse/STL-307
+    fn bulk_copy_apply(
+        &mut self,
+        stmt: &Statement,
+        snapshot: SystemTimeMicros,
+        rows: &[Vec<Option<String>>],
+    ) -> Result<u64, EngineError> {
+        let plan = {
+            let ctx = BindContext {
+                snapshot,
+                catalog: &self.catalog,
+            };
+            bind_copy(stmt, &ctx)?
         };
-        self.apply_insert_rows(dml)?;
-        Ok(n)
+        let table = plan.table.clone();
+        // Isolate the delta: seal any committed-but-unflushed rows into a segment so
+        // the tier holds only this load's rows. The bulk path applies spilling and an
+        // append-only spill file is not removable in place, so an aborted/crashed load
+        // is rolled back by discarding the delta wholesale — exact only once the
+        // pre-load rows are sealed elsewhere.
+        self.table_mut(&table)?.engine.flush()?;
+        let txn_id = TxnId(self.next_txn);
+        self.next_txn += 1;
+        let principal = self.write_principal.clone();
+        self.table_mut(&table)?.engine.begin_bulk_group();
+        match self.bulk_copy_chunks(&plan, rows, txn_id, &principal) {
+            Ok(total) => {
+                self.table_mut(&table)?.engine.end_bulk_group();
+                // One commit record vouches every chunk record sharing `txn_id`: the
+                // load commits all-or-none and the tamper-evident chain ticks once.
+                self.record_commit(txn_id)?;
+                self.prune_write_index();
+                Ok(total)
+            }
+            Err(e) => {
+                if let Ok(state) = self.table_mut(&table) {
+                    state.engine.abort_group();
+                }
+                // Prune on the abort path too ([`apply_write_group`](Self::apply_write_group)
+                // does the same): the failing chunk's already-applied rows were rolled
+                // back, so their write-index entries can never conflict again — clear
+                // them so an aborted load does not leave the conflict index growing
+                // ([STL-204]). The committed chunks before it were already pruned per
+                // chunk in `bulk_copy_chunks`.
+                self.prune_write_index();
+                Err(e)
+            }
+        }
+    }
+
+    /// Stream the bound `COPY` rows through the open bulk group in chunks: bind + fold
+    /// each chunk, apply its inserts (buffered + spilling), then commit the chunk as
+    /// one two-phase WAL record + fsync ([STL-240]). Returns the loaded row count;
+    /// propagates the first error so [`bulk_copy_apply`](Self::bulk_copy_apply) aborts
+    /// the whole load.
+    fn bulk_copy_chunks(
+        &mut self,
+        plan: &BoundCopy,
+        rows: &[Vec<Option<String>>],
+        txn_id: TxnId,
+        principal: &Principal,
+    ) -> Result<u64, EngineError> {
+        let mut total = 0u64;
+        for chunk in rows.chunks(BULK_COPY_CHUNK_ROWS) {
+            let bound = bind_copy_rows(plan, chunk)?;
+            let chunk_dml = BoundDml::InsertRows {
+                table: plan.table.clone(),
+                schema_id: plan.schema_id,
+                rows: bound,
+            };
+            let (writes, _summary) = expand_insert_rows(chunk_dml);
+            for write in writes {
+                self.apply_bound_dml(write, txn_id, principal)?;
+            }
+            self.table_mut(&plan.table)?
+                .engine
+                .commit_bulk_chunk(txn_id)?;
+            total += chunk.len() as u64;
+            // Bound the conflict-detection index across the load too, not just at the
+            // end: with no concurrent reader pinning an older snapshot this clears the
+            // chunk's keys back out ([STL-204]), so the write index stays O(chunk), not
+            // O(rows). A reader with an older snapshot legitimately holds entries it
+            // may still conflict against — those are kept, as they must be.
+            self.prune_write_index();
+        }
+        Ok(total)
     }
 
     /// Stage a streamed `COPY ... FROM STDIN` into an open transaction's buffer:
@@ -5332,6 +5449,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
 /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
 /// [STL-300]: https://allegromusic.atlassian.net/browse/STL-300
 const WIRE_PRINCIPAL: &[u8] = b"stele";
+
+/// Rows per chunk on the bulk `COPY` fast path ([STL-240]).
+///
+/// A `COPY` larger than this streams through the chunked bulk-load path: each chunk
+/// is bound, applied (spilling), and committed as one two-phase WAL record + fsync, so
+/// a million-row load is fsync-bounded (O(rows / this)) rather than row-bounded, and
+/// only one chunk's bound rows and redos are resident at a time. A load at or under it
+/// stays on the single-group resident path, byte-for-byte as before. Sized to amortize
+/// the per-chunk fsync over many rows while keeping the per-chunk working set small;
+/// it is independent of the delta's byte-based spill bound, which caps resident
+/// memory across chunks regardless of this value.
+const BULK_COPY_CHUNK_ROWS: usize = 4096;
 
 /// The in-memory state step 1 of [`SessionEngine::recover`] derives from the
 /// replayed catalog log, before any tier is reopened.

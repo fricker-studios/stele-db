@@ -232,6 +232,8 @@ sequenceDiagram
 
 The **durability point is the WAL fsync at commit.** Everything after (delta→segment flush, compaction, tiering) is asynchronous and recoverable from the WAL.
 
+**Bulk ingest fast path** ([STL-240](https://allegromusic.atlassian.net/browse/STL-240)). A `COPY`-scale load does not pay the per-row cost of the path above. It streams the rows through the delta in **chunks**: each chunk is staged spilling (so the in-memory tier stays bounded across a million-row load) and appended as one chunked redo record fsynced once — so a load is **O(chunks) fsyncs, not O(rows)**, and runs in bounded memory. Every chunk record shares one transaction id and is vouched by a **single commit record**, so the whole load is one crash-atomic group whose hash chain ticks once: a crash mid-load leaves the chunk records inert and recovery discards them (zero rows visible), exactly as a torn single-statement commit recovers all-or-none. The records still flow WAL→delta→segment (no bypass of the WAL durability point or the delta tier); direct-to-segment bulk writes are a later concern gated on compaction.
+
 ### 3.5 Read path / as-of (flow)
 
 ```mermaid
