@@ -2218,6 +2218,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 if let Ok(state) = self.table_mut(&table) {
                     state.engine.abort_group();
                 }
+                // Prune on the abort path too ([`apply_write_group`](Self::apply_write_group)
+                // does the same): the failing chunk's already-applied rows were rolled
+                // back, so their write-index entries can never conflict again — clear
+                // them so an aborted load does not leave the conflict index growing
+                // ([STL-204]). The committed chunks before it were already pruned per
+                // chunk in `bulk_copy_chunks`.
+                self.prune_write_index();
                 Err(e)
             }
         }

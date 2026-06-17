@@ -396,11 +396,31 @@ impl<C: Clock, D: Disk> DmlWriter<C, D> {
     /// (a wholesale delta discard). A torn append still poisons the WAL ([STL-299]) and
     /// an fsync failure still poisons it ([STL-217]), exactly as for a group commit.
     ///
+    /// # Panics
+    ///
+    /// If no bulk group is open ([`begin_bulk_group`](Self::begin_bulk_group) was not
+    /// called, or [`end_bulk_group`](Self::end_bulk_group)/[`abort_group`](Self::abort_group)
+    /// already closed it). A chunk commit outside a bulk group is a call-order bug, not
+    /// a recoverable state — surfacing it keeps `end_bulk_group` authoritative rather
+    /// than letting a stray chunk silently reopen a group.
+    ///
     /// # Errors
     ///
     /// [`DmlError::Wal`] if the append or fsync fails.
     pub fn commit_bulk_chunk(&mut self, txn_id: TxnId) -> Result<LogOffset, DmlError> {
-        let redos = self.group.replace(Vec::new()).unwrap_or_default();
+        debug_assert!(
+            self.group_bulk,
+            "commit_bulk_chunk requires an open bulk group"
+        );
+        // Drain this chunk's buffer and leave an empty one in its place, so the load
+        // keeps streaming. `expect` rather than `unwrap_or_default`: a missing buffer
+        // means the group was never opened (or already closed), which must surface as
+        // the call-order bug it is instead of silently reopening a group.
+        let redos = std::mem::take(
+            self.group
+                .as_mut()
+                .expect("commit_bulk_chunk requires an open bulk group"),
+        );
         if redos.is_empty() {
             return Ok(self.wal.durable_end());
         }
