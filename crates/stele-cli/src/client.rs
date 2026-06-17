@@ -39,6 +39,8 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::pem::PemObject as _;
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 
+use stele_common::query_stats::QueryStats;
+
 use crate::render::Column;
 
 // Backend message types this client consumes (the post-startup stream).
@@ -49,6 +51,7 @@ const MSG_ROW_DESCRIPTION: u8 = b'T';
 const MSG_DATA_ROW: u8 = b'D';
 const MSG_COMMAND_COMPLETE: u8 = b'C';
 const MSG_EMPTY_QUERY_RESPONSE: u8 = b'I';
+const MSG_NOTICE_RESPONSE: u8 = b'N';
 // Frontend message types this client emits.
 const MSG_QUERY: u8 = b'Q';
 const MSG_TERMINATE: u8 = b'X';
@@ -69,6 +72,11 @@ const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024;
 pub struct ResultSet {
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<Option<String>>>,
+    /// The server's per-query execution stats ([STL-201]), when it delivered them
+    /// (the `NoticeResponse` trailer). `None` when the server sent none — a build
+    /// without the trailer, a read with no scan to account for, or stats not
+    /// requested — so the shell suppresses the footer.
+    pub stats: Option<QueryStats>,
 }
 
 /// A decoded `ErrorResponse`: the fields the shell renders as the psql-style
@@ -215,7 +223,22 @@ impl Client {
                     current = Some(ResultSet {
                         columns: parse_row_description(&payload)?,
                         rows: Vec::new(),
+                        stats: None,
                     });
+                }
+                MSG_NOTICE_RESPONSE => {
+                    // The query-stats trailer ([STL-201]) rides a NoticeResponse,
+                    // which shares the ErrorResponse field layout — its message
+                    // ('M') field carries the stats line. Attach it to the result
+                    // set it annotates (it arrives after the rows, before
+                    // CommandComplete); any other notice parses to `None` and is
+                    // ignored.
+                    if let Some(set) = current.as_mut()
+                        && let Some(stats) =
+                            QueryStats::parse_notice(&parse_error(&payload).message)
+                    {
+                        set.stats = Some(stats);
+                    }
                 }
                 MSG_DATA_ROW => {
                     let set = current
@@ -243,7 +266,8 @@ impl Client {
                     self.txn_status = payload.first().copied().unwrap_or(b'I');
                     return Ok(replies);
                 }
-                // NoticeResponse / ParameterStatus mid-stream: skip.
+                // ParameterStatus / BackendKeyData and any other mid-stream
+                // informational message: skip.
                 _ => {}
             }
         }
@@ -426,11 +450,21 @@ impl Drop for Client {
     }
 }
 
-/// The `StartupMessage` body: protocol version + `user` / `database` params.
+/// The `StartupMessage` body: protocol version + `user` / `database` params, plus
+/// the `stele_stats` opt-in for the query-stats trailer ([STL-201]).
+///
+/// The shell always opts in so the channel is open; whether the footer is *drawn*
+/// is the client-side `--stats` setting. The server delivers the trailer to any
+/// client that sends this parameter — but no mainstream driver does, so psql and
+/// the JDBC / psycopg gate never receive it.
 fn startup_payload(user: &str, database: &str) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-    for (key, value) in [("user", user), ("database", database)] {
+    for (key, value) in [
+        ("user", user),
+        ("database", database),
+        ("stele_stats", "on"),
+    ] {
         body.extend_from_slice(key.as_bytes());
         body.push(0);
         body.extend_from_slice(value.as_bytes());
@@ -642,6 +676,10 @@ mod tests {
     fn startup_payload_carries_protocol_and_params() {
         let p = startup_payload("alice", "stele");
         assert_eq!(&p[..4], &PROTOCOL_VERSION.to_be_bytes());
-        assert_eq!(&p[4..], b"user\0alice\0database\0stele\0\0");
+        // The shell always opts in to the query-stats trailer (STL-201).
+        assert_eq!(
+            &p[4..],
+            b"user\0alice\0database\0stele\0stele_stats\0on\0\0"
+        );
     }
 }

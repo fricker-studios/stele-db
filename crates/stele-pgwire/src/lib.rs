@@ -153,6 +153,7 @@ const MSG_BACKEND_KEY_DATA: u8 = b'K';
 const MSG_PARAMETER_STATUS: u8 = b'S';
 const MSG_READY_FOR_QUERY: u8 = b'Z';
 const MSG_ERROR_RESPONSE: u8 = b'E';
+const MSG_NOTICE_RESPONSE: u8 = b'N';
 const MSG_QUERY: u8 = b'Q';
 const MSG_TERMINATE: u8 = b'X';
 const MSG_ROW_DESCRIPTION: u8 = b'T';
@@ -213,6 +214,9 @@ const SQLSTATE_DUPLICATE_COLUMN: &str = "42701";
 const SQLSTATE_UNDEFINED_COLUMN: &str = "42703";
 const SQLSTATE_INVALID_TABLE_DEFINITION: &str = "42P16";
 const SQLSTATE_INTERNAL_ERROR: &str = "XX000";
+// `successful_completion` — the SQLSTATE on an informational `NoticeResponse`
+// that reports nothing wrong, e.g. the query-stats trailer ([STL-201]).
+const SQLSTATE_SUCCESS: &str = "00000";
 // A literal in a `WHERE` / `VALUES` that does not match its column's type — the
 // code Postgres returns for an unparsable value (STL-147 DML routing).
 const SQLSTATE_INVALID_TEXT_REPRESENTATION: &str = "22P02";
@@ -1016,6 +1020,9 @@ async fn run_session<S: Wire>(
     };
     tracing::Span::current().record("user", user.as_str());
     let principal = Principal::new(user.into_bytes());
+    // Whether to append the opt-in query-stats trailer to row replies ([STL-201]);
+    // fixed for the connection's life from the startup parameter.
+    let stats_enabled = startup.stats_enabled();
 
     // --- 3. Send the OK bundle: AuthOk → ParameterStatus → BackendKeyData → ReadyForQuery
     write_authentication_ok(stream).await?;
@@ -1132,7 +1139,16 @@ async fn run_session<S: Wire>(
                 // first error). `handle_simple_query` writes the per-statement
                 // replies and advances the transaction state; the trailing
                 // ReadyForQuery — carrying the resulting status byte — is ours.
-                handle_simple_query(stream, &q, &session, &mut txn, metrics, &principal).await?;
+                handle_simple_query(
+                    stream,
+                    &q,
+                    &session,
+                    &mut txn,
+                    metrics,
+                    &principal,
+                    stats_enabled,
+                )
+                .await?;
                 write_ready_for_query(stream, txn.status_byte()).await?;
             }
             other => {
@@ -1282,6 +1298,7 @@ async fn handle_simple_query<S: Wire>(
     txn: &mut ConnTxn,
     metrics: &SharedMetrics,
     principal: &Principal,
+    stats_enabled: bool,
 ) -> Result<(), WireError> {
     if sql.trim().is_empty() {
         debug!("empty simple query");
@@ -1412,7 +1429,7 @@ async fn handle_simple_query<S: Wire>(
                 // `DELETE` — routed inline or through the session engine. On an
                 // error the reply is already on the wire and the batch aborts
                 // (Postgres stops on the first error), like the DDL arm above.
-                if !run_non_ddl(stream, stmt, session, txn, principal).await? {
+                if !run_non_ddl(stream, stmt, session, txn, principal, stats_enabled).await? {
                     txn.mark_failed();
                     return Ok(());
                 }
@@ -1446,6 +1463,7 @@ async fn run_non_ddl<S: Wire>(
     session: &SharedSession,
     txn: &mut ConnTxn,
     principal: &Principal,
+    stats_enabled: bool,
 ) -> Result<bool, WireError> {
     if let Some(columns) = constant_select(stmt) {
         write_row_description(stream, &columns, &[]).await?;
@@ -1454,7 +1472,7 @@ async fn run_non_ddl<S: Wire>(
         return Ok(true);
     }
     cap_unbounded_select(stmt, SIMPLE_QUERY_ROW_CAP);
-    run_statement(stream, stmt, session, txn, principal).await
+    run_statement(stream, stmt, session, txn, principal, stats_enabled).await
 }
 
 /// `BEGIN` / `START TRANSACTION` — open an explicit transaction block ([STL-174]).
@@ -1772,6 +1790,7 @@ async fn run_statement<S: Wire>(
     session: &SharedSession,
     txn: &mut ConnTxn,
     principal: &Principal,
+    stats_enabled: bool,
 ) -> Result<bool, WireError> {
     match run_query(session, stmt, txn, principal) {
         Ok(StatementOutcome::Rows(result)) => match decode_result_rows(&result) {
@@ -1779,6 +1798,17 @@ async fn run_statement<S: Wire>(
                 write_row_description(stream, &result_header(&result), &[]).await?;
                 for row in &data_rows {
                     write_data_row(stream, row, &[]).await?;
+                }
+                // The opt-in "see the engine" query-stats trailer ([STL-201]): a
+                // `NoticeResponse` carrying the read's scan accounting, after the
+                // rows and before `CommandComplete`. Only when the client asked for
+                // it and the read actually ran a scan (a join / overlay read leaves
+                // `stats` `None`, so the footer is suppressed).
+                if stats_enabled && let Some(stats) = &result.stats {
+                    // Bind the serialized line to a local so it outlives the await
+                    // (rather than borrowing a temporary across it).
+                    let notice = stats.to_notice();
+                    write_notice_response(stream, "NOTICE", SQLSTATE_SUCCESS, &notice).await?;
                 }
                 let n = u64::try_from(data_rows.len()).unwrap_or(u64::MAX);
                 write_command_complete(stream, &CommandTag::Select(n)).await?;
@@ -3084,7 +3114,23 @@ impl StartupMessage {
             .find(|(k, _)| k == "user")
             .map(|(_, v)| v.as_str())
     }
+
+    /// Whether the client opted in to the query-stats trailer ([STL-201]) by
+    /// sending the `stele_stats` startup parameter set to anything but `off`.
+    ///
+    /// The `stele shell` sets it; no mainstream driver does, so psql and the
+    /// JDBC / psycopg gate never receive the extra `NoticeResponse`.
+    fn stats_enabled(&self) -> bool {
+        self.params
+            .iter()
+            .find(|(k, _)| k == STATS_STARTUP_PARAM)
+            .is_some_and(|(_, v)| v != "off")
+    }
 }
+
+/// The startup parameter a client sets to opt in to the query-stats trailer
+/// ([STL-201]). Shared with the `stele shell` client, which always sends it.
+const STATS_STARTUP_PARAM: &str = "stele_stats";
 
 /// Read the startup phase, transparently refusing repeated SSL/GSS requests.
 ///
@@ -3288,6 +3334,38 @@ async fn write_error_response<S: Wire>(
     let len = i32::try_from(4 + payload.len()).unwrap_or(i32::MAX);
     let mut frame = BytesMut::with_capacity(5 + payload.len());
     frame.put_u8(MSG_ERROR_RESPONSE);
+    frame.put_i32(len);
+    frame.put_slice(&payload);
+    stream.write_all(&frame).await
+}
+
+/// A `NoticeResponse` ('N') — same field-coded body as [`write_error_response`],
+/// but informational: it never aborts a statement or changes the transaction
+/// status. Used to carry the opt-in query-stats trailer ([STL-201]); a client
+/// that does not recognize the message field simply ignores it.
+async fn write_notice_response<S: Wire>(
+    stream: &mut S,
+    severity: &str,
+    sqlstate: &str,
+    message: &str,
+) -> io::Result<()> {
+    // 'N' + len + sequence of (Byte1 field-code, cstring) + terminating Byte1 0.
+    let mut payload = BytesMut::new();
+    for (code, text) in [
+        (b'S', severity),
+        (b'V', severity),
+        (b'C', sqlstate),
+        (b'M', message),
+    ] {
+        payload.put_u8(code);
+        payload.put_slice(text.as_bytes());
+        payload.put_u8(0);
+    }
+    payload.put_u8(0); // terminator
+
+    let len = i32::try_from(4 + payload.len()).unwrap_or(i32::MAX);
+    let mut frame = BytesMut::with_capacity(5 + payload.len());
+    frame.put_u8(MSG_NOTICE_RESPONSE);
     frame.put_i32(len);
     frame.put_slice(&payload);
     stream.write_all(&frame).await

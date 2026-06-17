@@ -67,6 +67,11 @@ struct ShellArgs {
     /// Result-table border style.
     #[arg(long, value_enum, default_value_t = render::BorderStyle::Psql)]
     border: render::BorderStyle,
+    /// The "see the engine" query-stats footer (STL-201): `off`, `compact`, or
+    /// `detailed`. Defaults to `compact` in an interactive session and `off` when
+    /// scripted/piped, so captured output stays byte-clean.
+    #[arg(long, value_enum)]
+    stats: Option<render::StatsMode>,
     /// Prepend a 1-based row-number column to result tables.
     #[arg(long)]
     row_numbers: bool,
@@ -164,6 +169,7 @@ fn main() -> anyhow::Result<()> {
                 border: s.border,
                 row_nums: s.row_numbers,
                 no_color: s.no_color,
+                stats: s.stats,
                 admin: admin::AdminConfig {
                     host: admin_host,
                     port: s.admin_port,

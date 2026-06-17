@@ -571,7 +571,7 @@ impl GatheredColumns {
 /// `row_groups_total == row_groups_pruned_zone + row_groups_scanned` — and a
 /// segment whose *every* row-group is pruned this way is itself counted in
 /// [`segments_pruned_zone`](Self::segments_pruned_zone) (no identity chunk read).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ScanStats {
     /// Total sealed segments offered to the scan.
     pub segments_total: usize,

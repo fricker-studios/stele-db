@@ -885,6 +885,72 @@ SELECT 1;
     assert!(stdout.contains("(1 row)"), "{stdout}");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_stats_footer_renders_under_the_flag() {
+    // STL-201: `--stats` draws the "see the engine" footer under each result. The
+    // server delivers the scan accounting over a NoticeResponse the shell parses;
+    // this is the end-to-end proof the channel and the renderer connect.
+    let addr = spawn_server().await;
+    let script = "\
+CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING;
+INSERT INTO account VALUES (1, 100);
+SELECT id, balance FROM account;
+\\q
+";
+
+    // Compact: a one-liner. The rows live in the in-memory delta (nothing flushed),
+    // so the footer says so rather than inventing a segment scan.
+    let compact =
+        tokio::task::spawn_blocking(move || run_shell(addr, script, &["--stats", "compact"]))
+            .await
+            .expect("shell task");
+    let stdout = String::from_utf8_lossy(&compact.stdout);
+    assert!(compact.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("live @ now()"),
+        "compact footer missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("no sealed segments (delta only)"),
+        "compact footer should note the delta-only read: {stdout}"
+    );
+
+    // Detailed: the multi-line breakdown.
+    let detailed =
+        tokio::task::spawn_blocking(move || run_shell(addr, script, &["--stats", "detailed"]))
+            .await
+            .expect("shell task");
+    let stdout = String::from_utf8_lossy(&detailed.stdout);
+    assert!(detailed.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("query stats"),
+        "detailed header missing: {stdout}"
+    );
+    assert!(stdout.contains("rows returned"), "{stdout}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_query_stats_footer_by_default_when_scripted() {
+    // A scripted (piped) session defaults `--stats` off, so captured output stays
+    // byte-clean — the footer never appears unless asked for ([STL-201]).
+    let addr = spawn_server().await;
+    let script = "\
+CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING;
+INSERT INTO account VALUES (1, 100);
+SELECT id, balance FROM account;
+\\q
+";
+    let output = tokio::task::spawn_blocking(move || run_shell(addr, script, &[]))
+        .await
+        .expect("shell task");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        !stdout.contains("live @ now()") && !stdout.contains("query stats"),
+        "no footer should appear by default in a scripted session: {stdout}"
+    );
+}
+
 /// A unique scratch directory under the OS temp dir, removed on drop.
 struct Scratch(PathBuf);
 

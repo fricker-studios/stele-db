@@ -68,6 +68,7 @@ use stele_common::hash::Digest;
 use stele_common::metrics::{SharedMetrics, StatementKind};
 use stele_common::period::Interval;
 use stele_common::provenance::{self, Principal, TxnId};
+use stele_common::query_stats::QueryStats;
 use stele_common::row_codec::{self, RowCodecError};
 use stele_common::scram::{self, ScramVerifier};
 use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros, ValidTimeMicros};
@@ -75,9 +76,9 @@ use stele_common::types::{LogicalType, ScalarValue};
 use stele_exec::{
     AggregateFunc as ExecAggregateFunc, Aggregator, ArithOp as ExecArithOp, Batch, CmpOp, Column,
     DEFAULT_BATCH_SIZE, ExplodePayload, Expr, ExprError, Filter, GatheredColumns,
-    JoinType as ExecJoinType, LogicOp, Operator, ScanError, ScanSource, SnapshotScan, SortKey,
-    Vector, distinct_selection, eval_expr, evaluate, hash_aggregate, hash_join, limit_selection,
-    sort_selection,
+    JoinType as ExecJoinType, LogicOp, Operator, ScanError, ScanSource, ScanStats, SnapshotScan,
+    SortKey, Vector, distinct_selection, eval_expr, evaluate, hash_aggregate, hash_join,
+    limit_selection, sort_selection,
 };
 use stele_sql::Password;
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
@@ -314,6 +315,46 @@ pub struct SelectResult {
     /// (the value's canonical encoding) or `None` for a SQL `NULL` ([STL-154]),
     /// which the wire layer renders as the length-`-1` `DataRow` sentinel.
     pub rows: Vec<Vec<Option<Vec<u8>>>>,
+    /// Per-query execution accounting for the "see the engine" footer ([STL-201]),
+    /// folded from the scan's `ScanStats`. `Some` only for a read that ran the
+    /// committed-only snapshot-scan fast path (the common `SELECT`); `None` for a
+    /// read whose rows came another way — a read-your-own-writes overlay, a
+    /// provenance-pseudo-column read, a join, or a synthetic catalog/history
+    /// result — so the wire layer suppresses the footer rather than reporting a
+    /// scan that did not happen.
+    pub stats: Option<QueryStats>,
+}
+
+/// A committed-only snapshot scan's reconstructed rows plus its pruning
+/// accounting ([`scan_rows`](SessionEngine::scan_rows)) — paired so the
+/// "see the engine" footer ([STL-201]) can report the scan that produced them.
+struct ScannedRows {
+    rows: Vec<Vec<Option<Vec<u8>>>>,
+    stats: ScanStats,
+}
+
+/// Fold a scan's [`ScanStats`] into the wire [`QueryStats`] the "see the engine"
+/// footer renders ([STL-201]).
+///
+/// `rows` is the count the query finally returned (post-filter / post-aggregate);
+/// `snapshot` is the resolved system-time the read ran at. The `time_travel` flag
+/// is left `false` here and stamped by the caller that knows whether a `FOR
+/// SYSTEM_TIME AS OF` qualifier was given (only [`execute_at`](SessionEngine::execute_at)
+/// sees the raw statement's temporal clause).
+const fn query_stats(scan: &ScanStats, rows: usize, snapshot: SystemTimeMicros) -> QueryStats {
+    QueryStats {
+        rows: rows as u64,
+        system_snapshot: snapshot.0,
+        time_travel: false,
+        segments_total: scan.segments_total as u64,
+        segments_scanned: scan.segments_scanned as u64,
+        segments_pruned_zone: scan.segments_pruned_zone as u64,
+        segments_pruned_bloom: scan.segments_pruned_bloom as u64,
+        segments_pruned_superseded: scan.segments_pruned_superseded as u64,
+        row_groups_total: scan.row_groups_total as u64,
+        row_groups_scanned: scan.row_groups_scanned as u64,
+        row_groups_pruned_zone: scan.row_groups_pruned_zone as u64,
+    }
 }
 
 /// The affected-row count of a committed `INSERT` / `UPDATE` / `DELETE` /
@@ -1638,7 +1679,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             )?);
             rows.push(row);
         }
-        Ok(SelectResult { columns, rows })
+        Ok(SelectResult {
+            columns,
+            rows,
+            // A synthetic catalog / history / audit result is not a table scan, so
+            // it carries no scan accounting ([STL-201]).
+            stats: None,
+        })
     }
 
     /// The Stele-native segment-introspection result for `table` — the wire
@@ -1719,7 +1766,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             })
             .collect();
 
-        Ok(SelectResult { columns, rows })
+        Ok(SelectResult {
+            columns,
+            rows,
+            // A synthetic catalog / history / audit result is not a table scan, so
+            // it carries no scan accounting ([STL-201]).
+            stats: None,
+        })
     }
 
     /// The tamper-evident commit-chain audit of `table` — or of every key when
@@ -1855,7 +1908,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             verdict(&mut row);
             rows.push(row);
         }
-        Ok(SelectResult { columns, rows })
+        Ok(SelectResult {
+            columns,
+            rows,
+            // A synthetic catalog / history / audit result is not a table scan, so
+            // it carries no scan accounting ([STL-201]).
+            stats: None,
+        })
     }
 
     /// Set the **write principal** stamped on every version subsequently committed
@@ -2406,7 +2465,17 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                         .iter()
                         .any(|a| a.dimension == TimeDimension::System);
                     let live: &[BoundDml] = if system_time_travel { &[] } else { overlay };
-                    return self.run_select(&bound, live);
+                    let mut outcome = self.run_select(&bound, live)?;
+                    // Stamp the "see the engine" footer's time-travel flag here, the
+                    // one place that sees the raw statement's `FOR SYSTEM_TIME AS OF`
+                    // clause ([STL-201]); `run_select` left it `false`.
+                    if system_time_travel
+                        && let StatementOutcome::Rows(result) = &mut outcome
+                        && let Some(stats) = &mut result.stats
+                    {
+                        stats.time_travel = true;
+                    }
+                    return Ok(outcome);
                 }
                 // Not a SELECT either ⇒ try the DML router below.
                 Err(SelectError::NotSelect) => {}
@@ -2883,6 +2952,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// A `GROUP BY` / aggregate query ([STL-171]) folds the same reconstructed,
     /// filtered rows into grouped output ([`run_aggregate`]); a plain query
     /// projects them.
+    // Threading the scan accounting up for the query-stats footer ([STL-201])
+    // pushed the row-production match a few lines past the limit; the control flow
+    // is unchanged, so splitting it would scatter it rather than clarify it.
+    #[allow(clippy::too_many_lines)]
     fn run_select(
         &self,
         bound: &BoundSelect,
@@ -2957,18 +3030,27 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // valid-time table is overlaid too — its writes supersede one version per
         // business key like a system-only table, and a `FOR VALID_TIME AS OF` pin is
         // re-applied to the overlaid rows ([STL-223]).
-        let rows = if overlay.iter().any(|d| d.table() == table) {
-            Self::overlaid_rows(
-                bound,
-                state,
-                &addressable,
-                value_count,
-                overlay,
-                valid_cols,
-                &plan,
-                needs_provenance,
-                &self.metrics,
-            )?
+        // The scan's pruning accounting ([`ScanStats`], STL-146), threaded up into
+        // the result for the "see the engine" footer ([STL-201]) — but only on the
+        // committed-only snapshot-scan fast path below. A read-your-own-writes
+        // overlay or a provenance read reconstructs its rows another way and has no
+        // single scan to account for, so it leaves this `None` and the footer is
+        // suppressed.
+        let (rows, scan_stats) = if overlay.iter().any(|d| d.table() == table) {
+            (
+                Self::overlaid_rows(
+                    bound,
+                    state,
+                    &addressable,
+                    value_count,
+                    overlay,
+                    valid_cols,
+                    &plan,
+                    needs_provenance,
+                    &self.metrics,
+                )?,
+                None,
+            )
         } else if needs_provenance {
             // A provenance pseudo-column ([STL-247]) is referenced: materialize each
             // version's provenance after its value columns and filter over the
@@ -2983,7 +3065,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 value_count,
                 &self.metrics,
             )?;
-            filter_rows(&plan, &addressable, base)?
+            (filter_rows(&plan, &addressable, base)?, None)
         } else {
             // Rule-based index use ([STL-233], ranges [STL-237]): an equality
             // or one-sided range comparison on an indexed value column probes
@@ -2994,25 +3076,33 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // answer identical to a full scan either way — an index changes
             // speed, never results.
             match self.index_window(table, bound, &schema_columns) {
-                Some(Probe::Empty) => Vec::new(),
-                Some(Probe::Window { low, high }) => Self::scan_rows(
-                    bound,
-                    state,
-                    &schema_columns,
-                    value_count,
-                    Some(&(low, high)),
-                    &plan,
-                    &self.metrics,
-                )?,
-                None => Self::scan_rows(
-                    bound,
-                    state,
-                    &schema_columns,
-                    value_count,
-                    None,
-                    &plan,
-                    &self.metrics,
-                )?,
+                // The index proved no key can match, so no scan ran; report the
+                // all-zero accounting rather than suppressing the footer.
+                Some(Probe::Empty) => (Vec::new(), Some(ScanStats::default())),
+                Some(Probe::Window { low, high }) => {
+                    let scanned = Self::scan_rows(
+                        bound,
+                        state,
+                        &schema_columns,
+                        value_count,
+                        Some(&(low, high)),
+                        &plan,
+                        &self.metrics,
+                    )?;
+                    (scanned.rows, Some(scanned.stats))
+                }
+                None => {
+                    let scanned = Self::scan_rows(
+                        bound,
+                        state,
+                        &schema_columns,
+                        value_count,
+                        None,
+                        &plan,
+                        &self.metrics,
+                    )?;
+                    (scanned.rows, Some(scanned.stats))
+                }
             }
         };
 
@@ -3036,12 +3126,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // axis) and over the read-your-own-writes overlay (ordering after
         // overlay, [STL-203]).
         if let Some(agg) = &bound.aggregate {
-            return Ok(StatementOutcome::Rows(run_aggregate(
-                bound,
-                agg,
-                &schema_columns,
-                &rows,
-            )?));
+            let mut result = run_aggregate(bound, agg, &schema_columns, &rows)?;
+            // The footer reports the rows the aggregate *returned* (its grouped
+            // output), over the scan that fed it ([STL-201]).
+            result.stats = scan_stats.map(|s| query_stats(&s, result.rows.len(), bound.snapshot));
+            return Ok(StatementOutcome::Rows(result));
         }
 
         let columns = projected_columns(&bound.projection, &addressable, n_schema);
@@ -3050,9 +3139,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .iter()
             .map(|&r| projection.iter().map(|&i| rows[r][i].clone()).collect())
             .collect();
+        let stats = scan_stats.map(|s| query_stats(&s, out_rows.len(), bound.snapshot));
         Ok(StatementOutcome::Rows(SelectResult {
             columns,
             rows: out_rows,
+            stats,
         }))
     }
 
@@ -3182,7 +3273,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         key_window: Option<&(BusinessKey, BusinessKey)>,
         plan: &FilterPlan,
         metrics: &SharedMetrics,
-    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+    ) -> Result<ScannedRows, EngineError> {
         // The `WHERE` resolves to a single vectorized predicate ([STL-213]): a
         // `<col> <cmp> <scalar>` comparison ([STL-151]), a per-row period
         // predicate lowered to `Expr::Period` over `MakePeriod` operands
@@ -3191,7 +3282,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // an `Empty` plan excludes every row, so skip the scan entirely (never a
         // silently-unfiltered read).
         let filter_expr = match plan {
-            FilterPlan::Empty => return Ok(Vec::new()),
+            // A constant-false predicate skips the scan entirely — no segment is
+            // examined, so the accounting is the all-zero default.
+            FilterPlan::Empty => {
+                return Ok(ScannedRows {
+                    rows: Vec::new(),
+                    stats: ScanStats::default(),
+                });
+            }
             FilterPlan::KeepAll => None,
             FilterPlan::Predicate(expr) => Some(expr.clone()),
         };
@@ -3264,7 +3362,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 rows.push((0..ncols).map(|i| batch_cell(&batch, i, r)).collect());
             }
         }
-        Ok(rows)
+        // The pruning accounting bubbles up from the `ScanSource` at the bottom of
+        // the pipeline through the shaping operators ([`Operator::stats`], STL-201).
+        // The loop above drained at least one `next`, so the scan has resolved; the
+        // default guards the impossible un-resolved case rather than panicking.
+        let stats = pipeline.stats().unwrap_or_default();
+        Ok(ScannedRows { rows, stats })
     }
 
     /// The candidate window for a bound `SELECT`'s `WHERE`, when a secondary
@@ -3506,6 +3609,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         Ok(StatementOutcome::Rows(SelectResult {
             columns: join.columns.clone(),
             rows,
+            // A join reads two scans; per-query accounting over a join is a
+            // follow-up ([STL-201]), so the footer is suppressed for now.
+            stats: None,
         }))
     }
 
@@ -6613,6 +6719,9 @@ fn run_aggregate(
     Ok(SelectResult {
         columns: agg.columns.clone(),
         rows: result_rows,
+        // The caller ([`run_select`](SessionEngine::run_select)) folds in the scan
+        // accounting that fed this aggregate ([STL-201]).
+        stats: None,
     })
 }
 

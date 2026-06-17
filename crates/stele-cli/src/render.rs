@@ -6,6 +6,8 @@
 //! through the [`Theme`](crate::theme::Theme), which is the identity when the
 //! session is piped — so scripted output stays plain text.
 
+use stele_common::query_stats::QueryStats;
+
 use crate::theme::{Role, Seg};
 
 /// A result column: wire name plus the Postgres type OID from the
@@ -40,6 +42,18 @@ pub enum BorderStyle {
     Markdown,
     /// Borderless two-space layout with a thin header rule.
     Clean,
+}
+
+/// The "see the engine" query-stats footer mode (`--stats`, `\stats`) — STL-201.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum StatsMode {
+    /// No footer (the default when scripted/piped, for byte-clean output).
+    #[default]
+    Off,
+    /// A one-line summary under each result.
+    Compact,
+    /// A multi-line breakdown of the scan accounting.
+    Detailed,
 }
 
 /// Rendering options for one result table.
@@ -312,6 +326,127 @@ pub fn fmt_elapsed(elapsed: std::time::Duration) -> String {
     format!("{:.3} ms", elapsed.as_secs_f64() * 1000.0)
 }
 
+/// The "see the engine" query-stats footer ([STL-201]), rendered from the
+/// server-delivered [`QueryStats`]: a compact one-liner or a detailed block.
+/// [`StatsMode::Off`] returns no lines, so the caller draws nothing.
+///
+/// The footer reports the read's *scan accounting* — segment and row-group
+/// pruning, the system-time snapshot — which the `(N rows · X ms)` count trailer
+/// does not; timing stays in that trailer, so the two never duplicate.
+#[must_use]
+pub fn stats_lines(stats: &QueryStats, mode: StatsMode) -> Vec<Line> {
+    match mode {
+        StatsMode::Off => Vec::new(),
+        StatsMode::Compact => vec![compact_stats(stats)],
+        StatsMode::Detailed => detailed_stats(stats),
+    }
+}
+
+/// The system-time snapshot label and its role: an accented "snapshot @ …" for a
+/// time-traveled read, a muted "live @ now()" for the present.
+fn snapshot_label(stats: &QueryStats) -> (String, Role) {
+    if stats.time_travel {
+        (
+            format!("snapshot @ {} µs", stats.system_snapshot),
+            Role::Acc,
+        )
+    } else {
+        ("live @ now()".to_owned(), Role::Mut)
+    }
+}
+
+/// The compact one-line footer: snapshot · segment scan/prune summary.
+fn compact_stats(stats: &QueryStats) -> Line {
+    let (snap, snap_role) = snapshot_label(stats);
+    let mut segs: Line = vec![(Role::Dim, "  ⤷ ".to_owned()), (snap_role, snap)];
+    if stats.segments_total == 0 {
+        // The whole read was served from the in-memory delta tier — no sealed
+        // segment was offered to the scan, so there is nothing to prune.
+        segs.push((Role::Mut, " · no sealed segments (delta only)".to_owned()));
+    } else {
+        let plural = if stats.segments_total == 1 { "" } else { "s" };
+        segs.push((
+            Role::Mut,
+            format!(
+                " · scanned {} of {} segment{plural}",
+                stats.segments_scanned, stats.segments_total
+            ),
+        ));
+        let pruned = stats.segments_pruned();
+        if pruned > 0 {
+            segs.push((Role::Mut, format!(" · {pruned} pruned")));
+        }
+    }
+    segs
+}
+
+/// The detailed multi-line footer: every scan-accounting field, aligned.
+fn detailed_stats(stats: &QueryStats) -> Vec<Line> {
+    // Left-pad the label to a fixed column so the values line up; labels are ASCII
+    // (plus the 1-wide `↳`), so a char-count pad matches display width.
+    let row = |key: &str, value: String, role: Role| -> Line {
+        vec![(Role::Mut, format!("   {key:<17}")), (role, value)]
+    };
+    let mut out: Vec<Line> = vec![vec![(
+        Role::Div,
+        "  ── query stats ──────────────────────────".to_owned(),
+    )]];
+    out.push(row("rows returned", stats.rows.to_string(), Role::Text));
+    let (sys_value, sys_role) = if stats.time_travel {
+        (
+            format!("{} µs  (time-travel)", stats.system_snapshot),
+            Role::Acc,
+        )
+    } else {
+        ("live @ now()".to_owned(), Role::Text)
+    };
+    out.push(row("system-time", sys_value, sys_role));
+    if stats.segments_total == 0 {
+        out.push(row(
+            "segments",
+            "none sealed (served from the in-memory delta)".to_owned(),
+            Role::Text,
+        ));
+    } else {
+        out.push(row(
+            "segments",
+            format!(
+                "{} total · {} scanned · {} pruned",
+                stats.segments_total,
+                stats.segments_scanned,
+                stats.segments_pruned()
+            ),
+            Role::Text,
+        ));
+        out.push(row(
+            "↳ zone-map",
+            stats.segments_pruned_zone.to_string(),
+            Role::Text,
+        ));
+        out.push(row(
+            "↳ bloom",
+            stats.segments_pruned_bloom.to_string(),
+            Role::Text,
+        ));
+        out.push(row(
+            "↳ superseded",
+            stats.segments_pruned_superseded.to_string(),
+            Role::Text,
+        ));
+    }
+    if stats.row_groups_total > 0 {
+        out.push(row(
+            "row-groups",
+            format!(
+                "{} total · {} scanned · {} pruned",
+                stats.row_groups_total, stats.row_groups_scanned, stats.row_groups_pruned_zone
+            ),
+            Role::Text,
+        ));
+    }
+    out
+}
+
 /// Terminal display width — CJK/emoji occupy two columns, combining marks
 /// zero — so padded frames stay aligned for any cell text.
 fn width_of(s: &str) -> usize {
@@ -553,5 +688,79 @@ mod tests {
             "[\n  {\"ok\": true, \"note\": \"a\\\"b\\\\c\\n\"}\n]"
         );
         assert_eq!(text(&json_lines(&cols, &[])), "[]");
+    }
+
+    // --- query-stats footer (STL-201) --------------------------------------
+
+    fn flushed_stats() -> QueryStats {
+        QueryStats {
+            rows: 1,
+            system_snapshot: 0,
+            time_travel: false,
+            segments_total: 3,
+            segments_scanned: 1,
+            segments_pruned_zone: 2,
+            segments_pruned_bloom: 0,
+            segments_pruned_superseded: 0,
+            row_groups_total: 1,
+            row_groups_scanned: 1,
+            row_groups_pruned_zone: 0,
+        }
+    }
+
+    #[test]
+    fn stats_off_renders_nothing() {
+        assert!(stats_lines(&flushed_stats(), StatsMode::Off).is_empty());
+    }
+
+    #[test]
+    fn compact_footer_summarizes_the_scan() {
+        let rendered = text(&stats_lines(&flushed_stats(), StatsMode::Compact));
+        assert_eq!(
+            rendered,
+            "  ⤷ live @ now() · scanned 1 of 3 segments · 2 pruned"
+        );
+    }
+
+    #[test]
+    fn compact_footer_notes_a_delta_only_read() {
+        let stats = QueryStats {
+            segments_total: 0,
+            ..flushed_stats()
+        };
+        let rendered = text(&stats_lines(&stats, StatsMode::Compact));
+        assert!(
+            rendered.contains("no sealed segments (delta only)"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn compact_footer_marks_a_time_travel_read() {
+        let stats = QueryStats {
+            time_travel: true,
+            system_snapshot: 1_700_000_000_000_000,
+            ..flushed_stats()
+        };
+        let rendered = text(&stats_lines(&stats, StatsMode::Compact));
+        assert!(
+            rendered.contains("snapshot @ 1700000000000000 µs"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("live @ now()"), "{rendered}");
+    }
+
+    #[test]
+    fn detailed_footer_breaks_down_every_prune() {
+        let rendered = text(&stats_lines(&flushed_stats(), StatsMode::Detailed));
+        assert!(rendered.contains("query stats"), "{rendered}");
+        assert!(rendered.contains("rows returned"), "{rendered}");
+        assert!(rendered.contains("system-time"), "{rendered}");
+        assert!(
+            rendered.contains("3 total · 1 scanned · 2 pruned"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("↳ zone-map"), "{rendered}");
+        assert!(rendered.contains("row-groups"), "{rendered}");
     }
 }
