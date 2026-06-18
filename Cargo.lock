@@ -2735,7 +2735,7 @@ dependencies = [
 name = "stele-engine"
 version = "0.3.0"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "stele-catalog",
  "stele-common",
  "stele-exec",
@@ -2781,7 +2781,7 @@ version = "0.3.0"
 dependencies = [
  "bytes",
  "futures-util",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "rcgen",
  "rustls",
  "rustls-pki-types",
