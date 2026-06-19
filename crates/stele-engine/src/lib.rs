@@ -85,10 +85,10 @@ use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::dml::{BoundDml, DmlError, InsertRow};
 use stele_sql::merge::{BoundMerge, MergeBound, MergeSource, MergeValid, MergeValue};
 use stele_sql::select::{
-    AggregateFunc, ArithOp, BoundAggregate, BoundJoin, BoundPeriod, BoundPeriodPredicate,
-    BoundPredicate, BoundScalar, BoundSelect, BoundSubqueryFilter, CompareOp, Correlation,
-    JoinColumnRef, JoinType, OutputItem, PeriodEndpoint, Projection, SelectError, SortTarget,
-    SubqueryKind,
+    AggregateFunc, ArithOp, BoundAggregate, BoundCte, BoundJoin, BoundJoinSide, BoundPeriod,
+    BoundPeriodPredicate, BoundPredicate, BoundScalar, BoundSelect, BoundSubqueryFilter, CompareOp,
+    Correlation, JoinColumnRef, JoinType, OutputItem, PeriodEndpoint, Projection, SelectError,
+    SortTarget, SubqueryKind,
 };
 use stele_sql::{
     AdminCommand, BindContext, BindError, BoundCopy, CopyError, CopyShape, Statement,
@@ -333,6 +333,27 @@ struct ScannedRows {
     rows: Vec<Vec<Option<Vec<u8>>>>,
     stats: ScanStats,
 }
+
+/// A common-table-expression / derived table's **materialized** rows ([STL-242]),
+/// computed once at the statement snapshot.
+///
+/// A `WITH name AS (…)` entry, or a `FROM (…) AS d` derived table, runs once and
+/// is then referenced like a table. Its rows are the same canonical-bytes shape a
+/// base-table scan reconstructs (`[col cells…]`, each cell `Some(bytes)` or `None`
+/// for NULL), so the outer query's `WHERE` / aggregate / projection / join feed
+/// from it through the very same downstream pipeline as a base table. The relation's
+/// column header is carried on the bound plan ([`BoundSelect::relation_columns`] /
+/// [`BoundJoinSide::columns`]), so only the rows are kept here.
+#[derive(Debug, Clone)]
+struct MaterializedRelation {
+    rows: Vec<Vec<Option<Vec<u8>>>>,
+}
+
+/// The common-table-expressions / derived tables in scope while a `SELECT` runs
+/// ([STL-242]) — name → its materialized result, shared by [`Arc`] so a nested
+/// query inherits the enclosing scope without copying the rows. A [`BTreeMap`]
+/// (not a hash map) keeps the deterministic-core ordering invariant.
+type CteScope = BTreeMap<String, Arc<MaterializedRelation>>;
 
 /// Fold a scan's [`ScanStats`] into the wire [`QueryStats`] the "see the engine"
 /// footer renders ([STL-201]).
@@ -3131,6 +3152,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         if let Some(agg) = &bound.aggregate {
             return Ok(agg.columns.clone());
         }
+        // A CTE reference / derived table ([STL-242]) carries its own resolved
+        // columns; its shape is a function of the projection over those, with no
+        // catalog lookup or provenance pseudo-columns.
+        if let Some(columns) = &bound.relation_columns {
+            let n_schema = columns.len();
+            return Ok(projected_columns(&bound.projection, columns, n_schema));
+        }
         let table = bound.table.as_str();
         let schema = self
             .catalog
@@ -3179,6 +3207,47 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         bound: &BoundSelect,
         overlay: &[BoundDml],
     ) -> Result<StatementOutcome, EngineError> {
+        self.run_select_scoped(bound, overlay, &CteScope::new())
+    }
+
+    /// As [`run_select`](Self::run_select), but with the enclosing
+    /// common-table-expressions / derived tables in scope ([STL-242]).
+    ///
+    /// First materializes this query's own `WITH` list (and any lowered derived
+    /// tables) once, in declaration order — each at the statement snapshot, over
+    /// the same `overlay`, so a later CTE may read an earlier one and the one
+    /// consistent per-statement `(sys, valid)` rule holds (docs/16 §6) — extending
+    /// `parent_scope` into the scope the body resolves references against. A `FROM`
+    /// that names a materialized relation ([`BoundSelect::relation_columns`]) reads
+    /// its rows from that scope and then runs the very same `WHERE` / aggregate /
+    /// projection pipeline a base-table read does; otherwise the base-table and
+    /// join paths run as before.
+    // The committed-fast-path / overlay / provenance row reconstruction reads as one
+    // sequence (as it did on the pre-split `run_select`); the scope/CTE prelude only
+    // adds to it, so splitting would scatter the read path rather than clarify it.
+    #[allow(clippy::too_many_lines)]
+    fn run_select_scoped(
+        &self,
+        bound: &BoundSelect,
+        overlay: &[BoundDml],
+        parent_scope: &CteScope,
+    ) -> Result<StatementOutcome, EngineError> {
+        // Materialize this query's CTEs / derived tables into the scope (extending
+        // the inherited one) before anything references them. The common no-CTE
+        // case borrows the parent untouched; an extended scope shares each relation
+        // by `Arc`, so layering it costs no row copy.
+        let mut owned_scope;
+        let scope: &CteScope = if bound.ctes.is_empty() {
+            parent_scope
+        } else {
+            owned_scope = parent_scope.clone();
+            for cte in &bound.ctes {
+                let relation = self.materialize_cte(cte, overlay, &owned_scope)?;
+                owned_scope.insert(cte.name.clone(), Arc::new(relation));
+            }
+            &owned_scope
+        };
+
         // A two-table `JOIN` ([STL-172]) takes a wholly different path: it scans
         // both sides and combines their rows, rather than projecting one table's
         // reconstructed rows. The single-table fields below are unused for it. A
@@ -3186,8 +3255,34 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // read-your-own-writes overlay ([STL-203]) is single-table and not yet
         // threaded through the join path.
         if let Some(join) = &bound.join {
-            return self.run_join(join, bound.snapshot);
+            return self.run_join(join, bound.snapshot, scope);
         }
+
+        // A `FROM` that names a materialized relation — a CTE reference or a derived
+        // table ([STL-242]) — reads its rows from the scope, not from storage. The
+        // relation carries no provenance and no valid axis, so its addressable set
+        // is just its own columns; the `WHERE` is applied over the materialized rows
+        // ([`filter_rows`]) and the shared tail ([`finish_select`]) runs the
+        // correlated-subquery / aggregate / projection pipeline exactly as a base
+        // table's would.
+        if let Some(columns) = &bound.relation_columns {
+            let relation = scope
+                .get(bound.table.as_str())
+                .ok_or_else(|| EngineError::UnknownTable(bound.table.clone()))?;
+            let schema_columns = columns.clone();
+            let plan = self.resolve_filter(bound, overlay, scope)?;
+            let rows = filter_rows(&plan, &schema_columns, relation.rows.clone())?;
+            return self.finish_select(
+                bound,
+                &schema_columns,
+                &schema_columns,
+                rows,
+                None,
+                overlay,
+                scope,
+            );
+        }
+
         let table = bound.table.as_str();
         let snapshot = bound.snapshot;
         let state = self
@@ -3238,7 +3333,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // resolved plan, identical to a non-subquery `WHERE`. The inner read sees
         // the outer's overlay too, so an in-transaction subquery is consistent
         // with read-your-own-writes ([STL-203]).
-        let plan = self.resolve_filter(bound, overlay)?;
+        let plan = self.resolve_filter(bound, overlay, scope)?;
 
         // Reconstruct the full rows [key, value cells…] live at the snapshot, after
         // the `WHERE` filter. Read-your-own-writes ([STL-203], [STL-223]): when this
@@ -3324,6 +3419,62 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             }
         };
 
+        self.finish_select(
+            bound,
+            &schema_columns,
+            &addressable,
+            rows,
+            scan_stats,
+            overlay,
+            scope,
+        )
+    }
+
+    /// Materialize a CTE / derived table once ([STL-242]): run its defining plan at
+    /// the statement snapshot, over the same `overlay` and `scope` (so it reads the
+    /// transaction's own writes and any earlier sibling CTE), and capture its
+    /// columns + rows.
+    fn materialize_cte(
+        &self,
+        cte: &BoundCte,
+        overlay: &[BoundDml],
+        scope: &CteScope,
+    ) -> Result<MaterializedRelation, EngineError> {
+        let StatementOutcome::Rows(result) = self.run_select_scoped(&cte.plan, overlay, scope)?
+        else {
+            return Err(EngineError::Unsupported("a CTE body must be a SELECT"));
+        };
+        Ok(MaterializedRelation { rows: result.rows })
+    }
+
+    /// The shared result-shaping tail of a single-relation read ([STL-242]): the
+    /// correlated-subquery `WHERE` ([STL-239]), then either grouped aggregation
+    /// ([STL-171]) or `DISTINCT` → `ORDER BY` → `OFFSET`/`LIMIT` projection
+    /// ([STL-263]) — over the reconstructed `rows`, identically for a base table and
+    /// a materialized CTE / derived table.
+    ///
+    /// `schema_columns` types the relation's own columns (for aggregation and the
+    /// correlated decode); `addressable` is the projection/shaping addressable set —
+    /// the schema columns plus provenance pseudo-columns for a base table, or just
+    /// the schema columns for a materialized relation. `scan_stats` is the feeding
+    /// scan's accounting (`None` for an overlay / provenance / materialized read,
+    /// which suppresses the "see the engine" footer).
+    // Eight inputs because the tail is shared by the base-table and CTE read paths,
+    // which reconstruct rows differently (provenance addressable set, scan stats)
+    // but converge here; threading them keeps the one shaping pipeline in one place.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_select(
+        &self,
+        bound: &BoundSelect,
+        schema_columns: &[(String, LogicalType)],
+        addressable: &[(String, LogicalType)],
+        rows: Vec<Vec<Option<Vec<u8>>>>,
+        scan_stats: Option<ScanStats>,
+        overlay: &[BoundDml],
+        scope: &CteScope,
+    ) -> Result<StatementOutcome, EngineError> {
+        let n_schema = schema_columns.len();
+
         // A **correlated** subquery `WHERE` ([STL-239]) cannot fold to a constant
         // plan, so the scan above kept every row (`resolve_filter` → `KeepAll`); the
         // inner is re-run once per surviving outer row, with that row's value
@@ -3331,9 +3482,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // its predicate holds. This sits before the aggregate / projection so a
         // correlated `WHERE` filters rows *before* grouping, exactly as a plain one.
         let rows = match &bound.subquery_filter {
-            Some(sub) if sub.correlation.is_some() => {
-                self.filter_correlated_subquery(sub, &schema_columns, &addressable, rows, overlay)?
-            }
+            Some(sub) if sub.correlation.is_some() => self.filter_correlated_subquery(
+                sub,
+                schema_columns,
+                addressable,
+                rows,
+                overlay,
+                scope,
+            )?,
             _ => rows,
         };
 
@@ -3344,15 +3500,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // axis) and over the read-your-own-writes overlay (ordering after
         // overlay, [STL-203]).
         if let Some(agg) = &bound.aggregate {
-            let mut result = run_aggregate(bound, agg, &schema_columns, &rows)?;
+            let mut result = run_aggregate(bound, agg, schema_columns, &rows)?;
             // The footer reports the rows the aggregate *returned* (its grouped
             // output), over the scan that fed it ([STL-201]).
             result.stats = scan_stats.map(|s| query_stats(&s, result.rows.len(), bound.snapshot));
             return Ok(StatementOutcome::Rows(result));
         }
 
-        let columns = projected_columns(&bound.projection, &addressable, n_schema);
-        let selection = shape_rows(bound, &addressable, &projection, &rows)?;
+        let projection = projection_indices(&bound.projection, addressable, n_schema);
+        let columns = projected_columns(&bound.projection, addressable, n_schema);
+        let selection = shape_rows(bound, addressable, &projection, &rows)?;
         let out_rows: Vec<Vec<Option<Vec<u8>>>> = selection
             .iter()
             .map(|&r| projection.iter().map(|&i| rows[r][i].clone()).collect())
@@ -3393,6 +3550,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         &self,
         bound: &BoundSelect,
         overlay: &[BoundDml],
+        scope: &CteScope,
     ) -> Result<FilterPlan, EngineError> {
         let Some(sub) = &bound.subquery_filter else {
             return Ok(filter_plan(bound));
@@ -3400,8 +3558,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         if sub.correlation.is_some() {
             return Ok(FilterPlan::KeepAll);
         }
-        // The inner is itself a bound `SELECT`, so it always returns rows.
-        let StatementOutcome::Rows(result) = self.run_select(&sub.subquery, overlay)? else {
+        // The inner is itself a bound `SELECT`, so it always returns rows; it runs
+        // under the same CTE scope, so it may reference an enclosing CTE.
+        let StatementOutcome::Rows(result) =
+            self.run_select_scoped(&sub.subquery, overlay, scope)?
+        else {
             return Err(EngineError::Unsupported("a subquery must be a SELECT"));
         };
         fold_subquery(sub.kind, &result)
@@ -3431,6 +3592,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         addressable: &[(String, LogicalType)],
         rows: Vec<Vec<Option<Vec<u8>>>>,
         overlay: &[BoundDml],
+        scope: &CteScope,
     ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
         let correlation = sub
             .correlation
@@ -3454,7 +3616,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 None => empty_inner_keeps(sub.kind),
                 Some(value) => {
                     let inner = correlated_inner(&sub.subquery, correlation, value);
-                    let StatementOutcome::Rows(result) = self.run_select(&inner, overlay)? else {
+                    let StatementOutcome::Rows(result) =
+                        self.run_select_scoped(&inner, overlay, scope)?
+                    else {
                         return Err(EngineError::Unsupported("a subquery must be a SELECT"));
                     };
                     let plan = fold_subquery(sub.kind, &result)?;
@@ -3730,6 +3894,32 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         filter_rows(plan, columns, pinned)
     }
 
+    /// One join side's columns in the executor's columnar shape — a base table
+    /// scanned at `snapshot` ([`scan_all_columns`](Self::scan_all_columns)), or a
+    /// materialized CTE / derived table read from the scope ([STL-242]).
+    ///
+    /// A CTE side's rows are already the canonical-bytes form a scan produces, so
+    /// each column is rebuilt as a [`Column::Bytes`] of its cells — the same shape
+    /// `scan_all_columns` returns, so [`decode_key_column`] and the join output
+    /// assembly consume it unchanged. A CTE name shadows a base table of the same
+    /// name (the binder resolved which it is; the scope is checked first to match).
+    fn join_side_columns(
+        &self,
+        side: &BoundJoinSide,
+        snapshot: SystemTimeMicros,
+        scope: &CteScope,
+    ) -> Result<Vec<Column>, EngineError> {
+        if let Some(relation) = scope.get(side.table.as_str()) {
+            return Ok(materialized_columns(relation, side.columns.len()));
+        }
+        let state = self
+            .tables
+            .get(&side.table)
+            .ok_or_else(|| EngineError::UnknownTable(side.table.clone()))?;
+        let value_count = side.columns.len().saturating_sub(1);
+        Self::scan_all_columns(state, snapshot, value_count)
+    }
+
     /// Run a bound two-table `JOIN` ([STL-172]).
     ///
     /// Both sides are scanned at `snapshot` into the executor's columnar shape
@@ -3747,24 +3937,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         &self,
         join: &BoundJoin,
         snapshot: SystemTimeMicros,
+        scope: &CteScope,
     ) -> Result<StatementOutcome, EngineError> {
-        let left_state = self
-            .tables
-            .get(&join.left.table)
-            .ok_or_else(|| EngineError::UnknownTable(join.left.table.clone()))?;
-        let right_state = self
-            .tables
-            .get(&join.right.table)
-            .ok_or_else(|| EngineError::UnknownTable(join.right.table.clone()))?;
-        let left_value_count = join.left.columns.len().saturating_sub(1);
-        let right_value_count = join.right.columns.len().saturating_sub(1);
-
-        // Scan each side into its columns as shared `Cells` buffers (not the
-        // row-major copy `scan_all_rows` makes), so the output assembly can name a
-        // side's matched rows by index without re-allocating a surviving cell
-        // ([STL-224]).
-        let left_cols = Self::scan_all_columns(left_state, snapshot, left_value_count)?;
-        let right_cols = Self::scan_all_columns(right_state, snapshot, right_value_count)?;
+        // Each side is a base table scanned at `snapshot`, or a materialized CTE /
+        // derived table read from the scope ([STL-242]) — both yield the same
+        // shared-`Cells` columnar shape the join consumes.
+        let left_cols = self.join_side_columns(&join.left, snapshot, scope)?;
+        let right_cols = self.join_side_columns(&join.right, snapshot, scope)?;
         let left_rows = left_cols[0].len();
         let right_rows = right_cols[0].len();
 
@@ -4135,6 +4314,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             subquery_filter: None,
             aggregate: None,
             join: None,
+            ctes: Vec::new(),
+            relation_columns: None,
             distinct: false,
             order_by: Vec::new(),
             offset: 0,
@@ -4200,6 +4381,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             subquery_filter: None,
             aggregate: None,
             join: None,
+            ctes: Vec::new(),
+            relation_columns: None,
             distinct: false,
             order_by: Vec::new(),
             offset: 0,
@@ -4344,6 +4527,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// so the matched keys are distinct; the summary counts them.
     ///
     /// [STL-229]: https://allegromusic.atlassian.net/browse/STL-229
+    // The scan-probe `BoundSelect` gained the CTE/derived-table fields ([STL-242]),
+    // nudging this one-piece expansion just past the line limit; it reads as one
+    // sequence, so splitting it would scatter rather than clarify it.
+    #[allow(clippy::too_many_lines)]
     fn expand_scan_dml(
         &self,
         dml: BoundDml,
@@ -4398,6 +4585,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             subquery_filter: None,
             aggregate: None,
             join: None,
+            ctes: Vec::new(),
+            relation_columns: None,
             // DML row selection takes no result shaping — every match writes.
             distinct: false,
             order_by: Vec::new(),
@@ -4515,6 +4704,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             subquery_filter: None,
             aggregate: None,
             join: None,
+            ctes: Vec::new(),
+            relation_columns: None,
             distinct: false,
             order_by: Vec::new(),
             offset: 0,
@@ -4698,6 +4889,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     subquery_filter: None,
                     aggregate: None,
                     join: None,
+                    ctes: Vec::new(),
+                    relation_columns: None,
                     distinct: false,
                     order_by: Vec::new(),
                     offset: 0,
@@ -6730,6 +6923,27 @@ fn rows_passing_filter(
         .zip(mask)
         .filter_map(|(row, keep)| (keep == Some(true)).then_some(row))
         .collect())
+}
+
+/// A materialized CTE / derived table's rows as the executor's per-column shared
+/// buffers ([STL-242]) — one [`Column::Bytes`] per column, matching the shape
+/// [`scan_all_columns`](SessionEngine::scan_all_columns) returns for a base table,
+/// so a join consumes a CTE side identically.
+///
+/// `ncols` is the side's expected column count (the binder's
+/// [`BoundJoinSide::columns`] length); an empty relation yields `ncols` empty
+/// columns so the join's `[0].len()` row count is still well-defined.
+fn materialized_columns(relation: &MaterializedRelation, ncols: usize) -> Vec<Column> {
+    (0..ncols)
+        .map(|i| {
+            let cells: Vec<Option<Vec<u8>>> = relation
+                .rows
+                .iter()
+                .map(|row| row.get(i).cloned().flatten())
+                .collect();
+            Column::Bytes(cells.into())
+        })
+        .collect()
 }
 
 /// Map a bound [`JoinType`] to the executor's `ExecJoinType`. The two enums are

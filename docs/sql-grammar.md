@@ -322,9 +322,11 @@ live at the resolved system-time snapshot, that `snapshot`, an optional
   validity index — [ADR-0023], STL-133). The binder does not re-implement the
   prune; carrying the snapshot *is* the rewrite. Joint `(sys, valid)` version
   resolution from `valid_snapshot` is the executor's job (STL-163).
-- **Beyond the single-table scan**: a two-table join binds (STL-172) and a
-  `WHERE` subquery binds — uncorrelated (STL-234) and correlated (STL-239), see
-  [Subquery predicates](#subquery-predicates-stl-234-stl-239). **Rejected**: set
+- **Beyond the single-table scan**: a two-table join binds (STL-172), a `WHERE`
+  subquery binds — uncorrelated (STL-234) and correlated (STL-239), see
+  [Subquery predicates](#subquery-predicates-stl-234-stl-239) — and a `WITH` list
+  of non-recursive CTEs plus `FROM (SELECT …)` derived tables binds (STL-242, see
+  [CTEs and derived tables](#ctes-and-derived-tables-stl-242)). **Rejected**: set
   operations,
   schema-qualified table names, and projections other than `*` or bare column
   names (a computed or aliased select item — including a scalar subquery in the
@@ -465,9 +467,61 @@ SELECT id FROM t WHERE a = (SELECT a FROM s WHERE s.id = t.id);        -- scalar
   `EXISTS` / `IN` cases onto a semi/anti join is a tracked follow-up.
 
 **Not yet bound** (each a tracked follow-up): a scalar subquery in the **select
-list** (needs expression projection, STL-303), subqueries in `FROM` / CTEs
-(STL-242), a subquery composed with `AND` / `OR` or set over a join, a correlated
-`WHERE` with more than the one correlation comparison, and lateral joins.
+list** (needs expression projection, STL-303), a subquery composed with `AND` /
+`OR` or set over a join, a correlated `WHERE` with more than the one correlation
+comparison, and lateral joins. (`WITH` CTEs and `FROM (SELECT …)` derived tables
+*do* bind — see [CTEs and derived tables](#ctes-and-derived-tables-stl-242).)
+
+## CTEs and derived tables (STL-242)
+
+A query may name intermediate results with a `WITH` list and read inline
+subqueries in `FROM`. Both lower to the **same** shape — a *materialized
+relation*: the defining query runs once at the statement snapshot, its rows are
+captured, and a reference reads them like a table.
+
+```sql
+-- A named CTE, referenced in the main query.
+WITH big AS (SELECT id, a FROM t WHERE a >= 20) SELECT id FROM big WHERE a < 40;
+
+-- Multiple CTEs; a later one may read an earlier one (CTE → CTE chaining).
+WITH big AS (SELECT id, a FROM t WHERE a >= 20),
+     hi  AS (SELECT id, a FROM big WHERE a >= 30)
+SELECT id FROM hi;
+
+-- A CTE joined to a base table (either join side may be a CTE / derived table).
+WITH small AS (SELECT id, a FROM t WHERE a <= 30)
+SELECT small.id, s.label FROM small JOIN s ON small.id = s.id;
+
+-- A CTE under aggregation.
+WITH big AS (SELECT id, a FROM t WHERE a >= 20) SELECT count(*) FROM big;
+
+-- A derived table in FROM (an inline, single-use CTE named by its alias).
+SELECT id FROM (SELECT id, a FROM t WHERE a > 15) AS d WHERE a <> 30;
+
+-- A `name(col, …)` list renames the relation's output columns.
+WITH c(k, v) AS (SELECT id, a FROM t) SELECT k FROM c WHERE v = 40;
+```
+
+- **A reference resolves to a CTE first, then the catalog** — a CTE name shadows a
+  base table of the same name (the SQL scoping rule). A `WITH` name introduced
+  twice is an error; a later CTE sees every earlier one in the same list.
+- **A derived table must have an alias** (`FROM (SELECT …) AS d`); it lowers to a
+  single-use CTE named by that alias, so it composes with everything a CTE does —
+  including a join side.
+- **The body binds against a normal `SELECT` surface** — projection, `WHERE`,
+  `GROUP BY`/aggregates, `ORDER BY`/`LIMIT`, and a nested `WITH` — and a CTE /
+  derived table feeds the outer query's `WHERE`, aggregate, projection, and joins
+  through the very same pipeline a base table does. DuckDB differential
+  spot-checks live in the nightly `cte_differential.rs` oracle.
+- **Temporal rule:** a CTE evaluates at the statement's snapshot, the same one
+  consistent `(sys, valid)` point the rest of the statement and any subquery read
+  (docs/16 §6). A query-local relation has no valid-time period, so a
+  `FOR VALID_TIME AS OF` over a CTE / derived table is `ValidTimeUnsupported`.
+- **Not in scope** (tracked follow-ups): `WITH RECURSIVE` (v0.5) and
+  data-modifying `WITH` are rejected; a `LATERAL` derived table is rejected; a
+  `WHERE` subquery cannot itself name an enclosing CTE; and a single-relation
+  read still addresses a column by its bare name (a qualified `d.col` is bound
+  only in a join, as before).
 
 ## Multi-row INSERT (STL-228)
 

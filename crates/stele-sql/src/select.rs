@@ -59,7 +59,7 @@ use sqlparser::ast::{
     OrderByKind, Query, Select, SelectItem, SetExpr, Statement as SqlStatement, TableFactor,
     TableWithJoins, Value, WildcardAdditionalOptions,
 };
-use stele_catalog::{Catalog, SchemaId, TableSchema};
+use stele_catalog::{Catalog, ColumnDef, SchemaId, TableSchema};
 use stele_common::period::{Interval, IntervalError, PeriodPredicate};
 use stele_common::provenance;
 use stele_common::time::SystemTimeMicros;
@@ -355,6 +355,24 @@ pub struct BoundSelect {
     ///
     /// [STL-172]: https://allegromusic.atlassian.net/browse/STL-172
     pub join: Option<BoundJoin>,
+    /// The non-recursive common-table-expressions (and lowered derived tables)
+    /// this query must materialize before it runs ([STL-242]), in declaration
+    /// order — a later one may reference an earlier one. Empty for a query with no
+    /// `WITH` clause and no `FROM (SELECT …)` derived table. The executor runs each
+    /// once at this statement's snapshot, materializes its rows, and resolves a
+    /// reference to one (by name, in [`table`](Self::table) or a
+    /// [`BoundJoinSide::table`]) from that materialization rather than from storage.
+    ///
+    /// [STL-242]: https://allegromusic.atlassian.net/browse/STL-242
+    pub ctes: Vec<BoundCte>,
+    /// When the query's `FROM` is a **materialized relation** — a CTE reference or
+    /// a derived table ([STL-242]) — its resolved output columns `(name, type)`, so
+    /// the executor reads the relation's shape from here and its rows from the
+    /// matching entry in [`ctes`](Self::ctes) (a query-local name, not a
+    /// catalog-registered table), instead of scanning storage. `None` for an
+    /// ordinary base-table read, and on the join path (whose sides carry their own
+    /// columns). [`table`](Self::table) holds the relation's name in either case.
+    pub relation_columns: Option<Vec<(String, LogicalType)>>,
     /// `SELECT DISTINCT` — deduplicate the projected rows ([STL-263]). Applies
     /// over the **full projected row** (aggregate output for an aggregate
     /// query); `DISTINCT ON (…)` is not bound. Two rows are duplicates iff every
@@ -715,6 +733,33 @@ pub struct BoundJoin {
     pub columns: Vec<(String, LogicalType)>,
 }
 
+/// A bound non-recursive common-table-expression or derived table ([STL-242]).
+///
+/// A named subquery whose result the executor materializes **once** at the
+/// statement's snapshot, then references like a table in the outer query.
+///
+/// Both a `WITH name AS (SELECT …)` entry and a `FROM (SELECT …) AS d` derived
+/// table lower to this same shape — a derived table is just an inline,
+/// single-use CTE named by its alias. The defining query is a fully bound
+/// [`plan`](Self::plan); [`columns`](Self::columns) is its output header (with any
+/// `name(col, …)` alias applied), which the binder resolves outer references
+/// against and the executor uses to type the materialized rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundCte {
+    /// The relation name introduced into the query's scope — the `WITH` name or
+    /// the derived table's alias. A reference resolves a [`BoundSelect::table`] /
+    /// [`BoundJoinSide::table`] to this name.
+    pub name: String,
+    /// The bound defining query, evaluated once at the outer statement's snapshot
+    /// (it binds under the same snapshot, so the one consistent per-statement
+    /// `(sys, valid)` rule holds — docs/16 §6). May itself reference an earlier
+    /// CTE in the same `WITH` list.
+    pub plan: Box<BoundSelect>,
+    /// The relation's output columns `(name, type)`, in order — the materialized
+    /// result's header and the shape outer references resolve against.
+    pub columns: Vec<(String, LogicalType)>,
+}
+
 /// Why binding a `SELECT` failed.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SelectError {
@@ -956,6 +1001,17 @@ pub enum SelectError {
     /// rejection does not borrow that variant's v0.1 single-table wording.
     #[error("v0.2 cannot project this from the JOIN ({0})")]
     UnsupportedJoinProjection(String),
+
+    /// A `WITH` clause or derived table is not a shape v0.3 binds ([STL-242]) — a
+    /// `WITH RECURSIVE` (deferred to v0.5), a derived table with no alias (a
+    /// `FROM (SELECT …)` must be named), a `LATERAL` derived table, a `name(col, …)`
+    /// column-alias list whose arity does not match the relation's columns, two
+    /// CTEs sharing a name, or a CTE whose body does not bind. Rejected with the
+    /// reason rather than silently mis-bound.
+    ///
+    /// [STL-242]: https://allegromusic.atlassian.net/browse/STL-242
+    #[error("unsupported CTE/derived table ({0})")]
+    Cte(String),
 }
 
 /// Why folding an `AS OF <expr>` to an instant failed.
@@ -996,10 +1052,50 @@ pub enum AsOfError {
 /// no valid axis, or the table is unknown / not live (including the
 /// [before-history](SelectError::BeforeHistory) case) at the resolved snapshot.
 pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, SelectError> {
+    // The public entry binds at the top level — no enclosing CTEs in scope. The
+    // output-column header [`bind_select_scoped`] also returns is only needed when
+    // a CTE / derived table binds this query (to type its materialization), so it
+    // is dropped here.
+    Ok(bind_select_scoped(stmt, ctx, &[])?.0)
+}
+
+/// Bind a `SELECT`, with `outer_ctes` the common-table-expressions already in
+/// scope ([STL-242]) — the empty slice at the top level, the enclosing `WITH`
+/// signatures when binding a nested CTE / derived-table body.
+///
+/// Returns the bound plan **and** its output-column header `(name, type)` — the
+/// shape a `WITH name AS (…)` / `FROM (…) AS d` reference resolves against, which
+/// the binder computes here where the schema is live (the engine's
+/// `output_columns` agrees with it for the same plan).
+// The single-table binding tail (snapshot, CTE-list, FROM resolution, projection,
+// WHERE, aggregate, result shaping) reads top-to-bottom; splitting it would
+// scatter one cohesive lowering across helpers rather than clarify it.
+#[allow(clippy::too_many_lines)]
+fn bind_select_scoped(
+    stmt: &Statement,
+    ctx: &BindContext,
+    outer_ctes: &[CteSig],
+) -> Result<(BoundSelect, Vec<(String, LogicalType)>), SelectError> {
     // An admin command (CHECKPOINT / FLUSH) has no SQL body, so it is "not a
     // SELECT" — the binder cleanly defers it to the engine's admin route.
     let body = stmt.sql().ok_or(SelectError::NotSelect)?;
     let (query, select) = single_select(body)?;
+
+    // Resolve the statement's `(sys, valid)` snapshot up front: the `WITH` list and
+    // the `FROM` relation bind at it, so every CTE inherits the one consistent
+    // per-statement snapshot (docs/16 §6). A query with no temporal clause folds
+    // to `ctx.snapshot`.
+    let (snapshot, valid_snapshot) = resolve_snapshots(stmt, ctx.snapshot)?;
+
+    // Bind this query's non-recursive `WITH` list, extending `outer_ctes` so a
+    // later CTE may reference an earlier one ([STL-242]). `sigs` is the full scope
+    // (outer + this query's) the body resolves relation names against.
+    let cte_ctx = BindContext {
+        snapshot,
+        catalog: ctx.catalog,
+    };
+    let (mut ctes, sigs) = bind_with_list(query, &cte_ctx, outer_ctes)?;
+
     // A two-table `JOIN` binds to a wholly different shape (two sides, a join
     // condition, a combined header), so it is routed before the single-table path.
     // The result-shaping clauses are not threaded through the join path yet
@@ -1007,9 +1103,30 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
     // rejected over a join rather than silently dropped.
     if let Some(join) = detect_join(select)? {
         reject_shaping_over_join(query, select)?;
-        return bind_join(stmt, ctx, select, join);
+        let (mut bound, mut side_ctes) = bind_join(stmt, ctx, select, join, &sigs)?;
+        // The `WITH` relations materialize first (a derived join side may reference
+        // one), then any derived tables the join sides introduced.
+        ctes.append(&mut side_ctes);
+        bound.ctes = ctes;
+        let header = bound
+            .join
+            .as_ref()
+            .expect("the join path sets `join`")
+            .columns
+            .clone();
+        return Ok((bound, header));
     }
-    let table = single_table(select)?;
+
+    // The single `FROM` relation: a base table, a CTE in scope, or a derived table
+    // (`FROM (SELECT …) AS d`, lowered to a single-use CTE named by its alias).
+    let resolved = resolve_from(select, ctx, snapshot, &sigs)?;
+    if let Some(derived) = resolved.derived {
+        ctes.push(derived);
+    }
+    let schema: &TableSchema = &resolved.schema;
+    let table: &str = &resolved.name;
+    let materialized = resolved.materialized;
+
     // An aggregate query (a `GROUP BY`, or an aggregate in the SELECT list) takes
     // a different shape: its output columns come from the aggregate plan, so the
     // plain projection is bound only for a non-aggregate read. Detection is purely
@@ -1022,28 +1139,10 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
     } else {
         bind_projection(select)?
     };
-    let (snapshot, valid_snapshot) = resolve_snapshots(stmt, ctx.snapshot)?;
-
-    let schema = match resolve_table_at(ctx.catalog, table, snapshot) {
-        TableResolution::Found(schema) => schema,
-        TableResolution::Unknown => return Err(SelectError::UnknownTable(table.to_owned())),
-        TableResolution::BeforeHistory { first_commit } => {
-            return Err(SelectError::BeforeHistory {
-                table: table.to_owned(),
-                snapshot: snapshot.0,
-                first_commit: first_commit.0,
-            });
-        }
-        TableResolution::NotLive => {
-            return Err(SelectError::TableNotLive {
-                table: table.to_owned(),
-                snapshot: snapshot.0,
-            });
-        }
-    };
 
     // A valid-time `AS OF` only means something on a table with a valid-time
-    // period; against a system-only table there is no valid axis to travel.
+    // period; against a system-only table — and a query-local CTE / derived table,
+    // whose ephemeral schema is system-only — there is no valid axis to travel.
     if valid_snapshot.is_some() && !schema.temporal().valid_time_enabled() {
         return Err(SelectError::ValidTimeUnsupported {
             table: table.to_owned(),
@@ -1056,9 +1155,12 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
     // pseudo-column ([STL-247]) is *not* a schema column — it reads the version's
     // stored provenance, not a user cell — so it is accepted here too; the engine
     // resolves it against the fixed virtual layout after the table's own columns.
+    // A materialized relation (CTE / derived table) carries no provenance, so only
+    // its own columns are projectable.
     if let Projection::Columns(columns) = &projection {
         for column in columns {
-            if schema.column(column).is_none() && provenance::pseudo_column_type(column).is_none() {
+            let pseudo_ok = !materialized && provenance::pseudo_column_type(column).is_some();
+            if schema.column(column).is_none() && !pseudo_ok {
                 return Err(SelectError::UnknownColumn {
                     table: table.to_owned(),
                     column: column.clone(),
@@ -1109,7 +1211,21 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
         .map(|clause| bind_period_predicate(clause, ctx.snapshot, schema, table))
         .transpose()?;
 
-    Ok(BoundSelect {
+    // A materialized relation (CTE / derived table) carries its resolved columns so
+    // the executor reads them from the materialization, not the catalog.
+    let relation_columns = materialized.then(|| {
+        schema
+            .columns()
+            .iter()
+            .map(|c| (c.name().to_owned(), c.ty()))
+            .collect()
+    });
+    let header = aggregate.as_ref().map_or_else(
+        || projected_header(schema, &projection),
+        |agg| agg.columns.clone(),
+    );
+
+    let bound = BoundSelect {
         table: table.to_owned(),
         schema_id: schema.schema_id(),
         snapshot,
@@ -1120,11 +1236,285 @@ pub fn bind_select(stmt: &Statement, ctx: &BindContext) -> Result<BoundSelect, S
         subquery_filter,
         aggregate,
         join: None,
+        ctes,
+        relation_columns,
         distinct,
         order_by,
         offset,
         limit,
-    })
+    };
+    Ok((bound, header))
+}
+
+/// One common-table-expression / derived table in binding scope ([STL-242]): its
+/// name and the ephemeral [`TableSchema`] of its output columns, which outer
+/// references resolve against.
+#[derive(Debug, Clone)]
+struct CteSig {
+    /// The relation name introduced into scope (the `WITH` name / derived alias).
+    name: String,
+    /// The relation's ephemeral schema — its output columns, system-only and
+    /// carrying the reserved `SchemaId(0)` sentinel ([`TableSchema::ephemeral`]).
+    schema: TableSchema,
+}
+
+/// A resolved single-table `FROM` relation: either a catalog base table (a
+/// **borrowed** schema) or a query-local CTE / derived table (an **owned**
+/// ephemeral schema), behind one [`Deref`](std::ops::Deref) to [`TableSchema`] so
+/// the binding helpers consume it uniformly ([STL-242]).
+enum RelationSchema<'a> {
+    /// A catalog base table's schema, borrowed at the read snapshot.
+    Borrowed(&'a TableSchema),
+    /// A CTE / derived table's ephemeral schema, owned for the bind.
+    Owned(TableSchema),
+}
+
+impl std::ops::Deref for RelationSchema<'_> {
+    type Target = TableSchema;
+    fn deref(&self) -> &TableSchema {
+        match self {
+            Self::Borrowed(schema) => schema,
+            Self::Owned(schema) => schema,
+        }
+    }
+}
+
+/// What a single-table `FROM` resolved to ([STL-242]): the relation name, its
+/// schema, whether it is a materialized relation (CTE / derived table the engine
+/// reads from its materialization, not storage), and — for a derived table — the
+/// freshly bound [`BoundCte`] the query must register.
+struct ResolvedFrom<'a> {
+    name: String,
+    schema: RelationSchema<'a>,
+    materialized: bool,
+    derived: Option<BoundCte>,
+}
+
+/// Bind a query's non-recursive `WITH` list into [`BoundCte`]s plus the
+/// accumulated [`CteSig`] scope (the `outer_ctes` already in scope, then this
+/// query's, in declaration order), so a later CTE may reference an earlier one
+/// ([STL-242]).
+fn bind_with_list(
+    query: &Query,
+    ctx: &BindContext,
+    outer_ctes: &[CteSig],
+) -> Result<(Vec<BoundCte>, Vec<CteSig>), SelectError> {
+    let mut sigs: Vec<CteSig> = outer_ctes.to_vec();
+    let mut ctes: Vec<BoundCte> = Vec::new();
+    let Some(with) = &query.with else {
+        return Ok((ctes, sigs));
+    };
+    if with.recursive {
+        return Err(SelectError::Cte(
+            "WITH RECURSIVE is not supported (deferred to v0.5)".to_owned(),
+        ));
+    }
+    for cte in &with.cte_tables {
+        let name = cte.alias.name.value.clone();
+        if sigs.iter().any(|s| s.name == name) {
+            return Err(SelectError::Cte(format!("duplicate CTE name {name:?}")));
+        }
+        // Bind the body against the scope built so far (earlier CTEs visible).
+        let (bound, schema) = bind_named_subquery(&cte.query, &cte.alias, ctx, &sigs)?;
+        sigs.push(CteSig { name, schema });
+        ctes.push(bound);
+    }
+    Ok((ctes, sigs))
+}
+
+/// Bind a named subquery — a `WITH name AS (subquery)` body or a
+/// `FROM (subquery) AS name` derived table — into a [`BoundCte`] and its ephemeral
+/// [`TableSchema`] ([STL-242]).
+///
+/// The subquery binds under `sigs` (the enclosing CTE scope), so it may reference
+/// an earlier sibling CTE; a `name(col, …)` alias renames the output columns.
+fn bind_named_subquery(
+    subquery: &Query,
+    alias: &sqlparser::ast::TableAlias,
+    ctx: &BindContext,
+    sigs: &[CteSig],
+) -> Result<(BoundCte, TableSchema), SelectError> {
+    let name = alias.name.value.clone();
+    let stmt = Statement {
+        body: StatementBody::Sql(SqlStatement::Query(Box::new(subquery.clone()))),
+        temporal: Temporal::default(),
+    };
+    let (plan, header) = bind_select_scoped(&stmt, ctx, sigs)?;
+    let columns = apply_column_aliases(header, &alias.columns)?;
+    let defs = columns
+        .iter()
+        .map(|(n, t)| ColumnDef::new(n.clone(), *t))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| SelectError::Cte(e.to_string()))?;
+    let schema = TableSchema::ephemeral(defs).map_err(|e| SelectError::Cte(e.to_string()))?;
+    Ok((
+        BoundCte {
+            name,
+            plan: Box::new(plan),
+            columns,
+        },
+        schema,
+    ))
+}
+
+/// Apply an optional `name(col, …)` column-alias list to a relation's output
+/// header ([STL-242]): empty leaves the header as-is; otherwise each output column
+/// is renamed (its type kept), rejecting an arity mismatch or a typed alias.
+fn apply_column_aliases(
+    header: Vec<(String, LogicalType)>,
+    aliases: &[sqlparser::ast::TableAliasColumnDef],
+) -> Result<Vec<(String, LogicalType)>, SelectError> {
+    if aliases.is_empty() {
+        return Ok(header);
+    }
+    if aliases.iter().any(|a| a.data_type.is_some()) {
+        return Err(SelectError::Cte(
+            "a typed column alias (name(col TYPE, …)) is not supported".to_owned(),
+        ));
+    }
+    if aliases.len() != header.len() {
+        return Err(SelectError::Cte(format!(
+            "column alias list has {} names but the relation has {} columns",
+            aliases.len(),
+            header.len()
+        )));
+    }
+    Ok(aliases
+        .iter()
+        .zip(header)
+        .map(|(alias, (_, ty))| (alias.name.value.clone(), ty))
+        .collect())
+}
+
+/// Resolve a single-table `FROM` relation ([STL-242]): a CTE in `sigs` (which
+/// shadows a catalog table of the same name), a base table at `snapshot`, or a
+/// `FROM (SELECT …) AS d` derived table (bound into a single-use [`BoundCte`]).
+fn resolve_from<'a>(
+    select: &Select,
+    ctx: &'a BindContext<'a>,
+    snapshot: SystemTimeMicros,
+    sigs: &[CteSig],
+) -> Result<ResolvedFrom<'a>, SelectError> {
+    let [from] = select.from.as_slice() else {
+        return Err(SelectError::UnsupportedFrom("not exactly one table"));
+    };
+    if !from.joins.is_empty() {
+        return Err(SelectError::UnsupportedFrom("join"));
+    }
+    match &from.relation {
+        TableFactor::Table { name, .. } => {
+            let name = table_factor_name(name)?;
+            // A CTE shadows a catalog table of the same name (the SQL scoping rule);
+            // the innermost binding wins, so the scope is searched last-to-first.
+            if let Some(sig) = sigs.iter().rev().find(|s| s.name == name) {
+                return Ok(ResolvedFrom {
+                    name: name.to_owned(),
+                    schema: RelationSchema::Owned(sig.schema.clone()),
+                    materialized: true,
+                    derived: None,
+                });
+            }
+            let schema = match resolve_table_at(ctx.catalog, name, snapshot) {
+                TableResolution::Found(schema) => schema,
+                TableResolution::Unknown => {
+                    return Err(SelectError::UnknownTable(name.to_owned()));
+                }
+                TableResolution::BeforeHistory { first_commit } => {
+                    return Err(SelectError::BeforeHistory {
+                        table: name.to_owned(),
+                        snapshot: snapshot.0,
+                        first_commit: first_commit.0,
+                    });
+                }
+                TableResolution::NotLive => {
+                    return Err(SelectError::TableNotLive {
+                        table: name.to_owned(),
+                        snapshot: snapshot.0,
+                    });
+                }
+            };
+            Ok(ResolvedFrom {
+                name: name.to_owned(),
+                schema: RelationSchema::Borrowed(schema),
+                materialized: false,
+                derived: None,
+            })
+        }
+        TableFactor::Derived {
+            lateral,
+            subquery,
+            alias,
+            ..
+        } => {
+            if *lateral {
+                return Err(SelectError::Cte(
+                    "a LATERAL derived table is not supported".to_owned(),
+                ));
+            }
+            let Some(alias) = alias else {
+                return Err(SelectError::Cte(
+                    "a derived table (a FROM (SELECT …)) must have an alias".to_owned(),
+                ));
+            };
+            let derived_ctx = BindContext {
+                snapshot,
+                catalog: ctx.catalog,
+            };
+            let (cte, schema) = bind_named_subquery(subquery, alias, &derived_ctx, sigs)?;
+            Ok(ResolvedFrom {
+                name: cte.name.clone(),
+                schema: RelationSchema::Owned(schema),
+                materialized: true,
+                derived: Some(cte),
+            })
+        }
+        _ => Err(SelectError::UnsupportedFrom("non-table relation")),
+    }
+}
+
+/// The single, unqualified identifier of a `FROM` table name, or the matching
+/// [`SelectError::UnsupportedFrom`] for a non-identifier / schema-qualified name.
+fn table_factor_name(name: &sqlparser::ast::ObjectName) -> Result<&str, SelectError> {
+    match name.0.as_slice() {
+        [part] => part
+            .as_ident()
+            .map(|id| id.value.as_str())
+            .ok_or(SelectError::UnsupportedFrom("non-identifier table name")),
+        _ => Err(SelectError::UnsupportedFrom("schema-qualified table name")),
+    }
+}
+
+/// The `(name, type)` output header a plain (non-aggregate, non-join) read
+/// projects ([STL-242]) — the same shape the executor's `output_columns` /
+/// `projected_columns` produce, so a CTE / derived table's recorded columns match
+/// the rows the engine materializes. `SELECT *` is the schema columns in order; a
+/// named list resolves each against the schema's columns and the provenance
+/// pseudo-columns ([STL-247]).
+fn projected_header(schema: &TableSchema, projection: &Projection) -> Vec<(String, LogicalType)> {
+    let mut addressable: Vec<(String, LogicalType)> = schema
+        .columns()
+        .iter()
+        .map(|c| (c.name().to_owned(), c.ty()))
+        .collect();
+    let n_schema = addressable.len();
+    addressable.extend(
+        provenance::PSEUDO_COLUMNS
+            .iter()
+            .map(|(name, ty)| ((*name).to_owned(), *ty)),
+    );
+    match projection {
+        Projection::All => addressable[..n_schema].to_vec(),
+        Projection::Columns(names) => names
+            .iter()
+            .map(|name| {
+                addressable
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .cloned()
+                    .expect("bind validated the projected column exists")
+            })
+            .collect(),
+    }
 }
 
 /// Strip a statement's `WHERE` filter, for statement-level `Describe` ([STL-212]).
@@ -1529,10 +1919,11 @@ fn detect_join(select: &Select) -> Result<Option<&TableWithJoins>, SelectError> 
 /// `CROSS` joins, are rejected (each a tracked follow-up) rather than mis-bound.
 fn bind_join<'a>(
     stmt: &Statement,
-    ctx: &BindContext,
+    ctx: &'a BindContext<'a>,
     select: &'a Select,
     from: &'a TableWithJoins,
-) -> Result<BoundSelect, SelectError> {
+    sigs: &[CteSig],
+) -> Result<(BoundSelect, Vec<BoundCte>), SelectError> {
     // Clauses v0.2 does not yet support over a join: rejected, never dropped.
     if !stmt.temporal.as_of.is_empty() {
         return Err(SelectError::UnsupportedJoin(
@@ -1559,23 +1950,19 @@ fn bind_join<'a>(
     let join_ast: &Join = &from.joins[0];
     let (join_type, constraint) = join_kind_and_constraint(&join_ast.join_operator)?;
 
-    let left_ref = table_ref(&from.relation)?;
-    let right_ref = table_ref(&join_ast.relation)?;
-    let left = SideSchema {
-        table: left_ref.name,
-        alias: left_ref.alias,
-        schema: resolve_join_table(ctx.catalog, left_ref.name, snapshot)?,
-    };
-    let right = SideSchema {
-        table: right_ref.name,
-        alias: right_ref.alias,
-        schema: resolve_join_table(ctx.catalog, right_ref.name, snapshot)?,
-    };
+    // Either side may be a base table, a CTE in scope, or a derived table ([STL-242]);
+    // a derived side is bound into a single-use CTE the query must register.
+    let (left, left_cte) = resolve_join_side(&from.relation, ctx, snapshot, sigs)?;
+    let (right, right_cte) = resolve_join_side(&join_ast.relation, ctx, snapshot, sigs)?;
 
     let (left_key, right_key) = bind_join_condition(constraint, &left, &right)?;
     let (output, columns) = bind_join_projection(select, join_type, &left, &right)?;
 
-    Ok(BoundSelect {
+    let mut ctes = Vec::new();
+    ctes.extend(left_cte);
+    ctes.extend(right_cte);
+
+    let bound = BoundSelect {
         // The single-table fields are unused on the join path (see `BoundSelect`):
         // the executor routes to the join plan, never reading these.
         table: String::new(),
@@ -1596,13 +1983,105 @@ fn bind_join<'a>(
             output,
             columns,
         }),
+        // The `WITH` relations are prepended by the caller; a derived join side's
+        // CTE is returned alongside (`ctes`) for the caller to register.
+        ctes: Vec::new(),
+        relation_columns: None,
         // Result shaping over a join is rejected before this path is taken
         // (`reject_shaping_over_join`, [STL-264] lifts it).
         distinct: false,
         order_by: Vec::new(),
         offset: 0,
         limit: None,
-    })
+    };
+    Ok((bound, ctes))
+}
+
+/// Resolve one `JOIN` side ([STL-242]): a CTE in `sigs` (which shadows a catalog
+/// table of the same name), a base table at `snapshot`, or a `(SELECT …) AS d`
+/// derived table — the last bound into a single-use [`BoundCte`] returned for the
+/// query to register.
+fn resolve_join_side<'a>(
+    factor: &'a TableFactor,
+    ctx: &'a BindContext<'a>,
+    snapshot: SystemTimeMicros,
+    sigs: &[CteSig],
+) -> Result<(SideSchema<'a>, Option<BoundCte>), SelectError> {
+    match factor {
+        TableFactor::Table { name, alias, .. } => {
+            let table = join_table_name(name)?;
+            let alias = alias.as_ref().map(|a| a.name.value.as_str());
+            if let Some(sig) = sigs.iter().rev().find(|s| s.name == table) {
+                return Ok((
+                    SideSchema {
+                        table,
+                        alias,
+                        schema: RelationSchema::Owned(sig.schema.clone()),
+                    },
+                    None,
+                ));
+            }
+            let schema = resolve_join_table(ctx.catalog, table, snapshot)?;
+            Ok((
+                SideSchema {
+                    table,
+                    alias,
+                    schema: RelationSchema::Borrowed(schema),
+                },
+                None,
+            ))
+        }
+        TableFactor::Derived {
+            lateral,
+            subquery,
+            alias,
+            ..
+        } => {
+            if *lateral {
+                return Err(SelectError::Cte(
+                    "a LATERAL derived table is not supported".to_owned(),
+                ));
+            }
+            let Some(alias) = alias else {
+                return Err(SelectError::Cte(
+                    "a derived table in a JOIN must have an alias".to_owned(),
+                ));
+            };
+            let derived_ctx = BindContext {
+                snapshot,
+                catalog: ctx.catalog,
+            };
+            let (cte, schema) = bind_named_subquery(subquery, alias, &derived_ctx, sigs)?;
+            // The alias is the side's exposed name (it *is* the relation name the
+            // engine looks up in the materialization), so a `d.col` qualifier
+            // matches it through `table`; there is no separate alias to carry.
+            Ok((
+                SideSchema {
+                    table: alias.name.value.as_str(),
+                    alias: None,
+                    schema: RelationSchema::Owned(schema),
+                },
+                Some(cte),
+            ))
+        }
+        _ => Err(SelectError::UnsupportedJoin(
+            "a non-table relation (subquery / derived table) in a JOIN".to_owned(),
+        )),
+    }
+}
+
+/// The single, unqualified identifier of a `JOIN` table name, mapping a
+/// non-identifier / schema-qualified name to the [`SelectError::UnsupportedJoin`]
+/// the join path reports.
+fn join_table_name(name: &sqlparser::ast::ObjectName) -> Result<&str, SelectError> {
+    match name.0.as_slice() {
+        [part] => part.as_ident().map(|id| id.value.as_str()).ok_or_else(|| {
+            SelectError::UnsupportedJoin("a non-identifier table name in a JOIN".to_owned())
+        }),
+        _ => Err(SelectError::UnsupportedJoin(
+            "a schema-qualified table name in a JOIN".to_owned(),
+        )),
+    }
 }
 
 /// Which side of a join a resolved column came from.
@@ -1614,11 +2093,13 @@ enum Side {
 
 /// A join side during binding: its table name, optional alias, and resolved
 /// schema. The alias and table name are both valid qualifiers for the side's
-/// columns (`t.c` or `alias.c`).
+/// columns (`t.c` or `alias.c`). The schema is a base table's (borrowed) or a
+/// CTE / derived table's ephemeral one (owned) — [`RelationSchema`] derefs to
+/// either ([STL-242]).
 struct SideSchema<'a> {
     table: &'a str,
     alias: Option<&'a str>,
-    schema: &'a TableSchema,
+    schema: RelationSchema<'a>,
 }
 
 impl SideSchema<'_> {
@@ -1899,8 +2380,8 @@ fn bind_join_projection(
             other => return Err(SelectError::UnsupportedJoinProjection(other.to_string())),
         };
         let (side, idx) = resolve_join_column(expr, left, right)?;
-        let schema = match side {
-            Side::Left => left.schema,
+        let schema: &TableSchema = match side {
+            Side::Left => &left.schema,
             Side::Right => {
                 // A SEMI / ANTI join's result is the left table alone, so a right
                 // column has nowhere to come from.
@@ -1909,7 +2390,7 @@ fn bind_join_projection(
                         "a SEMI/ANTI join projects only its left table's columns".to_owned(),
                     ));
                 }
-                right.schema
+                &right.schema
             }
         };
         let col = &schema.columns()[idx];
@@ -3058,9 +3539,8 @@ fn single_select(body: &SqlStatement) -> Result<(&Query, &Select), SelectError> 
 /// ([STL-263]).
 fn reject_unsupported_query_clauses(query: &Query) -> Result<(), SelectError> {
     let reject = |what| Err(SelectError::UnsupportedClause(what));
-    if query.with.is_some() {
-        return reject("WITH (CTE)");
-    }
+    // A `WITH` clause is bound, not rejected, since [STL-242] (non-recursive CTEs);
+    // `bind_with_list` rejects `WITH RECURSIVE` with its own diagnostic.
     if !query.locks.is_empty() {
         return reject("FOR UPDATE/SHARE");
     }
@@ -3966,7 +4446,7 @@ mod tests {
             // HAVING and GROUP BY ALL remain unsupported clauses.
             "SELECT balance FROM account GROUP BY balance HAVING balance > 0",
             "SELECT balance FROM account GROUP BY ALL",
-            "WITH t AS (SELECT 1) SELECT balance FROM account",
+            // `WITH (CTE)` now binds ([STL-242]); see the CTE tests below.
         ] {
             let stmt = parse_one(sql);
             assert!(
@@ -5673,5 +6153,177 @@ mod tests {
         let mut stmt = parse_one("SELECT * FROM account");
         apply_session_time(&mut stmt, None, None);
         assert!(stmt.temporal.as_of.is_empty());
+    }
+
+    // ----- CTEs + derived tables ([STL-242]) -----
+
+    #[test]
+    fn cte_reference_resolves_as_a_materialized_relation() {
+        let catalog = catalog_with_account(1_000);
+        let bound = bind(
+            "WITH c AS (SELECT id, balance FROM account) SELECT id FROM c",
+            &catalog,
+        )
+        .expect("bind CTE reference");
+        // One CTE to materialize; the FROM names it and carries its columns.
+        assert_eq!(bound.ctes.len(), 1);
+        assert_eq!(bound.ctes[0].name, "c");
+        assert_eq!(bound.table, "c");
+        assert_eq!(
+            bound.relation_columns,
+            Some(vec![
+                ("id".to_owned(), LogicalType::Int4),
+                ("balance".to_owned(), LogicalType::Int4),
+            ])
+        );
+        assert_eq!(bound.projection, Projection::Columns(vec!["id".to_owned()]));
+        // The CTE body is a plain base-table read of `account`.
+        assert_eq!(bound.ctes[0].plan.table, "account");
+        assert_eq!(bound.ctes[0].plan.relation_columns, None);
+    }
+
+    #[test]
+    fn derived_table_lowers_to_a_single_use_cte() {
+        let catalog = catalog_with_account(1_000);
+        let bound = bind(
+            "SELECT id FROM (SELECT id, balance FROM account) AS d",
+            &catalog,
+        )
+        .expect("bind derived table");
+        assert_eq!(bound.ctes.len(), 1);
+        assert_eq!(bound.ctes[0].name, "d");
+        assert_eq!(bound.table, "d");
+        assert!(bound.relation_columns.is_some());
+    }
+
+    #[test]
+    fn later_cte_references_an_earlier_one() {
+        let catalog = catalog_with_account(1_000);
+        let bound = bind(
+            "WITH c1 AS (SELECT id, balance FROM account), \
+                  c2 AS (SELECT id FROM c1) \
+             SELECT id FROM c2",
+            &catalog,
+        )
+        .expect("bind chained CTEs");
+        assert_eq!(bound.ctes.len(), 2);
+        assert_eq!(bound.ctes[0].name, "c1");
+        assert_eq!(bound.ctes[1].name, "c2");
+        // c2's body reads c1 — a materialized relation, not the catalog.
+        assert_eq!(bound.ctes[1].plan.table, "c1");
+        assert!(bound.ctes[1].plan.relation_columns.is_some());
+    }
+
+    #[test]
+    fn cte_column_aliases_rename_the_output_header() {
+        let catalog = catalog_with_account(1_000);
+        let bound = bind(
+            "WITH c(k, v) AS (SELECT id, balance FROM account) SELECT k FROM c",
+            &catalog,
+        )
+        .expect("bind aliased CTE");
+        assert_eq!(
+            bound.ctes[0].columns,
+            vec![
+                ("k".to_owned(), LogicalType::Int4),
+                ("v".to_owned(), LogicalType::Int4),
+            ]
+        );
+        assert_eq!(bound.projection, Projection::Columns(vec!["k".to_owned()]));
+    }
+
+    #[test]
+    fn cte_joined_to_a_base_table_binds_both_sides() {
+        let catalog = catalog_with_account(1_000);
+        let bound = bind(
+            "WITH c AS (SELECT id, balance FROM account) \
+             SELECT c.id, account.balance FROM c JOIN account ON c.id = account.id",
+            &catalog,
+        )
+        .expect("bind CTE joined to base table");
+        let join = bound.join.expect("a join plan");
+        assert_eq!(join.left.table, "c");
+        assert_eq!(join.right.table, "account");
+        // The CTE side is registered for the executor to materialize.
+        assert_eq!(bound.ctes.len(), 1);
+        assert_eq!(bound.ctes[0].name, "c");
+    }
+
+    #[test]
+    fn aggregate_over_a_cte_binds() {
+        let catalog = catalog_with_account(1_000);
+        let bound = bind(
+            "WITH c AS (SELECT id, balance FROM account) SELECT count(*) FROM c",
+            &catalog,
+        )
+        .expect("bind aggregate over a CTE");
+        assert!(bound.aggregate.is_some());
+        assert!(bound.relation_columns.is_some());
+        assert_eq!(bound.table, "c");
+    }
+
+    #[test]
+    fn recursive_with_is_rejected() {
+        let catalog = catalog_with_account(1_000);
+        let err = bind(
+            "WITH RECURSIVE c AS (SELECT id, balance FROM account) SELECT id FROM c",
+            &catalog,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SelectError::Cte(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn duplicate_cte_name_is_rejected() {
+        let catalog = catalog_with_account(1_000);
+        let err = bind(
+            "WITH c AS (SELECT id FROM account), c AS (SELECT id FROM account) SELECT id FROM c",
+            &catalog,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SelectError::Cte(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn column_alias_arity_mismatch_is_rejected() {
+        let catalog = catalog_with_account(1_000);
+        let err = bind(
+            "WITH c(only_one) AS (SELECT id, balance FROM account) SELECT only_one FROM c",
+            &catalog,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SelectError::Cte(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn valid_time_as_of_over_a_cte_is_unsupported() {
+        let catalog = catalog_with_account(1_000);
+        // A CTE's ephemeral schema is system-only, so a valid-axis pin has nothing
+        // to travel — the documented `ValidTimeUnsupported`, not a wrong read.
+        let err = bind(
+            "WITH c AS (SELECT id, balance FROM account) \
+             SELECT id FROM c FOR VALID_TIME AS OF 100",
+            &catalog,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SelectError::ValidTimeUnsupported { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_column_over_a_cte_is_rejected() {
+        let catalog = catalog_with_account(1_000);
+        // `nope` is not one of the CTE's output columns.
+        let err = bind(
+            "WITH c AS (SELECT id, balance FROM account) SELECT nope FROM c",
+            &catalog,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SelectError::UnknownColumn { .. }),
+            "got {err:?}"
+        );
     }
 }
