@@ -74,6 +74,52 @@ point names both. A `VALID_TIME AS OF` against a table with no valid-time period
 is rejected at bind time (`SelectError::ValidTimeUnsupported`) — there is no valid
 axis to travel.
 
+### `SET stele.{system,valid}_time` — session time context (STL-246)
+
+```sql
+SET stele.system_time = now() - interval '1 hour';   -- pin the whole session
+SELECT balance FROM account WHERE id = 1;            -- reads as of an hour ago
+RESET stele.system_time;                              -- back to live
+```
+
+A connection can pin its read snapshot on either axis so **every** subsequent bare
+`SELECT` reads "as of" that instant, without repeating `FOR … AS OF` on each query.
+
+| Statement | Effect |
+|---|---|
+| `SET stele.system_time = <expr>` | Pin the system axis to the instant `<expr>` resolves to. |
+| `SET stele.valid_time = <expr>`  | Pin the valid axis (only meaningful for a valid-time table). |
+| `RESET stele.system_time` / `RESET stele.valid_time` | Clear one axis — live reads on it again. |
+| `RESET ALL` | Clear both axes. |
+| any other `SET`/`RESET` | A tolerated no-op (see below). |
+
+* **`<expr>` resolves exactly like a `FOR … AS OF` operand** — `now()`, an integer
+  microsecond instant, `now() ± interval '…'`, plus the alias `'now'` for `now()`.
+  It is folded **once, at the time of the `SET`** (so `SET … = now()` pins the
+  instant of the `SET`, not a moving target), against the server clock.
+* **Equivalence (the oracle).** A session-pinned read returns byte-for-byte what
+  the explicit form returns: the server applies the pin by replaying it as an
+  explicit `FOR <dim> AS OF <instant>` qualifier on each bare single-table
+  `SELECT`. So `SET stele.system_time = X; SELECT … FROM t` ≡ `SELECT … FROM t FOR
+  SYSTEM_TIME AS OF X`. An **explicit** `FOR … AS OF` in a statement overrides the
+  session pin for that axis (the statement's own qualifier always wins).
+* **Scope.** This is **session** state (per connection), not transactional: a pin
+  set inside a `BEGIN` block survives a `ROLLBACK`, matching Postgres `SET` (the
+  transactional `SET LOCAL` is not supported). Inside a transaction a pin makes the
+  block's reads time-travel exactly as an explicit `AS OF` does there — so under a
+  system pin, read-your-own-writes is suppressed (a past read shows only committed
+  history), while a valid pin keeps it ([STL-203], [STL-223]). The pin does **not**
+  apply over a `JOIN` (joins do not yet time-travel — [STL-243]); a join under a
+  pin reads live.
+* **Tolerant `SET`.** Every variable other than the two `stele.*` time variables is
+  accepted as a **no-op** (reported `SET`/`RESET`). This lets a stock Postgres
+  driver's connect-time preamble — pgjdbc's `extra_float_digits` /
+  `application_name`, etc. — succeed without a workaround ([STL-184]); only the two
+  Stele time variables carry behavior.
+
+Recognized at the token level (a `StatementBody::Session`), like the admin commands
+— Stele owns the `SET` surface rather than handing it to `sqlparser`.
+
 ### `PERIOD(from, to) <predicate> PERIOD(from, to)` — period predicates
 
 ```sql
@@ -712,7 +758,8 @@ Statement
 ├── body: StatementBody
 │   ├── Sql(sqlparser::ast::Statement)   // standard SQL, clauses stripped
 │   ├── Admin(AdminCommand)              // CHECKPOINT | FLUSH | COMPACT | BACKUP TO '<path>' — no sqlparser grammar
-│   └── User(UserDdl)                    // CREATE | ALTER | DROP USER (STL-252)
+│   ├── User(UserDdl)                    // CREATE | ALTER | DROP USER (STL-252)
+│   └── Session(SessionCommand)          // SET/RESET stele.{system,valid}_time, or a tolerated SET (STL-246)
 └── temporal: Temporal
     ├── system_versioning: bool         // WITH SYSTEM VERSIONING
     ├── valid_time: Option<ValidTimePeriod>   // VALID TIME (from, to)
@@ -727,9 +774,9 @@ Statement
 
 A statement with no temporal grammar carries `Temporal::default()` (all empty);
 `Statement::is_temporal()` reports the difference. `Statement::sql()` returns the
-standard-SQL body, or `None` for an admin command or user DDL — the seam the
-binders and the wire layer read so a lifted statement cleanly classifies as
-"none of the SQL routes".
+standard-SQL body, or `None` for an admin command, user DDL, or session command —
+the seam the binders and the wire layer read so a lifted statement cleanly
+classifies as "none of the SQL routes".
 
 ## Admin commands (STL-219, STL-231, STL-249)
 

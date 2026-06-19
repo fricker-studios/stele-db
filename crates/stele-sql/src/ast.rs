@@ -58,6 +58,58 @@ pub enum StatementBody {
     ///
     /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
     User(UserDdl),
+    /// A `SET` / `RESET` session command lifted off the token stream before
+    /// `sqlparser` ([STL-246]). The two `stele.{system,valid}_time` variables pin
+    /// the connection's read snapshot for time travel; every other variable is a
+    /// tolerated no-op so standard Postgres drivers connect without a workaround.
+    /// Handled at the session (wire) layer, not the engine binders.
+    ///
+    /// [STL-246]: https://allegromusic.atlassian.net/browse/STL-246
+    Session(SessionCommand),
+}
+
+/// A `SET` / `RESET` session command ([STL-246]), recognized at the token level
+/// (`sqlparser`'s own `SET` grammar is bypassed so Stele owns the surface) and
+/// handled per-connection by the wire layer.
+///
+/// Only `stele.system_time` and `stele.valid_time` carry behavior — they pin the
+/// session's read snapshot on the matching time axis so a whole session reads
+/// "as of" an instant without repeating `FOR … AS OF` on every query. Every other
+/// `SET`/`RESET` is [`Tolerated`](Self::Tolerated): accepted as a no-op so a
+/// driver's connect-time preamble (`extra_float_digits`, `application_name`, …)
+/// does not error ([STL-184]).
+///
+/// [STL-184]: https://allegromusic.atlassian.net/browse/STL-184
+/// [STL-246]: https://allegromusic.atlassian.net/browse/STL-246
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionCommand {
+    /// `SET stele.{system,valid}_time = <expr>` (or `… TO <expr>`) — pin the
+    /// session's read snapshot on one axis. The value is an arbitrary scalar
+    /// expression resolved exactly as a `FOR <dim> AS OF <expr>` qualifier is
+    /// (`now()`, an integer microsecond instant, `now() ± interval`, or `'now'`).
+    SetTime {
+        /// Which time axis the pin applies to.
+        dimension: TimeDimension,
+        /// The snapshot instant expression, resolved at the time of the `SET`.
+        /// Boxed because an [`Expr`] dwarfs the other (unit / `String`) variants;
+        /// a `SET` is rare, so the one allocation is immaterial.
+        value: Box<Expr>,
+    },
+    /// `RESET stele.{system,valid}_time` — clear one axis, restoring live reads.
+    ResetTime {
+        /// Which time axis the reset clears.
+        dimension: TimeDimension,
+    },
+    /// `RESET ALL` — clear both time axes (restoring fully live reads).
+    ResetAll,
+    /// Any other `SET`/`RESET` variable: accepted as a no-op. `is_reset` selects
+    /// the `SET` vs `RESET` `CommandComplete` tag; `name` is kept for logging.
+    Tolerated {
+        /// The variable name as written (best-effort), for diagnostics.
+        name: String,
+        /// `true` for `RESET <name>`, `false` for `SET <name> …`.
+        is_reset: bool,
+    },
 }
 
 /// A user-administration statement ([STL-252]) — Stele's Postgres-compatible
@@ -161,7 +213,7 @@ impl Statement {
     pub const fn sql(&self) -> Option<&SqlStatement> {
         match &self.body {
             StatementBody::Sql(body) => Some(body),
-            StatementBody::Admin(_) | StatementBody::User(_) => None,
+            StatementBody::Admin(_) | StatementBody::User(_) | StatementBody::Session(_) => None,
         }
     }
 
@@ -171,7 +223,7 @@ impl Statement {
     pub const fn sql_mut(&mut self) -> Option<&mut SqlStatement> {
         match &mut self.body {
             StatementBody::Sql(body) => Some(body),
-            StatementBody::Admin(_) | StatementBody::User(_) => None,
+            StatementBody::Admin(_) | StatementBody::User(_) | StatementBody::Session(_) => None,
         }
     }
 }

@@ -35,6 +35,13 @@ Because Stele speaks the [Postgres wire protocol](adr/0003-postgres-wire-protoco
 - **Logical replication / CDC:** stream changes (e.g., via Debezium/logical decoding) into Stele's MERGE path for an **online, low-downtime cutover** — each upstream change becomes a new bitemporal version, so the migration itself produces a clean history.
 - **Schema translation:** map Postgres types to Stele types ([01 §B.2](01-feature-plan.md#b2--type-system)); decide per table whether to enable **valid-time** (opt-in) and whether to assign **hash keys**.
 
+### Client drivers (JDBC / psycopg / pgAdmin)
+
+Stock Postgres drivers connect **out of the box** — no Stele-specific connection options. A driver's connect-time `SET` preamble (pgjdbc's `extra_float_digits` / `application_name`, psycopg's session defaults, …) is **tolerated as a no-op** ([STL-246](https://allegromusic.atlassian.net/browse/STL-246)): every `SET`/`RESET` of a variable other than the two Stele time variables succeeds and changes nothing.
+
+- **pgjdbc no longer needs `assumeMinServerVersion=9.4`.** That option was previously required only to fold pgjdbc's `SET` preamble into the startup packet, because the server had no `SET`; with `SET` now tolerated, a stock `jdbc:postgresql://…/stele` connection works. The CI driver gate ([`ci/JdbcSmoke.java`](../ci/JdbcSmoke.java), STL-184) connects with no such option and is itself the regression test.
+- **Session time travel.** `SET stele.system_time = '…'` (and the valid-axis twin) pins a whole connection's read snapshot, so an existing reporting tool can point at a past instant without rewriting its queries — see [sql-grammar.md](sql-grammar.md#set-stelesystemvalid_time--session-time-context-stl-246). The shell's `\asof` ([STL-199](https://allegromusic.atlassian.net/browse/STL-199)) is the same idea, client-side.
+
 ## 3. Temporal-aware historical backfill (the part unique to Stele)
 
 Loading *history* into a bitemporal store is not a plain insert — you must decide what each row's **system-time** and **valid-time** should be. Stele makes this explicit:
