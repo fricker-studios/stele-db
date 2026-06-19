@@ -13,6 +13,7 @@ members = [
     "crates/stele-pgwire",
     "crates/stele-lineage",
     "crates/stele-server",
+    "crates/stele-client",
     "crates/stele-cli",
 ]
 # `stele-exec-oracle` is a test-only crate whose dev-dep DuckDB compiles the
@@ -32,6 +33,7 @@ default-members = [
     "crates/stele-pgwire",
     "crates/stele-lineage",
     "crates/stele-server",
+    "crates/stele-client",
     "crates/stele-cli",
 ]
 
@@ -57,6 +59,7 @@ stele-engine   = { path = "crates/stele-engine",   version = "0.3.0" }
 stele-pgwire   = { path = "crates/stele-pgwire",   version = "0.3.0" }
 stele-lineage  = { path = "crates/stele-lineage",  version = "0.3.0" }
 stele-server   = { path = "crates/stele-server",   version = "0.3.0" }
+stele-client   = { path = "crates/stele-client",   version = "0.3.0" }
 
 # Pinned third-party deps. Keep this list short on purpose — each addition is a
 # supply-chain surface and a `cargo-deny` decision.

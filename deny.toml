@@ -46,6 +46,7 @@ exceptions = [
     { allow = ["BUSL-1.1"], name = "stele-pgwire" },
     { allow = ["BUSL-1.1"], name = "stele-lineage" },
     { allow = ["BUSL-1.1"], name = "stele-server" },
+    { allow = ["BUSL-1.1"], name = "stele-client" },
     { allow = ["BUSL-1.1"], name = "stele-cli" },
 ]
 
@@ -71,6 +72,14 @@ exceptions = [
 [bans]
 multiple-versions = "warn"
 wildcards         = "deny"
+# `stele-client` (the one published crate, STL-255) dev-depends on its sibling
+# workspace crates by **path with no version** so `cargo package` strips them at
+# publish time (a versioned dev-dep on an unpublished sibling fails packaging).
+# Those versionless path deps read as wildcards, so allow wildcards *for path
+# dependencies only* — registry wildcards (the real supply-chain risk) stay
+# denied, and a wildcard path dep that isn't a dev-dep of a published crate is
+# still flagged because it would break publishing.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

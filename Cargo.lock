@@ -2713,8 +2713,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustyline",
- "serde",
- "serde_json",
+ "stele-client",
  "stele-common",
  "stele-engine",
  "stele-pgwire",
@@ -2722,6 +2721,21 @@ dependencies = [
  "stele-storage",
  "tokio",
  "unicode-width",
+]
+
+[[package]]
+name = "stele-client"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "stele-common",
+ "stele-engine",
+ "stele-pgwire",
+ "stele-server",
+ "stele-sql",
+ "stele-storage",
+ "tokio",
 ]
 
 [[package]]
