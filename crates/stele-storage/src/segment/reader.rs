@@ -322,7 +322,7 @@ impl<F: DiskFile> SegmentReader<F> {
                 for rg in row_groups {
                     let meta = chunk_meta(rg, col)?;
                     let payload = read_chunk_payload(&self.file, meta)?;
-                    decode_nullable_bytes_chunk(&payload, meta.value_count, &mut out)?;
+                    append_nullable_bytes_cells(meta.codec, &payload, meta.value_count, &mut out)?;
                 }
                 Ok(ColumnData::NullableBytes(out))
             }
@@ -331,7 +331,7 @@ impl<F: DiskFile> SegmentReader<F> {
                 for rg in row_groups {
                     let meta = chunk_meta(rg, col)?;
                     let payload = read_chunk_payload(&self.file, meta)?;
-                    decode_bytes_chunk(&payload, meta.value_count, &mut out)?;
+                    append_present_bytes_cells(meta.codec, &payload, meta.value_count, &mut out)?;
                 }
                 Ok(ColumnData::Bytes(out))
             }
@@ -340,7 +340,7 @@ impl<F: DiskFile> SegmentReader<F> {
                 for rg in row_groups {
                     let meta = chunk_meta(rg, col)?;
                     let payload = read_chunk_payload(&self.file, meta)?;
-                    decode_i64_chunk(&payload, meta.value_count, &mut out)?;
+                    append_i64_cells(meta.codec, &payload, meta.value_count, &mut out)?;
                 }
                 Ok(ColumnData::I64(out))
             }
@@ -642,12 +642,12 @@ impl<F: DiskFile> SegmentReader<F> {
         match col.ty() {
             ColumnType::Bytes => {
                 let mut out: Vec<Vec<u8>> = Vec::new();
-                decode_bytes_chunk(&payload, meta.value_count, &mut out)?;
+                append_present_bytes_cells(meta.codec, &payload, meta.value_count, &mut out)?;
                 Ok(ColumnData::Bytes(out))
             }
             ColumnType::I64 => {
                 let mut out: Vec<i64> = Vec::new();
-                decode_i64_chunk(&payload, meta.value_count, &mut out)?;
+                append_i64_cells(meta.codec, &payload, meta.value_count, &mut out)?;
                 Ok(ColumnData::I64(out))
             }
         }
@@ -1155,6 +1155,111 @@ fn read_chunk_payload<F: DiskFile>(
     Ok(buf[CHUNK_HEADER_LEN..].to_vec())
 }
 
+/// Decode one bytes chunk's cells, dispatched on its codec, into `out` as
+/// `Option` cells — the general form for the nullable `payload` column. A
+/// [`Codec::Dict`] chunk ([STL-250]) decodes through the dictionary; a
+/// [`Codec::Plain`] one through the sentinel-aware plain path.
+fn append_nullable_bytes_cells(
+    codec: Codec,
+    payload: &[u8],
+    value_count: u32,
+    out: &mut Vec<Option<Vec<u8>>>,
+) -> Result<(), SegmentError> {
+    match codec {
+        Codec::Plain => decode_nullable_bytes_chunk(payload, value_count, out),
+        Codec::Dict => decode_dict_bytes_chunk(payload, value_count, out),
+    }
+}
+
+/// Decode one bytes chunk's cells, dispatched on its codec, into `out` as
+/// always-present values — every bytes column except `payload`. A dictionary
+/// chunk that carries a NULL entry in such a column is corrupt: only `payload`
+/// may be NULL ([STL-154]), so a NULL here means a malformed segment, not a
+/// silently-dropped value.
+fn append_present_bytes_cells(
+    codec: Codec,
+    payload: &[u8],
+    value_count: u32,
+    out: &mut Vec<Vec<u8>>,
+) -> Result<(), SegmentError> {
+    match codec {
+        Codec::Plain => decode_bytes_chunk(payload, value_count, out),
+        Codec::Dict => {
+            let mut cells: Vec<Option<Vec<u8>>> = Vec::new();
+            decode_dict_bytes_chunk(payload, value_count, &mut cells)?;
+            for cell in cells {
+                match cell {
+                    Some(v) => out.push(v),
+                    None => {
+                        return Err(SegmentError::Corrupt(
+                            "NULL cell in a non-nullable dictionary column",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Decode one `i64` chunk into `out`. An `i64` column is always stored verbatim
+/// ([`Codec::Plain`]) — [STL-250] applies dictionary encoding only to bytes
+/// columns — so a non-plain codec on an `i64` column is a corrupt footer the
+/// writer can never produce.
+fn append_i64_cells(
+    codec: Codec,
+    payload: &[u8],
+    value_count: u32,
+    out: &mut Vec<i64>,
+) -> Result<(), SegmentError> {
+    match codec {
+        Codec::Plain => decode_i64_chunk(payload, value_count, out),
+        Codec::Dict => Err(SegmentError::Corrupt("dictionary codec on an i64 column")),
+    }
+}
+
+/// Decode a dictionary-encoded bytes chunk ([`Codec::Dict`], [STL-250]) into
+/// `out` as `Option` cells — the inverse of the writer's `build_dict_payload`.
+/// Layout: `[u8 code_width][u32 dict_count][(u32 len, bytes) × dict_count][code ×
+/// value_count]`, where a dictionary `len` of [`BYTES_NULL_SENTINEL`] marks a
+/// NULL entry and each `code_width`-byte code indexes the dictionary. A code
+/// outside the dictionary, an unknown width, or trailing bytes are all corruption.
+fn decode_dict_bytes_chunk(
+    payload: &[u8],
+    value_count: u32,
+    out: &mut Vec<Option<Vec<u8>>>,
+) -> Result<(), SegmentError> {
+    let mut p = Parser::new(payload);
+    let code_width = usize::from(p.u8()?);
+    if !matches!(code_width, 1 | 2 | 4) {
+        return Err(SegmentError::Corrupt("invalid dictionary code width"));
+    }
+    let dict_count = p.u32()?;
+    // Don't pre-size from the footer-derived count — grow naturally, bounded by
+    // the parser's per-field length checks against the chunk payload (the same
+    // posture every other decoder takes against a corrupt count).
+    let mut dict: Vec<Option<Vec<u8>>> = Vec::new();
+    for _ in 0..dict_count {
+        let len = p.u32()?;
+        if len == BYTES_NULL_SENTINEL {
+            dict.push(None);
+        } else {
+            dict.push(Some(p.bytes(len as usize)?.to_vec()));
+        }
+    }
+    for _ in 0..value_count {
+        let code = p.code(code_width)? as usize;
+        let entry = dict
+            .get(code)
+            .ok_or(SegmentError::Corrupt("dictionary code out of range"))?;
+        out.push(entry.clone());
+    }
+    if !p.is_empty() {
+        return Err(SegmentError::Corrupt("trailing bytes in dictionary column"));
+    }
+    Ok(())
+}
+
 fn decode_bytes_chunk(
     payload: &[u8],
     value_count: u32,
@@ -1269,6 +1374,17 @@ impl<'a> Parser<'a> {
 
     fn bytes(&mut self, n: usize) -> Result<&'a [u8], SegmentError> {
         self.take(n)
+    }
+
+    /// Read a `code_width`-byte (1/2/4) little-endian dictionary code,
+    /// zero-extended to `u32` ([STL-250]). The width is validated by the caller
+    /// ([`decode_dict_bytes_chunk`]); the low `code_width` bytes carry the value
+    /// and the high bytes are zero.
+    fn code(&mut self, code_width: usize) -> Result<u32, SegmentError> {
+        let bytes = self.take(code_width)?;
+        let mut le = [0u8; 4];
+        le[..code_width].copy_from_slice(bytes);
+        Ok(u32::from_le_bytes(le))
     }
 }
 
@@ -1510,6 +1626,120 @@ mod tests {
         assert!(
             matches!(err, SegmentError::Corrupt(msg) if msg.contains("past end of file")),
             "expected end-of-file rejection, got {err:?}"
+        );
+    }
+
+    /// Hand-build a dictionary chunk payload ([STL-250]) from `(code_width,
+    /// entries, codes)` so the decoder tests pin the exact on-disk byte layout the
+    /// writer's `build_dict_payload` emits, without standing up a full segment.
+    fn dict_payload(code_width: u8, entries: &[Option<&[u8]>], codes: &[u32]) -> Vec<u8> {
+        let mut out = vec![code_width];
+        let dict_count = u32::try_from(entries.len()).expect("dict_count fits u32");
+        out.extend_from_slice(&dict_count.to_le_bytes());
+        for entry in entries {
+            match entry {
+                None => out.extend_from_slice(&BYTES_NULL_SENTINEL.to_le_bytes()),
+                Some(b) => {
+                    let len = u32::try_from(b.len()).expect("entry len fits u32");
+                    out.extend_from_slice(&len.to_le_bytes());
+                    out.extend_from_slice(b);
+                }
+            }
+        }
+        for &c in codes {
+            out.extend_from_slice(&c.to_le_bytes()[..usize::from(code_width)]);
+        }
+        out
+    }
+
+    #[test]
+    fn dict_chunk_round_trips_including_null_and_empty() {
+        // Dictionary ["x", NULL, ""], codes x, "", NULL, x. The NULL entry and the
+        // distinct empty-value entry must decode apart ([STL-154]).
+        let payload = dict_payload(1, &[Some(b"x"), None, Some(b"")], &[0, 2, 1, 0]);
+        let mut out = Vec::new();
+        decode_dict_bytes_chunk(&payload, 4, &mut out).expect("decode");
+        assert_eq!(
+            out,
+            vec![
+                Some(b"x".to_vec()),
+                Some(Vec::new()),
+                None,
+                Some(b"x".to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn dict_chunk_round_trips_two_byte_codes() {
+        // A two-byte code width still reconstructs the right values.
+        let payload = dict_payload(2, &[Some(b"aa"), Some(b"bb")], &[1, 0, 1]);
+        let mut out = Vec::new();
+        decode_dict_bytes_chunk(&payload, 3, &mut out).expect("decode");
+        assert_eq!(
+            out,
+            vec![
+                Some(b"bb".to_vec()),
+                Some(b"aa".to_vec()),
+                Some(b"bb".to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn dict_chunk_rejects_an_out_of_range_code() {
+        let payload = dict_payload(1, &[Some(b"a")], &[5]); // code 5 ≥ dict_count 1
+        let err = decode_dict_bytes_chunk(&payload, 1, &mut Vec::new()).unwrap_err();
+        assert!(
+            matches!(err, SegmentError::Corrupt(m) if m.contains("code out of range")),
+            "out-of-range code must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn dict_chunk_rejects_a_bad_code_width() {
+        let mut payload = vec![3u8]; // width 3 is not 1/2/4
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let err = decode_dict_bytes_chunk(&payload, 0, &mut Vec::new()).unwrap_err();
+        assert!(
+            matches!(err, SegmentError::Corrupt(m) if m.contains("code width")),
+            "an invalid code width must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn dict_chunk_rejects_trailing_bytes() {
+        let mut payload = dict_payload(1, &[Some(b"a")], &[0]);
+        payload.push(0xFF); // junk after the codes
+        let err = decode_dict_bytes_chunk(&payload, 1, &mut Vec::new()).unwrap_err();
+        assert!(
+            matches!(err, SegmentError::Corrupt(m) if m.contains("trailing")),
+            "trailing bytes must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn null_in_a_non_nullable_dict_column_is_rejected() {
+        // A dictionary whose code resolves to NULL, read through the present-only
+        // path (every bytes column except `payload`), is corrupt — not a silently
+        // dropped value.
+        let payload = dict_payload(1, &[None], &[0]);
+        let err =
+            append_present_bytes_cells(Codec::Dict, &payload, 1, &mut Vec::new()).unwrap_err();
+        assert!(
+            matches!(err, SegmentError::Corrupt(m) if m.contains("non-nullable")),
+            "a NULL in a non-nullable dictionary column must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn dict_codec_on_an_i64_column_is_rejected() {
+        // The writer never emits a dictionary i64 column; a corrupt footer that
+        // claims one must be rejected rather than mis-decoded.
+        let err = append_i64_cells(Codec::Dict, &[], 0, &mut Vec::new()).unwrap_err();
+        assert!(
+            matches!(err, SegmentError::Corrupt(m) if m.contains("i64")),
+            "dictionary codec on an i64 column must be rejected, got {err:?}"
         );
     }
 

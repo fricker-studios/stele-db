@@ -41,14 +41,21 @@
 //! [architecture §12](../../../../docs/02-architecture.md#12-cross-cutting-architectural-invariants)
 //! is enforced by the absence of a writing path, not by a runtime check.
 //!
-//! ## Codecs (v0.1)
+//! ## Codecs
 //!
-//! v0.1 emits a single codec — `Plain`. The per-chunk codec tag is the
-//! dispatch point in both writer and reader, so the architecture-listed
-//! codecs (dict + bitpack, RLE, delta, FOR — see
-//! [architecture §3.2](../../../../docs/02-architecture.md#32-on-disk-segment-format))
-//! drop in as new variants without bumping the on-disk format version. The
-//! follow-up tickets carrying them are tracked under the v0.1 epic [STL-76].
+//! The per-chunk codec tag (in both the chunk header and the footer column
+//! entry) is the dispatch point in writer and reader. v0.1 emitted only `Plain`;
+//! v0.3 adds `Dict` — version-chain-aware **dictionary** encoding for bytes
+//! columns ([STL-250], format v13): a value repeated across a key's version chain
+//! (the *identical* `business_key`, a repeated `principal` / `payload`) is stored
+//! once plus a narrow code per row, chosen per chunk by the writer from column
+//! statistics whenever it is smaller than plain
+//! ([architecture §3.2](../../../../docs/02-architecture.md#32-on-disk-segment-format)).
+//! The remaining listed codecs (RLE, delta, FOR — e.g. for the monotonic
+//! `sys_from` / `seq` axes) drop in the same way as further variants. Adding a
+//! variant bumps the format version (an older reader would otherwise choke on the
+//! unknown codec byte mid-footer rather than reject cleanly at the header), the
+//! same generation discipline every change follows.
 //!
 //! ## What is *not* in v0.1
 //!

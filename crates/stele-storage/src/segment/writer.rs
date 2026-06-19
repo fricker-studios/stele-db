@@ -14,6 +14,8 @@
 //! segments append-rejecting at the type level
 //! ([architecture §12 invariant 1](../../../../../docs/02-architecture.md#12-cross-cutting-architectural-invariants)).
 
+use std::collections::HashMap;
+
 use crate::backend::{Disk, DiskFile};
 use crate::bloom::{DEFAULT_BITS_PER_KEY, KeyBloom};
 use crate::checksum::crc32c;
@@ -71,6 +73,16 @@ pub struct SegmentWriter<F: DiskFile> {
     /// written for a valid-time segment — a system-only table has no valid
     /// windows to summarize.
     valid_interval_cap: usize,
+    /// Whether to consider per-column dictionary encoding ([STL-250], format
+    /// v13). `false` — the default — emits every column [`Codec::Plain`], so a
+    /// segment is byte-identical to a v12 one apart from the header version. When
+    /// `true`, each bytes column is encoded as a dictionary *or* plain, whichever
+    /// is smaller (the writer-by-statistics choice of architecture §3.2), so a
+    /// value repeated across a key's version chain is stored once. Enabled by
+    /// compaction ([`crate::engine::Engine::compact`]) — the natural place to
+    /// spend the CPU consolidating history — and left off for the latency-bound
+    /// flush path.
+    dictionary: bool,
 }
 
 impl<F: DiskFile> SegmentWriter<F> {
@@ -121,7 +133,24 @@ impl<F: DiskFile> SegmentWriter<F> {
             max_row_group_rows: None,
             bloom_bits_per_key: DEFAULT_BITS_PER_KEY,
             valid_interval_cap: DEFAULT_VALID_INTERVAL_CAP,
+            dictionary: false,
         })
+    }
+
+    /// Enable (or disable) per-column dictionary encoding ([STL-250], format
+    /// v13). When on, each bytes column is stored as a dictionary of its distinct
+    /// values plus a narrow per-row code *when that is smaller* than the plain
+    /// layout, and verbatim otherwise — the writer-by-statistics choice never
+    /// makes a chunk larger, so a value repeated across a key's version chain is
+    /// stored once but an all-distinct column is unaffected. Off by default,
+    /// which keeps a segment byte-identical to v12 apart from the header version;
+    /// compaction turns it on. Purely a writer-side choice — a reader decodes
+    /// either codec transparently — so toggling it changes a segment's *size*,
+    /// never the values it reads back (the equivalence the STL-250 oracle pins).
+    #[must_use]
+    pub const fn with_dictionary(mut self, enabled: bool) -> Self {
+        self.dictionary = enabled;
+        self
     }
 
     /// Size (or disable) the per-segment business-key bloom filter ([STL-238]).
@@ -288,7 +317,7 @@ impl<F: DiskFile> SegmentWriter<F> {
                 .map(|pairs| &pairs[row_base..row_base + group.len()]);
             let mut chunks: Vec<EncodedChunk> = Vec::with_capacity(schema.len());
             for &col in schema {
-                let encoded = encode_column(col, group, group_pairs)?;
+                let encoded = encode_column(col, group, group_pairs, self.dictionary)?;
                 // Within a row-group each chunk is laid out contiguously in
                 // `ColumnId::schema` order (`business_key`, `sys_from`,
                 // `payload`, the three provenance columns, then the valid-time
@@ -299,6 +328,7 @@ impl<F: DiskFile> SegmentWriter<F> {
                 let length = (CHUNK_HEADER_LEN + encoded.payload.len()) as u64;
                 chunks.push(EncodedChunk {
                     col,
+                    codec: encoded.codec,
                     offset,
                     length,
                     value_count: version_count,
@@ -326,10 +356,11 @@ impl<F: DiskFile> SegmentWriter<F> {
             .map_err(|_| SegmentError::TooLarge("retraction count exceeds u32::MAX"))?;
         if !self.retractions.is_empty() {
             for &col in &ColumnId::RETRACTION {
-                let encoded = encode_retraction_column(col, &self.retractions)?;
+                let encoded = encode_retraction_column(col, &self.retractions, self.dictionary)?;
                 let length = (CHUNK_HEADER_LEN + encoded.payload.len()) as u64;
                 retraction_chunks.push(EncodedChunk {
                     col,
+                    codec: encoded.codec,
                     offset,
                     length,
                     value_count: retraction_count,
@@ -357,7 +388,7 @@ impl<F: DiskFile> SegmentWriter<F> {
             })?;
             header.extend_from_slice(&payload_len.to_le_bytes());
             header.extend_from_slice(&chunk.value_count.to_le_bytes());
-            header.push(Codec::Plain as u8);
+            header.push(chunk.codec.as_byte());
             header.extend_from_slice(&[0u8; 3]); // reserved
             debug_assert_eq!(header.len(), CHUNK_HEADER_LEN - 4);
             let mut crc_input = Vec::with_capacity(header.len() + chunk.payload.len());
@@ -440,6 +471,11 @@ impl StatBound {
 }
 
 struct EncodedColumn {
+    /// The codec the encoder chose for this column's payload — [`Codec::Plain`]
+    /// or, when dictionary encoding was enabled *and* smaller, [`Codec::Dict`]
+    /// ([STL-250]). Stamped into both the chunk header and the footer entry so the
+    /// reader dispatches the matching decoder.
+    codec: Codec,
     payload: Vec<u8>,
     stat_min: StatBound,
     stat_max: StatBound,
@@ -447,6 +483,7 @@ struct EncodedColumn {
 
 struct EncodedChunk {
     col: ColumnId,
+    codec: Codec,
     offset: u64,
     length: u64,
     value_count: u32,
@@ -466,6 +503,7 @@ fn encode_column(
     col: ColumnId,
     rows: &[Version],
     valid_pairs: Option<&[(i64, i64)]>,
+    use_dict: bool,
 ) -> Result<EncodedColumn, SegmentError> {
     match col.ty() {
         ColumnType::Bytes => {
@@ -482,7 +520,7 @@ fn encode_column(
             for row in rows {
                 vals.push(extract_bytes(col, row, valid_time)?);
             }
-            encode_bytes_values(vals.into_iter())
+            encode_bytes_values(vals.into_iter(), use_dict)
         }
         ColumnType::I64 => {
             // Stream the per-row values straight into the encoder — no
@@ -519,17 +557,20 @@ fn encode_column(
 fn encode_retraction_column(
     col: ColumnId,
     closes: &[Close],
+    use_dict: bool,
 ) -> Result<EncodedColumn, SegmentError> {
     match col {
         // Retraction tombstone bytes columns are never NULL — wrap each value as
         // present so it shares the `Option`-aware bytes encoder ([STL-154]).
-        ColumnId::RetractKey => {
-            encode_bytes_values(closes.iter().map(|c| Some(c.business_key.as_bytes())))
-        }
+        ColumnId::RetractKey => encode_bytes_values(
+            closes.iter().map(|c| Some(c.business_key.as_bytes())),
+            use_dict,
+        ),
         ColumnId::RetractClosedByPrincipal => encode_bytes_values(
             closes
                 .iter()
                 .map(|c| Some(c.closed_by.principal.as_bytes())),
+            use_dict,
         ),
         ColumnId::RetractSysFrom => Ok(encode_i64_values(closes.iter().map(|c| c.sys_from.0))),
         // `seq` is a u64; store its bits in the i64 column (lossless round-trip —
@@ -546,36 +587,46 @@ fn encode_retraction_column(
     }
 }
 
-/// Encode a bytes column: plain `[u32 len][bytes]` per value, plus a bounded
-/// lex-min/max prefix stat.
+/// Encode a bytes column, choosing the smaller of plain and dictionary layout.
 ///
-/// Min/max stats are a bounded *prefix* of the lex-min and lex-max byte values;
-/// the catalog will later attach a column-level comparator, but at the format
-/// layer bytewise order is the natural choice (it matches how `BusinessKey`
-/// already sorts via `Vec<u8>`'s Ord).
+/// **Plain** is `[u32 len][bytes]` per value (a NULL writes [`BYTES_NULL_SENTINEL`]
+/// and no body — [STL-154]). **Dictionary** ([`Codec::Dict`], [STL-250]) stores
+/// the distinct values once — `[u8 code_width][u32 dict_count][(u32 len, bytes) ×
+/// dict_count][code × value_count]` — so a value repeated across a key's version
+/// chain (the *identical* `business_key`, a repeated `principal` / `payload`)
+/// costs one dictionary entry plus a narrow code per row instead of being
+/// re-stored wholesale. The writer keeps the dictionary only when `use_dict` is
+/// set *and* it is strictly smaller than plain, so an all-distinct column never
+/// grows — the "chosen by the writer from column statistics" rule of
+/// [architecture §3.2](../../../../../docs/02-architecture.md#32-on-disk-segment-format).
 ///
+/// The zone-map min/max stats are a bounded *prefix* of the lex-min and lex-max
+/// byte values, computed over the **logical** values and therefore identical for
+/// either codec — pruning is unaffected. (At the format layer bytewise order is
+/// the natural choice; it matches how `BusinessKey` sorts via `Vec<u8>`'s Ord.)
 /// Every bytes column can be an unbounded blob — `Payload` runs up to
-/// `MAX_VERSION_FRAME_LEN` (16 MiB) per row, and `BusinessKey` / `Principal` are
-/// only bounded by the same frame ceiling — so inlining a full lex-min/max would
-/// let one row push the footer past the `u32` `footer_len` limit. Instead we
-/// record a bounded prefix capped at `MAX_BYTES_STAT_PREFIX_LEN`: the min prefix
-/// is truncated *down* and the max prefix is rounded *up*, so the `[min, max]`
-/// envelope stays a superset of the real value range and `might_contain` keeps
-/// its no-false-negatives contract. This caps every bytes column's footer cost
-/// regardless of value size.
+/// `MAX_VERSION_FRAME_LEN` (16 MiB) per row, `BusinessKey` / `Principal` only by
+/// the same ceiling — so inlining a full lex-min/max could push the footer past
+/// its `u32` `footer_len` limit. Instead we record a bounded prefix capped at
+/// `MAX_BYTES_STAT_PREFIX_LEN`: the min prefix is truncated *down* and the max
+/// rounded *up*, so the `[min, max]` envelope stays a superset and `might_contain`
+/// keeps its no-false-negatives contract, regardless of value size.
 fn encode_bytes_values<'a>(
     values: impl Iterator<Item = Option<&'a [u8]>>,
+    use_dict: bool,
 ) -> Result<EncodedColumn, SegmentError> {
-    let mut payload = Vec::new();
+    // Materialize once: the zone-map pass, the plain build, and the optional
+    // dictionary build each look at the values, and the iterator borrows from the
+    // row buffer (no copies). The values live exactly as long as this call.
+    let values: Vec<Option<&[u8]>> = values.collect();
+
+    // Zone-map min/max over the present (non-NULL) values, and a single up-front
+    // preflight of every value's `u32` length so a too-large value surfaces here
+    // (localized to this column) rather than deep inside an encoder.
     let mut min: Option<&[u8]> = None;
     let mut max: Option<&[u8]> = None;
-    for value in values {
-        let Some(bytes) = value else {
-            // SQL `NULL`: the reserved sentinel length, no value bytes, and no
-            // contribution to the zone-map min/max ([STL-154]).
-            payload.extend_from_slice(&BYTES_NULL_SENTINEL.to_le_bytes());
-            continue;
-        };
+    for value in &values {
+        let Some(bytes) = *value else { continue };
         let len = u32::try_from(bytes.len())
             .map_err(|_| SegmentError::TooLarge("value length exceeds u32::MAX in one chunk"))?;
         // A present value can never reach the sentinel length — the frame ceiling
@@ -585,26 +636,136 @@ fn encode_bytes_values<'a>(
             len, BYTES_NULL_SENTINEL,
             "present value reached NULL sentinel length"
         );
-        payload.extend_from_slice(&len.to_le_bytes());
-        payload.extend_from_slice(bytes);
         min = Some(min.map_or(bytes, |m| if bytes < m { bytes } else { m }));
         max = Some(max.map_or(bytes, |m| if bytes > m { bytes } else { m }));
     }
+    // A column with no (non-NULL) values has no bound (`Absent`). For a present
+    // value, an empty bounded prefix is the degenerate edge of the scheme — an
+    // empty lex-min, or an all-`0xFF` max — recorded as a present *open* end
+    // (`Unbounded`, −∞ / +∞) so the column keeps its zone and prunes on the other
+    // side, instead of the bare zero-length sentinel that used to collapse the
+    // whole zone ([STL-120]).
+    let stat_min = min.map_or(StatBound::Absent, |m| {
+        bound_or_unbounded(bounded_min_prefix(m))
+    });
+    let stat_max = max.map_or(StatBound::Absent, |m| {
+        bound_or_unbounded(bounded_max_prefix(m))
+    });
+
+    // Plain is the always-correct fallback; its size is a 4-byte length per value
+    // plus the present bytes (a NULL contributes only its 4-byte sentinel).
+    let plain_size: usize = values.iter().map(|v| 4 + v.map_or(0, <[u8]>::len)).sum();
+    // Keep a dictionary only when enabled *and* strictly smaller than plain.
+    let (codec, payload) = match use_dict.then(|| build_dict_payload(&values)).flatten() {
+        Some(dict) if dict.len() < plain_size => (Codec::Dict, dict),
+        _ => (Codec::Plain, encode_plain_bytes(&values)),
+    };
     Ok(EncodedColumn {
+        codec,
         payload,
-        // A column with no (non-NULL) values has no bound (`Absent`). For a
-        // present value, an empty bounded prefix is the degenerate edge of the
-        // scheme — an empty lex-min, or an all-`0xFF` max — which we record as a
-        // present *open* end (`Unbounded`, −∞ / +∞) so the column keeps its zone
-        // and prunes on the other side, instead of the bare zero-length sentinel
-        // that used to collapse the whole zone ([STL-120]).
-        stat_min: min.map_or(StatBound::Absent, |m| {
-            bound_or_unbounded(bounded_min_prefix(m))
-        }),
-        stat_max: max.map_or(StatBound::Absent, |m| {
-            bound_or_unbounded(bounded_max_prefix(m))
-        }),
+        stat_min,
+        stat_max,
     })
+}
+
+/// The plain bytes layout: `[u32 len][bytes]` per value, or [`BYTES_NULL_SENTINEL`]
+/// and no body for a SQL `NULL` cell ([STL-154]). Every value's length was already
+/// preflighted to fit `u32` by [`encode_bytes_values`], so the conversion here
+/// cannot fail.
+fn encode_plain_bytes(values: &[Option<&[u8]>]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for value in values {
+        match value {
+            None => payload.extend_from_slice(&BYTES_NULL_SENTINEL.to_le_bytes()),
+            Some(bytes) => {
+                let len = u32::try_from(bytes.len()).expect("length preflighted to fit u32");
+                payload.extend_from_slice(&len.to_le_bytes());
+                payload.extend_from_slice(bytes);
+            }
+        }
+    }
+    payload
+}
+
+/// Build the dictionary payload for a bytes column ([`Codec::Dict`], [STL-250]),
+/// or `None` when a dictionary cannot beat plain — an empty column, or one whose
+/// values are *all distinct* (a dictionary then stores every value once like
+/// plain, plus a header and a code per row, so it can only be larger).
+///
+/// The dictionary is built in **first-appearance order**, which is deterministic
+/// given row order, so the same input always produces byte-identical output
+/// ([ADR-0010]). Layout: `[u8 code_width][u32 dict_count][(u32 len, bytes) ×
+/// dict_count][code × value_count]`, where a dictionary `len` of
+/// [`BYTES_NULL_SENTINEL`] marks a NULL entry (the `payload` column) and each code
+/// is the `code_width`-byte little-endian index of its value in the dictionary.
+fn build_dict_payload(values: &[Option<&[u8]>]) -> Option<Vec<u8>> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut index: HashMap<Option<&[u8]>, u32> = HashMap::new();
+    let mut distinct: Vec<Option<&[u8]>> = Vec::new();
+    let mut codes: Vec<u32> = Vec::with_capacity(values.len());
+    for &value in values {
+        let code = if let Some(&c) = index.get(&value) {
+            c
+        } else {
+            // `distinct.len() <= values.len()`, and `value_count` was bounded by
+            // `u32` before this column was encoded (`finish`), so the index fits.
+            let c = u32::try_from(distinct.len()).expect("dictionary index fits u32");
+            index.insert(value, c);
+            distinct.push(value);
+            c
+        };
+        codes.push(code);
+    }
+    // No repeats ⇒ a dictionary can only be larger than plain. Bail before paying
+    // to build it, so the all-distinct common case is free.
+    if distinct.len() == values.len() {
+        return None;
+    }
+    let code_width = code_width_for(distinct.len());
+    let mut payload = Vec::new();
+    payload.push(code_width);
+    let dict_count = u32::try_from(distinct.len()).expect("dictionary count fits u32");
+    payload.extend_from_slice(&dict_count.to_le_bytes());
+    for &entry in &distinct {
+        match entry {
+            None => payload.extend_from_slice(&BYTES_NULL_SENTINEL.to_le_bytes()),
+            Some(bytes) => {
+                let len = u32::try_from(bytes.len()).expect("length preflighted to fit u32");
+                payload.extend_from_slice(&len.to_le_bytes());
+                payload.extend_from_slice(bytes);
+            }
+        }
+    }
+    for &code in &codes {
+        push_code(&mut payload, code, code_width);
+    }
+    Some(payload)
+}
+
+/// The narrowest code width (bytes) that addresses a dictionary of `dict_count`
+/// entries: 1 byte for ≤256 entries, 2 for ≤65536, else 4 — the dict + (byte-)
+/// packing the architecture lists. A wider dictionary is rare for a version-chain
+/// column (a key has one business key), and the size comparison in
+/// [`encode_bytes_values`] discards the dictionary anyway when it does not pay.
+const fn code_width_for(dict_count: usize) -> u8 {
+    if dict_count <= 256 {
+        1
+    } else if dict_count <= 65536 {
+        2
+    } else {
+        4
+    }
+}
+
+/// Append `code` as `code_width` little-endian bytes. `code < dict_count <=
+/// 2^(8·code_width)` ([`code_width_for`]), so the high bytes of its `u32`
+/// representation are zero and the low `code_width` bytes carry the whole value —
+/// no truncation, no cast.
+fn push_code(buf: &mut Vec<u8>, code: u32, code_width: u8) {
+    let le = code.to_le_bytes();
+    buf.extend_from_slice(&le[..code_width as usize]);
 }
 
 /// A non-empty bounded prefix is a concrete [`StatBound::Value`]; an *empty* one
@@ -634,6 +795,10 @@ fn encode_i64_values(values: impl Iterator<Item = i64>) -> EncodedColumn {
         max = Some(max.map_or(v, |m| m.max(v)));
     }
     EncodedColumn {
+        // An `i64` column is always stored verbatim — the version-chain repeats a
+        // dictionary captures live in the bytes columns ([STL-250]); a delta / FOR
+        // codec for the monotonic `sys_from` / `seq` axes is a separate follow-up.
+        codec: Codec::Plain,
         payload,
         // An i64 bound is always exactly representable, so it is never open —
         // only `Absent` (empty column) or a concrete `Value` ([STL-120]).
@@ -863,7 +1028,7 @@ fn encode_footer(
 /// drift in layout.
 fn encode_chunk_meta(out: &mut Vec<u8>, chunk: &EncodedChunk) -> Result<(), SegmentError> {
     out.extend_from_slice(&chunk.col.as_u16().to_le_bytes());
-    out.push(Codec::Plain as u8);
+    out.push(chunk.codec.as_byte());
     // Stat-presence flags ([STL-120]): formerly an always-zero reserved byte.
     // Marks a present-but-open min/max (−∞ / +∞) so the reader tells it apart
     // from the zero-length "no stats" sentinel. Zero for every i64 column and
@@ -896,7 +1061,76 @@ mod tests {
     //! easy place to get an off-by-one that silently produces a too-tight
     //! upper bound.
 
-    use super::{MAX_BYTES_STAT_PREFIX_LEN, bounded_max_prefix, bounded_min_prefix};
+    use super::{
+        Codec, MAX_BYTES_STAT_PREFIX_LEN, bounded_max_prefix, bounded_min_prefix,
+        build_dict_payload, code_width_for, encode_bytes_values,
+    };
+
+    #[test]
+    fn code_width_grows_with_dictionary_size() {
+        // 1 byte addresses up to 256 entries (codes 0..=255), 2 up to 65536, then 4.
+        assert_eq!(code_width_for(1), 1);
+        assert_eq!(code_width_for(256), 1);
+        assert_eq!(code_width_for(257), 2);
+        assert_eq!(code_width_for(65_536), 2);
+        assert_eq!(code_width_for(65_537), 4);
+    }
+
+    #[test]
+    fn all_distinct_values_decline_the_dictionary() {
+        // No repeats ⇒ a dictionary stores every value once like plain, plus a
+        // header and a code per row, so it can only be larger. `build_dict_payload`
+        // bails, and `encode_bytes_values` keeps `Plain` even with dict enabled.
+        let vals: Vec<Option<&[u8]>> = vec![
+            Some(b"a".as_slice()),
+            Some(b"b".as_slice()),
+            Some(b"c".as_slice()),
+        ];
+        assert!(build_dict_payload(&vals).is_none());
+        let enc = encode_bytes_values(vals.into_iter(), true).expect("encode");
+        assert_eq!(enc.codec, Codec::Plain);
+    }
+
+    #[test]
+    fn an_empty_column_declines_the_dictionary() {
+        assert!(build_dict_payload(&[]).is_none());
+    }
+
+    #[test]
+    fn repeated_values_choose_the_dictionary_when_smaller() {
+        // A long key repeated many times: the dictionary stores it once plus one
+        // code per row, far smaller than re-storing it each time.
+        let key: &[u8] = b"a-fairly-long-repeated-business-key-value";
+        let on = encode_bytes_values((0..50).map(|_| Some(key)), true).expect("encode");
+        assert_eq!(on.codec, Codec::Dict);
+        // Disabled ⇒ always plain, and larger than the dictionary it declined.
+        let off = encode_bytes_values((0..50).map(|_| Some(key)), false).expect("encode");
+        assert_eq!(off.codec, Codec::Plain);
+        assert!(
+            on.payload.len() < off.payload.len(),
+            "dictionary {} B should beat plain {} B",
+            on.payload.len(),
+            off.payload.len(),
+        );
+    }
+
+    #[test]
+    fn dictionary_and_plain_compute_identical_zone_stats() {
+        // The codec changes only the physical layout — the logical min/max the
+        // zone map prunes on must be identical, so pruning is unaffected. Two
+        // longer values alternating so the dictionary wins (and is exercised).
+        let hi: &[u8] = b"mmmmmmmmmmmmmmmm";
+        let lo: &[u8] = b"aaaaaaaaaaaaaaaa";
+        let row = |i: usize| Some(if i % 2 == 0 { hi } else { lo });
+        let on = encode_bytes_values((0..10).map(row), true).expect("encode");
+        let off = encode_bytes_values((0..10).map(row), false).expect("encode");
+        assert_eq!(on.codec, Codec::Dict);
+        assert_eq!(off.codec, Codec::Plain);
+        assert_eq!(on.stat_min.bytes(), off.stat_min.bytes());
+        assert_eq!(on.stat_max.bytes(), off.stat_max.bytes());
+        assert_eq!(on.stat_min.bytes(), lo, "min is the lex-least value");
+        assert_eq!(on.stat_max.bytes(), hi, "max is the lex-greatest value");
+    }
 
     #[test]
     fn short_values_round_trip_exactly() {

@@ -161,7 +161,35 @@ pub(super) const TRAILER_MAGIC: [u8; 8] = *b"STLSEGFT";
 ///   v11 reader would read the trailing summary as `Corrupt("trailing bytes in
 ///   footer")`, so it makes the reject clean at the header in both directions —
 ///   the same reasoning as every prior bump.
-pub(super) const FORMAT_VERSION: u16 = 12;
+///
+/// * **v13** — **version-chain-aware dictionary column encoding** ([STL-250],
+///   [ADR-0002](../../../../../docs/adr/0002-on-disk-storage-format.md)). The
+///   first per-column [`Codec`] beyond [`Codec::Plain`]: a bytes column whose
+///   values repeat across a key's version chain — `business_key` is *identical*
+///   across every version of one key, and `principal` / `payload` often repeat —
+///   is encoded as a small dictionary of the distinct values plus a narrow code
+///   per row ([`Codec::Dict`]), so an unchanged column is stored once, not
+///   re-stored wholesale per version (feature plan §A.2, "Efficient
+///   historization"). The writer picks dictionary *or* plain **per chunk, by
+///   statistics** — whichever is smaller, so an all-distinct column never grows
+///   (architecture §3.2, "chosen by the writer from column statistics"); the
+///   per-chunk codec tag (already in the chunk header and footer entry) is the
+///   dispatch point and the reader decodes it transparently behind the existing
+///   column-read API, so late materialization ([STL-146]/[STL-155]/[STL-173])
+///   keeps working — the decode happens at materialization, not scan. The
+///   zone-map min/max stats are computed over the *logical* values, identical to
+///   a plain chunk, so pruning is unchanged.
+///
+///   It bumps the generation for the same reason every prior change did, *not*
+///   because the codec tag is not self-describing: a v12 reader encountering a
+///   `Dict` chunk would fail with `Corrupt("unknown codec in footer")`
+///   mid-footer, so the bump makes it reject the segment cleanly at the header
+///   ([`SegmentError::UnsupportedVersion`](super::SegmentError::UnsupportedVersion))
+///   instead. A plain-only segment is byte-identical to v12 apart from the header
+///   version; the codec is applied today only by compaction
+///   ([`Engine::compact`](crate::engine::Engine::compact)), the natural place to
+///   spend CPU consolidating history ([STL-231]).
+pub(super) const FORMAT_VERSION: u16 = 13;
 
 /// Footer-level flag bits — the `u32` flags word that follows the schema id in
 /// the footer. Additive: an unset bit is the pre-v11 behavior, and each defined
@@ -271,25 +299,51 @@ pub(super) const MAX_BYTES_STAT_PREFIX_LEN: usize = 64;
 /// schema reference resolved through the catalog at read time.
 pub(super) const SCHEMA_ID_IMPLICIT_VERSION: u32 = 0;
 
-/// Column codecs the format can describe. v0.1 emits [`Codec::Plain`]; the
-/// architecture-listed codecs (dict + bitpack, RLE, delta, FOR — see
+/// Column codecs the format can describe. The per-chunk codec tag (carried in
+/// both the chunk header and the footer column entry) is the dispatch point in
+/// writer and reader, and an unknown value is rejected at read time
+/// ([`Codec::from_byte`]). The remaining architecture-listed codecs (RLE, delta,
+/// FOR — see
 /// [02 §3.2](../../../../../docs/02-architecture.md#32-on-disk-segment-format))
-/// drop in as new variants without bumping [`FORMAT_VERSION`], because the
-/// per-chunk codec tag is the dispatch point and unknown values are rejected
-/// at read time.
+/// drop in as further variants the same way.
+///
+/// The codec tag is self-describing, but adding a *new* variant still bumps
+/// [`FORMAT_VERSION`] — an older reader would otherwise choke on the unknown
+/// codec byte mid-footer rather than reject cleanly at the header, the same
+/// generation discipline every prior change followed ([`Codec::Dict`] bumped
+/// v12 → v13, [STL-250]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(super) enum Codec {
     /// Verbatim — the layout depends on the column's [`ColumnType`].
     Plain = 0,
+    /// Dictionary encoding for a bytes column ([STL-250], [`FORMAT_VERSION`]
+    /// v13): a length-prefixed table of the distinct values followed by one
+    /// narrow code (1/2/4 bytes, sized to the dictionary) per row. Stores a
+    /// value repeated across a key's version chain *once*, the
+    /// version-chain-aware encoding feature plan §A.2 calls for. The payload
+    /// layout is `[u8 code_width][u32 dict_count][(u32 len, bytes) × dict_count]
+    /// [code × value_count]`; a dictionary `len` of [`BYTES_NULL_SENTINEL`] marks
+    /// a SQL `NULL` entry (the `payload` column), mirroring the plain encoding.
+    /// Applied only to [`ColumnType::Bytes`] columns; an `i64` column is always
+    /// [`Self::Plain`].
+    Dict = 1,
 }
 
 impl Codec {
     pub(super) const fn from_byte(b: u8) -> Option<Self> {
         match b {
             0 => Some(Self::Plain),
+            1 => Some(Self::Dict),
             _ => None,
         }
+    }
+
+    /// This codec's on-disk tag byte — the inverse of [`Self::from_byte`]. Used
+    /// by the writer to stamp the chunk header and footer entry from the codec
+    /// the encoder chose, so the two never drift from a hard-coded constant.
+    pub(super) const fn as_byte(self) -> u8 {
+        self as u8
     }
 }
 
