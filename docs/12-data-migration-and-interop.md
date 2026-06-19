@@ -78,6 +78,16 @@ Stele can emit **what changed between two times** as a query/stream ([01 §A.3](
 | **v0.5** | Parquet/CSV/Arrow import & export; temporal-aware backfill tooling; change-feed/diff. |
 | **v1.0+** | External/foreign tables (read in place), CDC/streaming ingest, Iceberg interop, online logical-replication cutover from Postgres. |
 
+## 9. Driver notes: isolation & retryable errors
+
+Stele speaks the pg-wire protocol, so stock Postgres drivers and ORMs connect unchanged ([ADR-0003](adr/0003-postgres-wire-protocol-early.md)). Two transaction behaviours are worth knowing when wiring an application up — both are deliberately Postgres-compatible at the wire/SQLSTATE level even though Stele's MVCC semantics are its own ([ADR-0008](adr/0008-mvcc-on-append-only.md), [02 §9](02-architecture.md#9-transaction--concurrency-model)).
+
+- **`40001` is the retry signal.** Under snapshot isolation a write-write conflict is resolved first-committer-wins: the losing `COMMIT` returns SQLSTATE **`40001` (`serialization_failure`)** and applies nothing. This is a *retryable* error, not a bug in your query — the correct response is to **replay the whole transaction** (it will re-`BEGIN` against a fresh snapshot). Most drivers/ORMs already classify `40001` as retryable; if you hand-roll transaction code, wrap it in a bounded retry loop on `40001`. Do **not** retry on other SQLSTATEs — a `40001` is the only one that means "you lost a race, try again".
+
+- **Isolation level is selectable.** `BEGIN ISOLATION LEVEL READ COMMITTED` (or `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` as the first statement of a block) gives per-statement snapshots — each statement sees data committed before it began. The default, `REPEATABLE READ`, is snapshot isolation: one snapshot for the whole transaction. **`SERIALIZABLE` is rejected** with `0A000` (feature not supported) rather than silently downgraded — true serializable (SSI) is a later opt-in ([01 §B.4](01-feature-plan.md#b4--transactions-concurrency--mvcc)). A driver that issues `SET default_transaction_isolation = 'serializable'` or `BEGIN ISOLATION LEVEL SERIALIZABLE` will see that error; pick `repeatable read` or `read committed` instead.
+
+- **No deadlocks to handle.** Stele never makes a writer wait on a lock, so transactions cannot deadlock — you will never see `40P01` (`deadlock_detected`). The only contention outcome is the `40001` above.
+
 ---
 
 *Interop leans on the [pg-wire](adr/0003-postgres-wire-protocol-early.md) and [Arrow](assumptions.md) bets — inherit ecosystems, don't reinvent them ([Charter §6](00-charter.md#6-guiding-principles)). The temporal-aware backfill is where migration becomes a feature, not a chore.*

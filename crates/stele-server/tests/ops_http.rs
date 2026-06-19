@@ -23,7 +23,8 @@ use stele_common::metrics::SharedMetrics;
 use stele_common::time::SystemClock;
 use stele_common::types::LogicalType;
 use stele_engine::{
-    EngineError, SessionEngine, SessionTransaction, StatementOutcome, TableDescription,
+    EngineError, IsolationLevel, SessionEngine, SessionTransaction, StatementOutcome,
+    TableDescription,
 };
 use stele_pgwire::{Server as PgServer, SessionHandle, SharedSession};
 use stele_server::ops::{OpsServer, OpsState};
@@ -113,8 +114,8 @@ impl SessionHandle for PoisonToggle {
         self.inner.describe_in_txn(stmt, txn)
     }
 
-    fn begin(&self) -> SessionTransaction {
-        self.inner.begin()
+    fn begin_with_isolation(&self, isolation: IsolationLevel) -> SessionTransaction {
+        self.inner.begin_with_isolation(isolation)
     }
 
     fn execute_in_txn(

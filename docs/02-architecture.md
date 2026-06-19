@@ -479,7 +479,7 @@ MVCC is layered directly on the append-only store, which already *is* a multi-ve
 
 - A transaction reads a **snapshot** = a system-time point; it sees, per key, the latest version whose `sys` interval contains the snapshot.
 - Writes append new versions with `sys_from = commit_time`; **snapshot isolation** is the v1 default.
-- Conflicts (write-write on the same key within overlapping snapshots) are detected and the loser retries.
+- Conflicts (write-write on the same key within overlapping snapshots) are detected and the loser retries — see the conflict & retry contract below.
 - **Serializable (SSI)** is a later opt-in (v0.7).
 - Garbage *is not* collected by default (append-only); space management is via tiering and explicit, audited retention policies only.
 
@@ -493,6 +493,18 @@ sequenceDiagram
     W->>K: append new version (sys_from = c)
     Note over R: Reader's snapshot s is unaffected by c —<br/>still sees the old version (snapshot isolation)
 ```
+
+**Isolation levels (selectable).** The level is chosen per transaction with `BEGIN ISOLATION LEVEL …` or `SET TRANSACTION ISOLATION LEVEL …`:
+
+| SQL level | Stele behaviour |
+|---|---|
+| `REPEATABLE READ` *(default)* / `SNAPSHOT` | **Snapshot isolation** — one snapshot pinned at `BEGIN` for the whole transaction. |
+| `READ COMMITTED` / `READ UNCOMMITTED` | Each statement re-pins a fresh snapshot, so a statement observes every transaction committed before it began. (Append-only MVCC never exposes an *uncommitted* version, so `READ UNCOMMITTED` is no weaker than `READ COMMITTED`.) |
+| `SERIALIZABLE` | **Rejected** with `0A000` (feature not supported) — true SSI is a v0.7 opt-in, and aliasing it to snapshot isolation would be a false serializability promise. |
+
+**Conflict & retry contract.** Write-write conflicts are resolved **first-committer-wins**: when a transaction commits a key whose current version was committed by another transaction *after* this one's snapshot, the later `COMMIT` fails with SQLSTATE **`40001` (`serialization_failure`)** — a *retryable* error — having applied nothing; the first committer's write stands. Stock drivers and ORMs treat `40001` as the signal to retry the whole transaction, so the correct client response is to replay it against a fresh snapshot (see [12 — driver notes](12-data-migration-and-interop.md#9-driver-notes-isolation--retryable-errors)). The check is the commit-time gate over the per-key MVCC write index; a correctness oracle re-derives every commit's Ok/Conflict decision from an independent first-committer-wins rule ([06 §4](06-testing-strategy.md#4-correctness-oracles-the-temporal-heart)).
+
+**No deadlock detection (by construction).** Readers never block writers and writers never block readers (MVCC), and writers do **not** take row locks and wait — a conflict is detected at commit and the loser is told to retry, never made to wait. With no lock-wait edges there is no wait-for cycle, so there is nothing to deadlock and no deadlock detector to run. (This is a consequence of OCC-style commit-time conflict detection on an append-only store, not a feature to be added later.)
 
 ---
 
