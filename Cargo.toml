@@ -95,6 +95,17 @@ toml               = "1.1"
 # cross-platform answer — already in the tree transitively via rand/ring.
 # `std` carries the io::Error conversion the failure path surfaces through.
 getrandom          = { version = "0.4", features = ["std"] }
+# SASLprep password normalization for SCRAM (STL-298, ADR-0033). The one
+# deliberate exception to vendoring the auth path (stele_common::scram): SASLprep
+# (RFC 4013) needs full Unicode NFKC + prohibited-class tables that cannot
+# reasonably be vendored or kept current by hand, so we take the ecosystem's
+# narrow, single-purpose crate. Pure, deterministic, I/O- and global-state-free —
+# it does not weaken the runtime-agnostic core ([ADR-0010]). Already in the tree
+# (a postgres-protocol dev-transitive); its `unicode-{normalization,bidi,
+# properties}` deps are all MIT/Apache-2.0/Unicode, already cargo-deny
+# allow-listed. ASCII passwords take its zero-alloc fast path and stay
+# byte-identical.
+stringprep         = "0.1"
 tokio              = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
 # TLS on pg-wire (STL-251). `ring` instead of the default `aws-lc-rs` provider:
 # ring is already in the dependency tree, builds clean on every CI target

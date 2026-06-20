@@ -38,6 +38,11 @@ wrk = "wrk"
 fo = "fo"
 abd = "abd"
 
+# The canonical NFC/NFD interop example in the SASLprep test (STL-298):
+# "caf\u{e9}" (precomposed é) vs "cafe\u{301}" (e + combining acute). typos
+# splits the literal and flags the bare "caf" stem as a typo for "calf".
+caf = "caf"
+
 [files]
 # Don't scan vendored or generated output. (Cargo.lock is regenerated; binary
 # artifacts under target/ are already excluded by .gitignore.)
