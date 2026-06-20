@@ -63,7 +63,9 @@ use std::sync::{Arc, Mutex};
 use crate::catalog_log::CatalogRecord;
 use crate::secondary::{IndexState, Probe};
 
-use stele_catalog::{Catalog, CatalogError, IndexDef, IndexKind, TableSchema, ValidTimeSpec};
+use stele_catalog::{
+    Catalog, CatalogError, IndexDef, IndexKind, SchemaId, TableSchema, ValidTimeSpec,
+};
 use stele_common::hash::Digest;
 use stele_common::metrics::{SharedMetrics, StatementKind};
 use stele_common::period::Interval;
@@ -3901,15 +3903,25 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// A CTE side's rows are already the canonical-bytes form a scan produces, so
     /// each column is rebuilt as a [`Column::Bytes`] of its cells — the same shape
     /// `scan_all_columns` returns, so [`decode_key_column`] and the join output
-    /// assembly consume it unchanged. A CTE name shadows a base table of the same
-    /// name (the binder resolved which it is; the scope is checked first to match).
+    /// assembly consume it unchanged.
+    ///
+    /// Whether a side is materialized is decided by its **schema id**, not its name:
+    /// the binder stamps a CTE / derived table with the ephemeral `SchemaId(0)`
+    /// sentinel ([`TableSchema::ephemeral`]), and the catalog never allocates `0`. A
+    /// base table is therefore always scanned from storage even when a same-named
+    /// relation is in scope — e.g. `FROM (SELECT …) AS t JOIN t AS t2`, where the
+    /// derived table aliased `t` must not shadow the base table `t` on the other
+    /// side.
     fn join_side_columns(
         &self,
         side: &BoundJoinSide,
         snapshot: SystemTimeMicros,
         scope: &CteScope,
     ) -> Result<Vec<Column>, EngineError> {
-        if let Some(relation) = scope.get(side.table.as_str()) {
+        if side.schema_id == SchemaId(0) {
+            let relation = scope
+                .get(side.table.as_str())
+                .ok_or_else(|| EngineError::UnknownTable(side.table.clone()))?;
             return Ok(materialized_columns(relation, side.columns.len()));
         }
         let state = self

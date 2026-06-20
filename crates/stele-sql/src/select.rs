@@ -1107,6 +1107,7 @@ fn bind_select_scoped(
         // The `WITH` relations materialize first (a derived join side may reference
         // one), then any derived tables the join sides introduced.
         ctes.append(&mut side_ctes);
+        reject_duplicate_relation_names(&ctes)?;
         bound.ctes = ctes;
         let header = bound
             .join
@@ -1122,6 +1123,7 @@ fn bind_select_scoped(
     let resolved = resolve_from(select, ctx, snapshot, &sigs)?;
     if let Some(derived) = resolved.derived {
         ctes.push(derived);
+        reject_duplicate_relation_names(&ctes)?;
     }
     let schema: &TableSchema = &resolved.schema;
     let table: &str = &resolved.name;
@@ -1288,6 +1290,30 @@ struct ResolvedFrom<'a> {
     schema: RelationSchema<'a>,
     materialized: bool,
     derived: Option<BoundCte>,
+}
+
+/// Reject two relations introduced under one name within a single query
+/// ([STL-242]) — a `WITH` name and a derived-table alias, or two derived-table
+/// aliases, that collide.
+///
+/// CTEs and derived tables share one flat per-statement materialization map
+/// (the engine's `CteScope`, keyed by name), so two same-named relations would
+/// silently overwrite one another there. Rejecting the collision keeps a
+/// reference unambiguous. (`WITH`×`WITH` collisions are already caught earlier,
+/// by [`bind_with_list`].) This is marginally stricter than Postgres, which lets
+/// a derived-table alias *shadow* an otherwise-unused CTE; that pathological
+/// shape is rejected here rather than mis-resolved.
+fn reject_duplicate_relation_names(ctes: &[BoundCte]) -> Result<(), SelectError> {
+    for (i, cte) in ctes.iter().enumerate() {
+        if ctes[..i].iter().any(|earlier| earlier.name == cte.name) {
+            return Err(SelectError::Cte(format!(
+                "relation name {:?} is introduced more than once (a CTE name and a \
+                 derived-table alias, or two aliases, collide)",
+                cte.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Bind a query's non-recursive `WITH` list into [`BoundCte`]s plus the
@@ -6244,6 +6270,12 @@ mod tests {
         let join = bound.join.expect("a join plan");
         assert_eq!(join.left.table, "c");
         assert_eq!(join.right.table, "account");
+        // The side's schema id is the executor's materialized-vs-storage signal:
+        // the CTE side carries the ephemeral SchemaId(0) sentinel, the base table a
+        // catalog-allocated id (never 0). `join_side_columns` reads the CTE from the
+        // scope and always scans the base table from storage on that basis.
+        assert_eq!(join.left.schema_id, SchemaId(0));
+        assert_ne!(join.right.schema_id, SchemaId(0));
         // The CTE side is registered for the executor to materialize.
         assert_eq!(bound.ctes.len(), 1);
         assert_eq!(bound.ctes[0].name, "c");
@@ -6325,5 +6357,20 @@ mod tests {
             matches!(err, SelectError::UnknownColumn { .. }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn derived_alias_colliding_with_a_cte_name_is_rejected() {
+        let catalog = catalog_with_account(1_000);
+        // A derived table aliased `c` collides with the `WITH c` name; the flat
+        // materialization scope cannot hold both, so it is rejected (not silently
+        // overwritten).
+        let err = bind(
+            "WITH c AS (SELECT id, balance FROM account) \
+             SELECT id FROM (SELECT id, balance FROM account) AS c",
+            &catalog,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SelectError::Cte(_)), "got {err:?}");
     }
 }
