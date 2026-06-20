@@ -89,8 +89,8 @@ use stele_sql::merge::{BoundMerge, MergeBound, MergeSource, MergeValid, MergeVal
 use stele_sql::select::{
     AggregateFunc, ArithOp, BoundAggregate, BoundCte, BoundJoinSide, BoundPeriod,
     BoundPeriodPredicate, BoundPredicate, BoundScalar, BoundSelect, BoundSubqueryFilter, CompareOp,
-    Correlation, JoinType, OutputItem, PeriodEndpoint, Projection, SelectError, SortTarget,
-    SubqueryKind,
+    Correlation, JoinType, OutputItem, PeriodEndpoint, Projection, ProjectionItem, ProjectionValue,
+    SelectError, SortTarget, SubqueryKind,
 };
 use stele_sql::{
     AdminCommand, BindContext, BindError, BoundCopy, CopyError, CopyShape, Statement,
@@ -3315,8 +3315,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // pseudo-column is reachable only when named. When the query references one,
         // the read must materialize the version's provenance alongside its payload.
         let addressable = addressable_columns(&schema_columns);
-        let projection = projection_indices(&bound.projection, &addressable, n_schema);
-        let needs_provenance = references_provenance(bound, &projection, n_schema);
+        let needs_provenance = references_provenance(bound, &addressable, n_schema);
 
         // The valid-time period columns' positions in the schema (`(from, to)`, each
         // an index into `schema_columns` — and so into a reconstructed row, which is
@@ -3511,19 +3510,150 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             return Ok(StatementOutcome::Rows(result));
         }
 
-        let projection = projection_indices(&bound.projection, addressable, n_schema);
         let columns = projected_columns(&bound.projection, addressable, n_schema);
-        let selection = shape_rows(bound, addressable, &projection, &rows)?;
-        let out_rows: Vec<Vec<Option<Vec<u8>>>> = selection
-            .iter()
-            .map(|&r| projection.iter().map(|&i| rows[r][i].clone()).collect())
-            .collect();
+        let out_rows: Vec<Vec<Option<Vec<u8>>>> = if bound.projection.is_all_columns() {
+            // Fast path: every item is a plain addressable column, projected by
+            // gathering its cell — no per-row expression evaluation.
+            let projection = projection_indices(&bound.projection, addressable, n_schema);
+            let selection = shape_rows(bound, addressable, &projection, &rows)?;
+            selection
+                .iter()
+                .map(|&r| projection.iter().map(|&i| rows[r][i].clone()).collect())
+                .collect()
+        } else {
+            // A computed expression or scalar subquery is projected ([STL-303]):
+            // evaluate each item into a materialized column, append it as a virtual
+            // column to every row, and shape / gather over the extended rows so
+            // `DISTINCT` / `ORDER BY` / `LIMIT` apply identically to a column read.
+            let projected = self.materialize_projection(
+                bound,
+                addressable,
+                schema_columns,
+                rows,
+                overlay,
+                scope,
+            )?;
+            let selection = shape_rows(
+                bound,
+                &projected.columns,
+                &projected.indices,
+                &projected.rows,
+            )?;
+            selection
+                .iter()
+                .map(|&r| {
+                    projected
+                        .indices
+                        .iter()
+                        .map(|&i| projected.rows[r][i].clone())
+                        .collect()
+                })
+                .collect()
+        };
         let stats = scan_stats.map(|s| query_stats(&s, out_rows.len(), bound.snapshot));
         Ok(StatementOutcome::Rows(SelectResult {
             columns,
             rows: out_rows,
             stats,
         }))
+    }
+
+    /// Materialize a projection that contains a computed expression or scalar
+    /// subquery ([STL-303]): evaluate each item into a column of canonical-encoded
+    /// cells, append those as virtual columns to every reconstructed row, and return
+    /// the extended column metadata, the extended rows, and the output-position
+    /// indices into them — the shape [`shape_rows`] then sorts / deduplicates /
+    /// limits exactly as it does a plain column projection.
+    ///
+    /// A bare column item keeps its addressable index; a computed item evaluates
+    /// `eval_expr` over the row's typed columns ([`eval_projection_scalar`]); an
+    /// uncorrelated scalar subquery resolves **once** at the statement snapshot (over
+    /// the same `overlay` / `scope`, [`resolve_scalar_subquery`]) and broadcasts its
+    /// single value — SQL `NULL` for an empty inner, SQLSTATE `21000` for `>1` row.
+    fn materialize_projection(
+        &self,
+        bound: &BoundSelect,
+        addressable: &[(String, LogicalType)],
+        schema_columns: &[(String, LogicalType)],
+        rows: Vec<Vec<Option<Vec<u8>>>>,
+        overlay: &[BoundDml],
+        scope: &CteScope,
+    ) -> Result<MaterializedProjection, EngineError> {
+        let Projection::Items(items) = &bound.projection else {
+            // `is_all_columns()` gates this path; `All` / a column-only list never
+            // reaches here.
+            return Err(EngineError::Unsupported(
+                "materialize_projection requires a projection-item list",
+            ));
+        };
+        let row_count = rows.len();
+        // The virtual columns start after the columns the rows already carry: the
+        // schema columns, plus the provenance pseudo-columns when a read
+        // materialized them (a provenance read widens every row).
+        let base_width = rows.first().map_or(schema_columns.len(), Vec::len);
+        let mut columns: Vec<(String, LogicalType)> =
+            addressable.iter().take(base_width).cloned().collect();
+        let mut computed: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+        let mut indices: Vec<usize> = Vec::with_capacity(items.len());
+        for item in items {
+            match &item.value {
+                ProjectionValue::Column(source) => {
+                    let idx = addressable.iter().position(|(n, _)| n == source).ok_or(
+                        EngineError::Unsupported(
+                            "a projected column is missing from the addressable set",
+                        ),
+                    )?;
+                    indices.push(idx);
+                }
+                ProjectionValue::Computed { scalar, ty } => {
+                    let column = eval_projection_scalar(scalar, schema_columns, &rows)?;
+                    indices.push(base_width + computed.len());
+                    columns.push((item.name.clone(), *ty));
+                    computed.push(column);
+                }
+                ProjectionValue::Subquery { subquery, ty } => {
+                    let value = self.resolve_scalar_subquery(subquery, overlay, scope)?;
+                    let cell = value.as_ref().map(encode_value);
+                    indices.push(base_width + computed.len());
+                    columns.push((item.name.clone(), *ty));
+                    computed.push(vec![cell; row_count]);
+                }
+            }
+        }
+        let rows: Vec<Vec<Option<Vec<u8>>>> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(r, mut row)| {
+                for column in &computed {
+                    row.push(column[r].clone());
+                }
+                row
+            })
+            .collect();
+        Ok(MaterializedProjection {
+            columns,
+            rows,
+            indices,
+        })
+    }
+
+    /// Resolve a projected uncorrelated scalar subquery to its single value
+    /// ([STL-303]): run the inner once at the statement snapshot (over the same
+    /// `overlay` / `scope`, so it sees the outer's `(sys, valid)` state and any
+    /// read-your-own-writes), then reduce its one output column to a value — SQL
+    /// `NULL` for an empty inner, the lone value for one row, SQLSTATE `21000` for
+    /// more than one ([`scalar_subquery_value`]).
+    fn resolve_scalar_subquery(
+        &self,
+        subquery: &BoundSelect,
+        overlay: &[BoundDml],
+        scope: &CteScope,
+    ) -> Result<Option<ScalarValue>, EngineError> {
+        let StatementOutcome::Rows(result) = self.run_select_scoped(subquery, overlay, scope)?
+        else {
+            return Err(EngineError::Unsupported("a subquery must be a SELECT"));
+        };
+        scalar_subquery_value(&result)
     }
 
     /// Resolve a bound `SELECT`'s `WHERE` to a concrete [`FilterPlan`].
@@ -4375,7 +4505,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             schema_id,
             snapshot,
             valid_snapshot: None,
-            projection: Projection::Columns(vec![key_col.name().to_owned()]),
+            projection: Projection::Items(vec![ProjectionItem::column(key_col.name())]),
             filter: Some(BoundPredicate {
                 left: BoundScalar::Column(0),
                 op: CompareOp::Eq,
@@ -4462,7 +4592,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             schema_id: merge.schema_id,
             snapshot,
             valid_snapshot: None,
-            projection: Projection::Columns(vec![key_col.to_owned()]),
+            projection: Projection::Items(vec![ProjectionItem::column(key_col)]),
             filter: Some(BoundPredicate {
                 left: BoundScalar::Column(0),
                 op: CompareOp::Eq,
@@ -4670,7 +4800,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             schema_id,
             snapshot,
             valid_snapshot: None,
-            projection: Projection::Columns(vec![key_col.name().to_owned()]),
+            projection: Projection::Items(vec![ProjectionItem::column(key_col.name())]),
             filter,
             period_filter: None,
             subquery_filter: None,
@@ -4792,7 +4922,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             schema_id: merge.schema_id,
             snapshot,
             valid_snapshot: None,
-            projection: Projection::Columns(vec![key_name.to_owned()]),
+            projection: Projection::Items(vec![ProjectionItem::column(key_name)]),
             filter: None,
             period_filter: None,
             subquery_filter: None,
@@ -4987,8 +5117,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     schema_id: *schema_id,
                     snapshot,
                     valid_snapshot: None,
-                    projection: Projection::Columns(
-                        columns.iter().map(|(name, _)| name.clone()).collect(),
+                    projection: Projection::Items(
+                        columns
+                            .iter()
+                            .map(|(name, _)| ProjectionItem::column(name.clone()))
+                            .collect(),
                     ),
                     filter: None,
                     period_filter: None,
@@ -6524,6 +6657,21 @@ fn const_period_interval(operand: &BoundPeriod) -> Option<Interval> {
     }
 }
 
+/// A computed projection materialized for shaping ([STL-303]): the reconstructed
+/// rows widened with the evaluated virtual columns, the matching extended column
+/// metadata, and the output-position indices into them — the trio [`shape_rows`]
+/// sorts / deduplicates / limits before the gather. See
+/// [`SessionEngine::materialize_projection`].
+struct MaterializedProjection {
+    /// The addressable columns the rows carry, then one entry per appended virtual
+    /// (computed / subquery) column.
+    columns: Vec<(String, LogicalType)>,
+    /// Each reconstructed row, widened with its computed virtual cells.
+    rows: Vec<Vec<Option<Vec<u8>>>>,
+    /// For each output position, its index into `columns` / a row of `rows`.
+    indices: Vec<usize>,
+}
+
 /// What a bound `SELECT`'s `WHERE` resolves to over the row set ([STL-213]).
 ///
 /// Both the committed-only fused scan ([`scan_rows`](SessionEngine::scan_rows)) and
@@ -6655,6 +6803,60 @@ fn subquery_column_values(result: &SelectResult) -> Result<Vec<Option<ScalarValu
     let vector =
         Vector::from_column(ty, &column).map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
     Ok((0..n).map(|i| vector.get(i)).collect())
+}
+
+/// Reduce a once-materialized scalar subquery `result` to its single value
+/// ([STL-303]) — the [`SubqueryKind::Scalar`] cardinality rule without the
+/// comparison, for a scalar subquery projected in the SELECT list: no row is SQL
+/// `NULL`, one row is its value, more than one is the standard's cardinality
+/// violation ([`ScalarSubqueryCardinality`], `21000`).
+fn scalar_subquery_value(result: &SelectResult) -> Result<Option<ScalarValue>, EngineError> {
+    let values = subquery_column_values(result)?;
+    match values.as_slice() {
+        [] => Ok(None),
+        [value] => Ok(value.clone()),
+        _ => Err(EngineError::ScalarSubqueryCardinality),
+    }
+}
+
+/// Evaluate a computed projection expression ([STL-303]) into a column of
+/// canonical-encoded cells — one per reconstructed row.
+///
+/// Decodes only the schema columns the expression references into typed [`Vector`]s
+/// (the [`rows_passing_filter`] discipline), runs the lowered expression through
+/// [`eval_expr`], then re-encodes each result cell to its canonical bytes (`None` →
+/// a SQL `NULL` on the wire). An empty row set short-circuits before `eval_expr`.
+fn eval_projection_scalar(
+    scalar: &BoundScalar,
+    schema_columns: &[(String, LogicalType)],
+    rows: &[Vec<Option<Vec<u8>>>],
+) -> Result<Vec<Option<Vec<u8>>>, EngineError> {
+    let row_count = rows.len();
+    if row_count == 0 {
+        return Ok(Vec::new());
+    }
+    let expr = lower_scalar(scalar);
+    let mut referenced = BTreeSet::new();
+    collect_expr_columns(&expr, &mut referenced);
+    let mut columns: Vec<Vector> = (0..schema_columns.len())
+        .map(|_| Vector::Bool(Vec::new()))
+        .collect();
+    for position in referenced {
+        let Some((_, ty)) = schema_columns.get(position) else {
+            continue;
+        };
+        let cells: Vec<Option<Vec<u8>>> = rows
+            .iter()
+            .map(|row| row.get(position).cloned().flatten())
+            .collect();
+        columns[position] = Vector::from_column(*ty, &Column::Bytes(cells.into()))
+            .map_err(|err| EngineError::Scan(ScanError::Eval(err)))?;
+    }
+    let vector = eval_expr(&expr, &columns, row_count)
+        .map_err(|err| EngineError::Scan(ScanError::Eval(err)))?;
+    Ok((0..row_count)
+        .map(|i| vector.get(i).as_ref().map(encode_value))
+        .collect())
 }
 
 /// Fold a scalar subquery's result into a comparison [`FilterPlan`] ([STL-234]).
@@ -7108,9 +7310,10 @@ fn batch_cell(batch: &Batch, position: usize, row: usize) -> Option<Vec<u8>> {
     }
 }
 
-/// The addressable indices a [`Projection`] selects, in output order: `All` is
-/// every **schema** column left-to-right (the first `n_schema` of `columns`);
-/// `Columns` maps each name to its position in `columns`.
+/// The addressable indices a **column-only** [`Projection`] selects, in output
+/// order: `All` is every **schema** column left-to-right (the first `n_schema` of
+/// `columns`); a [`Projection::Items`] list maps each column item's source name to
+/// its position in `columns`.
 ///
 /// `columns` is the addressable set ([`addressable_columns`]) — the table's own
 /// columns followed by the provenance pseudo-columns ([STL-247]) — so a named
@@ -7118,6 +7321,10 @@ fn batch_cell(batch: &Batch, position: usize, row: usize) -> Option<Vec<u8>> {
 /// `bind_select` has already proved every named column is either a schema column
 /// or a pseudo-column, so the lookup never misses — a miss would be a
 /// binder/engine contract break.
+///
+/// Only the all-column fast path ([`Projection::is_all_columns`]) calls this; a
+/// computed expression / scalar subquery has no single addressable index and is
+/// materialized by [`SessionEngine::materialize_projection`] instead.
 fn projection_indices(
     projection: &Projection,
     columns: &[(String, LogicalType)],
@@ -7125,22 +7332,26 @@ fn projection_indices(
 ) -> Vec<usize> {
     match projection {
         Projection::All => (0..n_schema).collect(),
-        Projection::Columns(names) => names
+        Projection::Items(items) => items
             .iter()
-            .map(|name| {
-                columns
+            .map(|item| match &item.value {
+                ProjectionValue::Column(source) => columns
                     .iter()
-                    .position(|(n, _)| n == name)
-                    .expect("bind_select validated the projected column exists")
+                    .position(|(n, _)| n == source)
+                    .expect("bind_select validated the projected column exists"),
+                ProjectionValue::Computed { .. } | ProjectionValue::Subquery { .. } => {
+                    unreachable!("projection_indices is only called for all-column projections")
+                }
             })
             .collect(),
     }
 }
 
-/// The `(name, type)` output columns a projection selects from the addressable
-/// columns — the projected slice of `columns` (schema columns then provenance
-/// pseudo-columns), in projection order. Shared by the streaming read
-/// (`run_select`) and the parameter-free statement `Describe`
+/// The `(name, type)` output columns a projection produces ([STL-303]): `All` is
+/// the addressable schema columns; a [`Projection::Items`] list takes each item's
+/// output name and type — a column item's type from the addressable set, a computed
+/// expression / scalar subquery's from its own resolved type. Shared by the
+/// streaming read (`run_select`) and the parameter-free statement `Describe`
 /// (`SessionEngine::describe`), so both agree on a `SELECT`'s `RowDescription`
 /// shape, pseudo-columns included.
 fn projected_columns(
@@ -7148,10 +7359,25 @@ fn projected_columns(
     columns: &[(String, LogicalType)],
     n_schema: usize,
 ) -> Vec<(String, LogicalType)> {
-    projection_indices(projection, columns, n_schema)
-        .iter()
-        .map(|&i| columns[i].clone())
-        .collect()
+    match projection {
+        Projection::All => columns[..n_schema].to_vec(),
+        Projection::Items(items) => items
+            .iter()
+            .map(|item| {
+                let ty = match &item.value {
+                    ProjectionValue::Column(source) => columns
+                        .iter()
+                        .find(|(n, _)| n == source)
+                        .map(|(_, ty)| *ty)
+                        .expect("bind_select validated the projected column exists"),
+                    ProjectionValue::Computed { ty, .. } | ProjectionValue::Subquery { ty, .. } => {
+                        *ty
+                    }
+                };
+                (item.name.clone(), ty)
+            })
+            .collect(),
+    }
 }
 
 /// The columns a bound `SELECT` can address by position: the table's own schema
@@ -7174,10 +7400,29 @@ fn addressable_columns(schema_columns: &[(String, LogicalType)]) -> Vec<(String,
 
 /// Whether a bound `SELECT` references a provenance pseudo-column ([STL-247]) — in
 /// its projection or its `WHERE` — so the read must materialize each version's
-/// provenance alongside its payload. `n_schema` is the table's own column count; an
-/// addressed index at or past it names a pseudo-column.
-fn references_provenance(bound: &BoundSelect, projection: &[usize], n_schema: usize) -> bool {
-    projection.iter().any(|&i| i >= n_schema)
+/// provenance alongside its payload. `addressable` is the addressable set (schema
+/// columns then pseudo-columns); `n_schema` is the table's own column count, so a
+/// projected column item resolving at or past it names a pseudo-column.
+///
+/// Only a bare **column** item can name a pseudo-column: the binder resolves a
+/// computed expression's columns against the schema alone ([STL-303]), so a
+/// computed item never pulls provenance in.
+fn references_provenance(
+    bound: &BoundSelect,
+    addressable: &[(String, LogicalType)],
+    n_schema: usize,
+) -> bool {
+    let projection_hits_pseudo = match &bound.projection {
+        Projection::All => false,
+        Projection::Items(items) => items.iter().any(|item| match &item.value {
+            ProjectionValue::Column(source) => addressable
+                .iter()
+                .position(|(n, _)| n == source)
+                .is_some_and(|i| i >= n_schema),
+            ProjectionValue::Computed { .. } | ProjectionValue::Subquery { .. } => false,
+        }),
+    };
+    projection_hits_pseudo
         || bound
             .filter
             .as_ref()
@@ -17547,5 +17792,269 @@ mod tests {
         };
         assert_eq!(subquery_ids(&result), vec![1]);
         engine.commit(txn).expect("commit");
+    }
+
+    // ---- STL-303: expression select items + scalar subqueries in the SELECT list --
+
+    /// Decode one **present** projected integer cell to `i64` (int4 / int8 widen to
+    /// it) — the STL-303 oracle projects only integer expressions, so a present cell
+    /// is always an integer. Callers map over the `Option` for the `NULL` cell.
+    fn int_cell(ty: LogicalType, bytes: &[u8]) -> i64 {
+        match ScalarValue::decode(ty, bytes).expect("decode integer cell") {
+            ScalarValue::Int4(v) => i64::from(v),
+            ScalarValue::Int8(v) => v,
+            // Name the type, not the value (the CodeQL cleartext-logging heuristic).
+            other => panic!("expected an integer cell, got {:?}", other.logical_type()),
+        }
+    }
+
+    /// Every row of `result` as `Vec<Option<i64>>`, decoding each present cell by its
+    /// column type — the shape the STL-303 projection oracle compares against a
+    /// reference (`None` is a SQL `NULL` cell).
+    fn int_rows(result: &SelectResult) -> Vec<Vec<Option<i64>>> {
+        result
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .zip(&result.columns)
+                    .map(|(cell, (_, ty))| cell.as_ref().map(|bytes| int_cell(*ty, bytes)))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The output column names of a result, for asserting projection headers.
+    fn column_names(result: &SelectResult) -> Vec<&str> {
+        result.columns.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    #[test]
+    fn projected_expressions_match_an_in_process_reference() {
+        // In-process oracle ([STL-303]): a bare column, an arithmetic expression, a
+        // constant literal, and an uncorrelated scalar subquery, projected in one
+        // SELECT, must match a hand-computed Rust reference over the inserted rows —
+        // the DoD shape `SELECT a, (SELECT max(b) FROM s), a + 1 AS plus FROM t`.
+        let mut engine = subquery_session();
+        let t: &[(i32, i32)] = &[(1, 10), (2, 20), (3, 30)];
+        let s: &[(i32, i32)] = &[(4, 5), (5, 25)];
+        for (id, a) in t {
+            engine
+                .execute(&parse_one(&format!("INSERT INTO t VALUES ({id}, {a})")))
+                .expect("insert t");
+        }
+        for (id, a) in s {
+            engine
+                .execute(&parse_one(&format!("INSERT INTO s VALUES ({id}, {a})")))
+                .expect("insert s");
+        }
+
+        let result = select(
+            &mut engine,
+            "SELECT id, a + 1 AS plus, 7 AS seven, (SELECT max(a) FROM s) AS m FROM t ORDER BY id",
+        );
+        assert_eq!(
+            column_names(&result),
+            vec!["id", "plus", "seven", "m"],
+            "bare column, then three aliased computed/subquery items"
+        );
+
+        let max_s = s.iter().map(|&(_, a)| i64::from(a)).max();
+        let want: Vec<Vec<Option<i64>>> = t
+            .iter()
+            .map(|&(id, a)| vec![Some(i64::from(id)), Some(i64::from(a) + 1), Some(7), max_s])
+            .collect();
+        assert_eq!(int_rows(&result), want);
+    }
+
+    #[test]
+    fn bare_literal_projection_broadcasts_with_the_postgres_fallback_name() {
+        // `SELECT 1 FROM t` projects a constant column on every row; an unaliased
+        // computed item takes the Postgres `?column?` fallback name.
+        let mut engine = subquery_session();
+        for id in [1, 2] {
+            engine
+                .execute(&parse_one(&format!(
+                    "INSERT INTO t VALUES ({id}, {})",
+                    id * 10
+                )))
+                .expect("insert");
+        }
+        let result = select(&mut engine, "SELECT 1 FROM t");
+        assert_eq!(column_names(&result), vec!["?column?"]);
+        assert_eq!(int_rows(&result), vec![vec![Some(1)], vec![Some(1)]]);
+    }
+
+    #[test]
+    fn projected_arithmetic_propagates_null() {
+        // A NULL value cell makes the arithmetic NULL for that row (3VL), exactly as
+        // the WHERE evaluator treats it — never a silent 0 or a dropped row.
+        let mut engine = subquery_session();
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (1, 10)"))
+            .expect("insert");
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (2, NULL)"))
+            .expect("insert null");
+
+        let result = select(&mut engine, "SELECT id, a + 1 AS plus FROM t ORDER BY id");
+        assert_eq!(
+            int_rows(&result),
+            vec![vec![Some(1), Some(11)], vec![Some(2), None]]
+        );
+    }
+
+    #[test]
+    fn projected_scalar_subquery_inherits_the_inner_column_name() {
+        // An unaliased scalar subquery takes the inner's sole output column name (the
+        // Postgres rule), compared against binding the inner standalone so the test
+        // never hardcodes the aggregate's naming.
+        let mut engine = subquery_session();
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (1, 10)"))
+            .expect("insert t");
+        engine
+            .execute(&parse_one("INSERT INTO s VALUES (4, 25)"))
+            .expect("insert s");
+
+        let expected = select(&mut engine, "SELECT max(a) FROM s").columns[0]
+            .0
+            .clone();
+        let outer = select(&mut engine, "SELECT id, (SELECT max(a) FROM s) FROM t");
+        assert_eq!(outer.columns[1].0, expected);
+    }
+
+    #[test]
+    fn projected_scalar_subquery_with_no_row_is_null() {
+        // An empty inner makes the projected scalar SQL NULL on every outer row (the
+        // zero-row branch of the cardinality rule).
+        let mut engine = subquery_session();
+        for id in [1, 2] {
+            engine
+                .execute(&parse_one(&format!(
+                    "INSERT INTO t VALUES ({id}, {})",
+                    id * 10
+                )))
+                .expect("insert");
+        }
+        // `s` stays empty, so the inner returns no row.
+        let result = select(
+            &mut engine,
+            "SELECT id, (SELECT a FROM s WHERE id = 99) AS m FROM t ORDER BY id",
+        );
+        assert_eq!(
+            int_rows(&result),
+            vec![vec![Some(1), None], vec![Some(2), None]]
+        );
+    }
+
+    #[test]
+    fn projected_scalar_subquery_returning_many_rows_is_cardinality_violation() {
+        // More than one inner row used as a projected scalar is SQLSTATE 21000 — and
+        // because the uncorrelated inner resolves once up front, it fires even when
+        // the outer produces no rows (the Postgres InitPlan posture).
+        let mut engine = subquery_session();
+        // `t` stays empty; `s` has two rows.
+        engine
+            .execute(&parse_one("INSERT INTO s VALUES (1, 10)"))
+            .expect("insert");
+        engine
+            .execute(&parse_one("INSERT INTO s VALUES (2, 20)"))
+            .expect("insert");
+        let err = engine
+            .execute(&parse_one("SELECT id, (SELECT a FROM s) FROM t"))
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::ScalarSubqueryCardinality),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn projected_computed_column_orders_and_dedups() {
+        // ORDER BY and DISTINCT resolve over a *computed* output column: ORDER BY on
+        // an aliased column sorts by its value (fast path), and DISTINCT deduplicates
+        // the projected computed rows.
+        let mut engine = subquery_session();
+        for (id, a) in [(1, 30), (2, 10), (3, 20), (4, 10)] {
+            engine
+                .execute(&parse_one(&format!("INSERT INTO t VALUES ({id}, {a})")))
+                .expect("insert");
+        }
+        // ORDER BY the alias `v` (= a), ties broken by id → ids 2, 4, 3, 1.
+        let asc = select(&mut engine, "SELECT id, a AS v FROM t ORDER BY v, id");
+        let ids: Vec<i64> = int_rows(&asc)
+            .iter()
+            .map(|row| row[0].expect("id"))
+            .collect();
+        assert_eq!(ids, vec![2, 4, 3, 1]);
+        // DISTINCT over a computed column: a + 1 → {31, 11, 21, 11} → {11, 21, 31}.
+        let distinct = select(&mut engine, "SELECT DISTINCT a + 1 AS v FROM t ORDER BY v");
+        assert_eq!(
+            int_rows(&distinct),
+            vec![vec![Some(11)], vec![Some(21)], vec![Some(31)]]
+        );
+    }
+
+    #[test]
+    fn computed_column_coexists_with_a_provenance_pseudo_column() {
+        // A computed expression projected alongside a provenance pseudo-column
+        // ([STL-247]): the read materializes provenance (widening each row), and the
+        // virtual computed column is appended after it without disturbing the layout.
+        let mut engine = subquery_session();
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (1, 10)"))
+            .expect("insert");
+        let result = select(&mut engine, "SELECT a + 1 AS plus, _stele_txn_id FROM t");
+        assert_eq!(column_names(&result), vec!["plus", "_stele_txn_id"]);
+        assert_eq!(
+            result.rows[0][0]
+                .as_ref()
+                .map(|bytes| int_cell(result.columns[0].1, bytes)),
+            Some(11)
+        );
+        assert!(
+            result.rows[0][1].is_some(),
+            "the provenance txn id is materialized"
+        );
+    }
+
+    #[test]
+    fn correlated_scalar_subquery_in_the_select_list_is_rejected() {
+        // A correlated scalar subquery in the SELECT list is out of scope (it rides
+        // STL-239) — rejected at bind time, not mis-evaluated.
+        let mut engine = subquery_session();
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (1, 10)"))
+            .expect("insert");
+        let err = engine
+            .execute(&parse_one(
+                "SELECT id, (SELECT a FROM s WHERE s.id = t.id) FROM t",
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::Select(SelectError::Subquery(_))),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn multi_column_computed_projection_is_rejected() {
+        // A computed select item referencing more than one column is a tracked
+        // follow-up — rejected, never silently mis-anchored.
+        let mut engine = keyed_session();
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (1, 100, 5)"))
+            .expect("insert");
+        let err = engine
+            .execute(&parse_one("SELECT id, k + a AS sum FROM t"))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::Select(SelectError::UnsupportedProjection(_))
+            ),
+            "got {err:?}"
+        );
     }
 }

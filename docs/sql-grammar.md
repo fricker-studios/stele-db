@@ -351,12 +351,46 @@ live at the resolved system-time snapshot, that `snapshot`, an optional
   `WHERE` subquery binds — uncorrelated (STL-234) and correlated (STL-239), see
   [Subquery predicates](#subquery-predicates-stl-234-stl-239) — and a `WITH` list
   of non-recursive CTEs plus `FROM (SELECT …)` derived tables binds (STL-242, see
-  [CTEs and derived tables](#ctes-and-derived-tables-stl-242)). **Rejected**: set
-  operations,
-  schema-qualified table names, and projections other than `*` or bare column
-  names (a computed or aliased select item — including a scalar subquery in the
-  select list — is not yet projected). The `WHERE` clause stays on the AST for
-  the executor-glue layer (pgwire, STL-104) to lower.
+  [CTEs and derived tables](#ctes-and-derived-tables-stl-242)). The select list
+  projects computed expressions and a scalar subquery, not just `*` / bare columns
+  (STL-303, see [Expression select items](#expression-select-items-stl-303)).
+  **Rejected**: set operations and schema-qualified table names. The `WHERE` clause
+  stays on the AST for the executor-glue layer (pgwire, STL-104) to lower.
+
+### Expression select items (STL-303)
+
+Beyond `*` and bare column names, the select list projects a **computed
+expression** and an **uncorrelated scalar subquery**, each optionally `AS`-aliased.
+`bind_select` lowers the list to projection items the executor evaluates per row;
+`SELECT *` stays the all-columns fast path:
+
+```sql
+SELECT a, (SELECT max(b) FROM s), a + 1 AS plus, 7 AS seven FROM t
+```
+
+- **Bare column** — `a`, optionally `AS x`. The output name is the alias, else the
+  column's own name. A provenance pseudo-column (STL-247) is projectable here on a
+  base table.
+- **Computed expression** — the `WHERE` scalar vocabulary (STL-213): one column
+  **anchor** with integer arithmetic and folded literals (`a + 1`, `qty % 2`), or a
+  single column-free literal (`1` → `int4`, `'x'` → `text`, `TRUE` → `bool`). The
+  result type is the anchor's (or the literal's). NULL propagates through arithmetic
+  (3VL), exactly as in a `WHERE`. An unaliased computed expression takes the
+  Postgres `?column?` fallback name.
+- **Uncorrelated scalar subquery** — `(SELECT … )`, resolved **once** at the
+  statement snapshot (the STL-234 fold, materialising a value instead of a row
+  filter) and broadcast as a constant column. No inner row ⇒ SQL `NULL`; more than
+  one inner row ⇒ SQLSTATE `21000` (`cardinality_violation`), raised even when the
+  outer produces no rows. An unaliased subquery inherits the inner's sole output
+  column name. The inner inherits the outer's `(sys, valid)` snapshot (docs/16 §6).
+- `ORDER BY` and `DISTINCT` resolve over the projected output columns — a computed
+  alias sorts/deduplicates by the expression's value.
+
+**Rejected** (each a tracked follow-up): a computed expression referencing more than
+one column or composed column-free arithmetic (`a + b`, `1 + 2`); a **correlated**
+scalar subquery in the select list (rides STL-239); a scalar subquery embedded
+inside arithmetic (`a + (SELECT …)`); a scalar function call other than the
+constant-folded `hash(...)`.
 
 ## Result shaping (STL-263)
 
@@ -538,11 +572,14 @@ SELECT id FROM t WHERE a = (SELECT a FROM s WHERE s.id = t.id);        -- scalar
   performance (`O(outer rows × inner cost)`). Decorrelating the common
   `EXISTS` / `IN` cases onto a semi/anti join is a tracked follow-up.
 
-**Not yet bound** (each a tracked follow-up): a scalar subquery in the **select
-list** (needs expression projection, STL-303), a subquery composed with `AND` /
-`OR` or set over a join, a correlated `WHERE` with more than the one correlation
-comparison, and lateral joins. (`WITH` CTEs and `FROM (SELECT …)` derived tables
-*do* bind — see [CTEs and derived tables](#ctes-and-derived-tables-stl-242).)
+An **uncorrelated** scalar subquery also binds in the **select list** (STL-303, see
+[Expression select items](#expression-select-items-stl-303)).
+
+**Not yet bound** (each a tracked follow-up): a subquery composed with `AND` / `OR`
+or set over a join, a correlated `WHERE` with more than the one correlation
+comparison, a **correlated** scalar subquery in the select list (rides STL-239), and
+lateral joins. (`WITH` CTEs and `FROM (SELECT …)` derived tables *do* bind — see
+[CTEs and derived tables](#ctes-and-derived-tables-stl-242).)
 
 ## CTEs and derived tables (STL-242)
 
