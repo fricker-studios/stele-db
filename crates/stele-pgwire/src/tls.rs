@@ -19,8 +19,15 @@
 //! certificate's subject CN/SAN into a [`CertIdentity`] — the authenticated
 //! principal the session stamps into provenance ([STL-291]).
 //!
+//! On a TLS connection the server also advertises **SCRAM-SHA-256-PLUS** channel
+//! binding ([STL-297]): [`ServerTls::endpoint_cbind`] holds the `tls-server-end-point`
+//! binding data (RFC 5929) for the configured certificate, computed once at load,
+//! which the SASL exchange folds into the client's `c=` check to bind the proof
+//! to this TLS channel.
+//!
 //! [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
 //! [STL-291]: https://allegromusic.atlassian.net/browse/STL-291
+//! [STL-297]: https://allegromusic.atlassian.net/browse/STL-297
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
@@ -29,7 +36,9 @@ use rustls::ServerConfig;
 use rustls::server::WebPkiClientVerifier;
 use rustls_pki_types::pem::PemObject as _;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use stele_common::hash::sha256;
 use tokio_rustls::TlsAcceptor;
+use x509_parser::oid_registry::{OID_PKCS1_SHA256WITHRSA, OID_SIG_ECDSA_WITH_SHA256};
 use x509_parser::prelude::{FromDer as _, GeneralName, X509Certificate};
 
 /// What happens to a client that skips the `SSLRequest` and opens with a
@@ -91,6 +100,15 @@ pub enum TlsError {
 pub struct ServerTls {
     pub(crate) acceptor: TlsAcceptor,
     pub(crate) mode: TlsMode,
+    /// The RFC 5929 `tls-server-end-point` channel-binding data for the server's
+    /// end-entity certificate — the certificate DER hashed with SHA-256 — or
+    /// `None` when that certificate's signature hash is not one we bind with
+    /// SHA-256. It is computed once at load (the single configured certificate is
+    /// what every handshake presents), and gates the **SCRAM-SHA-256-PLUS** offer:
+    /// `Some` ⇒ the SASL exchange advertises PLUS and folds this into the `c=`
+    /// check; `None` ⇒ PLUS is simply not advertised and plain SCRAM still runs
+    /// over the encrypted channel (STL-297).
+    pub(crate) endpoint_cbind: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for ServerTls {
@@ -98,6 +116,7 @@ impl std::fmt::Debug for ServerTls {
         // TlsAcceptor holds key material; print the policy only.
         f.debug_struct("ServerTls")
             .field("mode", &self.mode)
+            .field("channel_binding", &self.endpoint_cbind.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -157,6 +176,13 @@ impl ServerTls {
         client_ca: Option<Vec<CertificateDer<'static>>>,
         mode: TlsMode,
     ) -> Result<Self, TlsError> {
+        // The `tls-server-end-point` binding for the leaf is fixed for this
+        // server (the one configured certificate is presented on every
+        // handshake), so compute it once here rather than per connection.
+        let endpoint_cbind = certs
+            .first()
+            .and_then(|leaf| endpoint_channel_binding(leaf.as_ref()));
+
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let builder = ServerConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(rustls::DEFAULT_VERSIONS)?;
@@ -180,8 +206,30 @@ impl ServerTls {
         Ok(Self {
             acceptor: TlsAcceptor::from(Arc::new(config)),
             mode,
+            endpoint_cbind,
         })
     }
+}
+
+/// The RFC 5929 `tls-server-end-point` channel-binding data for an end-entity
+/// certificate: the DER-encoded certificate hashed with the digest of its
+/// signature algorithm.
+///
+/// RFC 5929 §4.1 derives the hash from the certificate's `signatureAlgorithm`
+/// (using SHA-256 where the signature itself uses MD5 or SHA-1). This
+/// implementation binds **only** the SHA-256 case directly: a leaf signed
+/// RSA-SHA-256 or ECDSA-SHA-256 — every modern certificate, including the
+/// `rcgen` certs we mint for the self-signed fallback and the tests. Every other
+/// signature hash returns `None`: the stronger SHA-384/512 (a filed follow-up,
+/// STL-330) and the legacy MD5/SHA-1 (deprecated, not worth a binding path).
+/// `None` means PLUS is *not advertised* (plain SCRAM still runs over TLS),
+/// which is the safe degrade — better than advertising PLUS and computing a hash
+/// the client would compute differently, which would fail the `c=` check.
+fn endpoint_channel_binding(cert_der: &[u8]) -> Option<Vec<u8>> {
+    let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
+    let sig_alg = &cert.signature_algorithm.algorithm;
+    (*sig_alg == OID_PKCS1_SHA256WITHRSA || *sig_alg == OID_SIG_ECDSA_WITH_SHA256)
+        .then(|| sha256(cert_der).as_bytes().to_vec())
 }
 
 /// A hot-swappable holder for the active [`ServerTls`]. The accept loop reads the
@@ -403,7 +451,32 @@ mod tests {
         for mode in [TlsMode::Required, TlsMode::Optional] {
             let tls = ServerTls::self_signed(mode).expect("generate self-signed acceptor");
             assert_eq!(tls.mode, mode);
+            // rcgen mints an ECDSA-P256/SHA-256 leaf, so channel binding is
+            // available — PLUS is advertised even on the self-signed fallback.
+            assert!(
+                tls.endpoint_cbind.is_some(),
+                "an ECDSA-SHA-256 leaf yields tls-server-end-point binding"
+            );
         }
+    }
+
+    #[test]
+    fn channel_binding_is_the_sha256_of_an_ecdsa_sha256_cert() {
+        // `tls-server-end-point` for a SHA-256-signed certificate is the SHA-256
+        // of the certificate DER (RFC 5929 §4.1). A client computes the identical
+        // value from the same bytes it received in the handshake, which is what
+        // makes the `c=` check bind the SASL proof to this TLS channel.
+        let der = leaf_der(Some("svc"), &["svc.local"]);
+        let cbind = endpoint_channel_binding(&der).expect("SHA-256 binding");
+        assert_eq!(cbind, sha256(&der).as_bytes().to_vec());
+        assert_eq!(cbind.len(), 32, "SHA-256 is 32 bytes");
+    }
+
+    #[test]
+    fn channel_binding_is_none_for_non_certificate_bytes() {
+        // A parse failure must degrade to "no binding" (PLUS unadvertised), never
+        // a panic — the certificate is operator-supplied.
+        assert!(endpoint_channel_binding(b"this is not a certificate").is_none());
     }
 
     /// A self-signed leaf certificate (DER) with the given subject CN and DNS
