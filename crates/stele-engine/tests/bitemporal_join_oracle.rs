@@ -259,6 +259,10 @@ fn differential(
     let mut digest: u64 = 0xCBF2_9CE4_8422_2325;
     for &s in instants {
         for &v in &VALID_GRID {
+            // The reference reads are independent of the join shape, so read each
+            // side once per `(s, v)` and reuse it across all four joins.
+            let left = read_side(engine, "a", s, v);
+            let right = read_side(engine, "b", s, v + valid_skew);
             for &(op, kind, keeps_right) in &JOINS {
                 let proj = if keeps_right {
                     "a.k, a.val, b.k, b.val"
@@ -270,8 +274,6 @@ fn differential(
                      FOR SYSTEM_TIME AS OF {s} FOR VALID_TIME AS OF {v}"
                 );
                 let got = sorted(rows(engine, &sql));
-                let left = read_side(engine, "a", s, v);
-                let right = read_side(engine, "b", s, v + valid_skew);
                 let want = sorted(reference_join(kind, &left, &right));
                 assert_eq!(got, want, "divergence on `{sql}` (valid_skew {valid_skew})");
                 for row in &got {

@@ -79,13 +79,15 @@ join too, and the rule is one **consistent `(sys, valid)` snapshot across the wh
 query** — every input is read at the *same* pinned point
 ([docs/16 §8](16-bitemporal-semantics.md#8-temporal-joins)). v0.3 supports the
 **statement-level** form (`SELECT … FROM a JOIN b … FOR SYSTEM_TIME AS OF s
-[FOR VALID_TIME AS OF v]`), which applies to all inputs; this is the floor. Because
-every `FOR … AS OF` is lifted off the token stream regardless of placement, the
-SQL:2011 *per-table* spelling (`FROM a FOR SYSTEM_TIME AS OF s JOIN b …`) is
-accepted as the same statement-level pin **when it names one instant**; naming a
-*different* instant per input (`a FOR SYSTEM_TIME AS OF s1 JOIN b FOR SYSTEM_TIME AS
-OF s2`) is rejected (`SelectError::MultipleAsOf`) — joining inputs at distinct
-points is out of scope. A `FOR VALID_TIME AS OF` pin requires **every** input to
+[FOR VALID_TIME AS OF v]`), which applies to all inputs; this is the floor. At most
+**one qualifier per axis per statement** is allowed: every `FOR … AS OF` is lifted
+off the token stream regardless of placement, so the SQL:2011 *per-table* spelling
+(`FROM a FOR SYSTEM_TIME AS OF s JOIN b …`) is just syntactic sugar for that single
+statement-level pin. Writing the qualifier on *both* inputs is rejected
+(`SelectError::MultipleAsOf`) **even when the two name the same instant** — the
+binder rejects a repeated axis by count, not by value — so joining inputs at
+distinct points (`a FOR SYSTEM_TIME AS OF s1 JOIN b FOR SYSTEM_TIME AS OF s2`) is
+out of scope a fortiori. A `FOR VALID_TIME AS OF` pin requires **every** input to
 have a valid axis; a system-only side (a plain table, or a CTE / derived table) is
 rejected (`ValidTimeUnsupported`), since the pin cannot travel an axis that side
 lacks. Inner / left / semi / anti joins are covered; a `WHERE` / aggregate over a

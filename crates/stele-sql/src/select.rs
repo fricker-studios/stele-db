@@ -2623,7 +2623,8 @@ fn inherit_valid_snapshot(
     if inner.join.is_some() {
         return Err(SelectError::Subquery(
             "a FOR VALID_TIME AS OF read cannot pin the valid axis of a subquery that joins \
-             tables (the join path carries no valid-time pin yet)"
+             tables (inheriting an outer valid pin into a joined subquery is not wired yet — \
+             STL-264)"
                 .to_owned(),
         ));
     }
@@ -5918,22 +5919,28 @@ mod tests {
     }
 
     #[test]
-    fn two_system_instants_across_join_inputs_are_rejected() {
-        // The per-table SQL:2011 form with a *different* instant per input is out
-        // of scope ([STL-243] — the v0.3 floor is one statement-level pin applied
-        // to all). The parser lifts both qualifiers regardless of placement, and
-        // two on one axis is already a `MultipleAsOf`.
+    fn two_system_qualifiers_across_join_inputs_are_rejected() {
+        // The per-table SQL:2011 form is sugar for one statement-level pin
+        // ([STL-243] — the v0.3 floor). The parser lifts both qualifiers regardless
+        // of placement, and the binder rejects a repeated axis by *count*, not
+        // value: two `SYSTEM_TIME` qualifiers are `MultipleAsOf` whether they name
+        // different instants or the same one.
         let catalog = catalog_with_join_tables();
-        let err = bind(
+        for sql in [
             "SELECT users.id FROM users FOR SYSTEM_TIME AS OF 5000 \
              JOIN orders FOR SYSTEM_TIME AS OF 6000 ON users.id = orders.uid",
-            &catalog,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, SelectError::MultipleAsOf(TimeDimension::System)),
-            "got {err:?}"
-        );
+            // Same instant on both inputs — still two qualifiers, still rejected.
+            "SELECT users.id FROM users FOR SYSTEM_TIME AS OF 5000 \
+             JOIN orders FOR SYSTEM_TIME AS OF 5000 ON users.id = orders.uid",
+        ] {
+            assert!(
+                matches!(
+                    bind(sql, &catalog),
+                    Err(SelectError::MultipleAsOf(TimeDimension::System))
+                ),
+                "expected MultipleAsOf for: {sql}"
+            );
+        }
     }
 
     #[test]
