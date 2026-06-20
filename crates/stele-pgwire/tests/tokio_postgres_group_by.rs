@@ -15,6 +15,7 @@ use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
 use stele_pgwire::SharedSession;
 use stele_storage::backend::MemDisk;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
 mod common;
@@ -103,6 +104,93 @@ async fn tokio_postgres_runs_group_by_aggregates() {
         _ => None,
     });
     assert_eq!(total, Some(("3".to_owned(), "350".to_owned())));
+
+    drop(client);
+    let _ = driver.await;
+}
+
+/// The grouping keys (column `region`) of a simple-query reply's data rows.
+fn regions(messages: &[SimpleQueryMessage]) -> Vec<Option<String>> {
+    messages
+        .iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(row) => Some(row.get("region").map(ToOwned::to_owned)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_postgres_runs_having() {
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+
+    let (client, connection) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect to the stele pgwire server");
+    let driver = tokio::spawn(connection);
+
+    client
+        .batch_execute(
+            "CREATE TABLE sales (id INT PRIMARY KEY, region TEXT, amount INT) \
+             WITH SYSTEM VERSIONING",
+        )
+        .await
+        .expect("create table");
+    for insert in [
+        "INSERT INTO sales VALUES (1, 'east', 100)",
+        "INSERT INTO sales VALUES (2, 'east', 200)",
+        "INSERT INTO sales VALUES (3, 'west', 50)",
+    ] {
+        client.simple_query(insert).await.expect("insert");
+    }
+
+    // HAVING filters groups after aggregation (STL-265): only `east` has > 1 sale.
+    let reply = client
+        .simple_query(
+            "SELECT region, COUNT(*) AS count, SUM(amount) AS total FROM sales \
+             GROUP BY region HAVING COUNT(*) > 1",
+        )
+        .await
+        .expect("group by having select");
+    let rows = grouped(&reply);
+    assert_eq!(rows.len(), 1, "only east has more than one sale");
+    assert_eq!(
+        rows.get(&Some("east".to_owned())),
+        Some(&("2".to_owned(), "300".to_owned()))
+    );
+    // The CommandComplete tag reports the post-HAVING row count (1).
+    assert!(
+        reply
+            .iter()
+            .any(|m| matches!(m, SimpleQueryMessage::CommandComplete(1))),
+        "HAVING leaves one group"
+    );
+
+    // HAVING can filter on an aggregate the SELECT list never projects: east sums
+    // to 300 (> 250), west to 50.
+    let reply = client
+        .simple_query("SELECT region FROM sales GROUP BY region HAVING SUM(amount) > 250")
+        .await
+        .expect("having on an unprojected aggregate");
+    assert_eq!(
+        regions(&reply),
+        vec![Some("east".to_owned())],
+        "only east sums above 250"
+    );
+
+    // A non-grouped column in HAVING is Postgres's 42803 grouping_error — a stock
+    // driver classifies it the same as Postgres would.
+    let err = client
+        .simple_query("SELECT region FROM sales GROUP BY region HAVING amount > 1")
+        .await
+        .expect_err("an ungrouped HAVING column must fail");
+    assert_eq!(
+        err.code(),
+        Some(&SqlState::GROUPING_ERROR),
+        "42803 over the wire, got: {err}"
+    );
 
     drop(client);
     let _ = driver.await;

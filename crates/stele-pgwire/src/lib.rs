@@ -259,6 +259,9 @@ const SQLSTATE_INVALID_BINARY_REPRESENTATION: &str = "22P03";
 // `SELECT DISTINCT … ORDER BY <col>` with `<col>` outside the select list —
 // Postgres's `invalid_column_reference` (STL-263).
 const SQLSTATE_INVALID_COLUMN_REFERENCE: &str = "42P10";
+// A non-aggregated column in the SELECT list or `HAVING` of a grouped query that
+// is not a grouping column — Postgres's `grouping_error` (STL-171, STL-265).
+const SQLSTATE_GROUPING_ERROR: &str = "42803";
 
 // Per-field / per-parameter wire format codes (STL-105 text, STL-183 binary). A
 // `RowDescription` field and a `Bind` parameter / result slot each carry one of
@@ -2469,6 +2472,10 @@ fn sqlstate_for_query(err: &EngineError) -> &'static str {
         // list — Postgres's 42P10, so a stock client sees the same class it
         // would from Postgres ([STL-263]).
         EngineError::Select(SelectError::DistinctOrderBy) => SQLSTATE_INVALID_COLUMN_REFERENCE,
+        // A non-aggregated, non-grouping column in a grouped query's SELECT list
+        // ([STL-171]) or `HAVING` ([STL-265]) — Postgres's 42803 grouping_error,
+        // so a stock client branches on the same class it would from Postgres.
+        EngineError::Select(SelectError::UngroupedColumn { .. }) => SQLSTATE_GROUPING_ERROR,
         EngineError::Dml(DmlError::BadLiteral { .. } | DmlError::TypeMismatch { .. })
         // A `\history` key literal that does not fit the key column's type ([STL-199]) —
         // the same invalid-text-representation class as a bad DML literal.
