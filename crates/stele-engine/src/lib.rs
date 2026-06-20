@@ -3756,8 +3756,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
 
         // Reconstruct each row as `[key, value cells…, sys_from, sys_to]`. The
         // endpoints are appended after the schema columns: `sys_from` is the
-        // version's recorded start, `sys_to` its resolved end — `NULL` for a still
-        // -current (open) version, the same convention `version_history` uses.
+        // version's recorded start, `sys_to` its resolved end — `NULL` for a
+        // still-current (open) version, the same convention `version_history` uses.
         let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(versions.len());
         for v in &versions {
             let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(n_schema + 2);

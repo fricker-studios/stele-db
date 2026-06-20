@@ -98,10 +98,11 @@ and `RIGHT` / `FULL` / non-equi joins (STL-270) remain follow-ups.
 ### `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` — temporal range scans (STL-244)
 
 ```sql
--- Every version of every row whose system interval overlaps [t1, t2):
-SELECT * FROM account FOR SYSTEM_TIME FROM 1700000000000000 TO 1700000003600000000;
+-- Every version of every row whose system interval overlaps [t1, t2)
+-- (here t1 and t2 are one hour apart, both in microseconds):
+SELECT * FROM account FOR SYSTEM_TIME FROM 1700000000000000 TO 1700003600000000;
 -- The closed form: overlap with [t1, t2] (upper bound inclusive):
-SELECT id, balance FROM account FOR SYSTEM_TIME BETWEEN 1700000000000000 AND 1700000003600000000
+SELECT id, balance FROM account FOR SYSTEM_TIME BETWEEN 1700000000000000 AND 1700003600000000
   WHERE id = 1;
 ```
 
