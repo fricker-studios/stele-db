@@ -371,12 +371,14 @@ SELECT a, (SELECT max(b) FROM s), a + 1 AS plus, 7 AS seven FROM t
 - **Bare column** — `a`, optionally `AS x`. The output name is the alias, else the
   column's own name. A provenance pseudo-column (STL-247) is projectable here on a
   base table.
-- **Computed expression** — the `WHERE` scalar vocabulary (STL-213): one column
-  **anchor** with integer arithmetic and folded literals (`a + 1`, `qty % 2`), or a
-  single column-free literal (`1` → `int4`, `'x'` → `text`, `TRUE` → `bool`). The
+- **Computed expression** — the `WHERE` scalar vocabulary (STL-213): one **schema**
+  column **anchor** with integer arithmetic and folded literals (`a + 1`, `qty % 2`),
+  or a single column-free literal (`1` → `int4`, `'x'` → `text`, `TRUE` → `bool`). The
   result type is the anchor's (or the literal's). NULL propagates through arithmetic
   (3VL), exactly as in a `WHERE`. An unaliased computed expression takes the
-  Postgres `?column?` fallback name.
+  Postgres `?column?` fallback name. A provenance pseudo-column is **not** usable
+  inside a computed expression (the evaluator decodes schema columns only) — it is
+  projectable solely as a bare column.
 - **Uncorrelated scalar subquery** — `(SELECT … )`, resolved **once** at the
   statement snapshot (the STL-234 fold, materialising a value instead of a row
   filter) and broadcast as a constant column. No inner row ⇒ SQL `NULL`; more than
@@ -392,17 +394,33 @@ scalar subquery in the select list (rides STL-239); a scalar subquery embedded
 inside arithmetic (`a + (SELECT …)`); a scalar function call other than the
 constant-folded `hash(...)`.
 
-## Result shaping (STL-263)
+## Result shaping (STL-263, STL-265)
 
-`ORDER BY`, `LIMIT`/`OFFSET`/`FETCH`, and `DISTINCT` bind and execute on the
-single-table `SELECT` path — plain and aggregate reads, under `AS OF` on either
+`HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`/`FETCH`, and `DISTINCT` bind and execute on
+the single-table `SELECT` path — plain and aggregate reads, under `AS OF` on either
 axis, and inside transactions (the read-your-own-writes overlay is shaped like
 committed rows). The executor applies them in the Postgres pipeline order:
 
 ```text
-WHERE → [GROUP BY/aggregates] → DISTINCT → ORDER BY → OFFSET → LIMIT
+WHERE → [GROUP BY/aggregates → HAVING] → DISTINCT → ORDER BY → OFFSET → LIMIT
 ```
 
+- **`HAVING <predicate>`** (STL-265) — the post-aggregation filter, applied after
+  the `GROUP BY` folds and before the shaping tail: a group is kept iff the
+  predicate is **`TRUE`** for it (a `FALSE` or `NULL` group drops, the `WHERE`
+  rule). The vocabulary is the single-comparison `WHERE` surface lifted to the
+  grouped batch — exactly one **anchor** (a grouping column **or** an aggregate call)
+  per predicate, the other side a literal or an integer arithmetic of it, through
+  any of the six comparisons. An aggregate the `HAVING` names but the select list
+  does not (`SELECT region … HAVING SUM(amount) > 100`) is computed and filtered
+  on without being emitted. A bare column that is not a grouping column is
+  Postgres's **42803** (`grouping_error`), the same code a non-aggregated select
+  item draws. **Rejected** with the reason: a non-comparison or boolean-connective
+  `HAVING`, a two-anchor comparison (aggregate-to-aggregate / column-to-aggregate,
+  the analog of `WHERE`'s deferred column-to-column), a `FLOAT8` `AVG` operand
+  (outside the evaluator's comparison set), and a subquery inside `HAVING` (rides
+  the subquery tickets). `HAVING` over a **join** is a tracked follow-up — rejected
+  there, never dropped.
 - **`ORDER BY col [ASC|DESC], …`** — bare column names, multi-key, first key
   outermost. A name resolves against the **select list first** (an aggregate
   query's output columns, aliases included); a plain non-`DISTINCT` query may
@@ -495,8 +513,9 @@ docs/16 §8); the composed clauses above run over that snapshot's output.
 
 **Not yet** (rejected, never silently mis-bound): **N-way** joins
 (`a JOIN b … JOIN c …` — left-deep chains are STL-323); `RIGHT` / `FULL OUTER`
-and non-equi `ON` conditions (STL-270); a period predicate over a join. A join read
-is also not auto-capped by the
+and non-equi `ON` conditions (STL-270); a period predicate over a join; a `HAVING`
+over a join's aggregate (STL-265 — the single-table path only, since the operands
+would need join-scope name resolution). A join read is also not auto-capped by the
 [default row cap](#default-row-cap-on-the-simple-query-path-stl-306) — give it an
 explicit `LIMIT`.
 

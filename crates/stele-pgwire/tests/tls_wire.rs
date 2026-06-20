@@ -22,7 +22,7 @@ use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
-use stele_pgwire::{Server, ServerTls, SharedSession, TlsMode, TlsSettings};
+use stele_pgwire::{Server, ServerTls, SharedSession, TlsMode, TlsReloader, TlsSettings};
 use stele_storage::backend::MemDisk;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -37,6 +37,10 @@ struct Pki {
     server_cert: PathBuf,
     /// Server private key (PEM) — what `[tls] key` points at.
     server_key: PathBuf,
+    /// The CA that signs the server certificate — retained so the hot-reload tests
+    /// (STL-293) can mint a *fresh* server leaf from the SAME CA, write it over the
+    /// cert/key paths, and have the test client still trust the rotated cert.
+    server_ca: TestCa,
     /// CA the *server certificate* chains to; the test client's trust anchor.
     ca_pem: String,
     /// CA the server trusts for **mTLS** — what `[tls] client_ca` points at.
@@ -72,6 +76,10 @@ fn mint_ca(name: &str) -> TestCa {
 /// this lands in `_stele_principal`, overriding the startup `user` (`stele`).
 const CLIENT_CERT_CN: &str = "alice-cert";
 
+/// The subject Common Name of the server certificate, shared by the initial cert
+/// and the rotated cert the hot-reload tests mint (STL-293).
+const SERVER_CERT_CN: &str = "stele tls test server";
+
 /// A leaf (cert, key) PEM pair signed by `ca`, with subject CN `cn`.
 fn mint_leaf(
     ca: &TestCa,
@@ -99,7 +107,7 @@ fn mint_pki(test: &str) -> Pki {
 
     let (server_cert_pem, server_key_pem) = mint_leaf(
         &server_ca,
-        "stele tls test server",
+        SERVER_CERT_CN,
         Some("localhost"),
         rcgen::ExtendedKeyUsagePurpose::ServerAuth,
     );
@@ -126,7 +134,8 @@ fn mint_pki(test: &str) -> Pki {
     Pki {
         server_cert: write("server.crt", &server_cert_pem),
         server_key: write("server.key", &server_key_pem),
-        ca_pem: server_ca.pem,
+        ca_pem: server_ca.pem.clone(),
+        server_ca,
         client_ca: write("client-ca.crt", &client_ca.pem),
         client_identity,
         rogue_identity,
@@ -158,6 +167,41 @@ async fn spawn_tls_server(pki: &Pki, mode: TlsMode, mtls: bool) -> SocketAddr {
     let addr = bound.local_addr();
     tokio::spawn(bound.serve());
     addr
+}
+
+/// Boot a TLS-enabled server behind a [`TlsReloader`] (STL-293) so the test can
+/// rotate the on-disk cert/key and call [`TlsReloader::reload`]. Returns the bound
+/// address and the reloader handle.
+async fn spawn_reloadable_tls_server(pki: &Pki, mode: TlsMode) -> (SocketAddr, TlsReloader) {
+    let settings = TlsSettings {
+        cert: pki.server_cert.clone(),
+        key: pki.server_key.clone(),
+        client_ca: None,
+        mode,
+    };
+    let reloader = TlsReloader::load(settings).expect("load TLS material");
+    let bound = Server::new("127.0.0.1:0".parse().unwrap(), fresh_session())
+        .with_tls_reloader(&reloader)
+        .bind()
+        .await
+        .expect("bind ephemeral port");
+    let addr = bound.local_addr();
+    tokio::spawn(bound.serve());
+    (addr, reloader)
+}
+
+/// The DER bytes of the leaf certificate the server presented on `stream` — what
+/// the hot-reload tests compare across a rotation to prove which cert is live.
+fn server_leaf_der(stream: &tokio_rustls::client::TlsStream<TcpStream>) -> Vec<u8> {
+    stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .expect("server presented a certificate")
+        .first()
+        .expect("a leaf certificate")
+        .as_ref()
+        .to_vec()
 }
 
 /// A rustls client config trusting `ca_pem`, optionally presenting `identity`.
@@ -593,4 +637,90 @@ async fn mtls_rejects_a_client_certificate_from_the_wrong_ca() {
     attempt
         .await
         .expect_err("a rogue-CA client certificate must be rejected");
+}
+
+// ---------------------------------------------------------------------------
+// Hot-reload (STL-293): rotate the cert/key under load without a restart
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reload_swaps_the_cert_for_new_connections_and_keeps_in_flight_sessions() {
+    let pki = mint_pki("reload-swap");
+    let (addr, reloader) = spawn_reloadable_tls_server(&pki, TlsMode::Required).await;
+
+    // An in-flight session, established before the rotation: it must keep working
+    // across the swap (it keeps the acceptor it handshook with).
+    let mut before = tls_connect(addr, client_config(&pki.ca_pem, None))
+        .await
+        .expect("initial TLS handshake");
+    let cert_before = server_leaf_der(&before);
+    complete_startup(&mut before).await.expect("startup");
+
+    // Rotate the on-disk pair to a fresh leaf signed by the SAME CA (so the client
+    // still trusts it), then reload — the operator's `kill -HUP` path.
+    let (new_cert, new_key) = mint_leaf(
+        &pki.server_ca,
+        SERVER_CERT_CN,
+        Some("localhost"),
+        rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+    );
+    std::fs::write(&pki.server_cert, &new_cert).expect("write rotated cert");
+    std::fs::write(&pki.server_key, &new_key).expect("write rotated key");
+    reloader.reload().expect("reload the rotated pair");
+
+    // A NEW connection presents the rotated certificate and serves queries.
+    let mut after = tls_connect(addr, client_config(&pki.ca_pem, None))
+        .await
+        .expect("TLS handshake after reload");
+    let cert_after = server_leaf_der(&after);
+    complete_startup(&mut after)
+        .await
+        .expect("startup after reload");
+    assert_ne!(
+        cert_before, cert_after,
+        "a connection accepted after the reload must present the rotated certificate"
+    );
+    assert_eq!(select_one(&mut after).await, "1");
+
+    // The in-flight session, handshook before the swap, still round-trips.
+    assert_eq!(
+        select_one(&mut before).await,
+        "1",
+        "an established session survives the rotation"
+    );
+}
+
+#[tokio::test]
+async fn broken_reload_keeps_serving_the_previous_cert() {
+    let pki = mint_pki("reload-broken");
+    let (addr, reloader) = spawn_reloadable_tls_server(&pki, TlsMode::Required).await;
+
+    let mut before = tls_connect(addr, client_config(&pki.ca_pem, None))
+        .await
+        .expect("initial TLS handshake");
+    let cert_before = server_leaf_der(&before);
+    complete_startup(&mut before).await.expect("startup");
+
+    // Corrupt the cert file (a torn write / wrong file mid-rotation). The reload
+    // must FAIL and leave the running acceptor untouched — the listener stays up.
+    std::fs::write(&pki.server_cert, b"not a certificate").expect("corrupt cert file");
+    reloader
+        .reload()
+        .expect_err("a broken pair must not swap in");
+
+    // A new connection still presents the ORIGINAL certificate and serves queries,
+    // and the in-flight session is unaffected.
+    let mut after = tls_connect(addr, client_config(&pki.ca_pem, None))
+        .await
+        .expect("TLS handshake survives the broken reload");
+    let cert_after = server_leaf_der(&after);
+    complete_startup(&mut after)
+        .await
+        .expect("startup after broken reload");
+    assert_eq!(
+        cert_before, cert_after,
+        "a broken rotation keeps the previously loaded certificate"
+    );
+    assert_eq!(select_one(&mut after).await, "1");
+    assert_eq!(select_one(&mut before).await, "1");
 }

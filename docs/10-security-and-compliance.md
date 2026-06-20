@@ -150,9 +150,20 @@ psycopg, pgjdbc, and `tokio-postgres` all speak it natively:
 - **Bootstrap** (no default credentials): boot once *without* `[auth]` —
   trust is loopback-plaintext-only or behind `[tls]` per §4 — run
   `CREATE USER`, then enable `[auth]` and restart; verifiers are durable.
-- **Deliberate v0.3 floor, filed as follow-ups:** `SCRAM-SHA-256-PLUS`
-  channel binding (plain SCRAM is the floor; a client demanding `p=…` is
-  refused) and client-side SCRAM in `stele shell` (STL-296). The authenticated identity reaches
+- **Channel binding over TLS (STL-297):** on a TLS connection whose certificate
+  yields a `tls-server-end-point` binding (RFC 5929), the server advertises
+  `SCRAM-SHA-256-PLUS` first and folds the certificate's SHA-256 into the `c=`
+  check, so a man-in-the-middle that terminates TLS with a different certificate
+  cannot relay a captured proof. The RFC downgrade rule is enforced: over a
+  PLUS-advertising channel a `y` gs2 flag (the client believing the server has no
+  channel binding) is refused. Off TLS — or for a certificate whose signature
+  hash is not one we bind with SHA-256 — only plain SCRAM is offered, and a
+  `p=…` demand is refused as before. The plain floor still authenticates over TLS
+  for a client that opts out with `n`.
+- **Deliberate v0.3 floor, filed as follow-ups:** `tls-server-end-point` binding
+  for SHA-384/512-signed server certificates (today PLUS is advertised only for
+  SHA-256-signed certs; a stronger-hash cert falls back to plain SCRAM) and
+  client-side SCRAM in `stele shell` (STL-296). The authenticated identity reaches
   the connection trace span (STL-107) **and the stored write provenance**: each
   wire-issued write stamps the connection's identity into `_stele_principal`
   (STL-300/STL-291), set per statement under the engine lock so a shared engine

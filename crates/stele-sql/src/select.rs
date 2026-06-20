@@ -589,14 +589,76 @@ pub struct BoundAggregate {
     /// (`SELECT COUNT(*) FROM t`), which is one whole-table group.
     pub group_by: Vec<usize>,
     /// The aggregates to compute, in first-appearance order. An
-    /// [`OutputItem::Aggregate`] indexes into this list.
+    /// [`OutputItem::Aggregate`] indexes into this list. A [`HavingScalar::Aggregate`]
+    /// indexes into it too — an aggregate a `HAVING` references but the SELECT
+    /// list does not is appended here (computed, never emitted), so it is wider
+    /// than [`items`](Self::items) when `HAVING` introduces one ([STL-265]).
     pub aggregates: Vec<AggregateCall>,
     /// The output columns, in SELECT-list order — each either a passed-through
     /// grouping column or an aggregate.
     pub items: Vec<OutputItem>,
+    /// A bound `HAVING` predicate over the grouped output, or `None` when the
+    /// query gave none ([STL-265]). Applied **after** the aggregate folds and
+    /// **before** the result-shaping tail (the Postgres pipeline:
+    /// aggregate → `HAVING` → `DISTINCT` → `ORDER BY` → `LIMIT`): a group is kept
+    /// iff the predicate is `TRUE` for it. Its operands address this plan's
+    /// [`group_by`](Self::group_by) positions and [`aggregates`](Self::aggregates)
+    /// — not the SELECT-list [`items`](Self::items) — so it may filter on an
+    /// aggregate the query never projects.
+    pub having: Option<BoundHaving>,
     /// The result columns `(name, type)`, aligned to [`items`](Self::items): a
     /// `RowDescription` header for the grouped result.
     pub columns: Vec<(String, LogicalType)>,
+}
+
+/// A bound `HAVING <scalar> <compare> <scalar>` predicate — the post-aggregation
+/// filter ([STL-265]).
+///
+/// Structurally the aggregate-output analog of the `WHERE`-row [`BoundPredicate`]:
+/// the same six [comparison operators](CompareOp), the same single-anchor shape
+/// (exactly one grouping column **or** aggregate anchors the predicate, the other
+/// side a literal or an integer arithmetic of it). The difference is the operand
+/// vocabulary — a [`HavingScalar`] addresses the *grouped* batch (a grouping
+/// column or an aggregate result), not a scanned row's cells — so it evaluates
+/// over [`BoundAggregate`]'s output rather than the pre-grouping rows a `WHERE`
+/// sees. An aggregate-to-aggregate / column-to-aggregate comparison (two distinct
+/// anchors) is a deferred follow-up, mirroring `WHERE`'s column-to-column
+/// deferral; a subquery inside `HAVING` rides the subquery tickets' vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundHaving {
+    /// The comparison's left operand.
+    pub left: HavingScalar,
+    /// The comparison operator.
+    pub op: CompareOp,
+    /// The comparison's right operand.
+    pub right: HavingScalar,
+}
+
+/// One side of a bound `HAVING` comparison: a grouping column, an aggregate
+/// result, a folded literal, or an integer arithmetic of them ([STL-265]).
+///
+/// Operands address the aggregate's *output* — a grouping column by its position
+/// in [`BoundAggregate::group_by`], an aggregate by its index into
+/// [`BoundAggregate::aggregates`] — the executor reads them straight out of the
+/// grouped batch (`out.groups[j]` / `out.aggregates[k]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HavingScalar {
+    /// The grouping column at this position in [`BoundAggregate::group_by`] (the
+    /// same index the grouped batch's `groups` are emitted in).
+    Group(usize),
+    /// The aggregate at this index in [`BoundAggregate::aggregates`].
+    Aggregate(usize),
+    /// A constant, folded to the predicate's anchor type.
+    Literal(ScalarValue),
+    /// `left <op> right` — integer arithmetic over two having scalars.
+    Arith {
+        /// The arithmetic operator.
+        op: ArithOp,
+        /// The left operand.
+        left: Box<HavingScalar>,
+        /// The right operand.
+        right: Box<HavingScalar>,
+    },
 }
 
 /// One output column of an aggregate query.
@@ -857,10 +919,10 @@ pub enum SelectError {
     UnsupportedProjection(String),
 
     /// The query carried a clause outside the supported single-table surface
-    /// (`WITH`, `HAVING`, `DISTINCT ON`, locking, …). [`BoundSelect`] does not
-    /// carry these, so accepting them would silently drop user intent — they
-    /// are rejected. (`ORDER BY` / `LIMIT` / `OFFSET` / `FETCH` / `DISTINCT`
-    /// bind since [STL-263]; `GROUP BY` since [STL-171].)
+    /// (`WITH RECURSIVE`, `DISTINCT ON`, `QUALIFY`, locking, …). [`BoundSelect`]
+    /// does not carry these, so accepting them would silently drop user intent —
+    /// they are rejected. (`ORDER BY` / `LIMIT` / `OFFSET` / `FETCH` / `DISTINCT`
+    /// bind since [STL-263]; `GROUP BY` since [STL-171]; `HAVING` since [STL-265].)
     #[error("unsupported `{0}` in a SELECT")]
     UnsupportedClause(&'static str),
 
@@ -919,6 +981,17 @@ pub enum SelectError {
     /// not read. Rejected with the reason rather than computed wrongly.
     #[error("unsupported aggregate query: {0}")]
     UnsupportedAggregate(String),
+
+    /// A `HAVING` is not a shape v0.3 binds ([STL-265]) — it is not a single
+    /// comparison, it compares two aggregates / grouping columns (the
+    /// aggregate-output analog of a column-to-column `WHERE`), it references no
+    /// aggregate or grouping column to anchor on, a literal cannot fold to the
+    /// anchor's type, or it filters on a value type the evaluator cannot compare
+    /// (a `FLOAT8` `AVG`). A subquery inside `HAVING` rides the subquery tickets'
+    /// vocabulary. Rejected with the reason rather than silently dropped (which
+    /// would return unfiltered groups — a wrong answer).
+    #[error("unsupported HAVING ({0})")]
+    UnsupportedHaving(String),
 
     /// The `ORDER BY` is not a shape v0.3 binds ([STL-263]) — a non-column key
     /// (an expression, an ordinal), an explicit `NULLS FIRST`/`NULLS LAST`
@@ -1691,7 +1764,11 @@ fn is_aggregate_query(select: &Select) -> bool {
         &select.group_by,
         GroupByExpr::Expressions(exprs, _) if !exprs.is_empty()
     );
-    grouped || select.projection.iter().any(projection_item_is_aggregate)
+    // A `HAVING` implies aggregation even without a `GROUP BY` or a projected
+    // aggregate (`SELECT … FROM t HAVING COUNT(*) > 0` is one whole-table group),
+    // so it routes through the aggregate path where `HAVING` binds — rather than
+    // being silently dropped on the plain-projection path ([STL-265]).
+    grouped || select.having.is_some() || select.projection.iter().any(projection_item_is_aggregate)
 }
 
 /// Whether a projected item is an aggregate function call (`COUNT(*)`,
@@ -1721,6 +1798,8 @@ fn function_name(func: &sqlparser::ast::Function) -> Option<&str> {
 /// Resolves the grouping columns to schema indices, then walks the SELECT list:
 /// each item is either an aggregate function call or a passed-through grouping
 /// column (one that is not in `GROUP BY` is [`SelectError::UngroupedColumn`]).
+/// Finally binds the post-grouping `HAVING` filter, if any ([`bind_having`],
+/// [STL-265]) — which may append an aggregate the SELECT list never projects.
 fn bind_aggregate(
     select: &Select,
     schema: &TableSchema,
@@ -1764,10 +1843,21 @@ fn bind_aggregate(
         }
     }
 
+    // The post-grouping `HAVING` filter ([STL-265]). It binds against the same
+    // grouping columns and may reference an aggregate the SELECT list does not —
+    // such an aggregate is appended to `aggregates` (computed, never emitted), so
+    // `bind_having` takes the list by `&mut`.
+    let having = select
+        .having
+        .as_ref()
+        .map(|expr| bind_having(expr, &group_by, &mut aggregates, schema, table))
+        .transpose()?;
+
     Ok(BoundAggregate {
         group_by,
         aggregates,
         items,
+        having,
         columns,
     })
 }
@@ -1964,6 +2054,284 @@ fn check_aggregate_arg_type(func: AggregateFunc, ty: LogicalType) -> Result<(), 
     }
 }
 
+/// One typed reference in a `HAVING` predicate — what anchors its literal folding
+/// ([STL-265]). A bound predicate has exactly one (the other operand a literal or
+/// an integer arithmetic of it), mirroring the single-column `WHERE` shape.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HavingAnchor {
+    /// A grouping column, by schema index, with its type.
+    Group {
+        /// The column's schema index.
+        index: usize,
+        /// The column's type.
+        ty: LogicalType,
+    },
+    /// An aggregate call, with its result type.
+    Aggregate {
+        /// The validated call (its identity — `(func, arg)` — deduplicates two
+        /// textual occurrences of the same aggregate).
+        call: AggregateCall,
+        /// The aggregate's result type.
+        ty: LogicalType,
+    },
+}
+
+impl HavingAnchor {
+    /// The type every literal in the predicate folds against.
+    const fn ty(self) -> LogicalType {
+        match self {
+            Self::Group { ty, .. } | Self::Aggregate { ty, .. } => ty,
+        }
+    }
+}
+
+/// Bind a `HAVING <scalar> <compare> <scalar>` predicate over the grouped output
+/// ([STL-265]).
+///
+/// The shape mirrors the single-column `WHERE` ([`bind_where_predicate`]): the top
+/// level is one of the six comparisons, and exactly one **anchor** — a grouping
+/// column or an aggregate call — types the predicate, every literal folding to it.
+/// The operand vocabulary is the difference: a bare identifier must be a grouping
+/// column (an ungrouped one is the Postgres grouping error,
+/// [`SelectError::UngroupedColumn`] / SQLSTATE 42803), and a function call is an
+/// aggregate whose computed column the predicate filters on — appended to
+/// `aggregates` (and so computed) if the SELECT list did not already request it.
+fn bind_having(
+    expr: &Expr,
+    group_by: &[usize],
+    aggregates: &mut Vec<AggregateCall>,
+    schema: &TableSchema,
+    table: &str,
+) -> Result<BoundHaving, SelectError> {
+    let Expr::BinaryOp { left, op, right } = unwrap_nested(expr) else {
+        return Err(SelectError::UnsupportedHaving(
+            "the HAVING is not a comparison".to_owned(),
+        ));
+    };
+    let Some(compare) = compare_op(op) else {
+        return Err(SelectError::UnsupportedHaving(format!(
+            "operator `{op}` is not a comparison"
+        )));
+    };
+    // Exactly one grouping column or aggregate anchors the type every literal folds
+    // to (and any arithmetic computes in) — the aggregate-output analog of the
+    // single-column WHERE anchor.
+    let anchor = having_anchor(left, right, group_by, schema, table)?;
+    // The grouped value must be one the evaluator can compare. Every grouping
+    // column is (GROUP BY rejects the rest) and every INT8 / argument-typed
+    // aggregate is, leaving only a FLOAT8 `AVG`, rejected cleanly here rather than
+    // erroring per group (the same evaluable-type set [`require_evaluable`] gates).
+    if !matches!(
+        anchor.ty(),
+        LogicalType::Int4 | LogicalType::Int8 | LogicalType::Bool | LogicalType::Text
+    ) {
+        return Err(SelectError::UnsupportedHaving(format!(
+            "comparing a {} value is not supported yet",
+            anchor.ty()
+        )));
+    }
+    Ok(BoundHaving {
+        left: bind_having_scalar(left, anchor.ty(), group_by, aggregates, schema, table)?,
+        op: compare,
+        right: bind_having_scalar(right, anchor.ty(), group_by, aggregates, schema, table)?,
+    })
+}
+
+/// Resolve the single grouping-column-or-aggregate anchor a `HAVING` comparison
+/// references ([STL-265]) — the type every literal in it folds against. A predicate
+/// with no such reference has no type to anchor; one with two *distinct* references
+/// is an aggregate-to-aggregate / column-to-aggregate comparison (a deferred
+/// follow-up, the analog of `WHERE`'s column-to-column). Both are
+/// [`SelectError::UnsupportedHaving`]; an ungrouped bare column is the Postgres
+/// grouping error [`SelectError::UngroupedColumn`].
+fn having_anchor(
+    left: &Expr,
+    right: &Expr,
+    group_by: &[usize],
+    schema: &TableSchema,
+    table: &str,
+) -> Result<HavingAnchor, SelectError> {
+    let mut anchors: Vec<HavingAnchor> = Vec::new();
+    collect_having_anchors(left, group_by, schema, table, &mut anchors)?;
+    collect_having_anchors(right, group_by, schema, table, &mut anchors)?;
+    let mut distinct: Vec<HavingAnchor> = Vec::new();
+    for anchor in anchors {
+        if !distinct.contains(&anchor) {
+            distinct.push(anchor);
+        }
+    }
+    match distinct.as_slice() {
+        [anchor] => Ok(*anchor),
+        [] => Err(SelectError::UnsupportedHaving(
+            "the HAVING references no aggregate or grouping column".to_owned(),
+        )),
+        _ => Err(SelectError::UnsupportedHaving(
+            "a HAVING comparing two aggregates or grouping columns is not supported".to_owned(),
+        )),
+    }
+}
+
+/// Collect the grouping-column / aggregate anchors a `HAVING` operand references,
+/// descending through parentheses and integer arithmetic ([STL-265]). A bare
+/// identifier must be a grouping column (else the grouping error); a function call
+/// is an aggregate (its shape validated, its result type computed); a literal
+/// contributes no anchor. Does **not** descend into an aggregate's argument — that
+/// column need not be grouped (`SUM(price)` over an ungrouped `price` is legal), so
+/// it is not itself an anchor.
+fn collect_having_anchors(
+    expr: &Expr,
+    group_by: &[usize],
+    schema: &TableSchema,
+    table: &str,
+    out: &mut Vec<HavingAnchor>,
+) -> Result<(), SelectError> {
+    match unwrap_nested(expr) {
+        Expr::Identifier(id) => {
+            let index = having_group_column(&id.value, group_by, schema, table)?;
+            out.push(HavingAnchor::Group {
+                index,
+                ty: schema.columns()[index].ty(),
+            });
+        }
+        function @ Expr::Function(_) => {
+            let call = bind_aggregate_call(function, schema, table)?
+                .expect("an Expr::Function binds to an aggregate call or errors");
+            let arg_ty = call.arg.map(|i| schema.columns()[i].ty());
+            out.push(HavingAnchor::Aggregate {
+                call,
+                ty: call.func.result_type(arg_ty),
+            });
+        }
+        Expr::BinaryOp { left, op, right } => {
+            if arith_op(op).is_none() {
+                return Err(SelectError::UnsupportedHaving(format!(
+                    "operator `{op}` is not supported in a HAVING comparand"
+                )));
+            }
+            collect_having_anchors(left, group_by, schema, table, out)?;
+            collect_having_anchors(right, group_by, schema, table, out)?;
+        }
+        // A literal (or any other leaf) anchors nothing.
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Resolve a bare `HAVING` column to its schema index, requiring it be a grouping
+/// column ([STL-265]). An unknown name is [`SelectError::UnknownColumn`]; a real
+/// column that is not in `GROUP BY` is the Postgres grouping error
+/// [`SelectError::UngroupedColumn`] (SQLSTATE 42803) — it has no single value per
+/// group, exactly as a non-aggregated SELECT-list column would.
+fn having_group_column(
+    name: &str,
+    group_by: &[usize],
+    schema: &TableSchema,
+    table: &str,
+) -> Result<usize, SelectError> {
+    let index = column_index(schema, name).ok_or_else(|| SelectError::UnknownColumn {
+        table: table.to_owned(),
+        column: name.to_owned(),
+    })?;
+    if group_by.contains(&index) {
+        Ok(index)
+    } else {
+        Err(SelectError::UngroupedColumn {
+            table: table.to_owned(),
+            column: name.to_owned(),
+        })
+    }
+}
+
+/// Bind one side of a `HAVING` comparison to a [`HavingScalar`] ([STL-265]): a
+/// grouping column (by its `group_by` position), an aggregate (registered into
+/// `aggregates`, deduplicated, returning its index), an integer arithmetic of
+/// them, or a literal folded to the anchor type. Arithmetic is integer-only (the
+/// evaluator computes `+ - * / %` over `INT4`/`INT8`), so it is rejected over a
+/// non-integer anchor at bind time rather than erroring per group.
+fn bind_having_scalar(
+    expr: &Expr,
+    anchor_ty: LogicalType,
+    group_by: &[usize],
+    aggregates: &mut Vec<AggregateCall>,
+    schema: &TableSchema,
+    table: &str,
+) -> Result<HavingScalar, SelectError> {
+    match unwrap_nested(expr) {
+        Expr::Identifier(id) => {
+            let index = having_group_column(&id.value, group_by, schema, table)?;
+            let pos = group_by
+                .iter()
+                .position(|&g| g == index)
+                .expect("having_group_column accepts only a grouping column");
+            Ok(HavingScalar::Group(pos))
+        }
+        function @ Expr::Function(_) => {
+            let call = bind_aggregate_call(function, schema, table)?
+                .expect("an Expr::Function binds to an aggregate call or errors");
+            Ok(HavingScalar::Aggregate(register_aggregate(
+                aggregates, call,
+            )))
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let Some(arith) = arith_op(op) else {
+                return Err(SelectError::UnsupportedHaving(format!(
+                    "operator `{op}` is not supported in a HAVING comparand"
+                )));
+            };
+            if !matches!(anchor_ty, LogicalType::Int4 | LogicalType::Int8) {
+                return Err(SelectError::UnsupportedHaving(format!(
+                    "arithmetic in a HAVING needs an integer aggregate or grouping column \
+                     (the anchor is {anchor_ty})"
+                )));
+            }
+            Ok(HavingScalar::Arith {
+                op: arith,
+                left: Box::new(bind_having_scalar(
+                    left, anchor_ty, group_by, aggregates, schema, table,
+                )?),
+                right: Box::new(bind_having_scalar(
+                    right, anchor_ty, group_by, aggregates, schema, table,
+                )?),
+            })
+        }
+        leaf => {
+            let value = fold::fold_scalar(leaf, anchor_ty).map_err(|err| {
+                SelectError::UnsupportedHaving(having_fold_reason(&err, anchor_ty))
+            })?;
+            Ok(HavingScalar::Literal(value))
+        }
+    }
+}
+
+/// Add an aggregate call to the plan's compute list, returning its index — reusing
+/// an identical call already present (the SELECT list's, or an earlier `HAVING`
+/// operand's) so a `HAVING` aggregate the query also projects is computed once
+/// ([STL-265]).
+fn register_aggregate(aggregates: &mut Vec<AggregateCall>, call: AggregateCall) -> usize {
+    if let Some(index) = aggregates.iter().position(|existing| *existing == call) {
+        return index;
+    }
+    aggregates.push(call);
+    aggregates.len() - 1
+}
+
+/// Render a literal-fold failure in a `HAVING` as the reason carried by
+/// [`SelectError::UnsupportedHaving`] — like [`predicate_reason`] but the anchor may
+/// be an aggregate, so the message names the target type rather than a column.
+fn having_fold_reason(err: &FoldError, ty: LogicalType) -> String {
+    match err {
+        FoldError::Null => format!("NULL cannot be compared to a {ty} value"),
+        FoldError::TypeMismatch { found } => format!("{found} is not a {ty} value"),
+        FoldError::BadLiteral { literal, reason } => {
+            let detail = reason.map(|r| format!(" ({r})")).unwrap_or_default();
+            format!("{literal:?} is not a valid {ty}{detail}")
+        }
+        FoldError::UnsupportedType(ty) => {
+            format!("comparing a {ty} value to a literal is not supported yet")
+        }
+    }
+}
+
 /// Accept a type the vectorized evaluator can decode (`INT4` / `INT8` / `BOOL` /
 /// `TEXT`); reject anything else with `reason`. Grouping keys and `MIN` / `MAX` /
 /// `COUNT` arguments must be evaluable because the executor decodes them into
@@ -2101,6 +2469,14 @@ fn bind_join<'a>(
     if stmt.temporal.period_predicate.is_some() {
         return Err(SelectError::UnsupportedJoin(
             "a period predicate over a JOIN".to_owned(),
+        ));
+    }
+    // A `HAVING` over a join's aggregate is a tracked follow-up ([STL-265]) — its
+    // operands would need join-scope (qualified-name) resolution, unlike the
+    // single-table binder's schema-index path. Rejected, never silently dropped.
+    if select.having.is_some() {
+        return Err(SelectError::UnsupportedJoin(
+            "a HAVING over a JOIN".to_owned(),
         ));
     }
 
@@ -2825,6 +3201,9 @@ fn bind_join_aggregate(select: &Select, scope: &JoinScope) -> Result<BoundAggreg
         group_by,
         aggregates,
         items,
+        // `HAVING` over a join is a tracked follow-up — `bind_join` rejects it up
+        // front, so an aggregate built here never carries one ([STL-265]).
+        having: None,
         columns,
     })
 }
@@ -4151,12 +4530,13 @@ fn describe_expr(expr: &Expr) -> String {
 /// which carries the result-shaping clauses), after rejecting every query- and
 /// select-level clause outside the supported surface.
 ///
-/// A clause [`BoundSelect`] cannot represent (`WITH`, `HAVING`, locking, …)
-/// must be rejected, not silently dropped when the plan is later executed. The
-/// result-shaping clauses — `ORDER BY`, `LIMIT`/`OFFSET`/`FETCH`, `DISTINCT` —
-/// are bound, not rejected ([STL-263]); their own unsupported shapes surface in
-/// [`bind_order_by`] / [`bind_limit_offset`] / [`bind_distinct`] with precise
-/// reasons.
+/// A clause [`BoundSelect`] cannot represent (`WITH RECURSIVE`, `QUALIFY`,
+/// locking, …) must be rejected, not silently dropped when the plan is later
+/// executed. The aggregate (`GROUP BY` / `HAVING`) and result-shaping clauses —
+/// `ORDER BY`, `LIMIT`/`OFFSET`/`FETCH`, `DISTINCT` — are bound, not rejected
+/// ([STL-171], [STL-263], [STL-265]); their own unsupported shapes surface in
+/// [`bind_aggregate`] / [`bind_having`] / [`bind_order_by`] / [`bind_limit_offset`]
+/// / [`bind_distinct`] with precise reasons.
 fn single_select(body: &SqlStatement) -> Result<(&Query, &Select), SelectError> {
     let SqlStatement::Query(query) = body else {
         return Err(SelectError::NotSelect);
@@ -4209,9 +4589,9 @@ fn reject_unsupported_select_clauses(select: &Select) -> Result<(), SelectError>
     if matches!(&select.group_by, GroupByExpr::All(_)) {
         return reject("GROUP BY ALL");
     }
-    if select.having.is_some() {
-        return reject("HAVING");
-    }
+    // `HAVING` is bound as the aggregate query's post-grouping filter ([STL-265],
+    // in `bind_having`); the join path rejects it with its own diagnostic
+    // (`bind_join`), since `HAVING` over a join is a tracked follow-up.
     if select.qualify.is_some() {
         return reject("QUALIFY");
     }
@@ -4420,6 +4800,12 @@ fn bind_projected_subquery(
 /// is `int4`, `'x'` is `text`). Two or more distinct columns, or column-free
 /// arithmetic, is an [`UnsupportedProjection`](SelectError::UnsupportedProjection)
 /// (a tracked follow-up).
+///
+/// The anchor resolves against **schema columns only** — unlike a `WHERE` scalar,
+/// a provenance pseudo-column ([STL-247]) is *not* usable inside a computed
+/// expression (the engine's `eval_projection_scalar` decodes schema columns alone),
+/// so a pseudo-column here is [`SelectError::UnknownColumn`]; it stays projectable
+/// only as a bare column.
 fn bind_projection_scalar(
     expr: &Expr,
     schema: &TableSchema,
@@ -4431,11 +4817,11 @@ fn bind_projection_scalar(
     names.dedup();
     match names.as_slice() {
         [name] => {
-            let (index, ty) =
-                resolve_filter_column(schema, name).ok_or_else(|| SelectError::UnknownColumn {
-                    table: table.to_owned(),
-                    column: (*name).to_owned(),
-                })?;
+            let index = column_index(schema, name).ok_or_else(|| SelectError::UnknownColumn {
+                table: table.to_owned(),
+                column: (*name).to_owned(),
+            })?;
+            let ty = schema.columns()[index].ty();
             let anchor = FilterAnchor { name, index, ty };
             let scalar = bind_scalar(expr, &anchor, schema, table)?;
             Ok((scalar, ty))
@@ -5257,9 +5643,8 @@ mod tests {
             // `ORDER BY` / `LIMIT` / `DISTINCT` now bind ([STL-263]); the
             // Postgres `DISTINCT ON (…)` extension stays out.
             "SELECT DISTINCT ON (balance) balance FROM account",
-            // `GROUP BY balance` now binds as an aggregate query ([STL-171]);
-            // HAVING and GROUP BY ALL remain unsupported clauses.
-            "SELECT balance FROM account GROUP BY balance HAVING balance > 0",
+            // `GROUP BY balance` now binds as an aggregate query ([STL-171]) and
+            // `HAVING` over it binds too ([STL-265]); `GROUP BY ALL` stays out.
             "SELECT balance FROM account GROUP BY ALL",
             // `WITH (CTE)` now binds ([STL-242]); see the CTE tests below.
         ] {
@@ -6460,6 +6845,197 @@ mod tests {
         );
     }
 
+    // ---- HAVING (STL-265) ----
+
+    #[test]
+    fn having_on_a_projected_aggregate_reuses_its_index() {
+        // `COUNT(*)` is projected *and* in HAVING: it is computed once (one entry
+        // in `aggregates`) and HAVING references that index.
+        let catalog = catalog_with_sales();
+        let agg = bind(
+            "SELECT region, COUNT(*) FROM sales GROUP BY region HAVING COUNT(*) > 1",
+            &catalog,
+        )
+        .unwrap()
+        .aggregate
+        .expect("aggregate plan");
+        assert_eq!(
+            agg.aggregates,
+            vec![AggregateCall {
+                func: AggregateFunc::Count,
+                arg: None,
+            }],
+            "the projected COUNT(*) is reused, not duplicated"
+        );
+        assert_eq!(
+            agg.items,
+            vec![OutputItem::Group(0), OutputItem::Aggregate(0)]
+        );
+        assert_eq!(
+            agg.having,
+            Some(BoundHaving {
+                left: HavingScalar::Aggregate(0),
+                op: CompareOp::Gt,
+                right: HavingScalar::Literal(ScalarValue::Int8(1)),
+            })
+        );
+    }
+
+    #[test]
+    fn having_aggregate_absent_from_the_select_list_is_computed_not_emitted() {
+        // `SUM(amount)` is only in HAVING: appended to `aggregates` (so it is
+        // computed) but not to `items`/`columns` (so it is never emitted).
+        let catalog = catalog_with_sales();
+        let bound = bind(
+            "SELECT region FROM sales GROUP BY region HAVING SUM(amount) > 100",
+            &catalog,
+        )
+        .unwrap();
+        let agg = bound.aggregate.expect("aggregate plan");
+        assert_eq!(
+            agg.aggregates,
+            vec![AggregateCall {
+                func: AggregateFunc::Sum,
+                arg: Some(2),
+            }]
+        );
+        assert_eq!(
+            agg.items,
+            vec![OutputItem::Group(0)],
+            "SUM is not projected"
+        );
+        assert_eq!(agg.columns, vec![("region".to_owned(), LogicalType::Text)]);
+        assert_eq!(
+            agg.having,
+            Some(BoundHaving {
+                left: HavingScalar::Aggregate(0),
+                op: CompareOp::Gt,
+                right: HavingScalar::Literal(ScalarValue::Int8(100)),
+            })
+        );
+    }
+
+    #[test]
+    fn having_on_a_grouping_column_binds() {
+        // A grouping column anchors the predicate; it is addressed by its position
+        // in `group_by`, the literal folding to the column's type.
+        let catalog = catalog_with_sales();
+        let agg = bind(
+            "SELECT id, COUNT(*) FROM sales GROUP BY id HAVING id >= 2",
+            &catalog,
+        )
+        .unwrap()
+        .aggregate
+        .expect("aggregate plan");
+        assert_eq!(
+            agg.having,
+            Some(BoundHaving {
+                left: HavingScalar::Group(0),
+                op: CompareOp::Ge,
+                right: HavingScalar::Literal(ScalarValue::Int4(2)),
+            })
+        );
+    }
+
+    #[test]
+    fn having_arithmetic_over_an_aggregate_binds() {
+        let catalog = catalog_with_sales();
+        let agg = bind(
+            "SELECT region FROM sales GROUP BY region HAVING COUNT(*) * 2 > 10",
+            &catalog,
+        )
+        .unwrap()
+        .aggregate
+        .expect("aggregate plan");
+        assert_eq!(
+            agg.having,
+            Some(BoundHaving {
+                left: HavingScalar::Arith {
+                    op: ArithOp::Mul,
+                    left: Box::new(HavingScalar::Aggregate(0)),
+                    right: Box::new(HavingScalar::Literal(ScalarValue::Int8(2))),
+                },
+                op: CompareOp::Gt,
+                right: HavingScalar::Literal(ScalarValue::Int8(10)),
+            })
+        );
+    }
+
+    #[test]
+    fn having_without_a_group_by_is_one_whole_table_group() {
+        // No GROUP BY, but a HAVING (and a projected aggregate) makes this an
+        // aggregate query — one whole-table group the HAVING filters.
+        let catalog = catalog_with_sales();
+        let agg = bind("SELECT COUNT(*) FROM sales HAVING COUNT(*) > 0", &catalog)
+            .unwrap()
+            .aggregate
+            .expect("aggregate plan");
+        assert!(agg.group_by.is_empty());
+        assert_eq!(
+            agg.having,
+            Some(BoundHaving {
+                left: HavingScalar::Aggregate(0),
+                op: CompareOp::Gt,
+                right: HavingScalar::Literal(ScalarValue::Int8(0)),
+            })
+        );
+    }
+
+    #[test]
+    fn an_ungrouped_column_in_having_is_a_grouping_error() {
+        // `amount` is neither grouped nor wrapped in an aggregate — Postgres's
+        // 42803 grouping error, not a silent pass.
+        let catalog = catalog_with_sales();
+        assert_eq!(
+            bind(
+                "SELECT region, COUNT(*) FROM sales GROUP BY region HAVING amount > 5",
+                &catalog,
+            ),
+            Err(SelectError::UngroupedColumn {
+                table: "sales".to_owned(),
+                column: "amount".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_unknown_column_in_having_is_rejected() {
+        let catalog = catalog_with_sales();
+        assert_eq!(
+            bind(
+                "SELECT region FROM sales GROUP BY region HAVING nope > 5",
+                &catalog,
+            ),
+            Err(SelectError::UnknownColumn {
+                table: "sales".to_owned(),
+                column: "nope".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn unsupported_having_shapes_are_rejected_with_a_reason() {
+        let catalog = catalog_with_sales();
+        for sql in [
+            // Two distinct anchors (aggregate-to-aggregate) — the analog of a
+            // column-to-column WHERE, a deferred follow-up.
+            "SELECT region FROM sales GROUP BY region HAVING COUNT(*) > SUM(amount)",
+            // A grouping column compared to an aggregate — also two anchors.
+            "SELECT id, COUNT(*) FROM sales GROUP BY id HAVING id > COUNT(*)",
+            // Not a comparison at all.
+            "SELECT region FROM sales GROUP BY region HAVING COUNT(*)",
+            // A boolean connective is not the single-comparison shape.
+            "SELECT region FROM sales GROUP BY region HAVING COUNT(*) > 1 AND COUNT(*) < 9",
+            // A FLOAT8 AVG is outside the evaluator's comparison set.
+            "SELECT region FROM sales GROUP BY region HAVING AVG(amount) > 5",
+        ] {
+            assert!(
+                matches!(bind(sql, &catalog), Err(SelectError::UnsupportedHaving(_))),
+                "expected UnsupportedHaving for: {sql}"
+            );
+        }
+    }
+
     // ---- joins (STL-172) ----
 
     /// A catalog with two joinable tables: `users (id INT, name TEXT)` and
@@ -6648,6 +7224,21 @@ mod tests {
         )
         .expect("bind GROUP BY over a join");
         assert!(grouped.aggregate.is_some());
+    }
+
+    #[test]
+    fn having_over_a_join_is_rejected_not_dropped() {
+        // HAVING over a join is a tracked follow-up ([STL-265]); it must be
+        // rejected, never silently dropped (which would return unfiltered groups).
+        let catalog = catalog_with_join_tables();
+        assert!(matches!(
+            bind(
+                "SELECT users.name, COUNT(*) FROM users JOIN orders ON users.id = orders.uid \
+                 GROUP BY users.name HAVING COUNT(*) > 1",
+                &catalog,
+            ),
+            Err(SelectError::UnsupportedJoin(_))
+        ));
     }
 
     /// Two valid-time tables sharing a key column, plus a system-only one — the

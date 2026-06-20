@@ -106,10 +106,11 @@ pub use stele_common::DEFAULT_PG_PORT;
 /// admin / control-plane API so its introspection replies match the SQL wire
 /// ([STL-254]).
 pub use text_format::render_cell;
-pub use tls::{ServerTls, TlsError, TlsMode, TlsSettings};
+pub use tls::{ServerTls, TlsError, TlsMode, TlsReloader, TlsSettings};
 // The verified mTLS client identity surfaced into the session principal (STL-291)
-// — crate-internal, never part of the public wire surface.
-use tls::{CertIdentity, peer_identity};
+// — crate-internal, never part of the public wire surface. `SharedServerTls` /
+// `shared_tls` are the hot-swappable acceptor cell behind TLS reload (STL-293).
+use tls::{CertIdentity, SharedServerTls, peer_identity, shared_tls};
 
 use stele_catalog::CatalogError;
 use stele_common::hashkey::hash_key;
@@ -259,6 +260,9 @@ const SQLSTATE_INVALID_BINARY_REPRESENTATION: &str = "22P03";
 // `SELECT DISTINCT … ORDER BY <col>` with `<col>` outside the select list —
 // Postgres's `invalid_column_reference` (STL-263).
 const SQLSTATE_INVALID_COLUMN_REFERENCE: &str = "42P10";
+// A non-aggregated column in the SELECT list or `HAVING` of a grouped query that
+// is not a grouping column — Postgres's `grouping_error` (STL-171, STL-265).
+const SQLSTATE_GROUPING_ERROR: &str = "42803";
 
 // Per-field / per-parameter wire format codes (STL-105 text, STL-183 binary). A
 // `RowDescription` field and a `Bind` parameter / result slot each carry one of
@@ -613,7 +617,10 @@ pub enum AuthMode {
 pub struct Server {
     listen_addr: SocketAddr,
     session: SharedSession,
-    tls: Option<Arc<ServerTls>>,
+    // A hot-swappable cell, not a fixed `Arc<ServerTls>`: the accept loop reads the
+    // live acceptor out of it per connection so a reload (STL-293) is picked up
+    // without rebuilding the server. `None` = TLS not configured.
+    tls: Option<SharedServerTls>,
     auth: AuthMode,
 }
 
@@ -636,7 +643,24 @@ impl Server {
     /// [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
     #[must_use]
     pub fn with_tls(mut self, tls: ServerTls) -> Self {
-        self.tls = Some(Arc::new(tls));
+        self.tls = Some(shared_tls(tls));
+        self
+    }
+
+    /// Serve TLS with a **hot-reloadable** acceptor ([STL-293]): the server reads
+    /// the live [`ServerTls`] out of `reloader`'s shared cell per connection, so a
+    /// [`TlsReloader::reload`] (driven by the daemon's SIGHUP handler) swaps in a
+    /// rotated certificate for new connections without a restart. Established
+    /// connections keep the acceptor they handshook with.
+    ///
+    /// Use this instead of [`with_tls`](Self::with_tls) when the caller holds a
+    /// [`TlsReloader`] it will trigger reloads on; the two are mutually exclusive
+    /// (the last call wins).
+    ///
+    /// [STL-293]: https://allegromusic.atlassian.net/browse/STL-293
+    #[must_use]
+    pub fn with_tls_reloader(mut self, reloader: &TlsReloader) -> Self {
+        self.tls = Some(reloader.cell());
         self
     }
 
@@ -696,7 +720,7 @@ pub struct BoundServer {
     listener: TcpListener,
     local_addr: SocketAddr,
     session: SharedSession,
-    tls: Option<Arc<ServerTls>>,
+    tls: Option<SharedServerTls>,
     auth: AuthMode,
 }
 
@@ -737,7 +761,15 @@ impl BoundServer {
             // Disable Nagle — short Postgres messages don't benefit from coalescing.
             let _ = stream.set_nodelay(true);
             let session = Arc::clone(&self.session);
-            let tls = self.tls.clone();
+            // Read the live acceptor out of the hot-swap cell once, here, at accept
+            // time (STL-293): this connection handshakes with whatever certificate
+            // is current now, and a later reload only affects connections accepted
+            // after it. The read clones an `Arc` and drops the guard immediately —
+            // never held across the handshake `await`.
+            let tls = self
+                .tls
+                .as_ref()
+                .map(|cell| Arc::clone(&cell.read().unwrap_or_else(PoisonError::into_inner)));
             let auth = self.auth;
             let metrics = Arc::clone(&metrics);
             metrics.connections_total.inc();
@@ -1017,14 +1049,26 @@ async fn handle_connection(
     // Negotiate first (the `SSLRequest` may upgrade the stream to TLS); the
     // protocol proper then runs identically over either stream.
     match negotiate_startup(stream, tls.as_deref()).await? {
-        // A plain connection has no client certificate, so no verified identity.
+        // A plain connection has no client certificate (no verified identity) and
+        // no channel binding (so only plain SCRAM is offered).
         Negotiated::Plain(mut stream, startup) => {
-            run_session(&mut stream, startup, None, session, auth, metrics).await
+            run_session(&mut stream, startup, None, None, session, auth, metrics).await
         }
         // Over TLS the peer may have presented an mTLS client certificate; its
-        // verified identity (when any) becomes a candidate write principal.
-        Negotiated::Tls(mut stream, startup, identity) => {
-            run_session(stream.as_mut(), startup, identity, session, auth, metrics).await
+        // verified identity (when any) becomes a candidate write principal, and
+        // the server certificate's `tls-server-end-point` binding (when any)
+        // enables SCRAM-SHA-256-PLUS (STL-297).
+        Negotiated::Tls(mut stream, startup, identity, channel_binding) => {
+            run_session(
+                stream.as_mut(),
+                startup,
+                identity,
+                channel_binding,
+                session,
+                auth,
+                metrics,
+            )
+            .await
         }
     }
 }
@@ -1038,6 +1082,9 @@ enum Negotiated {
         Box<tokio_rustls::server::TlsStream<TcpStream>>,
         StartupMessage,
         Option<CertIdentity>,
+        /// The server certificate's `tls-server-end-point` channel-binding data,
+        /// when it supports one — enables SCRAM-SHA-256-PLUS (STL-297).
+        Option<Vec<u8>>,
     ),
 }
 
@@ -1075,8 +1122,17 @@ async fn negotiate_startup(
                     if let Some(id) = &identity {
                         debug!(cert_cn_san = %id.name, "verified mTLS client identity");
                     }
+                    // The server certificate's `tls-server-end-point` binding is
+                    // fixed for the listener, so it was precomputed at load; clone
+                    // it onto the connection to enable SCRAM-SHA-256-PLUS (STL-297).
+                    let channel_binding = ctx.endpoint_cbind.clone();
                     let startup = read_startup(tls_stream.as_mut()).await?;
-                    return Ok(Negotiated::Tls(tls_stream, startup, identity));
+                    return Ok(Negotiated::Tls(
+                        tls_stream,
+                        startup,
+                        identity,
+                        channel_binding,
+                    ));
                 }
                 // No TLS configured: refuse; the client may fall back to
                 // plaintext and resend a StartupMessage.
@@ -1133,6 +1189,7 @@ async fn run_session<S: Wire>(
     stream: &mut S,
     startup: StartupMessage,
     cert_identity: Option<CertIdentity>,
+    channel_binding: Option<Vec<u8>>,
     session: SharedSession,
     auth: AuthMode,
     metrics: &SharedMetrics,
@@ -1144,7 +1201,7 @@ async fn run_session<S: Wire>(
     // lands on the connection span (STL-107). `trust` skips straight to the
     // OK bundle (the v0.1 posture, and the dev default).
     let user = if auth == AuthMode::Scram {
-        scram::authenticate(stream, &startup, &session).await?
+        scram::authenticate(stream, &startup, &session, channel_binding.as_deref()).await?
     } else {
         startup.user().unwrap_or(DEFAULT_WIRE_USER).to_owned()
     };
@@ -2469,6 +2526,10 @@ fn sqlstate_for_query(err: &EngineError) -> &'static str {
         // list — Postgres's 42P10, so a stock client sees the same class it
         // would from Postgres ([STL-263]).
         EngineError::Select(SelectError::DistinctOrderBy) => SQLSTATE_INVALID_COLUMN_REFERENCE,
+        // A non-aggregated, non-grouping column in a grouped query's SELECT list
+        // ([STL-171]) or `HAVING` ([STL-265]) — Postgres's 42803 grouping_error,
+        // so a stock client branches on the same class it would from Postgres.
+        EngineError::Select(SelectError::UngroupedColumn { .. }) => SQLSTATE_GROUPING_ERROR,
         EngineError::Dml(DmlError::BadLiteral { .. } | DmlError::TypeMismatch { .. })
         // A `\history` key literal that does not fit the key column's type ([STL-199]) —
         // the same invalid-text-representation class as a bad DML literal.

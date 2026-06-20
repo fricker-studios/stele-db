@@ -87,10 +87,10 @@ use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::dml::{BoundDml, DmlError, InsertRow};
 use stele_sql::merge::{BoundMerge, MergeBound, MergeSource, MergeValid, MergeValue};
 use stele_sql::select::{
-    AggregateFunc, ArithOp, BoundAggregate, BoundCte, BoundJoinSide, BoundPeriod,
+    AggregateFunc, ArithOp, BoundAggregate, BoundCte, BoundHaving, BoundJoinSide, BoundPeriod,
     BoundPeriodPredicate, BoundPredicate, BoundScalar, BoundSelect, BoundSubqueryFilter, CompareOp,
-    Correlation, JoinType, OutputItem, PeriodEndpoint, Projection, ProjectionItem, ProjectionValue,
-    SelectError, SortTarget, SubqueryKind,
+    Correlation, HavingScalar, JoinType, OutputItem, PeriodEndpoint, Projection, ProjectionItem,
+    ProjectionValue, SelectError, SortTarget, SubqueryKind,
 };
 use stele_sql::{
     AdminCommand, BindContext, BindError, BoundCopy, CopyError, CopyShape, Statement,
@@ -3589,8 +3589,21 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let row_count = rows.len();
         // The virtual columns start after the columns the rows already carry: the
         // schema columns, plus the provenance pseudo-columns when a read
-        // materialized them (a provenance read widens every row).
-        let base_width = rows.first().map_or(schema_columns.len(), Vec::len);
+        // materialized them (a provenance read widens every row). With no rows to
+        // read the width from, fall back to the width a row *would* have had — the
+        // full addressable set when this read referenced provenance, else just the
+        // schema columns — so the appended virtual columns and `shape_rows`' type
+        // decode stay in range even for an empty `DISTINCT` / `ORDER BY` result.
+        let base_width = rows.first().map_or_else(
+            || {
+                if references_provenance(bound, addressable, schema_columns.len()) {
+                    addressable.len()
+                } else {
+                    schema_columns.len()
+                }
+            },
+            Vec::len,
+        );
         let mut columns: Vec<(String, LogicalType)> =
             addressable.iter().take(base_width).cloned().collect();
         let mut computed: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
@@ -6580,6 +6593,38 @@ fn lower_scalar(scalar: &BoundScalar) -> Expr {
     }
 }
 
+/// Lower a bound `HAVING <scalar> <cmp> <scalar>` predicate ([STL-265]) to the
+/// vectorized [`Expr`] evaluated over the **grouped** batch in [`run_aggregate`].
+///
+/// The grouped batch presents the `group_count` grouping columns first (`out.groups`,
+/// in `group_by` order) then the aggregate columns (`out.aggregates`), so a
+/// [`HavingScalar::Group`] addresses position `j` and a [`HavingScalar::Aggregate`]
+/// addresses position `group_count + k` — the same flat-column convention
+/// [`lower_predicate`] uses over a scanned row, only the columns are aggregate
+/// outputs rather than schema cells.
+fn lower_having(having: &BoundHaving, group_count: usize) -> Expr {
+    Expr::Compare {
+        op: lower_compare_op(having.op),
+        left: Box::new(lower_having_scalar(&having.left, group_count)),
+        right: Box::new(lower_having_scalar(&having.right, group_count)),
+    }
+}
+
+/// Lower a [`HavingScalar`] operand to its [`Expr`] node over the grouped batch
+/// ([STL-265]) — see [`lower_having`] for the column layout.
+fn lower_having_scalar(scalar: &HavingScalar, group_count: usize) -> Expr {
+    match scalar {
+        HavingScalar::Group(position) => Expr::col(*position),
+        HavingScalar::Aggregate(index) => Expr::col(group_count + *index),
+        HavingScalar::Literal(value) => Expr::lit(value.clone()),
+        HavingScalar::Arith { op, left, right } => Expr::Arith {
+            op: lower_arith_op(*op),
+            left: Box::new(lower_having_scalar(left, group_count)),
+            right: Box::new(lower_having_scalar(right, group_count)),
+        },
+    }
+}
+
 /// Map the binder's [`CompareOp`] to the executor's `CmpOp`. The two enums are
 /// parallel; stele-sql and stele-exec do not depend on each other, so the engine is
 /// the lowering point (the same split [`lower_join_type`] / [`lower_arith_op`] draw).
@@ -7457,8 +7502,9 @@ fn scalar_references_pseudo(scalar: &BoundScalar, n_schema: usize) -> bool {
 /// (`[business key, value cells…]`) the scan produced after `WHERE`; `row_count`
 /// of `0` still yields one row for an ungrouped aggregate (`COUNT(*)` is `0`).
 ///
-/// The grouped output then runs the result-shaping tail of the pipeline
-/// ([STL-263]): `DISTINCT` → `ORDER BY` → `OFFSET` → `LIMIT` over the output
+/// The grouped output then runs the rest of the pipeline in Postgres order: the
+/// `HAVING` post-grouping filter ([STL-265]), then the result-shaping tail
+/// ([STL-263]) `DISTINCT` → `ORDER BY` → `OFFSET` → `LIMIT` over the output
 /// columns (an aggregate `ORDER BY` key is always a select-list output
 /// position — the binder enforces it).
 fn run_aggregate(
@@ -7504,9 +7550,55 @@ fn run_aggregate(
         })
         .collect();
 
-    // The result-shaping tail ([STL-263]): DISTINCT → ORDER BY → OFFSET →
-    // LIMIT over the grouped output rows, as a selection of group indices.
+    // The selection of group indices the tail shapes — every group, to start.
     let mut selection: Vec<usize> = (0..out.num_groups).collect();
+
+    // HAVING ([STL-265]): filter groups *before* the result-shaping tail, the
+    // Postgres pipeline position (aggregate → HAVING → DISTINCT → ORDER BY →
+    // LIMIT). The predicate evaluates over the grouped batch directly — the
+    // grouping columns then the aggregate columns, the flat layout `lower_having`
+    // addresses (already typed [`Vector`]s, no decode) — and a group is kept iff
+    // it is TRUE, dropping FALSE *and* NULL, the same rule the row Filter applies.
+    // An aggregate the HAVING references but the SELECT list omits was appended to
+    // `agg.aggregates`, so it is present here though absent from `output`.
+    if let Some(having) = &agg.having {
+        let group_count = out.groups.len();
+        let predicate = lower_having(having, group_count);
+        // Materialize only the columns the predicate references (a supported
+        // HAVING touches one or two), leaving the rest empty placeholders the
+        // evaluator never reads — the `run_aggregate` / `rows_passing_filter`
+        // discipline, so a wide / high-cardinality group-by does not clone every
+        // grouped vector.
+        let mut grouped: Vec<Vector> = (0..group_count + out.aggregates.len())
+            .map(|_| Vector::Bool(Vec::new()))
+            .collect();
+        let mut referenced = BTreeSet::new();
+        collect_expr_columns(&predicate, &mut referenced);
+        for position in referenced {
+            if position < group_count {
+                grouped[position] = out.groups[position].clone();
+            } else if let Some(vector) = out.aggregates.get(position - group_count) {
+                grouped[position] = vector.clone();
+            }
+        }
+        let mask = match eval_expr(&predicate, &grouped, out.num_groups)
+            .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?
+        {
+            Vector::Bool(mask) => mask,
+            // The binder types every HAVING as boolean, so a non-boolean result is
+            // a plan break, not a data error — surface it rather than silently keep.
+            other => {
+                return Err(EngineError::Scan(ScanError::Eval(ExprError::NotBoolean {
+                    op: "HAVING",
+                    found: other.logical_type(),
+                })));
+            }
+        };
+        selection.retain(|&g| mask[g] == Some(true));
+    }
+
+    // The result-shaping tail ([STL-263]): DISTINCT → ORDER BY → OFFSET →
+    // LIMIT over the surviving grouped output rows.
     if bound.distinct {
         selection = distinct_selection(&output, &selection);
     }
@@ -12301,6 +12393,74 @@ mod tests {
                 vec![cell(Some(ScalarValue::Int8(1)))],
                 vec![cell(Some(ScalarValue::Int8(2)))],
             ]
+        );
+    }
+
+    #[test]
+    fn having_filters_groups_after_aggregation() {
+        // STL-265: groups a=10 ×2, a=20 ×2, a=NULL ×1 (ids 1..=5, sums per group:
+        // a=10 → 2+5=7, a=20 → 1+3=4, a=NULL → 4).
+        let mut engine = seeded_wide();
+        let i8 = |v: i64| cell(Some(ScalarValue::Int8(v)));
+
+        // HAVING on the projected COUNT(*): the singleton NULL group (count 1) is
+        // dropped, the two count-2 groups kept (emitted in key order, NULL first
+        // had it survived).
+        let r = select(
+            &mut engine,
+            "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 1",
+        );
+        assert_eq!(r.rows, vec![vec![i4(10), i8(2)], vec![i4(20), i8(2)]]);
+
+        // HAVING on an aggregate the SELECT list never projects: only SUM(id) > 5
+        // (group a=10, sum 7) survives; the output column is still just `a`.
+        let r = select(&mut engine, "SELECT a FROM t GROUP BY a HAVING SUM(id) > 5");
+        assert_eq!(r.columns, vec![("a".to_owned(), LogicalType::Int4)]);
+        assert_eq!(r.rows, vec![vec![i4(10)]]);
+
+        // HAVING on a grouping column: a >= 20 keeps the a=20 group; the NULL group
+        // is dropped (NULL >= 20 is unknown, never TRUE — the keep-TRUE-only rule).
+        let r = select(
+            &mut engine,
+            "SELECT a, COUNT(*) FROM t GROUP BY a HAVING a >= 20",
+        );
+        assert_eq!(r.rows, vec![vec![i4(20), i8(2)]]);
+
+        // HAVING composes with the result-shaping tail in Postgres order
+        // (aggregate → HAVING → ORDER BY → LIMIT): filter to the count-2 groups,
+        // then order by the grouping key descending, then take one.
+        let r = select(
+            &mut engine,
+            "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 1 ORDER BY a DESC LIMIT 1",
+        );
+        assert_eq!(r.rows, vec![vec![i4(20), i8(2)]]);
+
+        // A HAVING that matches no group returns no rows (not every group).
+        assert!(
+            select(
+                &mut engine,
+                "SELECT a FROM t GROUP BY a HAVING COUNT(*) > 100",
+            )
+            .rows
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn having_over_the_whole_table_group() {
+        // No GROUP BY: HAVING filters the single whole-table group. COUNT(*) = 5.
+        let mut engine = seeded_wide();
+        let i8 = |v: i64| cell(Some(ScalarValue::Int8(v)));
+
+        // The group passes — one row.
+        let r = select(&mut engine, "SELECT COUNT(*) FROM t HAVING COUNT(*) > 2");
+        assert_eq!(r.rows, vec![vec![i8(5)]]);
+
+        // The group fails — no rows at all (the whole-table group is filtered out).
+        assert!(
+            select(&mut engine, "SELECT COUNT(*) FROM t HAVING COUNT(*) > 100")
+                .rows
+                .is_empty()
         );
     }
 
@@ -18056,5 +18216,40 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn computed_projection_rejects_a_provenance_pseudo_column() {
+        // A provenance pseudo-column ([STL-247]) inside a *computed* expression is
+        // rejected at bind time: the engine's `eval_projection_scalar` decodes schema
+        // columns only, so allowing it would fail at runtime. It stays projectable
+        // only as a bare column (Copilot review on PR #207).
+        let mut engine = subquery_session();
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (1, 10)"))
+            .expect("insert");
+        let err = engine
+            .execute(&parse_one("SELECT id, _stele_txn_id + 1 FROM t"))
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::Select(SelectError::UnknownColumn { .. })),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn computed_projection_over_an_empty_provenance_read_does_not_panic() {
+        // Regression (Copilot review on PR #207): a computed projection that also
+        // names a provenance pseudo-column over an *empty* table, with DISTINCT, must
+        // not index the column metadata out of range — the empty-rows width falls
+        // back to the full addressable set when provenance is referenced.
+        let mut engine = subquery_session();
+        // `t` stays empty.
+        let result = select(
+            &mut engine,
+            "SELECT DISTINCT _stele_principal, a + 1 AS plus FROM t",
+        );
+        assert_eq!(column_names(&result), vec!["_stele_principal", "plus"]);
+        assert!(result.rows.is_empty(), "an empty table projects no rows");
     }
 }

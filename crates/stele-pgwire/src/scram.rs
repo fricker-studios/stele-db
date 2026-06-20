@@ -15,11 +15,15 @@
 //! The math lives in [`stele_common::scram`] (vendored, RFC-vectored); this
 //! module owns the wire framing, the message grammar, and the policy:
 //!
-//! * Only `SCRAM-SHA-256` is advertised. `SCRAM-SHA-256-PLUS` (channel
-//!   binding) is a filed follow-up, so a client demanding it (`p=…`) is
-//!   refused, while the `y` gs2 flag — "I support channel binding but you
-//!   didn't advertise it" — is accepted, exactly the RFC's downgrade rule for
-//!   a server without PLUS.
+//! * `SCRAM-SHA-256` is always advertised. On a TLS connection whose certificate
+//!   yields a `tls-server-end-point` binding, `SCRAM-SHA-256-PLUS` is advertised
+//!   first ([STL-297], [RFC 5929]): the client proves the SASL exchange against
+//!   the hash of the server certificate it actually saw, so a MITM that
+//!   terminates TLS with a different certificate cannot relay the proof. Off TLS
+//!   (no binding) only plain SCRAM is offered, and the `y` gs2 flag — "I support
+//!   channel binding but you didn't advertise it" — is accepted, the RFC's
+//!   downgrade rule for a server without PLUS. **When PLUS *was* advertised, the
+//!   `y` flag is refused** instead: it means a MITM stripped the PLUS offer.
 //! * The identity authenticated is the **startup `user` parameter**; the
 //!   `n=` name inside the SCRAM message is ignored, as Postgres does.
 //! * An unknown user runs a **doomed mock exchange** (fresh random verifier)
@@ -29,8 +33,10 @@
 //!   replays nothing, because the proof signs the new server nonce.
 //!
 //! [RFC 5802]: https://www.rfc-editor.org/rfc/rfc5802
+//! [RFC 5929]: https://www.rfc-editor.org/rfc/rfc5929
 //! [RFC 7677]: https://www.rfc-editor.org/rfc/rfc7677
 //! [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+//! [STL-297]: https://allegromusic.atlassian.net/browse/STL-297
 
 use std::io;
 use std::sync::PoisonError;
@@ -46,8 +52,16 @@ use crate::{
     WireError, read_typed_message, write_error_response,
 };
 
-/// The one mechanism advertised and accepted.
+/// The mechanism always advertised and accepted.
 pub(crate) const MECHANISM: &str = "SCRAM-SHA-256";
+
+/// The channel-binding mechanism, advertised and accepted only on a TLS
+/// connection that yields a `tls-server-end-point` binding (STL-297).
+pub(crate) const MECHANISM_PLUS: &str = "SCRAM-SHA-256-PLUS";
+
+/// The one channel-binding type understood — the certificate-endpoint binding
+/// of RFC 5929, the type every Postgres client uses.
+const CBIND_TYPE: &str = "tls-server-end-point";
 
 // AuthenticationSASL* type codes ('R' message, first Int32 of the payload).
 const AUTH_SASL: i32 = 10;
@@ -67,10 +81,16 @@ const SERVER_NONCE_RAW_LEN: usize = 18;
 /// [`WireError::AuthFailed`]. The one exception is the client closing the
 /// connection mid-exchange (EOF): there is no peer to tell, so that unwinds as
 /// [`WireError::Protocol`] with no reply.
+/// `channel_binding` carries the connection's `tls-server-end-point` data
+/// (RFC 5929) when the session runs over a TLS stream whose certificate
+/// supports it: `Some` ⇒ advertise and accept `SCRAM-SHA-256-PLUS` and fold the
+/// binding into the `c=` check; `None` (plaintext, or a certificate we cannot
+/// bind) ⇒ plain `SCRAM-SHA-256` only.
 pub(crate) async fn authenticate<S: Wire>(
     stream: &mut S,
     startup: &StartupMessage,
     session: &SharedSession,
+    channel_binding: Option<&[u8]>,
 ) -> Result<String, WireError> {
     let Some(user) = startup
         .params
@@ -86,13 +106,9 @@ pub(crate) async fn authenticate<S: Wire>(
         .await;
     };
 
-    // --- S: AuthenticationSASL — the mechanism list (NUL-terminated names,
-    // empty name terminates the list).
-    let mut mechanisms = BytesMut::new();
-    mechanisms.put_slice(MECHANISM.as_bytes());
-    mechanisms.put_u8(0);
-    mechanisms.put_u8(0);
-    write_auth_request(stream, AUTH_SASL, &mechanisms).await?;
+    // --- S: AuthenticationSASL — the mechanism list (PLUS first when channel
+    // binding is available, so a capable client prefers it).
+    write_auth_request(stream, AUTH_SASL, &sasl_mechanism_list(channel_binding)).await?;
     stream.flush().await?;
 
     // --- C: SASLInitialResponse — chosen mechanism + client-first-message.
@@ -103,7 +119,9 @@ pub(crate) async fn authenticate<S: Wire>(
         Ok(parsed) => parsed,
         Err(message) => return fail(stream, SQLSTATE_PROTOCOL_VIOLATION, message).await,
     };
-    if mechanism != MECHANISM {
+    // PLUS is a valid choice only when we advertised it (channel binding present).
+    let chose_plus = mechanism == MECHANISM_PLUS;
+    if !(mechanism == MECHANISM || (chose_plus && channel_binding.is_some())) {
         return fail(
             stream,
             SQLSTATE_PROTOCOL_VIOLATION,
@@ -115,6 +133,15 @@ pub(crate) async fn authenticate<S: Wire>(
         Ok(parsed) => parsed,
         Err(reject) => return fail(stream, reject.sqlstate, reject.message).await,
     };
+
+    // Reconcile the gs2 channel-binding flag with the selected mechanism and what
+    // the server advertised. `cbind_data` is `Some` exactly when channel binding
+    // is in force, and carries the bytes that follow the gs2 header in `c=`.
+    let cbind_data =
+        match reconcile_channel_binding(&client_first.cbind_flag, chose_plus, channel_binding) {
+            Ok(data) => data,
+            Err(reject) => return fail(stream, reject.sqlstate, reject.message).await,
+        };
 
     // --- Verifier lookup. An unknown user gets a fresh random verifier and a
     // full, doomed exchange (anti-enumeration — see [`lookup_verifier`]).
@@ -141,7 +168,15 @@ pub(crate) async fn authenticate<S: Wire>(
         Ok(parsed) => parsed,
         Err(reject) => return fail(stream, reject.sqlstate, reject.message).await,
     };
-    if client_final.channel_binding != scram::b64_encode(client_first.gs2_header.as_bytes()) {
+    // `c=` is base64(gs2-header [|| cbind-data]). For plain SCRAM that is just
+    // the gs2 header the client first sent; under channel binding the server's
+    // `tls-server-end-point` data follows it, so a proof captured against a
+    // different TLS endpoint — a MITM's — fails to match here.
+    let mut expected_cbind = client_first.gs2_header.clone().into_bytes();
+    if let Some(data) = cbind_data {
+        expected_cbind.extend_from_slice(data);
+    }
+    if client_final.channel_binding != scram::b64_encode(&expected_cbind) {
         return fail(
             stream,
             SQLSTATE_PROTOCOL_VIOLATION,
@@ -191,6 +226,21 @@ pub(crate) async fn authenticate<S: Wire>(
     stream.flush().await?;
     debug!(user = %user, "SCRAM authentication succeeded");
     Ok(user)
+}
+
+/// The `AuthenticationSASL` mechanism list: `SCRAM-SHA-256-PLUS` first
+/// (preferred) when channel binding is available, then plain `SCRAM-SHA-256`,
+/// terminated by the empty name that ends the list.
+fn sasl_mechanism_list(channel_binding: Option<&[u8]>) -> BytesMut {
+    let mut mechanisms = BytesMut::new();
+    if channel_binding.is_some() {
+        mechanisms.put_slice(MECHANISM_PLUS.as_bytes());
+        mechanisms.put_u8(0);
+    }
+    mechanisms.put_slice(MECHANISM.as_bytes());
+    mechanisms.put_u8(0);
+    mechanisms.put_u8(0);
+    mechanisms
 }
 
 /// Look up the stored verifier for `user`, falling back to a fresh random
@@ -322,18 +372,80 @@ fn parse_sasl_initial(payload: &[u8]) -> Result<(String, String), &'static str> 
 }
 
 /// A policy/grammar refusal that owes the client a `FATAL` before closing.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct Reject {
     sqlstate: &'static str,
     message: &'static str,
 }
 
+/// The gs2 channel-binding flag of a `client-first-message` (RFC 5802 §7). The
+/// policy that reconciles it with the selected mechanism lives in
+/// [`authenticate`]; parsing only records what the client asked for.
+#[derive(Debug, PartialEq, Eq)]
+enum CbindFlag {
+    /// `n` — the client does not support channel binding.
+    NotSupported,
+    /// `y` — the client supports channel binding but believes the server did
+    /// not advertise a `-PLUS` mechanism.
+    SupportedButUnused,
+    /// `p=<type>` — the client requires channel binding of the named type.
+    Required(String),
+}
+
+/// Reconcile the gs2 channel-binding flag with the selected mechanism and what
+/// the server advertised (RFC 5802 §6, RFC 7677, STL-297). Returns the
+/// cbind-data to fold into the client's `c=` check — `Some` exactly when channel
+/// binding is in force — or a [`Reject`] the caller turns into a `FATAL`.
+///
+/// `chose_plus` is whether the client selected `SCRAM-SHA-256-PLUS`;
+/// `channel_binding` is `Some` exactly when the server advertised PLUS (it has a
+/// `tls-server-end-point` binding for this connection). The mechanism check in
+/// [`authenticate`] guarantees `chose_plus ⇒ channel_binding.is_some()`.
+fn reconcile_channel_binding<'a>(
+    flag: &CbindFlag,
+    chose_plus: bool,
+    channel_binding: Option<&'a [u8]>,
+) -> Result<Option<&'a [u8]>, Reject> {
+    // A flag that contradicts the selected mechanism is malformed either way:
+    // `p` demands PLUS, while `n`/`y` are only valid without it.
+    let flag_matches_mechanism = matches!(flag, CbindFlag::Required(_)) == chose_plus;
+    if !flag_matches_mechanism {
+        return Err(Reject {
+            sqlstate: SQLSTATE_PROTOCOL_VIOLATION,
+            message: "malformed SCRAM message: channel-binding flag does not match the \
+                      selected SASL mechanism",
+        });
+    }
+    match flag {
+        // `p=<type>`: the client requires channel binding of a type we implement.
+        CbindFlag::Required(cb_type) if cb_type == CBIND_TYPE => Ok(channel_binding),
+        CbindFlag::Required(_) => Err(Reject {
+            sqlstate: SQLSTATE_PROTOCOL_VIOLATION,
+            message: "unsupported SCRAM channel binding type",
+        }),
+        // `y`: the client supports channel binding but believes the server does
+        // not advertise it. If we *did* advertise PLUS, a MITM stripped the offer
+        // — RFC 5802 §6 downgrade detection (STL-297 flips the STL-252 accept on
+        // TLS).
+        CbindFlag::SupportedButUnused if channel_binding.is_some() => Err(Reject {
+            sqlstate: SQLSTATE_PROTOCOL_VIOLATION,
+            message: "channel binding required: this server advertised SCRAM-SHA-256-PLUS but \
+                      the client requested none (possible man-in-the-middle downgrade)",
+        }),
+        // `n`, or `y` off TLS (no binding advertised): no channel binding in force.
+        CbindFlag::NotSupported | CbindFlag::SupportedButUnused => Ok(None),
+    }
+}
+
 /// The parsed `client-first-message` (RFC 5802 §7).
 #[derive(Debug)]
 struct ClientFirst {
-    /// The gs2 header verbatim (e.g. `n,,`) — the bytes `c=` must re-present
-    /// base64-encoded in the client-final message.
+    /// The gs2 header verbatim (e.g. `n,,` or `p=tls-server-end-point,,`) — the
+    /// bytes `c=` must re-present base64-encoded (with the cbind-data appended
+    /// under channel binding) in the client-final message.
     gs2_header: String,
+    /// The channel-binding flag the header carried.
+    cbind_flag: CbindFlag,
     /// `client-first-message-bare` verbatim — the first third of AuthMessage.
     bare: String,
     /// The client nonce (`r=`).
@@ -346,20 +458,27 @@ fn parse_client_first(raw: &str) -> Result<ClientFirst, Reject> {
         message: "malformed SCRAM client-first message",
     };
 
-    // gs2-cbind-flag: 'n' (no channel binding), 'y' (client supports it, we
-    // did not advertise PLUS — fine), or 'p=…' (client demands it — refused
-    // until SCRAM-SHA-256-PLUS lands).
-    let rest = match raw.as_bytes().first() {
-        Some(b'n' | b'y') => raw.get(1..).ok_or(MALFORMED)?,
+    // gs2-cbind-flag, then the comma that ends it: 'n'/'y' are one byte;
+    // 'p=<type>' runs the type to the next comma. `after_flag` resumes at that
+    // comma so the authzid handling below is identical for every flag.
+    let (cbind_flag, after_flag) = match raw.as_bytes().first() {
+        Some(b'n') => (CbindFlag::NotSupported, raw.get(1..).ok_or(MALFORMED)?),
+        Some(b'y') => (
+            CbindFlag::SupportedButUnused,
+            raw.get(1..).ok_or(MALFORMED)?,
+        ),
         Some(b'p') => {
-            return Err(Reject {
-                sqlstate: SQLSTATE_PROTOCOL_VIOLATION,
-                message: "channel binding (SCRAM-SHA-256-PLUS) is not supported by this server",
-            });
+            let after_eq = raw.strip_prefix("p=").ok_or(MALFORMED)?;
+            let comma = after_eq.find(',').ok_or(MALFORMED)?;
+            let cb_type = &after_eq[..comma];
+            if cb_type.is_empty() {
+                return Err(MALFORMED);
+            }
+            (CbindFlag::Required(cb_type.to_owned()), &after_eq[comma..])
         }
         _ => return Err(MALFORMED),
     };
-    let rest = rest.strip_prefix(',').ok_or(MALFORMED)?;
+    let rest = after_flag.strip_prefix(',').ok_or(MALFORMED)?;
     let (authzid, bare) = rest.split_once(',').ok_or(MALFORMED)?;
     if !authzid.is_empty() {
         // `a=…`: Postgres refuses an authorization identity too.
@@ -397,6 +516,7 @@ fn parse_client_first(raw: &str) -> Result<ClientFirst, Reject> {
     }
     Ok(ClientFirst {
         gs2_header: gs2_header.to_owned(),
+        cbind_flag,
         bare: bare.to_owned(),
         nonce: nonce.to_owned(),
     })
@@ -451,17 +571,99 @@ mod tests {
     use super::*;
 
     #[test]
-    fn client_first_accepts_n_and_y_flags_and_rejects_p() {
+    fn client_first_parses_each_gs2_cbind_flag() {
         let parsed = parse_client_first("n,,n=alice,r=abcdef").expect("n flag");
         assert_eq!(parsed.gs2_header, "n,,");
+        assert_eq!(parsed.cbind_flag, CbindFlag::NotSupported);
         assert_eq!(parsed.bare, "n=alice,r=abcdef");
         assert_eq!(parsed.nonce, "abcdef");
 
         let parsed = parse_client_first("y,,n=,r=xyz").expect("y flag");
         assert_eq!(parsed.gs2_header, "y,,");
+        assert_eq!(parsed.cbind_flag, CbindFlag::SupportedButUnused);
 
-        let err = parse_client_first("p=tls-server-end-point,,n=a,r=x").expect_err("p flag");
+        // `p=…` now parses into the requested type, verbatim header and all; the
+        // reconciliation with the mechanism happens in `authenticate`.
+        let parsed = parse_client_first("p=tls-server-end-point,,n=a,r=x").expect("p flag");
+        assert_eq!(parsed.gs2_header, "p=tls-server-end-point,,");
+        assert_eq!(
+            parsed.cbind_flag,
+            CbindFlag::Required("tls-server-end-point".to_owned())
+        );
+        assert_eq!(parsed.bare, "n=a,r=x");
+    }
+
+    #[test]
+    fn client_first_rejects_a_p_flag_with_no_type() {
+        // `p=` with an empty type name is malformed (the comma immediately
+        // follows the `=`).
+        let err = parse_client_first("p=,,n=a,r=x").expect_err("empty cbind type");
         assert_eq!(err.sqlstate, SQLSTATE_PROTOCOL_VIOLATION);
+    }
+
+    #[test]
+    fn mechanism_list_offers_plus_first_only_with_channel_binding() {
+        // Off TLS (no binding): plain SCRAM only.
+        assert_eq!(&sasl_mechanism_list(None)[..], b"SCRAM-SHA-256\0\0");
+        // On TLS (binding present): PLUS first, then plain, so a capable client
+        // prefers PLUS.
+        assert_eq!(
+            &sasl_mechanism_list(Some(&[0u8; 32]))[..],
+            b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0",
+        );
+    }
+
+    #[test]
+    fn channel_binding_in_force_only_for_a_plus_p_exchange() {
+        let cbind = [7u8; 32];
+        let required = CbindFlag::Required(CBIND_TYPE.to_owned());
+
+        // PLUS + p=tls-server-end-point: binding is in force and threaded through.
+        assert_eq!(
+            reconcile_channel_binding(&required, true, Some(&cbind)),
+            Ok(Some(&cbind[..])),
+        );
+        // Plain + n: no binding, fine on either transport.
+        assert_eq!(
+            reconcile_channel_binding(&CbindFlag::NotSupported, false, Some(&cbind)),
+            Ok(None),
+        );
+        assert_eq!(
+            reconcile_channel_binding(&CbindFlag::NotSupported, false, None),
+            Ok(None),
+        );
+        // Plain + y off TLS: the without-PLUS rule still accepts it.
+        assert_eq!(
+            reconcile_channel_binding(&CbindFlag::SupportedButUnused, false, None),
+            Ok(None),
+        );
+    }
+
+    #[test]
+    fn channel_binding_rejects_downgrades_and_mechanism_mismatches() {
+        let cbind = [7u8; 32];
+        let required = CbindFlag::Required(CBIND_TYPE.to_owned());
+
+        // The downgrade: `y` over a channel where PLUS *was* advertised.
+        assert!(
+            reconcile_channel_binding(&CbindFlag::SupportedButUnused, false, Some(&cbind)).is_err(),
+            "y with PLUS advertised is a stripped-offer downgrade",
+        );
+        // Flag/mechanism mismatches are malformed in both directions.
+        assert!(
+            reconcile_channel_binding(&CbindFlag::NotSupported, true, Some(&cbind)).is_err(),
+            "n cannot pair with the PLUS mechanism",
+        );
+        assert!(
+            reconcile_channel_binding(&required, false, None).is_err(),
+            "p cannot pair with the plain mechanism",
+        );
+        // An unknown channel-binding type under PLUS is refused.
+        let unknown = CbindFlag::Required("tls-unique".to_owned());
+        assert!(
+            reconcile_channel_binding(&unknown, true, Some(&cbind)).is_err(),
+            "only tls-server-end-point is implemented",
+        );
     }
 
     #[test]
