@@ -266,6 +266,31 @@ impl<F: DiskFile> SegmentReader<F> {
             .is_none_or(|summary| summary.covers(point))
     }
 
+    /// Whether this segment *might* hold a row whose valid interval overlaps the
+    /// half-open probe `[lo, hi)` — the per-segment valid-time *interval* skip
+    /// test ([STL-315]), the range sibling of [`Self::might_contain_valid`]'s
+    /// point stab.
+    ///
+    /// Consults the same footer-resident `ValidIntervalSummary` (format v12) and
+    /// touches **no** column chunk. A `false` result *proves* no row in this
+    /// segment overlaps `[lo, hi)`, so a scan whose per-row PERIOD predicate can
+    /// match only an overlapping row — `PERIOD(valid_from, valid_to)` related to a
+    /// constant `PERIOD(lo, hi)` by `OVERLAPS` / `CONTAINS` / `EQUALS` ([STL-193])
+    /// — may prune the whole segment. This is the backdated-write scatter case
+    /// [`Self::might_contain`]'s `valid_from` / `valid_to` zone-map min/max cannot
+    /// rule out, exactly as for the point stab. A segment with no summary
+    /// (system-only, format ≤ v11, or a summary-disabled writer) admits every
+    /// probe, so this never prunes a real match. Snapshot-free by design: a sealed
+    /// segment's valid windows are fixed, so a coverage gap holds at every system
+    /// snapshot.
+    #[must_use]
+    pub fn might_overlap_valid(&self, lo: i64, hi: i64) -> bool {
+        self.footer
+            .valid_intervals
+            .as_ref()
+            .is_none_or(|summary| summary.overlaps(lo, hi))
+    }
+
     /// Read one column end-to-end across every row-group, in row order. The
     /// late-materialization path: only the requested column's chunks are
     /// touched, and each chunk's CRC32C is verified before any of its bytes

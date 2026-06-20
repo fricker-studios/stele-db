@@ -375,6 +375,29 @@ impl ValidIntervalSummary {
         idx > 0 && point < self.intervals[idx - 1].1
     }
 
+    /// Whether some retained interval overlaps the half-open probe `[lo, hi)` —
+    /// the `overlapping [V1, V2)` stab ([STL-315]), the range sibling of the
+    /// [`covers`](Self::covers) point stab. A `false` **proves** no row in the
+    /// segment overlaps `[lo, hi)` (the superset contract), so a scan whose
+    /// per-row PERIOD predicate can only match a row that overlaps `[lo, hi)`
+    /// (`OVERLAPS` / `CONTAINS` / `EQUALS`, [STL-193]) may skip the whole segment.
+    ///
+    /// `[lo, hi)` is a well-formed half-open probe (`lo < hi`); an empty or
+    /// inverted probe overlaps nothing and returns `false`. Two half-open
+    /// intervals `[a, b)` and `[c, d)` overlap iff `a < d && c < b`.
+    pub(crate) fn overlaps(&self, lo: i64, hi: i64) -> bool {
+        if lo >= hi {
+            return false;
+        }
+        // The intervals are disjoint and sorted by `from`, and (being disjoint and
+        // non-touching) their `to` bounds are strictly increasing too. The only
+        // intervals that can reach `[lo, hi)` are those whose `from < hi` — a
+        // prefix; among that prefix the largest `to` is the last one's, so the
+        // union overlaps `[lo, hi)` iff that interval's `to` is past `lo`.
+        let idx = self.intervals.partition_point(|&(from, _)| from < hi);
+        idx > 0 && lo < self.intervals[idx - 1].1
+    }
+
     /// Whether the summary is empty — no covered point. A built summary is empty
     /// only when every pair was empty/inverted; the writer never persists one.
     pub(crate) const fn is_empty(&self) -> bool {
@@ -866,6 +889,88 @@ mod tests {
         for p in -5..=40 {
             if full.covers(p) {
                 assert!(capped.covers(p), "capping dropped covered point {p}");
+            }
+        }
+    }
+
+    #[test]
+    fn summary_overlaps_is_half_open_and_respects_gaps() {
+        // [STL-315]: the `overlapping [lo, hi)` stab. Two disjoint windows with a
+        // gap [10, 100) between them: a probe entirely in the gap overlaps
+        // neither, a probe touching a window's exclusive end does not overlap it,
+        // and a probe straddling a boundary does.
+        let s = summary(&[(0, 10), (100, 200)], 256);
+        // A probe wholly inside the gap overlaps nothing — the prune case.
+        assert!(
+            !s.overlaps(20, 80),
+            "a probe in the coverage gap overlaps nothing"
+        );
+        assert!(
+            !s.overlaps(10, 100),
+            "a probe that exactly fills the gap (touch at both ends) overlaps nothing"
+        );
+        // Half-open touches: [0, 10) and a probe starting at 10 share no point.
+        assert!(
+            !s.overlaps(10, 50),
+            "a probe meeting the first window's exclusive end does not overlap it"
+        );
+        assert!(s.overlaps(9, 50), "one shared point (9) is an overlap");
+        // Straddling / contained probes overlap.
+        assert!(
+            s.overlaps(5, 7),
+            "a probe inside the first window overlaps it"
+        );
+        assert!(
+            s.overlaps(-5, 1),
+            "a probe straddling the first window's inclusive start overlaps"
+        );
+        assert!(
+            s.overlaps(150, 160),
+            "a probe inside the second window overlaps it"
+        );
+        assert!(
+            s.overlaps(50, 101),
+            "a probe straddling the gap into the second window overlaps"
+        );
+        // An empty / inverted probe covers no point, so it overlaps nothing.
+        assert!(!s.overlaps(50, 50), "an empty probe overlaps nothing");
+        assert!(!s.overlaps(60, 50), "an inverted probe overlaps nothing");
+    }
+
+    #[test]
+    fn summary_overlaps_handles_open_ended_and_unbounded_probes() {
+        // An open-ended window [100, +∞) overlaps any probe reaching past 100.
+        let s = summary(&[(0, 10), (100, i64::MAX)], 256);
+        assert!(
+            !s.overlaps(20, 100),
+            "a probe ending at the open window's start overlaps nothing"
+        );
+        assert!(
+            s.overlaps(20, 101),
+            "a probe reaching one point into the open window overlaps"
+        );
+        assert!(
+            s.overlaps(i64::MAX - 1, i64::MAX),
+            "the far edge of the open window overlaps"
+        );
+    }
+
+    #[test]
+    fn summary_overlaps_agrees_with_a_brute_force_reference() {
+        // Pin `overlaps` against a naïve per-interval scan across a grid of probes,
+        // so the binary-search shortcut can never silently diverge from the
+        // definition `[a, b)` overlaps `[c, d)` ⟺ `a < d && c < b`.
+        let windows = [(0, 5), (10, 12), (20, 30), (30, 40), (100, i64::MAX)];
+        let s = summary(&windows, 256);
+        let merged = summary(&windows, 256).intervals; // the coalesced union
+        let brute = |lo: i64, hi: i64| lo < hi && merged.iter().any(|&(f, t)| f < hi && lo < t);
+        for lo in -3..=45 {
+            for hi in (lo - 2)..=48 {
+                assert_eq!(
+                    s.overlaps(lo, hi),
+                    brute(lo, hi),
+                    "overlaps({lo}, {hi}) disagrees with the reference"
+                );
             }
         }
     }
