@@ -424,6 +424,86 @@ impl ValidIntervalSummary {
         4 + self.intervals.len() * 16
     }
 
+    /// Append a per-row-group sequence of summaries to `out` ([STL-316]): a `u32`
+    /// row-group count, then per row-group either a present summary (reusing
+    /// [`Self::encode`] — a `u32` interval count `≥ 1` then the pairs) or the
+    /// *admit-all* marker, a bare `u32` `0`.
+    ///
+    /// `0` is an unambiguous absent marker because a present summary always holds
+    /// at least one interval: [`build`](Self::build) drops empty/inverted pairs and
+    /// the writer only ever encodes a non-[`is_empty`](Self::is_empty) summary, so
+    /// [`encode`](Self::encode) never emits a count of `0`. The
+    /// per-row-group section is the finer-grained sibling of the per-segment
+    /// summary: it lets a scan skip an individual row-group whose coverage has a
+    /// gap at the pinned valid instant even when the segment as a whole cannot be
+    /// pruned ([STL-173] did the same for the system-axis zone maps).
+    pub(crate) fn encode_per_row_group(summaries: &[Option<Self>], out: &mut Vec<u8>) {
+        out.extend_from_slice(
+            &u32::try_from(summaries.len())
+                .expect("row-group count is capped well below u32::MAX")
+                .to_le_bytes(),
+        );
+        for entry in summaries {
+            match entry {
+                Some(summary) => summary.encode(out),
+                None => out.extend_from_slice(&0u32.to_le_bytes()),
+            }
+        }
+    }
+
+    /// Decode a per-row-group sequence written by [`Self::encode_per_row_group`],
+    /// returning one entry per row-group (`None` for an admit-all slot) and the
+    /// number of bytes consumed.
+    ///
+    /// `expected` is the footer's row-group count; the embedded count must equal
+    /// it, so a section that disagrees with the row-group framing is rejected
+    /// rather than silently mis-paired. Each present entry is decoded through
+    /// [`Self::decode`], inheriting its fail-closed checks (strictly
+    /// ascending/disjoint, non-empty, `from < to`) so a corrupt entry cannot make
+    /// [`covers`](Self::covers) miss a covered point and wrongly prune a
+    /// row-group.
+    ///
+    /// # Errors
+    ///
+    /// A static reason if the buffer is short, the embedded count disagrees with
+    /// `expected`, or any present entry is malformed.
+    pub(crate) fn decode_per_row_group(
+        bytes: &[u8],
+        expected: usize,
+    ) -> Result<(Vec<Option<Self>>, usize), &'static str> {
+        let count = bytes
+            .get(0..4)
+            .ok_or("missing per-row-group valid-interval count")?
+            .try_into()
+            .expect("4-byte slice");
+        let count = u32::from_le_bytes(count) as usize;
+        if count != expected {
+            return Err("per-row-group valid-interval count disagrees with row-group count");
+        }
+        let mut cursor = 4;
+        let mut out: Vec<Option<Self>> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let rest = bytes
+                .get(cursor..)
+                .ok_or("truncated per-row-group valid-interval section")?;
+            let entry_count = rest
+                .get(0..4)
+                .ok_or("missing per-row-group valid-interval entry count")?
+                .try_into()
+                .expect("4-byte slice");
+            if u32::from_le_bytes(entry_count) == 0 {
+                // Admit-all marker — this row-group carries no summary.
+                cursor += 4;
+                out.push(None);
+            } else {
+                let (summary, consumed) = Self::decode(rest)?;
+                cursor += consumed;
+                out.push(Some(summary));
+            }
+        }
+        Ok((out, cursor))
+    }
+
     /// Decode a summary written by [`Self::encode`], returning it and the number
     /// of bytes consumed.
     ///
@@ -1025,5 +1105,63 @@ mod tests {
         // A genuinely disjoint, ascending pair still decodes.
         let (ok, _) = ValidIntervalSummary::decode(&encode(&[(0, 10), (20, 30)])).expect("valid");
         assert!(ok.covers(5) && !ok.covers(15) && ok.covers(25));
+    }
+
+    // --- per-row-group sequence (STL-316) ----------------------------------
+
+    #[test]
+    fn per_row_group_round_trips_present_and_absent_entries() {
+        // Three row-groups: a backdated/current scatter, an admit-all (None), and
+        // a single window — the mix the writer emits for a bounded-flush segment.
+        let rgs = vec![
+            Some(summary(&[(0, 10), (100, i64::MAX)], 256)),
+            None,
+            Some(summary(&[(50, 60)], 256)),
+        ];
+        let mut buf = Vec::new();
+        ValidIntervalSummary::encode_per_row_group(&rgs, &mut buf);
+        // A trailing byte proves `decode_per_row_group` reports the exact length.
+        buf.push(0xAB);
+        let (decoded, consumed) =
+            ValidIntervalSummary::decode_per_row_group(&buf, 3).expect("round-trips");
+        assert_eq!(consumed, buf.len() - 1);
+        assert_eq!(decoded, rgs);
+        // The gap row-group prunes 50 while the third covers it — finer than any
+        // single segment-wide union of the three could be.
+        assert!(!decoded[0].as_ref().unwrap().covers(50));
+        assert!(decoded[2].as_ref().unwrap().covers(50));
+    }
+
+    #[test]
+    fn per_row_group_decode_rejects_a_count_mismatch() {
+        let mut buf = Vec::new();
+        ValidIntervalSummary::encode_per_row_group(&[Some(summary(&[(0, 10)], 256))], &mut buf);
+        // The footer says two row-groups but the section encodes one.
+        assert!(ValidIntervalSummary::decode_per_row_group(&buf, 2).is_err());
+        // Exact match decodes.
+        assert!(ValidIntervalSummary::decode_per_row_group(&buf, 1).is_ok());
+    }
+
+    #[test]
+    fn per_row_group_decode_rejects_a_malformed_entry() {
+        // A present entry (count 1) whose single interval is inverted — the
+        // per-entry `decode` must fail closed through the sequence decoder.
+        let mut buf = 1u32.to_le_bytes().to_vec(); // one row-group
+        buf.extend_from_slice(&1u32.to_le_bytes()); // entry: one interval
+        buf.extend_from_slice(&20i64.to_le_bytes()); // from
+        buf.extend_from_slice(&10i64.to_le_bytes()); // to (inverted)
+        assert!(ValidIntervalSummary::decode_per_row_group(&buf, 1).is_err());
+    }
+
+    #[test]
+    fn per_row_group_empty_sequence_round_trips() {
+        // Zero row-groups (the degenerate framing) encodes as a bare count and
+        // decodes back to an empty vector, consuming exactly four bytes.
+        let mut buf = Vec::new();
+        ValidIntervalSummary::encode_per_row_group(&[], &mut buf);
+        let (decoded, consumed) =
+            ValidIntervalSummary::decode_per_row_group(&buf, 0).expect("round-trips");
+        assert!(decoded.is_empty());
+        assert_eq!(consumed, 4);
     }
 }

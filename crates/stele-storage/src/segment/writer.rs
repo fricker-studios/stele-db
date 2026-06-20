@@ -28,9 +28,9 @@ use crate::validtime::{
 use super::SegmentError;
 use super::format::{
     BYTES_NULL_SENTINEL, CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FOOTER_FLAG_BLOOM,
-    FOOTER_FLAG_VALID_INTERVALS, FORMAT_VERSION, HEADER_LEN, HEADER_MAGIC,
-    MAX_BYTES_STAT_PREFIX_LEN, SCHEMA_ID_IMPLICIT_VERSION, STAT_MAX_UNBOUNDED, STAT_MIN_UNBOUNDED,
-    TRAILER_LEN, TRAILER_MAGIC, code_width_for,
+    FOOTER_FLAG_RG_VALID_INTERVALS, FOOTER_FLAG_VALID_INTERVALS, FORMAT_VERSION, HEADER_LEN,
+    HEADER_MAGIC, MAX_BYTES_STAT_PREFIX_LEN, SCHEMA_ID_IMPLICIT_VERSION, STAT_MAX_UNBOUNDED,
+    STAT_MIN_UNBOUNDED, TRAILER_LEN, TRAILER_MAGIC, code_width_for,
 };
 
 /// Streaming writer over a single sealed-segment file.
@@ -269,11 +269,17 @@ impl<F: DiskFile> SegmentWriter<F> {
         &self,
         valid_pairs: Option<&[(i64, i64)]>,
     ) -> Option<ValidIntervalSummary> {
-        if self.valid_interval_cap == 0 {
-            return None;
-        }
-        let pairs = valid_pairs?;
-        if pairs.is_empty() {
+        self.valid_interval_summary_for(valid_pairs?)
+    }
+
+    /// Build the valid-interval summary over one already-decoded `(valid_from,
+    /// valid_to)` slice — a whole segment's pairs ([STL-241]) or a single
+    /// row-group's ([STL-316]). `None` when the summary is disabled
+    /// (`valid_interval_cap == 0`), the slice is empty, or every pair is
+    /// degenerate (an empty summary covers nothing and would wrongly prune, so the
+    /// caller records an *admit-all* slot instead).
+    fn valid_interval_summary_for(&self, pairs: &[(i64, i64)]) -> Option<ValidIntervalSummary> {
+        if self.valid_interval_cap == 0 || pairs.is_empty() {
             return None;
         }
         let summary = ValidIntervalSummary::build(pairs.iter().copied(), self.valid_interval_cap);
@@ -306,6 +312,12 @@ impl<F: DiskFile> SegmentWriter<F> {
             self.rows.chunks(group_rows).collect()
         };
         let mut row_groups: Vec<RowGroupChunks> = Vec::with_capacity(groups.len());
+        // One valid-interval summary per row-group ([STL-316]), computed from that
+        // row-group's own `(valid_from, valid_to)` slice as the loop walks them.
+        // `None` for a system-only segment (kept empty, never emitted) or for an
+        // individual degenerate/empty row-group (an admit-all slot).
+        let mut rg_valid_summaries: Vec<Option<ValidIntervalSummary>> =
+            Vec::with_capacity(groups.len());
         let mut offset: u64 = HEADER_LEN as u64;
         let mut row_base = 0usize;
         for group in groups {
@@ -315,6 +327,7 @@ impl<F: DiskFile> SegmentWriter<F> {
             let group_pairs = valid_pairs
                 .as_deref()
                 .map(|pairs| &pairs[row_base..row_base + group.len()]);
+            rg_valid_summaries.push(group_pairs.and_then(|gp| self.valid_interval_summary_for(gp)));
             let mut chunks: Vec<EncodedChunk> = Vec::with_capacity(schema.len());
             for &col in schema {
                 let encoded = encode_column(col, group, group_pairs, self.dictionary)?;
@@ -403,11 +416,16 @@ impl<F: DiskFile> SegmentWriter<F> {
 
         let bloom = self.business_key_bloom();
         let valid_summary = self.valid_interval_summary(valid_pairs.as_deref());
+        // The per-row-group section rides with the per-segment summary: the
+        // segment summary is the cheap first cut, the per-row-group sequence the
+        // finer refinement, so they are emitted together or not at all ([STL-316]).
+        let rg_valid_summaries = valid_summary.as_ref().map(|_| rg_valid_summaries);
         let footer = encode_footer(
             &row_groups,
             &retraction_chunks,
             bloom.as_ref(),
             valid_summary.as_ref(),
+            rg_valid_summaries.as_deref(),
         )?;
         let footer_crc = crc32c(&footer);
         let footer_len = u32::try_from(footer.len())
@@ -953,20 +971,25 @@ fn encode_footer(
     retraction_chunks: &[EncodedChunk],
     bloom: Option<&KeyBloom>,
     valid_summary: Option<&ValidIntervalSummary>,
+    rg_valid_summaries: Option<&[Option<ValidIntervalSummary>]>,
 ) -> Result<Vec<u8>, SegmentError> {
     let row_group_count = u32::try_from(row_groups.len())
         .map_err(|_| SegmentError::TooLarge("row-group count exceeds u32::MAX"))?;
     let mut out = Vec::new();
     out.extend_from_slice(&SCHEMA_ID_IMPLICIT_VERSION.to_le_bytes());
     // The flags word signals the optional trailing sections — the bloom
-    // ([STL-238]) and the valid-time interval summary ([STL-241]). A footer with
-    // neither writes `0` here and is byte-identical to a v10 footer.
+    // ([STL-238]), the per-segment valid-time interval summary ([STL-241]), and
+    // the per-row-group summary sequence ([STL-316]). A footer with none writes
+    // `0` here and is byte-identical to a v10 footer.
     let mut flags = 0u32;
     if bloom.is_some() {
         flags |= FOOTER_FLAG_BLOOM;
     }
     if valid_summary.is_some() {
         flags |= FOOTER_FLAG_VALID_INTERVALS;
+    }
+    if rg_valid_summaries.is_some() {
+        flags |= FOOTER_FLAG_RG_VALID_INTERVALS;
     }
     out.extend_from_slice(&flags.to_le_bytes());
     // One by default; several when the writer was bounded ([STL-155]). The
@@ -1003,10 +1026,17 @@ fn encode_footer(
     }
     // Per-segment valid-time interval summary ([STL-241], v12) — present iff
     // `FOOTER_FLAG_VALID_INTERVALS` was set above, written *after* the bloom so a
-    // reader decodes the two trailing sections in a fixed order. A footer with no
+    // reader decodes the trailing sections in a fixed order. A footer with no
     // summary is byte-identical to v11.
     if let Some(summary) = valid_summary {
         summary.encode(&mut out);
+    }
+    // Per-row-group valid-time interval summaries ([STL-316], v14) — present iff
+    // `FOOTER_FLAG_RG_VALID_INTERVALS` was set above, written *after* the
+    // per-segment summary (the fixed trailing order). One entry per row-group, so
+    // the reader cross-checks the embedded count against the row-group count.
+    if let Some(summaries) = rg_valid_summaries {
+        ValidIntervalSummary::encode_per_row_group(summaries, &mut out);
     }
     Ok(out)
 }

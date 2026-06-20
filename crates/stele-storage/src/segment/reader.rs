@@ -38,8 +38,9 @@ use crate::validtime::{ValidIntervalSummary, reframe_payload};
 use super::SegmentError;
 use super::format::{
     BYTES_NULL_SENTINEL, CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FOOTER_FLAG_BLOOM,
-    FOOTER_FLAG_VALID_INTERVALS, FORMAT_VERSION, HEADER_LEN, HEADER_MAGIC, STAT_MAX_UNBOUNDED,
-    STAT_MIN_UNBOUNDED, TRAILER_LEN, TRAILER_MAGIC, code_width_for,
+    FOOTER_FLAG_RG_VALID_INTERVALS, FOOTER_FLAG_VALID_INTERVALS, FORMAT_VERSION, HEADER_LEN,
+    HEADER_MAGIC, STAT_MAX_UNBOUNDED, STAT_MIN_UNBOUNDED, TRAILER_LEN, TRAILER_MAGIC,
+    code_width_for,
 };
 use super::zone_map::{Predicate, ZoneBound, ZoneEnd, ZoneMap};
 
@@ -94,6 +95,17 @@ struct Footer {
     /// summary (a system-only, older, or summary-disabled segment) and admits
     /// every valid point.
     valid_intervals: Option<ValidIntervalSummary>,
+    /// Per-row-group valid-time interval summaries (format v14, [STL-316]) —
+    /// `Some` iff the footer's [`FOOTER_FLAG_RG_VALID_INTERVALS`] bit is set, with
+    /// one entry per row-group (in [`Self::row_groups`] order; `None` for an
+    /// admit-all row-group). The finer-grained sibling of [`Self::valid_intervals`]:
+    /// a `FOR VALID_TIME AS OF v` read consults it per row-group via
+    /// [`SegmentReader::row_group_might_contain_valid`] to skip an individual
+    /// row-group whose coverage gaps at `v` even when the segment summary cannot
+    /// prune. `None` (the whole field) means the segment carries no per-row-group
+    /// summaries (a system-only, older, or summary-disabled segment) and admits
+    /// every valid point in every row-group.
+    row_group_valid_intervals: Option<Vec<Option<ValidIntervalSummary>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +301,34 @@ impl<F: DiskFile> SegmentReader<F> {
             .valid_intervals
             .as_ref()
             .is_none_or(|summary| summary.overlaps(lo, hi))
+    }
+
+    /// Whether row-group `g` *might* hold a row valid at `point` — the
+    /// per-row-group valid-time interval skip test ([STL-316], format v14).
+    ///
+    /// The finer-grained sibling of [`Self::might_contain_valid`]: consults this
+    /// row-group's footer-resident `ValidIntervalSummary` and touches **no**
+    /// column chunk. A `false` result *proves* no row in row-group `g` is valid at
+    /// `point`, so a `FOR VALID_TIME AS OF point` read can skip that one row-group
+    /// even when the segment-level summary cannot prune the whole segment — a
+    /// production flush bounds row-groups ([STL-197]), so within a scatter-heavy
+    /// segment one row-group can carry a coverage gap at `point` the segment-wide
+    /// union (and the per-row-group `valid_from` / `valid_to` zone-map min/max,
+    /// [STL-173]) cannot see. A segment with no per-row-group summaries
+    /// (system-only, format ≤ v13, or a summary-disabled writer), an admit-all
+    /// row-group, or an out-of-range index all admit every point, so this never
+    /// prunes a real match. Snapshot-free by design: a sealed segment's valid
+    /// windows are fixed, so a coverage gap holds at every system snapshot.
+    ///
+    /// Indices line up with [`Self::row_group_row_counts`] /
+    /// [`Self::row_group_zone_maps`].
+    #[must_use]
+    pub fn row_group_might_contain_valid(&self, g: usize, point: i64) -> bool {
+        self.footer
+            .row_group_valid_intervals
+            .as_ref()
+            .and_then(|summaries| summaries.get(g))
+            .is_none_or(|entry| entry.as_ref().is_none_or(|summary| summary.covers(point)))
     }
 
     /// Read one column end-to-end across every row-group, in row order. The
@@ -804,7 +844,9 @@ fn parse_footer(bytes: &[u8]) -> Result<Footer, SegmentError> {
     // version, so fail closed rather than silently ignore it (the same posture the
     // parser takes on an unknown column or schema id).
     let flags = p.u32()?;
-    if flags & !(FOOTER_FLAG_BLOOM | FOOTER_FLAG_VALID_INTERVALS) != 0 {
+    if flags & !(FOOTER_FLAG_BLOOM | FOOTER_FLAG_VALID_INTERVALS | FOOTER_FLAG_RG_VALID_INTERVALS)
+        != 0
+    {
         return Err(SegmentError::Corrupt("unknown footer flag bits set"));
     }
     let row_group_count = p.u32()?;
@@ -880,6 +922,24 @@ fn parse_footer(bytes: &[u8]) -> Result<Footer, SegmentError> {
     } else {
         None
     };
+    // Per-row-group valid-time interval summaries (format v14, [STL-316]) —
+    // present iff the flags word advertised it, decoded from the bytes *after* the
+    // per-segment summary (the fixed write order) and before the trailing-bytes
+    // guard. The embedded count is cross-checked against the row-group count, so a
+    // section that disagrees with the row-group framing is rejected as corrupt.
+    let row_group_valid_intervals = if flags & FOOTER_FLAG_RG_VALID_INTERVALS != 0 {
+        let (summaries, consumed) =
+            ValidIntervalSummary::decode_per_row_group(&p.bytes[p.cursor..], row_groups.len())
+                .map_err(|_| {
+                    SegmentError::Corrupt(
+                        "malformed per-row-group valid-interval summaries in footer",
+                    )
+                })?;
+        p.take(consumed)?;
+        Some(summaries)
+    } else {
+        None
+    };
     if !p.is_empty() {
         return Err(SegmentError::Corrupt("trailing bytes in footer"));
     }
@@ -890,6 +950,7 @@ fn parse_footer(bytes: &[u8]) -> Result<Footer, SegmentError> {
         retraction_count,
         bloom,
         valid_intervals,
+        row_group_valid_intervals,
     })
 }
 
@@ -1486,12 +1547,12 @@ mod tests {
     #[test]
     fn unknown_footer_flag_bits_are_rejected() {
         // A footer with a reserved flag bit set (beyond the defined
-        // FOOTER_FLAG_BLOOM / FOOTER_FLAG_VALID_INTERVALS) is either corruption or
-        // a newer generation that should have bumped the version — the parser must
-        // fail closed rather than silently ignore it.
+        // FOOTER_FLAG_BLOOM / FOOTER_FLAG_VALID_INTERVALS / FOOTER_FLAG_RG_VALID_INTERVALS)
+        // is either corruption or a newer generation that should have bumped the
+        // version — the parser must fail closed rather than silently ignore it.
         let mut out = Vec::new();
         out.extend_from_slice(&0u32.to_le_bytes()); // schema_id
-        out.extend_from_slice(&(FOOTER_FLAG_VALID_INTERVALS << 1).to_le_bytes()); // an unknown bit
+        out.extend_from_slice(&(FOOTER_FLAG_RG_VALID_INTERVALS << 1).to_le_bytes()); // an unknown bit
         out.extend_from_slice(&0u32.to_le_bytes()); // row_group_count
         out.extend_from_slice(&0u32.to_le_bytes()); // retraction_count
         out.extend_from_slice(&0u32.to_le_bytes()); // retraction_column_count

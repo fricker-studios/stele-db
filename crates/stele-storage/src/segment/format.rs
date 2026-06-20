@@ -189,7 +189,31 @@ pub(super) const TRAILER_MAGIC: [u8; 8] = *b"STLSEGFT";
 ///   version; the codec is applied today only by compaction
 ///   ([`Engine::compact`](crate::engine::Engine::compact)), the natural place to
 ///   spend CPU consolidating history ([STL-231]).
-pub(super) const FORMAT_VERSION: u16 = 13;
+///
+/// * **v14** — **adds per-row-group valid-time interval summaries** ([STL-316]).
+///   A third optional trailing footer section — gated by
+///   [`FOOTER_FLAG_RG_VALID_INTERVALS`], after the per-segment valid-interval
+///   summary — holding one [`ValidIntervalSummary`](crate::validtime::ValidIntervalSummary)
+///   per row-group (the same coalesced-union shape the segment-level summary
+///   [STL-241] carries, computed over just that row-group's `[valid_from,
+///   valid_to)` windows). It refines the valid axis from segment to *row-group*
+///   granularity exactly as [STL-173] refined the system-axis zone maps: a
+///   production flush bounds row-groups ([STL-197]), so a single scatter-heavy
+///   row-group can carry windows spanning the timeline even when the segment as a
+///   whole cannot be pruned, and the finer summary skips that row-group when its
+///   coverage has a gap at the pinned instant. Present only when the per-segment
+///   summary is (a valid-time table, summary enabled, ≥1 real window); within the
+///   section a degenerate or empty row-group encodes as an *admit-all* marker
+///   (interval count `0`). Like the per-segment summary it is **advisory** —
+///   read-gating only, never consulted for a result — and rides the immutable
+///   segment, so it survives flush / compaction / recovery with no separate
+///   structure to rebuild. The version row-group, retraction section, bloom
+///   section, and per-segment summary are byte-identical to v13; the bump is
+///   because a v13 reader would read the trailing per-row-group section as
+///   `Corrupt("trailing bytes in footer")` (and the new flag bit as
+///   `Corrupt("unknown footer flag bits set")`), so it makes the reject clean at
+///   the header in both directions — the same reasoning as every prior bump.
+pub(super) const FORMAT_VERSION: u16 = 14;
 
 /// Footer-level flag bits — the `u32` flags word that follows the schema id in
 /// the footer. Additive: an unset bit is the pre-v11 behavior, and each defined
@@ -205,11 +229,24 @@ pub(super) const FORMAT_VERSION: u16 = 13;
 ///   the bloom section ([STL-241], [`FORMAT_VERSION`] v12). Clear for a
 ///   system-only segment (no valid windows), an empty segment, or when the
 ///   writer's summary is disabled.
+/// * [`FOOTER_FLAG_RG_VALID_INTERVALS`] — a per-row-group valid-time interval
+///   summary sequence (one [`ValidIntervalSummary`](crate::validtime::ValidIntervalSummary)
+///   per row-group) follows the per-segment summary section ([STL-316],
+///   [`FORMAT_VERSION`] v14). Set exactly when [`FOOTER_FLAG_VALID_INTERVALS`]
+///   is — the per-segment summary is the cheap first cut, the per-row-group
+///   sequence the finer refinement.
 pub(super) const FOOTER_FLAG_BLOOM: u32 = 0b0000_0001;
 
 /// See [`FOOTER_FLAG_BLOOM`]: a per-segment valid-time interval summary section
 /// ([STL-241], [`FORMAT_VERSION`] v12), written after the bloom section.
 pub(super) const FOOTER_FLAG_VALID_INTERVALS: u32 = 0b0000_0010;
+
+/// See [`FOOTER_FLAG_BLOOM`]: a per-row-group valid-time interval summary
+/// sequence ([STL-316], [`FORMAT_VERSION`] v14), written after the per-segment
+/// summary section. A `u32` row-group count then, per row-group, either a present
+/// [`ValidIntervalSummary`](crate::validtime::ValidIntervalSummary) (its interval
+/// count `≥ 1` then the pairs) or an *admit-all* marker (interval count `0`).
+pub(super) const FOOTER_FLAG_RG_VALID_INTERVALS: u32 = 0b0000_0100;
 
 /// The per-value length reserved in a bytes column to mean "this cell is SQL
 /// `NULL`" ([STL-154], [`FORMAT_VERSION`] v10). Only the `payload` column ever
