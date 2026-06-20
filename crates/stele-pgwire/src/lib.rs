@@ -106,10 +106,11 @@ pub use stele_common::DEFAULT_PG_PORT;
 /// admin / control-plane API so its introspection replies match the SQL wire
 /// ([STL-254]).
 pub use text_format::render_cell;
-pub use tls::{ServerTls, TlsError, TlsMode, TlsSettings};
+pub use tls::{ServerTls, TlsError, TlsMode, TlsReloader, TlsSettings};
 // The verified mTLS client identity surfaced into the session principal (STL-291)
-// — crate-internal, never part of the public wire surface.
-use tls::{CertIdentity, peer_identity};
+// — crate-internal, never part of the public wire surface. `SharedServerTls` /
+// `shared_tls` are the hot-swappable acceptor cell behind TLS reload (STL-293).
+use tls::{CertIdentity, SharedServerTls, peer_identity, shared_tls};
 
 use stele_catalog::CatalogError;
 use stele_common::hashkey::hash_key;
@@ -613,7 +614,10 @@ pub enum AuthMode {
 pub struct Server {
     listen_addr: SocketAddr,
     session: SharedSession,
-    tls: Option<Arc<ServerTls>>,
+    // A hot-swappable cell, not a fixed `Arc<ServerTls>`: the accept loop reads the
+    // live acceptor out of it per connection so a reload (STL-293) is picked up
+    // without rebuilding the server. `None` = TLS not configured.
+    tls: Option<SharedServerTls>,
     auth: AuthMode,
 }
 
@@ -636,7 +640,24 @@ impl Server {
     /// [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
     #[must_use]
     pub fn with_tls(mut self, tls: ServerTls) -> Self {
-        self.tls = Some(Arc::new(tls));
+        self.tls = Some(shared_tls(tls));
+        self
+    }
+
+    /// Serve TLS with a **hot-reloadable** acceptor ([STL-293]): the server reads
+    /// the live [`ServerTls`] out of `reloader`'s shared cell per connection, so a
+    /// [`TlsReloader::reload`] (driven by the daemon's SIGHUP handler) swaps in a
+    /// rotated certificate for new connections without a restart. Established
+    /// connections keep the acceptor they handshook with.
+    ///
+    /// Use this instead of [`with_tls`](Self::with_tls) when the caller holds a
+    /// [`TlsReloader`] it will trigger reloads on; the two are mutually exclusive
+    /// (the last call wins).
+    ///
+    /// [STL-293]: https://allegromusic.atlassian.net/browse/STL-293
+    #[must_use]
+    pub fn with_tls_reloader(mut self, reloader: &TlsReloader) -> Self {
+        self.tls = Some(reloader.cell());
         self
     }
 
@@ -696,7 +717,7 @@ pub struct BoundServer {
     listener: TcpListener,
     local_addr: SocketAddr,
     session: SharedSession,
-    tls: Option<Arc<ServerTls>>,
+    tls: Option<SharedServerTls>,
     auth: AuthMode,
 }
 
@@ -737,7 +758,15 @@ impl BoundServer {
             // Disable Nagle — short Postgres messages don't benefit from coalescing.
             let _ = stream.set_nodelay(true);
             let session = Arc::clone(&self.session);
-            let tls = self.tls.clone();
+            // Read the live acceptor out of the hot-swap cell once, here, at accept
+            // time (STL-293): this connection handshakes with whatever certificate
+            // is current now, and a later reload only affects connections accepted
+            // after it. The read clones an `Arc` and drops the guard immediately —
+            // never held across the handshake `await`.
+            let tls = self
+                .tls
+                .as_ref()
+                .map(|cell| Arc::clone(&cell.read().unwrap_or_else(PoisonError::into_inner)));
             let auth = self.auth;
             let metrics = Arc::clone(&metrics);
             metrics.connections_total.inc();

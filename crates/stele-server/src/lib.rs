@@ -28,7 +28,9 @@ use serde::Deserialize;
 use stele_common::DEFAULT_PG_PORT;
 use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
-use stele_pgwire::{AuthMode, Server as PgServer, ServerTls, SharedSession, TlsMode, TlsSettings};
+use stele_pgwire::{
+    AuthMode, Server as PgServer, ServerTls, SharedSession, TlsMode, TlsReloader, TlsSettings,
+};
 use stele_storage::backend::{AnyDisk, BackendKind};
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -496,14 +498,20 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     }
     if let Some(settings) = &cfg.tls {
         // Load certificate material now so a bad path / non-PEM file is a boot
-        // error with context, not a per-connection surprise.
-        let tls = ServerTls::load(settings).context("loading [tls] certificate material")?;
+        // error with context, not a per-connection surprise. Behind a reloader so a
+        // SIGHUP can rotate the cert/key without a restart (STL-293): the listener
+        // reads the live acceptor per connection.
+        let reloader =
+            TlsReloader::load(settings.clone()).context("loading [tls] certificate material")?;
         info!(
             mode = ?settings.mode,
             mtls = settings.client_ca.is_some(),
             "TLS enabled on pg-wire"
         );
-        pg = pg.with_tls(tls);
+        pg = pg.with_tls_reloader(&reloader);
+        // Arm the hot-reload trigger. On a platform without SIGHUP this only logs
+        // that rotation needs a restart — the listener still serves the boot cert.
+        spawn_tls_sighup_reload(reloader);
     } else if let Some(tls) = self_signed_tls {
         // The non-dev no-TLS non-loopback fallback (STL-304): warned above.
         info!(
@@ -533,6 +541,57 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Arm TLS certificate hot-reload on SIGHUP ([STL-293]): spawn a task that, on
+/// each `SIGHUP`, re-reads the `[tls]` cert/key paths and atomically swaps the
+/// acceptor the pg-wire listener reads per connection. A failed reload (torn
+/// write, non-PEM file, cert/key mismatch) keeps the previously loaded certificate
+/// and is logged loudly — it never takes the listener down.
+///
+/// SIGHUP is the conventional "reload config without restart" signal (nginx /
+/// PostgreSQL `pg_ctl reload`); cert-manager and similar rotators can be wired to
+/// send it. The task lives for the lifetime of the process and is dropped on
+/// shutdown.
+///
+/// [STL-293]: https://allegromusic.atlassian.net/browse/STL-293
+#[cfg(unix)]
+fn spawn_tls_sighup_reload(reloader: TlsReloader) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut hup = match signal(SignalKind::hangup()) {
+        Ok(stream) => stream,
+        Err(error) => {
+            warn!(
+                %error,
+                "could not install the SIGHUP handler; TLS hot-reload is disabled \
+                 (rotate the certificate with a restart)"
+            );
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        info!(
+            "TLS hot-reload armed: send SIGHUP (e.g. `kill -HUP <pid>`) to pick up a \
+             rotated [tls] cert/key without a restart"
+        );
+        // `recv` yields `Some` per delivered signal and `None` only if the stream is
+        // dropped; the reloader logs the success / failure of each attempt itself.
+        while hup.recv().await.is_some() {
+            info!("received SIGHUP: reloading [tls] certificate material");
+            let _ = reloader.reload();
+        }
+    });
+}
+
+/// On a platform without SIGHUP, hot-reload is unavailable: the listener keeps
+/// serving the certificate loaded at boot, and rotation needs a restart.
+#[cfg(not(unix))]
+fn spawn_tls_sighup_reload(_reloader: TlsReloader) {
+    warn!(
+        "TLS hot-reload via SIGHUP is not available on this platform; rotate the \
+         certificate with a restart"
+    );
 }
 
 /// Build the admin / control-plane gRPC listener future ([STL-254], ADR-0016).
