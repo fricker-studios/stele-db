@@ -560,17 +560,29 @@ impl GatheredColumns {
 /// What remains is [`segments_scanned`](Self::segments_scanned): the segments
 /// whose projected columns are materialized for the rows that survive resolution.
 ///
-/// ## Row-group accounting (STL-173)
+/// ## Row-group accounting (STL-173, STL-316)
 ///
 /// Within a segment that survives the segment-level zone prune, the scan prunes
-/// again at *row-group* granularity: each row-group's own zone map
-/// ([`SegmentReader::row_group_zone_maps`]) can prove no visible matching row
-/// even when the segment-level fold (whose `[min, max]` spans every row-group)
-/// cannot. The three `row_groups_*` counts partition the row-groups of exactly
-/// the segment-level zone survivors —
-/// `row_groups_total == row_groups_pruned_zone + row_groups_scanned` — and a
-/// segment whose *every* row-group is pruned this way is itself counted in
-/// [`segments_pruned_zone`](Self::segments_pruned_zone) (no identity chunk read).
+/// again at *row-group* granularity, two complementary ways, neither touching a
+/// column chunk:
+///
+/// * each row-group's own zone map ([`SegmentReader::row_group_zone_maps`]) can
+///   prove no visible matching row even when the segment-level fold (whose
+///   `[min, max]` spans every row-group) cannot
+///   ([`row_groups_pruned_zone`](Self::row_groups_pruned_zone));
+/// * on a `FOR VALID_TIME AS OF v` read, each row-group's own valid-interval
+///   summary ([`SegmentReader::row_group_might_contain_valid`], STL-316) can
+///   prove no row in it is valid at `v` — the backdated scatter case its
+///   `valid_from` / `valid_to` zone-map min/max cannot, because a correction in
+///   the row-group widens the envelope to span `v` though the coverage gaps there
+///   ([`row_groups_pruned_valid`](Self::row_groups_pruned_valid)).
+///
+/// The four `row_groups_*` counts partition the row-groups of exactly the
+/// segment-level zone survivors —
+/// `row_groups_total == row_groups_pruned_zone + row_groups_pruned_valid +
+/// row_groups_scanned` — and a segment whose *every* row-group is pruned this way
+/// is itself counted in [`segments_pruned_zone`](Self::segments_pruned_zone) (no
+/// identity chunk read).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ScanStats {
     /// Total sealed segments offered to the scan.
@@ -609,6 +621,14 @@ pub struct ScanStats {
     /// Row-groups a per-row-group zone map proved hold no visible match — their
     /// identity (and bulk) chunks are never read.
     pub row_groups_pruned_zone: usize,
+    /// Row-groups the per-row-group valid-time interval summary proved hold no row
+    /// valid at the pinned valid instant — skipped with no read I/O (STL-316).
+    /// Only ever non-zero for a `FOR VALID_TIME AS OF v` read against a segment
+    /// carrying per-row-group summaries; this is the backdated-write scatter case
+    /// the row-group's `valid_from` / `valid_to` zone-map min/max cannot prune,
+    /// the row-group-granular refinement of
+    /// [`segments_pruned_valid`](Self::segments_pruned_valid).
+    pub row_groups_pruned_valid: usize,
     /// Row-groups whose narrow identity columns were read to resolve the snapshot
     /// (the candidates that survived the per-row-group prune).
     pub row_groups_scanned: usize,
@@ -652,6 +672,9 @@ impl ScanStats {
         metrics
             .scan_row_groups_pruned_zone
             .add(self.row_groups_pruned_zone as u64);
+        metrics
+            .scan_row_groups_pruned_valid
+            .add(self.row_groups_pruned_valid as u64);
     }
 }
 
@@ -1011,6 +1034,7 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
         let mut pruned_valid = 0usize;
         let mut rg_total = 0usize;
         let mut rg_pruned = 0usize;
+        let mut rg_pruned_valid = 0usize;
         let mut rg_scanned = 0usize;
         // (segment index, its surviving rows as (segment-global row index, identity)).
         let mut survivors: Vec<(usize, Vec<(usize, VersionId)>)> = Vec::new();
@@ -1064,18 +1088,37 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
                 pruned_valid += 1;
                 continue;
             }
-            // Stage 2 — per-row-group zone maps (STL-173): rule out the
-            // row-groups whose own min/max prove no visible match, even when the
-            // segment-level fold (its `[min, max]` spanning every row-group)
-            // cannot. Footer-resident, so this costs no chunk I/O — the pruned
-            // row-groups' identity chunks are then never read.
+            // Stage 2 — per-row-group skips (STL-173, STL-316): rule out
+            // individual row-groups even when the segment-level fold (its
+            // `[min, max]` spanning every row-group) cannot, two complementary
+            // ways, both footer-resident so neither costs chunk I/O:
+            //
+            //  * the row-group's own zone map proves no visible match (STL-173);
+            //  * on a valid-pinned read, the row-group's own valid-interval
+            //    summary proves no row in it is valid at `v` (STL-316) — the
+            //    backdated scatter case its `valid_from` / `valid_to` zone-map
+            //    min/max cannot prune, now caught at row-group rather than only
+            //    segment granularity. Tallied separately from the zone skip, the
+            //    row-group analogue of the segment-level `pruned_valid` split.
+            //    (The STL-315 overlap probe stays segment-level for now.)
+            //
+            // The pruned row-groups' identity chunks are then never read.
             let rg_counts = reader.row_group_row_counts();
             let rg_maps = reader.row_group_zone_maps();
             rg_total += rg_maps.len();
-            let candidates: BTreeSet<usize> = (0..rg_maps.len())
-                .filter(|&g| rg_maps[g].might_contain(&pruning_pred, begins_after))
-                .collect();
-            rg_pruned += rg_maps.len() - candidates.len();
+            let mut candidates: BTreeSet<usize> = BTreeSet::new();
+            for (g, rg_map) in rg_maps.iter().enumerate() {
+                if !rg_map.might_contain(&pruning_pred, begins_after) {
+                    rg_pruned += 1;
+                } else if self
+                    .valid_snapshot
+                    .is_some_and(|point| !reader.row_group_might_contain_valid(g, point.0))
+                {
+                    rg_pruned_valid += 1;
+                } else {
+                    candidates.insert(g);
+                }
+            }
             if candidates.is_empty() {
                 // Every row-group ruled out — the segment holds no visible match
                 // even though its coarse segment-level fold could not prove it.
@@ -1120,6 +1163,7 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             segments_scanned: survivors.len(),
             row_groups_total: rg_total,
             row_groups_pruned_zone: rg_pruned,
+            row_groups_pruned_valid: rg_pruned_valid,
             row_groups_scanned: rg_scanned,
         };
         Ok((survivors, stats))
