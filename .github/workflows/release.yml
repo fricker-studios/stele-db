@@ -409,16 +409,26 @@ jobs:
       - name: Publish stele-client to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        # Idempotent: re-running an already-published tag is a no-op, not a
-        # failure (crates.io rejects a duplicate version). `--locked` publishes
-        # exactly the committed Cargo.lock. Only `stele-client` is published; its
-        # unpublished sibling crates appear solely as path-only dev-deps, which
-        # `cargo package` strips, so the published crate depends only on
-        # crates.io-resolvable deps (serde, serde_json).
+        # Idempotent: re-running an already-published tag must be a no-op, not a
+        # failure (crates.io rejects a duplicate version). Rather than pre-check
+        # with `cargo search` — which is flaky under network/rate-limiting and can
+        # false-negative into a failed publish — just attempt the publish and treat
+        # the "already uploaded" rejection as success; any other error is fatal.
+        # `--locked` publishes exactly the committed Cargo.lock. Only `stele-client`
+        # is published; its unpublished sibling crates appear solely as path-only
+        # dev-deps, which `cargo package` strips, so the published crate depends
+        # only on crates.io-resolvable deps (serde, serde_json).
         run: |
-          ver="${GITHUB_REF_NAME#v}"
-          if cargo search stele-client | grep -q "^stele-client = \"${ver}\""; then
-            echo "stele-client ${ver} already on crates.io — nothing to publish"
-            exit 0
+          set +e
+          cargo publish -p stele-client --locked >publish.log 2>&1
+          status=$?
+          set -e
+          cat publish.log
+          if [ "${status}" -eq 0 ]; then
+            echo "published stele-client ${GITHUB_REF_NAME#v}"
+          elif grep -qiE 'already (exists|uploaded)|is already uploaded|crate version .* is already' publish.log; then
+            echo "stele-client ${GITHUB_REF_NAME#v} already on crates.io — treating as success"
+          else
+            echo "::error::cargo publish failed for a reason other than a duplicate version"
+            exit 1
           fi
-          cargo publish -p stele-client --locked

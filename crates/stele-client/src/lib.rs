@@ -44,7 +44,9 @@
 //! let client = Client::new(Config {
 //!     host: "127.0.0.1".to_owned(),
 //!     port: 9090, // the ops listener the HTTP/JSON gateway shares
-//!     token: Some(std::env::var("STELE_ADMIN_TOKEN").unwrap_or_default()),
+//!     // A missing or empty env var becomes `None`, so an unconfigured token is
+//!     // refused locally (`Error::NoToken`) rather than spent on a 401 round-trip.
+//!     token: std::env::var("STELE_ADMIN_TOKEN").ok().filter(|t| !t.is_empty()),
 //! });
 //!
 //! // Liveness, then engine state.
@@ -396,6 +398,13 @@ impl Client {
     ) -> Result<String, Error> {
         let host = &self.config.host;
         let port = self.config.port;
+        // Header-injection guard: `host` and `token` are interpolated into the raw
+        // request head below, so a `\r`/`\n` (or any control char) in either would
+        // let a caller smuggle extra header lines or a second request. Tokens
+        // routinely come from environment variables, so refuse a malformed value up
+        // front — before opening a socket — rather than emit a corrupt request.
+        reject_control_chars("admin host", host)?;
+        reject_control_chars("admin token", token)?;
         let mut stream = TcpStream::connect((host.as_str(), port)).map_err(|e| {
             Error::Transport(format!("connecting to the admin API at {host}:{port}: {e}"))
         })?;
@@ -436,6 +445,21 @@ fn table_body(table: &str, key: Option<&str>) -> Value {
         || json!({ "table": table }),
         |key| json!({ "table": table, "key": key }),
     )
+}
+
+/// Reject a value bound for a raw HTTP header line if it carries an ASCII control
+/// character (notably CR/LF) — the header-injection / request-smuggling guard for
+/// the `host` and `token` interpolated into the request head. A hostname or bearer
+/// token never legitimately contains one, so this only ever fires on an attack or
+/// a corrupt config.
+fn reject_control_chars(field: &str, value: &str) -> Result<(), Error> {
+    if let Some(pos) = value.bytes().position(|b| b.is_ascii_control()) {
+        return Err(Error::Transport(format!(
+            "{field} contains an illegal control character at byte {pos}: \
+             refusing to send a request that could be header-injected"
+        )));
+    }
+    Ok(())
 }
 
 /// Decode a JSON value into a typed reply, mapping a shape mismatch to
@@ -545,6 +569,25 @@ mod tests {
         });
         assert!(matches!(client.status(), Err(Error::NoToken)));
         assert!(matches!(client.health(), Err(Error::NoToken)));
+    }
+
+    #[test]
+    fn crlf_in_token_or_host_is_refused_without_a_socket() {
+        // A CR/LF in the token would smuggle a header line; refuse before any
+        // connect (port 1 would fail anyway, but the guard fires first).
+        let evil_token = Client::new(Config::new(
+            "127.0.0.1",
+            1,
+            Some("tok\r\nX-Evil: 1".to_owned()),
+        ));
+        assert!(matches!(evil_token.status(), Err(Error::Transport(_))));
+        // Same for a CR/LF in the host.
+        let evil_host = Client::new(Config::new(
+            "127.0.0.1\r\nHost: evil",
+            1,
+            Some("tok".to_owned()),
+        ));
+        assert!(matches!(evil_host.status(), Err(Error::Transport(_))));
     }
 
     #[test]

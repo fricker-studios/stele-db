@@ -54,7 +54,9 @@ fn main() -> Result<(), stele_client::Error> {
     let client = Client::new(Config {
         host: "127.0.0.1".to_owned(),
         port: 9090, // the ops listener the HTTP/JSON gateway shares
-        token: Some(std::env::var("STELE_ADMIN_TOKEN").unwrap_or_default()),
+        // A missing or empty env var becomes `None`, so an unconfigured token is
+        // refused locally (`Error::NoToken`) rather than spent on a 401 round-trip.
+        token: std::env::var("STELE_ADMIN_TOKEN").ok().filter(|t| !t.is_empty()),
     });
 
     // Liveness, then engine state.
