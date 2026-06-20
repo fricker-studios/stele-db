@@ -36,23 +36,33 @@ clap         = { workspace = true }
 tokio        = { workspace = true }
 rustyline     = { workspace = true }
 unicode-width = { workspace = true }
+# `stele shell`'s client-side SCRAM-SHA-256 (STL-296) draws a fresh client nonce
+# per exchange from the same OS entropy the server's SASL path uses. `getrandom`
+# is the auth path's blessed RNG (already in the tree via stele-pgwire/common), so
+# this adds no new supply-chain surface.
+getrandom    = { workspace = true }
 # `stele shell --tls` (STL-251): the same rustls the server stack uses, driven
 # through its blocking `StreamOwned` adapter — still no async client crate.
 rustls           = { workspace = true }
 rustls-pki-types = { workspace = true }
 
+# The interactive no-echo password prompt (STL-296) toggles the terminal's ECHO
+# flag off via `nix`'s `term` (termios) feature, the true-no-echo recipe psql and
+# sudo use. `nix` is already compiled into the binary (rustyline pulls it on unix)
+# and its `term` feature is the same one the PTY tests below use for `openpty`, so
+# this adds no new compilation. Unix-only because termios is; on other platforms
+# the prompt is unavailable and PGPASSWORD is the path.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["term"] }
+
 [dev-dependencies]
 # The scripted-shell integration test boots an in-process engine + pgwire
 # server on an ephemeral port, then drives the real `stele` binary against it.
 stele-pgwire  = { workspace = true }
+# A SCRAM-enabled in-process server for the auth shell-session test (STL-296)
+# creates its users through the real SQL path — `CREATE USER … PASSWORD …` parsed
+# by `stele-sql` and run on the engine, exactly as the pgwire SCRAM tests do.
+stele-sql     = { workspace = true }
 tokio         = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # Self-signed certs for the TLS shell-session tests (STL-251).
 rcgen         = { workspace = true }
-
-# The interactive shell only engages the rustyline editor when stdin AND stdout
-# are TTYs, so the paste-handling regression test (STL-306) drives the real binary
-# over a pseudo-terminal. `nix`'s `term` feature (which carries `openpty`) is
-# already enabled in the graph by rustyline, so this adds no new compilation; it
-# is unix-only because PTYs are.
-[target.'cfg(unix)'.dev-dependencies]
-nix = { version = "0.31", features = ["term"] }
