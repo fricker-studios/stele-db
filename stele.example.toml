@@ -34,10 +34,13 @@ listen = "127.0.0.1:5454"
 # Ignored by the `memory` backend. Default: "/var/lib/stele".
 data_dir = "/var/lib/stele"
 
-# [tls]                          # TLS on pg-wire (active; STL-251)
+# [tls]                          # TLS on pg-wire + the admin surface (active; STL-251/STL-311)
 # Wire encryption via the standard Postgres SSLRequest negotiation: psql,
 # psycopg, pgjdbc, and `stele shell --tls` all speak it natively
-# (`sslmode=require` / `verify-full`). Uncomment and point at PEM files:
+# (`sslmode=require` / `verify-full`). The SAME certificate also encrypts the
+# admin / control-plane API (STL-311): the gRPC listener and the HTTPS
+# `/v1alpha1` gateway on the ops listener — one cert, no separate admin config.
+# Uncomment and point at PEM files:
 #
 # mode      = "required"         # "required" (default once [tls] is present):
 #                                #   plaintext startups are refused (FATAL 28000)
@@ -101,8 +104,11 @@ metrics = "0.0.0.0:9090"
 # SECURE DEFAULT: with no `tokens` the API rejects every request and the gRPC
 # listener is not bound — configuring a token is what turns the surface on.
 # Tokens are static bearer secrets, sent as `Authorization: Bearer <token>`;
-# they are never logged. Until admin-surface TLS lands they travel in plaintext,
-# so bind the gRPC listener to loopback (or front it with a TLS proxy) off-box.
+# they are never logged. They are only as safe as the channel: with the [tls]
+# section above, BOTH admin transports serve over TLS (STL-311); without it, a
+# non-loopback bind mints an ephemeral self-signed cert (encrypted, not
+# authenticated — STL-304) and a loopback bind stays plaintext. Configure [tls]
+# (or keep the surface on loopback) before exposing it off-box.
 #
 # tokens      = ["change-me-to-a-long-random-secret"]
 # grpc_listen = "127.0.0.1:5455"  # default "0.0.0.0:5455"; only bound when a

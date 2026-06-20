@@ -99,6 +99,11 @@ pub enum TlsError {
 #[derive(Clone)]
 pub struct ServerTls {
     pub(crate) acceptor: TlsAcceptor,
+    /// The rustls config the [`acceptor`](Self::acceptor) wraps, retained so
+    /// [`acceptor_with_alpn`](Self::acceptor_with_alpn) can mint an ALPN-tagged
+    /// variant from the same certificate material (the admin gRPC listener needs
+    /// HTTP/2 negotiated; STL-311) without re-reading the cert.
+    config: std::sync::Arc<ServerConfig>,
     pub(crate) mode: TlsMode,
     /// The RFC 5929 `tls-server-end-point` channel-binding data for the server's
     /// end-entity certificate — the certificate DER hashed with SHA-256 — or
@@ -203,11 +208,40 @@ impl ServerTls {
         }
         .with_single_cert(certs, key)?;
 
+        let config = Arc::new(config);
         Ok(Self {
-            acceptor: TlsAcceptor::from(Arc::new(config)),
+            acceptor: TlsAcceptor::from(Arc::clone(&config)),
+            config,
             mode,
             endpoint_cbind,
         })
+    }
+
+    /// The rustls acceptor this context drives, for callers that run the TLS
+    /// handshake on their own accept loop rather than through pg-wire's
+    /// `SSLRequest` negotiation. The admin / control-plane transports reuse the
+    /// pg-wire certificate material this way ([STL-311]) — gRPC and the HTTP/JSON
+    /// gateway speak TLS from the first byte, so they take the acceptor directly.
+    /// Cheap to clone (an `Arc` bump).
+    ///
+    /// [STL-311]: https://allegromusic.atlassian.net/browse/STL-311
+    #[must_use]
+    pub fn acceptor(&self) -> TlsAcceptor {
+        self.acceptor.clone()
+    }
+
+    /// An acceptor over this same certificate material but advertising the ALPN
+    /// `protocols` (e.g. `[b"h2"]`). The admin gRPC listener needs HTTP/2
+    /// negotiated by ALPN ([STL-311]); pg-wire and the HTTP/1.1 ops listener take
+    /// the plain [`acceptor`](Self::acceptor) (no ALPN), so the protocol list
+    /// lives with the caller that needs it rather than baked into every context.
+    ///
+    /// [STL-311]: https://allegromusic.atlassian.net/browse/STL-311
+    #[must_use]
+    pub fn acceptor_with_alpn(&self, protocols: &[&[u8]]) -> TlsAcceptor {
+        let mut config = (*self.config).clone();
+        config.alpn_protocols = protocols.iter().map(|p| p.to_vec()).collect();
+        TlsAcceptor::from(Arc::new(config))
     }
 }
 
@@ -290,6 +324,37 @@ impl TlsReloader {
     /// The cell the [`Server`](crate::Server) reads the live acceptor out of.
     pub(crate) fn cell(&self) -> SharedServerTls {
         Arc::clone(&self.active)
+    }
+
+    /// The TLS acceptor currently installed — the one a [`reload`](Self::reload)
+    /// most recently swapped in. Callers that run their own accept loop (the
+    /// admin / control-plane gRPC and ops HTTP transports, [STL-311]) read this
+    /// per connection, so a SIGHUP-driven rotation reaches them exactly as it
+    /// reaches the pg-wire listener — new connections present the rotated cert,
+    /// in-flight ones keep theirs. Cheap to clone (an `Arc` bump).
+    ///
+    /// [STL-311]: https://allegromusic.atlassian.net/browse/STL-311
+    #[must_use]
+    pub fn acceptor(&self) -> TlsAcceptor {
+        self.active
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .acceptor
+            .clone()
+    }
+
+    /// The live acceptor, tagged with the ALPN `protocols` — the hot-reloadable
+    /// counterpart of [`ServerTls::acceptor_with_alpn`], so the admin gRPC
+    /// listener picks up a rotated certificate while still negotiating HTTP/2
+    /// ([STL-311]).
+    ///
+    /// [STL-311]: https://allegromusic.atlassian.net/browse/STL-311
+    #[must_use]
+    pub fn acceptor_with_alpn(&self, protocols: &[&[u8]]) -> TlsAcceptor {
+        self.active
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .acceptor_with_alpn(protocols)
     }
 
     /// The acceptor currently installed — a snapshot, as the accept loop sees it.
