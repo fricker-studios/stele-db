@@ -39,7 +39,7 @@ use super::SegmentError;
 use super::format::{
     BYTES_NULL_SENTINEL, CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FOOTER_FLAG_BLOOM,
     FOOTER_FLAG_VALID_INTERVALS, FORMAT_VERSION, HEADER_LEN, HEADER_MAGIC, STAT_MAX_UNBOUNDED,
-    STAT_MIN_UNBOUNDED, TRAILER_LEN, TRAILER_MAGIC,
+    STAT_MIN_UNBOUNDED, TRAILER_LEN, TRAILER_MAGIC, code_width_for,
 };
 use super::zone_map::{Predicate, ZoneBound, ZoneEnd, ZoneMap};
 
@@ -1235,6 +1235,17 @@ fn decode_dict_bytes_chunk(
         return Err(SegmentError::Corrupt("invalid dictionary code width"));
     }
     let dict_count = p.u32()?;
+    // The code width must be wide enough to *address* the dictionary
+    // ([`code_width_for`] is the narrowest such width). A footer claiming a wider
+    // dictionary than its code width can index — e.g. a 1-byte code with a
+    // >256-entry dictionary — is corrupt: every code would alias the low 256
+    // entries. Reject it before parsing the entries rather than admit an
+    // internally-inconsistent layout the writer can never produce.
+    if code_width < usize::from(code_width_for(dict_count as usize)) {
+        return Err(SegmentError::Corrupt(
+            "dictionary code width too narrow for dictionary size",
+        ));
+    }
     // Don't pre-size from the footer-derived count — grow naturally, bounded by
     // the parser's per-field length checks against the chunk payload (the same
     // posture every other decoder takes against a corrupt count).
@@ -1704,6 +1715,20 @@ mod tests {
         assert!(
             matches!(err, SegmentError::Corrupt(m) if m.contains("code width")),
             "an invalid code width must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn dict_chunk_rejects_a_code_width_too_narrow_for_the_dictionary() {
+        // A 1-byte code addresses at most 256 entries; a footer claiming 257 with
+        // width 1 is corrupt (codes would alias the low entries) and must be
+        // rejected before the entries are parsed.
+        let entries: Vec<Option<&[u8]>> = (0..257).map(|_| Some(b"x".as_slice())).collect();
+        let payload = dict_payload(1, &entries, &[0]);
+        let err = decode_dict_bytes_chunk(&payload, 1, &mut Vec::new()).unwrap_err();
+        assert!(
+            matches!(err, SegmentError::Corrupt(m) if m.contains("too narrow")),
+            "a too-narrow code width must be rejected, got {err:?}"
         );
     }
 

@@ -347,6 +347,24 @@ impl Codec {
     }
 }
 
+/// The **canonical** [`Codec::Dict`] code width (bytes) for a dictionary of
+/// `dict_count` entries: 1 byte for ≤256 entries, 2 for ≤65536, else 4 — the
+/// dict + (byte-)packing the architecture lists. This is the single source of
+/// truth shared by the writer (which picks the narrowest width that addresses
+/// the dictionary) and the reader (which rejects a footer whose stored width
+/// disagrees with its `dict_count`, e.g. a 1-byte code claiming a >256-entry
+/// dictionary it cannot address — an internally-inconsistent layout the writer
+/// can never produce).
+pub(super) const fn code_width_for(dict_count: usize) -> u8 {
+    if dict_count <= 256 {
+        1
+    } else if dict_count <= 65536 {
+        2
+    } else {
+        4
+    }
+}
+
 /// Stable, format-level column identifiers.
 ///
 /// One enum value per column the v0.1 schema describes. Numeric values are

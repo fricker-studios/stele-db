@@ -30,7 +30,7 @@ use super::format::{
     BYTES_NULL_SENTINEL, CHUNK_HEADER_LEN, Codec, ColumnId, ColumnType, FOOTER_FLAG_BLOOM,
     FOOTER_FLAG_VALID_INTERVALS, FORMAT_VERSION, HEADER_LEN, HEADER_MAGIC,
     MAX_BYTES_STAT_PREFIX_LEN, SCHEMA_ID_IMPLICIT_VERSION, STAT_MAX_UNBOUNDED, STAT_MIN_UNBOUNDED,
-    TRAILER_LEN, TRAILER_MAGIC,
+    TRAILER_LEN, TRAILER_MAGIC, code_width_for,
 };
 
 /// Streaming writer over a single sealed-segment file.
@@ -520,7 +520,7 @@ fn encode_column(
             for row in rows {
                 vals.push(extract_bytes(col, row, valid_time)?);
             }
-            encode_bytes_values(vals.into_iter(), use_dict)
+            encode_bytes_values(&vals, use_dict)
         }
         ColumnType::I64 => {
             // Stream the per-row values straight into the encoder — no
@@ -562,16 +562,20 @@ fn encode_retraction_column(
     match col {
         // Retraction tombstone bytes columns are never NULL — wrap each value as
         // present so it shares the `Option`-aware bytes encoder ([STL-154]).
-        ColumnId::RetractKey => encode_bytes_values(
-            closes.iter().map(|c| Some(c.business_key.as_bytes())),
-            use_dict,
-        ),
-        ColumnId::RetractClosedByPrincipal => encode_bytes_values(
-            closes
+        ColumnId::RetractKey => {
+            let vals: Vec<Option<&[u8]>> = closes
                 .iter()
-                .map(|c| Some(c.closed_by.principal.as_bytes())),
-            use_dict,
-        ),
+                .map(|c| Some(c.business_key.as_bytes()))
+                .collect();
+            encode_bytes_values(&vals, use_dict)
+        }
+        ColumnId::RetractClosedByPrincipal => {
+            let vals: Vec<Option<&[u8]>> = closes
+                .iter()
+                .map(|c| Some(c.closed_by.principal.as_bytes()))
+                .collect();
+            encode_bytes_values(&vals, use_dict)
+        }
         ColumnId::RetractSysFrom => Ok(encode_i64_values(closes.iter().map(|c| c.sys_from.0))),
         // `seq` is a u64; store its bits in the i64 column (lossless round-trip —
         // see `ColumnId::RetractSeq`, same reinterpretation as `TxnId`).
@@ -611,21 +615,21 @@ fn encode_retraction_column(
 /// `MAX_BYTES_STAT_PREFIX_LEN`: the min prefix is truncated *down* and the max
 /// rounded *up*, so the `[min, max]` envelope stays a superset and `might_contain`
 /// keeps its no-false-negatives contract, regardless of value size.
-fn encode_bytes_values<'a>(
-    values: impl Iterator<Item = Option<&'a [u8]>>,
+fn encode_bytes_values(
+    values: &[Option<&[u8]>],
     use_dict: bool,
 ) -> Result<EncodedColumn, SegmentError> {
-    // Materialize once: the zone-map pass, the plain build, and the optional
-    // dictionary build each look at the values, and the iterator borrows from the
-    // row buffer (no copies). The values live exactly as long as this call.
-    let values: Vec<Option<&[u8]>> = values.collect();
+    // The caller (`encode_column` / `encode_retraction_column`) has already
+    // materialized the per-row pointers once into `values`; this takes a slice so
+    // the zone-map pass, the plain build, and the optional dictionary build all
+    // reuse that one buffer rather than re-collecting it.
 
     // Zone-map min/max over the present (non-NULL) values, and a single up-front
     // preflight of every value's `u32` length so a too-large value surfaces here
     // (localized to this column) rather than deep inside an encoder.
     let mut min: Option<&[u8]> = None;
     let mut max: Option<&[u8]> = None;
-    for value in &values {
+    for value in values {
         let Some(bytes) = *value else { continue };
         let len = u32::try_from(bytes.len())
             .map_err(|_| SegmentError::TooLarge("value length exceeds u32::MAX in one chunk"))?;
@@ -656,9 +660,9 @@ fn encode_bytes_values<'a>(
     // plus the present bytes (a NULL contributes only its 4-byte sentinel).
     let plain_size: usize = values.iter().map(|v| 4 + v.map_or(0, <[u8]>::len)).sum();
     // Keep a dictionary only when enabled *and* strictly smaller than plain.
-    let (codec, payload) = match use_dict.then(|| build_dict_payload(&values)).flatten() {
+    let (codec, payload) = match use_dict.then(|| build_dict_payload(values)).flatten() {
         Some(dict) if dict.len() < plain_size => (Codec::Dict, dict),
-        _ => (Codec::Plain, encode_plain_bytes(&values)),
+        _ => (Codec::Plain, encode_plain_bytes(values)),
     };
     Ok(EncodedColumn {
         codec,
@@ -742,21 +746,6 @@ fn build_dict_payload(values: &[Option<&[u8]>]) -> Option<Vec<u8>> {
         push_code(&mut payload, code, code_width);
     }
     Some(payload)
-}
-
-/// The narrowest code width (bytes) that addresses a dictionary of `dict_count`
-/// entries: 1 byte for ≤256 entries, 2 for ≤65536, else 4 — the dict + (byte-)
-/// packing the architecture lists. A wider dictionary is rare for a version-chain
-/// column (a key has one business key), and the size comparison in
-/// [`encode_bytes_values`] discards the dictionary anyway when it does not pay.
-const fn code_width_for(dict_count: usize) -> u8 {
-    if dict_count <= 256 {
-        1
-    } else if dict_count <= 65536 {
-        2
-    } else {
-        4
-    }
 }
 
 /// Append `code` as `code_width` little-endian bytes. `code < dict_count <=
@@ -1087,7 +1076,7 @@ mod tests {
             Some(b"c".as_slice()),
         ];
         assert!(build_dict_payload(&vals).is_none());
-        let enc = encode_bytes_values(vals.into_iter(), true).expect("encode");
+        let enc = encode_bytes_values(&vals, true).expect("encode");
         assert_eq!(enc.codec, Codec::Plain);
     }
 
@@ -1101,10 +1090,11 @@ mod tests {
         // A long key repeated many times: the dictionary stores it once plus one
         // code per row, far smaller than re-storing it each time.
         let key: &[u8] = b"a-fairly-long-repeated-business-key-value";
-        let on = encode_bytes_values((0..50).map(|_| Some(key)), true).expect("encode");
+        let vals: Vec<Option<&[u8]>> = (0..50).map(|_| Some(key)).collect();
+        let on = encode_bytes_values(&vals, true).expect("encode");
         assert_eq!(on.codec, Codec::Dict);
         // Disabled ⇒ always plain, and larger than the dictionary it declined.
-        let off = encode_bytes_values((0..50).map(|_| Some(key)), false).expect("encode");
+        let off = encode_bytes_values(&vals, false).expect("encode");
         assert_eq!(off.codec, Codec::Plain);
         assert!(
             on.payload.len() < off.payload.len(),
@@ -1121,9 +1111,11 @@ mod tests {
         // longer values alternating so the dictionary wins (and is exercised).
         let hi: &[u8] = b"mmmmmmmmmmmmmmmm";
         let lo: &[u8] = b"aaaaaaaaaaaaaaaa";
-        let row = |i: usize| Some(if i % 2 == 0 { hi } else { lo });
-        let on = encode_bytes_values((0..10).map(row), true).expect("encode");
-        let off = encode_bytes_values((0..10).map(row), false).expect("encode");
+        let vals: Vec<Option<&[u8]>> = (0..10)
+            .map(|i| Some(if i % 2 == 0 { hi } else { lo }))
+            .collect();
+        let on = encode_bytes_values(&vals, true).expect("encode");
+        let off = encode_bytes_values(&vals, false).expect("encode");
         assert_eq!(on.codec, Codec::Dict);
         assert_eq!(off.codec, Codec::Plain);
         assert_eq!(on.stat_min.bytes(), off.stat_min.bytes());
