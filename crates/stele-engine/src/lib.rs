@@ -68,7 +68,7 @@ use stele_catalog::{
 };
 use stele_common::hash::Digest;
 use stele_common::metrics::{SharedMetrics, StatementKind};
-use stele_common::period::Interval;
+use stele_common::period::{Interval, PeriodPredicate};
 use stele_common::provenance::{self, Principal, TxnId};
 use stele_common::query_stats::QueryStats;
 use stele_common::row_codec::{self, RowCodecError};
@@ -3419,6 +3419,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                         state,
                         &schema_columns,
                         value_count,
+                        valid_cols,
                         Some(&(low, high)),
                         &plan,
                         &self.metrics,
@@ -3431,6 +3432,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                         state,
                         &schema_columns,
                         value_count,
+                        valid_cols,
                         None,
                         &plan,
                         &self.metrics,
@@ -3927,11 +3929,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// rows it excludes. A key-equality predicate is pushed down to the scan for
     /// zone-map pruning; the same `Filter` re-applies it so the answer is exact
     /// regardless of what the prune could prove.
+    // The tier handles + schema + plan + valid-time column positions + metrics are
+    // each a distinct input the fused scan needs; bundling them into a context
+    // struct would only indirect the one call site.
+    #[allow(clippy::too_many_arguments)]
     fn scan_rows(
         bound: &BoundSelect,
         state: &TableState<C, D>,
         schema_columns: &[(String, LogicalType)],
         value_count: usize,
+        valid_cols: Option<(usize, usize)>,
         key_window: Option<&(BusinessKey, BusinessKey)>,
         plan: &FilterPlan,
         metrics: &SharedMetrics,
@@ -4001,6 +4008,19 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // unfiltered (every system-live version, period columns readable).
         if let Some(v) = bound.valid_snapshot {
             scan = scan.valid_as_of(ValidTimeMicros(v.0));
+        }
+        // Push a valid-time interval probe down for *segment pruning* when the
+        // `WHERE` is a per-row PERIOD predicate over this table's own valid-time
+        // period against a constant probe — `PERIOD(valid_from, valid_to)
+        // OVERLAPS / CONTAINS PERIOD(lo, hi)` ([STL-193]) — so the per-segment
+        // valid-interval summary can skip a segment whose coverage cannot overlap
+        // `[lo, hi)` ([STL-315]). Prune-only: the `Filter` below re-applies the
+        // exact predicate, so the answer is identical to the unpruned scan.
+        if let Some(cols) = valid_cols
+            && let Some(period) = bound.period_filter.as_ref()
+            && let Some((lo, hi)) = valid_overlap_probe(period, cols)
+        {
+            scan = scan.prune_valid_overlap(lo, hi);
         }
 
         // ScanSource → ExplodePayload → [Filter]: explode the packed payload into
@@ -6845,6 +6865,71 @@ fn const_period_interval(operand: &BoundPeriod) -> Option<Interval> {
     match (operand.from, operand.to) {
         (PeriodEndpoint::Const(from), PeriodEndpoint::Const(to)) => Interval::new(from, to).ok(),
         _ => None,
+    }
+}
+
+/// The half-open valid-time probe `[lo, hi)` a per-row PERIOD predicate pushes
+/// down into the scan to skip segments whose valid coverage cannot overlap it
+/// ([STL-315]), or `None` when the predicate's shape admits no sound probe.
+///
+/// Sound exactly when the predicate relates the row's **own valid-time period** —
+/// `PERIOD(valid_from, valid_to)`, the schema columns at `valid_cols` (the same
+/// `[valid_from, valid_to)` the per-segment summary indexes) — to a
+/// fully-constant probe period `PERIOD(lo, hi)`, under a predicate whose truth
+/// *requires* the two to overlap ([`period_implies_overlap`]). For those, a row
+/// whose interval does not overlap `[lo, hi)` can never satisfy the predicate, so
+/// a segment the summary proves holds no overlapping row holds no matching row —
+/// the superset contract [`SnapshotScan::prune_valid_overlap`] relies on.
+///
+/// Either operand may be the row period (the qualifying predicates are symmetric,
+/// or sound in both directions — see [`period_implies_overlap`]), so both orders
+/// are tried; the other operand must be fully constant, else there is no constant
+/// probe to push and the scan runs unpruned. A predicate over any other column
+/// pair, or against a non-constant probe, yields `None`: the prune never fires and
+/// the per-row [`Filter`] still decides every row.
+fn valid_overlap_probe(
+    period: &BoundPeriodPredicate,
+    valid_cols: (usize, usize),
+) -> Option<(i64, i64)> {
+    if !period_implies_overlap(period.predicate) {
+        return None;
+    }
+    let (from_idx, to_idx) = valid_cols;
+    let is_valid_axis = |operand: &BoundPeriod| {
+        operand.from == PeriodEndpoint::Column(from_idx)
+            && operand.to == PeriodEndpoint::Column(to_idx)
+    };
+    // One operand is the row's valid-time period; the probe is the constant
+    // interval of the other. A fully-constant predicate (both operands constant)
+    // is folded to a truth value before it reaches here ([`const_period_truth`]),
+    // and neither operand matches the column axis, so this returns `None` for it.
+    let probe = if is_valid_axis(&period.left) {
+        const_period_interval(&period.right)
+    } else if is_valid_axis(&period.right) {
+        const_period_interval(&period.left)
+    } else {
+        None
+    }?;
+    Some((probe.from, probe.to))
+}
+
+/// Whether a period predicate's truth *requires* its two operands to share at
+/// least one point — so a row whose valid interval does not overlap the probe can
+/// never satisfy it, the condition the valid-time overlap prune needs ([STL-315]).
+///
+/// True for the three SQL:2011 predicates that hold only on overlapping intervals
+/// — `OVERLAPS`, `CONTAINS` (a contained, non-empty period necessarily overlaps
+/// its container, in either operand order), `EQUALS` — and false for the
+/// disjoint-by-definition ones (`PRECEDES`, `SUCCEEDS`, and the two `IMMEDIATELY`
+/// / `MEETS` forms), which can be true *precisely when* the intervals do not
+/// overlap and so admit no overlap prune.
+const fn period_implies_overlap(predicate: PeriodPredicate) -> bool {
+    match predicate {
+        PeriodPredicate::Contains | PeriodPredicate::Overlaps | PeriodPredicate::Equals => true,
+        PeriodPredicate::Precedes
+        | PeriodPredicate::Succeeds
+        | PeriodPredicate::ImmediatelyPrecedes
+        | PeriodPredicate::ImmediatelySucceeds => false,
     }
 }
 
@@ -13054,6 +13139,198 @@ mod tests {
         // PRECEDES [40, 50): windows ending at or before 40 — keys 1 and 2, the
         // half-open touch at 40 counting (key 1's `[10, 40)` precedes `[40, 50)`).
         assert_eq!(ids(&mut engine, "PRECEDES PERIOD(40, 50)"), vec![1, 2]);
+    }
+
+    // --- STL-315: valid-time interval pruning for per-row PERIOD predicates ---
+
+    #[test]
+    fn valid_overlap_probe_extracts_only_sound_pushdowns() {
+        // A per-row PERIOD predicate over the table's own valid-time columns
+        // against a constant probe yields a segment-prune pushdown only when the
+        // predicate's truth *requires* the two periods to overlap.
+        let valid_cols = (1usize, 2usize); // (valid_from, valid_to) schema positions
+        let row = BoundPeriod {
+            from: PeriodEndpoint::Column(1),
+            to: PeriodEndpoint::Column(2),
+        };
+        let probe = BoundPeriod {
+            from: PeriodEndpoint::Const(10),
+            to: PeriodEndpoint::Const(20),
+        };
+        let pred = |predicate, left, right| BoundPeriodPredicate {
+            left,
+            predicate,
+            right,
+        };
+
+        // Overlap-implying predicates push the constant probe down, with the row
+        // period on either side (these predicates are symmetric or sound both ways).
+        for p in [
+            PeriodPredicate::Overlaps,
+            PeriodPredicate::Contains,
+            PeriodPredicate::Equals,
+        ] {
+            assert!(period_implies_overlap(p), "{p:?} implies overlap");
+            assert_eq!(
+                valid_overlap_probe(&pred(p, row, probe), valid_cols),
+                Some((10, 20)),
+                "{p:?}: row-on-left pushes the constant probe"
+            );
+            assert_eq!(
+                valid_overlap_probe(&pred(p, probe, row), valid_cols),
+                Some((10, 20)),
+                "{p:?}: row-on-right pushes the constant probe"
+            );
+        }
+
+        // Disjoint-by-definition predicates are true precisely when the periods do
+        // *not* overlap, so they admit no overlap prune.
+        for p in [
+            PeriodPredicate::Precedes,
+            PeriodPredicate::Succeeds,
+            PeriodPredicate::ImmediatelyPrecedes,
+            PeriodPredicate::ImmediatelySucceeds,
+        ] {
+            assert!(!period_implies_overlap(p), "{p:?} must not imply overlap");
+            assert_eq!(
+                valid_overlap_probe(&pred(p, row, probe), valid_cols),
+                None,
+                "{p:?} admits no overlap probe"
+            );
+        }
+
+        // A period over the wrong column pair is not this table's valid axis.
+        let other = BoundPeriod {
+            from: PeriodEndpoint::Column(3),
+            to: PeriodEndpoint::Column(4),
+        };
+        assert_eq!(
+            valid_overlap_probe(&pred(PeriodPredicate::Overlaps, other, probe), valid_cols),
+            None,
+            "a non-valid-axis column pair is not pushed"
+        );
+        // The valid columns supplied in reversed (to, from) order do not match the
+        // summary's `[valid_from, valid_to)` orientation.
+        let swapped = BoundPeriod {
+            from: PeriodEndpoint::Column(2),
+            to: PeriodEndpoint::Column(1),
+        };
+        assert_eq!(
+            valid_overlap_probe(&pred(PeriodPredicate::Overlaps, swapped, probe), valid_cols),
+            None,
+            "reversed valid columns are not the row's valid period"
+        );
+        // A non-constant "probe" (a column endpoint) leaves nothing constant to push.
+        let non_const = BoundPeriod {
+            from: PeriodEndpoint::Column(5),
+            to: PeriodEndpoint::Const(20),
+        };
+        assert_eq!(
+            valid_overlap_probe(&pred(PeriodPredicate::Overlaps, row, non_const), valid_cols),
+            None,
+            "a probe with a column endpoint is not pushable"
+        );
+        // Both operands the row axis (degenerate) — no constant probe at all.
+        assert_eq!(
+            valid_overlap_probe(&pred(PeriodPredicate::Overlaps, row, row), valid_cols),
+            None,
+        );
+    }
+
+    #[test]
+    fn backdated_per_row_period_prunes_segments_on_a_valid_gap() {
+        // STL-315 end-to-end oracle: a backdated workload sealed into one segment
+        // whose valid envelope spans the timeline but whose coverage has a gap. A
+        // per-row `PERIOD(vf, vt) OVERLAPS/CONTAINS PERIOD(lo, hi)` whose probe
+        // falls in the gap must (a) return exactly the brute-force reference and
+        // (b) skip the segment on the valid axis — byte-identical results, the
+        // summary changing only speed. A probe in a covered band must not prune.
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE booking (id INT PRIMARY KEY, vf TIMESTAMP, vt TIMESTAMP) \
+                 WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+            ))
+            .expect("create");
+
+        // Two old-band windows in [0, 10) and two new-band windows in [100, 200):
+        // the segment envelope is [0, 200) yet nothing is valid in the gap
+        // [10, 100), so the zone-map min/max cannot prune a gap probe — only the
+        // interval summary can.
+        let rows = [(1, 0, 10), (2, 2, 8), (3, 100, 150), (4, 120, 200)];
+        for (txn, &(id, vf, vt)) in rows.iter().enumerate() {
+            let payload = row_codec::encode_payload(&[
+                cell(Some(ScalarValue::Timestamp(vf))),
+                cell(Some(ScalarValue::Timestamp(vt))),
+            ]);
+            engine
+                .insert(
+                    "booking",
+                    business_key(&ScalarValue::Int4(id)),
+                    Some(ValidInterval::new(ValidTimeMicros(vf), ValidTimeMicros(vt)).unwrap()),
+                    payload,
+                    0,
+                    TxnId(u64::try_from(txn).unwrap() + 1),
+                    Principal::new(b"demo".to_vec()),
+                )
+                .expect("insert");
+        }
+        // Seal the delta into a segment carrying the valid-interval summary.
+        engine.flush().expect("flush seals the backdated rows");
+
+        let ids = |engine: &mut SessionEngine<ZeroClock, MemDisk>, pred: &str| -> Vec<i32> {
+            let sql = format!("SELECT id FROM booking WHERE PERIOD(vf, vt) {pred}");
+            let mut got: Vec<i32> = select(engine, &sql)
+                .rows
+                .into_iter()
+                .map(|row| {
+                    let bytes = row[0].clone().expect("id is never NULL");
+                    match ScalarValue::decode(LogicalType::Int4, &bytes).expect("decode id") {
+                        ScalarValue::Int4(id) => id,
+                        _ => panic!("id column is declared INT"),
+                    }
+                })
+                .collect();
+            got.sort_unstable();
+            got
+        };
+        let pruned_valid = |engine: &SessionEngine<ZeroClock, MemDisk>| {
+            engine.metrics().scan_segments_pruned_valid.get()
+        };
+
+        // OVERLAPS rows: vf < hi && lo < vt. CONTAINS rows: vf <= lo && hi <= vt.
+        // Each case names the expected result, whether a prune is expected, and
+        // runs against the segment.
+        let cases: &[(&str, Vec<i32>, bool)] = &[
+            // A probe wholly in the gap [10, 100) — no row overlaps, the segment
+            // is provably empty on the valid axis, so it is pruned.
+            ("OVERLAPS PERIOD(20, 80)", vec![], true),
+            ("CONTAINS PERIOD(30, 60)", vec![], true),
+            // Probes that reach a covered band must not prune; the result is the
+            // brute-force set.
+            ("OVERLAPS PERIOD(5, 105)", vec![1, 2, 3], false),
+            ("CONTAINS PERIOD(3, 7)", vec![1, 2], false),
+            ("OVERLAPS PERIOD(110, 130)", vec![3, 4], false),
+        ];
+        let mut total_pruned = 0u64;
+        for (pred, want, expect_prune) in cases {
+            let before = pruned_valid(&engine);
+            assert_eq!(&ids(&mut engine, pred), want, "result for `{pred}`");
+            let delta = pruned_valid(&engine) - before;
+            if *expect_prune {
+                assert_eq!(
+                    delta, 1,
+                    "`{pred}` must prune the one scatter segment on a gap"
+                );
+            } else {
+                assert_eq!(delta, 0, "`{pred}` reaches a covered band — no valid prune");
+            }
+            total_pruned += delta;
+        }
+        assert!(
+            total_pruned > 0,
+            "the overlap probe never pruned — the access path was untested"
+        );
     }
 
     // --- STL-218: plain (no-valid-pin) reads of a both-axes table ------------

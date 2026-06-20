@@ -589,11 +589,14 @@ pub struct ScanStats {
     /// index proved superseded at the snapshot — skipped after reading only the
     /// narrow identity columns, never the bulk chunks (STL-139).
     pub segments_pruned_superseded: usize,
-    /// Segments the per-segment valid-time interval summary proved hold no row
-    /// valid at the pinned valid instant — skipped with no read I/O (STL-241).
-    /// Only ever non-zero for a `FOR VALID_TIME AS OF v` read against a segment
-    /// carrying a summary; this is the backdated-write scatter case the
-    /// `valid_from` / `valid_to` zone-map min/max cannot prune.
+    /// Segments the per-segment valid-time interval summary proved hold no row on
+    /// the valid axis the read needs — skipped with no read I/O (STL-241,
+    /// STL-315). Non-zero for a `FOR VALID_TIME AS OF v` read whose `v` falls in a
+    /// coverage gap (the point stab, STL-241) **and** for a per-row PERIOD
+    /// predicate whose constant probe `[lo, hi)` overlaps no covered window (the
+    /// range stab, STL-315), in each case against a segment carrying a summary.
+    /// Both are the backdated-write scatter case the `valid_from` / `valid_to`
+    /// zone-map min/max cannot prune.
     pub segments_pruned_valid: usize,
     /// Segments that survived both prunes — their projected columns are read for
     /// any row live at the snapshot.
@@ -751,6 +754,15 @@ pub struct SnapshotScan<'a, D: Disk, I: Disk, F: DiskFile> {
     /// [`execute_range`](Self::execute_range) return **every** version whose system
     /// interval `[sys_from, sys_to)` overlaps the range.
     interval: Option<SystemRange>,
+    /// A half-open valid-time probe `[lo, hi)` to prune segments against, set via
+    /// [`prune_valid_overlap`](Self::prune_valid_overlap) ([STL-315]). **Prune
+    /// hint only** — unlike [`valid_snapshot`](Self::valid_snapshot) it filters no
+    /// row: when set, a segment whose valid-interval summary proves no row
+    /// overlaps `[lo, hi)` is skipped, but the surviving segments' rows are
+    /// returned unfiltered. The caller's per-row PERIOD predicate (which the probe
+    /// is derived from) re-applies the exact filter downstream, so the result is
+    /// byte-identical to an unpruned scan. `None` leaves every segment in play.
+    valid_overlap: Option<(i64, i64)>,
     projection: Vec<ColumnId>,
     predicate: Predicate,
     /// The session's shared metric registry, when installed via
@@ -784,6 +796,7 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             valid_snapshot: None,
             valid_time: false,
             interval: None,
+            valid_overlap: None,
             projection: ColumnId::ALL.to_vec(),
             predicate: Predicate::All,
             metrics: None,
@@ -881,6 +894,30 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
         self
     }
 
+    /// Push a half-open valid-time probe `[lo, hi)` down for **segment pruning
+    /// only** ([STL-315]): a segment whose per-segment valid-interval summary
+    /// proves no row overlaps `[lo, hi)` is skipped (counted in
+    /// [`ScanStats::segments_pruned_valid`]), the backdated-write scatter case the
+    /// `valid_from` / `valid_to` zone-map min/max cannot prune.
+    ///
+    /// Unlike [`valid_as_of`](Self::valid_as_of) this filters **no row** — it only
+    /// gates which segments are read. It is the access-path counterpart of a
+    /// per-row PERIOD predicate (`PERIOD(valid_from, valid_to) OVERLAPS / CONTAINS
+    /// PERIOD(lo, hi)`, [STL-193]) that the query executor evaluates over each
+    /// decoded row downstream: the predicate's truth *requires* the row's valid
+    /// interval to overlap `[lo, hi)`, so a segment proven to hold no overlapping
+    /// row holds no matching row. Because the executor re-applies the exact
+    /// predicate, the surviving rows are returned unfiltered here and the result
+    /// is byte-identical to an unpruned scan — the summary changes speed, never
+    /// results. The caller derives `[lo, hi)` only for predicates where overlap is
+    /// a necessary condition; the prune never fires for a segment carrying no
+    /// summary, so it never drops a real match.
+    #[must_use]
+    pub const fn prune_valid_overlap(mut self, lo: i64, hi: i64) -> Self {
+        self.valid_overlap = Some((lo, hi));
+        self
+    }
+
     /// Restrict the output to `columns`, in the given order (projection
     /// pushdown). Only the always-on version columns are projectable at v0.1;
     /// any other column surfaces [`ScanError::UnsupportedProjection`] at
@@ -939,9 +976,10 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
     ///
     /// Complementary skip stages, none of which reads a bulk column chunk: the
     /// segment-level zone map, the per-segment bloom (STL-238), the per-segment
-    /// valid-time interval summary on a valid-pinned read (STL-241), the
-    /// per-row-group zone maps (STL-173), and the validity index's "every
-    /// surviving version superseded" bound (STL-139).
+    /// valid-time interval summary on a valid-pinned read (the point stab,
+    /// STL-241) or against a per-row PERIOD predicate's probe period (the range
+    /// stab, STL-315), the per-row-group zone maps (STL-173), and the validity
+    /// index's "every surviving version superseded" bound (STL-139).
     ///
     /// `begins_after` drives the zone-map "begins after" test (a segment whose
     /// every row begins after it is pruned) and `ends_before` the validity index's
@@ -1006,6 +1044,22 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             // real match.
             if let Some(point) = self.valid_snapshot
                 && !reader.might_contain_valid(point.0)
+            {
+                pruned_valid += 1;
+                continue;
+            }
+            // Stage 1d — per-segment valid-time interval summary, range probe
+            // ([STL-315]): the access-path counterpart of a per-row PERIOD
+            // predicate (`PERIOD(valid_from, valid_to) OVERLAPS / CONTAINS
+            // PERIOD(lo, hi)`, [STL-193]). The same footer summary that answers the
+            // point stab above answers an `overlapping [lo, hi)` probe: a `false`
+            // proves no row in this segment overlaps the probe, and the predicate's
+            // truth requires overlap, so no row can match. Footer-resident, so
+            // still no chunk I/O; a segment with no summary admits every probe, so
+            // this never prunes a real match. Counts with the point stab in
+            // `segments_pruned_valid` — both skip on the valid axis.
+            if let Some((lo, hi)) = self.valid_overlap
+                && !reader.might_overlap_valid(lo, hi)
             {
                 pruned_valid += 1;
                 continue;
