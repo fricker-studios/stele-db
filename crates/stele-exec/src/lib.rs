@@ -53,6 +53,7 @@ pub use period::evaluate;
 pub use shape::{SortKey, distinct_selection, limit_selection, sort_selection};
 pub use snapshot_scan::{
     Batch, Cells, Column, GatheredColumns, ScanError, ScanOutput, ScanStats, SnapshotScan,
+    SystemRange,
 };
 // Re-exported so consumers (the binder's bound predicate, the oracle) name the
 // same period vocabulary the evaluator works in ([STL-165]).

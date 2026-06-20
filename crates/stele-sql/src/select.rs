@@ -365,6 +365,29 @@ impl BoundPredicate {
     }
 }
 
+/// A bound `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` range ([STL-244]).
+///
+/// Both endpoints are folded to concrete microsecond instants the same way an
+/// `AS OF` operand is ([`resolve_as_of`]). [`closed_upper`](Self::closed_upper)
+/// distinguishes the half-open `FROM a TO b` (the range `[from, to)`) from the
+/// closed `BETWEEN a AND b` (`[from, to]`, the SQL:2011 convention) — the only
+/// difference between the two spellings, and the source of the "off-by-one on a
+/// half-open interval" boundary class the oracle pins (docs/16 §4). A scan
+/// returns every version whose system interval `[sys_from, sys_to)` overlaps this
+/// range; the binder has already proved the range is non-empty
+/// (`from < to`, or `from <= to` when closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemTimeRange {
+    /// The inclusive lower bound, in system-time microseconds.
+    pub from: SystemTimeMicros,
+    /// The upper bound, in system-time microseconds — exclusive when
+    /// [`closed_upper`](Self::closed_upper) is `false`, inclusive when `true`.
+    pub to: SystemTimeMicros,
+    /// `true` for the closed `BETWEEN` (upper inclusive), `false` for the
+    /// half-open `FROM..TO` (upper exclusive).
+    pub closed_upper: bool,
+}
+
 /// A bound `SELECT … [FOR SYSTEM_TIME AS OF …]`, ready to lower to a
 /// `SnapshotScan`.
 ///
@@ -388,6 +411,16 @@ pub struct BoundSelect {
     /// ([STL-163]). `None` reads the valid-time table unfiltered on the valid
     /// axis — every system-live version, period columns readable ([STL-218]).
     pub valid_snapshot: Option<SystemTimeMicros>,
+    /// A bound `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` range
+    /// ([STL-244]), or `None` for a point-in-time / plain read. When `Some`, the
+    /// query is a **range scan**: the executor returns every version whose system
+    /// interval `[sys_from, sys_to)` overlaps the range — not just the one live at
+    /// [`snapshot`](Self::snapshot) — and the result appends the period endpoints
+    /// (`sys_from`, `sys_to`) after the projected columns. Mutually exclusive with
+    /// an `AS OF` point read; the binder rejects a range combined with a `JOIN`,
+    /// aggregate, `DISTINCT`/`ORDER BY`/`LIMIT`, subquery, or period predicate
+    /// (each a tracked follow-up).
+    pub system_range: Option<SystemTimeRange>,
     /// The columns the query projects.
     pub projection: Projection,
     /// The lowered `WHERE` predicate, or `None` for an unfiltered read. v0.2
@@ -1035,6 +1068,32 @@ pub enum SelectError {
     #[error("AS OF: {0}")]
     AsOf(#[from] AsOfError),
 
+    /// A `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` range scan
+    /// ([STL-244]) was combined with a clause v0.3 does not yet support over a
+    /// range — an `AS OF` point qualifier, a valid-axis range, a `JOIN`, an
+    /// aggregate / `GROUP BY`, `DISTINCT` / `ORDER BY` / `LIMIT` / `OFFSET`, a
+    /// subquery or period-predicate `WHERE`, or a CTE / derived-table source.
+    /// Each is a tracked follow-up; rejected rather than silently mis-bound.
+    #[error("unsupported range scan: {0}")]
+    UnsupportedSystemRange(String),
+
+    /// A `FOR SYSTEM_TIME` range folded to an empty or reversed interval
+    /// ([STL-244]). The half-open `FROM a TO b` requires `a < b` (it covers no
+    /// instant otherwise); the closed `BETWEEN a AND b` requires `a <= b`. Mirrors
+    /// the §2 reversed / zero-length rejection on the write path.
+    #[error(
+        "empty or reversed FOR SYSTEM_TIME range [{from}, {to}{}",
+        if *closed_upper { "]" } else { ")" }
+    )]
+    EmptySystemRange {
+        /// The folded lower bound, in microseconds.
+        from: i64,
+        /// The folded upper bound, in microseconds.
+        to: i64,
+        /// Whether the upper bound was inclusive (`BETWEEN`).
+        closed_upper: bool,
+    },
+
     /// A `PERIOD(from, to)` operand of a period predicate could not be folded to
     /// a concrete instant ([STL-165]). The endpoints fold the same way as `AS OF`
     /// expressions (`now()`, `now() ± interval`, integer microseconds).
@@ -1236,6 +1295,12 @@ fn bind_select_scoped(
     // to `ctx.snapshot`.
     let (snapshot, valid_snapshot) = resolve_snapshots(stmt, ctx.snapshot)?;
 
+    // A `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` range qualifier
+    // ([STL-244]): fold and validate it up front. A range and a point `AS OF` are
+    // mutually exclusive, so the schema still resolves at the (default `now`)
+    // snapshot above.
+    let system_range = resolve_system_range(stmt, ctx.snapshot)?;
+
     // Bind this query's non-recursive `WITH` list, extending `outer_ctes` so a
     // later CTE may reference an earlier one ([STL-242]). `sigs` is the full scope
     // (outer + this query's) the body resolves relation names against.
@@ -1250,6 +1315,14 @@ fn bind_select_scoped(
     // The `WHERE` / aggregate / `DISTINCT` / `ORDER BY` / `LIMIT` clauses compose
     // over the join's output ([STL-264]) — bound against its addressable columns.
     if let Some(join) = detect_join(select)? {
+        // A range scan over a join is a tracked follow-up — the single consistent
+        // `(sys, valid)` snapshot rule a join pins (docs/16 §8) does not generalize
+        // to an interval read of every input.
+        if system_range.is_some() {
+            return Err(SelectError::UnsupportedSystemRange(
+                "over a JOIN".to_owned(),
+            ));
+        }
         let (mut bound, mut side_ctes) = bind_join(
             stmt,
             ctx,
@@ -1382,6 +1455,54 @@ fn bind_select_scoped(
             .map(|c| (c.name().to_owned(), c.ty()))
             .collect()
     });
+
+    // A range scan ([STL-244]) is the "all versions over an interval" read. v0.3
+    // binds it only as a plain single base-table read (projection + a `WHERE`); the
+    // result-shaping, aggregation, subquery, period-predicate, and materialized-relation
+    // shapes are each a tracked follow-up — rejected here so a range scan never
+    // silently drops a clause.
+    if system_range.is_some() {
+        let reject = |what: &str| Err(SelectError::UnsupportedSystemRange(what.to_owned()));
+        if aggregate.is_some() {
+            return reject("with an aggregate / GROUP BY");
+        }
+        if distinct {
+            return reject("with DISTINCT");
+        }
+        if !order_by.is_empty() {
+            return reject("with ORDER BY");
+        }
+        if limit.is_some() || offset != 0 {
+            return reject("with LIMIT / OFFSET");
+        }
+        if subquery_filter.is_some() {
+            return reject("with a subquery WHERE");
+        }
+        if period_filter.is_some() {
+            return reject("with a period-predicate WHERE");
+        }
+        if materialized {
+            return reject("over a CTE / derived table");
+        }
+        // The range path appends `sys_from` / `sys_to` after plain projected
+        // columns. A computed expression or scalar-subquery select item ([STL-303])
+        // and a provenance pseudo-column ([STL-247]) over a range are both tracked
+        // follow-ups — rejected here rather than mis-projected by the engine's
+        // positional range path. (The general binder accepts both in any projection.)
+        if !projection.is_all_columns() {
+            return reject("with a computed or subquery projection");
+        }
+        if let Projection::Items(items) = &projection {
+            for item in items {
+                if let ProjectionValue::Column(source) = &item.value
+                    && schema.column(source).is_none()
+                {
+                    return reject("with a provenance pseudo-column");
+                }
+            }
+        }
+    }
+
     let header = aggregate.as_ref().map_or_else(
         || projected_header(schema, &projection),
         |agg| agg.columns.clone(),
@@ -1392,6 +1513,7 @@ fn bind_select_scoped(
         schema_id: schema.schema_id(),
         snapshot,
         valid_snapshot,
+        system_range,
         projection,
         filter,
         period_filter,
@@ -2556,6 +2678,9 @@ fn bind_join<'a>(
         schema_id: left.schema.schema_id(),
         snapshot,
         valid_snapshot,
+        // A range scan over a join is rejected at bind time (see the join path in
+        // `bind_select_scoped`), so the join plan never carries one.
+        system_range: None,
         projection: Projection::All,
         filter,
         period_filter: None,
@@ -4310,6 +4435,66 @@ fn resolve_snapshots(
     Ok((system.unwrap_or(now), valid))
 }
 
+/// Resolve a `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` range qualifier
+/// ([STL-244]) into a [`SystemTimeRange`], or `None` when the statement carries no
+/// range.
+///
+/// Both endpoints fold the same way an `AS OF` operand does ([`resolve_as_of`]),
+/// against `now`. A range and a point `AS OF` are contradictory shapes of the same
+/// read, so naming both is rejected here; the valid axis is a tracked follow-up,
+/// so only `SYSTEM_TIME` binds. The folded interval must be non-empty — `from < to`
+/// for the half-open `FROM..TO`, `from <= to` for the closed `BETWEEN` — mirroring
+/// the docs/16 §2 reversed / zero-length rejection.
+///
+/// # Errors
+///
+/// [`SelectError::UnsupportedSystemRange`] for a range mixed with `AS OF` or on the
+/// valid axis; [`SelectError::AsOf`] if an endpoint cannot be folded;
+/// [`SelectError::EmptySystemRange`] for an empty or reversed interval.
+fn resolve_system_range(
+    stmt: &Statement,
+    now: SystemTimeMicros,
+) -> Result<Option<SystemTimeRange>, SelectError> {
+    let Some(range) = &stmt.temporal.range else {
+        return Ok(None);
+    };
+    // A point `AS OF` and a range are two different reads of the same table; naming
+    // both is contradictory rather than a composition.
+    if !stmt.temporal.as_of.is_empty() {
+        return Err(SelectError::UnsupportedSystemRange(
+            "a FOR ... AS OF point qualifier cannot be combined with a FROM/BETWEEN range"
+                .to_owned(),
+        ));
+    }
+    // Only the system axis binds at v0.3; valid-time range scans are a tracked
+    // follow-up (the valid axis can carry many overlapping versions per key, a
+    // distinct resolution problem).
+    if matches!(range.dimension, TimeDimension::Valid) {
+        return Err(SelectError::UnsupportedSystemRange(
+            "FOR VALID_TIME range scans are not yet supported (system-time only)".to_owned(),
+        ));
+    }
+    let from = resolve_as_of(&range.from, now)?;
+    let to = resolve_as_of(&range.to, now)?;
+    let well_formed = if range.closed_upper {
+        from.0 <= to.0
+    } else {
+        from.0 < to.0
+    };
+    if !well_formed {
+        return Err(SelectError::EmptySystemRange {
+            from: from.0,
+            to: to.0,
+            closed_upper: range.closed_upper,
+        });
+    }
+    Ok(Some(SystemTimeRange {
+        from,
+        to,
+        closed_upper: range.closed_upper,
+    }))
+}
+
 /// The outcome of resolving a table name against the catalog at a snapshot.
 ///
 /// Shared by the [`SELECT`](bind_select) and [`DML`](crate::bind_dml) binders so
@@ -5095,6 +5280,12 @@ fn row_count(expr: &Expr, clause: &str) -> Result<u64, SelectError> {
 ///
 /// [STL-306]: https://allegromusic.atlassian.net/browse/STL-306
 pub fn cap_unbounded_select(stmt: &mut Statement, max_rows: u64) {
+    // A `FOR SYSTEM_TIME` range scan ([STL-244]) is an explicit history read whose
+    // binder rejects a `LIMIT`; injecting one would turn every range scan into a
+    // bind error. Leave it uncapped — like a join or a table-valued read.
+    if stmt.temporal.range.is_some() {
+        return;
+    }
     let Some(SqlStatement::Query(query)) = stmt.sql_mut() else {
         return;
     };
@@ -6187,6 +6378,109 @@ mod tests {
                 .filter,
             None
         );
+    }
+
+    #[test]
+    fn from_to_binds_a_half_open_system_range() {
+        let catalog = catalog_with_account(1_000);
+        let range = bind(
+            "SELECT * FROM account FOR SYSTEM_TIME FROM 10 TO 20",
+            &catalog,
+        )
+        .unwrap()
+        .system_range
+        .expect("a range was bound");
+        assert_eq!(range.from, SystemTimeMicros(10));
+        assert_eq!(range.to, SystemTimeMicros(20));
+        assert!(!range.closed_upper, "FROM..TO is half-open");
+    }
+
+    #[test]
+    fn between_binds_a_closed_system_range() {
+        let catalog = catalog_with_account(1_000);
+        let range = bind(
+            "SELECT * FROM account FOR SYSTEM_TIME BETWEEN 10 AND 20",
+            &catalog,
+        )
+        .unwrap()
+        .system_range
+        .expect("a range was bound");
+        assert!(range.closed_upper, "BETWEEN..AND is closed");
+        // A single-instant closed range (from == to) is valid; the equivalent
+        // half-open range is not.
+        assert!(
+            bind(
+                "SELECT * FROM account FOR SYSTEM_TIME BETWEEN 10 AND 10",
+                &catalog
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn empty_or_reversed_ranges_are_rejected() {
+        let catalog = catalog_with_account(1_000);
+        for sql in [
+            "SELECT * FROM account FOR SYSTEM_TIME FROM 20 TO 10", // reversed
+            "SELECT * FROM account FOR SYSTEM_TIME FROM 10 TO 10", // zero-length half-open
+            "SELECT * FROM account FOR SYSTEM_TIME BETWEEN 20 AND 10", // reversed closed
+        ] {
+            assert!(
+                matches!(
+                    bind(sql, &catalog),
+                    Err(SelectError::EmptySystemRange { .. })
+                ),
+                "expected EmptySystemRange for: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_range_with_a_where_binds_the_filter() {
+        let catalog = catalog_with_account(1_000);
+        let bound = bind(
+            "SELECT id FROM account FOR SYSTEM_TIME FROM 1 TO 9 WHERE id = 1",
+            &catalog,
+        )
+        .unwrap();
+        assert!(bound.system_range.is_some());
+        assert!(
+            bound.filter.is_some(),
+            "the WHERE binds alongside the range"
+        );
+    }
+
+    #[test]
+    fn a_range_combined_with_unsupported_clauses_is_rejected() {
+        let catalog = catalog_with_account(1_000);
+        for sql in [
+            // mixing a point AS OF with a range
+            "SELECT * FROM account FOR SYSTEM_TIME AS OF 5 FOR SYSTEM_TIME FROM 1 TO 9",
+            "SELECT * FROM account FOR SYSTEM_TIME FROM 1 TO 9 ORDER BY id",
+            "SELECT * FROM account FOR SYSTEM_TIME FROM 1 TO 9 LIMIT 10",
+            "SELECT DISTINCT id FROM account FOR SYSTEM_TIME FROM 1 TO 9",
+            "SELECT count(*) FROM account FOR SYSTEM_TIME FROM 1 TO 9",
+            // A provenance pseudo-column over a range is a tracked follow-up.
+            "SELECT _stele_txn_id FROM account FOR SYSTEM_TIME FROM 1 TO 9",
+        ] {
+            assert!(
+                matches!(
+                    bind(sql, &catalog),
+                    Err(SelectError::UnsupportedSystemRange(_))
+                ),
+                "expected UnsupportedSystemRange for: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_axis_range_is_not_yet_supported() {
+        // The valid axis is a tracked follow-up; only SYSTEM_TIME binds.
+        let catalog = catalog_with_booking(1_000);
+        assert!(matches!(
+            bind("SELECT * FROM booking FOR VALID_TIME FROM 1 TO 9", &catalog),
+            Err(SelectError::UnsupportedSystemRange(_))
+        ));
     }
 
     #[test]
