@@ -87,8 +87,83 @@ pub struct BindContext<'a> {
 pub enum Projection {
     /// `SELECT *` — every column of the resolved schema, in declaration order.
     All,
-    /// `SELECT a, b, …` — the named columns, in projection order.
-    Columns(Vec<String>),
+    /// `SELECT a, b AS x, a + 1 AS p, (SELECT max(b) FROM s), …` — one
+    /// [`ProjectionItem`] per select-list entry, in projection order ([STL-303]).
+    ///
+    /// [STL-303]: https://allegromusic.atlassian.net/browse/STL-303
+    Items(Vec<ProjectionItem>),
+}
+
+impl Projection {
+    /// Whether every projected item is a plain addressable column (or `*`) — the
+    /// fast path the engine projects by gathering cells, with no per-row expression
+    /// evaluation ([STL-303]). A computed expression or scalar subquery item makes
+    /// this `false`, routing the read to the materialized-projection path.
+    #[must_use]
+    pub fn is_all_columns(&self) -> bool {
+        match self {
+            Self::All => true,
+            Self::Items(items) => items
+                .iter()
+                .all(|item| matches!(item.value, ProjectionValue::Column(_))),
+        }
+    }
+}
+
+/// One select-list entry of a [`Projection::Items`] list ([STL-303]): the output
+/// column name and the value the entry projects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionItem {
+    /// The output column name on the wire: an explicit `AS` alias, a bare column's
+    /// own name, an unaliased scalar subquery's inherited inner-column name (the
+    /// Postgres rule), or the `?column?` fallback for an unaliased computed
+    /// expression.
+    pub name: String,
+    /// What this item projects.
+    pub value: ProjectionValue,
+}
+
+impl ProjectionItem {
+    /// A bare addressable column projected under its own name — the common case,
+    /// and the shape the engine's internal point-read plans build.
+    #[must_use]
+    pub fn column(name: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            name: name.clone(),
+            value: ProjectionValue::Column(name),
+        }
+    }
+}
+
+/// What a [`ProjectionItem`] projects ([STL-303]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectionValue {
+    /// A bare addressable column (a schema column or a provenance pseudo-column),
+    /// by its **source** name — resolved to an addressable index at execution. The
+    /// output name may differ (an `AS` alias) and is carried by
+    /// [`ProjectionItem::name`].
+    Column(String),
+    /// A computed scalar expression over the row, with its resolved result type.
+    /// Reuses the `WHERE` [`BoundScalar`] vocabulary (a single column anchor,
+    /// integer arithmetic, a folded literal); the engine evaluates it per row with
+    /// the same `eval_expr` the filter uses.
+    Computed {
+        /// The scalar to evaluate per row.
+        scalar: BoundScalar,
+        /// The expression's result type — the output column's wire type.
+        ty: LogicalType,
+    },
+    /// An **uncorrelated** scalar subquery, resolved once at the statement snapshot
+    /// and broadcast as a constant column (the [STL-234] `resolve_filter` fold,
+    /// materializing a value instead of a row filter). No inner row is SQL `NULL`;
+    /// more than one is SQLSTATE `21000`.
+    Subquery {
+        /// The bound inner query (capped at two rows for the cardinality check).
+        subquery: Box<BoundSelect>,
+        /// The inner's sole output column type — the output column's wire type.
+        ty: LogicalType,
+    },
 }
 
 /// One bound `ORDER BY` key: which column to sort on and in which direction
@@ -1222,13 +1297,6 @@ fn bind_select_scoped(
     // plain projection is bound only for a non-aggregate read. Detection is purely
     // syntactic, so it runs before name resolution.
     let aggregate_query = is_aggregate_query(select);
-    let projection = if aggregate_query {
-        // The output columns are the aggregate's; the projection is an unused
-        // placeholder the executor never consults on the aggregate path.
-        Projection::All
-    } else {
-        bind_projection(select)?
-    };
 
     // A valid-time `AS OF` only means something on a table with a valid-time
     // period; against a system-only table — and a query-local CTE / derived table,
@@ -1239,25 +1307,29 @@ fn bind_select_scoped(
         });
     }
 
-    // Every named projected column must exist in the schema live *at the
-    // snapshot* — a column added after the `AS OF` instant is not yet present
-    // and is rejected here rather than deferred to the executor. A provenance
-    // pseudo-column ([STL-247]) is *not* a schema column — it reads the version's
-    // stored provenance, not a user cell — so it is accepted here too; the engine
-    // resolves it against the fixed virtual layout after the table's own columns.
-    // A materialized relation (CTE / derived table) carries no provenance, so only
-    // its own columns are projectable.
-    if let Projection::Columns(columns) = &projection {
-        for column in columns {
-            let pseudo_ok = !materialized && provenance::pseudo_column_type(column).is_some();
-            if schema.column(column).is_none() && !pseudo_ok {
-                return Err(SelectError::UnknownColumn {
-                    table: table.to_owned(),
-                    column: column.clone(),
-                });
-            }
-        }
-    }
+    // Bind the projection list ([STL-303]): `*`, or one item per select-list entry
+    // — a bare column (optionally `AS`-aliased), a computed scalar expression, or an
+    // uncorrelated scalar subquery. An aggregate query takes its output columns from
+    // the aggregate plan instead, so its projection is an unused `All` placeholder
+    // the executor never consults. Each bare column is validated against the schema
+    // live *at the snapshot* — a column added after the `AS OF` instant is not yet
+    // present and is rejected here rather than deferred to the executor. A
+    // provenance pseudo-column ([STL-247]) is accepted on a base table (the engine
+    // resolves it against the fixed virtual layout after the table's own columns)
+    // but not on a materialized CTE / derived relation, which carries none.
+    let projection = if aggregate_query {
+        Projection::All
+    } else {
+        bind_projection(
+            select,
+            schema,
+            table,
+            materialized,
+            ctx,
+            snapshot,
+            valid_snapshot,
+        )?
+    };
 
     // Bind the `GROUP BY` + aggregate plan against the resolved schema, which
     // gives the grouping/argument columns their indices and types.
@@ -1618,17 +1690,30 @@ fn projected_header(schema: &TableSchema, projection: &Projection) -> Vec<(Strin
     );
     match projection {
         Projection::All => addressable[..n_schema].to_vec(),
-        Projection::Columns(names) => names
+        Projection::Items(items) => items
             .iter()
-            .map(|name| {
-                addressable
-                    .iter()
-                    .find(|(n, _)| n == name)
-                    .cloned()
-                    .expect("bind validated the projected column exists")
-            })
+            .map(|item| projection_output_column(item, &addressable))
             .collect(),
     }
+}
+
+/// The `(output name, type)` a projection item contributes to the result header
+/// ([STL-303]): a column item resolves its type from the addressable set; a
+/// computed expression / scalar subquery carries its own resolved type. The binder
+/// has already validated a column item resolves, so the lookup never misses.
+fn projection_output_column(
+    item: &ProjectionItem,
+    addressable: &[(String, LogicalType)],
+) -> (String, LogicalType) {
+    let ty = match &item.value {
+        ProjectionValue::Column(source) => addressable
+            .iter()
+            .find(|(n, _)| n == source)
+            .map(|(_, ty)| *ty)
+            .expect("bind validated the projected column exists"),
+        ProjectionValue::Computed { ty, .. } | ProjectionValue::Subquery { ty, .. } => *ty,
+    };
+    (item.name.clone(), ty)
 }
 
 /// Strip a statement's `WHERE` filter, for statement-level `Describe` ([STL-212]).
@@ -3699,16 +3784,27 @@ fn check_subquery_column_type(
 
 /// The single output column type of an inner subquery, or a
 /// [`SelectError::Subquery`] when it returns a number of columns other than one.
+fn sole_output_type(bound: &BoundSelect, catalog: &Catalog) -> Result<LogicalType, SelectError> {
+    sole_output_column(bound, catalog).map(|(_, ty)| ty)
+}
+
+/// The single `(name, type)` output column of an inner subquery, or a
+/// [`SelectError::Subquery`] when it returns a number of columns other than one
+/// ([STL-303]). The name is what an unaliased scalar subquery inherits as its
+/// output column name (the Postgres rule).
 ///
 /// Mirrors the engine's output-column resolution: an aggregate query's columns
 /// are its [`BoundAggregate::columns`], a join's its [`BoundJoin::columns`], and a
 /// plain projection's are read from the schema live at the inner's snapshot.
-fn sole_output_type(bound: &BoundSelect, catalog: &Catalog) -> Result<LogicalType, SelectError> {
+fn sole_output_column(
+    bound: &BoundSelect,
+    catalog: &Catalog,
+) -> Result<(String, LogicalType), SelectError> {
     if let Some(agg) = &bound.aggregate {
-        return single_output_type(&agg.columns);
+        return single_output_column(&agg.columns);
     }
     if let Some(join) = &bound.join {
-        return single_output_type(&join.columns);
+        return single_output_column(&join.columns);
     }
     // `bind_select` already resolved the inner table here, so a miss is a
     // contract break rather than user input.
@@ -3728,28 +3824,40 @@ fn sole_output_type(bound: &BoundSelect, catalog: &Catalog) -> Result<LogicalTyp
                     columns.len()
                 )));
             }
-            Ok(columns[0].ty())
+            Ok((columns[0].name().to_owned(), columns[0].ty()))
         }
-        Projection::Columns(names) => match names.as_slice() {
-            [name] => {
-                let index = column_index(schema, name).ok_or_else(|| {
-                    SelectError::Subquery(format!("unknown subquery column {name:?}"))
-                })?;
-                Ok(schema.columns()[index].ty())
-            }
+        Projection::Items(items) => match items.as_slice() {
+            [item] => Ok((item.name.clone(), projection_item_type(item, schema)?)),
             _ => Err(SelectError::Subquery(format!(
                 "a subquery used here must return one column, but it returns {}",
-                names.len()
+                items.len()
             ))),
         },
     }
 }
 
-/// The type of a one-element `(name, type)` output-column list, or a
+/// The result type of a single inner-subquery projection item ([STL-303]): a column
+/// item resolves its source column's type from the inner schema; a computed
+/// expression / scalar subquery carries its own resolved type.
+fn projection_item_type(
+    item: &ProjectionItem,
+    schema: &TableSchema,
+) -> Result<LogicalType, SelectError> {
+    match &item.value {
+        ProjectionValue::Column(source) => resolve_filter_column(schema, source)
+            .map(|(_, ty)| ty)
+            .ok_or_else(|| SelectError::Subquery(format!("unknown subquery column {source:?}"))),
+        ProjectionValue::Computed { ty, .. } | ProjectionValue::Subquery { ty, .. } => Ok(*ty),
+    }
+}
+
+/// The single `(name, type)` of a one-element output-column list, or a
 /// [`SelectError::Subquery`] when the list is not exactly one column.
-fn single_output_type(columns: &[(String, LogicalType)]) -> Result<LogicalType, SelectError> {
+fn single_output_column(
+    columns: &[(String, LogicalType)],
+) -> Result<(String, LogicalType), SelectError> {
     match columns {
-        [(_, ty)] => Ok(*ty),
+        [(name, ty)] => Ok((name.clone(), *ty)),
         _ => Err(SelectError::Subquery(format!(
             "a subquery used here must return one column, but it returns {}",
             columns.len()
@@ -4537,25 +4645,222 @@ fn single_table(select: &Select) -> Result<&str, SelectError> {
     }
 }
 
-/// Lower the projection list to [`Projection`]: `*` or bare column names only.
-fn bind_projection(select: &Select) -> Result<Projection, SelectError> {
+/// The outer-query context a projection item binds against ([STL-303]): the
+/// resolved schema/table (for column resolution), the relation alias and the
+/// per-statement snapshot (for a scalar subquery's correlation scope and snapshot
+/// inheritance), and whether the relation is a materialized CTE / derived table
+/// (which has no provenance pseudo-columns).
+struct ProjectionScope<'a> {
+    schema: &'a TableSchema,
+    table: &'a str,
+    alias: Option<&'a str>,
+    materialized: bool,
+    catalog: &'a Catalog,
+    snapshot: SystemTimeMicros,
+    valid_snapshot: Option<SystemTimeMicros>,
+}
+
+/// Lower the projection list to [`Projection`] ([STL-303]): `*` ([`Projection::All`]),
+/// or a [`ProjectionItem`] per select-list entry — a bare column (optionally
+/// `AS`-aliased), a computed scalar expression, or an uncorrelated scalar subquery.
+///
+/// Every bare column is validated against the schema live at the snapshot (a
+/// provenance pseudo-column is accepted on a base table, [STL-247], but not on a
+/// materialized relation). A computed expression reuses the `WHERE` [`BoundScalar`]
+/// vocabulary; a scalar subquery binds under the same per-statement snapshot
+/// (docs/16 §6) and must be uncorrelated and single-column.
+#[allow(clippy::too_many_arguments)]
+fn bind_projection(
+    select: &Select,
+    schema: &TableSchema,
+    table: &str,
+    materialized: bool,
+    ctx: &BindContext,
+    snapshot: SystemTimeMicros,
+    valid_snapshot: Option<SystemTimeMicros>,
+) -> Result<Projection, SelectError> {
     // `SELECT *` is the lone wildcard item.
     if let [SelectItem::Wildcard(_)] = select.projection.as_slice() {
         return Ok(Projection::All);
     }
-    let mut columns = Vec::with_capacity(select.projection.len());
+    let scope = ProjectionScope {
+        schema,
+        table,
+        alias: select_table_alias(select),
+        materialized,
+        catalog: ctx.catalog,
+        snapshot,
+        valid_snapshot,
+    };
+    let mut items = Vec::with_capacity(select.projection.len());
     for item in &select.projection {
-        match item {
-            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => columns.push(ident.value.clone()),
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
             SelectItem::Wildcard(_) => {
                 return Err(SelectError::UnsupportedProjection(
                     "`*` mixed with named columns".to_owned(),
                 ));
             }
             other => return Err(SelectError::UnsupportedProjection(other.to_string())),
-        }
+        };
+        items.push(bind_projection_item(unwrap_nested(expr), alias, &scope)?);
     }
-    Ok(Projection::Columns(columns))
+    Ok(Projection::Items(items))
+}
+
+/// Bind one select-list entry to a [`ProjectionItem`] ([STL-303]): a bare column,
+/// an uncorrelated scalar subquery, or a computed scalar expression — in that order
+/// of recognition. `alias` is the explicit `AS` name, if any.
+fn bind_projection_item(
+    expr: &Expr,
+    alias: Option<String>,
+    scope: &ProjectionScope,
+) -> Result<ProjectionItem, SelectError> {
+    // 1. A bare addressable column — the fast path. An `AS` alias only renames the
+    //    output; the source column is still looked up by its own name.
+    if let Expr::Identifier(id) = expr {
+        let source = id.value.clone();
+        let pseudo_ok = !scope.materialized && provenance::pseudo_column_type(&source).is_some();
+        if scope.schema.column(&source).is_none() && !pseudo_ok {
+            return Err(SelectError::UnknownColumn {
+                table: scope.table.to_owned(),
+                column: source,
+            });
+        }
+        let name = alias.unwrap_or_else(|| source.clone());
+        return Ok(ProjectionItem {
+            name,
+            value: ProjectionValue::Column(source),
+        });
+    }
+    // 2. An uncorrelated scalar subquery `(SELECT …)`.
+    if let Some(query) = as_subquery(expr) {
+        return bind_projected_subquery(query, alias, scope);
+    }
+    // 3. A computed scalar expression (`a + 1`, `1`).
+    let (scalar, ty) = bind_projection_scalar(expr, scope.schema, scope.table)?;
+    let name = alias.unwrap_or_else(|| "?column?".to_owned());
+    Ok(ProjectionItem {
+        name,
+        value: ProjectionValue::Computed { scalar, ty },
+    })
+}
+
+/// Bind an uncorrelated scalar subquery in the SELECT list ([STL-303]).
+///
+/// The inner binds under the same per-statement snapshot as the outer (docs/16 §6),
+/// inheriting any `FOR VALID_TIME AS OF` pin, and must be **uncorrelated** (a
+/// correlated SELECT-list scalar subquery rides STL-239) and **single-column**. The
+/// inner is capped at two rows so the engine can raise the `21000` cardinality
+/// violation without materializing an arbitrarily large result. An unaliased
+/// subquery inherits the inner's sole output column name (the Postgres rule).
+fn bind_projected_subquery(
+    query: &Query,
+    alias: Option<String>,
+    scope: &ProjectionScope,
+) -> Result<ProjectionItem, SelectError> {
+    let inner_ctx = BindContext {
+        snapshot: scope.snapshot,
+        catalog: scope.catalog,
+    };
+    let outer = OuterScope {
+        table: scope.table,
+        alias: scope.alias,
+        schema: scope.schema,
+    };
+    let (mut inner, correlation) =
+        bind_inner_query(query, &outer, &inner_ctx, /* exists = */ false)?;
+    if correlation.is_some() {
+        return Err(SelectError::Subquery(
+            "a correlated scalar subquery in the SELECT list is not supported yet \
+             (it rides STL-239)"
+                .to_owned(),
+        ));
+    }
+    let (inner_name, ty) = sole_output_column(&inner, scope.catalog)?;
+    inner.limit = Some(inner.limit.map_or(2, |existing| existing.min(2)));
+    inherit_valid_snapshot(&mut inner, scope.valid_snapshot, scope.catalog)?;
+    let name = alias.unwrap_or(inner_name);
+    Ok(ProjectionItem {
+        name,
+        value: ProjectionValue::Subquery {
+            subquery: Box::new(inner),
+            ty,
+        },
+    })
+}
+
+/// Bind a computed (non-column, non-subquery) projection expression to a
+/// [`BoundScalar`] and its result type ([STL-303]).
+///
+/// Reuses the `WHERE` scalar vocabulary: an expression referencing exactly one
+/// column anchors on that column's type (`a + 1`, `qty % 2`); a column-free
+/// expression must be a single literal, whose type is inferred from its shape (`1`
+/// is `int4`, `'x'` is `text`). Two or more distinct columns, or column-free
+/// arithmetic, is an [`UnsupportedProjection`](SelectError::UnsupportedProjection)
+/// (a tracked follow-up).
+///
+/// The anchor resolves against **schema columns only** — unlike a `WHERE` scalar,
+/// a provenance pseudo-column ([STL-247]) is *not* usable inside a computed
+/// expression (the engine's `eval_projection_scalar` decodes schema columns alone),
+/// so a pseudo-column here is [`SelectError::UnknownColumn`]; it stays projectable
+/// only as a bare column.
+fn bind_projection_scalar(
+    expr: &Expr,
+    schema: &TableSchema,
+    table: &str,
+) -> Result<(BoundScalar, LogicalType), SelectError> {
+    let mut names: Vec<&str> = Vec::new();
+    collect_where_columns(expr, &mut names);
+    names.sort_unstable();
+    names.dedup();
+    match names.as_slice() {
+        [name] => {
+            let index = column_index(schema, name).ok_or_else(|| SelectError::UnknownColumn {
+                table: table.to_owned(),
+                column: (*name).to_owned(),
+            })?;
+            let ty = schema.columns()[index].ty();
+            let anchor = FilterAnchor { name, index, ty };
+            let scalar = bind_scalar(expr, &anchor, schema, table)?;
+            Ok((scalar, ty))
+        }
+        [] => {
+            let value = infer_constant_projection(expr)?;
+            let ty = value.logical_type();
+            Ok((BoundScalar::Literal(value), ty))
+        }
+        _ => Err(SelectError::UnsupportedProjection(
+            "a computed select item may reference at most one column".to_owned(),
+        )),
+    }
+}
+
+/// Infer the value and type of a column-free constant projection item ([STL-303]):
+/// an integer literal (`int4`, or `int8` if it overflows `i32`), a single-quoted
+/// string (`text`), or a boolean (`bool`) — the literal shapes the smoke-test /
+/// `hash` constant paths already fold. Anything else (NULL, a float, column-free
+/// arithmetic, a non-literal) is an
+/// [`UnsupportedProjection`](SelectError::UnsupportedProjection).
+fn infer_constant_projection(expr: &Expr) -> Result<ScalarValue, SelectError> {
+    if let Some(digits) = fold::signed_number(expr) {
+        if let Ok(v) = digits.parse::<i32>() {
+            return Ok(ScalarValue::Int4(v));
+        }
+        if let Ok(v) = digits.parse::<i64>() {
+            return Ok(ScalarValue::Int8(v));
+        }
+        // A wider-than-`i64` integer or a decimal (no `float8` literal codec) falls
+        // through to the generic rejection below.
+    }
+    match fold::literal(expr) {
+        Some(Value::SingleQuotedString(s)) => Ok(ScalarValue::Text(s.clone())),
+        Some(Value::Boolean(b)) => Ok(ScalarValue::Bool(*b)),
+        _ => Err(SelectError::UnsupportedProjection(format!(
+            "constant select item `{expr}` is not a supported literal"
+        ))),
+    }
 }
 
 /// Bind the `SELECT [ALL | DISTINCT]` set quantifier ([STL-263]).
@@ -4657,7 +4962,7 @@ fn bind_sort_key(
     // the schema order, so a schema hit *is* the output position.
     let output_pos = match projection {
         Projection::All => column_index(schema, name),
-        Projection::Columns(names) => names.iter().position(|n| n == name),
+        Projection::Items(items) => items.iter().position(|item| item.name == name),
     };
     if let Some(pos) = output_pos {
         return output(pos);
@@ -5025,7 +5330,10 @@ mod tests {
         let bound = bind_select(&described, &ctx).expect("the stripped copy binds");
         assert_eq!(
             bound.projection,
-            Projection::Columns(vec!["id".to_owned(), "balance".to_owned()])
+            Projection::Items(vec![
+                ProjectionItem::column("id"),
+                ProjectionItem::column("balance"),
+            ])
         );
         assert!(bound.filter.is_none(), "no filter survives the strip");
     }
@@ -5134,7 +5442,7 @@ mod tests {
         assert_eq!(bound.table, "account");
         assert_eq!(
             bound.projection,
-            Projection::Columns(vec!["balance".to_owned()])
+            Projection::Items(vec![ProjectionItem::column("balance")])
         );
     }
 
@@ -5764,7 +6072,10 @@ mod tests {
         let ok = parse_one("SELECT id, balance FROM account");
         assert_eq!(
             bind_select(&ok, &ctx).expect("bind").projection,
-            Projection::Columns(vec!["id".to_owned(), "balance".to_owned()])
+            Projection::Items(vec![
+                ProjectionItem::column("id"),
+                ProjectionItem::column("balance"),
+            ])
         );
     }
 
@@ -5795,11 +6106,11 @@ mod tests {
         );
         assert_eq!(
             bind_select(&stmt, &ctx).expect("bind").projection,
-            Projection::Columns(vec![
-                "id".to_owned(),
-                "_stele_txn_id".to_owned(),
-                "_stele_committed_at".to_owned(),
-                "_stele_principal".to_owned(),
+            Projection::Items(vec![
+                ProjectionItem::column("id"),
+                ProjectionItem::column("_stele_txn_id"),
+                ProjectionItem::column("_stele_committed_at"),
+                ProjectionItem::column("_stele_principal"),
             ])
         );
     }
@@ -7435,7 +7746,10 @@ mod tests {
                 ("balance".to_owned(), LogicalType::Int4),
             ])
         );
-        assert_eq!(bound.projection, Projection::Columns(vec!["id".to_owned()]));
+        assert_eq!(
+            bound.projection,
+            Projection::Items(vec![ProjectionItem::column("id")])
+        );
         // The CTE body is a plain base-table read of `account`.
         assert_eq!(bound.ctes[0].plan.table, "account");
         assert_eq!(bound.ctes[0].plan.relation_columns, None);
@@ -7488,7 +7802,10 @@ mod tests {
                 ("v".to_owned(), LogicalType::Int4),
             ]
         );
-        assert_eq!(bound.projection, Projection::Columns(vec!["k".to_owned()]));
+        assert_eq!(
+            bound.projection,
+            Projection::Items(vec![ProjectionItem::column("k")])
+        );
     }
 
     #[test]
