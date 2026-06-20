@@ -369,6 +369,29 @@ impl<D: Disk> Delta<D> {
         self.merge_staged()
     }
 
+    /// The number of staged versions across the in-memory tier and every spill —
+    /// the delta's contribution to the live-keyspace estimate the cost-based
+    /// `MERGE` probe-plan choice uses ([STL-312]).
+    ///
+    /// Cheaper than [`staged_versions`](Self::staged_versions): the in-memory
+    /// count is O(distinct keys) and clones no `Version`, and a spill is counted
+    /// only by reading it (rare — only a delta past the spill threshold spills at
+    /// all). It is an **estimate**, not a strict count: a version re-staged after
+    /// its first copy spilled is counted in both tiers, so the figure can run a
+    /// hair high. That only nudges a borderline plan choice toward the indexed
+    /// probe and never changes a result, so the slack is harmless here.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces I/O or corruption errors loading a delta spill file.
+    pub fn staged_len(&self) -> Result<usize, DeltaError> {
+        let mut n = self.mem.len();
+        for &idx in &self.live_spills {
+            n += spill::read_spill(&self.disk, idx)?.len();
+        }
+        Ok(n)
+    }
+
     /// Every staged retraction tombstone, in `(business_key, sys_from, seq)` order,
     /// **without** draining the buffer — the tombstone half of the non-draining
     /// flush snapshot (see [`staged_versions`](Self::staged_versions)). Unlike
