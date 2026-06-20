@@ -94,7 +94,7 @@ toml               = "1.1"
 # one piece that cannot be, and `getrandom` is the ecosystem's narrow,
 # cross-platform answer — already in the tree transitively via rand/ring.
 # `std` carries the io::Error conversion the failure path surfaces through.
-getrandom          = { version = "0.3", features = ["std"] }
+getrandom          = { version = "0.4", features = ["std"] }
 tokio              = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
 # TLS on pg-wire (STL-251). `ring` instead of the default `aws-lc-rs` provider:
 # ring is already in the dependency tree, builds clean on every CI target
