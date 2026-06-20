@@ -116,8 +116,8 @@ use stele_common::scram::ScramVerifier;
 use stele_common::time::Clock;
 use stele_common::types::{DecodeError, LogicalType, ScalarValue};
 use stele_engine::{
-    DmlSummary, EngineError, SelectResult, SessionEngine, SessionTransaction, StatementOutcome,
-    TableDescription,
+    DmlSummary, EngineError, IsolationLevel, SelectResult, SessionEngine, SessionTransaction,
+    StatementOutcome, TableDescription,
 };
 use stele_storage::backend::Disk;
 
@@ -125,8 +125,8 @@ use stele_storage::backend::Disk;
 // from there, so matching on the AST adds no new dependency.
 use stele_sql::select::SelectError;
 use stele_sql::sqlparser::ast::{
-    CopyTarget, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr,
-    Statement as SqlStatement, UnaryOperator, Value,
+    CopyTarget, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, Set, SetExpr,
+    Statement as SqlStatement, TransactionIsolationLevel, TransactionMode, UnaryOperator, Value,
 };
 use stele_sql::{
     BindError, CopyError, CopyShape, DmlError, Statement, bind_ddl, cap_unbounded_select,
@@ -326,12 +326,20 @@ pub trait SessionHandle: Send {
         txn: &SessionTransaction,
     ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError>;
 
-    /// Open a multi-statement transaction, **pinning its read snapshot now** — see
-    /// [`SessionEngine::begin`] ([STL-174], [STL-175]).
+    /// Open a multi-statement transaction reading under `isolation`, **pinning its
+    /// read snapshot now** — see [`SessionEngine::begin_with_isolation`] ([STL-174],
+    /// [STL-175], [STL-248]).
     ///
     /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
     /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
-    fn begin(&self) -> SessionTransaction;
+    /// [STL-248]: https://allegromusic.atlassian.net/browse/STL-248
+    fn begin_with_isolation(&self, isolation: IsolationLevel) -> SessionTransaction;
+
+    /// Open a transaction at the default isolation level (snapshot isolation) — the
+    /// [`begin_with_isolation`](Self::begin_with_isolation) shorthand ([STL-174]).
+    fn begin(&self) -> SessionTransaction {
+        self.begin_with_isolation(IsolationLevel::default())
+    }
 
     /// Run one statement inside an open transaction: a buffered `INSERT`/`UPDATE`/
     /// `DELETE`, or a `SELECT`/DDL run at once against the pinned snapshot — see
@@ -486,8 +494,8 @@ where
         Self::describe_in_txn(self, stmt, txn)
     }
 
-    fn begin(&self) -> SessionTransaction {
-        Self::begin(self)
+    fn begin_with_isolation(&self, isolation: IsolationLevel) -> SessionTransaction {
+        Self::begin_with_isolation(self, isolation)
     }
 
     fn execute_in_txn(
@@ -836,8 +844,13 @@ impl ConnTxn {
 /// The savepoint variants borrow their name from the statement; Stele matches
 /// savepoint names verbatim, as it does table and column names (no case-folding).
 enum TxnControl<'a> {
-    /// `BEGIN` / `START TRANSACTION`.
-    Begin,
+    /// `BEGIN` / `START TRANSACTION`, with the isolation level the `ISOLATION LEVEL`
+    /// modes resolved to ([STL-248]): `Ok(None)` for none given (use the default),
+    /// `Err` naming an unsupported level (`SERIALIZABLE`).
+    Begin(Result<Option<IsolationLevel>, &'static str>),
+    /// `SET TRANSACTION ISOLATION LEVEL …` (or `SET SESSION CHARACTERISTICS AS
+    /// TRANSACTION …`), resolved as for [`Begin`](Self::Begin) ([STL-248]).
+    SetTransaction(Result<Option<IsolationLevel>, &'static str>),
     /// `COMMIT` / `END`.
     Commit,
     /// `ROLLBACK` / `ABORT` (without a savepoint target).
@@ -856,7 +869,19 @@ fn txn_control(stmt: &Statement) -> Option<TxnControl<'_>> {
     // An admin command (CHECKPOINT / FLUSH) has no SQL body and is not txn
     // control — `sql()` is `None`, so it falls through to the engine route.
     match stmt.sql()? {
-        SqlStatement::StartTransaction { .. } => Some(TxnControl::Begin),
+        SqlStatement::StartTransaction { modes, .. } => {
+            Some(TxnControl::Begin(isolation_from_modes(modes)))
+        }
+        // `SET TRANSACTION ISOLATION LEVEL …` selects the level for the open block
+        // ([STL-248]). Only the per-transaction form (`session: false`) is
+        // transaction control; the `SET SESSION CHARACTERISTICS AS TRANSACTION …`
+        // session-default form (`session: true`), and every other `SET`, fall
+        // through to the engine route — Stele does not model session defaults.
+        SqlStatement::Set(Set::SetTransaction {
+            modes,
+            session: false,
+            ..
+        }) => Some(TxnControl::SetTransaction(isolation_from_modes(modes))),
         SqlStatement::Commit { .. } => Some(TxnControl::Commit),
         SqlStatement::Rollback {
             savepoint: None, ..
@@ -868,6 +893,45 @@ fn txn_control(stmt: &Statement) -> Option<TxnControl<'_>> {
         SqlStatement::Savepoint { name } => Some(TxnControl::Savepoint(name.value.as_str())),
         SqlStatement::ReleaseSavepoint { name } => Some(TxnControl::Release(name.value.as_str())),
         _ => None,
+    }
+}
+
+/// Resolve the `ISOLATION LEVEL` among a `BEGIN` / `SET TRANSACTION`'s modes to the
+/// engine [`IsolationLevel`] ([STL-248]). `Ok(None)` when no isolation mode was
+/// given (the caller uses the default); the last one wins if several are listed,
+/// matching Postgres. Access modes (`READ ONLY` / `READ WRITE`) are accepted and
+/// ignored — Stele has no read-only enforcement yet. `Err` names a level Stele does
+/// not implement, so the caller can reject it rather than under-deliver silently.
+fn isolation_from_modes(modes: &[TransactionMode]) -> Result<Option<IsolationLevel>, &'static str> {
+    let mut level = None;
+    for mode in modes {
+        if let TransactionMode::IsolationLevel(iso) = mode {
+            level = Some(map_isolation(*iso)?);
+        }
+    }
+    Ok(level)
+}
+
+/// Map a SQL isolation level to Stele's [`IsolationLevel`] ([STL-248], [ADR-0008]).
+///
+/// `READ COMMITTED` is the selectable lower level; `READ UNCOMMITTED` can be no
+/// weaker than it here (append-only MVCC never exposes an uncommitted version), so
+/// it maps there too. `REPEATABLE READ` is Stele's snapshot-isolation default, and
+/// `SNAPSHOT` names the same thing. True `SERIALIZABLE` (SSI) is a later opt-in
+/// (v0.7); aliasing it to snapshot isolation would be a false serializability
+/// promise, so it is rejected rather than quietly under-delivered.
+const fn map_isolation(iso: TransactionIsolationLevel) -> Result<IsolationLevel, &'static str> {
+    match iso {
+        TransactionIsolationLevel::ReadCommitted | TransactionIsolationLevel::ReadUncommitted => {
+            Ok(IsolationLevel::ReadCommitted)
+        }
+        TransactionIsolationLevel::RepeatableRead | TransactionIsolationLevel::Snapshot => {
+            Ok(IsolationLevel::RepeatableRead)
+        }
+        TransactionIsolationLevel::Serializable => Err(
+            "serializable isolation is not yet supported; use REPEATABLE READ \
+             (snapshot isolation) or READ COMMITTED",
+        ),
     }
 }
 
@@ -1336,9 +1400,9 @@ async fn handle_simple_query<S: Wire>(
         // aborted state.
         if let Some(ctl) = txn_control(stmt) {
             let proceed = match ctl {
-                TxnControl::Begin => {
-                    run_begin(stream, session, txn).await?;
-                    true
+                TxnControl::Begin(isolation) => run_begin(stream, session, txn, isolation).await?,
+                TxnControl::SetTransaction(isolation) => {
+                    run_set_transaction(stream, txn, isolation).await?
                 }
                 // A failed COMMIT writes an ErrorResponse and returns `false`, so
                 // the batch aborts here like any other statement error — nothing
@@ -1478,32 +1542,105 @@ async fn run_non_ddl<S: Wire>(
 /// `BEGIN` / `START TRANSACTION` — open an explicit transaction block ([STL-174]).
 ///
 /// From idle this enters [`ConnTxn::Active`] with an empty write buffer, **pinning
-/// the transaction's read snapshot** through [`SessionHandle::begin`] so every
-/// statement in the block reads one consistent system-time snapshot (snapshot
-/// isolation, [STL-175]). A `BEGIN` already inside a transaction (active or
-/// aborted) leaves the state — and the pinned snapshot — untouched, as Postgres
-/// warns but stays in the block, and still reports `BEGIN`.
+/// the transaction's read snapshot** through
+/// [`SessionHandle::begin_with_isolation`] so every statement reads one consistent
+/// snapshot (snapshot isolation, the `REPEATABLE READ` default) — or, under
+/// `BEGIN ISOLATION LEVEL READ COMMITTED`, re-pins per statement ([STL-248]). A
+/// `BEGIN` already inside a transaction (active or aborted) is a warning-only no-op
+/// in Postgres: it leaves the state — the pinned snapshot and its level — untouched
+/// and still reports `BEGIN`. The requested isolation modes are therefore
+/// interpreted **only** on the transition from idle into a new transaction; a nested
+/// `BEGIN ISOLATION LEVEL …` (even an unsupported one) is ignored, not validated.
+///
+/// Returns whether the batch may continue: `Ok(false)` only when an idle-to-active
+/// `BEGIN` named an unsupported `ISOLATION LEVEL` (`SERIALIZABLE`) — an
+/// `ErrorResponse` is written and the caller aborts the batch.
 ///
 /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
 /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
+/// [STL-248]: https://allegromusic.atlassian.net/browse/STL-248
 async fn run_begin<S: Wire>(
     stream: &mut S,
     session: &SharedSession,
     txn: &mut ConnTxn,
-) -> Result<(), WireError> {
+    isolation: Result<Option<IsolationLevel>, &'static str>,
+) -> Result<bool, WireError> {
     if matches!(txn, ConnTxn::Idle) {
+        // Only the idle-to-active transition interprets the requested level; a
+        // `BEGIN` inside an existing block ignores the modes (Postgres parity), so
+        // an unsupported level there is *not* an error.
+        let level = match isolation {
+            Ok(level) => level.unwrap_or_default(),
+            Err(msg) => return reject_isolation(stream, txn, msg).await,
+        };
         // Pin the read snapshot now, at BEGIN. The guard is taken and released
         // entirely within this synchronous call — never held across the `await`
         // below — and a poisoned mutex is recovered, as in `run_ddl`.
         let buffered = session
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .begin();
+            .begin_with_isolation(level);
         *txn = ConnTxn::Active(buffered);
     }
-    write_command_complete_tag(stream, "BEGIN")
-        .await
-        .map_err(WireError::Io)
+    write_command_complete_tag(stream, "BEGIN").await?;
+    Ok(true)
+}
+
+/// `SET TRANSACTION ISOLATION LEVEL …` — select the isolation level of the open
+/// transaction block ([STL-248]).
+///
+/// Matches Postgres's state rules for `SET TRANSACTION`:
+/// * **Active block** — changes the transaction's level in place (it takes effect
+///   from the next statement; under `READ COMMITTED` the snapshot then re-pins per
+///   statement). A `SET` with no isolation mode (e.g. `READ ONLY` alone) is a no-op
+///   that still reports `SET`; an unsupported level (`SERIALIZABLE`) is rejected.
+/// * **No transaction open** — refused with `25P01` ("SET TRANSACTION can only be
+///   used in transaction blocks"). (The session-default form,
+///   `SET SESSION CHARACTERISTICS AS TRANSACTION …`, is not classified as
+///   transaction control and routes to the engine; Stele does not model session
+///   defaults.)
+/// * **Aborted block** — refused with `25P02`, like every other statement there,
+///   until the block ends ([STL-205]).
+///
+/// Returns whether the batch may continue (`Ok(false)` on any of the refusals).
+///
+/// [STL-205]: https://allegromusic.atlassian.net/browse/STL-205
+async fn run_set_transaction<S: Wire>(
+    stream: &mut S,
+    txn: &mut ConnTxn,
+    isolation: Result<Option<IsolationLevel>, &'static str>,
+) -> Result<bool, WireError> {
+    // State takes precedence over the level, as in Postgres: an aborted block
+    // refuses everything, and `SET TRANSACTION` outside a block is invalid — both
+    // independent of which level was named.
+    if matches!(txn, ConnTxn::Failed(_)) {
+        return savepoint_in_aborted_txn(stream).await;
+    }
+    if matches!(txn, ConnTxn::Idle) {
+        return savepoint_not_in_txn(stream, "SET TRANSACTION").await;
+    }
+    let level = match isolation {
+        Ok(level) => level,
+        Err(msg) => return reject_isolation(stream, txn, msg).await,
+    };
+    if let (Some(level), ConnTxn::Active(buffered)) = (level, &mut *txn) {
+        buffered.set_isolation(level);
+    }
+    write_command_complete_tag(stream, "SET").await?;
+    Ok(true)
+}
+
+/// Reject an unsupported `ISOLATION LEVEL` (`SERIALIZABLE`): write a
+/// feature-not-supported `ErrorResponse`, abort any open block, and signal the
+/// batch to stop ([STL-248]).
+async fn reject_isolation<S: Wire>(
+    stream: &mut S,
+    txn: &mut ConnTxn,
+    msg: &str,
+) -> Result<bool, WireError> {
+    write_error_response(stream, "ERROR", SQLSTATE_FEATURE_NOT_SUPPORTED, msg).await?;
+    txn.mark_failed();
+    Ok(false)
 }
 
 /// `COMMIT` / `END` — apply the transaction's buffered writes as a unit

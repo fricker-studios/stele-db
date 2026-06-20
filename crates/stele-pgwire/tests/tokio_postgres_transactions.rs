@@ -19,6 +19,13 @@
 //! whole block — Postgres's `in_failed_sql_transaction` escape hatch (STL-205) —
 //! while `SAVEPOINT` / `RELEASE` stay refused there. Both paths ride the `Q` loop
 //! the v0.1 front end speaks; the extended protocol is a v0.2 concern.
+//!
+//! **Isolation breadth** (STL-248): the level is selectable per transaction —
+//! `BEGIN ISOLATION LEVEL READ COMMITTED` (or `SET TRANSACTION ISOLATION LEVEL …`
+//! inside the block) re-pins a fresh snapshot per statement, so a transaction
+//! observes commits made after it began; `SERIALIZABLE` (SSI, a v0.7 opt-in) is
+//! rejected rather than silently downgraded. The default stays `REPEATABLE READ`
+//! (snapshot isolation), exercised by the stable-snapshot test above.
 
 use std::sync::{Arc, Mutex};
 
@@ -591,6 +598,245 @@ async fn rollback_to_savepoint_recovers_an_aborted_transaction() {
          after the savepoint and the failed statement are undone — the error was recovered, \
          not the whole transaction lost"
     );
+
+    drop(client);
+    let _ = driver.await;
+}
+
+/// READ COMMITTED over the wire (STL-248): `BEGIN ISOLATION LEVEL READ COMMITTED`
+/// re-pins a fresh snapshot per statement, so a transaction's successive reads
+/// observe a value another connection commits mid-transaction — the statement-level
+/// snapshot advance, in deliberate contrast to the REPEATABLE READ default
+/// (`a_transaction_reads_a_stable_snapshot_over_the_wire`, where the same
+/// interleaving leaves the in-block read unchanged).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_committed_sees_concurrent_commits_mid_transaction() {
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+
+    let (a, a_conn) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect a");
+    let a_driver = tokio::spawn(a_conn);
+    let (b, b_conn) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect b");
+    let b_driver = tokio::spawn(b_conn);
+
+    a.batch_execute(
+        "CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+    )
+    .await
+    .expect("create table");
+    a.simple_query("INSERT INTO account VALUES (1, 100)")
+        .await
+        .expect("seed 100");
+
+    // `a` opens a READ COMMITTED block and reads the seeded value.
+    a.simple_query("BEGIN ISOLATION LEVEL READ COMMITTED")
+        .await
+        .expect("a begin read committed");
+    let before = a
+        .simple_query("SELECT balance FROM account")
+        .await
+        .expect("a reads before the concurrent commit");
+    assert_eq!(balances(&before), vec!["100"], "the block first sees 100");
+
+    // `b` auto-commits a newer value on another connection, mid-block.
+    b.simple_query("UPDATE account SET balance = 200 WHERE id = 1")
+        .await
+        .expect("b update");
+
+    // Under READ COMMITTED `a`'s next read re-pins and sees `b`'s commit.
+    let after = a
+        .simple_query("SELECT balance FROM account")
+        .await
+        .expect("a reads after the concurrent commit");
+    assert_eq!(
+        balances(&after),
+        vec!["200"],
+        "READ COMMITTED re-pins per statement: the same transaction observes the concurrent commit"
+    );
+
+    a.simple_query("COMMIT").await.expect("a commit");
+
+    drop(a);
+    drop(b);
+    let _ = a_driver.await;
+    let _ = b_driver.await;
+}
+
+/// `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` selects the level mid-block
+/// (STL-248): the same statement-level snapshot advance as `BEGIN ISOLATION LEVEL
+/// READ COMMITTED`, reached via the `SET` spelling drivers/ORMs emit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_transaction_isolation_level_switches_a_block_to_read_committed() {
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+
+    let (a, a_conn) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect a");
+    let a_driver = tokio::spawn(a_conn);
+    let (b, b_conn) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect b");
+    let b_driver = tokio::spawn(b_conn);
+
+    a.batch_execute(
+        "CREATE TABLE account (id INT PRIMARY KEY, balance INT) WITH SYSTEM VERSIONING",
+    )
+    .await
+    .expect("create table");
+    a.simple_query("INSERT INTO account VALUES (1, 100)")
+        .await
+        .expect("seed 100");
+
+    a.simple_query("BEGIN").await.expect("a begin");
+    a.simple_query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .await
+        .expect("a set read committed");
+
+    b.simple_query("UPDATE account SET balance = 200 WHERE id = 1")
+        .await
+        .expect("b update");
+
+    let after = a
+        .simple_query("SELECT balance FROM account")
+        .await
+        .expect("a reads after the concurrent commit");
+    assert_eq!(
+        balances(&after),
+        vec!["200"],
+        "after SET TRANSACTION ISOLATION LEVEL READ COMMITTED the block re-pins per statement"
+    );
+
+    a.simple_query("COMMIT").await.expect("a commit");
+
+    drop(a);
+    drop(b);
+    let _ = a_driver.await;
+    let _ = b_driver.await;
+}
+
+/// SERIALIZABLE is not implemented (true SSI is a v0.7 opt-in, ADR-0008):
+/// `BEGIN ISOLATION LEVEL SERIALIZABLE` is rejected with feature_not_supported
+/// (0A000) rather than silently downgraded to snapshot isolation — an honest
+/// refusal, not a false serializability promise (STL-248).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serializable_isolation_is_rejected_not_downgraded() {
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+
+    let (client, connection) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect");
+    let driver = tokio::spawn(connection);
+
+    let err = client
+        .simple_query("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect_err("serializable must be rejected, not silently downgraded");
+    assert_eq!(
+        err.code(),
+        Some(&SqlState::FEATURE_NOT_SUPPORTED),
+        "serializable isolation reports 0A000 (feature_not_supported): {err}"
+    );
+
+    // The connection is still usable after the refusal — a plain BEGIN works.
+    client
+        .simple_query("BEGIN")
+        .await
+        .expect("plain begin works");
+    client.simple_query("COMMIT").await.expect("commit");
+
+    drop(client);
+    let _ = driver.await;
+}
+
+/// A `BEGIN` already inside a transaction is a warning-only no-op in Postgres, so a
+/// nested `BEGIN ISOLATION LEVEL SERIALIZABLE` is **ignored**, not validated — the
+/// modes are only interpreted on the idle-to-active transition (STL-248). The block
+/// keeps its existing level and stays open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_nested_begin_isolation_level_is_ignored_not_validated() {
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+    let (client, driver) = account_client(addr).await;
+
+    client.simple_query("BEGIN").await.expect("begin");
+    client
+        .simple_query("INSERT INTO account VALUES (1, 100)")
+        .await
+        .expect("insert in the open block");
+    // A nested BEGIN — even naming the unsupported SERIALIZABLE — is a no-op, not an
+    // error: the block is untouched and continues to a clean COMMIT.
+    client
+        .simple_query("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("a nested BEGIN ISOLATION LEVEL SERIALIZABLE is ignored, not rejected");
+    client.simple_query("COMMIT").await.expect("commit");
+
+    let after = client
+        .simple_query("SELECT id FROM account")
+        .await
+        .expect("select after commit");
+    assert_eq!(
+        ids(&after),
+        vec!["1"],
+        "the block was untouched by the nested BEGIN and committed normally"
+    );
+
+    drop(client);
+    let _ = driver.await;
+}
+
+/// `SET TRANSACTION ISOLATION LEVEL …` is only valid inside a transaction block:
+/// with none open it is refused with `25P01` (Postgres parity), not a silent no-op
+/// (STL-248); inside an **aborted** block it is refused with `25P02` like every
+/// other statement, until the block ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_transaction_is_refused_outside_a_block_and_in_an_aborted_one() {
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+    let (client, driver) = account_client(addr).await;
+
+    // (1) No transaction open — 25P01.
+    let err = client
+        .simple_query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .await
+        .expect_err("SET TRANSACTION outside a block is refused");
+    assert_eq!(
+        sqlstate(&err),
+        Some("25P01"),
+        "SET TRANSACTION can only be used in transaction blocks"
+    );
+
+    // (2) Inside an aborted block — 25P02 (refused until the block ends).
+    client.simple_query("BEGIN").await.expect("begin");
+    let err = client
+        .simple_query("INSERT INTO nope VALUES (9, 9)")
+        .await
+        .expect_err("the bad write aborts the block");
+    assert_eq!(sqlstate(&err), Some("42P01"), "unknown table");
+    let err = client
+        .simple_query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .await
+        .expect_err("SET TRANSACTION is refused in an aborted block");
+    assert_eq!(
+        sqlstate(&err),
+        Some("25P02"),
+        "commands are ignored until the aborted block ends"
+    );
+    client
+        .simple_query("ROLLBACK")
+        .await
+        .expect("rollback ends it");
 
     drop(client);
     let _ = driver.await;

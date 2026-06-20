@@ -31,3 +31,15 @@ Lock-based concurrency would fight the append-only grain and hurt the analytical
 ### Neutral / follow-ups
 - Whether SSI becomes default at some later major version is left open.
 - The interaction of MVCC snapshots with the distributed manifest is deferred to [ADR-0006](0006-distribution-later-shared-storage.md).
+
+## Amendment — selectable READ COMMITTED + explicit conflict contract (STL-248, 2026-06-19)
+
+The original decision left two things informal: the precise write-write conflict rule ("the loser retries") and how the selectable lower level behaves. This amendment makes both commitments, without changing the overall design.
+
+- **First-committer-wins, surfaced as a retryable `40001`.** A transaction's `COMMIT` is refused iff it wrote a key whose current version was committed by another transaction *strictly after* this transaction's snapshot. The refusal is SQLSTATE **`40001` (`serialization_failure`)** — a *retryable* signal, applied atomically (nothing of the losing transaction lands) — and the first committer's write stands. This is the existing snapshot-isolation commitment made precise; clients retry the whole transaction on `40001` (see [12 §9](../12-data-migration-and-interop.md#9-driver-notes-isolation--retryable-errors)). A [correctness oracle](../06-testing-strategy.md#4-correctness-oracles-the-temporal-heart) re-derives every commit's Ok/Conflict decision from an independent first-committer-wins rule, so the rule is tested, not just asserted.
+
+- **`READ COMMITTED` is selectable; it re-pins per statement.** `BEGIN ISOLATION LEVEL READ COMMITTED` (and `SET TRANSACTION ISOLATION LEVEL …`) selects per-statement snapshots: each statement reads a fresh snapshot, so it observes transactions committed before it began. `REPEATABLE READ`/`SNAPSHOT` remain the default snapshot-isolation level (one snapshot per transaction). The weaker level's commit check naturally raises `40001` in fewer cases (its snapshot is fresher), which is the expected weaker guarantee — not a different conflict rule.
+
+- **`SERIALIZABLE` is rejected, not downgraded.** Until SSI ships (v0.7), `SERIALIZABLE` returns `0A000` (feature not supported) rather than silently behaving as snapshot isolation — aliasing it would be a false serializability promise, which the audit-honesty charter forbids.
+
+- **No deadlock detection — by construction.** Writers detect conflicts at commit and the loser retries; no writer ever *waits* on a lock held by another. With no lock-wait edges there is no wait-for cycle to deadlock, so there is no deadlock detector and clients never see `40P01`. This is a property of commit-time (OCC-style) conflict detection on the append-only store, not deferred work.

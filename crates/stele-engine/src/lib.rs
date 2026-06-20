@@ -382,6 +382,37 @@ pub enum DmlSummary {
     Merge(u64),
 }
 
+/// The isolation level an open transaction reads under ([STL-248], [ADR-0008]).
+///
+/// Stele's default and strongest single-node level is **snapshot isolation**,
+/// which the SQL surface spells `REPEATABLE READ` (`SERIALIZABLE` — true SSI — is a
+/// later opt-in, [01 §B.4]). A transaction can select the weaker `READ COMMITTED`
+/// instead, trading the stable single snapshot for a fresher one per statement.
+///
+/// The level only changes **which snapshot a statement reads at**; the write path
+/// is identical, and a write-write conflict is still first-committer-wins, detected
+/// at [`commit`](SessionEngine::commit). Because `READ COMMITTED` re-pins toward the
+/// present before each statement, its commit conflict check runs against that
+/// fresher snapshot, so it raises the retryable [`EngineError::Conflict`] in
+/// correspondingly fewer cases than the stable-snapshot default — the expected
+/// weaker guarantee of the lower level, not a bug.
+///
+/// [STL-248]: https://allegromusic.atlassian.net/browse/STL-248
+/// [01 §B.4]: ../../../docs/01-feature-plan.md#b4--transactions-concurrency--mvcc
+/// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IsolationLevel {
+    /// **Snapshot isolation** — one snapshot pinned at `BEGIN` for the whole
+    /// transaction (the SQL `REPEATABLE READ`/`SNAPSHOT` spelling). The default and
+    /// strongest level Stele offers single-node ([ADR-0008]).
+    #[default]
+    RepeatableRead,
+    /// **Read committed** — each statement re-pins a fresh snapshot, so a statement
+    /// observes every transaction committed before it began. Weaker than the
+    /// default: a transaction's successive reads can advance.
+    ReadCommitted,
+}
+
 /// A multi-statement transaction's buffered, not-yet-applied writes ([STL-174]).
 ///
 /// Created by [`SessionEngine::begin`], fed bound DML one statement at a time by
@@ -439,8 +470,15 @@ pub enum DmlSummary {
 pub struct SessionTransaction {
     /// The system-time snapshot pinned at [`begin`](SessionEngine::begin). Every
     /// read in the transaction resolves here, and a write-write conflict is one
-    /// whose key was committed by another transaction *after* this instant.
+    /// whose key was committed by another transaction *after* this instant. Under
+    /// [`IsolationLevel::ReadCommitted`] it is re-pinned toward the present before
+    /// each statement, so the conflict anchor advances with it.
     snapshot: SystemTimeMicros,
+    /// The isolation level this transaction reads under ([STL-248]). The default,
+    /// [`IsolationLevel::RepeatableRead`], keeps the single `BEGIN`-pinned snapshot;
+    /// [`IsolationLevel::ReadCommitted`] re-pins it per statement in
+    /// [`execute_in_txn`](SessionEngine::execute_in_txn).
+    isolation: IsolationLevel,
     /// The bound writes staged so far, in statement order. Applied front-to-back
     /// at commit so a later `UPDATE` of a key staged after its `INSERT` lands in
     /// the order the client issued them.
@@ -554,6 +592,21 @@ struct Savepoint {
 }
 
 impl SessionTransaction {
+    /// The isolation level this transaction reads under ([STL-248]).
+    #[must_use]
+    pub const fn isolation(&self) -> IsolationLevel {
+        self.isolation
+    }
+
+    /// Change this transaction's isolation level mid-block — the engine path for
+    /// `SET TRANSACTION ISOLATION LEVEL …` ([STL-248]). It takes effect from the
+    /// next statement: under [`IsolationLevel::ReadCommitted`],
+    /// [`execute_in_txn`](SessionEngine::execute_in_txn) re-pins the snapshot before
+    /// each statement; the currently-pinned snapshot is left as-is until then.
+    pub const fn set_isolation(&mut self, isolation: IsolationLevel) {
+        self.isolation = isolation;
+    }
+
     /// Establish a savepoint at the current write position (`SAVEPOINT name`,
     /// [STL-176]).
     ///
@@ -2102,6 +2155,17 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         stmt: &Statement,
         txn: &mut SessionTransaction,
     ) -> Result<StatementOutcome, EngineError> {
+        // Under READ COMMITTED every statement reads a fresh snapshot ([STL-248]):
+        // re-pin toward the present *before* binding or executing this statement, so
+        // it observes every transaction committed since the block began (and binds
+        // against the catalog as it stands now). REPEATABLE READ (the default) holds
+        // the one `BEGIN`-pinned snapshot, so it is left untouched. The transaction's
+        // own buffered writes still overlay either snapshot (read-your-own-writes,
+        // [STL-203]) — re-pinning advances only the committed baseline, not the
+        // buffer.
+        if matches!(txn.isolation, IsolationLevel::ReadCommitted) {
+            self.repin_snapshot(txn);
+        }
         if let Some(summary) = self.stage_dml(stmt, txn)? {
             return Ok(StatementOutcome::Dml(summary));
         }
@@ -4965,11 +5029,28 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// [`commit`](Self::commit), so a `BEGIN` followed by `ROLLBACK` (or a
     /// read-only transaction) consumes none.
     ///
+    /// By default the transaction reads under [`IsolationLevel::RepeatableRead`]
+    /// (snapshot isolation); [`begin_with_isolation`](Self::begin_with_isolation)
+    /// selects [`IsolationLevel::ReadCommitted`] instead ([STL-248]).
+    ///
     /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
     /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
     /// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
     #[must_use]
     pub fn begin(&self) -> SessionTransaction {
+        self.begin_with_isolation(IsolationLevel::default())
+    }
+
+    /// Begin a transaction reading under a chosen [`IsolationLevel`] — the engine
+    /// path for `BEGIN ISOLATION LEVEL …` ([STL-248]). [`begin`](Self::begin) is the
+    /// default-level shorthand.
+    ///
+    /// The snapshot is pinned here as in [`begin`](Self::begin); the level only
+    /// governs whether [`execute_in_txn`](Self::execute_in_txn) re-pins it per
+    /// statement ([`IsolationLevel::ReadCommitted`]) or holds it for the whole block
+    /// ([`IsolationLevel::RepeatableRead`], the default).
+    #[must_use]
+    pub fn begin_with_isolation(&self, isolation: IsolationLevel) -> SessionTransaction {
         // Pin at transaction-start time (clock observed fresh, [STL-227]):
         // `now()` inside the block is the `BEGIN` instant, Postgres-style, and
         // every later commit lands strictly past the pin (`observe` folds the
@@ -4977,6 +5058,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let snapshot = self.clock.observe();
         SessionTransaction {
             snapshot,
+            isolation,
             writes: Vec::new(),
             savepoints: Vec::new(),
             // Register the pinned snapshot so it holds the prune floor down for as
@@ -10530,6 +10612,102 @@ mod tests {
         assert_eq!(
             payload_column(&result),
             vec![encode_value(&ScalarValue::Int4(300))]
+        );
+    }
+
+    #[test]
+    fn read_committed_advances_the_snapshot_each_statement() {
+        // STL-248: REPEATABLE READ (the default) holds the BEGIN-pinned snapshot
+        // for the whole block, so a concurrent commit is invisible inside it; READ
+        // COMMITTED re-pins per statement, so the same transaction's later read
+        // observes the commit. Both levels watch the *same* concurrent write here.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("seed 100");
+
+        let balance = |engine: &mut SessionEngine<ZeroClock, MemDisk>,
+                       txn: &mut SessionTransaction| {
+            let StatementOutcome::Rows(rows) = engine
+                .execute_in_txn(&parse_one("SELECT balance FROM account"), txn)
+                .expect("read inside the transaction")
+            else {
+                panic!("rows")
+            };
+            payload_column(&rows)
+        };
+        let hundred = vec![encode_value(&ScalarValue::Int4(100))];
+        let two_hundred = vec![encode_value(&ScalarValue::Int4(200))];
+
+        // Both transactions pin at the same instant, before the concurrent commit.
+        let mut rr = engine.begin();
+        let mut rc = engine.begin_with_isolation(IsolationLevel::ReadCommitted);
+        assert_eq!(rr.isolation(), IsolationLevel::RepeatableRead);
+        assert_eq!(rc.isolation(), IsolationLevel::ReadCommitted);
+        assert_eq!(balance(&mut engine, &mut rr), hundred);
+        assert_eq!(balance(&mut engine, &mut rc), hundred);
+
+        // A concurrent auto-commit moves the live balance to 200.
+        engine
+            .execute(&parse_one("UPDATE account SET balance = 200 WHERE id = 1"))
+            .expect("concurrent update");
+
+        assert_eq!(
+            balance(&mut engine, &mut rr),
+            hundred,
+            "REPEATABLE READ holds the snapshot pinned at BEGIN"
+        );
+        assert_eq!(
+            balance(&mut engine, &mut rc),
+            two_hundred,
+            "READ COMMITTED re-pins a fresh snapshot per statement and sees the commit"
+        );
+    }
+
+    #[test]
+    fn set_isolation_switches_an_open_block_to_read_committed() {
+        // STL-248: `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` mid-block — the
+        // engine path is `SessionTransaction::set_isolation` — takes effect from the
+        // next statement, after which the snapshot advances per statement.
+        let mut engine = session();
+        engine.execute(&parse_one(CREATE)).expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+            .expect("seed 100");
+
+        let balance = |engine: &mut SessionEngine<ZeroClock, MemDisk>,
+                       txn: &mut SessionTransaction| {
+            let StatementOutcome::Rows(rows) = engine
+                .execute_in_txn(&parse_one("SELECT balance FROM account"), txn)
+                .expect("read inside the transaction")
+            else {
+                panic!("rows")
+            };
+            payload_column(&rows)
+        };
+
+        let mut txn = engine.begin();
+        assert_eq!(
+            txn.isolation(),
+            IsolationLevel::RepeatableRead,
+            "the default level is snapshot isolation"
+        );
+
+        engine
+            .execute(&parse_one("UPDATE account SET balance = 200 WHERE id = 1"))
+            .expect("concurrent update");
+        assert_eq!(
+            balance(&mut engine, &mut txn),
+            vec![encode_value(&ScalarValue::Int4(100))],
+            "before the switch the block reads its fixed BEGIN snapshot"
+        );
+
+        txn.set_isolation(IsolationLevel::ReadCommitted);
+        assert_eq!(
+            balance(&mut engine, &mut txn),
+            vec![encode_value(&ScalarValue::Int4(200))],
+            "after the switch the block re-pins per statement and sees the commit"
         );
     }
 

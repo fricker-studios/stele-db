@@ -1,6 +1,6 @@
-//! The snapshot-isolation + provenance correctness oracle ([STL-168]).
+//! The snapshot-isolation + provenance correctness oracle ([STL-168], [STL-248]).
 //!
-//! Two guarantees of the transaction layer that, like every temporal behaviour,
+//! Three guarantees of the transaction layer that, like every temporal behaviour,
 //! are not "done" without an oracle
 //! ([docs/06 §4](../../../docs/06-testing-strategy.md#4-correctness-oracles-the-temporal-heart),
 //! [architecture invariant 5](../../../docs/02-architecture.md#12-cross-cutting-architectural-invariants)):
@@ -12,6 +12,11 @@
 //! * **Provenance.** Every version a reader resolves carries the `txn_id` and
 //!   `committed_at` of the transaction that actually wrote it — captured inline
 //!   at commit, never reconstructed.
+//! * **Write-write conflict outcomes** ([STL-248]). When two transactions race to
+//!   write the same key, exactly one commits and the other gets the clean
+//!   `Conflict` retry signal — first committer wins. The engine's per-transaction
+//!   Ok/Conflict *decision* must match an independent first-committer-wins rule,
+//!   not merely "some conflicts happened".
 //!
 //! The system under test is the real concurrency core the DST strategy names —
 //! [`stele-txn`](stele_txn)'s [`TxnManager`] over [`stele-storage`](stele_storage)'s
@@ -22,7 +27,7 @@
 //! a per-key list of committed periods ([`RefModel`]) whose `AS OF` answer is a
 //! linear scan, too simple to be wrong.
 //!
-//! Two layers of checking:
+//! Three layers of checking:
 //! * **Live**, during the interleaving: whenever a transaction reads a key at its
 //!   snapshot, [`assert_snapshot_stable`] asserts the resolved version matches the
 //!   reference *at that snapshot* — the snapshot-stability guarantee, exercised
@@ -30,14 +35,23 @@
 //! * **Differential**, after the run: [`differential_check`] sweeps every commit
 //!   boundary and key and asserts the engine's resolved
 //!   `(sys_from, sys_to, txn_id, committed_at, payload)` matches the reference.
+//! * **Conflict-outcome differential** ([STL-248]), after the run:
+//!   [`conflict_check`] replays each transaction's recorded commit attempt
+//!   (snapshot, written keys, Ok/Conflict) through an independent
+//!   first-committer-wins rule and asserts the engine's decision matches — the
+//!   engine's recorded outcomes must be *exactly* what first-committer-wins
+//!   prescribes, re-derived from the observable attempt sequence, not its internal
+//!   write index.
 //!
-//! The [mutation tests](#tests) inject two *documented intentional bugs* — a
+//! The [mutation tests](#tests) inject three *documented intentional bugs* — a
 //! reader that sees a version newer than its snapshot ([`Bug::SeesNewer`], the
-//! textbook SI violation) and a misattributed writer ([`Bug::WrongWriter`]) — and
-//! prove the very same differential check **catches** each. An oracle that cannot
-//! fail a wrong implementation guards nothing (STL-168 DoD).
+//! textbook SI violation), a misattributed writer ([`Bug::WrongWriter`]), and a
+//! rule that never predicts a conflict ([`ConflictRule::NeverConflicts`]) — and
+//! prove the matching check **catches** each. An oracle that cannot fail a wrong
+//! implementation guards nothing (STL-168, STL-248 DoD).
 //!
 //! [STL-168]: https://allegromusic.atlassian.net/browse/STL-168
+//! [STL-248]: https://allegromusic.atlassian.net/browse/STL-248
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -268,15 +282,33 @@ impl fmt::Display for Divergence {
     }
 }
 
+/// One transaction's commit attempt, recorded in the order the workload attempted
+/// commits — the scheduler's serialization order, since
+/// [`commit_and_record`] runs without yielding. Replayed after the run by
+/// [`conflict_check`] to assert the engine's first-committer-wins decision matches
+/// an independent reference ([STL-248]).
+#[derive(Debug, Clone)]
+struct Attempt {
+    /// The snapshot the transaction pinned at `begin` — its conflict anchor.
+    snapshot: SystemTimeMicros,
+    /// The business keys it staged a write to (empty for a read-only transaction).
+    keys: BTreeSet<BusinessKey>,
+    /// The commit instant the engine assigned, or `None` if the engine refused the
+    /// commit with a write-write [`TxnError::Conflict`].
+    commit_ts: Option<SystemTimeMicros>,
+}
+
 /// The world the workload builds: the engine's storage tiers, the independent
-/// reference model, the commit boundaries to probe, and how many transactions
-/// lost a write-write race (so a test can assert the workload genuinely contends).
+/// reference model, the commit boundaries to probe, how many transactions lost a
+/// write-write race (so a test can assert the workload genuinely contends), and the
+/// per-transaction commit attempts the conflict oracle replays ([STL-248]).
 struct World {
     delta: Delta<MemDisk>,
     index: ValidityIndex<MemDisk>,
     model: RefModel,
     commits: Vec<SystemTimeMicros>,
     conflicts: usize,
+    attempts: Vec<Attempt>,
 }
 
 impl World {
@@ -288,6 +320,7 @@ impl World {
             model: RefModel::default(),
             commits: Vec::new(),
             conflicts: 0,
+            attempts: Vec::new(),
         }
     }
 }
@@ -409,20 +442,28 @@ fn assert_snapshot_stable(
 /// A write-write conflict is the clean, expected SI retry signal: the loser
 /// committed nothing, so neither the engine nor the reference records it — exactly
 /// the "a reader never sees an uncommitted version" guarantee, by construction.
+///
+/// Either way the transaction's commit *attempt* — its snapshot, written keys, and
+/// Ok/Conflict outcome — is appended to [`World::attempts`] in commit order, so
+/// [`conflict_check`] can later re-derive the engine's first-committer-wins
+/// decisions from an independent reference ([STL-248]).
 fn commit_and_record(
     mgr: &TxnManager<StepClock, MemDisk>,
     shared: &Rc<RefCell<World>>,
     txn: Transaction,
     writes: BTreeMap<BusinessKey, Vec<u8>>,
 ) {
+    // The conflict anchor and write set, captured before `commit` consumes `txn`.
+    // `snapshot()` is a [`Snapshot`] newtype; its `.0` is the system-time instant
+    // the first-committer-wins comparison is against.
+    let snapshot = txn.snapshot().0;
+    let keys: BTreeSet<BusinessKey> = writes.keys().cloned().collect();
     match mgr.commit(txn) {
         Ok(committed) => {
-            if writes.is_empty() {
-                // A read-only transaction: it consumed a commit timestamp but
-                // wrote no version, so there is nothing to stage or probe.
-                return;
-            }
             let mut world = shared.borrow_mut();
+            // A read-only transaction stages nothing (the loop is empty) but still
+            // consumed a commit timestamp; its attempt is recorded all the same so
+            // the conflict oracle sees every commit decision.
             for (key, payload) in writes {
                 stage_commit(
                     &mut world,
@@ -432,9 +473,24 @@ fn commit_and_record(
                     payload,
                 );
             }
-            world.commits.push(committed.commit_ts);
+            if !keys.is_empty() {
+                world.commits.push(committed.commit_ts);
+            }
+            world.attempts.push(Attempt {
+                snapshot,
+                keys,
+                commit_ts: Some(committed.commit_ts),
+            });
         }
-        Err(TxnError::Conflict) => shared.borrow_mut().conflicts += 1,
+        Err(TxnError::Conflict) => {
+            let mut world = shared.borrow_mut();
+            world.conflicts += 1;
+            world.attempts.push(Attempt {
+                snapshot,
+                keys,
+                commit_ts: None,
+            });
+        }
         // A WAL or time-exhaustion error is a real failure, not a workload
         // outcome — fail loudly rather than digest a "valid" run.
         Err(other) => panic!("unexpected transaction error (not a workload outcome): {other}"),
@@ -578,24 +634,129 @@ fn differential_check(world: &World, bug: Bug) -> Result<u64, Box<Divergence>> {
     Ok(digest)
 }
 
-/// Run the snapshot-isolation + provenance oracle for `seed`.
+/// Which first-committer-wins rule the reference applies when replaying the
+/// recorded commit attempts ([`conflict_check`]) — the seam a *documented
+/// intentional bug* is injected into for the conflict mutation test ([STL-248]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictRule {
+    /// The correct rule: a transaction conflicts iff some key it wrote was committed
+    /// by an earlier transaction at an instant strictly after this one's snapshot.
+    Correct,
+    /// A broken rule that never predicts a conflict, so the loser of every
+    /// write-write race is wrongly expected to commit. The mutation test asserts the
+    /// check catches the disagreement with the engine.
+    NeverConflicts,
+}
+
+impl ConflictRule {
+    /// Does a transaction with `snapshot` writing `keys` conflict, given each key's
+    /// last committed instant in `committed_at`? First committer wins: a key
+    /// committed strictly after our snapshot means a concurrent writer beat us.
+    fn conflicts(
+        self,
+        committed_at: &BTreeMap<BusinessKey, SystemTimeMicros>,
+        keys: &BTreeSet<BusinessKey>,
+        snapshot: SystemTimeMicros,
+    ) -> bool {
+        match self {
+            Self::Correct => keys
+                .iter()
+                .any(|k| committed_at.get(k).is_some_and(|&at| at > snapshot)),
+            Self::NeverConflicts => false,
+        }
+    }
+}
+
+/// A disagreement between the engine's recorded commit decision and the reference
+/// first-committer-wins rule for one attempt, carrying enough to reproduce it.
+#[derive(Debug)]
+struct ConflictDivergence {
+    snapshot: SystemTimeMicros,
+    keys: Vec<BusinessKey>,
+    engine_conflicted: bool,
+    reference_conflicts: bool,
+}
+
+impl fmt::Display for ConflictDivergence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let keys: Vec<String> = self.keys.iter().map(render_key).collect();
+        write!(
+            f,
+            "conflict-outcome oracle divergence @ snapshot={} keys=[{}]: engine {}, reference {}",
+            self.snapshot.0,
+            keys.join(", "),
+            if self.engine_conflicted {
+                "conflicted"
+            } else {
+                "committed"
+            },
+            if self.reference_conflicts {
+                "expects a conflict"
+            } else {
+                "expects a commit"
+            },
+        )
+    }
+}
+
+/// Replay the recorded commit attempts in commit-attempt order through an
+/// independent first-committer-wins reference and assert the engine's Ok/Conflict
+/// decision matches under `rule` ([STL-248]).
+///
+/// The reference is a per-key "last committer" index, updated from the engine's own
+/// assigned commit timestamps — as the version oracle uses them — so only the
+/// *decision rule* is independent: the engine's recorded outcome for each attempt
+/// must be exactly what first-committer-wins prescribes given the attempts that
+/// committed before it. A bug in the engine's conflict logic (a wrong comparison, a
+/// missed committer, a key recorded at the wrong instant) makes its outcomes
+/// inconsistent with this replay. Returns the first [`ConflictDivergence`], or `Ok`
+/// if every attempt agreed.
+fn conflict_check(attempts: &[Attempt], rule: ConflictRule) -> Result<(), Box<ConflictDivergence>> {
+    let mut committed_at: BTreeMap<BusinessKey, SystemTimeMicros> = BTreeMap::new();
+    for attempt in attempts {
+        let reference_conflicts = rule.conflicts(&committed_at, &attempt.keys, attempt.snapshot);
+        let engine_conflicted = attempt.commit_ts.is_none();
+        if reference_conflicts != engine_conflicted {
+            return Err(Box::new(ConflictDivergence {
+                snapshot: attempt.snapshot,
+                keys: attempt.keys.iter().cloned().collect(),
+                engine_conflicted,
+                reference_conflicts,
+            }));
+        }
+        // A committed attempt becomes the newest committer of each key it wrote.
+        if let Some(commit_ts) = attempt.commit_ts {
+            for key in &attempt.keys {
+                committed_at.insert(key.clone(), commit_ts);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run the snapshot-isolation + provenance + conflict-outcome oracle for `seed`.
 ///
 /// Drives concurrent multi-statement transactions through the real
 /// [`TxnManager`] + storage under the deterministic scheduler (asserting snapshot
-/// stability live), then sweeps every commit boundary and asserts the engine's
-/// resolved version — payload, interval, and inline provenance — matches the
-/// independent reference model
+/// stability live), then (1) replays every transaction's commit attempt through an
+/// independent first-committer-wins rule and asserts the engine's Ok/Conflict
+/// decision matches (the conflict check, [STL-248]), and (2) sweeps every commit
+/// boundary and asserts the engine's resolved version — payload, interval, and
+/// inline provenance — matches the independent reference model
 /// ([docs/06 §4](../../../docs/06-testing-strategy.md#4-correctness-oracles-the-temporal-heart),
 /// architecture invariant 5, STL-168). Same seed ⇒ same digest.
 ///
 /// # Panics
 ///
-/// Panics with the diverging snapshot, key, and the key's committed timeline if
-/// any resolved version disagrees with the reference — a correctness regression,
-/// not a workload outcome.
+/// Panics with the diverging attempt, or the diverging snapshot, key, and the key's
+/// committed timeline, if the engine's conflict decision or any resolved version
+/// disagrees with the reference — a correctness regression, not a workload outcome.
 #[must_use]
 pub fn run_si_oracle_seed(seed: u64) -> u64 {
     let world = build_world(seed);
+    if let Err(divergence) = conflict_check(&world.attempts, ConflictRule::Correct) {
+        panic!("seed {seed}: {divergence}");
+    }
     match differential_check(&world, Bug::None) {
         Ok(digest) => digest,
         Err(divergence) => panic!("seed {seed}: {divergence}"),
@@ -637,6 +798,63 @@ mod tests {
         assert!(
             total > 0,
             "no transaction ever lost a write-write race across 64 seeds — the workload does not contend"
+        );
+    }
+
+    /// A hand-built attempt sequence with one genuine write-write conflict: two
+    /// transactions pinned at the same snapshot both write `k`; the first commits,
+    /// and the second — its snapshot now older than the first's commit — must
+    /// conflict. The controlled fixture the conflict mutation test perturbs.
+    fn conflicting_attempts() -> Vec<Attempt> {
+        let k = BusinessKey::new(b"k".to_vec());
+        vec![
+            Attempt {
+                snapshot: SystemTimeMicros(1_000),
+                keys: BTreeSet::from([k.clone()]),
+                commit_ts: Some(SystemTimeMicros(1_005)),
+            },
+            Attempt {
+                snapshot: SystemTimeMicros(1_000),
+                keys: BTreeSet::from([k]),
+                commit_ts: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn conflict_oracle_is_sound_under_the_correct_rule() {
+        // The correct first-committer-wins replay must agree with a sequence that
+        // genuinely conflicts, or the mutation test below would prove nothing.
+        conflict_check(&conflicting_attempts(), ConflictRule::Correct)
+            .expect("the correct rule must agree with a real first-committer-wins outcome");
+    }
+
+    /// The conflict mutation test (STL-248 DoD): a rule that never predicts a
+    /// conflict must be caught by the replay exactly where the engine *did*
+    /// conflict.
+    #[test]
+    fn conflict_oracle_catches_a_rule_that_never_predicts_conflicts() {
+        let divergence = conflict_check(&conflicting_attempts(), ConflictRule::NeverConflicts)
+            .expect_err("a rule that never predicts a conflict must disagree with the engine");
+        assert!(
+            divergence.engine_conflicted && !divergence.reference_conflicts,
+            "the engine conflicted where the buggy rule expected a commit: {divergence}"
+        );
+    }
+
+    #[test]
+    fn the_conflict_oracle_is_non_vacuous_on_real_workloads() {
+        // Tie the mutation to the seeded workload: the engine produces real
+        // conflicts across seeds (`the_workload_actually_contends`), so the
+        // never-conflicts rule must diverge on at least one seed — the conflict
+        // check is exercising something the workload actually contains.
+        let caught = (0..64).any(|seed| {
+            conflict_check(&build_world(seed).attempts, ConflictRule::NeverConflicts).is_err()
+        });
+        assert!(
+            caught,
+            "no seed's recorded attempts contained a conflict the never-conflicts rule \
+             missed — the conflict oracle would be vacuous"
         );
     }
 
