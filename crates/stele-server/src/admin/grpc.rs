@@ -70,10 +70,12 @@ where
     }
 }
 
-/// The most completed TLS handshakes that may queue ahead of tonic on the TLS
-/// serve path. Handshakes run on their own tasks (so a slow one never blocks the
-/// accept loop); this bounds how many finished-but-not-yet-served connections
-/// buffer, backpressuring the accept loop under a flood.
+/// The most TLS handshakes in flight (plus completed-but-not-yet-served
+/// connections) on the gRPC TLS serve path. The accept loop reserves a channel
+/// slot *before* accepting, so once this many are outstanding it stops pulling
+/// new connections — real backpressure under a flood — and resumes as tonic
+/// drains the stream. Handshakes still run on their own tasks, so a slow one
+/// never blocks accepting the next peer up to this bound.
 const TLS_HANDSHAKE_BACKLOG: usize = 1024;
 
 /// Serve the gRPC admin API **in plaintext** on an already-bound `listener`.
@@ -131,9 +133,12 @@ where
 
 /// A stream of TLS-handshaked connections for [`serve_tls`] to feed tonic.
 ///
-/// An accept loop on its own task pulls raw TCP connections and spawns a
-/// per-connection handshake; only completed [`TlsStream`]s reach the channel, so
-/// a stalled handshake never blocks accepting the next peer. tonic treats the
+/// An accept loop on its own task reserves a backlog slot, accepts a TCP
+/// connection, then spawns the rustls handshake on it — so a stalled handshake
+/// never blocks accepting the next peer, while a full backlog backpressures the
+/// loop ([`TLS_HANDSHAKE_BACKLOG`]). The reservation also bounds the task's life:
+/// when tonic drops the incoming stream on shutdown the receiver is gone, the
+/// reservation fails, and the loop exits rather than spinning. tonic treats the
 /// `tls-connect-info` [`Connected`](tonic::transport::server::Connected) impl on
 /// `TlsStream<TcpStream>` exactly as it does a bare `TcpStream`.
 fn tls_incoming(
@@ -143,23 +148,28 @@ fn tls_incoming(
     let (tx, rx) = mpsc::channel(TLS_HANDSHAKE_BACKLOG);
     tokio::spawn(async move {
         loop {
+            // Reserve a slot before accepting: this is the backpressure (the loop
+            // parks here when the backlog is full) and the shutdown signal (a
+            // closed channel — tonic dropped the receiver — ends the loop).
+            let Ok(permit) = tx.clone().reserve_owned().await else {
+                break;
+            };
             let (stream, peer) = match listener.accept().await {
                 Ok(pair) => pair,
                 Err(error) => {
                     warn!(%error, "admin gRPC accept failed");
-                    continue;
+                    continue; // releases `permit` on drop
                 }
             };
             let acceptor = tls.grpc_acceptor();
-            let tx = tx.clone();
             tokio::spawn(async move {
                 match crate::tls::handshake(acceptor, stream).await {
-                    // The receiver is dropped only when tonic's serve future ends,
-                    // which also drops this accept task — a send error is shutdown.
                     Ok(tls_stream) => {
-                        let _ = tx.send(Ok(tls_stream)).await;
+                        // Consumes the reserved slot; never blocks.
+                        permit.send(Ok(tls_stream));
                     }
                     Err(error) => {
+                        // Dropping `permit` frees the slot for the next connection.
                         debug!(%peer, %error, "admin gRPC TLS handshake failed");
                     }
                 }
