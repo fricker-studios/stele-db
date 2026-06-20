@@ -420,7 +420,9 @@ fn tls_config(tls: &TlsOpts) -> anyhow::Result<rustls::ClientConfig> {
 /// Finish the client config by deciding whether to present an mTLS client
 /// certificate ([STL-292]). Both `--tls-cert` and `--tls-key` must be given
 /// together — only one is a clear configuration error, raised *before* any file
-/// is read. The PEM loading mirrors the server-side `ServerTls::load`.
+/// is read. The CLI enforces this pairing at parse time too (clap `requires`);
+/// this guard also covers callers that build [`TlsOpts`] directly. The PEM
+/// loading mirrors the server-side `ServerTls::load`.
 ///
 /// [STL-292]: https://allegromusic.atlassian.net/browse/STL-292
 fn finish_client_auth(
