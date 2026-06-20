@@ -1017,14 +1017,26 @@ async fn handle_connection(
     // Negotiate first (the `SSLRequest` may upgrade the stream to TLS); the
     // protocol proper then runs identically over either stream.
     match negotiate_startup(stream, tls.as_deref()).await? {
-        // A plain connection has no client certificate, so no verified identity.
+        // A plain connection has no client certificate (no verified identity) and
+        // no channel binding (so only plain SCRAM is offered).
         Negotiated::Plain(mut stream, startup) => {
-            run_session(&mut stream, startup, None, session, auth, metrics).await
+            run_session(&mut stream, startup, None, None, session, auth, metrics).await
         }
         // Over TLS the peer may have presented an mTLS client certificate; its
-        // verified identity (when any) becomes a candidate write principal.
-        Negotiated::Tls(mut stream, startup, identity) => {
-            run_session(stream.as_mut(), startup, identity, session, auth, metrics).await
+        // verified identity (when any) becomes a candidate write principal, and
+        // the server certificate's `tls-server-end-point` binding (when any)
+        // enables SCRAM-SHA-256-PLUS (STL-297).
+        Negotiated::Tls(mut stream, startup, identity, channel_binding) => {
+            run_session(
+                stream.as_mut(),
+                startup,
+                identity,
+                channel_binding,
+                session,
+                auth,
+                metrics,
+            )
+            .await
         }
     }
 }
@@ -1038,6 +1050,9 @@ enum Negotiated {
         Box<tokio_rustls::server::TlsStream<TcpStream>>,
         StartupMessage,
         Option<CertIdentity>,
+        /// The server certificate's `tls-server-end-point` channel-binding data,
+        /// when it supports one — enables SCRAM-SHA-256-PLUS (STL-297).
+        Option<Vec<u8>>,
     ),
 }
 
@@ -1075,8 +1090,17 @@ async fn negotiate_startup(
                     if let Some(id) = &identity {
                         debug!(cert_cn_san = %id.name, "verified mTLS client identity");
                     }
+                    // The server certificate's `tls-server-end-point` binding is
+                    // fixed for the listener, so it was precomputed at load; clone
+                    // it onto the connection to enable SCRAM-SHA-256-PLUS (STL-297).
+                    let channel_binding = ctx.endpoint_cbind.clone();
                     let startup = read_startup(tls_stream.as_mut()).await?;
-                    return Ok(Negotiated::Tls(tls_stream, startup, identity));
+                    return Ok(Negotiated::Tls(
+                        tls_stream,
+                        startup,
+                        identity,
+                        channel_binding,
+                    ));
                 }
                 // No TLS configured: refuse; the client may fall back to
                 // plaintext and resend a StartupMessage.
@@ -1133,6 +1157,7 @@ async fn run_session<S: Wire>(
     stream: &mut S,
     startup: StartupMessage,
     cert_identity: Option<CertIdentity>,
+    channel_binding: Option<Vec<u8>>,
     session: SharedSession,
     auth: AuthMode,
     metrics: &SharedMetrics,
@@ -1144,7 +1169,7 @@ async fn run_session<S: Wire>(
     // lands on the connection span (STL-107). `trust` skips straight to the
     // OK bundle (the v0.1 posture, and the dev default).
     let user = if auth == AuthMode::Scram {
-        scram::authenticate(stream, &startup, &session).await?
+        scram::authenticate(stream, &startup, &session, channel_binding.as_deref()).await?
     } else {
         startup.user().unwrap_or(DEFAULT_WIRE_USER).to_owned()
     };
