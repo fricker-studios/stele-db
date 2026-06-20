@@ -13039,6 +13039,17 @@ mod tests {
             sorted(names.rows),
             sorted(vec![vec![txt("alice")], vec![txt("bob")]])
         );
+        // DISTINCT + ORDER BY a *qualified* projected column is legal and ordered
+        // (the qualifier disambiguates after the join; not a 42P10 — STL-264).
+        let ordered_distinct = select(
+            &mut engine,
+            "SELECT DISTINCT users.name FROM users JOIN orders ON users.id = orders.uid \
+             ORDER BY users.name DESC",
+        );
+        assert_eq!(
+            ordered_distinct.rows,
+            vec![vec![txt("bob")], vec![txt("alice")]]
+        );
     }
 
     #[test]

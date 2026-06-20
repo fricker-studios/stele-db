@@ -1102,8 +1102,16 @@ fn bind_select_scoped(
     // The `WHERE` / aggregate / `DISTINCT` / `ORDER BY` / `LIMIT` clauses compose
     // over the join's output ([STL-264]) — bound against its addressable columns.
     if let Some(join) = detect_join(select)? {
-        let (mut bound, mut side_ctes) =
-            bind_join(stmt, ctx, query, select, join, &sigs, snapshot, valid_snapshot)?;
+        let (mut bound, mut side_ctes) = bind_join(
+            stmt,
+            ctx,
+            query,
+            select,
+            join,
+            &sigs,
+            snapshot,
+            valid_snapshot,
+        )?;
         // The `WITH` relations materialize first (a derived join side may reference
         // one), then any derived tables the join sides introduced.
         ctes.append(&mut side_ctes);
@@ -1987,6 +1995,12 @@ fn detect_join(select: &Select) -> Result<Option<&TableWithJoins>, SelectError> 
 /// [`SelectError::ValidTimeUnsupported`]. A period predicate over the join, the
 /// `RIGHT` / `FULL` / `CROSS` joins ([`join_kind_and_constraint`]), and N-way joins
 /// ([`detect_join`], [STL-323]) stay rejected (each a tracked follow-up).
+// Eight inputs because the join binds the whole `SELECT` over both relations: the
+// statement (temporal qualifiers) and its `query` / `select` halves, the catalog
+// `ctx`, the `from` relations, the CTE `sigs` in scope, and the resolved
+// `(snapshot, valid_snapshot)` pin every input reads at. Bundling any subset only
+// moves the plumbing without clarifying it.
+#[allow(clippy::too_many_arguments)]
 fn bind_join<'a>(
     stmt: &Statement,
     ctx: &'a BindContext<'a>,
@@ -2055,7 +2069,14 @@ fn bind_join<'a>(
     // exactly as the single-table path binds them over a schema — only column
     // resolution differs (`JoinScope` vs a base-table schema).
     let distinct = bind_distinct(select)?;
-    let order_by = bind_join_order_by(query, &scope, distinct, aggregate.as_ref(), &columns)?;
+    let order_by = bind_join_order_by(
+        query,
+        &scope,
+        distinct,
+        aggregate.as_ref(),
+        &output,
+        &columns,
+    )?;
     let (limit, offset) = bind_limit_offset(query)?;
     let filter = select
         .selection
@@ -2788,12 +2809,18 @@ fn bind_join_aggregate_call(
 /// Bind a join query's `ORDER BY` into [`BoundSortKey`]s ([STL-263], [STL-264]) —
 /// the join counterpart of [`bind_order_by`], resolving each key against the
 /// projected output columns first, then the join's addressable columns.
+///
+/// `projection` is the addressable indices the select list projects (a plain
+/// query's [`BoundJoin::output`]) and `header` their `(name, type)` columns — both
+/// empty/aggregate on the aggregate path, which resolves against `aggregate`'s
+/// output columns instead.
 fn bind_join_order_by(
     query: &Query,
     scope: &JoinScope,
     distinct: bool,
     aggregate: Option<&BoundAggregate>,
-    output: &[(String, LogicalType)],
+    projection: &[usize],
+    header: &[(String, LogicalType)],
 ) -> Result<Vec<BoundSortKey>, SelectError> {
     let Some(order_by) = &query.order_by else {
         return Ok(Vec::new());
@@ -2809,23 +2836,27 @@ fn bind_join_order_by(
     };
     exprs
         .iter()
-        .map(|key| bind_join_sort_key(key, scope, distinct, aggregate, output))
+        .map(|key| bind_join_sort_key(key, scope, distinct, aggregate, projection, header))
         .collect()
 }
 
-/// Bind one join `ORDER BY` key ([STL-264]). Like [`bind_sort_key`], a bare name
-/// resolves against the **select list first** (an aggregate query's output columns;
-/// a plain query's projected columns), then — for a plain, non-`DISTINCT` query —
-/// against the join's addressable columns (a qualified `t.c`, or an unprojected
-/// column — the Postgres allowance). With `DISTINCT` a non-projected key is the
-/// 42P10 [`SelectError::DistinctOrderBy`]; an aggregate query's rows have no
+/// Bind one join `ORDER BY` key ([STL-264]). Like [`bind_sort_key`], the name
+/// resolves against the **select list first**: an aggregate query's output columns;
+/// a plain query's projected columns, **by name for a bare key and by resolved
+/// addressable column for a qualified one** — so `SELECT DISTINCT t.a … ORDER BY
+/// t.a` sorts on the projected `t.a` (a qualifier is often needed to disambiguate
+/// same-named columns after a join) rather than tripping 42P10. A plain,
+/// non-`DISTINCT` query may also sort on an unprojected addressable column (the
+/// Postgres allowance); under `DISTINCT` that is the 42P10
+/// [`SelectError::DistinctOrderBy`], and an aggregate query's rows have no
 /// addressable columns to fall back to.
 fn bind_join_sort_key(
     key: &OrderByExpr,
     scope: &JoinScope,
     distinct: bool,
     aggregate: Option<&BoundAggregate>,
-    output: &[(String, LogicalType)],
+    projection: &[usize],
+    header: &[(String, LogicalType)],
 ) -> Result<BoundSortKey, SelectError> {
     if key.with_fill.is_some() {
         return Err(SelectError::UnsupportedOrderBy("WITH FILL".to_owned()));
@@ -2844,9 +2875,9 @@ fn bind_join_sort_key(
             descending,
         })
     };
-    // A bare name may match a select-list output column by name; a qualified `t.c`
-    // never names an output column (the header is bare), so it resolves against the
-    // addressable columns directly.
+    // A bare name may match a select-list output column by name — even one whose
+    // bare form is ambiguous across the inputs (the projected column disambiguates
+    // it), so this precedes addressable resolution.
     let bare = bare_column(&key.expr);
 
     // An aggregate query's result rows are its output columns — there is no
@@ -2868,15 +2899,14 @@ fn bind_join_sort_key(
         );
     }
 
-    // Plain query: the select list (by name) first.
+    // Plain query: a bare name matching a projected output column by name.
     if let Some(name) = bare
-        && let Some(pos) = output.iter().position(|(n, _)| n == name)
+        && let Some(pos) = header.iter().position(|(n, _)| n == name)
     {
         return sort_output(pos);
     }
 
-    // Otherwise resolve against the addressable columns — a qualified key, or an
-    // unprojected one. After `DISTINCT` that value is ambiguous (Postgres 42P10).
+    // Resolve the key (bare or qualified) to an addressable column.
     let column_expr = match &key.expr {
         e @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Nested(_)) => e,
         other => {
@@ -2886,6 +2916,14 @@ fn bind_join_sort_key(
         }
     };
     let (index, _) = scope.resolve(column_expr)?;
+
+    // A qualified key that resolves to a **projected** column *is* a select-list
+    // column (`SELECT DISTINCT t.a … ORDER BY t.a`) — sort by its output position,
+    // legal under `DISTINCT`. Only a column the projection does not carry falls
+    // through: allowed for a plain read, the 42P10 ambiguity under `DISTINCT`.
+    if let Some(pos) = projection.iter().position(|&p| p == index) {
+        return sort_output(pos);
+    }
     if distinct {
         return Err(SelectError::DistinctOrderBy);
     }
@@ -5280,6 +5318,52 @@ mod tests {
             .expect("bind")
             .distinct
         );
+    }
+
+    #[test]
+    fn distinct_order_by_a_projected_join_column_is_legal_qualified_or_bare() {
+        // A qualified ORDER BY key that is in the select list is valid under
+        // DISTINCT — qualification disambiguates same-named columns after a join,
+        // and the key resolves to its output position, not a 42P10 ([STL-264]).
+        let catalog = catalog_with_join_tables();
+        for sql in [
+            "SELECT DISTINCT users.name FROM users JOIN orders ON users.id = orders.uid \
+             ORDER BY users.name",
+            "SELECT DISTINCT users.name FROM users JOIN orders ON users.id = orders.uid \
+             ORDER BY name",
+        ] {
+            let bound = bind(sql, &catalog).expect("DISTINCT ORDER BY a projected join column");
+            assert_eq!(
+                bound.order_by,
+                vec![BoundSortKey {
+                    column: SortTarget::Output(0),
+                    descending: false,
+                }],
+                "{sql}"
+            );
+        }
+        // But ORDER BY a column the DISTINCT projection discarded is the 42P10.
+        assert!(matches!(
+            bind(
+                "SELECT DISTINCT users.name FROM users JOIN orders ON users.id = orders.uid \
+                 ORDER BY orders.oid",
+                &catalog,
+            ),
+            Err(SelectError::DistinctOrderBy)
+        ));
+        // Without DISTINCT, sorting on an unprojected qualified column is allowed.
+        let plain = bind(
+            "SELECT users.name FROM users JOIN orders ON users.id = orders.uid ORDER BY orders.oid",
+            &catalog,
+        )
+        .expect("plain ORDER BY an unprojected join column");
+        assert!(matches!(
+            plain.order_by.as_slice(),
+            [BoundSortKey {
+                column: SortTarget::Schema(_),
+                ..
+            }]
+        ));
     }
 
     #[test]
