@@ -93,10 +93,13 @@ A connection can pin its read snapshot on either axis so **every** subsequent ba
 | `RESET ALL` | Clear both axes. |
 | any other `SET`/`RESET` | A tolerated no-op (see below). |
 
-* **`<expr>` resolves exactly like a `FOR … AS OF` operand** — `now()`, an integer
-  microsecond instant, `now() ± interval '…'`, plus the alias `'now'` for `now()`.
-  It is folded **once, at the time of the `SET`** (so `SET … = now()` pins the
-  instant of the `SET`, not a moving target), against the server clock.
+* **`<expr>` accepts the same expression *shapes* as a `FOR … AS OF` operand** —
+  `now()`, an integer microsecond instant, `now() ± interval '…'`, plus the alias
+  `'now'` for `now()`. Unlike an `AS OF` operand (whose `now()` folds to the
+  reading statement/transaction), the `SET` value is **evaluated once, at the
+  moment of the `SET`**: `now()` is that statement's instant (the server clock
+  observed fresh, **not** an open transaction's `BEGIN` snapshot), and the pin
+  holds that fixed instant until changed or `RESET` — it is not a moving target.
 * **Equivalence (the oracle).** A session-pinned read returns byte-for-byte what
   the explicit form returns: the server applies the pin by replaying it as an
   explicit `FOR <dim> AS OF <instant>` qualifier on each bare single-table

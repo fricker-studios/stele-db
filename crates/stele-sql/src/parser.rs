@@ -345,6 +345,7 @@ fn lift_session_command(
         return Ok(None);
     };
     let rest = &tokens[1..];
+    let syntax = |msg: &str| ParseError::Syntax(ParserError::ParserError(msg.to_owned()));
 
     if is_reset {
         // `RESET ALL` clears every session setting — for the time context, both axes.
@@ -353,13 +354,21 @@ fn lift_session_command(
         {
             return Ok(Some(SessionCommand::ResetAll));
         }
-        // `RESET stele.<axis>_time` clears one axis; anything else is tolerated.
-        return Ok(Some(match stele_time_axis(rest) {
-            Some(dimension) if rest.len() == 3 => SessionCommand::ResetTime { dimension },
-            _ => SessionCommand::Tolerated {
-                name: variable_name(rest),
-                is_reset: true,
-            },
+        // A `RESET` of a Stele time axis is **ours**: it must be exactly the
+        // three-token name, so a trailing token (`RESET stele.system_time = 1`) is a
+        // loud error rather than a silent tolerated no-op that leaves the session
+        // pinned. Any non-`stele.*` variable stays tolerated.
+        if let Some(dimension) = stele_time_axis(rest) {
+            if rest.len() != 3 {
+                return Err(syntax(
+                    "RESET of a session time variable takes no arguments",
+                ));
+            }
+            return Ok(Some(SessionCommand::ResetTime { dimension }));
+        }
+        return Ok(Some(SessionCommand::Tolerated {
+            name: variable_name(rest),
+            is_reset: true,
         }));
     }
 
@@ -372,7 +381,6 @@ fn lift_session_command(
             is_reset: false,
         }));
     };
-    let syntax = |msg: &str| ParseError::Syntax(ParserError::ParserError(msg.to_owned()));
     // The qualified name spans three tokens (`stele` `.` `<axis>_time`); the
     // assignment operator and value follow.
     let after = &rest[3..];
@@ -994,6 +1002,24 @@ mod session_tests {
         ] {
             assert!(parse(sql).is_err(), "expected a parse error for: {sql}");
         }
+    }
+
+    #[test]
+    fn reset_of_a_stele_time_variable_is_strict() {
+        // A trailing token on `RESET stele.<axis>_time` is a loud error, not a
+        // silent tolerated no-op that would leave the session pinned.
+        for sql in [
+            "RESET stele.system_time = 1",
+            "RESET stele.system_time now()",
+            "RESET stele.valid_time junk",
+        ] {
+            assert!(parse(sql).is_err(), "expected a parse error for: {sql}");
+        }
+        // A non-Stele `RESET` with trailing tokens stays tolerated (we do not own it).
+        assert!(matches!(
+            session("RESET extra_float_digits"),
+            SessionCommand::Tolerated { is_reset: true, .. }
+        ));
     }
 
     #[test]
