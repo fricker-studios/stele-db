@@ -711,7 +711,10 @@ fn parse_server_first(msg: &str) -> anyhow::Result<(String, Vec<u8>, u32)> {
         } else if let Some(v) = attr.strip_prefix("s=") {
             salt = scram::b64_decode(v);
         } else if let Some(v) = attr.strip_prefix("i=") {
-            iterations = v.parse().ok();
+            // Reject `i=0` (and any non-numeric count): SCRAM/PBKDF2 requires at
+            // least one iteration — 0 would silently degrade `scram::hi` to a
+            // single round and deviates from RFC 5802.
+            iterations = v.parse::<u32>().ok().filter(|&i| i > 0);
         }
     }
     match (nonce, salt, iterations) {
@@ -959,11 +962,13 @@ mod tests {
 
     #[test]
     fn parse_server_first_rejects_malformed_messages() {
-        // Missing salt, missing iterations, a non-numeric count, and bad base64.
+        // Missing salt, missing iterations, a non-numeric count, a zero count
+        // (PBKDF2 needs >= 1), and bad base64.
         for msg in [
             "r=abc,i=4096",
             "r=abc,s=AAAA",
             "r=abc,s=AAAA,i=lots",
+            "r=abc,s=AAAA,i=0",
             "r=abc,s=!!,i=1",
         ] {
             assert!(parse_server_first(msg).is_err(), "{msg:?}");

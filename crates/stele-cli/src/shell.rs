@@ -206,9 +206,12 @@ fn prompt_password(user: &str) -> anyhow::Result<String> {
     let mut quiet = original.clone();
     quiet.local_flags.remove(LocalFlags::ECHO);
 
+    // Disable echo *before* writing the prompt: otherwise a user who starts
+    // typing while the prompt is still flushing could have those first
+    // characters echoed before ECHO is cleared.
+    tcsetattr(fd, SetArg::TCSANOW, &quiet).context("disabling terminal echo")?;
     eprint!("Password for user {user}: ");
     std::io::stderr().flush().ok();
-    tcsetattr(fd, SetArg::TCSANOW, &quiet).context("disabling terminal echo")?;
 
     let mut password = String::new();
     let read = stdin.lock().read_line(&mut password);
