@@ -21,11 +21,14 @@ use std::time::Instant;
 
 use anyhow::Context as _;
 
-use crate::admin::{AdminClient, AdminConfig, AdminError};
 use crate::client::{Client, Reply, ResultSet, ServerError};
+// The admin / control-plane tier ([STL-200]) rides the published `stele-client`
+// SDK ([STL-255]) — the dogfood for the crate the CLI, Studio, and the operator
+// share. Aliased so the SDK's `Client` does not shadow the pg-wire `Client` above.
 use crate::highlight;
 use crate::render::{self, BorderStyle, Column, StatsMode, TableOpts};
 use crate::theme::{Role, Seg, Theme, paint_segs};
+use stele_client::{Client as AdminClient, Config as AdminConfig, Error as AdminError};
 
 /// Connection + presentation options for `stele shell` (from clap in `main`).
 pub struct Opts {
@@ -1832,7 +1835,7 @@ fn print_admin_error(session: &Session, err: &AdminError) {
 }
 
 /// `\status` — engine health over the admin / control-plane API ([STL-200]).
-/// Renders the real [`StatusReport`](crate::admin::StatusReport): version,
+/// Renders the real [`StatusReport`](stele_client::StatusReport): version,
 /// relation/segment/user counts, and a health verdict from `ready` /
 /// `wal_poisoned`. (The prototype's WAL-LSN, system-time, and storage rows have
 /// no server field, so they are not shown.)

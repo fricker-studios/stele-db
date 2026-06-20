@@ -1,0 +1,50 @@
+[package]
+name        = "stele-client"
+description = "Rust SDK for the Stele admin / control-plane API (v1alpha1): health, backup/restore-plan, and introspection over the HTTP/JSON gateway."
+# `stele-client` is the first crate Stele publishes to crates.io (ADR-0016,
+# assumption A26). It carries crates.io metadata of its own — keywords,
+# categories, a README rendered on the crate page — on top of the inherited
+# workspace fields. SQL access stays on existing Postgres drivers; this crate is
+# ops-only.
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+readme       = "README.md"
+keywords     = ["stele", "database", "admin", "control-plane", "client"]
+categories   = ["database", "api-bindings"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# A deliberately tiny footprint: the v0 transport is the HTTP/JSON gateway over a
+# blocking std `TcpStream` (the gRPC transport is optional in v0, ADR-0016), so
+# the only external dependencies are serde + serde_json to (de)serialize request
+# and reply bodies. No async runtime, no HTTP framework — keeps the published
+# crate's dependency tree small for downstream consumers.
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The live-server integration test (the DoD: health-check, backup, and
+# introspection against a real server) boots an in-process engine behind the
+# admin HTTP gateway on an ephemeral port, then drives the blocking client at it.
+#
+# These sibling crates are declared **path-only** (no version) rather than via
+# `{ workspace = true }`, because the workspace form carries `version = "0.3.0"`
+# and those crates are NOT on crates.io. `cargo package` checks every versioned
+# dependency — dev-deps included — against the registry, but **drops path-only
+# dev-deps entirely** from the published manifest, so they never gate publication
+# of `stele-client` (the one crate that *is* published). tokio is a real registry
+# crate, so it keeps the workspace form.
+stele-server  = { path = "../stele-server" }
+stele-engine  = { path = "../stele-engine" }
+stele-pgwire  = { path = "../stele-pgwire" }
+stele-storage = { path = "../stele-storage" }
+stele-common  = { path = "../stele-common" }
+stele-sql     = { path = "../stele-sql" }
+tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

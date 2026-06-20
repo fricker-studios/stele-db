@@ -10,7 +10,6 @@
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
-mod admin;
 mod client;
 mod highlight;
 mod render;
@@ -170,7 +169,7 @@ fn main() -> anyhow::Result<()> {
                 row_nums: s.row_numbers,
                 no_color: s.no_color,
                 stats: s.stats,
-                admin: admin::AdminConfig {
+                admin: stele_client::Config {
                     host: admin_host,
                     port: s.admin_port,
                     token: admin_token,

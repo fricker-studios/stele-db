@@ -382,3 +382,53 @@ jobs:
               --prerelease="${prerelease}" \
               dist/*
           fi
+
+  # Publish the one crates.io artifact — the `stele-client` Rust SDK (ADR-0016,
+  # STL-255). The engine, server, and CLI stay GitHub-Releases + Docker only;
+  # crates.io carries the SDK and reusable libraries, not the server (docs/08 §2).
+  #
+  # Gated two ways: the whole workflow is tag-driven (no other trigger), and this
+  # job runs in the protected `crates-io` environment, which holds the
+  # CARGO_REGISTRY_TOKEN secret and (optionally) required reviewers — that
+  # environment approval is the manual gate. It runs *after* the GitHub Release is
+  # published, so a crates.io version can never exist without a matching release.
+  publish-crate:
+    name: publish (crates.io)
+    needs: release
+    runs-on: ubuntu-latest
+    # The deployment environment that gates the publish: configure
+    # CARGO_REGISTRY_TOKEN (a crates.io API token scoped to publish-update) and
+    # any required reviewers on it in the repo settings.
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (no semver tags)
+        with:
+          toolchain: "1.89.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: Publish stele-client to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # Idempotent: re-running an already-published tag must be a no-op, not a
+        # failure (crates.io rejects a duplicate version). Rather than pre-check
+        # with `cargo search` — which is flaky under network/rate-limiting and can
+        # false-negative into a failed publish — just attempt the publish and treat
+        # the "already uploaded" rejection as success; any other error is fatal.
+        # `--locked` publishes exactly the committed Cargo.lock. Only `stele-client`
+        # is published; its unpublished sibling crates appear solely as path-only
+        # dev-deps, which `cargo package` strips, so the published crate depends
+        # only on crates.io-resolvable deps (serde, serde_json).
+        run: |
+          set +e
+          cargo publish -p stele-client --locked >publish.log 2>&1
+          status=$?
+          set -e
+          cat publish.log
+          if [ "${status}" -eq 0 ]; then
+            echo "published stele-client ${GITHUB_REF_NAME#v}"
+          elif grep -qiE 'already (exists|uploaded)|is already uploaded|crate version .* is already' publish.log; then
+            echo "stele-client ${GITHUB_REF_NAME#v} already on crates.io — treating as success"
+          else
+            echo "::error::cargo publish failed for a reason other than a duplicate version"
+            exit 1
+          fi
