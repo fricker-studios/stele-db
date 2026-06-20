@@ -90,7 +90,7 @@ use stele_sql::select::{
     AggregateFunc, ArithOp, BoundAggregate, BoundCte, BoundHaving, BoundJoinSide, BoundPeriod,
     BoundPeriodPredicate, BoundPredicate, BoundScalar, BoundSelect, BoundSubqueryFilter, CompareOp,
     Correlation, HavingScalar, JoinType, OutputItem, PeriodEndpoint, Projection, ProjectionItem,
-    ProjectionValue, SelectError, SortTarget, SubqueryKind,
+    ProjectionValue, SelectError, SortTarget, SubqueryKind, SystemTimeRange,
 };
 use stele_sql::{
     AdminCommand, BindContext, BindError, BoundCopy, CopyError, CopyShape, Statement,
@@ -3172,6 +3172,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .map(|c| (c.name().to_owned(), c.ty()))
             .collect();
         let n_schema = schema_columns.len();
+        // A range scan ([STL-244]) appends the period endpoints after the projected
+        // user columns, and has no provenance pseudo-columns in its addressable set.
+        if bound.system_range.is_some() {
+            let mut columns = projected_columns(&bound.projection, &schema_columns, n_schema);
+            columns.push(("sys_from".to_owned(), LogicalType::TimestampTz));
+            columns.push(("sys_to".to_owned(), LogicalType::TimestampTz));
+            return Ok(columns);
+        }
         Ok(projected_columns(
             &bound.projection,
             &addressable_columns(&schema_columns),
@@ -3260,6 +3268,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // threaded through the join path.
         if bound.join.is_some() {
             return self.run_join(bound, scope);
+        }
+
+        // A `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` range scan
+        // ([STL-244]) returns every version overlapping the interval — many per key
+        // — with the period endpoints (`sys_from`, `sys_to`) appended after the
+        // projected columns. A wholly different shape from a point read, and the
+        // binder has already rejected the clauses (aggregate / shaping / subquery /
+        // CTE / overlay-sensitive) that the single-table path below threads.
+        if let Some(range) = bound.system_range {
+            return self.run_system_range(bound, range);
         }
 
         // A `FROM` that names a materialized relation — a CTE reference or a derived
@@ -3667,6 +3685,121 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             return Err(EngineError::Unsupported("a subquery must be a SELECT"));
         };
         scalar_subquery_value(&result)
+    }
+
+    /// Run a `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` range scan
+    /// ([STL-244]): return **every** version whose system interval
+    /// `[sys_from, sys_to)` overlaps the range, with the period endpoints
+    /// (`sys_from`, `sys_to`, both `TIMESTAMPTZ`) appended after the projected
+    /// columns. `sys_to` is `NULL` for a still-current (open) version.
+    ///
+    /// The version selection is the executor's interval mode
+    /// ([`SnapshotScan::execute_range`]); the engine reconstructs each version's
+    /// row from its bare payload (the row codec), applies the bound `WHERE` over the
+    /// schema columns (the appended endpoints ride along, never referenced by the
+    /// predicate), then projects the user columns and appends the endpoints. A
+    /// key-equality `WHERE` is pushed down to the scan for zone-map pruning; the
+    /// binder has rejected the aggregate / shaping / subquery / CTE clauses the
+    /// point path threads, so this stays a plain projection + filter.
+    ///
+    /// Read-committed only: the read-your-own-writes overlay ([STL-203]) is not
+    /// applied to a range scan (a tracked follow-up), matching the join path.
+    fn run_system_range(
+        &self,
+        bound: &BoundSelect,
+        range: SystemTimeRange,
+    ) -> Result<StatementOutcome, EngineError> {
+        let table = bound.table.as_str();
+        let snapshot = bound.snapshot;
+        let state = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
+        let schema = self
+            .catalog
+            .resolve(table, snapshot)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
+        let schema_columns: Vec<(String, LogicalType)> = schema
+            .columns()
+            .iter()
+            .map(|c| (c.name().to_owned(), c.ty()))
+            .collect();
+        let value_count = schema_columns.len().saturating_sub(1);
+        let n_schema = schema_columns.len();
+
+        // Push a business-key equality down to the scan for zone-map pruning when the
+        // `WHERE` pins one; any richer predicate lives in the payload and is applied
+        // by the row filter below (re-applied exactly, so the prune need not be
+        // tight). Declare the valid-time policy so a valid-time table's framed delta
+        // payload is stripped to the bare row before the codec decodes it ([STL-218]).
+        let predicate = bound
+            .filter
+            .as_ref()
+            .and_then(BoundPredicate::key_equality)
+            .map_or(Predicate::All, |value| Predicate::Eq {
+                column: ColumnId::BusinessKey,
+                value: ZoneBound::Bytes(encode_value(value)),
+            });
+        let readers = state.engine.open_segment_readers()?;
+        let scan = SnapshotScan::new(
+            state.engine.delta(),
+            state.engine.index(),
+            &readers,
+            Snapshot(snapshot),
+        )
+        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .filter(predicate)
+        .valid_time(state.valid_time)
+        .system_range(range.from.0, range.to.0, range.closed_upper)
+        .metrics(Arc::clone(&self.metrics));
+        let (versions, stats) = scan.execute_range()?;
+
+        // Reconstruct each row as `[key, value cells…, sys_from, sys_to]`. The
+        // endpoints are appended after the schema columns: `sys_from` is the
+        // version's recorded start, `sys_to` its resolved end — `NULL` for a
+        // still-current (open) version, the same convention `version_history` uses.
+        let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(versions.len());
+        for v in &versions {
+            let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(n_schema + 2);
+            row.push(Some(v.business_key.as_bytes().to_vec()));
+            row.extend(row_codec::decode_payload(
+                value_count,
+                v.payload.as_deref(),
+            )?);
+            let open = v.sys_to == SYSTEM_TIME_OPEN;
+            row.push(Some(encode_value(&ScalarValue::TimestampTz(v.sys_from.0))));
+            row.push((!open).then(|| encode_value(&ScalarValue::TimestampTz(v.sys_to.0))));
+            rows.push(row);
+        }
+
+        // The bound `WHERE` is a plain value-column predicate (subquery / period are
+        // rejected at bind), so it folds to the syntactic plan and filters over the
+        // schema columns; the trailing endpoint cells (indices `n_schema`,
+        // `n_schema + 1`) are never referenced, so they ride along on the kept rows.
+        let plan = filter_plan(bound);
+        let rows = filter_rows(&plan, &schema_columns, rows)?;
+
+        // Project the user columns, then append the two endpoint columns.
+        let projection = projection_indices(&bound.projection, &schema_columns, n_schema);
+        let mut columns = projected_columns(&bound.projection, &schema_columns, n_schema);
+        columns.push(("sys_from".to_owned(), LogicalType::TimestampTz));
+        columns.push(("sys_to".to_owned(), LogicalType::TimestampTz));
+        let out_rows: Vec<Vec<Option<Vec<u8>>>> = rows
+            .iter()
+            .map(|row| {
+                let mut out: Vec<Option<Vec<u8>>> =
+                    projection.iter().map(|&i| row[i].clone()).collect();
+                out.push(row[n_schema].clone());
+                out.push(row[n_schema + 1].clone());
+                out
+            })
+            .collect();
+        let result_stats = query_stats(&stats, out_rows.len(), snapshot);
+        Ok(StatementOutcome::Rows(SelectResult {
+            columns,
+            rows: out_rows,
+            stats: Some(result_stats),
+        }))
     }
 
     /// Resolve a bound `SELECT`'s `WHERE` to a concrete [`FilterPlan`].
@@ -4518,6 +4651,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             schema_id,
             snapshot,
             valid_snapshot: None,
+            // A range scan is never lowered to one of these synthetic DML
+            // probe/scan plans ([STL-244]).
+            system_range: None,
             projection: Projection::Items(vec![ProjectionItem::column(key_col.name())]),
             filter: Some(BoundPredicate {
                 left: BoundScalar::Column(0),
@@ -4605,6 +4741,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             schema_id: merge.schema_id,
             snapshot,
             valid_snapshot: None,
+            // A range scan is never lowered to one of these synthetic DML
+            // probe/scan plans ([STL-244]).
+            system_range: None,
             projection: Projection::Items(vec![ProjectionItem::column(key_col)]),
             filter: Some(BoundPredicate {
                 left: BoundScalar::Column(0),
@@ -4813,6 +4952,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             schema_id,
             snapshot,
             valid_snapshot: None,
+            // A range scan is never lowered to one of these synthetic DML
+            // probe/scan plans ([STL-244]).
+            system_range: None,
             projection: Projection::Items(vec![ProjectionItem::column(key_col.name())]),
             filter,
             period_filter: None,
@@ -4935,6 +5077,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             schema_id: merge.schema_id,
             snapshot,
             valid_snapshot: None,
+            // A range scan is never lowered to one of these synthetic DML
+            // probe/scan plans ([STL-244]).
+            system_range: None,
             projection: Projection::Items(vec![ProjectionItem::column(key_name)]),
             filter: None,
             period_filter: None,
@@ -5130,6 +5275,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     schema_id: *schema_id,
                     snapshot,
                     valid_snapshot: None,
+                    system_range: None,
                     projection: Projection::Items(
                         columns
                             .iter()
