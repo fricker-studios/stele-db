@@ -9,13 +9,19 @@
 //! [STL-254]: https://allegromusic.atlassian.net/browse/STL-254
 //! [ADR-0016]: ../../../docs/adr/0016-admin-control-plane-api.md
 
+use std::io;
 use std::sync::Arc;
 
 use stele_common::time::Clock;
 use stele_storage::backend::Disk;
 use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
+use tokio::sync::mpsc;
+use tokio_rustls::server::TlsStream;
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Request, Response, Status};
+use tracing::{debug, warn};
+
+use crate::tls::AcceptorSource;
 
 use super::proto::admin_service_server::{AdminService as AdminServiceRpc, AdminServiceServer};
 use super::proto::{
@@ -64,11 +70,18 @@ where
     }
 }
 
-/// Serve the gRPC admin API on an already-bound `listener`.
+/// The most completed TLS handshakes that may queue ahead of tonic on the TLS
+/// serve path. Handshakes run on their own tasks (so a slow one never blocks the
+/// accept loop); this bounds how many finished-but-not-yet-served connections
+/// buffer, backpressuring the accept loop under a flood.
+const TLS_HANDSHAKE_BACKLOG: usize = 1024;
+
+/// Serve the gRPC admin API **in plaintext** on an already-bound `listener`.
 ///
 /// The caller binds the listener (so it can report the bound address), mirroring
 /// the pg-wire / ops listeners ([STL-152]); the server runs until the future is
-/// dropped.
+/// dropped. Used in dev / on a loopback bind without `[tls]`; [`serve_tls`] is
+/// the encrypted path.
 ///
 /// # Errors
 ///
@@ -87,6 +100,73 @@ where
         .add_service(AdminServiceServer::new(service))
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await
+}
+
+/// Serve the gRPC admin API **over TLS** on an already-bound `listener`, reusing
+/// the pg-wire certificate material via `tls` ([STL-311]).
+///
+/// Every connection runs the rustls handshake (off the accept loop) before tonic
+/// sees it; a connection that fails the handshake — a plaintext client, a
+/// rejected mTLS certificate — is logged and dropped, never reaching the service.
+///
+/// # Errors
+///
+/// Propagates a fatal [`tonic::transport::Error`] from the server.
+///
+/// [STL-311]: https://allegromusic.atlassian.net/browse/STL-311
+pub async fn serve_tls<C, D>(
+    listener: TcpListener,
+    service: GrpcAdmin<C, D>,
+    tls: AcceptorSource,
+) -> Result<(), tonic::transport::Error>
+where
+    C: Clock + Clone + Send + 'static,
+    D: Disk + Clone + Send + 'static,
+{
+    tonic::transport::Server::builder()
+        .add_service(AdminServiceServer::new(service))
+        .serve_with_incoming(tls_incoming(listener, tls))
+        .await
+}
+
+/// A stream of TLS-handshaked connections for [`serve_tls`] to feed tonic.
+///
+/// An accept loop on its own task pulls raw TCP connections and spawns a
+/// per-connection handshake; only completed [`TlsStream`]s reach the channel, so
+/// a stalled handshake never blocks accepting the next peer. tonic treats the
+/// `tls-connect-info` [`Connected`](tonic::transport::server::Connected) impl on
+/// `TlsStream<TcpStream>` exactly as it does a bare `TcpStream`.
+fn tls_incoming(
+    listener: TcpListener,
+    tls: AcceptorSource,
+) -> ReceiverStream<io::Result<TlsStream<tokio::net::TcpStream>>> {
+    let (tx, rx) = mpsc::channel(TLS_HANDSHAKE_BACKLOG);
+    tokio::spawn(async move {
+        loop {
+            let (stream, peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(error) => {
+                    warn!(%error, "admin gRPC accept failed");
+                    continue;
+                }
+            };
+            let acceptor = tls.grpc_acceptor();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                match crate::tls::handshake(acceptor, stream).await {
+                    // The receiver is dropped only when tonic's serve future ends,
+                    // which also drops this accept task — a send error is shutdown.
+                    Ok(tls_stream) => {
+                        let _ = tx.send(Ok(tls_stream)).await;
+                    }
+                    Err(error) => {
+                        debug!(%peer, %error, "admin gRPC TLS handshake failed");
+                    }
+                }
+            });
+        }
+    });
+    ReceiverStream::new(rx)
 }
 
 /// Map an [`AdminError`] onto a gRPC [`Status`].
