@@ -4342,42 +4342,39 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     }
 
     /// Which plan [`merge_live_keys`](Self::merge_live_keys) resolves a `MERGE`'s
-    /// target membership with: `true` to point-probe each of the `source_rows`
-    /// source keys against the always-indexed business key (per-segment bloom +
-    /// zone pruning, [STL-238]), `false` to read every live key in one full-keyset
-    /// scan.
+    /// target membership with: `true` to point-probe each of the `probe_keys`
+    /// distinct source keys against the always-indexed business key (per-segment
+    /// bloom + zone pruning, [STL-238]), `false` to read every live key in one
+    /// full-keyset scan.
     ///
     /// A **cost-based** choice ([STL-312]): the per-source-key plan does one
-    /// pruned point read per source row, the full-keyset plan one scan of the
-    /// whole live keyspace, so probing wins exactly when the source is smaller
-    /// than the keyspace. The keyspace size is
+    /// pruned point read per distinct source key, the full-keyset plan one scan of
+    /// the whole live keyspace, so probing wins exactly when the source touches
+    /// fewer keys than the keyspace holds. `probe_keys` is the count of *distinct,
+    /// non-NULL* join keys — the reads the probe path actually issues, since a NULL
+    /// never matches and a repeated key is probed once — not the raw source-row
+    /// count. The keyspace size is
     /// [`Engine::live_version_estimate`](stele_storage::engine::Engine::live_version_estimate)
-    /// — the sealed segments' footer row counts plus the resident delta — a
-    /// version count that never *undercounts* the keys a full scan reads. Both
-    /// plans yield the same `live ∩ source` membership
-    /// ([`merge_live_keys`](Self::merge_live_keys)), so the estimate only ever
-    /// picks the faster plan, never a different upsert.
+    /// — the resident sealed version set plus the delta — a version count that
+    /// never *undercounts* the keys a full scan reads. Both plans yield the same
+    /// `live ∩ source` membership ([`merge_live_keys`](Self::merge_live_keys)), so
+    /// the estimate only ever picks the faster plan, never a different upsert.
     ///
     /// This replaces the original "the target holds ≥1 sealed segment" heuristic,
     /// which always full-scanned an all-delta target and always point-probed a
     /// flushed one — wrong at the corner the estimate now catches: a flushed
-    /// target whose source is *larger* than its live keyspace, where the single
-    /// scan beats `source_rows` point reads.
+    /// target whose source touches *more* keys than its live keyspace, where the
+    /// single scan beats `probe_keys` point reads.
     ///
     /// An unknown table (an internal contract break — `bind_merge` proved it
     /// resolves) reports `false`, leaving the subsequent read to surface the error.
     ///
     /// [STL-312]: https://allegromusic.atlassian.net/browse/STL-312
-    fn merge_should_probe_per_key(
-        &self,
-        table: &str,
-        source_rows: usize,
-    ) -> Result<bool, EngineError> {
+    fn merge_should_probe_per_key(&self, table: &str, probe_keys: usize) -> bool {
         let Some(state) = self.tables.get(table) else {
-            return Ok(false);
+            return false;
         };
-        let keyspace = state.engine.live_version_estimate()?;
-        Ok((source_rows as u64) < keyspace)
+        (probe_keys as u64) < state.engine.live_version_estimate()
     }
 
     /// Whether `key` resolves to a live target row at the statement snapshot — the
@@ -4811,8 +4808,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
 
         let rows = self.merge_source_rows(&merge.source, snapshot, overlay)?;
         // Cost-based plan choice ([STL-312]): point-probe each source key when the
-        // source is smaller than the live keyspace, else read every live key once.
-        let probe_per_key = self.merge_should_probe_per_key(&merge.table, rows.len())?;
+        // source touches fewer keys than the live keyspace holds, else read every
+        // live key once. The probe path reads one key per *distinct, non-NULL* join
+        // key (a NULL never matches; a repeat is probed once), so the cost compares
+        // that count — not the raw source-row count — against the keyspace.
+        let probe_keys: HashSet<Vec<u8>> = rows
+            .iter()
+            .filter_map(|row| row.get(merge.on).and_then(|c| c.as_ref()))
+            .map(encode_value)
+            .collect();
+        let probe_per_key = self.merge_should_probe_per_key(&merge.table, probe_keys.len());
         let live =
             self.merge_live_keys(merge, &key_name, snapshot, &rows, probe_per_key, overlay)?;
 
@@ -16012,18 +16017,18 @@ mod tests {
     #[test]
     fn merge_probe_plan_follows_the_source_vs_keyspace_cost() {
         // STL-312: the per-source-key indexed probe is chosen by a cost estimate,
-        // not by "the target holds a sealed segment". Probe when the source is
-        // smaller than the live keyspace (segment rows + delta); otherwise read
-        // every live key in one full-keyset scan. Either plan yields the same
-        // upsert — that result-identity is the existing oracle
+        // not by "the target holds a sealed segment". Probe when the source touches
+        // fewer keys than the live keyspace holds (sealed versions + delta);
+        // otherwise read every live key in one full-keyset scan. Either plan yields
+        // the same upsert — that result-identity is the existing oracle
         // (`merge_matches_a_reference_model_over_seeded_workloads`) — so this pins
         // only the *choice*, including the corners the old heuristic missed.
         let mut engine = session();
         engine.execute(&parse_one(CREATE_O)).expect("create");
 
         // Empty target: no live key to point-read, so any source full-scans.
-        assert!(!engine.merge_should_probe_per_key("o", 0).expect("estimate"));
-        assert!(!engine.merge_should_probe_per_key("o", 4).expect("estimate"));
+        assert!(!engine.merge_should_probe_per_key("o", 0));
+        assert!(!engine.merge_should_probe_per_key("o", 4));
 
         // Ten resident (all-delta) keys → a keyspace estimate of ten.
         let batch = (0..10)
@@ -16032,49 +16037,39 @@ mod tests {
             .join(", ");
         dml(&mut engine, &format!("INSERT INTO o VALUES {batch}"));
 
-        // The boundary the old heuristic could not see: a source below the
-        // keyspace probes, one at or above it full-scans — even though every key
-        // is still in the delta (the old rule *always* full-scanned an all-delta
+        // The boundary the old heuristic could not see: a probe-key count below the
+        // keyspace probes, one at or above it full-scans — even though every key is
+        // still in the delta (the old rule *always* full-scanned an all-delta
         // target, whatever the source size).
         assert!(
-            engine.merge_should_probe_per_key("o", 9).expect("estimate"),
+            engine.merge_should_probe_per_key("o", 9),
             "9 < 10 keys → probe per key",
         );
         assert!(
-            !engine
-                .merge_should_probe_per_key("o", 10)
-                .expect("estimate"),
+            !engine.merge_should_probe_per_key("o", 10),
             "10 ≥ 10 keys → full-keyset scan",
         );
         assert!(
-            !engine
-                .merge_should_probe_per_key("o", 40)
-                .expect("estimate"),
+            !engine.merge_should_probe_per_key("o", 40),
             "40 ≥ 10 keys → full-keyset scan",
         );
 
         // Flushing the ten versions into a sealed segment leaves the estimate at
-        // ten — it counts segment rows and delta rows alike — so the choice is
+        // ten — it counts sealed versions and delta rows alike — so the choice is
         // unchanged. (The old rule flipped the small-source case to the probe the
         // instant a segment existed, regardless of how the sizes actually compare.)
         engine.flush().expect("flush");
         assert!(
-            engine.merge_should_probe_per_key("o", 9).expect("estimate"),
+            engine.merge_should_probe_per_key("o", 9),
             "9 < 10 keys → probe per key (now sealed)",
         );
         assert!(
-            !engine
-                .merge_should_probe_per_key("o", 10)
-                .expect("estimate"),
+            !engine.merge_should_probe_per_key("o", 10),
             "10 ≥ 10 keys → full-keyset scan (now sealed)",
         );
 
         // An unknown table reports false; the subsequent read surfaces the error.
-        assert!(
-            !engine
-                .merge_should_probe_per_key("absent", 1)
-                .expect("estimate")
-        );
+        assert!(!engine.merge_should_probe_per_key("absent", 1));
     }
 
     // ---- STL-235: temporal MERGE historization (close/open over both axes) ----

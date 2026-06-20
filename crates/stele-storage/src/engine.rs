@@ -1281,29 +1281,21 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
     /// across the sealed segments plus the resident delta tier — for the
     /// cost-based `MERGE` probe-plan choice ([STL-312]).
     ///
-    /// Each sealed segment contributes its footer [`SegmentReader::row_count`]
-    /// (no column-chunk I/O, like [`segment_metadata`](Self::segment_metadata)),
-    /// the delta its [`staged_len`](Delta::staged_len). This counts **versions**,
+    /// Reads no disk: the sealed contribution is the length of the resident
+    /// [`SealedVersions`] set (v0.1 keeps every sealed version in memory), the
+    /// delta's is its [`staged_len`](Delta::staged_len). This counts **versions**,
     /// not distinct live keys — a superseded or deleted key still contributes its
     /// versions — so it is a conservative proxy that never *undercounts* the rows
-    /// a full-keyset scan would read. The planner compares a `MERGE`'s source-row
+    /// a full-keyset scan would read. The planner compares a `MERGE`'s probe-key
     /// count against this to choose between point-probing each source key (cheap
     /// when the source is smaller than the keyspace) and one full-keyset scan
     /// (cheap when it is larger); either plan yields the same upsert, so an
     /// imprecise estimate costs at most a slower plan, never a wrong answer.
-    ///
-    /// # Errors
-    ///
-    /// [`EngineError::Segment`] if a sealed segment fails to open or re-validate,
-    /// or [`EngineError::Delta`] if the delta tier cannot be read.
-    pub fn live_version_estimate(&self) -> Result<u64, EngineError> {
-        let sealed: u64 = self
-            .open_segment_readers()?
-            .iter()
-            .map(SegmentReader::row_count)
-            .sum();
-        let delta = self.delta.staged_len()? as u64;
-        Ok(sealed.saturating_add(delta))
+    #[must_use]
+    pub fn live_version_estimate(&self) -> u64 {
+        let sealed = self.sealed.versions().len() as u64;
+        let delta = self.delta.staged_len() as u64;
+        sealed.saturating_add(delta)
     }
 
     /// Per-segment introspection metadata for the shell's `\segments` command
@@ -1709,9 +1701,9 @@ mod tests {
     #[test]
     fn live_version_estimate_counts_segment_rows_plus_delta() {
         // STL-312: the cost-based MERGE probe-plan choice estimates the live
-        // keyspace as the sealed segments' footer row counts plus the resident
-        // delta — counting both tiers, so a flush that moves rows from delta to
-        // segment leaves the figure unchanged.
+        // keyspace as the resident sealed version set plus the delta — counting
+        // both tiers, so a flush that moves rows from delta to sealed leaves the
+        // figure unchanged.
         let principal = Principal::new(b"op".to_vec());
         let key = |k: i64| BusinessKey::new(k.to_le_bytes().to_vec());
 
@@ -1723,7 +1715,7 @@ mod tests {
         .expect("open");
 
         // An empty table estimates a zero keyspace.
-        assert_eq!(engine.live_version_estimate().expect("estimate"), 0);
+        assert_eq!(engine.live_version_estimate(), 0);
 
         // Two resident (delta) versions.
         engine
@@ -1746,17 +1738,13 @@ mod tests {
                 principal.clone(),
             )
             .expect("insert k2");
-        assert_eq!(
-            engine.live_version_estimate().expect("estimate"),
-            2,
-            "two delta versions",
-        );
+        assert_eq!(engine.live_version_estimate(), 2, "two delta versions",);
 
         // Flushing seals them into one segment — the estimate is unchanged (it
         // counts segment rows as well as delta rows).
         engine.flush().expect("flush");
         assert_eq!(
-            engine.live_version_estimate().expect("estimate"),
+            engine.live_version_estimate(),
             2,
             "two sealed rows, empty delta",
         );
@@ -1766,7 +1754,7 @@ mod tests {
             .insert(key(3), None, Some(b"v3".to_vec()), 0, TxnId(3), principal)
             .expect("insert k3");
         assert_eq!(
-            engine.live_version_estimate().expect("estimate"),
+            engine.live_version_estimate(),
             3,
             "two sealed rows plus one delta version",
         );

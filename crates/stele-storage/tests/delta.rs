@@ -334,6 +334,42 @@ fn flush_merges_memory_and_spills_then_clears() {
     assert!(remaining.is_empty(), "flush must remove spill files");
 }
 
+/// `staged_len` counts in-memory + spilled versions without decoding any spill
+/// file, and tracks the spill → flush lifecycle ([STL-312]). It feeds the live-
+/// keyspace estimate the cost-based MERGE probe-plan choice uses.
+#[test]
+fn staged_len_counts_memory_plus_spills_without_reading_them() {
+    let mut delta = Delta::open(
+        MemDisk::new(),
+        DeltaConfig {
+            spill_threshold_bytes: 96,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(delta.staged_len(), 0, "an empty delta stages nothing");
+
+    for i in 0u64..40 {
+        delta
+            .insert(version(format!("k-{i:04}").as_bytes(), i as i64, b"x"))
+            .unwrap();
+    }
+    assert!(
+        delta.is_spilled(),
+        "40 records past a 96B threshold must spill"
+    );
+
+    // Spans both tiers (the running tally does the spilled part — no spill is
+    // read) and agrees with the materialized snapshot, which the 40 distinct keys
+    // never dedup.
+    assert_eq!(delta.staged_len(), 40);
+    assert_eq!(delta.staged_len(), delta.staged_versions().unwrap().len());
+
+    // Flush clears both tiers, so the staged count returns to zero.
+    delta.flush_to_segment().unwrap();
+    assert_eq!(delta.staged_len(), 0, "a flushed delta stages nothing");
+}
+
 /// Stale spill files on `disk` at open time must not influence reads.
 #[test]
 fn open_discards_pre_existing_spill_files() {

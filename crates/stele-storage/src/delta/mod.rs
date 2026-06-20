@@ -121,6 +121,10 @@ pub struct Delta<D: Disk> {
     /// Spill indices we have written this lifetime and have not yet flushed
     /// into a sealed segment. Kept in ascending order.
     live_spills: Vec<u64>,
+    /// Running count of versions frozen out to the live spills — maintained at
+    /// spill time so [`staged_len`](Self::staged_len) needs no spill reads
+    /// ([STL-312]). Reset whenever the staged contents are cleared or flushed.
+    spilled_rows: usize,
     /// Retraction tombstones (logical deletes) staged since the last flush,
     /// keyed `(business_key, sys_from, seq)` by the version they close. Drained
     /// into the sealed segment at flush ([`Self::take_retractions`]) so the
@@ -154,6 +158,7 @@ impl<D: Disk> Delta<D> {
             mem: MemTier::new(),
             next_spill_index,
             live_spills: Vec::new(),
+            spilled_rows: 0,
             retractions: BTreeMap::new(),
         })
     }
@@ -345,6 +350,7 @@ impl<D: Disk> Delta<D> {
         let out = self.merge_staged()?;
         let spills = std::mem::take(&mut self.live_spills);
         self.mem = MemTier::new();
+        self.spilled_rows = 0;
         for idx in spills {
             let _ = spill::remove_spill(&self.disk, idx);
         }
@@ -373,23 +379,17 @@ impl<D: Disk> Delta<D> {
     /// the delta's contribution to the live-keyspace estimate the cost-based
     /// `MERGE` probe-plan choice uses ([STL-312]).
     ///
-    /// Cheaper than [`staged_versions`](Self::staged_versions): the in-memory
-    /// count is O(distinct keys) and clones no `Version`, and a spill is counted
-    /// only by reading it (rare — only a delta past the spill threshold spills at
-    /// all). It is an **estimate**, not a strict count: a version re-staged after
-    /// its first copy spilled is counted in both tiers, so the figure can run a
-    /// hair high. That only nudges a borderline plan choice toward the indexed
-    /// probe and never changes a result, so the slack is harmless here.
-    ///
-    /// # Errors
-    ///
-    /// Surfaces I/O or corruption errors loading a delta spill file.
-    pub fn staged_len(&self) -> Result<usize, DeltaError> {
-        let mut n = self.mem.len();
-        for &idx in &self.live_spills {
-            n += spill::read_spill(&self.disk, idx)?.len();
-        }
-        Ok(n)
+    /// Reads no disk: the in-memory count is `MemTier::len` (O(distinct keys),
+    /// clones no `Version`) and the spilled count is the running `spilled_rows`
+    /// tally maintained at spill time, so a spilled delta costs nothing to count
+    /// here. It is an **estimate**, not a
+    /// strict count: a version re-staged after its first copy spilled is counted
+    /// in both tallies, so the figure can run a hair high. That only nudges a
+    /// borderline plan choice toward the indexed probe and never changes a result,
+    /// so the slack is harmless here.
+    #[must_use]
+    pub fn staged_len(&self) -> usize {
+        self.mem.len() + self.spilled_rows
     }
 
     /// Every staged retraction tombstone, in `(business_key, sys_from, seq)` order,
@@ -436,6 +436,7 @@ impl<D: Disk> Delta<D> {
     /// (post-flush) and [`discard_staged`](Self::discard_staged) (abort).
     fn clear_staged(&mut self) {
         self.mem = MemTier::new();
+        self.spilled_rows = 0;
         self.retractions.clear();
         for idx in std::mem::take(&mut self.live_spills) {
             let _ = spill::remove_spill(&self.disk, idx);
@@ -512,6 +513,7 @@ impl<D: Disk> Delta<D> {
         self.next_spill_index += 1;
         spill::write_spill(&self.disk, idx, &rows)?;
         self.live_spills.push(idx);
+        self.spilled_rows += rows.len();
         Ok(())
     }
 }
