@@ -107,6 +107,9 @@ pub use stele_common::DEFAULT_PG_PORT;
 /// ([STL-254]).
 pub use text_format::render_cell;
 pub use tls::{ServerTls, TlsError, TlsMode, TlsSettings};
+// The verified mTLS client identity surfaced into the session principal (STL-291)
+// — crate-internal, never part of the public wire surface.
+use tls::{CertIdentity, peer_identity};
 
 use stele_catalog::CatalogError;
 use stele_common::hashkey::hash_key;
@@ -999,7 +1002,7 @@ const fn map_isolation(iso: TransactionIsolationLevel) -> Result<IsolationLevel,
 // The `user` field starts empty and is recorded once SCRAM authentication
 // succeeds, so the connection span carries the *authenticated* identity
 // (STL-107 × STL-252) — never the unverified startup parameter.
-#[instrument(skip(stream, session, tls, auth, metrics), fields(%peer, user = tracing::field::Empty))]
+#[instrument(skip(stream, session, tls, auth, metrics), fields(%peer, user = tracing::field::Empty, cert_identity = tracing::field::Empty))]
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
@@ -1012,22 +1015,27 @@ async fn handle_connection(
     // Negotiate first (the `SSLRequest` may upgrade the stream to TLS); the
     // protocol proper then runs identically over either stream.
     match negotiate_startup(stream, tls.as_deref()).await? {
+        // A plain connection has no client certificate, so no verified identity.
         Negotiated::Plain(mut stream, startup) => {
-            run_session(&mut stream, startup, session, auth, metrics).await
+            run_session(&mut stream, startup, None, session, auth, metrics).await
         }
-        Negotiated::Tls(mut stream, startup) => {
-            run_session(stream.as_mut(), startup, session, auth, metrics).await
+        // Over TLS the peer may have presented an mTLS client certificate; its
+        // verified identity (when any) becomes a candidate write principal.
+        Negotiated::Tls(mut stream, startup, identity) => {
+            run_session(stream.as_mut(), startup, identity, session, auth, metrics).await
         }
     }
 }
 
 /// What [`negotiate_startup`] settled on: the stream the session runs over
-/// (plain or TLS-wrapped) plus the parsed `StartupMessage`.
+/// (plain or TLS-wrapped) plus the parsed `StartupMessage`. The TLS variant also
+/// carries the verified mTLS client identity, if the peer presented one (STL-291).
 enum Negotiated {
     Plain(TcpStream, StartupMessage),
     Tls(
         Box<tokio_rustls::server::TlsStream<TcpStream>>,
         StartupMessage,
+        Option<CertIdentity>,
     ),
 }
 
@@ -1057,9 +1065,16 @@ async fn negotiate_startup(
                     debug!("TLS handshake complete");
                     // mTLS note: when a client CA is configured the handshake
                     // above already verified the client certificate — an
-                    // unauthenticated peer never reaches the startup message.
+                    // unauthenticated peer never reaches the startup message — so
+                    // the identity read here is authenticated, not merely claimed
+                    // (STL-291). It is `None` for a plain-TLS connection (no client
+                    // CA ⇒ no certificate requested).
+                    let identity = peer_identity(tls_stream.get_ref().1);
+                    if let Some(id) = &identity {
+                        debug!(cert_cn_san = %id.name, "verified mTLS client identity");
+                    }
                     let startup = read_startup(tls_stream.as_mut()).await?;
-                    return Ok(Negotiated::Tls(tls_stream, startup));
+                    return Ok(Negotiated::Tls(tls_stream, startup, identity));
                 }
                 // No TLS configured: refuse; the client may fall back to
                 // plaintext and resend a StartupMessage.
@@ -1115,6 +1130,7 @@ async fn negotiate_startup(
 async fn run_session<S: Wire>(
     stream: &mut S,
     startup: StartupMessage,
+    cert_identity: Option<CertIdentity>,
     session: SharedSession,
     auth: AuthMode,
     metrics: &SharedMetrics,
@@ -1125,26 +1141,41 @@ async fn run_session<S: Wire>(
     // succeed before anything else is served; the authenticated identity then
     // lands on the connection span (STL-107). `trust` skips straight to the
     // OK bundle (the v0.1 posture, and the dev default).
-    //
-    // Either way, capture the connection's **write principal** ([STL-300]): the
-    // identity stamped on every version this connection commits. Under `scram` it
-    // is the SCRAM-verified user; under `trust` it is the unauthenticated startup
-    // `user` (taken on faith). It is fixed for the connection's life, so it is
-    // captured once here and re-applied to the shared engine under the dispatch
-    // lock before each write (see [`SessionHandle::set_principal`]) — never as a
-    // single shared field, which connections sharing the engine would race.
-    //
-    // A real client always sends `user`; only a malformed startup omits it. In that
-    // degenerate case fall back to the server identity `stele` — the engine's own
-    // default write principal — rather than stamping an empty principal, so a
-    // principal-less connection behaves as it did before STL-300.
     let user = if auth == AuthMode::Scram {
         scram::authenticate(stream, &startup, &session).await?
     } else {
         startup.user().unwrap_or(DEFAULT_WIRE_USER).to_owned()
     };
+
+    // Capture the connection's **write principal** — the identity stamped on every
+    // version this connection commits ([STL-300]). It is fixed for the connection's
+    // life, captured once here and re-applied to the shared engine under the
+    // dispatch lock before each write (see [`SessionHandle::set_principal`]) — never
+    // a single shared field, which connections sharing the engine would race.
+    //
+    // Precedence is "strongest verified identity wins" ([STL-291], docs/10 §5):
+    //   1. the SCRAM-verified `user`     (auth = scram)  — a password-proven
+    //      database principal is authoritative; a cert then only identifies the
+    //      transport peer (kept on the trace span, below);
+    //   2. the verified mTLS cert identity (trust + client cert) — CA-proven, so
+    //      it beats an unauthenticated startup `user` taken on faith;
+    //   3. the startup `user`             (trust, no cert);
+    //   4. `stele` (DEFAULT_WIRE_USER)    — only a malformed startup omits `user`,
+    //      and stamping the engine default keeps that case behaving as before STL-300.
+    // The `user` binding already resolved (1)/(3)/(4); the cert overrides it only
+    // when SCRAM did not run. User-mapping (enforce cert CN == requested user, or
+    // map cert → role) is a deliberate follow-up; today a verified cert *is* the
+    // principal.
+    let principal_name = match &cert_identity {
+        Some(id) if auth != AuthMode::Scram => id.name.clone(),
+        _ => user.clone(),
+    };
     tracing::Span::current().record("user", user.as_str());
-    let principal = Principal::new(user.into_bytes());
+    if let Some(id) = &cert_identity {
+        tracing::Span::current().record("cert_identity", id.name.as_str());
+    }
+    debug!(principal = %principal_name, "connection write principal resolved");
+    let principal = Principal::new(principal_name.into_bytes());
     // Whether to append the opt-in query-stats trailer to row replies ([STL-201]);
     // fixed for the connection's life from the startup parameter.
     let stats_enabled = startup.stats_enabled();
