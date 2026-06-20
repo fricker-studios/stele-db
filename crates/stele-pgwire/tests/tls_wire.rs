@@ -67,9 +67,15 @@ fn mint_ca(name: &str) -> TestCa {
     }
 }
 
-/// A leaf (cert, key) PEM pair signed by `ca`.
+/// The subject Common Name minted into the accepted client certificate. The
+/// mTLS-principal test (`mtls_cert_identity_becomes_the_write_principal`) asserts
+/// this lands in `_stele_principal`, overriding the startup `user` (`stele`).
+const CLIENT_CERT_CN: &str = "alice-cert";
+
+/// A leaf (cert, key) PEM pair signed by `ca`, with subject CN `cn`.
 fn mint_leaf(
     ca: &TestCa,
+    cn: &str,
     san: Option<&str>,
     eku: rcgen::ExtendedKeyUsagePurpose,
 ) -> (String, String) {
@@ -78,7 +84,7 @@ fn mint_leaf(
     let mut params = rcgen::CertificateParams::new(sans).expect("leaf params");
     params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, "stele tls test leaf");
+        .push(rcgen::DnType::CommonName, cn);
     params.extended_key_usages = vec![eku];
     let cert = params.signed_by(&key, &ca.issuer).expect("sign leaf");
     (cert.pem(), key.serialize_pem())
@@ -93,11 +99,22 @@ fn mint_pki(test: &str) -> Pki {
 
     let (server_cert_pem, server_key_pem) = mint_leaf(
         &server_ca,
+        "stele tls test server",
         Some("localhost"),
         rcgen::ExtendedKeyUsagePurpose::ServerAuth,
     );
-    let client_identity = mint_leaf(&client_ca, None, rcgen::ExtendedKeyUsagePurpose::ClientAuth);
-    let rogue_identity = mint_leaf(&rogue_ca, None, rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+    let client_identity = mint_leaf(
+        &client_ca,
+        CLIENT_CERT_CN,
+        None,
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+    );
+    let rogue_identity = mint_leaf(
+        &rogue_ca,
+        "stele tls test rogue",
+        None,
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+    );
 
     let dir = std::env::temp_dir().join(format!("stele-tls-wire-{}-{test}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create scratch dir");
@@ -328,6 +345,60 @@ async fn select_one<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> String
     }
 }
 
+/// Run one simple-query statement and return the cells of its first `DataRow`
+/// (each `None` for a SQL NULL), or an empty vector for a statement that returns
+/// no rows (`CREATE`/`INSERT`). Panics on an `ErrorResponse` so a failed DDL/DML
+/// fails the test at the call site rather than silently.
+async fn simple_query_row<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    sql: &str,
+) -> Vec<Option<String>> {
+    let mut msg = Vec::with_capacity(6 + sql.len());
+    msg.push(b'Q');
+    msg.extend_from_slice(&i32::try_from(4 + sql.len() + 1).unwrap().to_be_bytes());
+    msg.extend_from_slice(sql.as_bytes());
+    msg.push(0);
+    stream.write_all(&msg).await.expect("send query");
+
+    let mut first_row: Option<Vec<Option<String>>> = None;
+    loop {
+        let (kind, payload) = read_message(stream).await.expect("read reply");
+        match kind {
+            b'D' if first_row.is_none() => {
+                // DataRow: u16 column count, then per cell (i32 len, bytes); -1 = NULL.
+                let cols = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+                let mut pos = 2;
+                let mut cells = Vec::with_capacity(cols);
+                for _ in 0..cols {
+                    let len = i32::from_be_bytes([
+                        payload[pos],
+                        payload[pos + 1],
+                        payload[pos + 2],
+                        payload[pos + 3],
+                    ]);
+                    pos += 4;
+                    if len < 0 {
+                        cells.push(None);
+                    } else {
+                        let len = usize::try_from(len).expect("sane cell length");
+                        cells.push(Some(
+                            String::from_utf8(payload[pos..pos + len].to_vec()).unwrap(),
+                        ));
+                        pos += len;
+                    }
+                }
+                first_row = Some(cells);
+            }
+            b'Z' => return first_row.unwrap_or_default(),
+            b'E' => {
+                let (_, code, message) = parse_error_fields(&payload);
+                panic!("statement {sql:?} failed: {code} {message}");
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Decode the `(severity, sqlstate, message)` out of an `ErrorResponse` payload.
 fn parse_error_fields(payload: &[u8]) -> (String, String, String) {
     let (mut severity, mut code, mut message) = (String::new(), String::new(), String::new());
@@ -459,6 +530,37 @@ async fn mtls_accepts_a_client_certificate_from_the_trusted_ca() {
     let mut stream = tls_connect(addr, config).await.expect("mTLS handshake");
     complete_startup(&mut stream).await.expect("startup");
     assert_eq!(select_one(&mut stream).await, "1");
+}
+
+#[tokio::test]
+async fn mtls_cert_identity_becomes_the_write_principal() {
+    // STL-291: the verified mTLS client certificate's subject CN becomes the
+    // connection's write principal, so provenance records who *actually*
+    // connected — overriding the unauthenticated startup `user`. The server runs
+    // the default `trust` auth (no SCRAM), the precedence case where the cert is
+    // the strongest verified identity.
+    let pki = mint_pki("mtls-principal");
+    let addr = spawn_tls_server(&pki, TlsMode::Required, true).await;
+
+    let config = client_config(&pki.ca_pem, Some(&pki.client_identity));
+    let mut stream = tls_connect(addr, config).await.expect("mTLS handshake");
+    // `startup_message` identifies as user `stele`; the client certificate's CN is
+    // `alice-cert` (CLIENT_CERT_CN). The verified cert must win.
+    complete_startup(&mut stream).await.expect("startup");
+
+    simple_query_row(
+        &mut stream,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT) WITH SYSTEM VERSIONING",
+    )
+    .await;
+    simple_query_row(&mut stream, "INSERT INTO t VALUES (1, 100)").await;
+    let row = simple_query_row(&mut stream, "SELECT _stele_principal FROM t").await;
+
+    assert_eq!(
+        row.first().and_then(Option::as_deref),
+        Some(CLIENT_CERT_CN),
+        "the verified mTLS cert CN is the write principal, not the startup user `stele`",
+    );
 }
 
 #[tokio::test]

@@ -31,6 +31,9 @@ rustls-pki-types = { workspace = true }
 # rather than refuse to boot, the daemon mints an ephemeral cert so the listener
 # is encrypted. Also mints the per-test PKI in tests/tls_wire.rs (STL-251).
 rcgen            = { workspace = true }
+# Parse the verified mTLS client certificate's subject CN / SANs into the session
+# write principal (STL-291) — rustls verifies the chain, this names the peer.
+x509-parser      = { workspace = true }
 # Fresh per-connection SASL server nonces (STL-252).
 getrandom        = { workspace = true }
 

@@ -123,6 +123,18 @@ rustls-pki-types   = { version = "1.14", features = ["std"] }
 # mTLS handshake tests (STL-251). `ring` provider — no new crates over what
 # rustls already pulls; default features off keeps aws-lc out of the tree.
 rcgen              = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+# Parse the verified mTLS client certificate's subject CN / SANs into a session
+# principal (STL-291). rustls hands back only the raw end-entity DER from the
+# handshake it already verified; turning that into a name needs an X.509 parser.
+# Already resolved in the lockfile (rcgen's optional `x509-parser` feature pins the
+# same 0.18.1, MIT/Apache-2.0), so naming it directly only *activates* an
+# already-vetted crate. `default-features = false`: x509-parser's `ring` /
+# `aws-lc-rs` are optional, gated behind its `verify` / `verify-aws` features —
+# the lockfile lists them, but they are NOT compiled (we parse, never verify; the
+# chain was already checked by rustls). `cargo tree -i x509-parser` confirms it
+# pulls only the parse stack (asn1-rs / der-parser / oid-registry / nom / time),
+# all already in the tree. Disabling defaults guards against a future default too.
+x509-parser        = { version = "0.18", default-features = false }
 # Dev-only: a real Postgres client driving the pgwire front end end-to-end in an
 # integration test (STL-147 DoD). Never a runtime dependency of a shipped crate.
 tokio-postgres     = "0.7"

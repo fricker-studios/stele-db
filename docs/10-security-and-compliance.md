@@ -89,7 +89,7 @@ This is why an audit-native engine is the *right* foundation for regulated data:
 ### In transit
 TLS for pg-wire and the [admin API](09-ecosystem-and-products.md#2-the-admin--control-plane-api-the-shared-substrate), with an **mTLS** option for service-to-service and operator use. Modern ciphers only; secure defaults.
 
-**Landed for pg-wire (v0.3, STL-251)** via the standard Postgres `SSLRequest` negotiation (rustls; the library ships only modern cipher suites, so a weak-cipher configuration is impossible). Operators point `[tls]` in `stele.toml` at PEM cert/key paths; `mode = "required"` (the default once `[tls]` is present) refuses plaintext startups with `FATAL` SQLSTATE `28000`, and `"optional"` is the migration posture. Setting `client_ca` switches on **mTLS**: the handshake rejects any client not presenting a certificate chaining to that CA. The **secure-default posture** is enforced at boot, not documented-and-hoped: a non-dev server **without TLS on a non-loopback bind mints an ephemeral self-signed certificate** so the listener is encrypted (TLS `required`) rather than refusing to boot or silently serving plaintext — with a loud warning that the certificate is *unauthenticated* (clients cannot verify the server) and *ephemeral* (regenerated each restart), so it must be replaced with a CA-issued cert before production (STL-304). Plaintext is still allowed only on loopback, with a loud warning; `--dev` stays friction-free for the five-minute path. Mapping the verified mTLS client identity (CN/SAN) onto the session principal lands with authN (SCRAM, STL-252).
+**Landed for pg-wire (v0.3, STL-251)** via the standard Postgres `SSLRequest` negotiation (rustls; the library ships only modern cipher suites, so a weak-cipher configuration is impossible). Operators point `[tls]` in `stele.toml` at PEM cert/key paths; `mode = "required"` (the default once `[tls]` is present) refuses plaintext startups with `FATAL` SQLSTATE `28000`, and `"optional"` is the migration posture. Setting `client_ca` switches on **mTLS**: the handshake rejects any client not presenting a certificate chaining to that CA. The **secure-default posture** is enforced at boot, not documented-and-hoped: a non-dev server **without TLS on a non-loopback bind mints an ephemeral self-signed certificate** so the listener is encrypted (TLS `required`) rather than refusing to boot or silently serving plaintext — with a loud warning that the certificate is *unauthenticated* (clients cannot verify the server) and *ephemeral* (regenerated each restart), so it must be replaced with a CA-issued cert before production (STL-304). Plaintext is still allowed only on loopback, with a loud warning; `--dev` stays friction-free for the five-minute path. **The verified mTLS client identity becomes the session's write principal (STL-291):** once the handshake verifies the client certificate against `client_ca`, its subject CN (else its first SAN) is parsed out and recorded as the connection's principal, so provenance attributes each write to who actually connected rather than to an unauthenticated startup `user`. Precedence against the startup `user` and SCRAM is documented under [§5](#5-authentication).
 
 ### At rest (envelope encryption)
 Per [ADR-0019](adr/0019-encryption-at-rest-kms.md): **envelope encryption with a three-tier key hierarchy** — each segment is encrypted with a per-segment **data key (DEK)**; DEKs are wrapped by a **per-namespace key (NEK)**; NEKs are wrapped by a root **key-encryption key (KEK)** held in a KMS. Immutable segments make this clean (a sealed segment's key never changes), and the per-namespace layer is what enables both per-tenant BYOK and instant [namespace-drop erasure](#the-append-only-vs-right-to-erasure-tension-handled-not-hand-waved).
@@ -155,10 +155,28 @@ psycopg, pgjdbc, and `tokio-postgres` all speak it natively:
   refused) and client-side SCRAM in `stele shell` (STL-296). The authenticated identity reaches
   the connection trace span (STL-107) **and the stored write provenance**: each
   wire-issued write stamps the connection's identity into `_stele_principal`
-  (STL-300) — the SCRAM-verified user under `scram`, the unauthenticated startup
-  `user` under `trust` — set per statement under the engine lock so a shared engine
-  attributes each row to whoever wrote it. (mTLS-cert-identity → principal is the
-  STL-291 follow-up.)
+  (STL-300/STL-291), set per statement under the engine lock so a shared engine
+  attributes each row to whoever wrote it.
+
+#### Which identity is the principal (precedence)
+
+The write principal is the **strongest verified identity** the connection
+offers, in order (STL-291):
+
+1. **SCRAM-verified user** (`auth = scram`) — a password-proven database
+   principal is authoritative; it wins even when a client certificate is also
+   presented (the certificate then identifies the *transport peer*, recorded on
+   the trace span, while the row is attributed to the database actor).
+2. **Verified mTLS client certificate** — the subject CN, else the first SAN.
+   It is CA-proven, so it overrides an unauthenticated startup `user` taken on
+   faith. This is the `trust`-plus-mTLS case ("the client certificate is then
+   the identity", §4).
+3. **Startup `user`** — `trust`, no client certificate.
+4. **Server default `stele`** — only a malformed startup omits `user`.
+
+Enforcing a certificate↔`user` match, or mapping a certificate onto a different
+database role, is a deliberate follow-up: today a verified certificate simply
+*is* the principal.
 
 ## 6. Authorization
 

@@ -15,7 +15,12 @@
 //! to start) lives with the daemon config in `stele-server`; this module only
 //! enforces the per-connection half.
 //!
+//! Once an mTLS handshake completes, [`peer_identity`] turns the verified client
+//! certificate's subject CN/SAN into a [`CertIdentity`] — the authenticated
+//! principal the session stamps into provenance ([STL-291]).
+//!
 //! [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
+//! [STL-291]: https://allegromusic.atlassian.net/browse/STL-291
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +30,7 @@ use rustls::server::WebPkiClientVerifier;
 use rustls_pki_types::pem::PemObject as _;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio_rustls::TlsAcceptor;
+use x509_parser::prelude::{FromDer as _, GeneralName, X509Certificate};
 
 /// What happens to a client that skips the `SSLRequest` and opens with a
 /// plaintext `StartupMessage` while the server has TLS configured.
@@ -178,6 +184,74 @@ impl ServerTls {
     }
 }
 
+/// The verified identity of a connection's peer, extracted from the client
+/// certificate it presented during an **mTLS** handshake ([STL-291]).
+///
+/// rustls has already checked that the certificate chains to the configured
+/// `client_ca` before this is read — a peer that fails verification never
+/// reaches the startup message (`negotiate_startup`). So this name is
+/// *authenticated*: it states who is on the other end of the connection, not
+/// merely who the client claims to be. The session adopts it as the write
+/// principal so provenance records the verified identity (precedence and the
+/// `trust`/`scram` interplay live in `run_session`).
+///
+/// The `name` is the certificate's subject **Common Name** when present — the
+/// field Postgres `cert` authentication maps onto a user — and otherwise the
+/// first **Subject Alternative Name** (a DNS name, e-mail, or URI). A
+/// certificate carrying neither a CN nor a usable SAN names no principal, so it
+/// yields `None`.
+///
+/// [STL-291]: https://allegromusic.atlassian.net/browse/STL-291
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CertIdentity {
+    /// The canonical principal name: the subject CN, else the first SAN.
+    pub(crate) name: String,
+}
+
+/// The verified [`CertIdentity`] of `conn`'s peer, if it presented a client
+/// certificate during the (already-verified) mTLS handshake.
+///
+/// `None` for a plain-TLS connection — no `client_ca` was configured, so no
+/// certificate was requested — or for a certificate whose subject names nothing
+/// usable. rustls returns the peer chain end-entity-first, so the leaf is the
+/// first element.
+pub(crate) fn peer_identity(conn: &rustls::ServerConnection) -> Option<CertIdentity> {
+    let end_entity = conn.peer_certificates()?.first()?;
+    identity_from_cert_der(end_entity.as_ref())
+}
+
+/// Parse one end-entity certificate's DER into a [`CertIdentity`]: the subject
+/// Common Name if present, else the first usable Subject Alternative Name.
+///
+/// Split out from [`peer_identity`] so the CN-vs-SAN precedence is unit-testable
+/// against rcgen-minted certificates without standing up a TLS handshake.
+fn identity_from_cert_der(der: &[u8]) -> Option<CertIdentity> {
+    let (_, cert) = X509Certificate::from_der(der).ok()?;
+    let cn = cert
+        .subject()
+        .iter_common_name()
+        .filter_map(|attr| attr.as_str().ok())
+        .find(|cn| !cn.is_empty())
+        .map(str::to_owned);
+    let name = cn.or_else(|| first_subject_alt_name(&cert))?;
+    Some(CertIdentity { name })
+}
+
+/// The first usable Subject Alternative Name — a DNS name, e-mail, or URI — in
+/// document order. The other SAN kinds (IP address, directory name, …) are not
+/// meaningful session principals, so they are skipped.
+fn first_subject_alt_name(cert: &X509Certificate) -> Option<String> {
+    let san = cert.subject_alternative_name().ok()??;
+    san.value.general_names.iter().find_map(|gn| match gn {
+        GeneralName::DNSName(s) | GeneralName::RFC822Name(s) | GeneralName::URI(s)
+            if !s.is_empty() =>
+        {
+            Some((*s).to_owned())
+        }
+        _ => None,
+    })
+}
+
 /// Generate an ephemeral self-signed server certificate plus its key, for the
 /// `localhost` SAN — the encryption material behind [`ServerTls::self_signed`].
 /// The certificate is intentionally unauthenticated (no CA), so it only ever
@@ -229,5 +303,54 @@ mod tests {
             let tls = ServerTls::self_signed(mode).expect("generate self-signed acceptor");
             assert_eq!(tls.mode, mode);
         }
+    }
+
+    /// A self-signed leaf certificate (DER) with the given subject CN and DNS
+    /// SANs — the input to the identity parser. Self-signed is fine: the parser
+    /// reads the subject, it does not verify the chain (rustls already did).
+    fn leaf_der(common_name: Option<&str>, dns_sans: &[&str]) -> Vec<u8> {
+        let key = rcgen::KeyPair::generate().expect("generate key");
+        let sans: Vec<String> = dns_sans.iter().map(|s| (*s).to_owned()).collect();
+        let mut params = rcgen::CertificateParams::new(sans).expect("cert params");
+        // rcgen seeds a default CN ("rcgen self signed cert"); start from an empty
+        // subject so the test controls exactly which CN (if any) the cert carries.
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        if let Some(cn) = common_name {
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, cn);
+        }
+        let cert = params.self_signed(&key).expect("self-sign leaf");
+        cert.der().as_ref().to_vec()
+    }
+
+    #[test]
+    fn identity_prefers_the_subject_common_name() {
+        // CN present alongside a SAN: the CN is the principal (Postgres `cert`
+        // auth semantics).
+        let der = leaf_der(Some("svc-billing"), &["billing.svc.local"]);
+        let id = identity_from_cert_der(&der).expect("an identity");
+        assert_eq!(id.name, "svc-billing");
+    }
+
+    #[test]
+    fn identity_falls_back_to_the_first_san_without_a_cn() {
+        // No CN: the first SAN, in document order, becomes the principal.
+        let der = leaf_der(None, &["primary.example", "secondary.example"]);
+        let id = identity_from_cert_der(&der).expect("an identity");
+        assert_eq!(id.name, "primary.example");
+    }
+
+    #[test]
+    fn identity_is_none_without_a_cn_or_san() {
+        // A subjectless certificate names no principal — the session then falls
+        // back to the startup `user`, exactly as a plain-TLS connection does.
+        let der = leaf_der(None, &[]);
+        assert!(identity_from_cert_der(&der).is_none());
+    }
+
+    #[test]
+    fn identity_is_none_for_non_certificate_bytes() {
+        assert!(identity_from_cert_der(b"this is not a certificate").is_none());
     }
 }
