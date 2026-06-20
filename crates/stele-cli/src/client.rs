@@ -18,7 +18,10 @@
 //! adapter, behind a libpq-style [`SslMode`]: send `SSLRequest`, handshake on
 //! `S`, fall back (or refuse to) on `N`. As in libpq, `require` and below
 //! encrypt **without verifying the server's identity**; only `verify-full`
-//! checks the certificate against a CA (`--tls-ca`) and the host name.
+//! checks the certificate against a CA (`--tls-ca`) and the host name. To reach
+//! a server running mTLS (`[tls] client_ca`), the shell **presents a client
+//! certificate** ([STL-292]) with `--tls-cert`/`--tls-key` — libpq's
+//! `sslcert`/`sslkey` — under any encrypting mode.
 //!
 //! Errors split deliberately: a *SQL* failure (`ErrorResponse`) is data — it
 //! comes back as [`Reply::Error`] and the connection stays usable — while a
@@ -27,6 +30,7 @@
 //!
 //! [STL-185]: https://allegromusic.atlassian.net/browse/STL-185
 //! [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
+//! [STL-292]: https://allegromusic.atlassian.net/browse/STL-292
 
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
@@ -37,7 +41,7 @@ use anyhow::{Context as _, bail};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::pem::PemObject as _;
-use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
 use stele_common::query_stats::QueryStats;
 
@@ -130,12 +134,18 @@ pub enum SslMode {
     VerifyFull,
 }
 
-/// TLS connect options: the mode plus the `verify-full` trust anchor.
+/// TLS connect options: the mode, the `verify-full` trust anchor, and the
+/// optional mTLS client-certificate pair.
 #[derive(Debug, Clone, Default)]
 pub struct TlsOpts {
     pub mode: SslMode,
     /// PEM CA bundle for [`SslMode::VerifyFull`].
     pub ca: Option<PathBuf>,
+    /// PEM client-certificate chain to present for mTLS (`--tls-cert`). Requires
+    /// [`Self::key`]; the server must be configured with `[tls] client_ca`.
+    pub cert: Option<PathBuf>,
+    /// PEM private key for [`Self::cert`] (`--tls-key`).
+    pub key: Option<PathBuf>,
 }
 
 /// The blocking duplex transport a [`Client`] runs over — plain TCP or the
@@ -172,7 +182,7 @@ impl Client {
         stream.set_nodelay(true).ok();
         let transport = match tls.mode {
             SslMode::Disable => Box::new(stream) as Box<dyn Transport>,
-            mode => negotiate_tls(stream, host, mode, tls.ca.as_deref())?,
+            _ => negotiate_tls(stream, host, tls)?,
         };
         let mut client = Self {
             stream: BufReader::new(transport),
@@ -326,13 +336,13 @@ impl Client {
 
 /// Send the `SSLRequest`, and on `S` run the rustls handshake over the socket.
 ///
-/// `mode` is never [`SslMode::Disable`] here (the caller short-circuits it).
+/// `tls.mode` is never [`SslMode::Disable`] here (the caller short-circuits it).
 fn negotiate_tls(
     mut stream: TcpStream,
     host: &str,
-    mode: SslMode,
-    ca: Option<&Path>,
+    tls: &TlsOpts,
 ) -> anyhow::Result<Box<dyn Transport>> {
+    let mode = tls.mode;
     let mut request = [0_u8; 8];
     request[..4].copy_from_slice(&8_i32.to_be_bytes());
     request[4..].copy_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
@@ -344,7 +354,7 @@ fn negotiate_tls(
         .context("reading SSLRequest answer")?;
     match answer[0] {
         b'S' => {
-            let config = tls_config(mode, ca)?;
+            let config = tls_config(tls)?;
             let name = ServerName::try_from(host.to_owned())
                 .with_context(|| format!("{host:?} is not a valid TLS server name"))?;
             let conn = rustls::ClientConnection::new(Arc::new(config), name)
@@ -368,37 +378,76 @@ fn negotiate_tls(
     }
 }
 
-/// The rustls client config for `mode`.
-fn tls_config(mode: SslMode, ca: Option<&Path>) -> anyhow::Result<rustls::ClientConfig> {
+/// The rustls client config for `tls`: the server-verification posture from the
+/// mode, then the mTLS client certificate (if `--tls-cert`/`--tls-key` are set).
+fn tls_config(tls: &TlsOpts) -> anyhow::Result<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(rustls::DEFAULT_VERSIONS)
         .context("selecting TLS protocol versions")?;
-    let config = match mode {
-        SslMode::Disable => unreachable!("disable never negotiates"),
-        // Encrypt-only, exactly libpq's `require`/`prefer`: any certificate is
-        // accepted, so this defeats passive eavesdropping but NOT an active
-        // man-in-the-middle. `verify-full` is the authenticated mode.
-        SslMode::Prefer | SslMode::Require => builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(
-                provider.signature_verification_algorithms,
-            )))
-            .with_no_client_auth(),
-        SslMode::VerifyFull => {
-            let ca = ca.context("--tls verify-full requires --tls-ca <ca.pem>")?;
-            let mut roots = rustls::RootCertStore::empty();
-            for cert in CertificateDer::pem_file_iter(ca)
-                .with_context(|| format!("reading CA bundle {}", ca.display()))?
-            {
-                roots
-                    .add(cert.context("parsing CA certificate")?)
-                    .context("adding CA certificate to the trust store")?;
+    // Resolve the server-trust posture; both arms land in the `WantsClientCert`
+    // state, so the client-auth decision is made once, after the match.
+    let builder =
+        match tls.mode {
+            SslMode::Disable => unreachable!("disable never negotiates"),
+            // Encrypt-only, exactly libpq's `require`/`prefer`: any certificate is
+            // accepted, so this defeats passive eavesdropping but NOT an active
+            // man-in-the-middle. `verify-full` is the authenticated mode.
+            SslMode::Prefer | SslMode::Require => builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(
+                    provider.signature_verification_algorithms,
+                ))),
+            SslMode::VerifyFull => {
+                let ca = tls
+                    .ca
+                    .as_deref()
+                    .context("--tls verify-full requires --tls-ca <ca.pem>")?;
+                let mut roots = rustls::RootCertStore::empty();
+                for cert in CertificateDer::pem_file_iter(ca)
+                    .with_context(|| format!("reading CA bundle {}", ca.display()))?
+                {
+                    roots
+                        .add(cert.context("parsing CA certificate")?)
+                        .context("adding CA certificate to the trust store")?;
+                }
+                builder.with_root_certificates(roots)
             }
-            builder.with_root_certificates(roots).with_no_client_auth()
+        };
+    finish_client_auth(builder, tls.cert.as_deref(), tls.key.as_deref())
+}
+
+/// Finish the client config by deciding whether to present an mTLS client
+/// certificate ([STL-292]). Both `--tls-cert` and `--tls-key` must be given
+/// together — only one is a clear configuration error, raised *before* any file
+/// is read. The CLI enforces this pairing at parse time too (clap `requires`);
+/// this guard also covers callers that build [`TlsOpts`] directly. The PEM
+/// loading mirrors the server-side `ServerTls::load`.
+///
+/// [STL-292]: https://allegromusic.atlassian.net/browse/STL-292
+fn finish_client_auth(
+    builder: rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>,
+    cert: Option<&Path>,
+    key: Option<&Path>,
+) -> anyhow::Result<rustls::ClientConfig> {
+    match (cert, key) {
+        (None, None) => Ok(builder.with_no_client_auth()),
+        (Some(_), None) => bail!("--tls-cert requires --tls-key (the client certificate's key)"),
+        (None, Some(_)) => {
+            bail!("--tls-key requires --tls-cert (the client certificate to present)")
         }
-    };
-    Ok(config)
+        (Some(cert), Some(key)) => {
+            let chain = CertificateDer::pem_file_iter(cert)
+                .with_context(|| format!("reading client certificate {}", cert.display()))?
+                .collect::<Result<Vec<_>, _>>()
+                .with_context(|| format!("parsing client certificate {}", cert.display()))?;
+            let key = PrivateKeyDer::from_pem_file(key)
+                .with_context(|| format!("reading client key {}", key.display()))?;
+            builder
+                .with_client_auth_cert(chain, key)
+                .context("configuring the mTLS client certificate")
+        }
+    }
 }
 
 /// The `require`-mode verifier: accepts any server certificate (no chain or
@@ -670,6 +719,30 @@ mod tests {
         assert_eq!(err.message, "no such table");
         assert_eq!(err.hint.as_deref(), Some("Try \\dt."));
         assert_eq!(err.to_string(), "ERROR: no such table");
+    }
+
+    #[test]
+    fn one_of_the_client_cert_pair_is_a_clear_error() {
+        // Supplying only one of --tls-cert / --tls-key is a configuration error,
+        // raised before any file is touched (so the nonexistent paths never
+        // matter) — STL-292.
+        let only_cert = TlsOpts {
+            mode: SslMode::Require,
+            ca: None,
+            cert: Some(PathBuf::from("/nope/client.crt")),
+            key: None,
+        };
+        let err = tls_config(&only_cert).unwrap_err().to_string();
+        assert!(err.contains("--tls-key"), "{err}");
+
+        let only_key = TlsOpts {
+            mode: SslMode::Require,
+            ca: None,
+            cert: None,
+            key: Some(PathBuf::from("/nope/client.key")),
+        };
+        let err = tls_config(&only_key).unwrap_err().to_string();
+        assert!(err.contains("--tls-cert"), "{err}");
     }
 
     #[test]

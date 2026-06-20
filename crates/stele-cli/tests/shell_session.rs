@@ -607,6 +607,165 @@ async fn tls_require_fails_loudly_against_a_plaintext_server() {
     assert!(stderr.contains("refused TLS"), "{stderr}");
 }
 
+// ---------------------------------------------------------------------------
+// mTLS sessions (STL-292): the shell presents a client certificate
+// ---------------------------------------------------------------------------
+
+/// Every PEM path the mTLS round-trip needs: a server cert for `127.0.0.1`
+/// (chaining to a server CA the shell trusts via `--tls-ca`) plus a client
+/// identity (chaining to a *separate* client CA the server trusts via
+/// `[tls] client_ca`) the shell presents with `--tls-cert`/`--tls-key`.
+struct MtlsPki {
+    server_cert: PathBuf,
+    server_key: PathBuf,
+    server_ca: PathBuf,
+    client_ca: PathBuf,
+    client_cert: PathBuf,
+    client_key: PathBuf,
+}
+
+/// A self-signed CA: its PEM plus an issuer that signs leaves.
+fn mint_ca(cn: &str) -> (String, rcgen::Issuer<'static, rcgen::KeyPair>) {
+    let key = rcgen::KeyPair::generate().expect("CA key");
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    let pem = params.clone().self_signed(&key).expect("CA cert").pem();
+    (pem, rcgen::Issuer::new(params, key))
+}
+
+/// Mint a full mTLS PKI for one test (two independent CAs) and write every PEM
+/// under a scratch dir. The server cert carries the `127.0.0.1` SAN the shell
+/// dials, so the same material drives `--tls verify-full` in both directions.
+fn mint_mtls(test: &str) -> MtlsPki {
+    let (server_ca_pem, server_issuer) = mint_ca("stele shell mtls server CA");
+    let (client_ca_pem, client_issuer) = mint_ca("stele shell mtls client CA");
+
+    let server_key = rcgen::KeyPair::generate().expect("server key");
+    let server_params =
+        rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned()]).expect("server params");
+    let server_cert = server_params
+        .signed_by(&server_key, &server_issuer)
+        .expect("server cert");
+
+    let client_key = rcgen::KeyPair::generate().expect("client key");
+    let mut client_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("client params");
+    client_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "stele-shell-client");
+    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let client_cert = client_params
+        .signed_by(&client_key, &client_issuer)
+        .expect("client cert");
+
+    let dir = std::env::temp_dir().join(format!("stele-shell-mtls-{}-{test}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let write = |name: &str, pem: &str| -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, pem).expect("write PEM");
+        path
+    };
+    MtlsPki {
+        server_cert: write("server.crt", &server_cert.pem()),
+        server_key: write("server.key", &server_key.serialize_pem()),
+        server_ca: write("server-ca.crt", &server_ca_pem),
+        client_ca: write("client-ca.crt", &client_ca_pem),
+        client_cert: write("client.crt", &client_cert.pem()),
+        client_key: write("client.key", &client_key.serialize_pem()),
+    }
+}
+
+/// Boot a TLS-required engine + pgwire server that *demands* a client
+/// certificate chaining to `pki.client_ca`.
+async fn spawn_mtls_server(pki: &MtlsPki) -> SocketAddr {
+    let tls = ServerTls::load(&TlsSettings {
+        cert: pki.server_cert.clone(),
+        key: pki.server_key.clone(),
+        client_ca: Some(pki.client_ca.clone()),
+        mode: TlsMode::Required,
+    })
+    .expect("load mTLS material");
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let bound = Server::new("127.0.0.1:0".parse().unwrap(), session)
+        .with_tls(tls)
+        .bind()
+        .await
+        .expect("bind ephemeral port");
+    let addr = bound.local_addr();
+    tokio::spawn(bound.serve());
+    addr
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mtls_session_presents_the_client_certificate() {
+    // The full mutual handshake: the shell verifies the server (verify-full +
+    // --tls-ca) AND presents its own certificate (--tls-cert/--tls-key) to a
+    // server that requires one. A query round-trips only if both halves succeed.
+    let pki = mint_mtls("present");
+    let addr = spawn_mtls_server(&pki).await;
+    let server_ca = pki.server_ca.to_str().expect("utf-8 path").to_owned();
+    let client_cert = pki.client_cert.to_str().expect("utf-8 path").to_owned();
+    let client_key = pki.client_key.to_str().expect("utf-8 path").to_owned();
+    let script = "SELECT 1;\n\\q\n";
+    let output = tokio::task::spawn_blocking(move || {
+        run_shell(
+            addr,
+            script,
+            &[
+                "--tls",
+                "verify-full",
+                "--tls-ca",
+                &server_ca,
+                "--tls-cert",
+                &client_cert,
+                "--tls-key",
+                &client_key,
+            ],
+        )
+    })
+    .await
+    .expect("shell task");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stderr.is_empty(), "clean session wrote to stderr: {stderr}");
+    assert!(stdout.contains("(1 row)"), "{stdout}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mtls_server_rejects_a_session_without_a_client_certificate() {
+    // Guards the positive test from passing vacuously: the same server, dialed
+    // *without* --tls-cert/--tls-key, must fail the handshake — proving it truly
+    // requires the client certificate the positive test supplies.
+    let pki = mint_mtls("absent");
+    let addr = spawn_mtls_server(&pki).await;
+    let server_ca = pki.server_ca.to_str().expect("utf-8 path").to_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        run_shell(
+            addr,
+            "SELECT 1;\n\\q\n",
+            &["--tls", "verify-full", "--tls-ca", &server_ca],
+        )
+    })
+    .await
+    .expect("shell task");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a session without a client certificate must fail against an mTLS server"
+    );
+    assert!(!stderr.is_empty(), "the failure must be reported on stderr");
+}
+
 /// `\segments` (STL-301) renders the columnar segment + zone-map table end to
 /// end: a sealed segment (after `FLUSH`) plus the resident hot tier, the key zone
 /// over the flushed range, and the inspect-segment trailer. A bare `\segments`

@@ -63,6 +63,13 @@ struct ShellArgs {
     /// PEM CA bundle that `--tls verify-full` verifies the server against.
     #[arg(long)]
     tls_ca: Option<std::path::PathBuf>,
+    /// PEM client certificate to present for mTLS (libpq's `sslcert`), for a
+    /// server configured with `[tls] client_ca`. Requires `--tls-key`.
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<std::path::PathBuf>,
+    /// PEM private key for `--tls-cert` (libpq's `sslkey`). Requires `--tls-cert`.
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<std::path::PathBuf>,
     /// Result-table border style.
     #[arg(long, value_enum, default_value_t = render::BorderStyle::Psql)]
     border: render::BorderStyle,
@@ -164,6 +171,8 @@ fn main() -> anyhow::Result<()> {
                 tls: client::TlsOpts {
                     mode: s.tls,
                     ca: s.tls_ca,
+                    cert: s.tls_cert,
+                    key: s.tls_key,
                 },
                 border: s.border,
                 row_nums: s.row_numbers,
@@ -436,6 +445,9 @@ mod tests {
         // libpq's default: try TLS, fall back to plaintext (STL-251).
         assert_eq!(s.tls, client::SslMode::Prefer);
         assert!(s.tls_ca.is_none());
+        // No mTLS client certificate by default (STL-292).
+        assert!(s.tls_cert.is_none());
+        assert!(s.tls_key.is_none());
     }
 
     #[test]
@@ -454,6 +466,46 @@ mod tests {
         assert_eq!(
             s.tls_ca.as_deref(),
             Some(std::path::Path::new("/etc/stele/ca.pem"))
+        );
+    }
+
+    #[test]
+    fn shell_accepts_mtls_client_cert_flags() {
+        // STL-292: --tls-cert/--tls-key carry the client certificate the shell
+        // presents to an mTLS-required server.
+        let Cmd::Shell(s) = parse(&[
+            "stele",
+            "shell",
+            "--tls",
+            "require",
+            "--tls-cert",
+            "/etc/stele/client.crt",
+            "--tls-key",
+            "/etc/stele/client.key",
+        ]) else {
+            panic!("expected shell subcommand");
+        };
+        assert_eq!(
+            s.tls_cert.as_deref(),
+            Some(std::path::Path::new("/etc/stele/client.crt"))
+        );
+        assert_eq!(
+            s.tls_key.as_deref(),
+            Some(std::path::Path::new("/etc/stele/client.key"))
+        );
+    }
+
+    #[test]
+    fn shell_rejects_a_half_specified_client_cert_pair() {
+        // clap enforces the --tls-cert/--tls-key dependency at parse time, so an
+        // incomplete mTLS config fails fast as a CLI usage error (STL-292).
+        assert!(
+            Args::try_parse_from(["stele", "shell", "--tls-cert", "/c.pem"]).is_err(),
+            "--tls-cert without --tls-key must be a usage error"
+        );
+        assert!(
+            Args::try_parse_from(["stele", "shell", "--tls-key", "/k.pem"]).is_err(),
+            "--tls-key without --tls-cert must be a usage error"
         );
     }
 
