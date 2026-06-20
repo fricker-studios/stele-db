@@ -1277,6 +1277,27 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
             .collect())
     }
 
+    /// A cheap estimate of the live keyspace size — the total version count
+    /// across the sealed segments plus the resident delta tier — for the
+    /// cost-based `MERGE` probe-plan choice ([STL-312]).
+    ///
+    /// Reads no disk: the sealed contribution is the length of the resident
+    /// [`SealedVersions`] set (v0.1 keeps every sealed version in memory), the
+    /// delta's is its [`staged_len`](Delta::staged_len). This counts **versions**,
+    /// not distinct live keys — a superseded or deleted key still contributes its
+    /// versions — so it is a conservative proxy that never *undercounts* the rows
+    /// a full-keyset scan would read. The planner compares a `MERGE`'s probe-key
+    /// count against this to choose between point-probing each source key (cheap
+    /// when the source is smaller than the keyspace) and one full-keyset scan
+    /// (cheap when it is larger); either plan yields the same upsert, so an
+    /// imprecise estimate costs at most a slower plan, never a wrong answer.
+    #[must_use]
+    pub fn live_version_estimate(&self) -> u64 {
+        let sealed = self.sealed.versions().len() as u64;
+        let delta = self.delta.staged_len() as u64;
+        sealed.saturating_add(delta)
+    }
+
     /// Per-segment introspection metadata for the shell's `\segments` command
     /// ([STL-301]): every sealed segment in `segment_names` (oldest-first) order,
     /// then the resident delta (hot) tier as a final entry when it holds versions.
@@ -1674,6 +1695,68 @@ mod tests {
         assert!(
             hot.sys_min.expect("hot sys_min") > smax,
             "the hot tier holds the most recent write",
+        );
+    }
+
+    #[test]
+    fn live_version_estimate_counts_segment_rows_plus_delta() {
+        // STL-312: the cost-based MERGE probe-plan choice estimates the live
+        // keyspace as the resident sealed version set plus the delta — counting
+        // both tiers, so a flush that moves rows from delta to sealed leaves the
+        // figure unchanged.
+        let principal = Principal::new(b"op".to_vec());
+        let key = |k: i64| BusinessKey::new(k.to_le_bytes().to_vec());
+
+        let mut engine = Engine::open(
+            crate::backend::MemDisk::new(),
+            StepClock(std::sync::atomic::AtomicI64::new(0)),
+            false,
+        )
+        .expect("open");
+
+        // An empty table estimates a zero keyspace.
+        assert_eq!(engine.live_version_estimate(), 0);
+
+        // Two resident (delta) versions.
+        engine
+            .insert(
+                key(1),
+                None,
+                Some(b"v1".to_vec()),
+                0,
+                TxnId(1),
+                principal.clone(),
+            )
+            .expect("insert k1");
+        engine
+            .insert(
+                key(2),
+                None,
+                Some(b"v2".to_vec()),
+                0,
+                TxnId(2),
+                principal.clone(),
+            )
+            .expect("insert k2");
+        assert_eq!(engine.live_version_estimate(), 2, "two delta versions",);
+
+        // Flushing seals them into one segment — the estimate is unchanged (it
+        // counts segment rows as well as delta rows).
+        engine.flush().expect("flush");
+        assert_eq!(
+            engine.live_version_estimate(),
+            2,
+            "two sealed rows, empty delta",
+        );
+
+        // A third write lands in the delta behind the segment: 2 sealed + 1 delta.
+        engine
+            .insert(key(3), None, Some(b"v3".to_vec()), 0, TxnId(3), principal)
+            .expect("insert k3");
+        assert_eq!(
+            engine.live_version_estimate(),
+            3,
+            "two sealed rows plus one delta version",
         );
     }
 

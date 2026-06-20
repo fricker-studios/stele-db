@@ -83,7 +83,6 @@ impl MemTier {
     }
 
     /// Number of distinct versions in memory.
-    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.rows.values().map(BTreeMap::len).sum()
     }

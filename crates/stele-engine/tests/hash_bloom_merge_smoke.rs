@@ -80,10 +80,9 @@ impl Db {
 }
 
 /// Load the scattered keyspace: segment `s` holds every sixth key across
-/// `[k0000, k0599]`. With `flush`, seal each batch into its own sealed segment
-/// (six overlapping segments — the on-disk, bloom-prunable shape); without it,
-/// leave all 600 rows in the in-memory delta (no segments — the full-keyset plan).
-fn load_scattered(db: &mut Db, flush: bool) {
+/// `[k0000, k0599]`, each batch sealed into its own segment — six overlapping
+/// segments, the on-disk, bloom-prunable shape every test here needs.
+fn load_scattered(db: &mut Db) {
     db.run("CREATE TABLE t (id TEXT PRIMARY KEY, v INT) WITH SYSTEM VERSIONING");
     for seg in 0..SEGMENTS {
         let values: Vec<String> = (0..PER_SEGMENT)
@@ -93,50 +92,62 @@ fn load_scattered(db: &mut Db, flush: bool) {
             })
             .collect();
         db.run(&format!("INSERT INTO t VALUES {}", values.join(", ")));
-        if flush {
-            db.run("FLUSH");
-        }
+        db.run("FLUSH");
     }
 }
 
 #[test]
-fn merge_over_a_large_keyspace_probes_blooms_and_matches_the_full_keyset_plan() {
-    // On-disk keyspace → the per-source-key MERGE plan, which point-probes each
-    // source key and skips segments via the bloom.
-    let mut on_disk = Db::fresh();
-    load_scattered(&mut on_disk, true);
-    let bloom_before = on_disk.engine.metrics().scan_segments_pruned_bloom.get();
-    on_disk.run(MERGE_SQL);
-    let bloom_after = on_disk.engine.metrics().scan_segments_pruned_bloom.get();
+fn merge_runs_the_cost_chosen_plan_and_both_yield_the_same_upsert() {
+    // STL-312: the MERGE probe plan is chosen by cost — point-probe each source
+    // key when the source is smaller than the live keyspace, else read every live
+    // key in one full-keyset scan. The same three-row upsert must land identically
+    // under either plan; the plan changes speed, never the result.
 
-    // Each matched key lives in one of six overlapping segments, so its point
-    // probe bloom-prunes the other five — segment skips zone maps cannot give.
+    // Indexed (per-key) arm: a large flushed keyspace (600 keys across six
+    // overlapping segments) and a three-row source — 3 < 600, so each source key
+    // point-probes the always-indexed business key and the blooms skip the
+    // segments it is absent from. Each matched key lives in one of six overlapping
+    // segments, so its probe bloom-prunes the other five — skips zone maps cannot
+    // give.
+    let mut indexed = Db::fresh();
+    load_scattered(&mut indexed);
+    let bloom_before = indexed.engine.metrics().scan_segments_pruned_bloom.get();
+    indexed.run(MERGE_SQL);
+    let bloom_after = indexed.engine.metrics().scan_segments_pruned_bloom.get();
     assert!(
         bloom_after > bloom_before,
-        "the MERGE's point probes must skip segments via the bloom (pruned {bloom_before} → {bloom_after})",
+        "the small-source MERGE must point-probe and bloom-prune segments (pruned {bloom_before} → {bloom_after})",
     );
 
-    // All-delta keyspace → the original full-keyset MERGE plan (no segments).
-    let mut in_delta = Db::fresh();
-    load_scattered(&mut in_delta, false);
-    in_delta.run(MERGE_SQL);
+    // Full-keyset arm: a flushed target holding only the two keys the source
+    // matches — 3 ≥ 2, so the cost choice flips to a single scan of the whole
+    // keyspace (the corner the old "any sealed segment ⇒ probe" heuristic got
+    // wrong: it would have point-probed here too).
+    let mut full_keyset = Db::fresh();
+    full_keyset.run("CREATE TABLE t (id TEXT PRIMARY KEY, v INT) WITH SYSTEM VERSIONING");
+    full_keyset.run("INSERT INTO t VALUES ('k0150', 150), ('k0151', 151)");
+    full_keyset.run("FLUSH");
+    full_keyset.run(MERGE_SQL);
 
-    // The two plans must produce identical tables — the bloom/point-probe path
-    // changed speed, never the upsert.
-    let want = in_delta.rows("SELECT id, v FROM t ORDER BY id");
-    let got = on_disk.rows("SELECT id, v FROM t ORDER BY id");
+    // Both plans resolved the same arms: k0150/k0151 matched (updated to 1/2),
+    // k0900 not matched (inserted as 3). Compare the touched keys key-for-key.
+    for (id, want) in [("k0150", 1), ("k0151", 2), ("k0900", 3)] {
+        let from_probe = indexed.rows(&format!("SELECT v FROM t WHERE id = '{id}'"));
+        let from_scan = full_keyset.rows(&format!("SELECT v FROM t WHERE id = '{id}'"));
+        assert_eq!(
+            from_probe,
+            vec![vec![Some(int4(want))]],
+            "per-key plan upserted {id}",
+        );
+        assert_eq!(from_scan, from_probe, "the full-keyset plan agrees on {id}");
+    }
+
+    // Sanity: the indexed arm's upsert grew the table by exactly the one insert.
+    let all = indexed.rows("SELECT id FROM t");
     assert_eq!(
-        got, want,
-        "the per-source-key MERGE plan must match the full-keyset plan byte-for-byte",
-    );
-    // Sanity: the upsert happened — 600 loaded + 1 inserted (`k0900`).
-    assert_eq!(
-        want.len(),
+        all.len(),
         usize::try_from(SEGMENTS * PER_SEGMENT + 1).unwrap()
     );
-    // ...and a matched key carries its new value.
-    let updated = on_disk.rows("SELECT v FROM t WHERE id = 'k0150'");
-    assert_eq!(updated, vec![vec![Some(int4(1))]]);
 }
 
 #[test]
@@ -145,7 +156,7 @@ fn point_select_over_a_scattered_keyspace_skips_segments_via_the_bloom() {
     // pushes down to the always-indexed business key and bloom-prunes the
     // segments that do not hold it, returning exactly the one row.
     let mut db = Db::fresh();
-    load_scattered(&mut db, true);
+    load_scattered(&mut db);
 
     let before = db.engine.metrics().scan_segments_pruned_bloom.get();
     let row = db.rows("SELECT v FROM t WHERE id = 'k0150'");
@@ -166,7 +177,7 @@ fn blooms_survive_compaction() {
     // new bloom never wrongly prunes a present key — and an absent key still reads
     // empty. The bloom survived the rewrite.
     let mut db = Db::fresh();
-    load_scattered(&mut db, true);
+    load_scattered(&mut db);
     db.run("COMPACT");
 
     let present = db.rows("SELECT v FROM t WHERE id = 'k0303'");
@@ -186,7 +197,7 @@ fn hash_index_on_a_value_column_is_consulted_for_equality() {
     // serves equality probes — observable via the index-probe counter — and
     // returns the same rows a full scan would.
     let mut db = Db::fresh();
-    load_scattered(&mut db, true);
+    load_scattered(&mut db);
     db.run("CREATE INDEX i_v ON t USING HASH (v)");
 
     let before = db.engine.index_probe_count();
