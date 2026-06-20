@@ -90,8 +90,10 @@ distinct points (`a FOR SYSTEM_TIME AS OF s1 JOIN b FOR SYSTEM_TIME AS OF s2`) i
 out of scope a fortiori. A `FOR VALID_TIME AS OF` pin requires **every** input to
 have a valid axis; a system-only side (a plain table, or a CTE / derived table) is
 rejected (`ValidTimeUnsupported`), since the pin cannot travel an axis that side
-lacks. Inner / left / semi / anti joins are covered; a `WHERE` / aggregate over a
-join, and `RIGHT` / `FULL` joins, remain follow-ups (STL-264, STL-172).
+lacks. Inner / left / semi / anti joins are covered, and the pinned snapshot
+composes with a `WHERE` / aggregates / `ORDER BY` / `LIMIT` / `DISTINCT` over the
+join output (STL-264, see [Joins](#joins-stl-172-stl-264)); N-way joins (STL-323)
+and `RIGHT` / `FULL` / non-equi joins (STL-270) remain follow-ups.
 
 ### `SET stele.{system,valid}_time` — session time context (STL-246)
 
@@ -342,8 +344,11 @@ live at the resolved system-time snapshot, that `snapshot`, an optional
   validity index — [ADR-0023], STL-133). The binder does not re-implement the
   prune; carrying the snapshot *is* the rewrite. Joint `(sys, valid)` version
   resolution from `valid_snapshot` is the executor's job (STL-163).
-- **Beyond the single-table scan**: a two-table join binds (STL-172), a `WHERE`
-  subquery binds — uncorrelated (STL-234) and correlated (STL-239), see
+- **Beyond the single-table scan**: a two-table join binds (STL-172) and composes
+  with the rest of the `SELECT` surface — `WHERE`, aggregates / `GROUP BY`, and the
+  `DISTINCT` / `ORDER BY` / `LIMIT` tail over the join output, with qualified-name
+  resolution across both inputs (STL-264, see [Joins](#joins-stl-172-stl-264)) — a
+  `WHERE` subquery binds — uncorrelated (STL-234) and correlated (STL-239), see
   [Subquery predicates](#subquery-predicates-stl-234-stl-239) — and a `WITH` list
   of non-recursive CTEs plus `FROM (SELECT …)` derived tables binds (STL-242, see
   [CTEs and derived tables](#ctes-and-derived-tables-stl-242)). **Rejected**: set
@@ -385,11 +390,9 @@ WHERE → [GROUP BY/aggregates] → DISTINCT → ORDER BY → OFFSET → LIMIT
   wording. `DISTINCT ON (…)` is rejected (a different operation, not
   approximated).
 
-Result shaping over a **join** read is rejected (`ORDER BY`/`LIMIT`/`DISTINCT`
-over a `JOIN`, the same posture as `WHERE` and aggregates over a join) — join
-composability is STL-264. (A `FOR … AS OF` over a join is the exception: it binds
-and executes, since time-travel over a join is a defined v0.3 behavior — STL-243.)
-Top-N pushdown and sort spill are performance work, deliberately out of v0.3 scope.
+Result shaping composes over a **join** read too (STL-264): the same pipeline runs
+over the join's output rows — see [Joins](#joins-stl-172-stl-264). Top-N pushdown
+and sort spill are performance work, deliberately out of v0.3 scope.
 
 ### Default row cap on the simple-query path (STL-306)
 
@@ -405,15 +408,63 @@ touched** (capping a `WHERE … IN (SELECT …)` would change the result, not ju
 truncate it). An explicit `LIMIT n` — including one above the cap — always wins;
 `LIMIT ALL` reads as unbounded and is capped like a bare read.
 
-The cap is applied only where `LIMIT` is legal — the single-table read path. A
-**`JOIN`**, a **table-valued function** (`stele_history`/`stele_audit`/
-`stele_segments` introspection), a **set operation**, an `INSERT … SELECT`
-source, and a constant `SELECT` all reject result shaping and are left intact, so
-the cap never turns a working statement into an error.
+The cap is injected only on the **plain single-table** read path. A **`JOIN`**
+(which now accepts an explicit `LIMIT`/`ORDER BY`/`DISTINCT`, STL-264, but is not
+auto-capped), a **table-valued function** (`stele_history`/`stele_audit`/
+`stele_segments` introspection), a **set operation**, an `INSERT … SELECT` source,
+and a constant `SELECT` are all left intact, so the cap never turns a working
+statement into an error.
 
 The **extended** query protocol is exempt: a driver (JDBC, psycopg, pgAdmin)
 sets its own row count through the portal's `Execute` `max_rows`, so an
 automated consumer fetches exactly what it requested.
+
+## Joins (STL-172, STL-264)
+
+A two-table equi-join binds and runs (STL-172): `INNER` / `JOIN`, `LEFT [OUTER]`,
+and `LEFT SEMI` / `LEFT ANTI`, joined on a single `ON left.col = right.col`
+equality (either operand order; the two key columns must share a type). Either
+side may be a base table, a CTE, or a `FROM (SELECT …)` derived table.
+
+```sql
+SELECT u.name, count(*)
+FROM users u JOIN orders o ON u.id = o.uid
+WHERE o.total >= 100
+GROUP BY u.name
+ORDER BY count DESC
+LIMIT 10;
+```
+
+The join's **output is a relation like any other**, and the rest of the `SELECT`
+surface composes over it (STL-264), in the Postgres pipeline order
+(`WHERE → [GROUP BY/aggregates] → DISTINCT → ORDER BY → OFFSET → LIMIT`):
+
+- **Addressable columns.** The output is the left side's columns, then the right's
+  for an `INNER` / `LEFT` join (a `SEMI` / `ANTI` join keeps only the left). A
+  column reference — in the projection, `WHERE`, `GROUP BY`, or `ORDER BY` — is a
+  bare name (resolved if it is unique across the output) or a qualified `table.col`
+  / `alias.col`; an ambiguous bare name is an error (`42702`-style), as Postgres
+  requires.
+- **`WHERE`** over the joined columns, including a column the projection does not
+  select, applied after the join. The same single-comparison shape the single-table
+  path binds (six operators, integer arithmetic of one anchor column — STL-213).
+- **Aggregates / `GROUP BY`** over the join output (STL-171): `COUNT` / `SUM` /
+  `MIN` / `MAX` / `AVG`, grouped on any output column(s).
+- **`DISTINCT` / `ORDER BY` / `OFFSET` / `LIMIT`** over the join output (STL-263),
+  with the same semantics (NULL placement, the `DISTINCT` 42P10 rule) as a
+  single-table read.
+
+A join also **time-travels**: a statement-level `FOR … AS OF` on either axis reads
+every input at one consistent `(sys, valid)` snapshot (STL-243, see
+[Over a `JOIN`](#for--system_time--valid_time--as-of-expr--time-travel-select) and
+docs/16 §8); the composed clauses above run over that snapshot's output.
+
+**Not yet** (rejected, never silently mis-bound): **N-way** joins
+(`a JOIN b … JOIN c …` — left-deep chains are STL-323); `RIGHT` / `FULL OUTER`
+and non-equi `ON` conditions (STL-270); a period predicate over a join. A join read
+is also not auto-capped by the
+[default row cap](#default-row-cap-on-the-simple-query-path-stl-306) — give it an
+explicit `LIMIT`.
 
 ## Subquery predicates (STL-234, STL-239)
 

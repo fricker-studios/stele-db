@@ -87,10 +87,10 @@ use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::dml::{BoundDml, DmlError, InsertRow};
 use stele_sql::merge::{BoundMerge, MergeBound, MergeSource, MergeValid, MergeValue};
 use stele_sql::select::{
-    AggregateFunc, ArithOp, BoundAggregate, BoundCte, BoundJoin, BoundJoinSide, BoundPeriod,
+    AggregateFunc, ArithOp, BoundAggregate, BoundCte, BoundJoinSide, BoundPeriod,
     BoundPeriodPredicate, BoundPredicate, BoundScalar, BoundSelect, BoundSubqueryFilter, CompareOp,
-    Correlation, JoinColumnRef, JoinType, OutputItem, PeriodEndpoint, Projection, SelectError,
-    SortTarget, SubqueryKind,
+    Correlation, JoinType, OutputItem, PeriodEndpoint, Projection, SelectError, SortTarget,
+    SubqueryKind,
 };
 use stele_sql::{
     AdminCommand, BindContext, BindError, BoundCopy, CopyError, CopyShape, Statement,
@@ -3258,8 +3258,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // inside a transaction still reads the committed snapshot only — the
         // read-your-own-writes overlay ([STL-203]) is single-table and not yet
         // threaded through the join path.
-        if let Some(join) = &bound.join {
-            return self.run_join(join, bound.snapshot, bound.valid_snapshot, scope);
+        if bound.join.is_some() {
+            return self.run_join(bound, scope);
         }
 
         // A `FROM` that names a materialized relation — a CTE reference or a derived
@@ -3939,27 +3939,40 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         Self::scan_all_columns(state, snapshot, valid_snapshot, value_count)
     }
 
-    /// Run a bound two-table `JOIN` ([STL-172]).
+    /// Run a bound two-table `JOIN` ([STL-172], [STL-264]).
     ///
-    /// Both sides are scanned at the same statement `(snapshot, valid_snapshot)` pin
-    /// ([STL-243]) into the executor's columnar shape
-    /// ([`scan_all_columns`](Self::scan_all_columns)) — shared [`Cells`](stele_exec::Cells)
-    /// buffers, not a row-major copy; the join key column of each side is decoded
-    /// into a typed [`Vector`] and handed to the [`hash_join`] operator, which
-    /// returns the surviving rows as input-row indices. The output rows are then
-    /// assembled by a zero-copy [`GatheredColumns`] view per side — each keeps its
-    /// full buffers and names its matched rows by index per the bound
-    /// [`output`](BoundJoin::output) references, never re-allocating a surviving cell
-    /// ([STL-224]) — a `LEFT` join's unmatched row drawing `NULL` for every right
-    /// column. Non-key columns are never decoded; they pass through as the opaque
-    /// canonical bytes the scan produced.
+    /// Both sides are scanned at the one statement `(sys, valid)` pin ([STL-243];
+    /// `AS OF` on either axis threads through here, every input read at the *same*
+    /// point — docs/16 §8) into the executor's columnar shape
+    /// ([`scan_all_columns`](Self::scan_all_columns)) — shared
+    /// [`Cells`](stele_exec::Cells) buffers, not a row-major copy; the join key
+    /// column of each side is decoded into a typed [`Vector`] and handed to the
+    /// [`hash_join`] operator, which returns the surviving rows as input-row
+    /// indices. A zero-copy [`GatheredColumns`] view per side ([STL-224]) then
+    /// materializes the join's **addressable output** — every kept column (the
+    /// left's, then the right's for an `INNER` / `LEFT` join; a `LEFT` join's
+    /// unmatched row draws `NULL` for every right column), `SEMI` / `ANTI` keeping
+    /// the left alone.
+    ///
+    /// The `WHERE` / aggregate / `DISTINCT` / `ORDER BY` / `OFFSET` / `LIMIT` tail
+    /// then runs over those rows through the **same** shared helpers a single-table
+    /// read uses ([`filter_rows`] / [`run_aggregate`] / [`shape_rows`]), addressing
+    /// the addressable columns by the indices the binder bound them against (the
+    /// binder's `JoinScope`, STL-264) — so the join composes with the rest of the
+    /// SELECT surface. The read-your-own-writes overlay is not threaded through the
+    /// join path (a single-table feature, [STL-203]).
     fn run_join(
         &self,
-        join: &BoundJoin,
-        snapshot: SystemTimeMicros,
-        valid_snapshot: Option<SystemTimeMicros>,
+        bound: &BoundSelect,
         scope: &CteScope,
     ) -> Result<StatementOutcome, EngineError> {
+        let join = bound
+            .join
+            .as_ref()
+            .expect("run_join is routed only for a bound join plan");
+        let snapshot = bound.snapshot;
+        let valid_snapshot = bound.valid_snapshot;
+
         // Each side is a base table scanned at the one statement `(sys, valid)` pin
         // ([STL-243]), or a materialized CTE / derived table read from the scope
         // ([STL-242]) — both yield the same shared-`Cells` columnar shape the join
@@ -3988,49 +4001,71 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         )
         .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
 
-        // Gather each output row's cells per the bound output references, by index
-        // over each side's shared columns ([STL-224], the join counterpart of the
-        // STL-214 `Filter` selection): a side keeps its full buffers and names its
-        // matched rows, so a surviving cell is copied exactly once — here, when the
-        // wire `SelectResult` is materialized. A right-keeping join reads both sides
-        // (a `None` right index — a LEFT join's unmatched row — yields NULL right
-        // cells); SEMI/ANTI read the left alone.
+        // Materialize the addressable output — every kept column, row-major. The
+        // left's columns first, then the right's for an `INNER` / `LEFT` join (a
+        // `None` right index — a `LEFT` join's unmatched row — draws NULL right
+        // cells); `SEMI` / `ANTI` keep the left alone. Each surviving cell is copied
+        // once here, off the shared buffers ([STL-224]).
+        let left_width = join.left.columns.len();
         let left = GatheredColumns::new(left_cols, indices.left.iter().map(|&l| Some(l)).collect());
         let rows: Vec<Vec<Option<Vec<u8>>>> = if join_type.keeps_right() {
+            let right_width = join.right.columns.len();
             let right = GatheredColumns::new(right_cols, indices.right);
             (0..left.rows())
                 .map(|t| {
-                    join.output
-                        .iter()
-                        .map(|col| match col {
-                            JoinColumnRef::Left(i) => left.bytes(*i, t).map(<[u8]>::to_vec),
-                            JoinColumnRef::Right(j) => right.bytes(*j, t).map(<[u8]>::to_vec),
-                        })
-                        .collect()
+                    let mut row = Vec::with_capacity(left_width + right_width);
+                    row.extend((0..left_width).map(|i| left.bytes(i, t).map(<[u8]>::to_vec)));
+                    row.extend((0..right_width).map(|j| right.bytes(j, t).map(<[u8]>::to_vec)));
+                    row
                 })
                 .collect()
         } else {
             (0..left.rows())
                 .map(|t| {
-                    join.output
-                        .iter()
-                        .map(|col| match col {
-                            JoinColumnRef::Left(i) => left.bytes(*i, t).map(<[u8]>::to_vec),
-                            // The binder proves a SEMI/ANTI output is left-only.
-                            JoinColumnRef::Right(_) => {
-                                unreachable!("SEMI/ANTI output references only the left side")
-                            }
-                        })
+                    (0..left_width)
+                        .map(|i| left.bytes(i, t).map(<[u8]>::to_vec))
                         .collect()
                 })
                 .collect()
         };
 
+        // The addressable columns `(name, type)` the bound `WHERE` / aggregate /
+        // `ORDER BY` index into — the same layout the binder bound them against.
+        let mut addressable = join.left.columns.clone();
+        if join_type.keeps_right() {
+            addressable.extend(join.right.columns.iter().cloned());
+        }
+
+        // The WHERE over the materialized rows, then the aggregate or the
+        // projection + shaping tail — the shared single-table helpers ([STL-264]).
+        let plan = filter_plan(bound);
+        let rows = filter_rows(&plan, &addressable, rows)?;
+
+        if let Some(agg) = &bound.aggregate {
+            // A join reads two scans; per-query stats over a join is a follow-up
+            // ([STL-318]), so the footer is suppressed (the aggregate sets it `None`).
+            return Ok(StatementOutcome::Rows(run_aggregate(
+                bound,
+                agg,
+                &addressable,
+                &rows,
+            )?));
+        }
+
+        // The projection: the output columns, by addressable index. `DISTINCT` /
+        // `ORDER BY` / `OFFSET` / `LIMIT` move row indices only ([`shape_rows`]),
+        // then each surviving row is projected.
+        let projection = &join.output;
+        let selection = shape_rows(bound, &addressable, projection, &rows)?;
+        let out_rows: Vec<Vec<Option<Vec<u8>>>> = selection
+            .iter()
+            .map(|&r| projection.iter().map(|&i| rows[r][i].clone()).collect())
+            .collect();
         Ok(StatementOutcome::Rows(SelectResult {
             columns: join.columns.clone(),
-            rows,
+            rows: out_rows,
             // A join reads two scans; per-query accounting over a join is a
-            // follow-up ([STL-201]), so the footer is suppressed for now.
+            // follow-up ([STL-318]), so the footer is suppressed for now.
             stats: None,
         }))
     }
@@ -12927,6 +12962,100 @@ mod tests {
             "SELECT emp.id, dept.floor FROM emp JOIN dept ON emp.dept = dept.name",
         );
         assert_eq!(sorted(result.rows), vec![vec![i4(1), i4(3)]]);
+    }
+
+    // ---- clauses compose over a join (STL-264) ----
+
+    #[test]
+    fn where_filters_join_output() {
+        let mut engine = joinable_session();
+        // A WHERE over a qualified output column ([STL-264]): only alice's orders.
+        let by_key = select(
+            &mut engine,
+            "SELECT users.name, orders.oid FROM users JOIN orders \
+             ON users.id = orders.uid WHERE users.id = 1",
+        );
+        assert_eq!(
+            sorted(by_key.rows),
+            sorted(vec![vec![txt("alice"), i4(10)], vec![txt("alice"), i4(11)]])
+        );
+        // The WHERE may filter on an *unprojected* join column (`users.name`).
+        let unprojected = select(
+            &mut engine,
+            "SELECT orders.oid FROM users JOIN orders ON users.id = orders.uid \
+             WHERE users.name = 'bob'",
+        );
+        assert_eq!(unprojected.rows, vec![vec![i4(12)]]);
+    }
+
+    #[test]
+    fn aggregate_groups_join_output() {
+        let mut engine = joinable_session();
+        // GROUP BY a qualified left column over the join; groups emit in key order.
+        let grouped = select(
+            &mut engine,
+            "SELECT users.name, COUNT(*) FROM users JOIN orders \
+             ON users.id = orders.uid GROUP BY users.name",
+        );
+        assert_eq!(
+            grouped.columns,
+            vec![
+                ("name".to_owned(), LogicalType::Text),
+                ("count".to_owned(), LogicalType::Int8),
+            ]
+        );
+        // carol has no orders (dropped by the inner join); alice 2, bob 1.
+        assert_eq!(
+            grouped.rows,
+            vec![
+                vec![txt("alice"), cell(Some(ScalarValue::Int8(2)))],
+                vec![txt("bob"), cell(Some(ScalarValue::Int8(1)))],
+            ]
+        );
+        // Ungrouped: the whole join is one group — three matched rows.
+        let total = select(
+            &mut engine,
+            "SELECT COUNT(*) FROM users JOIN orders ON users.id = orders.uid",
+        );
+        assert_eq!(total.rows, vec![vec![cell(Some(ScalarValue::Int8(3)))]]);
+    }
+
+    #[test]
+    fn order_by_limit_and_distinct_shape_join_output() {
+        let mut engine = joinable_session();
+        // ORDER BY a (qualified) column over the join, then LIMIT — deterministic.
+        let top = select(
+            &mut engine,
+            "SELECT orders.oid FROM users JOIN orders ON users.id = orders.uid \
+             ORDER BY orders.oid DESC LIMIT 2",
+        );
+        assert_eq!(top.rows, vec![vec![i4(12)], vec![i4(11)]]);
+        // DISTINCT dedups the projected join rows (alice appears twice).
+        let names = select(
+            &mut engine,
+            "SELECT DISTINCT users.name FROM users JOIN orders ON users.id = orders.uid",
+        );
+        assert_eq!(
+            sorted(names.rows),
+            sorted(vec![vec![txt("alice")], vec![txt("bob")]])
+        );
+    }
+
+    #[test]
+    fn full_clause_stack_composes_over_a_join() {
+        // The DoD shape: SELECT … FROM a JOIN b ON … WHERE … GROUP BY … ORDER BY …
+        // LIMIT … end to end ([STL-264]).
+        let mut engine = joinable_session();
+        let result = select(
+            &mut engine,
+            "SELECT users.name, COUNT(*) FROM users JOIN orders ON users.id = orders.uid \
+             WHERE orders.oid > 9 GROUP BY users.name ORDER BY count DESC, name LIMIT 1",
+        );
+        // All oids > 9, so every match survives: alice 2, bob 1 → DESC, LIMIT 1.
+        assert_eq!(
+            result.rows,
+            vec![vec![txt("alice"), cell(Some(ScalarValue::Int8(2)))]]
+        );
     }
 
     // ---- durable catalog + cold-boot recovery (STL-210, ADR-0028) ----

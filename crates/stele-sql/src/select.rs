@@ -681,7 +681,10 @@ impl JoinType {
 ///
 /// The column list is the side's schema (`(name, type)`, position `0` the business
 /// key) — it gives the executor the side's value-column count (for the row codec)
-/// and the join key's type (for decoding), and a [`JoinColumnRef`] indexes into it.
+/// and the join key's type (for decoding). The two sides' column lists, in order
+/// (the left's, then the right's for an `INNER` / `LEFT` join), are the join's
+/// **addressable output** — the flat row a [`BoundJoin::output`] index, a `WHERE`,
+/// an aggregate, and an `ORDER BY` over the join all address ([STL-264]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundJoinSide {
     /// The table this side reads.
@@ -693,25 +696,21 @@ pub struct BoundJoinSide {
     pub columns: Vec<(String, LogicalType)>,
 }
 
-/// Which side of a join an output column is drawn from, and its position in that
-/// side's schema ([STL-172]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JoinColumnRef {
-    /// The left side's column at this schema index.
-    Left(usize),
-    /// The right side's column at this schema index. Never produced for a
-    /// [`Semi`](JoinType::Semi) / [`Anti`](JoinType::Anti) join (it has no right
-    /// columns).
-    Right(usize),
-}
-
-/// A bound two-table equi-join ([STL-172]).
+/// A bound two-table equi-join ([STL-172], [STL-264]).
 ///
 /// The executor scans each side at the read snapshot, joins their rows on
-/// `left[left_key] = right[right_key]`, and assembles the [`output`](Self::output)
-/// columns. v0.2 binds a single equality condition over one column per side; a
-/// `WHERE` / aggregate / `AS OF` over the join, multi-condition / non-equi joins,
-/// `RIGHT` / `FULL` joins, and N-way joins are tracked follow-ups.
+/// `left[left_key] = right[right_key]`, and materializes the **addressable output**
+/// — the left side's columns, then the right's for an `INNER` / `LEFT` join (a
+/// `SEMI` / `ANTI` join keeps only the left). A `WHERE`, an aggregate, and the
+/// `DISTINCT` / `ORDER BY` / `OFFSET` / `LIMIT` tail then run over that flat row
+/// exactly as the single-table path runs them over a reconstructed row ([STL-264]):
+/// the bound [`BoundSelect`] carries them, addressing columns by their index in the
+/// addressable output. [`output`](Self::output) is the projection — the indices the
+/// `SELECT` list selects from it.
+///
+/// v0.3 binds a single equality condition over one column per side. `AS OF` over
+/// the join ([STL-243]), N-way joins ([STL-323]), and `RIGHT` / `FULL` / non-equi
+/// joins ([STL-270]) are tracked follow-ups.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundJoin {
     /// Which join to compute.
@@ -725,11 +724,13 @@ pub struct BoundJoin {
     /// The equi-join key's column index in the right side's schema. The two key
     /// columns share a [`LogicalType`] (the binder enforces it).
     pub right_key: usize,
-    /// The output columns, in SELECT-list order — each drawn from one side. For a
-    /// `SEMI` / `ANTI` join every entry is [`JoinColumnRef::Left`].
-    pub output: Vec<JoinColumnRef>,
+    /// The projection: the `SELECT`-list output columns, as indices into the
+    /// **addressable output** (the left side's columns, then the right's for an
+    /// `INNER` / `LEFT` join). `SELECT *` is every index in order. Unused on the
+    /// aggregate path, whose output columns come from [`BoundSelect::aggregate`].
+    pub output: Vec<usize>,
     /// The result columns `(name, type)`, aligned to [`output`](Self::output) — a
-    /// `RowDescription` header for the joined result.
+    /// `RowDescription` header for the projected (non-aggregate) join result.
     pub columns: Vec<(String, LogicalType)>,
 }
 
@@ -1098,24 +1099,29 @@ fn bind_select_scoped(
 
     // A two-table `JOIN` binds to a wholly different shape (two sides, a join
     // condition, a combined header), so it is routed before the single-table path.
-    // The result-shaping clauses are not threaded through the join path yet
-    // ([STL-264] lifts this with the rest of join composability), so they are
-    // rejected over a join rather than silently dropped.
+    // The `WHERE` / aggregate / `DISTINCT` / `ORDER BY` / `LIMIT` clauses compose
+    // over the join's output ([STL-264]) — bound against its addressable columns.
     if let Some(join) = detect_join(select)? {
-        reject_shaping_over_join(query, select)?;
         let (mut bound, mut side_ctes) =
-            bind_join(stmt, ctx, select, join, &sigs, snapshot, valid_snapshot)?;
+            bind_join(stmt, ctx, query, select, join, &sigs, snapshot, valid_snapshot)?;
         // The `WITH` relations materialize first (a derived join side may reference
         // one), then any derived tables the join sides introduced.
         ctes.append(&mut side_ctes);
         reject_duplicate_relation_names(&ctes)?;
         bound.ctes = ctes;
-        let header = bound
-            .join
-            .as_ref()
-            .expect("the join path sets `join`")
-            .columns
-            .clone();
+        // An aggregate over the join takes its header from the aggregate plan; a
+        // plain projection takes it from the join's projected columns.
+        let header = bound.aggregate.as_ref().map_or_else(
+            || {
+                bound
+                    .join
+                    .as_ref()
+                    .expect("the join path sets `join`")
+                    .columns
+                    .clone()
+            },
+            |agg| agg.columns.clone(),
+        );
         return Ok((bound, header));
     }
 
@@ -1715,15 +1721,21 @@ fn bind_group_by(
     Ok(group_by)
 }
 
-/// Bind one aggregate function call expression, or `Ok(None)` if `expr` is not a
-/// function call at all (so the caller treats it as a grouping column). A
-/// function call that is *not* a core aggregate, or a supported aggregate in an
-/// unsupported form, is an error rather than `None`.
-fn bind_aggregate_call(
-    expr: &Expr,
-    schema: &TableSchema,
-    table: &str,
-) -> Result<Option<AggregateCall>, SelectError> {
+/// An aggregate call's validated shape ([`aggregate_call_shape`]): its kind, the
+/// function name (for diagnostics), and its optional argument expression (`None`
+/// for `COUNT(*)`), all borrowing the source `Expr`.
+type AggregateCallShape<'a> = (AggregateFunc, &'a str, Option<&'a Expr>);
+
+/// Validate an aggregate function call's shape ([STL-171]), returning its
+/// [`AggregateCallShape`] — or `Ok(None)` if `expr` is not a function call at all
+/// (so the caller treats it as a grouping column).
+///
+/// Everything beyond a plain single-argument aggregate — `DISTINCT`, `FILTER`, an
+/// `OVER` window, `WITHIN GROUP`, a parametric call — is an error, not `None`,
+/// since silently ignoring it would be a wrong answer. The single-table
+/// ([`bind_aggregate_call`]) and join ([`bind_join_aggregate_call`]) paths share
+/// this and differ only in how they resolve the argument column.
+fn aggregate_call_shape(expr: &Expr) -> Result<Option<AggregateCallShape<'_>>, SelectError> {
     let Expr::Function(func) = expr else {
         return Ok(None);
     };
@@ -1782,8 +1794,7 @@ fn bind_aggregate_call(
     };
 
     // `COUNT(*)` is the one wildcard-argument aggregate; everything else needs a
-    // column. A bare `COUNT(col)` / `SUM(col)` / … resolves the column and checks
-    // its type fits the aggregate.
+    // column the caller resolves against its relation.
     let arg = match arg {
         FunctionArgExpr::Wildcard => {
             if func_kind != AggregateFunc::Count {
@@ -1793,7 +1804,32 @@ fn bind_aggregate_call(
             }
             None
         }
-        FunctionArgExpr::Expr(expr) => {
+        FunctionArgExpr::Expr(arg) => Some(arg),
+        FunctionArgExpr::QualifiedWildcard(_) | FunctionArgExpr::WildcardWithOptions(_) => {
+            return Err(SelectError::UnsupportedAggregate(format!(
+                "{name}() does not support a qualified or option-bearing wildcard"
+            )));
+        }
+    };
+
+    Ok(Some((func_kind, name, arg)))
+}
+
+/// Bind one aggregate function call over a base table, or `Ok(None)` if `expr` is
+/// not a function call (so the caller treats it as a grouping column) ([STL-171]).
+/// The call's shape is validated by [`aggregate_call_shape`]; the argument column
+/// resolves against the base-table `schema`.
+fn bind_aggregate_call(
+    expr: &Expr,
+    schema: &TableSchema,
+    table: &str,
+) -> Result<Option<AggregateCall>, SelectError> {
+    let Some((func, name, arg_expr)) = aggregate_call_shape(expr)? else {
+        return Ok(None);
+    };
+    let arg = match arg_expr {
+        None => None,
+        Some(expr) => {
             let column = bare_column(expr).ok_or_else(|| {
                 SelectError::UnsupportedAggregate(format!(
                     "{name}() supports a bare column argument only"
@@ -1803,20 +1839,11 @@ fn bind_aggregate_call(
                 table: table.to_owned(),
                 column: column.to_owned(),
             })?;
-            check_aggregate_arg_type(func_kind, schema.columns()[idx].ty())?;
+            check_aggregate_arg_type(func, schema.columns()[idx].ty())?;
             Some(idx)
         }
-        FunctionArgExpr::QualifiedWildcard(_) | FunctionArgExpr::WildcardWithOptions(_) => {
-            return Err(SelectError::UnsupportedAggregate(format!(
-                "{name}() does not support a qualified or option-bearing wildcard"
-            )));
-        }
     };
-
-    Ok(Some(AggregateCall {
-        func: func_kind,
-        arg,
-    }))
+    Ok(Some(AggregateCall { func, arg }))
 }
 
 /// Check an aggregate argument's column type: `SUM` / `AVG` need an integer;
@@ -1931,19 +1958,25 @@ fn detect_join(select: &Select) -> Result<Option<&TableWithJoins>, SelectError> 
         0 => Ok(None),
         1 => Ok(Some(from)),
         _ => Err(SelectError::UnsupportedJoin(
-            "only a single JOIN is supported (N-way joins are a follow-up)".to_owned(),
+            "only a single JOIN is supported (N-way left-deep joins are STL-323)".to_owned(),
         )),
     }
 }
 
 /// Bind a two-table `JOIN` `SELECT` into a [`BoundSelect`] carrying a
-/// [`BoundJoin`] ([STL-172]).
+/// [`BoundJoin`] ([STL-172], [STL-264]).
 ///
 /// Resolves both tables at the statement's `(sys, valid)` snapshot — the single
 /// per-statement pin every input reads at (docs/16 §8: a temporal join takes one
 /// consistent snapshot across the query) — lowers the join operator to a
-/// [`JoinType`], binds the `ON left.col = right.col` equi-condition to a key column
-/// per side, and binds the projection to output columns drawn from the two sides.
+/// [`JoinType`], and binds the `ON left.col = right.col` equi-condition to a key
+/// column per side. The join's **addressable output** (the two sides' columns,
+/// [`JoinScope`]) is then the surface the rest of the `SELECT` binds against — the
+/// projection, a `WHERE` ([STL-213]), a `GROUP BY` + aggregates ([STL-171]), and
+/// the `DISTINCT` / `ORDER BY` / `OFFSET` / `LIMIT` tail ([STL-263]) — each
+/// resolving its (bare or qualified) column references to an addressable index, so
+/// the executor runs the same downstream pipeline a single-table read does
+/// ([STL-264]).
 ///
 /// A `FOR … AS OF` qualifier on *either* axis is honored ([STL-243]): it is the
 /// statement-level pin lifted off the token stream ([STL-162]), applied to every
@@ -1951,33 +1984,24 @@ fn detect_join(select: &Select) -> Result<Option<&TableWithJoins>, SelectError> 
 /// per-input "different instant per table" join cannot reach here.) A `FOR
 /// VALID_TIME AS OF` pin is meaningful only where every input has a valid axis, so
 /// a system-only side under one is rejected, mirroring the single-table
-/// [`SelectError::ValidTimeUnsupported`]. A `WHERE` / aggregate / period predicate
-/// *over* the join, and `RIGHT` / `FULL` / `CROSS` joins, stay rejected (each a
-/// tracked follow-up) rather than mis-bound.
+/// [`SelectError::ValidTimeUnsupported`]. A period predicate over the join, the
+/// `RIGHT` / `FULL` / `CROSS` joins ([`join_kind_and_constraint`]), and N-way joins
+/// ([`detect_join`], [STL-323]) stay rejected (each a tracked follow-up).
 fn bind_join<'a>(
     stmt: &Statement,
     ctx: &'a BindContext<'a>,
+    query: &'a Query,
     select: &'a Select,
     from: &'a TableWithJoins,
     sigs: &[CteSig],
     snapshot: SystemTimeMicros,
     valid_snapshot: Option<SystemTimeMicros>,
 ) -> Result<(BoundSelect, Vec<BoundCte>), SelectError> {
-    // Clauses v0.3 does not yet support over a join: rejected, never dropped. (A
-    // `FOR … AS OF` on either axis *is* threaded — [STL-243].)
+    // A `FOR … AS OF` on either axis *is* threaded ([STL-243]); a period predicate
+    // over a join stays a follow-up: rejected, never dropped.
     if stmt.temporal.period_predicate.is_some() {
         return Err(SelectError::UnsupportedJoin(
             "a period predicate over a JOIN".to_owned(),
-        ));
-    }
-    if select.selection.is_some() {
-        return Err(SelectError::UnsupportedJoin(
-            "a WHERE over a JOIN".to_owned(),
-        ));
-    }
-    if is_aggregate_query(select) {
-        return Err(SelectError::UnsupportedJoin(
-            "an aggregate over a JOIN".to_owned(),
         ));
     }
 
@@ -2006,24 +2030,55 @@ fn bind_join<'a>(
     }
 
     let (left_key, right_key) = bind_join_condition(constraint, &left, &right)?;
-    let (output, columns) = bind_join_projection(select, join_type, &left, &right)?;
+
+    // The join's addressable output — the surface every clause below resolves its
+    // column references against (bare or qualified, STL-172's `resolve_join_column`).
+    let scope = JoinScope::new(&left, &right, join_type);
+
+    // An aggregate query (`GROUP BY`, or an aggregate in the SELECT list) replaces
+    // the plain projection with a grouped plan that names its own output columns;
+    // otherwise the projection selects addressable indices. Detection is syntactic,
+    // so it runs before column resolution, exactly as the single-table path.
+    let aggregate = if is_aggregate_query(select) {
+        Some(bind_join_aggregate(select, &scope)?)
+    } else {
+        None
+    };
+    let (output, columns) = match &aggregate {
+        // The projection is unused on the aggregate path; the header is the
+        // aggregate's. Keeping `columns` here lets the caller read one header field.
+        Some(agg) => (Vec::new(), agg.columns.clone()),
+        None => bind_join_projection(select, &scope)?,
+    };
+
+    // The result-shaping tail and the `WHERE`, bound over the addressable output
+    // exactly as the single-table path binds them over a schema — only column
+    // resolution differs (`JoinScope` vs a base-table schema).
+    let distinct = bind_distinct(select)?;
+    let order_by = bind_join_order_by(query, &scope, distinct, aggregate.as_ref(), &columns)?;
+    let (limit, offset) = bind_limit_offset(query)?;
+    let filter = select
+        .selection
+        .as_ref()
+        .map(|expr| bind_join_filter(expr, &scope))
+        .transpose()?;
 
     let mut ctes = Vec::new();
     ctes.extend(left_cte);
     ctes.extend(right_cte);
 
     let bound = BoundSelect {
-        // The single-table fields are unused on the join path (see `BoundSelect`):
-        // the executor routes to the join plan, never reading these.
+        // The single-table relation fields are unused on the join path (see
+        // `BoundSelect`): the executor routes to the join plan, never reading these.
         table: String::new(),
         schema_id: left.schema.schema_id(),
         snapshot,
         valid_snapshot,
         projection: Projection::All,
-        filter: None,
+        filter,
         period_filter: None,
         subquery_filter: None,
-        aggregate: None,
+        aggregate,
         join: Some(BoundJoin {
             join_type,
             left: bound_side(&left),
@@ -2037,12 +2092,10 @@ fn bind_join<'a>(
         // CTE is returned alongside (`ctes`) for the caller to register.
         ctes: Vec::new(),
         relation_columns: None,
-        // Result shaping over a join is rejected before this path is taken
-        // (`reject_shaping_over_join`, [STL-264] lifts it).
-        distinct: false,
-        order_by: Vec::new(),
-        offset: 0,
-        limit: None,
+        distinct,
+        order_by,
+        offset,
+        limit,
     };
     Ok((bound, ctes))
 }
@@ -2385,34 +2438,93 @@ fn compound_name(parts: &[sqlparser::ast::Ident]) -> String {
         .join(".")
 }
 
-/// A bound join projection: the output column references and their aligned
-/// `(name, type)` result header.
-type JoinProjection = (Vec<JoinColumnRef>, Vec<(String, LogicalType)>);
-
-/// Bind a join's projection to its output columns ([`JoinColumnRef`]) and the
-/// result header. `SELECT *` is the left side's columns followed by the right's
-/// (left only for `SEMI` / `ANTI`); a named list resolves each item to a side.
-fn bind_join_projection(
-    select: &Select,
+/// The combined output of a two-table join, as the surface a projection / `WHERE`
+/// / `GROUP BY` / `ORDER BY` resolves its column references against ([STL-264]).
+///
+/// The **addressable** columns are the left side's, then — for an `INNER` / `LEFT`
+/// join — the right side's, in schema order (a `SEMI` / `ANTI` join exposes only
+/// the left). A reference (bare `c` or qualified `t.c`) resolves through the
+/// STL-172 [`resolve_join_column`] machinery to a `(side, index)`, which this
+/// flattens to a single addressable index — `i` for the left, `left_width + j` for
+/// the right — so the clause binders address one flat row, exactly as the
+/// single-table path addresses a schema row.
+struct JoinScope<'a> {
+    left: &'a SideSchema<'a>,
+    right: &'a SideSchema<'a>,
     join_type: JoinType,
-    left: &SideSchema,
-    right: &SideSchema,
-) -> Result<JoinProjection, SelectError> {
-    // `SELECT *` — every column of each kept side, in schema order.
-    if let [SelectItem::Wildcard(_)] = select.projection.as_slice() {
-        let mut output = Vec::new();
-        let mut columns = Vec::new();
-        for (i, c) in left.schema.columns().iter().enumerate() {
-            output.push(JoinColumnRef::Left(i));
-            columns.push((c.name().to_owned(), c.ty()));
-        }
+    /// The flat addressable columns `(name, type)`, in output order.
+    columns: Vec<(String, LogicalType)>,
+}
+
+impl<'a> JoinScope<'a> {
+    fn new(left: &'a SideSchema<'a>, right: &'a SideSchema<'a>, join_type: JoinType) -> Self {
+        let mut columns: Vec<(String, LogicalType)> = left
+            .schema
+            .columns()
+            .iter()
+            .map(|c| (c.name().to_owned(), c.ty()))
+            .collect();
         if join_type.keeps_right() {
-            for (j, c) in right.schema.columns().iter().enumerate() {
-                output.push(JoinColumnRef::Right(j));
-                columns.push((c.name().to_owned(), c.ty()));
-            }
+            columns.extend(
+                right
+                    .schema
+                    .columns()
+                    .iter()
+                    .map(|c| (c.name().to_owned(), c.ty())),
+            );
         }
-        return Ok((output, columns));
+        Self {
+            left,
+            right,
+            join_type,
+            columns,
+        }
+    }
+
+    /// The addressable output columns `(name, type)`, in order.
+    fn columns(&self) -> &[(String, LogicalType)] {
+        &self.columns
+    }
+
+    /// Resolve a column reference (bare or qualified) to its addressable index and
+    /// type. A `SEMI` / `ANTI` join exposes only its left columns, so a right-side
+    /// reference is rejected here rather than addressing a column the output omits.
+    fn resolve(&self, expr: &Expr) -> Result<(usize, LogicalType), SelectError> {
+        let (side, idx) = resolve_join_column(expr, self.left, self.right)?;
+        let index = match side {
+            Side::Left => idx,
+            Side::Right => {
+                if !self.join_type.keeps_right() {
+                    return Err(SelectError::UnsupportedJoinProjection(
+                        "a SEMI/ANTI join exposes only its left table's columns".to_owned(),
+                    ));
+                }
+                self.left.schema.columns().len() + idx
+            }
+        };
+        Ok((index, self.columns[index].1))
+    }
+
+    /// A label naming the joined relations, for an ungrouped-column diagnostic.
+    fn relation_label(&self) -> String {
+        format!("{} JOIN {}", self.left.table, self.right.table)
+    }
+}
+
+/// A bound join projection: the output-column **addressable indices** and their
+/// aligned `(name, type)` result header.
+type JoinProjection = (Vec<usize>, Vec<(String, LogicalType)>);
+
+/// Bind a join's projection to addressable output-column indices and the result
+/// header ([STL-264]). `SELECT *` is every addressable column in order (the left
+/// side, then the right for an `INNER` / `LEFT` join); a named list resolves each
+/// item (bare or qualified) through the [`JoinScope`]. The header uses each
+/// column's bare name, the Postgres `RowDescription` convention.
+fn bind_join_projection(select: &Select, scope: &JoinScope) -> Result<JoinProjection, SelectError> {
+    // `SELECT *` — every addressable column, in output order.
+    if let [SelectItem::Wildcard(_)] = select.projection.as_slice() {
+        let output: Vec<usize> = (0..scope.columns().len()).collect();
+        return Ok((output, scope.columns().to_vec()));
     }
 
     let mut output = Vec::with_capacity(select.projection.len());
@@ -2429,28 +2541,358 @@ fn bind_join_projection(
             }
             other => return Err(SelectError::UnsupportedJoinProjection(other.to_string())),
         };
-        let (side, idx) = resolve_join_column(expr, left, right)?;
-        let schema: &TableSchema = match side {
-            Side::Left => &left.schema,
-            Side::Right => {
-                // A SEMI / ANTI join's result is the left table alone, so a right
-                // column has nowhere to come from.
-                if !join_type.keeps_right() {
-                    return Err(SelectError::UnsupportedJoinProjection(
-                        "a SEMI/ANTI join projects only its left table's columns".to_owned(),
-                    ));
-                }
-                &right.schema
-            }
-        };
-        let col = &schema.columns()[idx];
-        columns.push((col.name().to_owned(), col.ty()));
-        output.push(match side {
-            Side::Left => JoinColumnRef::Left(idx),
-            Side::Right => JoinColumnRef::Right(idx),
-        });
+        let (index, ty) = scope.resolve(expr)?;
+        columns.push((scope.columns()[index].0.clone(), ty));
+        output.push(index);
     }
     Ok((output, columns))
+}
+
+/// One column a `WHERE` over a join anchors on — its addressable index, type, and
+/// name (for fold diagnostics). The join counterpart of [`FilterAnchor`].
+struct JoinFilterAnchor {
+    index: usize,
+    ty: LogicalType,
+    name: String,
+}
+
+/// Bind a `WHERE` over a join's output to a [`BoundPredicate`] ([STL-264]).
+///
+/// The join counterpart of [`bind_where_predicate`]: the same single-comparison,
+/// one-anchor-column shape ([STL-213]) — six comparison operators, either side an
+/// integer arithmetic of the anchor column or a literal folded to its type — but
+/// each column reference (bare or qualified) resolves through the [`JoinScope`] to
+/// an addressable index. A subquery / period `WHERE` over a join is not a shape the
+/// v0.3 join path binds (its non-comparison form is rejected here).
+fn bind_join_filter(expr: &Expr, scope: &JoinScope) -> Result<BoundPredicate, SelectError> {
+    let Expr::BinaryOp { left, op, right } = unwrap_nested(expr) else {
+        return Err(SelectError::UnsupportedPredicate(
+            "the WHERE over a JOIN is not a comparison".to_owned(),
+        ));
+    };
+    let Some(compare) = compare_op(op) else {
+        return Err(SelectError::UnsupportedPredicate(format!(
+            "operator `{op}` is not a comparison"
+        )));
+    };
+    let anchor = join_filter_anchor(left, right, scope)?;
+    Ok(BoundPredicate {
+        left: bind_join_scalar(left, &anchor, scope)?,
+        op: compare,
+        right: bind_join_scalar(right, &anchor, scope)?,
+    })
+}
+
+/// Resolve the one column a join `WHERE` comparison references to a
+/// [`JoinFilterAnchor`]. Like [`filter_anchor`], a predicate with no column has no
+/// type to anchor, and one referencing two distinct columns is a column-to-column
+/// comparison — both unsupported.
+fn join_filter_anchor(
+    left: &Expr,
+    right: &Expr,
+    scope: &JoinScope,
+) -> Result<JoinFilterAnchor, SelectError> {
+    let mut refs: Vec<&Expr> = Vec::new();
+    collect_join_columns(left, &mut refs);
+    collect_join_columns(right, &mut refs);
+    let mut anchor: Option<JoinFilterAnchor> = None;
+    for r in refs {
+        let (index, ty) = scope.resolve(r)?;
+        match &anchor {
+            Some(a) if a.index != index => {
+                return Err(SelectError::UnsupportedPredicate(
+                    "a column-to-column comparison over a JOIN is not supported".to_owned(),
+                ));
+            }
+            Some(_) => {}
+            None => {
+                anchor = Some(JoinFilterAnchor {
+                    index,
+                    ty,
+                    name: scope.columns()[index].0.clone(),
+                });
+            }
+        }
+    }
+    anchor.ok_or_else(|| {
+        SelectError::UnsupportedPredicate("the WHERE over a JOIN references no column".to_owned())
+    })
+}
+
+/// Collect the column-reference operands (bare or qualified) a join `WHERE` side
+/// references, descending through parentheses and arithmetic — the join
+/// counterpart of [`collect_where_columns`], which collects bare names only.
+fn collect_join_columns<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => out.push(expr),
+        Expr::Nested(inner) => collect_join_columns(inner, out),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_join_columns(left, out);
+            collect_join_columns(right, out);
+        }
+        _ => {}
+    }
+}
+
+/// Bind one side of a join `WHERE` comparison to a [`BoundScalar`] — the anchor
+/// column (by addressable index), an integer arithmetic of it, or a literal folded
+/// to the anchor's type. The join counterpart of [`bind_scalar`].
+fn bind_join_scalar(
+    expr: &Expr,
+    anchor: &JoinFilterAnchor,
+    scope: &JoinScope,
+) -> Result<BoundScalar, SelectError> {
+    match unwrap_nested(expr) {
+        column @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => {
+            let (index, _) = scope.resolve(column)?;
+            Ok(BoundScalar::Column(index))
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let Some(arith) = arith_op(op) else {
+                return Err(SelectError::UnsupportedPredicate(format!(
+                    "operator `{op}` is not supported in a WHERE comparand"
+                )));
+            };
+            if !matches!(anchor.ty, LogicalType::Int4 | LogicalType::Int8) {
+                return Err(SelectError::UnsupportedPredicate(format!(
+                    "arithmetic in a WHERE needs an integer column, but `{}` is {}",
+                    anchor.name, anchor.ty
+                )));
+            }
+            Ok(BoundScalar::Arith {
+                op: arith,
+                left: Box::new(bind_join_scalar(left, anchor, scope)?),
+                right: Box::new(bind_join_scalar(right, anchor, scope)?),
+            })
+        }
+        leaf => {
+            let value = fold::fold_scalar(leaf, anchor.ty).map_err(|err| {
+                SelectError::UnsupportedPredicate(predicate_reason(&err, &anchor.name, anchor.ty))
+            })?;
+            Ok(BoundScalar::Literal(value))
+        }
+    }
+}
+
+/// Bind a `GROUP BY` + aggregate `SELECT` over a join's output into a
+/// [`BoundAggregate`] ([STL-171], [STL-264]) — the join counterpart of
+/// [`bind_aggregate`], resolving grouping / argument / passed-through columns
+/// against the [`JoinScope`] (addressable indices) rather than a base-table schema.
+fn bind_join_aggregate(select: &Select, scope: &JoinScope) -> Result<BoundAggregate, SelectError> {
+    let group_by = bind_join_group_by(select, scope)?;
+
+    let mut aggregates: Vec<AggregateCall> = Vec::new();
+    let mut items: Vec<OutputItem> = Vec::new();
+    let mut columns: Vec<(String, LogicalType)> = Vec::new();
+
+    for item in &select.projection {
+        let (expr, alias) = select_item(item)?;
+        if let Some(call) = bind_join_aggregate_call(expr, scope)? {
+            let arg_ty = call.arg.map(|i| scope.columns()[i].1);
+            let ty = call.func.result_type(arg_ty);
+            let name = alias.unwrap_or_else(|| call.func.default_name().to_owned());
+            items.push(OutputItem::Aggregate(aggregates.len()));
+            aggregates.push(call);
+            columns.push((name, ty));
+        } else {
+            // Not an aggregate ⇒ it must be a grouping column passed through.
+            let column = unwrap_nested(expr);
+            if !matches!(column, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                return Err(SelectError::UnsupportedAggregate(
+                    "a SELECT item must be a grouping column or an aggregate".to_owned(),
+                ));
+            }
+            let (index, ty) = scope.resolve(column)?;
+            let group_pos = group_by.iter().position(|&g| g == index).ok_or_else(|| {
+                SelectError::UngroupedColumn {
+                    table: scope.relation_label(),
+                    column: scope.columns()[index].0.clone(),
+                }
+            })?;
+            let name = alias.unwrap_or_else(|| scope.columns()[index].0.clone());
+            items.push(OutputItem::Group(group_pos));
+            columns.push((name, ty));
+        }
+    }
+
+    Ok(BoundAggregate {
+        group_by,
+        aggregates,
+        items,
+        columns,
+    })
+}
+
+/// Resolve a join query's `GROUP BY` columns to addressable indices ([STL-264]) —
+/// the join counterpart of [`bind_group_by`].
+fn bind_join_group_by(select: &Select, scope: &JoinScope) -> Result<Vec<usize>, SelectError> {
+    let exprs = match &select.group_by {
+        GroupByExpr::Expressions(exprs, modifiers) => {
+            if !modifiers.is_empty() {
+                return Err(SelectError::UnsupportedAggregate(
+                    "GROUP BY modifiers (ROLLUP/CUBE/GROUPING SETS) are not supported".to_owned(),
+                ));
+            }
+            exprs
+        }
+        GroupByExpr::All(_) => {
+            return Err(SelectError::UnsupportedAggregate(
+                "GROUP BY ALL is not supported".to_owned(),
+            ));
+        }
+    };
+    let mut group_by = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        let column = unwrap_nested(expr);
+        if !matches!(column, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+            return Err(SelectError::UnsupportedAggregate(
+                "GROUP BY supports bare or qualified column names only".to_owned(),
+            ));
+        }
+        let (index, ty) = scope.resolve(column)?;
+        require_evaluable(ty, || {
+            format!("GROUP BY on a {ty} column is not supported yet")
+        })?;
+        group_by.push(index);
+    }
+    Ok(group_by)
+}
+
+/// Bind one aggregate function call over a join's output, or `Ok(None)` if `expr`
+/// is not a function call ([STL-264]). The call's shape is validated by the shared
+/// [`aggregate_call_shape`]; the argument column resolves against the [`JoinScope`].
+fn bind_join_aggregate_call(
+    expr: &Expr,
+    scope: &JoinScope,
+) -> Result<Option<AggregateCall>, SelectError> {
+    let Some((func, name, arg_expr)) = aggregate_call_shape(expr)? else {
+        return Ok(None);
+    };
+    let arg = match arg_expr {
+        None => None,
+        Some(expr) => {
+            let column = unwrap_nested(expr);
+            if !matches!(column, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                return Err(SelectError::UnsupportedAggregate(format!(
+                    "{name}() supports a bare or qualified column argument only"
+                )));
+            }
+            let (index, ty) = scope.resolve(column)?;
+            check_aggregate_arg_type(func, ty)?;
+            Some(index)
+        }
+    };
+    Ok(Some(AggregateCall { func, arg }))
+}
+
+/// Bind a join query's `ORDER BY` into [`BoundSortKey`]s ([STL-263], [STL-264]) —
+/// the join counterpart of [`bind_order_by`], resolving each key against the
+/// projected output columns first, then the join's addressable columns.
+fn bind_join_order_by(
+    query: &Query,
+    scope: &JoinScope,
+    distinct: bool,
+    aggregate: Option<&BoundAggregate>,
+    output: &[(String, LogicalType)],
+) -> Result<Vec<BoundSortKey>, SelectError> {
+    let Some(order_by) = &query.order_by else {
+        return Ok(Vec::new());
+    };
+    if order_by.interpolate.is_some() {
+        return Err(SelectError::UnsupportedOrderBy("INTERPOLATE".to_owned()));
+    }
+    let exprs = match &order_by.kind {
+        OrderByKind::All(_) => {
+            return Err(SelectError::UnsupportedOrderBy("ORDER BY ALL".to_owned()));
+        }
+        OrderByKind::Expressions(exprs) => exprs,
+    };
+    exprs
+        .iter()
+        .map(|key| bind_join_sort_key(key, scope, distinct, aggregate, output))
+        .collect()
+}
+
+/// Bind one join `ORDER BY` key ([STL-264]). Like [`bind_sort_key`], a bare name
+/// resolves against the **select list first** (an aggregate query's output columns;
+/// a plain query's projected columns), then — for a plain, non-`DISTINCT` query —
+/// against the join's addressable columns (a qualified `t.c`, or an unprojected
+/// column — the Postgres allowance). With `DISTINCT` a non-projected key is the
+/// 42P10 [`SelectError::DistinctOrderBy`]; an aggregate query's rows have no
+/// addressable columns to fall back to.
+fn bind_join_sort_key(
+    key: &OrderByExpr,
+    scope: &JoinScope,
+    distinct: bool,
+    aggregate: Option<&BoundAggregate>,
+    output: &[(String, LogicalType)],
+) -> Result<BoundSortKey, SelectError> {
+    if key.with_fill.is_some() {
+        return Err(SelectError::UnsupportedOrderBy("WITH FILL".to_owned()));
+    }
+    if key.options.nulls_first.is_some() {
+        return Err(SelectError::UnsupportedOrderBy(
+            "explicit NULLS FIRST/LAST (the Postgres defaults apply: \
+             NULLS LAST under ASC, NULLS FIRST under DESC)"
+                .to_owned(),
+        ));
+    }
+    let descending = key.options.asc == Some(false);
+    let sort_output = |pos| {
+        Ok(BoundSortKey {
+            column: SortTarget::Output(pos),
+            descending,
+        })
+    };
+    // A bare name may match a select-list output column by name; a qualified `t.c`
+    // never names an output column (the header is bare), so it resolves against the
+    // addressable columns directly.
+    let bare = bare_column(&key.expr);
+
+    // An aggregate query's result rows are its output columns — there is no
+    // addressable column to fall back to.
+    if let Some(agg) = aggregate {
+        let name = bare.ok_or_else(|| {
+            SelectError::UnsupportedOrderBy(format!(
+                "key `{}` — an aggregate query orders only by a select-list column",
+                key.expr
+            ))
+        })?;
+        return agg.columns.iter().position(|(n, _)| n == name).map_or_else(
+            || {
+                Err(SelectError::UnsupportedOrderBy(format!(
+                    "column {name:?} is not a select-list column of the aggregate query"
+                )))
+            },
+            sort_output,
+        );
+    }
+
+    // Plain query: the select list (by name) first.
+    if let Some(name) = bare
+        && let Some(pos) = output.iter().position(|(n, _)| n == name)
+    {
+        return sort_output(pos);
+    }
+
+    // Otherwise resolve against the addressable columns — a qualified key, or an
+    // unprojected one. After `DISTINCT` that value is ambiguous (Postgres 42P10).
+    let column_expr = match &key.expr {
+        e @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Nested(_)) => e,
+        other => {
+            return Err(SelectError::UnsupportedOrderBy(format!(
+                "key `{other}` — only a column name sorts"
+            )));
+        }
+    };
+    let (index, _) = scope.resolve(column_expr)?;
+    if distinct {
+        return Err(SelectError::DistinctOrderBy);
+    }
+    Ok(BoundSortKey {
+        column: SortTarget::Schema(index),
+        descending,
+    })
 }
 
 /// Bind a parsed [`PeriodPredicateClause`] to a [`BoundPeriodPredicate`]
@@ -3698,29 +4140,6 @@ fn bind_projection(select: &Select) -> Result<Projection, SelectError> {
     Ok(Projection::Columns(columns))
 }
 
-/// Reject the result-shaping clauses over a `JOIN` read. `ORDER BY`,
-/// `LIMIT`/`OFFSET`/`FETCH`, and `DISTINCT` bind for single-table reads only
-/// ([STL-263]); over a join each is part of join composability ([STL-264] —
-/// the same posture as `WHERE` / aggregates over a join), rejected rather than
-/// silently dropped.
-///
-/// [STL-264]: https://allegromusic.atlassian.net/browse/STL-264
-fn reject_shaping_over_join(query: &Query, select: &Select) -> Result<(), SelectError> {
-    let reject = |what: &str| Err(SelectError::UnsupportedJoin(format!("{what} over a JOIN")));
-    // `Distinct::All` is the explicit `SELECT ALL` default — not a shaping
-    // clause — so only an actual `DISTINCT` / `DISTINCT ON` is rejected here.
-    if matches!(select.distinct, Some(Distinct::Distinct | Distinct::On(_))) {
-        return reject("DISTINCT");
-    }
-    if query.order_by.is_some() {
-        return reject("ORDER BY");
-    }
-    if query.limit_clause.is_some() || query.fetch.is_some() {
-        return reject("LIMIT/OFFSET/FETCH");
-    }
-    Ok(())
-}
-
 /// Bind the `SELECT [ALL | DISTINCT]` set quantifier ([STL-263]).
 ///
 /// `DISTINCT` deduplicates the full projected row. The Postgres
@@ -4827,27 +5246,39 @@ mod tests {
     }
 
     #[test]
-    fn result_shaping_over_a_join_is_rejected() {
+    fn result_shaping_binds_over_a_join() {
         let catalog = catalog_with_join_tables();
-        for sql in [
+        // ORDER BY a projected output column ([STL-264]).
+        let ordered = bind(
             "SELECT name FROM users JOIN orders ON users.id = orders.uid ORDER BY name",
-            "SELECT name FROM users JOIN orders ON users.id = orders.uid LIMIT 1",
-            "SELECT DISTINCT name FROM users JOIN orders ON users.id = orders.uid",
-        ] {
-            assert!(
-                matches!(bind(sql, &catalog), Err(SelectError::UnsupportedJoin(_))),
-                "expected UnsupportedJoin for: {sql}"
-            );
-        }
-        // `SELECT ALL` is the explicit default (not DISTINCT), so a join with it
-        // binds — it must not be mistaken for a shaping clause over the join.
+            &catalog,
+        )
+        .expect("bind ORDER BY over a join");
+        assert_eq!(ordered.order_by.len(), 1);
+        // LIMIT / OFFSET.
+        let limited = bind(
+            "SELECT name FROM users JOIN orders ON users.id = orders.uid LIMIT 1 OFFSET 2",
+            &catalog,
+        )
+        .expect("bind LIMIT over a join");
+        assert_eq!((limited.limit, limited.offset), (Some(1), 2));
+        // DISTINCT.
         assert!(
             bind(
+                "SELECT DISTINCT name FROM users JOIN orders ON users.id = orders.uid",
+                &catalog,
+            )
+            .expect("bind DISTINCT over a join")
+            .distinct
+        );
+        // `SELECT ALL` is the explicit default (not DISTINCT) and still binds.
+        assert!(
+            !bind(
                 "SELECT ALL name FROM users JOIN orders ON users.id = orders.uid",
                 &catalog,
             )
-            .is_ok(),
-            "explicit ALL is not a shaping clause and must bind over a JOIN"
+            .expect("bind")
+            .distinct
         );
     }
 
@@ -5690,16 +6121,9 @@ mod tests {
         assert_eq!(join.right.table, "orders");
         // users.id is index 0; orders.uid is index 1.
         assert_eq!((join.left_key, join.right_key), (0, 1));
-        // `SELECT *` over an inner join = the left's columns then the right's.
-        assert_eq!(
-            join.output,
-            vec![
-                JoinColumnRef::Left(0),
-                JoinColumnRef::Left(1),
-                JoinColumnRef::Right(0),
-                JoinColumnRef::Right(1),
-            ]
-        );
+        // `SELECT *` over an inner join = every addressable index in order (the
+        // left's columns then the right's).
+        assert_eq!(join.output, vec![0, 1, 2, 3]);
         assert_eq!(
             join.columns,
             vec![
@@ -5736,11 +6160,7 @@ mod tests {
         for kw in ["SEMI JOIN", "ANTI JOIN"] {
             let sql = format!("SELECT * FROM users {kw} orders ON users.id = orders.uid");
             let join = join_of(&sql, &catalog);
-            assert_eq!(
-                join.output,
-                vec![JoinColumnRef::Left(0), JoinColumnRef::Left(1)],
-                "{kw}"
-            );
+            assert_eq!(join.output, vec![0, 1], "{kw}");
             assert_eq!(
                 join.columns,
                 vec![
@@ -5770,10 +6190,7 @@ mod tests {
             "SELECT u.name, o.oid FROM users u JOIN orders o ON u.id = o.uid",
             &catalog,
         );
-        assert_eq!(
-            aliased.output,
-            vec![JoinColumnRef::Left(1), JoinColumnRef::Right(0)]
-        );
+        assert_eq!(aliased.output, vec![1, 2]);
         assert_eq!(
             aliased.columns,
             vec![
@@ -5787,10 +6204,7 @@ mod tests {
             &catalog,
         );
         assert_eq!((bare.left_key, bare.right_key), (0, 1));
-        assert_eq!(
-            bare.output,
-            vec![JoinColumnRef::Left(1), JoinColumnRef::Right(0)]
-        );
+        assert_eq!(bare.output, vec![1, 2]);
     }
 
     #[test]
@@ -5821,19 +6235,30 @@ mod tests {
     }
 
     #[test]
-    fn clauses_over_a_join_are_rejected_not_dropped() {
+    fn where_and_aggregate_bind_over_a_join() {
         let catalog = catalog_with_join_tables();
-        for sql in [
-            // A WHERE over the join (a follow-up) — dropping it would over-return.
-            "SELECT users.id FROM users JOIN orders ON users.id = orders.uid WHERE users.id = 1",
-            // An aggregate over the join.
+        // A WHERE over the join's output ([STL-264]) — a qualified column resolves.
+        let filtered = bind(
+            "SELECT users.id FROM users JOIN orders ON users.id = orders.uid WHERE orders.uid = 1",
+            &catalog,
+        )
+        .expect("bind WHERE over a join");
+        assert!(filtered.filter.is_some());
+        // An ungrouped aggregate over the whole join.
+        let agg = bind(
             "SELECT COUNT(*) FROM users JOIN orders ON users.id = orders.uid",
-        ] {
-            assert!(
-                matches!(bind(sql, &catalog), Err(SelectError::UnsupportedJoin(_))),
-                "expected UnsupportedJoin for: {sql}"
-            );
-        }
+            &catalog,
+        )
+        .expect("bind aggregate over a join");
+        assert!(agg.aggregate.is_some());
+        // GROUP BY a qualified column, with a passed-through grouping column.
+        let grouped = bind(
+            "SELECT users.name, COUNT(*) FROM users JOIN orders ON users.id = orders.uid \
+             GROUP BY users.name",
+            &catalog,
+        )
+        .expect("bind GROUP BY over a join");
+        assert!(grouped.aggregate.is_some());
     }
 
     /// Two valid-time tables sharing a key column, plus a system-only one — the
@@ -6037,7 +6462,7 @@ mod tests {
         ));
         // Qualifying resolves it.
         let join = join_of("SELECT a.id FROM a JOIN b ON a.id = b.id", &catalog);
-        assert_eq!(join.output, vec![JoinColumnRef::Left(0)]);
+        assert_eq!(join.output, vec![0]);
     }
 
     // ---- STL-234: uncorrelated subquery binding ----
