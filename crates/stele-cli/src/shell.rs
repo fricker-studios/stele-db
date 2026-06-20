@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use anyhow::Context as _;
 
-use crate::client::{Client, Reply, ResultSet, ServerError};
+use crate::client::{Client, PasswordRequired, Reply, ResultSet, ServerError};
 // The admin / control-plane tier ([STL-200]) rides the published `stele-client`
 // SDK ([STL-255]) — the dogfood for the crate the CLI, Studio, and the operator
 // share. Aliased so the SDK's `Client` does not shadow the pg-wire `Client` above.
@@ -36,6 +36,9 @@ pub struct Opts {
     pub port: u16,
     pub user: String,
     pub dbname: String,
+    /// SCRAM password from `PGPASSWORD` ([STL-296]), or `None` to prompt (when
+    /// interactive) if the server requests authentication.
+    pub password: Option<String>,
     pub tls: crate::client::TlsOpts,
     pub border: BorderStyle,
     pub row_nums: bool,
@@ -98,13 +101,12 @@ enum Flow {
 /// Fails on connect failure or a mid-session transport failure; SQL errors are
 /// reported inline and do not end the session.
 pub fn run(opts: &Opts) -> anyhow::Result<()> {
-    let mut client = Client::connect(&opts.host, opts.port, &opts.user, &opts.dbname, &opts.tls)
-        .context("starting stele shell")?;
     let stdin = std::io::stdin();
     // Interactive needs BOTH ends on a terminal: with stdout redirected
     // (`stele shell > file`, `| tee`) the rustyline editor would spray
     // prompts and refresh escapes into the capture, so that runs scripted.
     let interactive = stdin.is_terminal() && std::io::stdout().is_terminal();
+    let mut client = connect(opts, interactive).context("starting stele shell")?;
     let mut session = Session {
         theme: if opts.no_color {
             Theme::plain()
@@ -150,6 +152,85 @@ pub fn run(opts: &Opts) -> anyhow::Result<()> {
     } else {
         repl_scripted(&mut client, &mut session, stdin.lock(), std::io::stdout())
     }
+}
+
+/// Connect to the engine, prompting for a password if the server requests SCRAM
+/// authentication and none was supplied ([STL-296]).
+///
+/// The `PGPASSWORD` value (if any) is tried first. A trust-auth server ignores it
+/// and this returns on the first attempt. Against a `scram` server with no
+/// password available, the first attempt fails with [`PasswordRequired`]; an
+/// **interactive** session then prompts (no echo) and reconnects once on a fresh
+/// socket — libpq's behavior. A scripted session has no terminal to prompt at, so
+/// the error propagates with its "set PGPASSWORD" guidance. A wrong password (or
+/// any other failure) is not retried — it surfaces as-is.
+fn connect(opts: &Opts, interactive: bool) -> anyhow::Result<Client> {
+    let attempt = |password: Option<&str>| {
+        Client::connect(
+            &opts.host,
+            opts.port,
+            &opts.user,
+            &opts.dbname,
+            &opts.tls,
+            password,
+        )
+    };
+    match attempt(opts.password.as_deref()) {
+        Ok(client) => Ok(client),
+        Err(e) if interactive && e.downcast_ref::<PasswordRequired>().is_some() => {
+            let password = prompt_password(&opts.user)?;
+            attempt(Some(&password))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Prompt for a password on the controlling terminal without echoing it
+/// ([STL-296]) — used when the server requests SCRAM and no `PGPASSWORD` was set.
+///
+/// On unix the terminal's `ECHO` flag is cleared for the duration of the read
+/// (the prompt and the trailing newline go to stderr, so stdout stays clean and
+/// the keystrokes never appear), then restored unconditionally — the same
+/// true-no-echo recipe psql and sudo use. The prompt is unavailable off unix,
+/// where `PGPASSWORD` is the path.
+#[cfg(unix)]
+fn prompt_password(user: &str) -> anyhow::Result<String> {
+    use std::io::{BufRead as _, Write as _};
+    use std::os::fd::AsFd as _;
+
+    use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
+
+    let stdin = std::io::stdin();
+    let fd = stdin.as_fd();
+    let original = tcgetattr(fd).context("reading terminal mode for the password prompt")?;
+    let mut quiet = original.clone();
+    quiet.local_flags.remove(LocalFlags::ECHO);
+
+    // Disable echo *before* writing the prompt: otherwise a user who starts
+    // typing while the prompt is still flushing could have those first
+    // characters echoed before ECHO is cleared.
+    tcsetattr(fd, SetArg::TCSANOW, &quiet).context("disabling terminal echo")?;
+    eprint!("Password for user {user}: ");
+    std::io::stderr().flush().ok();
+
+    let mut password = String::new();
+    let read = stdin.lock().read_line(&mut password);
+    // Restore echo no matter how the read went, then end the un-echoed line.
+    let _ = tcsetattr(fd, SetArg::TCSANOW, &original);
+    eprintln!();
+    read.context("reading password")?;
+
+    // Drop the trailing newline the user's Enter left in the buffer.
+    password.truncate(password.trim_end_matches(['\r', '\n']).len());
+    Ok(password)
+}
+
+#[cfg(not(unix))]
+fn prompt_password(_user: &str) -> anyhow::Result<String> {
+    anyhow::bail!(
+        "no password supplied: set the PGPASSWORD environment variable \
+         (the interactive password prompt is unix-only)"
+    )
 }
 
 /// The scripted (piped) loop: plain lines in, plain results out.

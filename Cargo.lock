@@ -2726,6 +2726,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
+ "getrandom 0.4.2",
  "nix",
  "rcgen",
  "rustls",
@@ -2736,6 +2737,7 @@ dependencies = [
  "stele-engine",
  "stele-pgwire",
  "stele-server",
+ "stele-sql",
  "stele-storage",
  "tokio",
  "unicode-width",

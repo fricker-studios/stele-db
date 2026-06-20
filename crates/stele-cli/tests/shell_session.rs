@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
-use stele_pgwire::{Server, ServerTls, SharedSession, TlsMode, TlsSettings};
+use stele_pgwire::{AuthMode, Server, ServerTls, SharedSession, TlsMode, TlsSettings};
 use stele_server::admin::http::AdminHttp;
 use stele_server::admin::{AdminAuth, AdminService};
 use stele_server::ops::{OpsServer, OpsState};
@@ -98,7 +98,21 @@ async fn spawn_tls_server(test: &str) -> (SocketAddr, PathBuf) {
 /// taking CI with it: the child is killed (and the test fails) rather than
 /// waiting forever.
 fn run_shell(addr: SocketAddr, script: &str, extra: &[&str]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_stele"))
+    run_shell_env(addr, script, extra, &[])
+}
+
+/// Like [`run_shell`], but with environment overrides: each `(key, value)` sets
+/// the variable, or **removes** it when `value` is `None` — so an ambient
+/// `PGPASSWORD` in the developer's shell cannot leak into a test. Drives the
+/// SCRAM auth sessions (STL-296).
+fn run_shell_env(
+    addr: SocketAddr,
+    script: &str,
+    extra: &[&str],
+    env: &[(&str, Option<&str>)],
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_stele"));
+    command
         .args([
             "shell",
             "--host",
@@ -109,9 +123,18 @@ fn run_shell(addr: SocketAddr, script: &str, extra: &[&str]) -> Output {
         .args(extra)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn stele shell");
+        .stderr(Stdio::piped());
+    for (key, value) in env {
+        match value {
+            Some(v) => {
+                command.env(key, v);
+            }
+            None => {
+                command.env_remove(key);
+            }
+        }
+    }
+    let mut child = command.spawn().expect("spawn stele shell");
     child
         .stdin
         .take()
@@ -764,6 +787,118 @@ async fn mtls_server_rejects_a_session_without_a_client_certificate() {
         "a session without a client certificate must fail against an mTLS server"
     );
     assert!(!stderr.is_empty(), "the failure must be reported on stderr");
+}
+
+// ---------------------------------------------------------------------------
+// SCRAM-SHA-256 authentication (STL-296)
+// ---------------------------------------------------------------------------
+
+/// Boot a SCRAM-required engine + pgwire server with `users` pre-created through
+/// the real SQL path (mirrors the pgwire `scram_wire` test). Returns the address.
+async fn spawn_scram_server(users: &[(&str, &str)]) -> SocketAddr {
+    let mut engine = SessionEngine::open(MemDisk::new(), SystemClock);
+    for (name, password) in users {
+        let sql = format!("CREATE USER {name} PASSWORD '{password}'");
+        let stmt = &stele_sql::parse(&sql).expect("parse CREATE USER")[0];
+        engine.execute(stmt).expect("create user");
+    }
+    let session: SharedSession = Arc::new(Mutex::new(engine));
+    let bound = Server::new("127.0.0.1:0".parse().unwrap(), session)
+        .with_auth(AuthMode::Scram)
+        .bind()
+        .await
+        .expect("bind ephemeral port");
+    let addr = bound.local_addr();
+    tokio::spawn(bound.serve());
+    addr
+}
+
+/// STL-296 Definition of Done: against a `auth = "scram"` server the shell
+/// authenticates with the password from `PGPASSWORD` and round-trips a query.
+/// This is the env-var path — no terminal needed — so it runs scripted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scram_session_authenticates_via_pgpassword() {
+    let addr = spawn_scram_server(&[("alice", "s3cret")]).await;
+    let script = "SELECT 1;\n\\q\n";
+    let output = tokio::task::spawn_blocking(move || {
+        run_shell_env(
+            addr,
+            script,
+            &["--user", "alice"],
+            &[("PGPASSWORD", Some("s3cret"))],
+        )
+    })
+    .await
+    .expect("shell task");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "a clean SCRAM session wrote to stderr: {stderr}"
+    );
+    // The query ran past authentication.
+    assert!(stdout.contains("(1 row)"), "{stdout}");
+}
+
+/// A wrong password is refused: the server fails the proof (SQLSTATE `28P01`) and
+/// the shell exits non-zero with an authentication error — not a panic or a hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scram_session_rejects_a_wrong_password() {
+    let addr = spawn_scram_server(&[("alice", "s3cret")]).await;
+    let output = tokio::task::spawn_blocking(move || {
+        run_shell_env(
+            addr,
+            "SELECT 1;\n\\q\n",
+            &["--user", "alice"],
+            &[("PGPASSWORD", Some("wrong-password"))],
+        )
+    })
+    .await
+    .expect("shell task");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a wrong password must fail the shell"
+    );
+    assert!(
+        stderr.contains("authentication failed"),
+        "expected an auth-failed error, got: {stderr}"
+    );
+}
+
+/// With no password and no terminal to prompt at (scripted), a SCRAM server's
+/// request is a clear, actionable failure that points at `PGPASSWORD` — not a
+/// silent hang or an empty-password attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scram_session_without_a_password_points_at_pgpassword() {
+    let addr = spawn_scram_server(&[("alice", "s3cret")]).await;
+    let output = tokio::task::spawn_blocking(move || {
+        run_shell_env(
+            addr,
+            "SELECT 1;\n\\q\n",
+            &["--user", "alice"],
+            // Remove any ambient PGPASSWORD so the no-password path is exercised.
+            &[("PGPASSWORD", None)],
+        )
+    })
+    .await
+    .expect("shell task");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a SCRAM server with no password supplied must fail"
+    );
+    assert!(
+        stderr.contains("PGPASSWORD"),
+        "expected guidance to set PGPASSWORD, got: {stderr}"
+    );
 }
 
 /// `\segments` (STL-301) renders the columnar segment + zone-map table end to

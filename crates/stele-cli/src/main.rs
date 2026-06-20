@@ -163,11 +163,17 @@ fn main() -> anyhow::Result<()> {
                     .ok()
                     .filter(|t| !t.is_empty())
             });
+            // The SCRAM password (STL-296) comes from PGPASSWORD — like libpq, and
+            // like the admin token above — never a CLI flag, so it stays out of
+            // `ps` output and shell history. An empty value counts as unset, so the
+            // shell prompts (interactively) rather than sending an empty password.
+            let password = std::env::var("PGPASSWORD").ok().filter(|p| !p.is_empty());
             shell::run(&shell::Opts {
                 host: s.host,
                 port: s.port,
                 user: s.user,
                 dbname: s.dbname,
+                password,
                 tls: client::TlsOpts {
                     mode: s.tls,
                     ca: s.tls_ca,

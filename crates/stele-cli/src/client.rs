@@ -2,10 +2,18 @@
 //! `stele shell` REPL ([STL-185]).
 //!
 //! Speaks the **simple-query** slice of the protocol the Stele front end
-//! serves: a `StartupMessage` (the server runs trust auth — `AuthenticationOk`
-//! arrives unconditionally), then `Query` round-trips collecting
+//! serves: a `StartupMessage`, then `Query` round-trips collecting
 //! `RowDescription` / `DataRow` / `CommandComplete` until `ReadyForQuery`.
 //! Everything arrives in text format, so cells decode straight to strings.
+//!
+//! **Authentication** ([STL-296]): against a trust-auth server `AuthenticationOk`
+//! arrives unconditionally; against one running `auth = "scram"` the server sends
+//! `AuthenticationSASL` and the client runs the SASL SCRAM-SHA-256 exchange —
+//! sending its proof and, crucially, **verifying the server's signature** before
+//! trusting the connection (mutual authentication). The proof math is the
+//! vendored, RFC-vectored [`stele_common::scram`]; this file owns only the wire
+//! framing, the mirror of the server's `stele_pgwire::scram` (a dev-only
+//! dependency here, so it is named, not linked).
 //!
 //! Deliberately hand-rolled rather than pulling in a client crate:
 //! `tokio-postgres` is pinned as a **dev-only** dependency workspace-wide (a
@@ -31,6 +39,7 @@
 //! [STL-185]: https://allegromusic.atlassian.net/browse/STL-185
 //! [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
 //! [STL-292]: https://allegromusic.atlassian.net/browse/STL-292
+//! [STL-296]: https://allegromusic.atlassian.net/browse/STL-296
 
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
@@ -44,6 +53,7 @@ use rustls_pki_types::pem::PemObject as _;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
 use stele_common::query_stats::QueryStats;
+use stele_common::scram::{self, ScramVerifier};
 
 use crate::render::Column;
 
@@ -59,6 +69,25 @@ const MSG_NOTICE_RESPONSE: u8 = b'N';
 // Frontend message types this client emits.
 const MSG_QUERY: u8 = b'Q';
 const MSG_TERMINATE: u8 = b'X';
+// SASLInitialResponse / SASLResponse share the password-message type byte.
+const MSG_SASL: u8 = b'p';
+
+// SASL authentication request codes — the Int32 inside an `Authentication`
+// ('R') message ([STL-296], RFC 5802 / RFC 7677).
+const AUTH_OK: i32 = 0;
+const AUTH_SASL: i32 = 10;
+const AUTH_SASL_CONTINUE: i32 = 11;
+const AUTH_SASL_FINAL: i32 = 12;
+
+/// The one SASL mechanism the shell speaks — plain `SCRAM-SHA-256`, no channel
+/// binding. A server that advertises `SCRAM-SHA-256-PLUS` over TLS still offers
+/// plain `SCRAM-SHA-256` alongside it, and the `n` gs2 flag the client sends ("I
+/// do not support channel binding") is accepted on either transport (STL-297).
+const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
+
+/// Raw client-nonce entropy — 18 bytes → 24 base64 characters, matching the
+/// server's nonce width and Postgres.
+const CLIENT_NONCE_RAW_LEN: usize = 18;
 
 /// pg-wire protocol version 3.0, as the `StartupMessage` carries it.
 const PROTOCOL_VERSION: i32 = 196_608;
@@ -100,6 +129,31 @@ impl std::fmt::Display for ServerError {
         write!(f, "{}: {}", self.severity, self.message)
     }
 }
+
+/// [`Client::connect`] failed because the server requested SCRAM authentication
+/// but no password was supplied ([STL-296]). The caller distinguishes this from
+/// every other failure (via [`anyhow::Error::downcast_ref`]) so it can prompt
+/// for a password and retry — an interactive shell — or report that `PGPASSWORD`
+/// must be set — a scripted one.
+///
+/// [STL-296]: https://allegromusic.atlassian.net/browse/STL-296
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasswordRequired {
+    /// The user the server is asking us to authenticate.
+    pub user: String,
+}
+
+impl std::fmt::Display for PasswordRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "server requires a password for user {:?}; set the PGPASSWORD environment variable",
+            self.user
+        )
+    }
+}
+
+impl std::error::Error for PasswordRequired {}
 
 /// What one statement inside a simple-query round-trip produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,9 +220,16 @@ pub struct Client {
 impl Client {
     /// Connect — negotiating TLS per `tls` — and complete the startup handshake.
     ///
+    /// `password` is used only if the server requests SCRAM authentication
+    /// (`auth = "scram"`); a trust-auth server ignores it. When the server
+    /// requests SCRAM and `password` is `None`, this fails with
+    /// [`PasswordRequired`] so the caller can prompt and retry.
+    ///
     /// # Errors
-    /// Fails if the TCP connect or TLS negotiation fails, the server demands
-    /// authentication (trust-only for now), or startup itself returns an
+    /// Fails if the TCP connect or TLS negotiation fails, the server requests an
+    /// authentication method the shell does not speak (or SCRAM without a
+    /// password), the SCRAM exchange fails (wrong password / unknown user /
+    /// unverifiable server signature), or startup itself returns an
     /// `ErrorResponse`.
     pub fn connect(
         host: &str,
@@ -176,6 +237,7 @@ impl Client {
         user: &str,
         database: &str,
         tls: &TlsOpts,
+        password: Option<&str>,
     ) -> anyhow::Result<Self> {
         let stream = TcpStream::connect((host, port))
             .with_context(|| format!("connecting to {host}:{port}"))?;
@@ -195,11 +257,25 @@ impl Client {
             match kind {
                 MSG_AUTHENTICATION => {
                     let code = be_i32(&payload, 0).context("malformed Authentication")?;
-                    if code != 0 {
-                        bail!(
-                            "server requested authentication (type {code}); \
-                             stele shell only supports trust auth for now"
-                        );
+                    match code {
+                        // AuthenticationOk — trust auth, or the tail of a SCRAM
+                        // exchange that already succeeded.
+                        AUTH_OK => {}
+                        AUTH_SASL => {
+                            let Some(password) = password else {
+                                return Err(PasswordRequired {
+                                    user: user.to_owned(),
+                                }
+                                .into());
+                            };
+                            let mechanisms =
+                                payload.get(4..).context("AuthenticationSASL truncated")?;
+                            client.scram_authenticate(password, mechanisms)?;
+                        }
+                        other => bail!(
+                            "server requested authentication (type {other}); \
+                             stele shell supports trust and SCRAM-SHA-256 only"
+                        ),
                     }
                 }
                 MSG_READY_FOR_QUERY => {
@@ -327,6 +403,104 @@ impl Client {
             .read_exact(&mut payload)
             .context("reading message payload")?;
         Ok((head[0], payload))
+    }
+
+    /// Run the client half of the SASL SCRAM-SHA-256 exchange ([STL-296], RFC
+    /// 5802 / RFC 7677): pick the mechanism, send the client-first message,
+    /// prove possession of `password` against the server's challenge, and —
+    /// before trusting the connection — **verify the server's signature**, which
+    /// proves the peer holds this user's stored verifier (mutual authentication,
+    /// so an impostor that could not is rejected here even though our proof would
+    /// have satisfied it). `mechanisms` is the NUL-separated mechanism list from
+    /// `AuthenticationSASL`. Returns once `AuthenticationSASLFinal` verifies; the
+    /// trailing `AuthenticationOk` is consumed by the [`connect`](Self::connect)
+    /// loop.
+    fn scram_authenticate(&mut self, password: &str, mechanisms: &[u8]) -> anyhow::Result<()> {
+        if !mechanism_offered(mechanisms, SCRAM_SHA_256) {
+            bail!(
+                "server offered SASL mechanisms {:?}, but stele shell only speaks {SCRAM_SHA_256}",
+                String::from_utf8_lossy(mechanisms)
+            );
+        }
+
+        // --- C: SASLInitialResponse — mechanism + client-first-message.
+        let client_nonce = client_nonce()?;
+        let client_first = scram_client_first(&client_nonce);
+        let mut initial = Vec::with_capacity(SCRAM_SHA_256.len() + 5 + client_first.len());
+        initial.extend_from_slice(SCRAM_SHA_256.as_bytes());
+        initial.push(0);
+        initial.extend_from_slice(
+            &i32::try_from(client_first.len())
+                .context("client-first message too large")?
+                .to_be_bytes(),
+        );
+        initial.extend_from_slice(client_first.as_bytes());
+        self.send(MSG_SASL, &initial)?;
+
+        // --- S: AuthenticationSASLContinue — server-first-message.
+        let server_first = self.read_sasl_message(AUTH_SASL_CONTINUE)?;
+        let (server_nonce, salt, iterations) = parse_server_first(&server_first)?;
+        // The server nonce must *extend* the one we sent, or it is not answering
+        // this exchange (a stale or spoofed challenge).
+        if !server_nonce.starts_with(&client_nonce) || server_nonce.len() == client_nonce.len() {
+            bail!("SCRAM server nonce did not extend the client nonce");
+        }
+
+        // --- C: SASLResponse — the client-final-message and the server signature
+        // to expect back, both folded over the same AuthMessage.
+        let (client_final, expected_sig) = scram_client_final(
+            password,
+            &client_nonce,
+            &server_first,
+            &server_nonce,
+            &salt,
+            iterations,
+        );
+        self.send(MSG_SASL, client_final.as_bytes())?;
+
+        // --- S: AuthenticationSASLFinal — verify the server signature (`v=`).
+        let server_final = self.read_sasl_message(AUTH_SASL_FINAL)?;
+        let server_sig_b64 = server_final
+            .strip_prefix("v=")
+            .context("malformed SCRAM server-final message (no v=)")?;
+        let server_sig =
+            scram::b64_decode(server_sig_b64).context("server signature is not valid base64")?;
+        if !scram::ct_eq(&server_sig, &expected_sig) {
+            bail!(
+                "SCRAM server signature did not verify — the server does not hold this user's \
+                 password (possible impostor or man-in-the-middle)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Read one backend message mid-SASL and return the SCRAM text of an
+    /// `Authentication` ('R') message whose code is `expected`. An
+    /// `ErrorResponse` (wrong password / unknown user — SQLSTATE `28P01`) is
+    /// surfaced as the connection error it is; any other message is a protocol
+    /// violation.
+    fn read_sasl_message(&mut self, expected: i32) -> anyhow::Result<String> {
+        let (kind, payload) = self.read_message()?;
+        match kind {
+            MSG_AUTHENTICATION => {
+                let code = be_i32(&payload, 0).context("malformed Authentication during SASL")?;
+                if code != expected {
+                    bail!(
+                        "unexpected authentication code {code} during SASL (expected {expected})"
+                    );
+                }
+                let body = payload
+                    .get(4..)
+                    .context("Authentication message truncated")?;
+                String::from_utf8(body.to_vec())
+                    .context("SCRAM message from server is not valid UTF-8")
+            }
+            MSG_ERROR_RESPONSE => Err(anyhow::anyhow!(
+                "authentication failed — {}",
+                parse_error(&payload)
+            )),
+            other => bail!("unexpected message type {other:#04x} during SASL authentication"),
+        }
     }
 }
 
@@ -521,6 +695,81 @@ fn startup_payload(user: &str, database: &str) -> Vec<u8> {
     }
     body.push(0);
     body
+}
+
+// ---------------------------------------------------------------------------
+// SASL SCRAM-SHA-256 helpers (STL-296)
+// ---------------------------------------------------------------------------
+
+/// Whether the NUL-separated SASL mechanism list offers `wanted`.
+fn mechanism_offered(list: &[u8], wanted: &str) -> bool {
+    list.split(|&b| b == 0).any(|m| m == wanted.as_bytes())
+}
+
+/// The SCRAM client-first message — `n,,n=,r=<nonce>`: the `n,,` gs2 header (no
+/// channel binding, no authzid), an empty `n=` username (the identity is the
+/// startup `user`, as Postgres does), and the client nonce.
+fn scram_client_first(client_nonce: &str) -> String {
+    format!("n,,n=,r={client_nonce}")
+}
+
+/// Build the client-final message and the `ServerSignature` to expect back,
+/// both folded over the one AuthMessage (RFC 5802 §3:
+/// `client-first-bare "," server-first "," client-final-without-proof`). Pure —
+/// the I/O method is a thin frame around it, so the proof/signature math is unit-
+/// tested against `stele_common::scram`'s server side without a socket.
+fn scram_client_final(
+    password: &str,
+    client_nonce: &str,
+    server_first: &str,
+    server_nonce: &str,
+    salt: &[u8],
+    iterations: u32,
+) -> (String, [u8; 32]) {
+    // `c=` is base64 of the gs2 header the client-first message sent (`n,,` →
+    // `biws`); under plain SCRAM no cbind-data follows it.
+    let channel_binding = scram::b64_encode(b"n,,");
+    let without_proof = format!("c={channel_binding},r={server_nonce}");
+    let auth_message = format!("n=,r={client_nonce},{server_first},{without_proof}");
+    let proof = scram::client_proof(password, salt, iterations, auth_message.as_bytes());
+    let client_final = format!("{without_proof},p={}", scram::b64_encode(&proof));
+    let server_sig =
+        ScramVerifier::derive(password, salt, iterations).server_signature(auth_message.as_bytes());
+    (client_final, server_sig)
+}
+
+/// A fresh client nonce: 18 bytes of OS entropy as base64 (24 characters), all
+/// within the printable RFC 5802 nonce alphabet. Fresh per exchange, so each
+/// proof signs a distinct combined nonce — a captured exchange replays nothing.
+fn client_nonce() -> anyhow::Result<String> {
+    let mut raw = [0_u8; CLIENT_NONCE_RAW_LEN];
+    getrandom::fill(&mut raw).context("generating a SCRAM client nonce")?;
+    Ok(scram::b64_encode(&raw))
+}
+
+/// Pull `r=` (combined nonce), `s=` (base64 salt), and `i=` (iteration count)
+/// out of a SCRAM server-first-message. `Err` on any missing or malformed
+/// attribute — server input is parsed strictly, not repaired.
+fn parse_server_first(msg: &str) -> anyhow::Result<(String, Vec<u8>, u32)> {
+    let mut nonce = None;
+    let mut salt = None;
+    let mut iterations = None;
+    for attr in msg.split(',') {
+        if let Some(v) = attr.strip_prefix("r=") {
+            nonce = Some(v.to_owned());
+        } else if let Some(v) = attr.strip_prefix("s=") {
+            salt = scram::b64_decode(v);
+        } else if let Some(v) = attr.strip_prefix("i=") {
+            // Reject `i=0` (and any non-numeric count): SCRAM/PBKDF2 requires at
+            // least one iteration — 0 would silently degrade `scram::hi` to a
+            // single round and deviates from RFC 5802.
+            iterations = v.parse::<u32>().ok().filter(|&i| i > 0);
+        }
+    }
+    match (nonce, salt, iterations) {
+        (Some(nonce), Some(salt), Some(iterations)) => Ok((nonce, salt, iterations)),
+        _ => bail!("malformed SCRAM server-first message: {msg:?}"),
+    }
 }
 
 /// Columns (name + type OID) out of a `RowDescription` payload.
@@ -754,5 +1003,132 @@ mod tests {
             &p[4..],
             b"user\0alice\0database\0stele\0stele_stats\0on\0\0"
         );
+    }
+
+    // -- SASL SCRAM-SHA-256 (STL-296) --------------------------------------
+
+    #[test]
+    fn mechanism_offered_finds_plain_scram_among_the_list() {
+        // Plain server, and a TLS server that lists PLUS first — both offer it.
+        assert!(mechanism_offered(b"SCRAM-SHA-256\0\0", "SCRAM-SHA-256"));
+        assert!(mechanism_offered(
+            b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0",
+            "SCRAM-SHA-256"
+        ));
+        // A list that names only PLUS does not offer plain SCRAM (substring of a
+        // longer name must not match).
+        assert!(!mechanism_offered(
+            b"SCRAM-SHA-256-PLUS\0\0",
+            "SCRAM-SHA-256"
+        ));
+    }
+
+    #[test]
+    fn parse_server_first_extracts_nonce_salt_and_iterations() {
+        let salt = b"\x00\x11\x22\x33\x44\x55\x66\x77";
+        let msg = format!("r=abcdEFGH,s={},i=4096", scram::b64_encode(salt));
+        let (nonce, parsed_salt, iterations) = parse_server_first(&msg).expect("parses");
+        assert_eq!(nonce, "abcdEFGH");
+        assert_eq!(parsed_salt, salt);
+        assert_eq!(iterations, 4096);
+    }
+
+    #[test]
+    fn parse_server_first_rejects_malformed_messages() {
+        // Missing salt, missing iterations, a non-numeric count, a zero count
+        // (PBKDF2 needs >= 1), and bad base64.
+        for msg in [
+            "r=abc,i=4096",
+            "r=abc,s=AAAA",
+            "r=abc,s=AAAA,i=lots",
+            "r=abc,s=AAAA,i=0",
+            "r=abc,s=!!,i=1",
+        ] {
+            assert!(parse_server_first(msg).is_err(), "{msg:?}");
+        }
+    }
+
+    #[test]
+    fn client_first_is_the_no_channel_binding_gs2_shape() {
+        assert_eq!(scram_client_first("noncenonce"), "n,,n=,r=noncenonce");
+    }
+
+    /// The proof the client builds verifies against a verifier derived from the
+    /// same password, and the server signature the client expects is exactly the
+    /// one that verifier emits — the interop contract the server enforces, run
+    /// here with the server played in-process by `stele_common::scram`.
+    #[test]
+    fn client_final_interoperates_with_the_server_verifier() {
+        let password = "pencil";
+        let salt = b"0123456789abcdef";
+        let iterations = scram::DEFAULT_ITERATIONS;
+        let client_nonce = "clientnonce";
+        // The server appends its own entropy to the client nonce.
+        let server_nonce = "clientnonceSERVERENTROPY";
+        let server_first = format!(
+            "r={server_nonce},s={},i={iterations}",
+            scram::b64_encode(salt)
+        );
+
+        let (client_final, expected_sig) = scram_client_final(
+            password,
+            client_nonce,
+            &server_first,
+            server_nonce,
+            salt,
+            iterations,
+        );
+
+        // The server re-derives AuthMessage from the bytes it received (the
+        // client-first-bare it saw, its own server-first, and the without-proof
+        // prefix of client-final) and checks the proof.
+        let (without_proof, proof_b64) = client_final
+            .rsplit_once(",p=")
+            .expect("client-final has a proof");
+        let proof: [u8; 32] = scram::b64_decode(proof_b64)
+            .expect("proof base64")
+            .try_into()
+            .expect("32-byte proof");
+        let auth_message = format!("n=,r={client_nonce},{server_first},{without_proof}");
+        let verifier = ScramVerifier::derive(password, salt, iterations);
+        assert!(
+            verifier.verify_client_proof(auth_message.as_bytes(), &proof),
+            "the client proof must satisfy the server verifier"
+        );
+        assert_eq!(
+            expected_sig,
+            verifier.server_signature(auth_message.as_bytes()),
+            "the client must expect exactly the server's signature"
+        );
+    }
+
+    #[test]
+    fn a_wrong_password_proof_is_refused_by_the_verifier() {
+        let salt = b"0123456789abcdef";
+        let iterations = scram::DEFAULT_ITERATIONS;
+        let server_nonce = "cnSERVER";
+        let server_first = format!(
+            "r={server_nonce},s={},i={iterations}",
+            scram::b64_encode(salt)
+        );
+        // The client proves with the wrong password against a verifier for the
+        // right one — the proof must not verify.
+        let (client_final, _) =
+            scram_client_final("wrong", "cn", &server_first, server_nonce, salt, iterations);
+        let (without_proof, proof_b64) = client_final.rsplit_once(",p=").unwrap();
+        let proof: [u8; 32] = scram::b64_decode(proof_b64).unwrap().try_into().unwrap();
+        let auth_message = format!("n=,r=cn,{server_first},{without_proof}");
+        let verifier = ScramVerifier::derive("right", salt, iterations);
+        assert!(!verifier.verify_client_proof(auth_message.as_bytes(), &proof));
+    }
+
+    #[test]
+    fn password_required_error_names_the_user_and_points_at_pgpassword() {
+        let err = PasswordRequired {
+            user: "alice".to_owned(),
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("alice"), "{rendered}");
+        assert!(rendered.contains("PGPASSWORD"), "{rendered}");
     }
 }

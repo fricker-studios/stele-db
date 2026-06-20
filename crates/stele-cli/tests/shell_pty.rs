@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
-use stele_pgwire::{Server, SharedSession};
+use stele_pgwire::{AuthMode, Server, SharedSession};
 use stele_storage::backend::MemDisk;
 
 /// Boot a fresh engine + pgwire server on an ephemeral port (mirrors the helper
@@ -34,6 +34,26 @@ async fn spawn_server() -> SocketAddr {
     let session: SharedSession =
         Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
     let bound = Server::new("127.0.0.1:0".parse().unwrap(), session)
+        .bind()
+        .await
+        .expect("bind ephemeral port");
+    let addr = bound.local_addr();
+    tokio::spawn(bound.serve());
+    addr
+}
+
+/// Boot a SCRAM-required server with `users` pre-created via the real SQL path
+/// (STL-296), for the interactive password-prompt test.
+async fn spawn_scram_server(users: &[(&str, &str)]) -> SocketAddr {
+    let mut engine = SessionEngine::open(MemDisk::new(), SystemClock);
+    for (name, password) in users {
+        let sql = format!("CREATE USER {name} PASSWORD '{password}'");
+        let stmt = &stele_sql::parse(&sql).expect("parse CREATE USER")[0];
+        engine.execute(stmt).expect("create user");
+    }
+    let session: SharedSession = Arc::new(Mutex::new(engine));
+    let bound = Server::new("127.0.0.1:0".parse().unwrap(), session)
+        .with_auth(AuthMode::Scram)
         .bind()
         .await
         .expect("bind ephemeral port");
@@ -57,6 +77,12 @@ struct PtyShell {
 impl PtyShell {
     /// Spawn the real `stele` binary attached to a fresh PTY, talking to `addr`.
     fn spawn(addr: SocketAddr) -> Self {
+        Self::spawn_args(addr, &[])
+    }
+
+    /// Spawn the real `stele` binary on a fresh PTY with `extra` shell flags
+    /// (e.g. `--user`), talking to `addr`.
+    fn spawn_args(addr: SocketAddr, extra: &[&str]) -> Self {
         let winsize = nix::pty::Winsize {
             ws_row: 24,
             ws_col: 80,
@@ -89,11 +115,15 @@ impl PtyShell {
                 "--port",
                 &addr.port().to_string(),
             ])
+            .args(extra)
             .stdin(stdin)
             .stdout(stdout)
             .stderr(stderr)
             .env("HOME", &home)
             .env("TERM", "xterm")
+            // Strip any ambient PGPASSWORD so the no-password path — and thus the
+            // interactive prompt under test — is exercised deterministically.
+            .env_remove("PGPASSWORD")
             .spawn()
             .expect("spawn interactive shell");
         // Drop the test's own handle to the slave so the master observes EOF once
@@ -293,6 +323,61 @@ async fn completion_still_learns_a_table_created_this_session() {
             "⇥ did not complete `zqxw` to the table created this session — the \
              post-DDL completion refresh regressed:\n{}",
             shell.snapshot().get(mark..).unwrap_or_default()
+        );
+    })
+    .await
+    .expect("pty shell task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interactive_shell_prompts_for_a_scram_password_without_echoing_it() {
+    // STL-296: against a `auth = "scram"` server with no PGPASSWORD, an
+    // interactive shell prompts for the password, reads it with echo off, and
+    // connects. The only way to exercise the no-echo terminal prompt is over a
+    // real PTY (the scripted tests cover the PGPASSWORD path).
+    let addr = spawn_scram_server(&[("alice", "hunter2pw")]).await;
+
+    tokio::task::spawn_blocking(move || {
+        let mut shell = PtyShell::spawn_args(addr, &["--user", "alice"]);
+
+        // The shell asks for a password before it can connect (so no banner yet).
+        assert!(
+            shell.wait_until(Duration::from_secs(15), Duration::from_secs(12), |o| o
+                .contains("Password for user alice")),
+            "shell never prompted for a SCRAM password:\n{}",
+            shell.snapshot()
+        );
+
+        // Type the password + Enter. With echo disabled the slave never reflects
+        // these bytes, so they must not appear in the captured stream.
+        shell.send("hunter2pw\n");
+
+        // It authenticates and the REPL comes up…
+        assert!(
+            shell.wait_until(Duration::from_secs(15), Duration::from_secs(12), |o| o
+                .contains("Connected to database")),
+            "shell did not connect after the password was entered:\n{}",
+            shell.snapshot()
+        );
+
+        // …and a query runs past authentication. Look only at output after this
+        // point for the result trailer (`(1 row …)`), a render artifact never echoed.
+        let mark = shell.snapshot().len();
+        shell.send("SELECT 1;\n");
+        assert!(
+            shell.wait_until(Duration::from_secs(15), Duration::from_secs(12), |o| o
+                .get(mark..)
+                .is_some_and(|tail| tail.contains("(1 row"))),
+            "shell did not answer a query after SCRAM auth:\n{}",
+            shell.snapshot().get(mark..).unwrap_or_default()
+        );
+
+        // The password was never echoed to the terminal — not at the prompt, not
+        // anywhere in the session.
+        let snap = shell.snapshot();
+        assert!(
+            !snap.contains("hunter2pw"),
+            "the password was echoed to the terminal:\n{snap}"
         );
     })
     .await
