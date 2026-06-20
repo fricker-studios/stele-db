@@ -372,6 +372,18 @@ fn lift_session_command(
         }));
     }
 
+    // `SET TRANSACTION …` is standard-SQL transaction control ([STL-248]), not a
+    // session variable. Leave it for `sqlparser`'s `SET` grammar so it reaches the
+    // pgwire `txn_control` handler — which refuses it outside a `BEGIN` block and
+    // selects the isolation level inside one. Swallowing it here as a tolerated
+    // no-op (it is not a `stele.*` axis) silently drops both behaviors. Only the
+    // `SET TRANSACTION` form is handed back; `SET SESSION CHARACTERISTICS AS
+    // TRANSACTION …` (a session default Stele does not model) and every other
+    // variable stay tolerated below.
+    if rest.first().is_some_and(|t| word_is(t, "TRANSACTION")) {
+        return Ok(None);
+    }
+
     // `SET <variable> { = | TO } <value…>`.
     let Some(dimension) = stele_time_axis(rest) else {
         // A `SET` of any non-Stele variable is tolerated as a no-op (the value is
@@ -987,6 +999,39 @@ mod session_tests {
                 assert_eq!(name, "extra_float_digits");
                 assert!(is_reset);
             }
+            other => panic!("expected Tolerated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_transaction_is_not_lifted_as_a_session_command() {
+        // `SET TRANSACTION …` is standard-SQL transaction control ([STL-248]), not a
+        // session variable: it must reach `sqlparser`'s `SET` grammar (and the
+        // pgwire `txn_control` handler), never be swallowed here as a tolerated
+        // no-op (which left it neither refused outside a block nor applied inside).
+        for sql in [
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        ] {
+            match parse_one_ok(sql).body {
+                StatementBody::Sql(SqlStatement::Set(sqlparser::ast::Set::SetTransaction {
+                    session,
+                    ..
+                })) => assert!(
+                    !session,
+                    "{sql}: the per-transaction form, not a session default"
+                ),
+                other => {
+                    panic!("expected a SET TRANSACTION SQL statement, got {other:?} for {sql}")
+                }
+            }
+        }
+
+        // `SET SESSION CHARACTERISTICS AS TRANSACTION …` sets a session default
+        // Stele does not model, so it stays a tolerated no-op — a driver preamble
+        // using it must not error.
+        match session("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED") {
+            SessionCommand::Tolerated { is_reset, .. } => assert!(!is_reset),
             other => panic!("expected Tolerated, got {other:?}"),
         }
     }
