@@ -215,15 +215,16 @@ impl ServerTls {
 /// certificate: the DER-encoded certificate hashed with the digest of its
 /// signature algorithm.
 ///
-/// RFC 5929 §4.1 selects the hash from the certificate's `signatureAlgorithm`,
-/// raising MD5/SHA-1 to SHA-256. We compute the binding only when that digest is
-/// SHA-256 — every modern RSA-SHA-256 or ECDSA-SHA-256 certificate, including the
-/// `rcgen` certs we mint for the self-signed fallback and the tests — and return
-/// `None` for a stronger or unrecognized signature hash. Returning `None` means
-/// PLUS is *not advertised* (plain SCRAM still runs over TLS) rather than
-/// advertised with a hash a SHA-384/512-cert client would compute differently,
-/// which would break the `c=` check; broadening to those digests is a filed
-/// follow-up.
+/// RFC 5929 §4.1 derives the hash from the certificate's `signatureAlgorithm`
+/// (using SHA-256 where the signature itself uses MD5 or SHA-1). This
+/// implementation binds **only** the SHA-256 case directly: a leaf signed
+/// RSA-SHA-256 or ECDSA-SHA-256 — every modern certificate, including the
+/// `rcgen` certs we mint for the self-signed fallback and the tests. Every other
+/// signature hash returns `None`: the stronger SHA-384/512 (a filed follow-up,
+/// STL-330) and the legacy MD5/SHA-1 (deprecated, not worth a binding path).
+/// `None` means PLUS is *not advertised* (plain SCRAM still runs over TLS),
+/// which is the safe degrade — better than advertising PLUS and computing a hash
+/// the client would compute differently, which would fail the `c=` check.
 fn endpoint_channel_binding(cert_der: &[u8]) -> Option<Vec<u8>> {
     let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
     let sig_alg = &cert.signature_algorithm.algorithm;
