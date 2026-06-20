@@ -1005,7 +1005,13 @@ impl<C: Clock, D: Disk + Clone> Engine<C, D> {
         } else {
             SegmentWriter::create(&self.disk, &name)?
         }
-        .with_max_row_group_rows(self.flush_row_group_rows);
+        .with_max_row_group_rows(self.flush_row_group_rows)
+        // Compaction is the natural place to encode across versions ([STL-250]):
+        // it has already re-clustered a key's chain to be physically local, so a
+        // repeated `business_key` / `principal` / `payload` collapses to one
+        // dictionary entry per row-group instead of being re-stored per version.
+        // History stays cheap to keep without rewriting any input (invariant 1).
+        .with_dictionary(true);
         for v in &versions {
             writer.push(v.clone())?;
         }
