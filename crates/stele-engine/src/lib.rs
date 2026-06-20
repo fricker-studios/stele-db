@@ -7299,19 +7299,30 @@ fn run_aggregate(
     // Postgres pipeline position (aggregate → HAVING → DISTINCT → ORDER BY →
     // LIMIT). The predicate evaluates over the grouped batch directly — the
     // grouping columns then the aggregate columns, the flat layout `lower_having`
-    // addresses (no decode: these are already typed [`Vector`]s) — and a group is
-    // kept iff it is TRUE, dropping FALSE *and* NULL, the same rule the row Filter
-    // applies. An aggregate the HAVING references but the SELECT list omits was
-    // appended to `agg.aggregates`, so it is present here though absent from
-    // `output`.
+    // addresses (already typed [`Vector`]s, no decode) — and a group is kept iff
+    // it is TRUE, dropping FALSE *and* NULL, the same rule the row Filter applies.
+    // An aggregate the HAVING references but the SELECT list omits was appended to
+    // `agg.aggregates`, so it is present here though absent from `output`.
     if let Some(having) = &agg.having {
-        let grouped: Vec<Vector> = out
-            .groups
-            .iter()
-            .chain(out.aggregates.iter())
-            .cloned()
+        let group_count = out.groups.len();
+        let predicate = lower_having(having, group_count);
+        // Materialize only the columns the predicate references (a supported
+        // HAVING touches one or two), leaving the rest empty placeholders the
+        // evaluator never reads — the `run_aggregate` / `rows_passing_filter`
+        // discipline, so a wide / high-cardinality group-by does not clone every
+        // grouped vector.
+        let mut grouped: Vec<Vector> = (0..group_count + out.aggregates.len())
+            .map(|_| Vector::Bool(Vec::new()))
             .collect();
-        let predicate = lower_having(having, out.groups.len());
+        let mut referenced = BTreeSet::new();
+        collect_expr_columns(&predicate, &mut referenced);
+        for position in referenced {
+            if position < group_count {
+                grouped[position] = out.groups[position].clone();
+            } else if let Some(vector) = out.aggregates.get(position - group_count) {
+                grouped[position] = vector.clone();
+            }
+        }
         let mask = match eval_expr(&predicate, &grouped, out.num_groups)
             .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?
         {
