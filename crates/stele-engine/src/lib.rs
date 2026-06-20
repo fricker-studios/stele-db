@@ -3252,12 +3252,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
 
         // A two-table `JOIN` ([STL-172]) takes a wholly different path: it scans
         // both sides and combines their rows, rather than projecting one table's
-        // reconstructed rows. The single-table fields below are unused for it. A
-        // join inside a transaction reads the committed snapshot only — the
+        // reconstructed rows. The single-table fields below are unused for it. Every
+        // input reads at the one statement-level `(sys, valid)` pin ([STL-243],
+        // docs/16 §8) — a `FOR … AS OF` on either axis threads through here. A join
+        // inside a transaction still reads the committed snapshot only — the
         // read-your-own-writes overlay ([STL-203]) is single-table and not yet
         // threaded through the join path.
         if let Some(join) = &bound.join {
-            return self.run_join(join, bound.snapshot, scope);
+            return self.run_join(join, bound.snapshot, bound.valid_snapshot, scope);
         }
 
         // A `FROM` that names a materialized relation — a CTE reference or a derived
@@ -3916,9 +3918,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         &self,
         side: &BoundJoinSide,
         snapshot: SystemTimeMicros,
+        valid_snapshot: Option<SystemTimeMicros>,
         scope: &CteScope,
     ) -> Result<Vec<Column>, EngineError> {
         if side.schema_id == SchemaId(0) {
+            // A materialized relation (CTE / derived table) is system-only, so it
+            // carries no valid axis; the binder rejects a `FOR VALID_TIME AS OF`
+            // pin over a join with such a side ([STL-243]), so `valid_snapshot` is
+            // always `None` on this branch.
             let relation = scope
                 .get(side.table.as_str())
                 .ok_or_else(|| EngineError::UnknownTable(side.table.clone()))?;
@@ -3929,12 +3936,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .get(&side.table)
             .ok_or_else(|| EngineError::UnknownTable(side.table.clone()))?;
         let value_count = side.columns.len().saturating_sub(1);
-        Self::scan_all_columns(state, snapshot, value_count)
+        Self::scan_all_columns(state, snapshot, valid_snapshot, value_count)
     }
 
     /// Run a bound two-table `JOIN` ([STL-172]).
     ///
-    /// Both sides are scanned at `snapshot` into the executor's columnar shape
+    /// Both sides are scanned at the same statement `(snapshot, valid_snapshot)` pin
+    /// ([STL-243]) into the executor's columnar shape
     /// ([`scan_all_columns`](Self::scan_all_columns)) — shared [`Cells`](stele_exec::Cells)
     /// buffers, not a row-major copy; the join key column of each side is decoded
     /// into a typed [`Vector`] and handed to the [`hash_join`] operator, which
@@ -3949,13 +3957,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         &self,
         join: &BoundJoin,
         snapshot: SystemTimeMicros,
+        valid_snapshot: Option<SystemTimeMicros>,
         scope: &CteScope,
     ) -> Result<StatementOutcome, EngineError> {
-        // Each side is a base table scanned at `snapshot`, or a materialized CTE /
-        // derived table read from the scope ([STL-242]) — both yield the same
-        // shared-`Cells` columnar shape the join consumes.
-        let left_cols = self.join_side_columns(&join.left, snapshot, scope)?;
-        let right_cols = self.join_side_columns(&join.right, snapshot, scope)?;
+        // Each side is a base table scanned at the one statement `(sys, valid)` pin
+        // ([STL-243]), or a materialized CTE / derived table read from the scope
+        // ([STL-242]) — both yield the same shared-`Cells` columnar shape the join
+        // consumes. Both sides resolve at the *same* pins, so the result is a
+        // consistent snapshot across every input (docs/16 §8).
+        let left_cols = self.join_side_columns(&join.left, snapshot, valid_snapshot, scope)?;
+        let right_cols = self.join_side_columns(&join.right, snapshot, valid_snapshot, scope)?;
         let left_rows = left_cols[0].len();
         let right_rows = right_cols[0].len();
 
@@ -4135,6 +4146,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// row-major copy `scan_all_rows` makes) is what lets the join's output assembly
     /// name matched rows by index instead of cloning each surviving cell.
     ///
+    /// When `valid_snapshot` is set the valid axis is pinned too ([STL-243]), the
+    /// same [`SnapshotScan::valid_as_of`] the single-table read uses ([STL-164]) —
+    /// so a bitemporal join reads every input at one consistent `(sys, valid)` point
+    /// (docs/16 §8). The binder guarantees a valid pin reaches only a valid-time
+    /// side.
+    ///
     /// A single emitted batch is handed back as-is — its buffers shared, nothing
     /// copied. Multiple batches are concatenated per column into one buffer, since
     /// the hash join must address every row of a side at once; that per-cell copy is
@@ -4143,10 +4160,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     fn scan_all_columns(
         state: &TableState<C, D>,
         snapshot: SystemTimeMicros,
+        valid_snapshot: Option<SystemTimeMicros>,
         value_count: usize,
     ) -> Result<Vec<Column>, EngineError> {
         let readers = state.engine.open_segment_readers()?;
-        let scan = SnapshotScan::new(
+        let mut scan = SnapshotScan::new(
             state.engine.delta(),
             state.engine.index(),
             &readers,
@@ -4154,6 +4172,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         )
         .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
         .valid_time(state.valid_time);
+        // Pin the valid axis when the statement carries a `FOR VALID_TIME AS OF v`
+        // ([STL-243]) — the same half-open `from <= v < to` filter the single-table
+        // read applies ([STL-164]); without one a valid-time side is read unfiltered.
+        if let Some(v) = valid_snapshot {
+            scan = scan.valid_as_of(ValidTimeMicros(v.0));
+        }
         let source = ScanSource::new(scan, DEFAULT_BATCH_SIZE);
         let mut exploded = ExplodePayload::new(source, value_count);
 
@@ -8677,6 +8701,102 @@ mod tests {
         // window `[10, 20)` excludes 25. (Only the system axis differs from the 100
         // case — so the system instant is load-bearing.)
         assert_eq!(balance(c1.0, 25), None);
+    }
+
+    #[test]
+    fn both_axes_as_of_join_reads_every_input_at_one_consistent_snapshot() {
+        // The join sibling of the single-table test above ([STL-243]): a join under
+        // `FOR SYSTEM_TIME AS OF s FOR VALID_TIME AS OF v` must read *every* input
+        // at the one pinned `(sys, valid)` point (docs/16 §8). `acct` carries two
+        // both-axes versions of key 1; `tier` carries one wide-window version; the
+        // join on the key proves the engine honored both axes on the `acct` side and
+        // the same snapshot on the `tier` side — and that an `acct` row absent at
+        // `(s, v)` drops the joined pair (inner join), not just its own columns.
+        let mut engine = session();
+        for ddl in [
+            "CREATE TABLE acct (k INT PRIMARY KEY, bal INT, vf TIMESTAMP, vt TIMESTAMP) \
+             WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+            "CREATE TABLE tier (k INT PRIMARY KEY, lvl INT, vf TIMESTAMP, vt TIMESTAMP) \
+             WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+        ] {
+            engine
+                .execute(&parse_one(ddl))
+                .expect("create valid-time table");
+        }
+
+        let who = || Principal::new(b"demo".to_vec());
+        let key = || business_key(&ScalarValue::Int4(1));
+        let payload = |value: i32, from: i64, to: i64| {
+            row_codec::encode_payload(&[
+                cell(Some(ScalarValue::Int4(value))),
+                cell(Some(ScalarValue::Timestamp(from))),
+                cell(Some(ScalarValue::Timestamp(to))),
+            ])
+        };
+        let iv = |from: i64, to: i64| {
+            ValidInterval::new(ValidTimeMicros(from), ValidTimeMicros(to)).expect("well-formed")
+        };
+
+        // tier key 1: lvl 5 valid [0, 40), committed first so it is system-live at
+        // both acct snapshots below. acct key 1: bal 100 valid [10, 20) (c1), then
+        // bal 250 valid [20, 30) (c2, superseding v1 on the system axis).
+        engine
+            .insert(
+                "tier",
+                key(),
+                Some(iv(0, 40)),
+                payload(5, 0, 40),
+                0,
+                TxnId(1),
+                who(),
+            )
+            .expect("insert tier");
+        let c1 = engine
+            .insert(
+                "acct",
+                key(),
+                Some(iv(10, 20)),
+                payload(100, 10, 20),
+                0,
+                TxnId(2),
+                who(),
+            )
+            .expect("insert acct v1")
+            .commit;
+        let c2 = engine
+            .update(
+                "acct",
+                key(),
+                Some(iv(20, 30)),
+                payload(250, 20, 30),
+                0,
+                TxnId(3),
+                who(),
+            )
+            .expect("update acct v2")
+            .commit;
+
+        let mut join = |sys: i64, valid: i64| -> Vec<Vec<Option<Vec<u8>>>> {
+            let sql = format!(
+                "SELECT acct.bal, tier.lvl FROM acct JOIN tier ON acct.k = tier.k \
+                 FOR SYSTEM_TIME AS OF {sys} FOR VALID_TIME AS OF {valid}"
+            );
+            let StatementOutcome::Rows(r) = engine.execute(&parse_one(&sql)).expect("select")
+            else {
+                panic!("SELECT must return rows");
+            };
+            sorted(r.rows)
+        };
+
+        // Pre-update system + acct's first window → bal 100 joined to tier lvl 5.
+        assert_eq!(join(c1.0, 15), vec![vec![i4(100), i4(5)]]);
+        // Post-update system + second window → bal 250 joined to the same tier row.
+        assert_eq!(join(c2.0, 25), vec![vec![i4(250), i4(5)]]);
+        // Post-update system + first window → acct has no live version (v1 superseded,
+        // v2's [20, 30) excludes 15), so the inner join drops the pair entirely.
+        assert!(join(c2.0, 15).is_empty());
+        // Pre-update system + second window → acct's [10, 20) excludes 25 → empty.
+        assert!(join(c1.0, 25).is_empty());
     }
 
     #[test]
