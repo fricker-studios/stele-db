@@ -293,6 +293,11 @@ pub struct Metrics {
     pub scan_row_groups_scanned: Counter,
     /// Row groups skipped by per-row-group zone-map pruning.
     pub scan_row_groups_pruned_zone: Counter,
+    /// Row groups skipped by the per-row-group valid-time interval summary — a
+    /// `FOR VALID_TIME AS OF v` read whose `v` falls in a single row-group's
+    /// coverage gap, the row-group-granular refinement of
+    /// `scan_segments_pruned_valid` (STL-316).
+    pub scan_row_groups_pruned_valid: Counter,
 }
 
 impl Metrics {
@@ -500,6 +505,12 @@ impl Metrics {
             "stele_scan_row_groups_pruned_zone_total",
             "Row groups skipped by per-row-group zone-map pruning.",
             self.scan_row_groups_pruned_zone.get(),
+        );
+        counter(
+            &mut out,
+            "stele_scan_row_groups_pruned_valid_total",
+            "Row groups skipped by the per-row-group valid-time interval summary (STL-316).",
+            self.scan_row_groups_pruned_valid.get(),
         );
 
         out

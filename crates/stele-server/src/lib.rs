@@ -14,6 +14,7 @@
 
 pub mod admin;
 pub mod ops;
+pub mod tls;
 
 use std::fmt;
 use std::future::{self, Future};
@@ -37,6 +38,7 @@ use tokio::signal;
 use tracing::{info, warn};
 
 use crate::admin::{AdminAuth, AdminService};
+use crate::tls::AcceptorSource;
 
 /// Default data directory for non-dev runs that omit `[server] data_dir`
 /// (matches the `stele.toml` example in [05 — configuration](../../../docs/05-dev-environment.md#configuration)).
@@ -389,6 +391,82 @@ fn auth_posture(cfg: &Config) -> Option<String> {
     })
 }
 
+/// The TLS material the daemon serves on, shared by pg-wire and the admin gRPC +
+/// ops HTTP transports ([STL-311]). Two shapes, both turned into per-connection
+/// acceptors the listeners read live:
+///
+/// * [`Reloading`](Self::Reloading) — operator `[tls]` material behind a
+///   [`TlsReloader`], so SIGHUP rotation ([STL-293]) reaches every surface.
+/// * [`SelfSigned`](Self::SelfSigned) — the ephemeral certificate the
+///   secure-defaults fallback mints ([STL-304]); fixed for the process lifetime.
+///
+/// [STL-311]: https://allegromusic.atlassian.net/browse/STL-311
+enum TlsContext {
+    /// Hot-reloadable operator-supplied material from `[tls]`.
+    Reloading(TlsReloader),
+    /// An ephemeral self-signed certificate (encryption without authentication).
+    SelfSigned(ServerTls),
+}
+
+impl TlsContext {
+    /// An [`AcceptorSource`] over this context for the admin gRPC + ops HTTP
+    /// accept loops. Reading the acceptor per connection means the reloading
+    /// variant picks up rotations there too.
+    fn acceptor_source(&self) -> AcceptorSource {
+        match self {
+            Self::Reloading(reloader) => AcceptorSource::reloading(reloader),
+            Self::SelfSigned(server_tls) => AcceptorSource::fixed(server_tls),
+        }
+    }
+}
+
+/// Resolve the single TLS context for the whole daemon ([STL-311]).
+///
+/// * `[tls]` configured → load it behind a [`TlsReloader`] (errors as a boot
+///   failure with context, never a per-connection surprise).
+/// * No `[tls]`, non-dev, and a secret-carrying surface bound beyond loopback →
+///   mint an ephemeral self-signed certificate ([STL-304]). pg-wire's own
+///   decision is `pg_posture`; [`admin_wants_self_signed`] adds the admin surface.
+/// * Otherwise → `None` (plaintext: dev, or a loopback-only bind).
+fn resolve_tls(cfg: &Config, pg_posture: &PlaintextPosture) -> anyhow::Result<Option<TlsContext>> {
+    if let Some(settings) = &cfg.tls {
+        let reloader =
+            TlsReloader::load(settings.clone()).context("loading [tls] certificate material")?;
+        info!(
+            mode = ?settings.mode,
+            mtls = settings.client_ca.is_some(),
+            "TLS enabled on pg-wire and the admin surface"
+        );
+        return Ok(Some(TlsContext::Reloading(reloader)));
+    }
+    let pg_wants = matches!(pg_posture, PlaintextPosture::GenerateSelfSigned(_));
+    if !cfg.dev && (pg_wants || admin_wants_self_signed(cfg)) {
+        let server_tls = ServerTls::self_signed(TlsMode::Required)
+            .context("generating a self-signed TLS certificate")?;
+        info!(
+            mode = ?TlsMode::Required,
+            "self-signed TLS enabled on pg-wire and the admin surface (ephemeral certificate)"
+        );
+        return Ok(Some(TlsContext::SelfSigned(server_tls)));
+    }
+    Ok(None)
+}
+
+/// Whether the admin surface, were it left plaintext, would carry bearer tokens
+/// beyond loopback — the trigger for extending the self-signed fallback to it
+/// ([STL-311]). Only when the API is actually enabled (a token configured): a
+/// disabled surface carries no secret, and the ops listener then serves only
+/// metrics/probes, which need no certificate. Caller guarantees non-dev + no
+/// `[tls]`.
+fn admin_wants_self_signed(cfg: &Config) -> bool {
+    if cfg.admin_tokens.tokens().is_empty() {
+        return false;
+    }
+    // Tokens ride the admin gRPC listener and the `/v1alpha1` gateway on the ops
+    // listener; either one bound off-loopback exposes them.
+    !cfg.admin_grpc_listen.ip().is_loopback() || !cfg.metrics_listen.ip().is_loopback()
+}
+
 /// Boot the engine.
 ///
 /// Install tracing, apply the plaintext posture, start the ops HTTP listener,
@@ -407,24 +485,29 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // configuration means for plaintext. A non-dev server without [tls] on a
     // non-loopback bind mints an ephemeral self-signed certificate (encryption
     // without authentication) rather than refusing to boot or silently serving
-    // unencrypted traffic. Decided — and the certificate generated — before any
-    // port is bound, so a generation failure holds nothing open.
-    let mut self_signed_tls = None;
-    match plaintext_posture(&cfg) {
+    // unencrypted traffic.
+    let pg_posture = plaintext_posture(&cfg);
+    match &pg_posture {
         PlaintextPosture::Proceed => {}
-        PlaintextPosture::Warn(msg) => warn!("{msg}"),
-        PlaintextPosture::GenerateSelfSigned(msg) => {
-            warn!("{msg}");
-            self_signed_tls = Some(
-                ServerTls::self_signed(TlsMode::Required)
-                    .context("generating a self-signed TLS certificate")?,
-            );
-        }
+        PlaintextPosture::Warn(msg) | PlaintextPosture::GenerateSelfSigned(msg) => warn!("{msg}"),
     }
     // The authentication half of the same posture (STL-252).
     if let Some(msg) = auth_posture(&cfg) {
         warn!("{msg}");
     }
+
+    // One TLS context, shared by pg-wire and the admin gRPC + ops HTTP transports
+    // (STL-311): the admin surface reuses the pg-wire `[tls]` certificate material
+    // — and the self-signed fallback — rather than a second cert config. Resolved
+    // (and any ephemeral certificate minted) before any port is bound, so a
+    // generation failure holds nothing open.
+    let tls = resolve_tls(&cfg, &pg_posture)?;
+    if let Some(TlsContext::Reloading(reloader)) = &tls {
+        // Arm SIGHUP hot-reload once; pg-wire, the admin gRPC listener, and the ops
+        // listener all read the same reloader cell, so one rotation reaches them all.
+        spawn_tls_sighup_reload(reloader.clone());
+    }
+    let admin_tls = tls.as_ref().map(TlsContext::acceptor_source);
 
     // Stand the ops HTTP listener up FIRST, before recovery runs (STL-253):
     // `/healthz` answers as soon as the process holds the port, while
@@ -432,6 +515,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // key their traffic-routing on.
     let ops_state = Arc::new(ops::OpsState::new());
     let ops = ops::OpsServer::new(cfg.metrics_listen, Arc::clone(&ops_state))
+        // Encrypt the ops listener (metrics, probes, and the /v1alpha1 admin
+        // gateway) with the shared material when TLS is active (STL-311).
+        .with_tls(admin_tls.clone())
         .bind()
         .await
         .with_context(|| format!("binding ops listener on {}", cfg.metrics_listen))?;
@@ -496,35 +582,19 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     if cfg.auth == AuthMode::Scram {
         info!("SCRAM-SHA-256 authentication enabled on pg-wire");
     }
-    if let Some(settings) = &cfg.tls {
-        // Load certificate material now so a bad path / non-PEM file is a boot
-        // error with context, not a per-connection surprise. Behind a reloader so a
-        // SIGHUP can rotate the cert/key without a restart (STL-293): the listener
-        // reads the live acceptor per connection.
-        let reloader =
-            TlsReloader::load(settings.clone()).context("loading [tls] certificate material")?;
-        info!(
-            mode = ?settings.mode,
-            mtls = settings.client_ca.is_some(),
-            "TLS enabled on pg-wire"
-        );
-        pg = pg.with_tls_reloader(&reloader);
-        // Arm the hot-reload trigger. On a platform without SIGHUP this only logs
-        // that rotation needs a restart — the listener still serves the boot cert.
-        spawn_tls_sighup_reload(reloader);
-    } else if let Some(tls) = self_signed_tls {
-        // The non-dev no-TLS non-loopback fallback (STL-304): warned above.
-        info!(
-            mode = ?TlsMode::Required,
-            "self-signed TLS enabled on pg-wire (ephemeral certificate)"
-        );
-        pg = pg.with_tls(tls);
+    // Apply the shared TLS context to pg-wire. The reloader path keeps SIGHUP
+    // hot-reload (STL-293); the self-signed path is the STL-304 fallback.
+    match &tls {
+        Some(TlsContext::Reloading(reloader)) => pg = pg.with_tls_reloader(reloader),
+        Some(TlsContext::SelfSigned(server_tls)) => pg = pg.with_tls(server_tls.clone()),
+        None => {}
     }
 
     // The admin / control-plane gRPC listener ([STL-254], ADR-0016) — bound only
     // when a token is configured (secure default: no token ⇒ no surface). The
-    // HTTP/JSON gateway is already live on the ops listener regardless.
-    let admin_grpc = build_admin_grpc(&cfg, admin_core, admin_auth).await?;
+    // HTTP/JSON gateway is already live on the ops listener regardless. Both reuse
+    // `admin_tls`, the same material pg-wire just took (STL-311).
+    let admin_grpc = build_admin_grpc(&cfg, admin_core, admin_auth, admin_tls).await?;
 
     tokio::select! {
         res = pg.run() => res.context("pgwire listener exited")?,
@@ -603,12 +673,14 @@ fn spawn_tls_sighup_reload(_reloader: TlsReloader) {
 ///
 /// Bound and serving when a token is configured; an always-pending no-op
 /// otherwise — the secure default: no token, no surface. The listener is bound
-/// eagerly so a port clash is a boot error, and a non-loopback bind warns that
-/// tokens travel plaintext until admin-surface TLS lands.
+/// eagerly so a port clash is a boot error. When `tls` is set the listener
+/// serves over TLS ([STL-311], sharing the pg-wire material); otherwise a
+/// non-loopback bind warns that tokens travel plaintext.
 async fn build_admin_grpc(
     cfg: &Config,
     admin_core: AdminService<SystemClock, AnyDisk>,
     admin_auth: Arc<AdminAuth>,
+    tls: Option<AcceptorSource>,
 ) -> anyhow::Result<Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>> {
     if !admin_auth.is_enabled() {
         info!(
@@ -620,18 +692,29 @@ async fn build_admin_grpc(
         .await
         .with_context(|| format!("binding admin gRPC listener on {}", cfg.admin_grpc_listen))?;
     let addr = listener.local_addr().unwrap_or(cfg.admin_grpc_listen);
-    info!(%addr, "admin API enabled: gRPC (v1alpha1) + HTTP/JSON gateway on the ops listener");
-    if !addr.ip().is_loopback() {
-        warn!(
-            "admin API tokens travel in PLAINTEXT on {addr}: bind loopback or front with a \
-             TLS proxy until admin-surface TLS lands"
+    if tls.is_some() {
+        info!(
+            %addr,
+            "admin API enabled: gRPC (v1alpha1, TLS) + HTTP/JSON gateway on the ops listener"
         );
+    } else {
+        info!(%addr, "admin API enabled: gRPC (v1alpha1) + HTTP/JSON gateway on the ops listener");
+        if !addr.ip().is_loopback() {
+            // Reachable only in dev: a non-dev off-loopback admin bind without
+            // [tls] takes the self-signed fallback above (admin_wants_self_signed).
+            warn!(
+                "admin API tokens travel in PLAINTEXT on {addr}: bind loopback or configure \
+                 [tls] to encrypt the admin surface"
+            );
+        }
     }
     let service = admin::grpc::GrpcAdmin::new(admin_core, admin_auth);
     Ok(Box::pin(async move {
-        admin::grpc::serve(listener, service)
-            .await
-            .context("admin gRPC listener exited")
+        match tls {
+            Some(tls) => admin::grpc::serve_tls(listener, service, tls).await,
+            None => admin::grpc::serve(listener, service).await,
+        }
+        .context("admin gRPC listener exited")
     }))
 }
 
@@ -1086,6 +1169,85 @@ mod tests {
             panic!("expected warning, got {posture:?}");
         };
         assert!(msg.contains("optional"), "{msg}");
+    }
+
+    // --- admin-surface TLS posture (STL-311) --------------------------------
+
+    /// A non-dev config with the admin API enabled, binding pg-wire / gRPC / ops
+    /// at the given addresses and no `[tls]` section.
+    fn non_dev_admin(pg: &str, grpc: &str, metrics: &str) -> Config {
+        let mut cfg = Config::from_toml_str("").unwrap();
+        cfg.listen = pg.parse().unwrap();
+        cfg.admin_grpc_listen = grpc.parse().unwrap();
+        cfg.metrics_listen = metrics.parse().unwrap();
+        cfg.admin_tokens = AdminTokens(vec!["secret".to_owned()]);
+        cfg
+    }
+
+    #[test]
+    fn admin_wants_self_signed_only_when_enabled_and_off_loopback() {
+        // Disabled admin never wants a cert, even bound wide open.
+        let mut disabled = non_dev_admin("127.0.0.1:5454", "0.0.0.0:5455", "0.0.0.0:9090");
+        disabled.admin_tokens = AdminTokens::default();
+        assert!(!admin_wants_self_signed(&disabled));
+
+        // Enabled + both admin surfaces loopback: tokens stay local, no cert.
+        let loop_only = non_dev_admin("127.0.0.1:5454", "127.0.0.1:5455", "127.0.0.1:9090");
+        assert!(!admin_wants_self_signed(&loop_only));
+
+        // Enabled + a non-loopback gRPC bind → wants a cert.
+        let public_grpc = non_dev_admin("127.0.0.1:5454", "0.0.0.0:5455", "127.0.0.1:9090");
+        assert!(admin_wants_self_signed(&public_grpc));
+
+        // Enabled + a non-loopback ops bind (the /v1alpha1 gateway) → wants a cert.
+        let public_ops = non_dev_admin("127.0.0.1:5454", "127.0.0.1:5455", "0.0.0.0:9090");
+        assert!(admin_wants_self_signed(&public_ops));
+    }
+
+    #[test]
+    fn resolve_tls_self_signs_for_a_public_admin_on_a_loopback_pg_wire() {
+        // pg-wire loopback (would not self-sign on its own) but the admin API is
+        // exposed off-loopback: the shared context still mints an ephemeral cert
+        // so the tokens are encrypted (STL-311 extends STL-304 to the admin API).
+        let cfg = non_dev_admin("127.0.0.1:5454", "0.0.0.0:5455", "127.0.0.1:9090");
+        let posture = plaintext_posture(&cfg);
+        assert!(
+            matches!(posture, PlaintextPosture::Warn(_)),
+            "pg-wire alone only warns on loopback"
+        );
+        assert!(matches!(
+            resolve_tls(&cfg, &posture).unwrap(),
+            Some(TlsContext::SelfSigned(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_tls_self_signs_for_a_public_pg_wire() {
+        let cfg = non_dev("0.0.0.0:5454", None);
+        assert!(matches!(
+            resolve_tls(&cfg, &plaintext_posture(&cfg)).unwrap(),
+            Some(TlsContext::SelfSigned(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_tls_is_none_for_dev_and_for_a_quiet_loopback_bind() {
+        // Dev is friction-free even off-loopback.
+        let mut dev = Config::dev();
+        dev.listen = "0.0.0.0:5454".parse().unwrap();
+        assert!(
+            resolve_tls(&dev, &plaintext_posture(&dev))
+                .unwrap()
+                .is_none()
+        );
+
+        // Non-dev, loopback pg-wire, admin disabled: nothing secret leaves the box.
+        let quiet = non_dev("127.0.0.1:5454", None);
+        assert!(
+            resolve_tls(&quiet, &plaintext_posture(&quiet))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

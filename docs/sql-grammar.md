@@ -95,6 +95,60 @@ composes with a `WHERE` / aggregates / `ORDER BY` / `LIMIT` / `DISTINCT` over th
 join output (STL-264, see [Joins](#joins-stl-172-stl-264)); N-way joins (STL-323)
 and `RIGHT` / `FULL` / non-equi joins (STL-270) remain follow-ups.
 
+### `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` — temporal range scans (STL-244)
+
+```sql
+-- Every version of every row whose system interval overlaps [t1, t2)
+-- (here t1 and t2 are one hour apart, both in microseconds):
+SELECT * FROM account FOR SYSTEM_TIME FROM 1700000000000000 TO 1700003600000000;
+-- The closed form: overlap with [t1, t2] (upper bound inclusive):
+SELECT id, balance FROM account FOR SYSTEM_TIME BETWEEN 1700000000000000 AND 1700003600000000
+  WHERE id = 1;
+```
+
+Where `AS OF` reads the **one** version live at a point, a **range** read returns
+**all** versions whose system-time interval `[sys_from, sys_to)` *overlaps* the
+range — the "show me the history" query shape. Lifted off the token stream like
+`AS OF` (`sqlparser` has no grammar for it), captured as `Temporal::range`, and
+bound into `BoundSelect::system_range`.
+
+**Half-open vs closed (the boundary contract).** Both endpoints fold the same way
+an `AS OF` operand does (`now()`, `now() ± interval`, an integer-microsecond
+literal). The two spellings differ **only** on the upper bound, per the canonical
+half-open µs model ([docs/16 §2](16-bitemporal-semantics.md#2-intervals)):
+
+| Spelling | Query range | A version `[vf, vt)` is returned iff |
+|---|---|---|
+| `FROM a TO b` | `[a, b)` (half-open) | `vf < vt` and `vt > a` and `vf < b` |
+| `BETWEEN a AND b` | `[a, b]` (closed) | `vf < vt` and `vt > a` and `vf ≤ b` |
+
+A degenerate same-tick version (`vf == vt`) covers no instant and is never
+returned. `FROM a TO b` requires `a < b`; `BETWEEN a AND b` requires `a ≤ b`
+(`a == b` is the single instant `a`); an empty or reversed range is a bind error,
+mirroring the §2 reversed/zero-length rejection. The half-open vs closed `<`/`≤`
+difference is the "off-by-one on a half-open interval" bug class the §4 oracle
+(`crates/stele-engine/tests/system_range_oracle.rs`) pins against a reference
+model across the flush/seal boundary.
+
+**Output shape (the projection contract).** A range read appends the period
+endpoints **`sys_from`** and **`sys_to`** (both `TIMESTAMPTZ`) after the projected
+columns — `SELECT *` is `[user columns…, sys_from, sys_to]`, `SELECT a` is
+`[a, sys_from, sys_to]`. `sys_to` is `NULL` for a still-current (open) version.
+This is the row shape STL-199's `\history` consumes. A provenance pseudo-column
+([STL-247]) over a range read is a tracked follow-up — rejected at bind for now,
+not silently dropped.
+
+**v0.3 scope.** A range scan binds as a plain single base-table read with a
+`WHERE` predicate. Each of these is rejected at bind time (a tracked follow-up,
+never a silently-dropped clause): the **valid axis** (`FOR VALID_TIME FROM…` — the
+valid axis can carry many overlapping versions per key, a distinct resolution
+problem); combining a range with an `AS OF` point qualifier; a `JOIN`, aggregate /
+`GROUP BY`, `DISTINCT` / `ORDER BY` / `LIMIT` / `OFFSET`, subquery or
+period-predicate `WHERE`, or a CTE / derived-table source; and `FOR SYSTEM_TIME
+ALL` (the trivially-full range). A range scan reads the committed snapshot only —
+the read-your-own-writes overlay is not applied (as on the join path) — and is
+exempt from the simple-query default row cap ([below](#default-row-cap-on-the-simple-query-path-stl-306)).
+
 ### `SET stele.{system,valid}_time` — session time context (STL-246)
 
 ```sql
@@ -951,6 +1005,10 @@ Statement
     ├── as_of: Vec<AsOf>                 // FOR <axis> AS OF <expr>
     │   ├── dimension: TimeDimension { System | Valid }
     │   └── timestamp: sqlparser::ast::Expr
+    ├── range: Option<TemporalRange>     // FOR <axis> { FROM a TO b | BETWEEN a AND b }
+    │   ├── dimension: TimeDimension { System | Valid }
+    │   ├── from / to: sqlparser::ast::Expr
+    │   └── closed_upper: bool           // BETWEEN (closed) vs FROM..TO (half-open)
     └── period_predicate: Option<PeriodPredicateClause>   // PERIOD(..) <pred> PERIOD(..)
         ├── left:  PeriodExpr { from, to: sqlparser::ast::Expr }
         ├── predicate: PeriodPredicate { Contains | Overlaps | Equals | … }

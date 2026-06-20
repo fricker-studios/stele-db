@@ -42,6 +42,10 @@ scrape_configs:
     scrape_interval: 15s
     static_configs:
       - targets: ["stele-host:9090"]
+    # When [tls] is configured the whole ops listener is TLS (STL-311) — the
+    # /v1alpha1 admin gateway shares this port — so scrape over HTTPS:
+    #   scheme: https
+    #   tls_config: { ca_file: /etc/prometheus/stele-ca.pem }
 ```
 
 **The metric names are stable.** Renaming or re-labeling any series below is a
@@ -254,10 +258,18 @@ request (`401`) — a secure default, like `[tls]`/`[auth]`. Every call carries 
 token: HTTP `Authorization: Bearer <token>`, gRPC the same as `authorization`
 metadata. Tokens are **never logged**.
 
-> **Transport security.** v0 admin traffic is **plaintext** — admin-surface TLS is
-> a follow-up. Bearer tokens are only as safe as the channel, so bind the gRPC
-> listener to loopback (or front it with a TLS proxy) off-box; a non-loopback bind
-> warns at boot. Rotate by listing several tokens and removing the old one on the
+> **Transport security.** The admin surface reuses pg-wire's `[tls]` certificate
+> material (STL-311) — there is no separate admin cert config. With `[tls]`
+> configured, **both** transports serve over TLS with that one certificate: the
+> gRPC listener and the HTTPS `/v1alpha1` gateway (and, because they share the
+> port, the metrics/probe endpoints), including the optional `client_ca` mTLS and
+> SIGHUP hot-reload. Without `[tls]`, the same secure-defaults posture as pg-wire
+> applies: a non-loopback admin bind mints an **ephemeral self-signed**
+> certificate (STL-304 — encrypted but unauthenticated; replace it with a
+> CA-issued cert) rather than serving tokens in cleartext, a loopback-only bind
+> serves plaintext, and `--dev` is plaintext. Bearer tokens are only as safe as
+> the channel, so configure `[tls]` (or keep the surface on loopback) before
+> exposing it. Rotate tokens by listing several and removing the old one on the
 > next restart.
 
 ### 9.2 Endpoints
@@ -283,6 +295,11 @@ SQL wire. HTTP error mapping: `400` invalid argument, `401` missing/invalid toke
 ```bash
 # Liveness (401 without a token):
 curl -fsS -H "Authorization: Bearer $TOKEN" http://localhost:9090/v1alpha1/health
+
+# With [tls] configured the gateway is HTTPS — verify the server cert with --cacert
+# (STL-311); the path is otherwise identical:
+curl -fsS --cacert /etc/stele/ca.pem \
+  -H "Authorization: Bearer $TOKEN" https://stele-host:9090/v1alpha1/health
 
 # Trigger an online backup, then validate the directory it produced:
 curl -fsS -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \

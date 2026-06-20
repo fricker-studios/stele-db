@@ -375,6 +375,29 @@ impl ValidIntervalSummary {
         idx > 0 && point < self.intervals[idx - 1].1
     }
 
+    /// Whether some retained interval overlaps the half-open probe `[lo, hi)` —
+    /// the `overlapping [V1, V2)` stab ([STL-315]), the range sibling of the
+    /// [`covers`](Self::covers) point stab. A `false` **proves** no row in the
+    /// segment overlaps `[lo, hi)` (the superset contract), so a scan whose
+    /// per-row PERIOD predicate can only match a row that overlaps `[lo, hi)`
+    /// (`OVERLAPS` / `CONTAINS` / `EQUALS`, [STL-193]) may skip the whole segment.
+    ///
+    /// `[lo, hi)` is a well-formed half-open probe (`lo < hi`); an empty or
+    /// inverted probe overlaps nothing and returns `false`. Two half-open
+    /// intervals `[a, b)` and `[c, d)` overlap iff `a < d && c < b`.
+    pub(crate) fn overlaps(&self, lo: i64, hi: i64) -> bool {
+        if lo >= hi {
+            return false;
+        }
+        // The intervals are disjoint and sorted by `from`, and (being disjoint and
+        // non-touching) their `to` bounds are strictly increasing too. The only
+        // intervals that can reach `[lo, hi)` are those whose `from < hi` — a
+        // prefix; among that prefix the largest `to` is the last one's, so the
+        // union overlaps `[lo, hi)` iff that interval's `to` is past `lo`.
+        let idx = self.intervals.partition_point(|&(from, _)| from < hi);
+        idx > 0 && lo < self.intervals[idx - 1].1
+    }
+
     /// Whether the summary is empty — no covered point. A built summary is empty
     /// only when every pair was empty/inverted; the writer never persists one.
     pub(crate) const fn is_empty(&self) -> bool {
@@ -399,6 +422,86 @@ impl ValidIntervalSummary {
     /// writer size its buffer without a trial encode.
     pub(crate) const fn encoded_len(&self) -> usize {
         4 + self.intervals.len() * 16
+    }
+
+    /// Append a per-row-group sequence of summaries to `out` ([STL-316]): a `u32`
+    /// row-group count, then per row-group either a present summary (reusing
+    /// [`Self::encode`] — a `u32` interval count `≥ 1` then the pairs) or the
+    /// *admit-all* marker, a bare `u32` `0`.
+    ///
+    /// `0` is an unambiguous absent marker because a present summary always holds
+    /// at least one interval: [`build`](Self::build) drops empty/inverted pairs and
+    /// the writer only ever encodes a non-[`is_empty`](Self::is_empty) summary, so
+    /// [`encode`](Self::encode) never emits a count of `0`. The
+    /// per-row-group section is the finer-grained sibling of the per-segment
+    /// summary: it lets a scan skip an individual row-group whose coverage has a
+    /// gap at the pinned valid instant even when the segment as a whole cannot be
+    /// pruned ([STL-173] did the same for the system-axis zone maps).
+    pub(crate) fn encode_per_row_group(summaries: &[Option<Self>], out: &mut Vec<u8>) {
+        out.extend_from_slice(
+            &u32::try_from(summaries.len())
+                .expect("row-group count is capped well below u32::MAX")
+                .to_le_bytes(),
+        );
+        for entry in summaries {
+            match entry {
+                Some(summary) => summary.encode(out),
+                None => out.extend_from_slice(&0u32.to_le_bytes()),
+            }
+        }
+    }
+
+    /// Decode a per-row-group sequence written by [`Self::encode_per_row_group`],
+    /// returning one entry per row-group (`None` for an admit-all slot) and the
+    /// number of bytes consumed.
+    ///
+    /// `expected` is the footer's row-group count; the embedded count must equal
+    /// it, so a section that disagrees with the row-group framing is rejected
+    /// rather than silently mis-paired. Each present entry is decoded through
+    /// [`Self::decode`], inheriting its fail-closed checks (strictly
+    /// ascending/disjoint, non-empty, `from < to`) so a corrupt entry cannot make
+    /// [`covers`](Self::covers) miss a covered point and wrongly prune a
+    /// row-group.
+    ///
+    /// # Errors
+    ///
+    /// A static reason if the buffer is short, the embedded count disagrees with
+    /// `expected`, or any present entry is malformed.
+    pub(crate) fn decode_per_row_group(
+        bytes: &[u8],
+        expected: usize,
+    ) -> Result<(Vec<Option<Self>>, usize), &'static str> {
+        let count = bytes
+            .get(0..4)
+            .ok_or("missing per-row-group valid-interval count")?
+            .try_into()
+            .expect("4-byte slice");
+        let count = u32::from_le_bytes(count) as usize;
+        if count != expected {
+            return Err("per-row-group valid-interval count disagrees with row-group count");
+        }
+        let mut cursor = 4;
+        let mut out: Vec<Option<Self>> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let rest = bytes
+                .get(cursor..)
+                .ok_or("truncated per-row-group valid-interval section")?;
+            let entry_count = rest
+                .get(0..4)
+                .ok_or("missing per-row-group valid-interval entry count")?
+                .try_into()
+                .expect("4-byte slice");
+            if u32::from_le_bytes(entry_count) == 0 {
+                // Admit-all marker — this row-group carries no summary.
+                cursor += 4;
+                out.push(None);
+            } else {
+                let (summary, consumed) = Self::decode(rest)?;
+                cursor += consumed;
+                out.push(Some(summary));
+            }
+        }
+        Ok((out, cursor))
     }
 
     /// Decode a summary written by [`Self::encode`], returning it and the number
@@ -871,6 +974,88 @@ mod tests {
     }
 
     #[test]
+    fn summary_overlaps_is_half_open_and_respects_gaps() {
+        // [STL-315]: the `overlapping [lo, hi)` stab. Two disjoint windows with a
+        // gap [10, 100) between them: a probe entirely in the gap overlaps
+        // neither, a probe touching a window's exclusive end does not overlap it,
+        // and a probe straddling a boundary does.
+        let s = summary(&[(0, 10), (100, 200)], 256);
+        // A probe wholly inside the gap overlaps nothing — the prune case.
+        assert!(
+            !s.overlaps(20, 80),
+            "a probe in the coverage gap overlaps nothing"
+        );
+        assert!(
+            !s.overlaps(10, 100),
+            "a probe that exactly fills the gap (touch at both ends) overlaps nothing"
+        );
+        // Half-open touches: [0, 10) and a probe starting at 10 share no point.
+        assert!(
+            !s.overlaps(10, 50),
+            "a probe meeting the first window's exclusive end does not overlap it"
+        );
+        assert!(s.overlaps(9, 50), "one shared point (9) is an overlap");
+        // Straddling / contained probes overlap.
+        assert!(
+            s.overlaps(5, 7),
+            "a probe inside the first window overlaps it"
+        );
+        assert!(
+            s.overlaps(-5, 1),
+            "a probe straddling the first window's inclusive start overlaps"
+        );
+        assert!(
+            s.overlaps(150, 160),
+            "a probe inside the second window overlaps it"
+        );
+        assert!(
+            s.overlaps(50, 101),
+            "a probe straddling the gap into the second window overlaps"
+        );
+        // An empty / inverted probe covers no point, so it overlaps nothing.
+        assert!(!s.overlaps(50, 50), "an empty probe overlaps nothing");
+        assert!(!s.overlaps(60, 50), "an inverted probe overlaps nothing");
+    }
+
+    #[test]
+    fn summary_overlaps_handles_open_ended_and_unbounded_probes() {
+        // An open-ended window [100, +∞) overlaps any probe reaching past 100.
+        let s = summary(&[(0, 10), (100, i64::MAX)], 256);
+        assert!(
+            !s.overlaps(20, 100),
+            "a probe ending at the open window's start overlaps nothing"
+        );
+        assert!(
+            s.overlaps(20, 101),
+            "a probe reaching one point into the open window overlaps"
+        );
+        assert!(
+            s.overlaps(i64::MAX - 1, i64::MAX),
+            "the far edge of the open window overlaps"
+        );
+    }
+
+    #[test]
+    fn summary_overlaps_agrees_with_a_brute_force_reference() {
+        // Pin `overlaps` against a naïve per-interval scan across a grid of probes,
+        // so the binary-search shortcut can never silently diverge from the
+        // definition `[a, b)` overlaps `[c, d)` ⟺ `a < d && c < b`.
+        let windows = [(0, 5), (10, 12), (20, 30), (30, 40), (100, i64::MAX)];
+        let s = summary(&windows, 256);
+        let merged = summary(&windows, 256).intervals; // the coalesced union
+        let brute = |lo: i64, hi: i64| lo < hi && merged.iter().any(|&(f, t)| f < hi && lo < t);
+        for lo in -3..=45 {
+            for hi in (lo - 2)..=48 {
+                assert_eq!(
+                    s.overlaps(lo, hi),
+                    brute(lo, hi),
+                    "overlaps({lo}, {hi}) disagrees with the reference"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn summary_encode_decode_round_trips_and_reports_consumed_len() {
         let s = summary(&[(0, 10), (100, i64::MAX)], 256);
         let mut buf = Vec::new();
@@ -920,5 +1105,63 @@ mod tests {
         // A genuinely disjoint, ascending pair still decodes.
         let (ok, _) = ValidIntervalSummary::decode(&encode(&[(0, 10), (20, 30)])).expect("valid");
         assert!(ok.covers(5) && !ok.covers(15) && ok.covers(25));
+    }
+
+    // --- per-row-group sequence (STL-316) ----------------------------------
+
+    #[test]
+    fn per_row_group_round_trips_present_and_absent_entries() {
+        // Three row-groups: a backdated/current scatter, an admit-all (None), and
+        // a single window — the mix the writer emits for a bounded-flush segment.
+        let rgs = vec![
+            Some(summary(&[(0, 10), (100, i64::MAX)], 256)),
+            None,
+            Some(summary(&[(50, 60)], 256)),
+        ];
+        let mut buf = Vec::new();
+        ValidIntervalSummary::encode_per_row_group(&rgs, &mut buf);
+        // A trailing byte proves `decode_per_row_group` reports the exact length.
+        buf.push(0xAB);
+        let (decoded, consumed) =
+            ValidIntervalSummary::decode_per_row_group(&buf, 3).expect("round-trips");
+        assert_eq!(consumed, buf.len() - 1);
+        assert_eq!(decoded, rgs);
+        // The gap row-group prunes 50 while the third covers it — finer than any
+        // single segment-wide union of the three could be.
+        assert!(!decoded[0].as_ref().unwrap().covers(50));
+        assert!(decoded[2].as_ref().unwrap().covers(50));
+    }
+
+    #[test]
+    fn per_row_group_decode_rejects_a_count_mismatch() {
+        let mut buf = Vec::new();
+        ValidIntervalSummary::encode_per_row_group(&[Some(summary(&[(0, 10)], 256))], &mut buf);
+        // The footer says two row-groups but the section encodes one.
+        assert!(ValidIntervalSummary::decode_per_row_group(&buf, 2).is_err());
+        // Exact match decodes.
+        assert!(ValidIntervalSummary::decode_per_row_group(&buf, 1).is_ok());
+    }
+
+    #[test]
+    fn per_row_group_decode_rejects_a_malformed_entry() {
+        // A present entry (count 1) whose single interval is inverted — the
+        // per-entry `decode` must fail closed through the sequence decoder.
+        let mut buf = 1u32.to_le_bytes().to_vec(); // one row-group
+        buf.extend_from_slice(&1u32.to_le_bytes()); // entry: one interval
+        buf.extend_from_slice(&20i64.to_le_bytes()); // from
+        buf.extend_from_slice(&10i64.to_le_bytes()); // to (inverted)
+        assert!(ValidIntervalSummary::decode_per_row_group(&buf, 1).is_err());
+    }
+
+    #[test]
+    fn per_row_group_empty_sequence_round_trips() {
+        // Zero row-groups (the degenerate framing) encodes as a bare count and
+        // decodes back to an empty vector, consuming exactly four bytes.
+        let mut buf = Vec::new();
+        ValidIntervalSummary::encode_per_row_group(&[], &mut buf);
+        let (decoded, consumed) =
+            ValidIntervalSummary::decode_per_row_group(&buf, 0).expect("round-trips");
+        assert!(decoded.is_empty());
+        assert_eq!(consumed, 4);
     }
 }

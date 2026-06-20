@@ -244,11 +244,45 @@ pub struct Temporal {
     /// `FOR { SYSTEM_TIME | VALID_TIME } AS OF <expr>` qualifiers, one per
     /// table reference that carried one, in left-to-right source order.
     pub as_of: Vec<AsOf>,
+    /// A `FOR { SYSTEM_TIME | VALID_TIME } { FROM a TO b | BETWEEN a AND b }`
+    /// **range** qualifier lifted off the token stream ([STL-244]) — the
+    /// "all versions over an interval" read. At most one per statement (a
+    /// repeated one is a parse error); mutually exclusive with `AS OF` on the
+    /// same table (a point read and a range read are different shapes). `None`
+    /// for a plain or point-in-time `SELECT`.
+    pub range: Option<TemporalRange>,
     /// A `WHERE PERIOD(a, b) <pred> PERIOD(c, d)` period predicate lifted off the
     /// token stream, when the whole `WHERE` is one ([STL-165]). `sqlparser` has
     /// no grammar for the period predicates, so — like `AS OF` — they are lifted
     /// here and bound separately; `body`'s `WHERE` is left clean.
     pub period_predicate: Option<PeriodPredicateClause>,
+}
+
+/// A parsed `FOR <dimension> { FROM <from> TO <to> | BETWEEN <from> AND <to> }`
+/// range qualifier ([STL-244]).
+///
+/// The SQL:2011 temporal range forms return **all** versions whose interval
+/// overlaps the range, not just the one live at a point.
+///
+/// The two spellings differ only on the **upper** bound's inclusivity, which
+/// [`closed_upper`](Self::closed_upper) records: `FROM a TO b` is the half-open
+/// range `[a, b)`, `BETWEEN a AND b` the closed range `[a, b]` (the SQL:2011
+/// convention). Each endpoint is an arbitrary scalar expression the binder folds
+/// to a concrete microsecond instant, the same way an `AS OF` operand folds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalRange {
+    /// Which time axis the range applies to. Only `SYSTEM_TIME` binds at v0.3;
+    /// the valid axis is rejected at bind time as a tracked follow-up.
+    pub dimension: TimeDimension,
+    /// The inclusive lower bound of the range.
+    pub from: Expr,
+    /// The upper bound of the range — exclusive when
+    /// [`closed_upper`](Self::closed_upper) is `false` (`FROM a TO b`), inclusive
+    /// when `true` (`BETWEEN a AND b`).
+    pub to: Expr,
+    /// `true` for the closed `BETWEEN a AND b` (upper bound inclusive); `false`
+    /// for the half-open `FROM a TO b` (upper bound exclusive).
+    pub closed_upper: bool,
 }
 
 /// A parsed `PERIOD(from, to) <predicate> PERIOD(from, to)` clause — the

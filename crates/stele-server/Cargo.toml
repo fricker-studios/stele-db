@@ -33,11 +33,20 @@ tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 # The admin / control-plane API (STL-254, ADR-0016): gRPC service + client over
 # HTTP/2; the HTTP/JSON gateway shares the ops listener. See the workspace
-# manifest for the supply-chain rationale.
-tonic              = { workspace = true }
+# manifest for the supply-chain rationale. `tls-connect-info` (STL-311) adds the
+# `Connected` impl for `tokio_rustls::server::TlsStream`, so the admin gRPC
+# listener can `serve_with_incoming` connections we handshake ourselves with the
+# shared pg-wire acceptor — no `tonic` server-TLS (no second cert config), and it
+# pulls no new crate (tonic's tokio-rustls is the one already in the tree, ring).
+tonic              = { workspace = true, features = ["tls-connect-info"] }
 tonic-prost        = { workspace = true }
 prost              = { workspace = true }
 tokio-stream       = { workspace = true }
+# Admin-surface TLS (STL-311): wrap the admin gRPC + ops HTTP connections in the
+# rustls acceptor pg-wire already loads from `[tls]`. `tokio-rustls` names the
+# `TlsAcceptor` / `TlsStream` types; the certificate material itself comes from
+# stele-pgwire's `ServerTls` / `TlsReloader`.
+tokio-rustls       = { workspace = true }
 
 [build-dependencies]
 # Codegen of the v1alpha1 admin .proto contract via a vendored protoc (no system
@@ -50,3 +59,13 @@ protoc-bin-vendored = { workspace = true }
 # (STL-253): tokio-postgres as the SQL client, stele-sql for the `Statement`
 # type a delegating test session needs in its `SessionHandle` signatures.
 tokio-postgres = { workspace = true }
+# Admin-surface TLS handshake tests (STL-311). `tls-ring` switches on tonic's
+# client TLS so a real gRPC client can reach the listener over TLS (the DoD);
+# it is a DEV-ONLY feature add — under the v2 resolver it never reaches the
+# shipped lib build, and it uses ring (no aws-lc). `rcgen` mints the per-test
+# server certificate; `rustls` / `rustls-pki-types` build the raw HTTPS client
+# that exercises the `/v1alpha1` gateway (the `curl --cacert` face).
+tonic            = { workspace = true, features = ["tls-ring"] }
+rcgen            = { workspace = true }
+rustls           = { workspace = true }
+rustls-pki-types = { workspace = true }

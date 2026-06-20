@@ -560,17 +560,29 @@ impl GatheredColumns {
 /// What remains is [`segments_scanned`](Self::segments_scanned): the segments
 /// whose projected columns are materialized for the rows that survive resolution.
 ///
-/// ## Row-group accounting (STL-173)
+/// ## Row-group accounting (STL-173, STL-316)
 ///
 /// Within a segment that survives the segment-level zone prune, the scan prunes
-/// again at *row-group* granularity: each row-group's own zone map
-/// ([`SegmentReader::row_group_zone_maps`]) can prove no visible matching row
-/// even when the segment-level fold (whose `[min, max]` spans every row-group)
-/// cannot. The three `row_groups_*` counts partition the row-groups of exactly
-/// the segment-level zone survivors —
-/// `row_groups_total == row_groups_pruned_zone + row_groups_scanned` — and a
-/// segment whose *every* row-group is pruned this way is itself counted in
-/// [`segments_pruned_zone`](Self::segments_pruned_zone) (no identity chunk read).
+/// again at *row-group* granularity, two complementary ways, neither touching a
+/// column chunk:
+///
+/// * each row-group's own zone map ([`SegmentReader::row_group_zone_maps`]) can
+///   prove no visible matching row even when the segment-level fold (whose
+///   `[min, max]` spans every row-group) cannot
+///   ([`row_groups_pruned_zone`](Self::row_groups_pruned_zone));
+/// * on a `FOR VALID_TIME AS OF v` read, each row-group's own valid-interval
+///   summary ([`SegmentReader::row_group_might_contain_valid`], STL-316) can
+///   prove no row in it is valid at `v` — the backdated scatter case its
+///   `valid_from` / `valid_to` zone-map min/max cannot, because a correction in
+///   the row-group widens the envelope to span `v` though the coverage gaps there
+///   ([`row_groups_pruned_valid`](Self::row_groups_pruned_valid)).
+///
+/// The four `row_groups_*` counts partition the row-groups of exactly the
+/// segment-level zone survivors —
+/// `row_groups_total == row_groups_pruned_zone + row_groups_pruned_valid +
+/// row_groups_scanned` — and a segment whose *every* row-group is pruned this way
+/// is itself counted in [`segments_pruned_zone`](Self::segments_pruned_zone) (no
+/// identity chunk read).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ScanStats {
     /// Total sealed segments offered to the scan.
@@ -589,11 +601,14 @@ pub struct ScanStats {
     /// index proved superseded at the snapshot — skipped after reading only the
     /// narrow identity columns, never the bulk chunks (STL-139).
     pub segments_pruned_superseded: usize,
-    /// Segments the per-segment valid-time interval summary proved hold no row
-    /// valid at the pinned valid instant — skipped with no read I/O (STL-241).
-    /// Only ever non-zero for a `FOR VALID_TIME AS OF v` read against a segment
-    /// carrying a summary; this is the backdated-write scatter case the
-    /// `valid_from` / `valid_to` zone-map min/max cannot prune.
+    /// Segments the per-segment valid-time interval summary proved hold no row on
+    /// the valid axis the read needs — skipped with no read I/O (STL-241,
+    /// STL-315). Non-zero for a `FOR VALID_TIME AS OF v` read whose `v` falls in a
+    /// coverage gap (the point stab, STL-241) **and** for a per-row PERIOD
+    /// predicate whose constant probe `[lo, hi)` overlaps no covered window (the
+    /// range stab, STL-315), in each case against a segment carrying a summary.
+    /// Both are the backdated-write scatter case the `valid_from` / `valid_to`
+    /// zone-map min/max cannot prune.
     pub segments_pruned_valid: usize,
     /// Segments that survived both prunes — their projected columns are read for
     /// any row live at the snapshot.
@@ -606,6 +621,14 @@ pub struct ScanStats {
     /// Row-groups a per-row-group zone map proved hold no visible match — their
     /// identity (and bulk) chunks are never read.
     pub row_groups_pruned_zone: usize,
+    /// Row-groups the per-row-group valid-time interval summary proved hold no row
+    /// valid at the pinned valid instant — skipped with no read I/O (STL-316).
+    /// Only ever non-zero for a `FOR VALID_TIME AS OF v` read against a segment
+    /// carrying per-row-group summaries; this is the backdated-write scatter case
+    /// the row-group's `valid_from` / `valid_to` zone-map min/max cannot prune,
+    /// the row-group-granular refinement of
+    /// [`segments_pruned_valid`](Self::segments_pruned_valid).
+    pub row_groups_pruned_valid: usize,
     /// Row-groups whose narrow identity columns were read to resolve the snapshot
     /// (the candidates that survived the per-row-group prune).
     pub row_groups_scanned: usize,
@@ -649,6 +672,9 @@ impl ScanStats {
         metrics
             .scan_row_groups_pruned_zone
             .add(self.row_groups_pruned_zone as u64);
+        metrics
+            .scan_row_groups_pruned_valid
+            .add(self.row_groups_pruned_valid as u64);
     }
 }
 
@@ -660,6 +686,63 @@ pub struct ScanOutput {
     pub batch: Batch,
     /// Pruning / read accounting for the scan.
     pub stats: ScanStats,
+}
+
+/// A system-time **range** for an interval read ([STL-244]) — the
+/// [`SnapshotScan`]'s interval mode resolves every version whose system interval
+/// `[sys_from, sys_to)` overlaps it.
+///
+/// [`closed_upper`](Self::closed_upper) selects the upper bound's inclusivity:
+/// `false` is the half-open `FROM lo TO hi` (`[lo, hi)`), `true` the closed
+/// `BETWEEN lo AND hi` (`[lo, hi]`). The half-open vs closed distinction is the
+/// single `<` vs `<=` difference [`overlaps`](Self::overlaps) draws — the
+/// "off-by-one on a half-open interval" boundary class (docs/16 §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemRange {
+    /// The inclusive lower bound, in system-time microseconds.
+    pub lo: i64,
+    /// The upper bound, in system-time microseconds — exclusive when
+    /// [`closed_upper`](Self::closed_upper) is `false`, inclusive when `true`.
+    pub hi: i64,
+    /// `true` for the closed `BETWEEN` (upper inclusive), `false` for the
+    /// half-open `FROM..TO` (upper exclusive).
+    pub closed_upper: bool,
+}
+
+impl SystemRange {
+    /// Whether a version's system interval `[vf, vt)` overlaps this range.
+    ///
+    /// A version is returned by a range read iff it is *active at some instant in
+    /// the range*. With `vt` the resolved (index-overlaid) end —
+    /// [`SYSTEM_TIME_OPEN`](stele_common::time::SYSTEM_TIME_OPEN) for an open
+    /// version — the test is:
+    ///
+    /// * the interval is **non-empty** (`vf < vt`) — a degenerate same-tick close
+    ///   `[vf, vf)` covers no instant and is never returned;
+    /// * it **reaches into** the range (`vt > lo`); and
+    /// * it **begins within** the range — `vf < hi` for the half-open form, or
+    ///   `vf <= hi` for the closed form.
+    #[must_use]
+    pub const fn overlaps(self, vf: i64, vt: i64) -> bool {
+        let begins_in_range = if self.closed_upper {
+            vf <= self.hi
+        } else {
+            vf < self.hi
+        };
+        vf < vt && vt > self.lo && begins_in_range
+    }
+
+    /// The `begins after` snapshot bound for zone-map pruning: a segment whose
+    /// every row begins strictly after this instant cannot overlap the range. For
+    /// the half-open `[lo, hi)` that is `hi - 1` (a row at `hi` cannot overlap);
+    /// for the closed `[lo, hi]` it is `hi` (a row at `hi` does overlap).
+    const fn begins_after_bound(self) -> i64 {
+        if self.closed_upper {
+            self.hi
+        } else {
+            self.hi.saturating_sub(1)
+        }
+    }
 }
 
 /// The `SnapshotScan { table, snapshot, projection, predicates }` operator.
@@ -687,6 +770,22 @@ pub struct SnapshotScan<'a, D: Disk, I: Disk, F: DiskFile> {
     /// `valid_as_of` pin implies a valid-time table, so it sets this too; a
     /// system-only table leaves it `false` and its payload is bare already.
     valid_time: bool,
+    /// The system-time range to resolve in **interval mode**, set via
+    /// [`system_range`](Self::system_range) ([STL-244]). `None` is the default
+    /// point-in-time scan ([`execute`](Self::execute) returns the one version per
+    /// key live at [`snapshot`](Self::new)); `Some(range)` makes
+    /// [`execute_range`](Self::execute_range) return **every** version whose system
+    /// interval `[sys_from, sys_to)` overlaps the range.
+    interval: Option<SystemRange>,
+    /// A half-open valid-time probe `[lo, hi)` to prune segments against, set via
+    /// [`prune_valid_overlap`](Self::prune_valid_overlap) ([STL-315]). **Prune
+    /// hint only** — unlike [`valid_snapshot`](Self::valid_snapshot) it filters no
+    /// row: when set, a segment whose valid-interval summary proves no row
+    /// overlaps `[lo, hi)` is skipped, but the surviving segments' rows are
+    /// returned unfiltered. The caller's per-row PERIOD predicate (which the probe
+    /// is derived from) re-applies the exact filter downstream, so the result is
+    /// byte-identical to an unpruned scan. `None` leaves every segment in play.
+    valid_overlap: Option<(i64, i64)>,
     projection: Vec<ColumnId>,
     predicate: Predicate,
     /// The session's shared metric registry, when installed via
@@ -719,6 +818,8 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             snapshot,
             valid_snapshot: None,
             valid_time: false,
+            interval: None,
+            valid_overlap: None,
             projection: ColumnId::ALL.to_vec(),
             predicate: Predicate::All,
             metrics: None,
@@ -794,6 +895,52 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
         self
     }
 
+    /// Turn this scan into an **interval** read over the system-time range
+    /// `[lo, hi)` (half-open, `closed_upper == false`) or `[lo, hi]` (closed,
+    /// `closed_upper == true`) ([STL-244]).
+    ///
+    /// [`execute_range`](Self::execute_range) then returns **every** version whose
+    /// system interval `[sys_from, sys_to)` overlaps the range — across both tiers,
+    /// each version's end overlaid from the validity index — rather than the single
+    /// version live at [`snapshot`](Self::new). The base [`snapshot`](Self::new) is
+    /// unused on the range path; pass any value (the engine passes the statement
+    /// snapshot). Pushed-down predicate and `valid_time` framing apply as on the
+    /// point path; a `valid_as_of` pin is not meaningful here (a range read is the
+    /// system axis) and is ignored by [`execute_range`](Self::execute_range).
+    #[must_use]
+    pub const fn system_range(mut self, lo: i64, hi: i64, closed_upper: bool) -> Self {
+        self.interval = Some(SystemRange {
+            lo,
+            hi,
+            closed_upper,
+        });
+        self
+    }
+
+    /// Push a half-open valid-time probe `[lo, hi)` down for **segment pruning
+    /// only** ([STL-315]): a segment whose per-segment valid-interval summary
+    /// proves no row overlaps `[lo, hi)` is skipped (counted in
+    /// [`ScanStats::segments_pruned_valid`]), the backdated-write scatter case the
+    /// `valid_from` / `valid_to` zone-map min/max cannot prune.
+    ///
+    /// Unlike [`valid_as_of`](Self::valid_as_of) this filters **no row** — it only
+    /// gates which segments are read. It is the access-path counterpart of a
+    /// per-row PERIOD predicate (`PERIOD(valid_from, valid_to) OVERLAPS / CONTAINS
+    /// PERIOD(lo, hi)`, [STL-193]) that the query executor evaluates over each
+    /// decoded row downstream: the predicate's truth *requires* the row's valid
+    /// interval to overlap `[lo, hi)`, so a segment proven to hold no overlapping
+    /// row holds no matching row. Because the executor re-applies the exact
+    /// predicate, the surviving rows are returned unfiltered here and the result
+    /// is byte-identical to an unpruned scan — the summary changes speed, never
+    /// results. The caller derives `[lo, hi)` only for predicates where overlap is
+    /// a necessary condition; the prune never fires for a segment carrying no
+    /// summary, so it never drops a real match.
+    #[must_use]
+    pub const fn prune_valid_overlap(mut self, lo: i64, hi: i64) -> Self {
+        self.valid_overlap = Some((lo, hi));
+        self
+    }
+
     /// Restrict the output to `columns`, in the given order (projection
     /// pushdown). Only the always-on version columns are projectable at v0.1;
     /// any other column surfaces [`ScanError::UnsupportedProjection`] at
@@ -852,12 +999,22 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
     ///
     /// Complementary skip stages, none of which reads a bulk column chunk: the
     /// segment-level zone map, the per-segment bloom (STL-238), the per-segment
-    /// valid-time interval summary on a valid-pinned read (STL-241), the
-    /// per-row-group zone maps (STL-173), and the validity index's "every
-    /// surviving version superseded" bound (STL-139).
+    /// valid-time interval summary on a valid-pinned read (the point stab,
+    /// STL-241) or against a per-row PERIOD predicate's probe period (the range
+    /// stab, STL-315), the per-row-group zone maps (STL-173), and the validity
+    /// index's "every surviving version superseded" bound (STL-139).
+    ///
+    /// `begins_after` drives the zone-map "begins after" test (a segment whose
+    /// every row begins after it is pruned) and `ends_before` the validity index's
+    /// "every version superseded at or before it" test. A point scan passes the
+    /// snapshot for both; an interval scan ([`execute_range`](Self::execute_range))
+    /// passes the range's upper-edge and lower bound respectively, so a segment is
+    /// pruned only when it can hold no version overlapping the range.
     #[allow(clippy::type_complexity)]
     fn prune_segments(
         &self,
+        begins_after: Snapshot,
+        ends_before: SystemTimeMicros,
     ) -> Result<(Vec<(usize, Vec<(usize, VersionId)>)>, ScanStats), ScanError> {
         // The predicate the zone maps prune against. A system-only scan prunes
         // against the bare pushed-down predicate, unchanged; a both-axes scan
@@ -877,13 +1034,14 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
         let mut pruned_valid = 0usize;
         let mut rg_total = 0usize;
         let mut rg_pruned = 0usize;
+        let mut rg_pruned_valid = 0usize;
         let mut rg_scanned = 0usize;
         // (segment index, its surviving rows as (segment-global row index, identity)).
         let mut survivors: Vec<(usize, Vec<(usize, VersionId)>)> = Vec::new();
         for (seg_idx, reader) in self.segments.iter().enumerate() {
             // Stage 1 — segment zone map: rules a whole segment out touching no
             // column chunk.
-            if !reader.might_contain(&pruning_pred, self.snapshot) {
+            if !reader.might_contain(&pruning_pred, begins_after) {
                 pruned_zone += 1;
                 continue;
             }
@@ -914,18 +1072,53 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
                 pruned_valid += 1;
                 continue;
             }
-            // Stage 2 — per-row-group zone maps (STL-173): rule out the
-            // row-groups whose own min/max prove no visible match, even when the
-            // segment-level fold (its `[min, max]` spanning every row-group)
-            // cannot. Footer-resident, so this costs no chunk I/O — the pruned
-            // row-groups' identity chunks are then never read.
+            // Stage 1d — per-segment valid-time interval summary, range probe
+            // ([STL-315]): the access-path counterpart of a per-row PERIOD
+            // predicate (`PERIOD(valid_from, valid_to) OVERLAPS / CONTAINS
+            // PERIOD(lo, hi)`, [STL-193]). The same footer summary that answers the
+            // point stab above answers an `overlapping [lo, hi)` probe: a `false`
+            // proves no row in this segment overlaps the probe, and the predicate's
+            // truth requires overlap, so no row can match. Footer-resident, so
+            // still no chunk I/O; a segment with no summary admits every probe, so
+            // this never prunes a real match. Counts with the point stab in
+            // `segments_pruned_valid` — both skip on the valid axis.
+            if let Some((lo, hi)) = self.valid_overlap
+                && !reader.might_overlap_valid(lo, hi)
+            {
+                pruned_valid += 1;
+                continue;
+            }
+            // Stage 2 — per-row-group skips (STL-173, STL-316): rule out
+            // individual row-groups even when the segment-level fold (its
+            // `[min, max]` spanning every row-group) cannot, two complementary
+            // ways, both footer-resident so neither costs chunk I/O:
+            //
+            //  * the row-group's own zone map proves no visible match (STL-173);
+            //  * on a valid-pinned read, the row-group's own valid-interval
+            //    summary proves no row in it is valid at `v` (STL-316) — the
+            //    backdated scatter case its `valid_from` / `valid_to` zone-map
+            //    min/max cannot prune, now caught at row-group rather than only
+            //    segment granularity. Tallied separately from the zone skip, the
+            //    row-group analogue of the segment-level `pruned_valid` split.
+            //    (The STL-315 overlap probe stays segment-level for now.)
+            //
+            // The pruned row-groups' identity chunks are then never read.
             let rg_counts = reader.row_group_row_counts();
             let rg_maps = reader.row_group_zone_maps();
             rg_total += rg_maps.len();
-            let candidates: BTreeSet<usize> = (0..rg_maps.len())
-                .filter(|&g| rg_maps[g].might_contain(&pruning_pred, self.snapshot))
-                .collect();
-            rg_pruned += rg_maps.len() - candidates.len();
+            let mut candidates: BTreeSet<usize> = BTreeSet::new();
+            for (g, rg_map) in rg_maps.iter().enumerate() {
+                if !rg_map.might_contain(&pruning_pred, begins_after) {
+                    rg_pruned += 1;
+                } else if self
+                    .valid_snapshot
+                    .is_some_and(|point| !reader.row_group_might_contain_valid(g, point.0))
+                {
+                    rg_pruned_valid += 1;
+                } else {
+                    candidates.insert(g);
+                }
+            }
             if candidates.is_empty() {
                 // Every row-group ruled out — the segment holds no visible match
                 // even though its coarse segment-level fold could not prove it.
@@ -943,7 +1136,7 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             if self
                 .index
                 .sys_upper_bound(keys.iter().cloned())?
-                .superseded_at_or_before(self.snapshot.0)
+                .superseded_at_or_before(ends_before)
             {
                 pruned_superseded += 1;
                 continue;
@@ -970,6 +1163,7 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             segments_scanned: survivors.len(),
             row_groups_total: rg_total,
             row_groups_pruned_zone: rg_pruned,
+            row_groups_pruned_valid: rg_pruned_valid,
             row_groups_scanned: rg_scanned,
         };
         Ok((survivors, stats))
@@ -1009,7 +1203,9 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
 
         // Prune the sealed segments (segment- then row-group-level zone maps,
         // then the validity index), keeping each survivor's candidate identities.
-        let (survivors, stats) = self.prune_segments()?;
+        // A point scan prunes against the snapshot on both axes (begins-after and
+        // ends-before).
+        let (survivors, stats) = self.prune_segments(self.snapshot, self.snapshot.0)?;
 
         // Resolve which survivor rows are live at the snapshot from the identity
         // columns alone: `fold_chains` overlays the validity index's closes and
@@ -1042,44 +1238,8 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
         }
 
         // Late materialization: read each needed bulk column once per survivor
-        // that actually holds a live row, then patch it into the resolved
-        // version. The read touches only that column's chunks, and only in the
-        // row-groups that hold a live row ([`RowGroupSelection`], STL-155) — so
-        // the scan pays for the projected columns of the live rows' row-groups,
-        // never the full column of every survivor, never a survivor with no
-        // live row.
-        let live_rows = live_rows_by_segment(&sealed_live, &locator);
-        let mut cols_by_seg: BTreeMap<usize, (RowGroupSelection, Vec<(ColumnId, ColumnData)>)> =
-            BTreeMap::new();
-        for (seg_idx, rows) in live_rows {
-            let sel = RowGroupSelection::new(&self.segments[seg_idx].row_group_row_counts(), &rows);
-            let mut cols = Vec::with_capacity(needed.len());
-            for &col in &needed {
-                let data = self.segments[seg_idx].read_column_in_row_groups(col, &sel.groups)?;
-                // Every bulk column must carry exactly as many values as the
-                // selected row-groups declare in the footer (the same counts the
-                // identity columns satisfied in [`SegmentReader::version_keys`]);
-                // a disagreement is a corrupt segment, surfaced as an error
-                // rather than an out-of-bounds panic when the per-row patch
-                // indexes into the read result (the same guard
-                // `SegmentReader::read_versions` applies across its columns).
-                if column_len(&data) != sel.selected_rows {
-                    return Err(ScanError::Segment(SegmentError::Corrupt(
-                        "segment column value count disagrees with the selected row-groups' row count",
-                    )));
-                }
-                cols.push((col, data));
-            }
-            cols_by_seg.insert(seg_idx, (sel, cols));
-        }
-        for v in &mut sealed_live {
-            let (seg_idx, row_idx) = locate(&locator, v);
-            let (sel, cols) = &cols_by_seg[&seg_idx];
-            let local_idx = sel.local_index(row_idx);
-            for (col, data) in cols {
-                patch_version(v, *col, data, local_idx);
-            }
-        }
+        // that actually holds a live row, then patch it into the resolved version.
+        self.materialize_bulk_columns(&mut sealed_live, &locator, &needed)?;
 
         // Union the two per-tier results, deduplicated per key. The intervals
         // are disjoint across tiers (see the module docs), so a key resolves to
@@ -1115,6 +1275,155 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             }
         }
         needed
+    }
+
+    /// Late materialization: read each `needed` bulk column once per survivor
+    /// segment that holds a resolved live row, then patch it into the matching
+    /// resolved version ([`patch_version`]). The read touches only that column's
+    /// chunks, and only in the row-groups that hold a live row
+    /// ([`RowGroupSelection`], STL-155) — so the scan pays for the projected
+    /// columns of the live rows' row-groups, never the full column of every
+    /// survivor, never a survivor with no live row. Shared by the point
+    /// ([`resolve_rows`](Self::resolve_rows)) and interval
+    /// ([`resolve_rows_in_range`](Self::resolve_rows_in_range)) paths.
+    fn materialize_bulk_columns(
+        &self,
+        sealed_live: &mut [Version],
+        locator: &BTreeMap<VersionId, (usize, usize)>,
+        needed: &[ColumnId],
+    ) -> Result<(), ScanError> {
+        let live_rows = live_rows_by_segment(sealed_live, locator);
+        let mut cols_by_seg: BTreeMap<usize, (RowGroupSelection, Vec<(ColumnId, ColumnData)>)> =
+            BTreeMap::new();
+        for (seg_idx, rows) in live_rows {
+            let sel = RowGroupSelection::new(&self.segments[seg_idx].row_group_row_counts(), &rows);
+            let mut cols = Vec::with_capacity(needed.len());
+            for &col in needed {
+                let data = self.segments[seg_idx].read_column_in_row_groups(col, &sel.groups)?;
+                // Every bulk column must carry exactly as many values as the
+                // selected row-groups declare in the footer (the same counts the
+                // identity columns satisfied in [`SegmentReader::version_keys`]);
+                // a disagreement is a corrupt segment, surfaced as an error rather
+                // than an out-of-bounds panic when the per-row patch indexes into
+                // the read result.
+                if column_len(&data) != sel.selected_rows {
+                    return Err(ScanError::Segment(SegmentError::Corrupt(
+                        "segment column value count disagrees with the selected row-groups' row count",
+                    )));
+                }
+                cols.push((col, data));
+            }
+            cols_by_seg.insert(seg_idx, (sel, cols));
+        }
+        for v in sealed_live.iter_mut() {
+            let (seg_idx, row_idx) = locate(locator, v);
+            let (sel, cols) = &cols_by_seg[&seg_idx];
+            let local_idx = sel.local_index(row_idx);
+            for (col, data) in cols {
+                patch_version(v, *col, data, local_idx);
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute the scan in **interval mode** ([STL-244]): resolve every version
+    /// whose system interval `[sys_from, sys_to)` overlaps the range set by
+    /// [`system_range`](Self::system_range), across both tiers, with the projected
+    /// bulk columns materialized. Each returned [`Version`] carries its resolved
+    /// `[sys_from, sys_to)` — `sys_to` is
+    /// [`SYSTEM_TIME_OPEN`](stele_common::time::SYSTEM_TIME_OPEN) for a
+    /// still-current version — so the caller can expose the period endpoints.
+    ///
+    /// Unlike [`execute`](Self::execute) this returns the resolved [`Version`]s
+    /// directly rather than a projected [`Batch`] — a range read appends the system
+    /// endpoints, which are not [`ColumnId`] columns, so the engine reconstructs the
+    /// output rows from the versions.
+    ///
+    /// # Panics
+    ///
+    /// If [`system_range`](Self::system_range) was not set — the caller routes a
+    /// range scan here and a point scan to [`execute`](Self::execute).
+    ///
+    /// # Errors
+    ///
+    /// [`ScanError`] if a tier read fails.
+    pub fn execute_range(&self) -> Result<(Vec<Version>, ScanStats), ScanError> {
+        let range = self
+            .interval
+            .expect("execute_range requires a system_range to be set");
+        let (rows, stats) = self.resolve_rows_in_range(range)?;
+        if let Some(m) = &self.metrics {
+            stats.record(m);
+        }
+        // Apply the pushed-down predicate exactly as the point path does. The engine
+        // pushes only the business-key zone constraint here (the full `WHERE` runs
+        // over the reconstructed rows), so this is the same exact row filter.
+        let filtered = rows
+            .into_iter()
+            .filter(|v| predicate_matches(&self.predicate, v))
+            .collect();
+        Ok((filtered, stats))
+    }
+
+    /// Resolve every version overlapping the system-time `range`, across both
+    /// tiers, with bulk columns materialized — the interval-mode mirror of
+    /// [`resolve_rows`](Self::resolve_rows). The delta tier carries full versions;
+    /// the sealed tier is resolved from identity columns and late-materialized.
+    fn resolve_rows_in_range(
+        &self,
+        range: SystemRange,
+    ) -> Result<(Vec<Version>, ScanStats), ScanError> {
+        // Delta tier: every staged version within the predicate's business-key
+        // range, folded so each carries its index-overlaid `sys_to`, then
+        // range-resolved. A valid-time table frames the delta payload; a range read
+        // is the system axis, so strip the prefix to the bare user row (the sealed
+        // tier already stores it bare) — never a valid-axis filter.
+        let key_range = predicate_key_range(&self.predicate);
+        let delta_candidates: Vec<Version> = self
+            .delta
+            .staged_versions()?
+            .into_iter()
+            .filter(|v| key_in_bounds(&v.business_key, &key_range))
+            .collect();
+        let delta_chains = merge::fold_chains(delta_candidates, self.index)?;
+        let mut delta_live = resolve_chain_range(&delta_chains, range);
+        if self.valid_time {
+            delta_live = strip_delta_frames(delta_live)?;
+        }
+
+        let needed = self.materialized_columns();
+
+        // Sealed tier: prune against the range's bounds — a segment is dropped only
+        // when it can hold no version overlapping the range (begins after the upper
+        // edge, or every version superseded at or before the lower bound).
+        let begins_after = Snapshot(SystemTimeMicros(range.begins_after_bound()));
+        let ends_before = SystemTimeMicros(range.lo);
+        let (survivors, stats) = self.prune_segments(begins_after, ends_before)?;
+
+        let mut locator: BTreeMap<VersionId, (usize, usize)> = BTreeMap::new();
+        let mut identities: Vec<Version> = Vec::new();
+        for (seg_idx, keys) in &survivors {
+            for (row_idx, (bk, sys_from, seq)) in keys {
+                locator.insert((bk.clone(), *sys_from, *seq), (*seg_idx, *row_idx));
+                identities.push(identity_version(bk.clone(), *sys_from, *seq));
+            }
+        }
+        let sealed_chains = merge::fold_chains(identities, self.index)?;
+        let mut sealed_live = resolve_chain_range(&sealed_chains, range);
+        self.materialize_bulk_columns(&mut sealed_live, &locator, &needed)?;
+
+        // Union both tiers, deduplicated by the full `(business_key, sys_from, seq)`
+        // identity — **not** per key, since a range read returns many versions per
+        // key. The tiers' intervals are disjoint by construction, so the dedup only
+        // guards a defensive mid-flush overlap; the delta copy (full body) wins.
+        let mut by_id: BTreeMap<VersionId, Version> = BTreeMap::new();
+        for v in sealed_live {
+            by_id.insert((v.business_key.clone(), v.sys_from, v.seq), v);
+        }
+        for v in delta_live {
+            by_id.insert((v.business_key.clone(), v.sys_from, v.seq), v);
+        }
+        Ok((by_id.into_values().collect(), stats))
     }
 
     /// The predicate the zone maps (segment- and row-group-level) prune against.
@@ -1664,5 +1973,133 @@ fn tighter_upper(a: Bound<BusinessKey>, b: Bound<BusinessKey>) -> Bound<Business
         (Bound::Unbounded, other @ Bound::Included(_))
         | (other @ Bound::Included(_), Bound::Unbounded) => other,
         _ => Bound::Unbounded,
+    }
+}
+
+/// Resolve a system-time **range** read over already index-overlaid `chains`
+/// ([STL-244]): every version whose resolved interval `[sys_from, sys_to)` overlaps
+/// `range` ([`SystemRange::overlaps`]), across every key. The interval-mode mirror
+/// of [`merge::resolve_snapshot`] (which picks one per key at a point); a key may
+/// contribute many versions here.
+fn resolve_chain_range(chains: &merge::KeyChains, range: SystemRange) -> Vec<Version> {
+    chains
+        .values()
+        .flat_map(std::collections::BTreeMap::values)
+        .filter(|v| range.overlaps(v.sys_from.0, v.sys_to.0))
+        .cloned()
+        .collect()
+}
+
+/// Whether a business key falls within a `(low, high)` bound pair — the delta-tier
+/// key-range filter for an interval scan, the row-level mirror of the zone-map
+/// push-down [`predicate_key_range`] derives. Only `Included` / `Unbounded` bounds
+/// are produced upstream; `Excluded` is handled for completeness.
+fn key_in_bounds(key: &BusinessKey, bounds: &(Bound<BusinessKey>, Bound<BusinessKey>)) -> bool {
+    let above_low = match &bounds.0 {
+        Bound::Unbounded => true,
+        Bound::Included(low) => key >= low,
+        Bound::Excluded(low) => key > low,
+    };
+    let below_high = match &bounds.1 {
+        Bound::Unbounded => true,
+        Bound::Included(high) => key <= high,
+        Bound::Excluded(high) => key < high,
+    };
+    above_low && below_high
+}
+
+#[cfg(test)]
+mod range_overlap_tests {
+    use super::SystemRange;
+    use stele_common::time::SYSTEM_TIME_OPEN;
+
+    const fn half_open(lo: i64, hi: i64) -> SystemRange {
+        SystemRange {
+            lo,
+            hi,
+            closed_upper: false,
+        }
+    }
+
+    const fn closed(lo: i64, hi: i64) -> SystemRange {
+        SystemRange {
+            lo,
+            hi,
+            closed_upper: true,
+        }
+    }
+
+    // A closed version `[10, 20)` — the canonical "off-by-one on a half-open
+    // interval" boundary cases (docs/16 §4).
+    #[test]
+    fn half_open_query_boundaries() {
+        let (vf, vt) = (10, 20);
+        // Touch on the upper edge: a query starting exactly at the version's end
+        // does not overlap (the end is exclusive).
+        assert!(
+            !half_open(20, 30).overlaps(vf, vt),
+            "[20,30) misses [10,20)"
+        );
+        // A query ending exactly at the version's start does not overlap (the
+        // query's upper edge is exclusive).
+        assert!(!half_open(5, 10).overlaps(vf, vt), "[5,10) misses [10,20)");
+        // Genuine overlaps.
+        assert!(half_open(15, 25).overlaps(vf, vt), "[15,25) overlaps");
+        assert!(half_open(5, 15).overlaps(vf, vt), "[5,15) overlaps");
+        assert!(
+            half_open(10, 20).overlaps(vf, vt),
+            "the exact interval overlaps"
+        );
+        assert!(
+            half_open(0, 1000).overlaps(vf, vt),
+            "a covering range overlaps"
+        );
+    }
+
+    #[test]
+    fn closed_query_includes_the_upper_instant() {
+        let (vf, vt) = (10, 20);
+        // The single difference from the half-open form: a closed query whose
+        // lower bound equals the version's start instant includes it.
+        assert!(closed(5, 10).overlaps(vf, vt), "[5,10] includes instant 10");
+        assert!(
+            !half_open(5, 10).overlaps(vf, vt),
+            "[5,10) excludes instant 10"
+        );
+        // A closed query starting at the version's end still misses it (the end is
+        // exclusive on the *version*, regardless of the query's inclusivity).
+        assert!(!closed(20, 30).overlaps(vf, vt), "[20,30] misses [10,20)");
+    }
+
+    #[test]
+    fn an_open_version_overlaps_any_range_reaching_its_start() {
+        let vt = SYSTEM_TIME_OPEN.0;
+        // Open version `[10, +∞)`.
+        assert!(
+            half_open(5, 20).overlaps(10, vt),
+            "reaches into the version"
+        );
+        assert!(half_open(50, 60).overlaps(10, vt), "still open at 50");
+        assert!(
+            !half_open(5, 8).overlaps(10, vt),
+            "ends before the version begins"
+        );
+        assert!(
+            !half_open(5, 10).overlaps(10, vt),
+            "[5,10) excludes the start instant"
+        );
+        assert!(
+            closed(5, 10).overlaps(10, vt),
+            "[5,10] includes the start instant"
+        );
+    }
+
+    #[test]
+    fn a_degenerate_version_never_overlaps() {
+        // A same-tick superseded version `[10, 10)` covers no instant, so no range
+        // returns it.
+        assert!(!half_open(0, 100).overlaps(10, 10));
+        assert!(!closed(0, 100).overlaps(10, 10));
+        assert!(!closed(10, 10).overlaps(10, 10));
     }
 }

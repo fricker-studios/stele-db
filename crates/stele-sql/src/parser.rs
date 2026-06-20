@@ -27,7 +27,7 @@ use stele_common::period::PeriodPredicate;
 
 use crate::ast::{
     AdminCommand, AsOf, Password, PeriodExpr, PeriodPredicateClause, SessionCommand, Statement,
-    StatementBody, Temporal, TimeDimension, UserDdl, ValidTimePeriod,
+    StatementBody, Temporal, TemporalRange, TimeDimension, UserDdl, ValidTimePeriod,
 };
 use crate::dialect::SteleDialect;
 use crate::error::ParseError;
@@ -129,7 +129,7 @@ fn parse_one(mut tokens: Vec<Token>) -> Result<Statement, ParseError> {
     }
 
     let (system_versioning, valid_time) = extract_create_table_clauses(&mut tokens)?;
-    let as_of = lift_as_of(&mut tokens, &dialect)?;
+    let (as_of, range) = lift_temporal_qualifiers(&mut tokens, &dialect)?;
     let period_predicate = lift_period_predicate(&mut tokens, &dialect)?;
 
     let mut parser = Parser::new(&dialect).with_tokens(tokens);
@@ -156,6 +156,15 @@ fn parse_one(mut tokens: Vec<Token>) -> Result<Statement, ParseError> {
         ));
     }
 
+    // A `FOR … FROM/BETWEEN` range is likewise a read-time qualifier — lifting it
+    // off a write/DDL would silently strip it, so reject the misuse loudly
+    // ([STL-244]).
+    if range.is_some() && !matches!(body, SqlStatement::Query(_)) {
+        return Err(ParseError::Temporal(
+            "FOR ... FROM/BETWEEN applies only to a SELECT query".to_string(),
+        ));
+    }
+
     // A period predicate is a `WHERE` filter — only a SELECT has one. Lifting it
     // off a write/DDL would silently drop it, so reject the misuse loudly.
     if period_predicate.is_some() && !matches!(body, SqlStatement::Query(_)) {
@@ -170,6 +179,7 @@ fn parse_one(mut tokens: Vec<Token>) -> Result<Statement, ParseError> {
             system_versioning,
             valid_time,
             as_of,
+            range,
             period_predicate,
         },
     })
@@ -583,32 +593,42 @@ fn parse_valid_time_clause(
     Ok((ValidTimePeriod { from, to }, start + 5))
 }
 
-/// Lift every `FOR { SYSTEM_TIME | VALID_TIME } AS OF <expr>` qualifier out of
-/// the token stream, in source order, leaving a clean standard-SQL remainder.
+/// Lift every `FOR { SYSTEM_TIME | VALID_TIME } …` temporal qualifier out of the
+/// token stream, in source order, leaving a clean standard-SQL remainder. Two
+/// forms are recognized, each beginning with `FOR <axis>`:
 ///
-/// `sqlparser` allows at most one `FOR … AS OF` per table and has no `VALID_TIME`
-/// axis, so a bitemporal `… FOR SYSTEM_TIME AS OF s FOR VALID_TIME AS OF v` can
-/// never parse natively. Instead each qualifier's `<expr>` is parsed here with
-/// `sqlparser`'s own expression parser — the boundary of the expression is found
-/// by parsing and asking how many tokens were consumed — and the whole qualifier
-/// (the `FOR … AS OF` prefix plus the expression's tokens) is removed.
+/// * **`AS OF <expr>`** — a point-in-time read ([STL-101], [STL-162]); collected
+///   into the returned `Vec<AsOf>`, one per qualifier in source order.
+/// * **`FROM <a> TO <b>`** / **`BETWEEN <a> AND <b>`** — a range read returning
+///   all versions over an interval ([STL-244]); collected into the returned
+///   `Option<TemporalRange>` (at most one per statement — a repeated range is an
+///   error).
+///
+/// `sqlparser` allows at most one `FOR … AS OF` per table, has no `VALID_TIME`
+/// axis, and no grammar for the range forms at all, so a bitemporal or range
+/// qualifier can never parse natively. Each operand `<expr>` is parsed here with
+/// `sqlparser`'s own expression parser — its boundary found by parsing and asking
+/// how many tokens were consumed — and the whole qualifier removed.
 ///
 /// # Errors
 ///
-/// [`ParseError`] if a qualifier has no expression after `AS OF`, or if that
-/// expression does not parse.
-fn lift_as_of(tokens: &mut Vec<Token>, dialect: &SteleDialect) -> Result<Vec<AsOf>, ParseError> {
+/// [`ParseError`] if a qualifier has no/ill-formed operand, if a second range
+/// qualifier appears, or if a `FOR <axis>` is followed by none of `AS OF` /
+/// `FROM` / `BETWEEN` (e.g. the unsupported `FOR SYSTEM_TIME ALL`).
+fn lift_temporal_qualifiers(
+    tokens: &mut Vec<Token>,
+    dialect: &SteleDialect,
+) -> Result<(Vec<AsOf>, Option<TemporalRange>), ParseError> {
     let mut as_of = Vec::new();
+    let mut range: Option<TemporalRange> = None;
     let mut keep = Vec::with_capacity(tokens.len());
     let mut i = 0;
     while i < tokens.len() {
-        let is_qualifier = word_is(&tokens[i], "FOR")
+        let is_for_axis = word_is(&tokens[i], "FOR")
             && tokens
                 .get(i + 1)
-                .is_some_and(|t| word_is(t, "SYSTEM_TIME") || word_is(t, "VALID_TIME"))
-            && tokens.get(i + 2).is_some_and(|t| word_is(t, "AS"))
-            && tokens.get(i + 3).is_some_and(|t| word_is(t, "OF"));
-        if !is_qualifier {
+                .is_some_and(|t| word_is(t, "SYSTEM_TIME") || word_is(t, "VALID_TIME"));
+        if !is_for_axis {
             keep.push(tokens[i].clone());
             i += 1;
             continue;
@@ -618,15 +638,119 @@ fn lift_as_of(tokens: &mut Vec<Token>, dialect: &SteleDialect) -> Result<Vec<AsO
         } else {
             TimeDimension::System
         };
-        let (timestamp, consumed) = parse_as_of_expr(&tokens[i + 4..], dialect)?;
-        as_of.push(AsOf {
-            dimension,
-            timestamp,
-        });
-        i += 4 + consumed;
+        // The keyword after `FOR <axis>` selects the form. `rest` is the operand
+        // tokens that follow it (clamped so a truncated `FOR <axis> FROM` at the
+        // tail is an empty operand the range parser rejects, not a slice panic).
+        let keyword = tokens.get(i + 2);
+        let rest = &tokens[(i + 3).min(tokens.len())..];
+        if keyword.is_some_and(|t| word_is(t, "AS"))
+            && tokens.get(i + 3).is_some_and(|t| word_is(t, "OF"))
+        {
+            let (timestamp, consumed) = parse_as_of_expr(&tokens[i + 4..], dialect)?;
+            as_of.push(AsOf {
+                dimension,
+                timestamp,
+            });
+            i += 4 + consumed;
+        } else if keyword.is_some_and(|t| word_is(t, "FROM")) {
+            let (temporal_range, consumed) = lift_range(dimension, rest, "TO", false, dialect)?;
+            set_range(&mut range, temporal_range)?;
+            i += 3 + consumed;
+        } else if keyword.is_some_and(|t| word_is(t, "BETWEEN")) {
+            let (temporal_range, consumed) = lift_range(dimension, rest, "AND", true, dialect)?;
+            set_range(&mut range, temporal_range)?;
+            i += 3 + consumed;
+        } else {
+            // `FOR SYSTEM_TIME ALL` (out of scope, [STL-244]) and any other stray
+            // form land here — a loud error rather than a confusing `sqlparser`
+            // failure on the leftover `FOR SYSTEM_TIME` tokens.
+            return Err(ParseError::Temporal(format!(
+                "FOR {} must be followed by AS OF <expr>, FROM <a> TO <b>, or BETWEEN <a> AND <b>",
+                if matches!(dimension, TimeDimension::Valid) {
+                    "VALID_TIME"
+                } else {
+                    "SYSTEM_TIME"
+                }
+            )));
+        }
     }
     *tokens = keep;
-    Ok(as_of)
+    Ok((as_of, range))
+}
+
+/// Record a lifted range qualifier, rejecting a second one — a statement carries
+/// at most one range ([STL-244]).
+fn set_range(slot: &mut Option<TemporalRange>, range: TemporalRange) -> Result<(), ParseError> {
+    if slot.is_some() {
+        return Err(ParseError::Temporal(
+            "at most one FOR ... FROM/BETWEEN range qualifier per statement".to_string(),
+        ));
+    }
+    *slot = Some(range);
+    Ok(())
+}
+
+/// Parse a range qualifier's two bound expressions starting at `rest` (the tokens
+/// after `FOR <axis> {FROM|BETWEEN}`), with `separator` the keyword between them
+/// (`TO` for `FROM..TO`, `AND` for `BETWEEN..AND`). Returns the [`TemporalRange`]
+/// and the number of `rest` tokens consumed (the lower bound, the separator, and
+/// the upper bound).
+///
+/// The separator is located at paren-depth 0 first, so the lower bound is the run
+/// before it (parsed as one complete expression) and the upper bound the run
+/// after (parsed up to the next clause). `BETWEEN`'s `AND` would otherwise be
+/// swallowed as a boolean operator by the expression parser, so the explicit
+/// split is what keeps both forms honest.
+///
+/// # Errors
+///
+/// [`ParseError`] if the separator is absent, or either bound is missing or does
+/// not parse as a single expression.
+fn lift_range(
+    dimension: TimeDimension,
+    rest: &[Token],
+    separator: &str,
+    closed_upper: bool,
+    dialect: &SteleDialect,
+) -> Result<(TemporalRange, usize), ParseError> {
+    let sep_idx = top_level_position(rest, |t| word_is(t, separator)).ok_or_else(|| {
+        ParseError::Temporal(format!(
+            "expected `{separator}` between the two range bounds"
+        ))
+    })?;
+    let from = parse_complete_expr(&rest[..sep_idx], dialect)?;
+    let (to, to_consumed) = parse_as_of_expr(&rest[sep_idx + 1..], dialect)?;
+    Ok((
+        TemporalRange {
+            dimension,
+            from,
+            to,
+            closed_upper,
+        },
+        sep_idx + 1 + to_consumed,
+    ))
+}
+
+/// Parse `tokens` as exactly one scalar expression, requiring it to consume them
+/// all — a range's lower bound is a complete expression, so anything left over is
+/// junk.
+///
+/// # Errors
+///
+/// [`ParseError`] if the bound is empty, fails to parse, or leaves trailing
+/// tokens.
+fn parse_complete_expr(tokens: &[Token], dialect: &SteleDialect) -> Result<Expr, ParseError> {
+    if tokens.is_empty() {
+        return Err(ParseError::Temporal("a range bound is empty".to_string()));
+    }
+    let mut parser = Parser::new(dialect).with_tokens(tokens.to_vec());
+    let expr = parser.parse_expr()?;
+    if parser.peek_token().token != Token::EOF {
+        return Err(ParseError::Temporal(
+            "a range bound is not a single expression".to_string(),
+        ));
+    }
+    Ok(expr)
 }
 
 /// Parse the single expression at the head of `tokens` (the operand just after
@@ -1073,5 +1197,99 @@ mod session_tests {
             parse_one_ok("SELECT 1").body,
             StatementBody::Sql(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    fn parse_one_ok(sql: &str) -> Statement {
+        let mut stmts = parse(sql).expect("parse");
+        assert_eq!(stmts.len(), 1);
+        stmts.remove(0)
+    }
+
+    fn range(sql: &str) -> TemporalRange {
+        parse_one_ok(sql)
+            .temporal
+            .range
+            .expect("a range qualifier was lifted")
+    }
+
+    #[test]
+    fn from_to_is_half_open_and_between_is_closed() {
+        let from_to = range("SELECT * FROM t FOR SYSTEM_TIME FROM 10 TO 20");
+        assert_eq!(from_to.dimension, TimeDimension::System);
+        assert!(!from_to.closed_upper, "FROM..TO is half-open");
+
+        let between = range("SELECT * FROM t FOR SYSTEM_TIME BETWEEN 10 AND 20");
+        assert!(between.closed_upper, "BETWEEN..AND is closed");
+    }
+
+    #[test]
+    fn range_leaves_a_clean_standard_sql_body() {
+        // The qualifier is lifted off, so the body is a plain `SELECT … WHERE`.
+        let stmt = parse_one_ok("SELECT id FROM t FOR SYSTEM_TIME FROM 1 TO 9 WHERE id = 1");
+        match stmt.sql() {
+            Some(SqlStatement::Query(q)) => match q.body.as_ref() {
+                sqlparser::ast::SetExpr::Select(s) => {
+                    assert!(s.selection.is_some(), "the WHERE survives the lift");
+                }
+                other => panic!("expected a SELECT body, got {other:?}"),
+            },
+            other => panic!("expected a query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn range_bounds_accept_the_full_as_of_expression_grammar() {
+        // The bounds parse with the same grammar an `AS OF` operand does.
+        let r = range("SELECT * FROM t FOR SYSTEM_TIME FROM now() - interval '1 hour' TO now()");
+        assert!(matches!(r.from, Expr::BinaryOp { .. }));
+        assert!(matches!(r.to, Expr::Function(_)));
+    }
+
+    #[test]
+    fn between_does_not_swallow_its_and_as_a_boolean_operator() {
+        // `BETWEEN a AND b`'s `AND` is the separator, not a boolean operator over
+        // the two bounds — each bound is its own expression.
+        let r = range("SELECT * FROM t FOR SYSTEM_TIME BETWEEN 100 AND 200");
+        assert!(matches!(r.from, Expr::Value(_)));
+        assert!(matches!(r.to, Expr::Value(_)));
+    }
+
+    #[test]
+    fn a_second_range_qualifier_is_rejected() {
+        assert!(matches!(
+            parse("SELECT * FROM t FOR SYSTEM_TIME FROM 1 TO 2 FOR VALID_TIME FROM 3 TO 4"),
+            Err(ParseError::Temporal(_))
+        ));
+    }
+
+    #[test]
+    fn a_range_on_a_non_select_is_rejected() {
+        assert!(matches!(
+            parse("DELETE FROM t FOR SYSTEM_TIME FROM 1 TO 2"),
+            Err(ParseError::Temporal(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_ranges_and_unsupported_forms_are_rejected() {
+        for sql in [
+            "SELECT * FROM t FOR SYSTEM_TIME FROM 1",    // no TO bound
+            "SELECT * FROM t FOR SYSTEM_TIME FROM 1 TO", // empty upper bound
+            "SELECT * FROM t FOR SYSTEM_TIME TO 2",      // no FROM/BETWEEN
+            "SELECT * FROM t FOR SYSTEM_TIME BETWEEN 1", // no AND bound
+            "SELECT * FROM t FOR SYSTEM_TIME ALL",       // ALL is out of scope
+        ] {
+            assert!(parse(sql).is_err(), "expected a parse error for: {sql}");
+        }
+    }
+
+    #[test]
+    fn a_plain_select_has_no_range() {
+        assert!(parse_one_ok("SELECT 1").temporal.range.is_none());
     }
 }

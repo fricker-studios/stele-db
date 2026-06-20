@@ -32,11 +32,12 @@ use std::time::Duration;
 
 use stele_common::metrics::SharedMetrics;
 use stele_pgwire::SharedSession;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tracing::{debug, info, instrument, warn};
 
 use crate::admin::http::{AdminHttpResponder, HttpRequest, MAX_BODY_BYTES};
+use crate::tls::AcceptorSource;
 
 /// The path prefix the admin / control-plane HTTP gateway owns ([STL-254]).
 const ADMIN_PREFIX: &str = "/v1alpha1/";
@@ -151,12 +152,30 @@ impl OpsState {
 pub struct OpsServer {
     listen_addr: SocketAddr,
     state: Arc<OpsState>,
+    /// TLS for the listener ([STL-311]): when set, every connection (the metrics
+    /// scrape, the probes, and the `/v1alpha1` admin gateway) is encrypted with
+    /// the shared pg-wire certificate material; `None` serves plaintext (dev /
+    /// loopback, the secure-defaults posture [`crate::run`] decides).
+    tls: Option<AcceptorSource>,
 }
 
 impl OpsServer {
     #[must_use]
     pub const fn new(listen_addr: SocketAddr, state: Arc<OpsState>) -> Self {
-        Self { listen_addr, state }
+        Self {
+            listen_addr,
+            state,
+            tls: None,
+        }
+    }
+
+    /// Encrypt the listener with the shared TLS material ([STL-311]). `None`
+    /// keeps it plaintext (the default), so callers can pass the daemon's
+    /// resolved posture through unconditionally.
+    #[must_use]
+    pub fn with_tls(mut self, tls: Option<AcceptorSource>) -> Self {
+        self.tls = tls;
+        self
     }
 
     /// Bind the listen socket now, returning a [`BoundOpsServer`] whose
@@ -170,6 +189,7 @@ impl OpsServer {
             listener,
             local_addr,
             state: self.state,
+            tls: self.tls,
         })
     }
 }
@@ -179,6 +199,7 @@ pub struct BoundOpsServer {
     listener: TcpListener,
     local_addr: SocketAddr,
     state: Arc<OpsState>,
+    tls: Option<AcceptorSource>,
 }
 
 impl BoundOpsServer {
@@ -189,10 +210,14 @@ impl BoundOpsServer {
         self.local_addr
     }
 
-    /// Accept and answer connections until cancelled by the caller.
-    #[instrument(skip_all, fields(addr = %self.local_addr))]
+    /// Accept and answer connections until cancelled by the caller. When TLS is
+    /// configured ([STL-311]) every connection is handshaked before its request
+    /// is read; the handshake runs inside the per-connection task, so a stalled
+    /// peer never blocks accepting the next one.
+    #[instrument(skip_all, fields(addr = %self.local_addr, tls = self.tls.is_some()))]
     pub async fn serve(self) -> io::Result<()> {
-        info!(addr = %self.local_addr, "stele-server: ops listener up (/metrics /healthz /readyz)");
+        let scheme = if self.tls.is_some() { "https" } else { "http" };
+        info!(addr = %self.local_addr, %scheme, "stele-server: ops listener up (/metrics /healthz /readyz)");
         loop {
             let (stream, peer) = match self.listener.accept().await {
                 Ok(pair) => pair,
@@ -202,9 +227,26 @@ impl BoundOpsServer {
                 }
             };
             let state = Arc::clone(&self.state);
+            let tls = self.tls.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, state).await {
-                    debug!(%peer, error = %e, "ops connection closed with error");
+                match tls {
+                    // Plaintext: serve the raw TCP stream directly.
+                    None => {
+                        if let Err(e) = handle_connection(stream, state).await {
+                            debug!(%peer, error = %e, "ops connection closed with error");
+                        }
+                    }
+                    // TLS: handshake first, then serve the encrypted stream. A
+                    // failed handshake (a plaintext client, a rejected mTLS cert)
+                    // is logged and the connection dropped.
+                    Some(tls) => match crate::tls::handshake(tls.acceptor(), stream).await {
+                        Ok(stream) => {
+                            if let Err(e) = handle_connection(stream, state).await {
+                                debug!(%peer, error = %e, "ops connection closed with error");
+                            }
+                        }
+                        Err(e) => debug!(%peer, error = %e, "ops TLS handshake failed"),
+                    },
                 }
             });
         }
@@ -212,8 +254,13 @@ impl BoundOpsServer {
 }
 
 /// Serve exactly one request on `stream`, then close (`Connection: close` —
-/// scrapers reconnect per scrape, so keep-alive buys nothing here).
-async fn handle_connection(mut stream: TcpStream, state: Arc<OpsState>) -> io::Result<()> {
+/// scrapers reconnect per scrape, so keep-alive buys nothing here). Generic over
+/// the stream so the same path serves a raw [`tokio::net::TcpStream`] or a
+/// TLS-wrapped one ([STL-311]).
+async fn handle_connection<S>(mut stream: S, state: Arc<OpsState>) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let Some(request) = read_request(&mut stream).await? else {
         return Ok(()); // peer closed (or dribbled past a cap) before a full request
     };
@@ -233,7 +280,10 @@ struct RawRequest {
 /// body. `None` if the peer closes first, exceeds [`MAX_HEAD_BYTES`] /
 /// [`MAX_BODY_BYTES`], or stalls past [`READ_TIMEOUT`]. Body-less probes (the
 /// metrics/health scrapes) read exactly the head and return an empty body.
-async fn read_request(stream: &mut TcpStream) -> io::Result<Option<RawRequest>> {
+async fn read_request<S>(stream: &mut S) -> io::Result<Option<RawRequest>>
+where
+    S: AsyncRead + Unpin,
+{
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0u8; 512];
     // Read until the CRLFCRLF that ends the head.
@@ -396,7 +446,10 @@ fn respond(method: &str, path: &str, state: &OpsState) -> Response {
     }
 }
 
-async fn write_response(stream: &mut TcpStream, response: &Response) -> io::Result<()> {
+async fn write_response<S>(stream: &mut S, response: &Response) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     // `Allow` is mandatory on 405 (RFC 9110 §15.5.6); each route supplies the
     // methods it accepts.
     let allow = if response.allow.is_empty() {
