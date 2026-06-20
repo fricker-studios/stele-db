@@ -99,6 +99,31 @@ impl TableSchema {
         })
     }
 
+    /// Build an **ephemeral** schema for a query-local relation — a CTE or a
+    /// derived table ([STL-242]) — that is *not* registered in the catalog.
+    ///
+    /// A `WITH name AS (SELECT …)` result, or a `FROM (SELECT …) AS d` derived
+    /// table, has a real shape (its output columns' names and types) the binder
+    /// must resolve references against, but no catalog identity and no schema
+    /// evolution: it lives only for the duration of the one statement. So it
+    /// carries the **reserved** [`SchemaId(0)`](SchemaId) sentinel (never a
+    /// catalog-allocated id, which start at `1`) and the
+    /// [system-only](TableTemporal::system_only) temporal config — a query-local
+    /// relation has no valid-time period, so a `FOR VALID_TIME AS OF` over one is
+    /// the documented unsupported read. Unlike a catalog-allocated schema, the
+    /// engine never resolves an ephemeral schema's rows from storage — it
+    /// materializes the relation's defining query once and reads that.
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::DuplicateColumn`] if two output columns share a name —
+    /// names must be distinct for a reference to resolve unambiguously.
+    ///
+    /// [STL-242]: https://allegromusic.atlassian.net/browse/STL-242
+    pub fn ephemeral(columns: Vec<ColumnDef>) -> Result<Self, CatalogError> {
+        Self::new(SchemaId(0), columns, TableTemporal::system_only())
+    }
+
     /// The id segments written under this schema record in their footer.
     #[must_use]
     pub const fn schema_id(&self) -> SchemaId {
