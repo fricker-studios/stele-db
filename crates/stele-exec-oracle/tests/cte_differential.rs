@@ -153,7 +153,10 @@ fn stele_col0(engine: &mut SessionEngine<OriginClock, MemDisk>, sql: &str) -> Ve
             match ScalarValue::decode(ty, bytes).expect("decode column 0") {
                 ScalarValue::Int4(v) => i64::from(v),
                 ScalarValue::Int8(v) => v,
-                other => panic!("unexpected column-0 type: {other:?}"),
+                // Not debug-formatted: a `{:?}` of `ScalarValue` (which has a
+                // `Uuid` variant) trips CodeQL's cleartext-logging rule, a known
+                // false positive in these test panics.
+                _ => panic!("column 0 is neither INT4 nor INT8"),
             }
         })
         .collect();
