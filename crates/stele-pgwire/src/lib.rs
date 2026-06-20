@@ -873,12 +873,15 @@ fn txn_control(stmt: &Statement) -> Option<TxnControl<'_>> {
             Some(TxnControl::Begin(isolation_from_modes(modes)))
         }
         // `SET TRANSACTION ISOLATION LEVEL …` selects the level for the open block
-        // ([STL-248]); the `SESSION CHARACTERISTICS` spelling parses to the same
-        // node and is handled identically. Other `SET` variants fall through to the
-        // engine route.
-        SqlStatement::Set(Set::SetTransaction { modes, .. }) => {
-            Some(TxnControl::SetTransaction(isolation_from_modes(modes)))
-        }
+        // ([STL-248]). Only the per-transaction form (`session: false`) is
+        // transaction control; the `SET SESSION CHARACTERISTICS AS TRANSACTION …`
+        // session-default form (`session: true`), and every other `SET`, fall
+        // through to the engine route — Stele does not model session defaults.
+        SqlStatement::Set(Set::SetTransaction {
+            modes,
+            session: false,
+            ..
+        }) => Some(TxnControl::SetTransaction(isolation_from_modes(modes))),
         SqlStatement::Commit { .. } => Some(TxnControl::Commit),
         SqlStatement::Rollback {
             savepoint: None, ..
@@ -1543,13 +1546,15 @@ async fn run_non_ddl<S: Wire>(
 /// [`SessionHandle::begin_with_isolation`] so every statement reads one consistent
 /// snapshot (snapshot isolation, the `REPEATABLE READ` default) — or, under
 /// `BEGIN ISOLATION LEVEL READ COMMITTED`, re-pins per statement ([STL-248]). A
-/// `BEGIN` already inside a transaction (active or aborted) leaves the state — and
-/// the pinned snapshot and its level — untouched, as Postgres warns but stays in
-/// the block, and still reports `BEGIN`.
+/// `BEGIN` already inside a transaction (active or aborted) is a warning-only no-op
+/// in Postgres: it leaves the state — the pinned snapshot and its level — untouched
+/// and still reports `BEGIN`. The requested isolation modes are therefore
+/// interpreted **only** on the transition from idle into a new transaction; a nested
+/// `BEGIN ISOLATION LEVEL …` (even an unsupported one) is ignored, not validated.
 ///
-/// Returns whether the batch may continue: `Ok(false)` only when an unsupported
-/// `ISOLATION LEVEL` (`SERIALIZABLE`) was named — an `ErrorResponse` is written and
-/// the caller aborts the batch.
+/// Returns whether the batch may continue: `Ok(false)` only when an idle-to-active
+/// `BEGIN` named an unsupported `ISOLATION LEVEL` (`SERIALIZABLE`) — an
+/// `ErrorResponse` is written and the caller aborts the batch.
 ///
 /// [STL-174]: https://allegromusic.atlassian.net/browse/STL-174
 /// [STL-175]: https://allegromusic.atlassian.net/browse/STL-175
@@ -1560,11 +1565,14 @@ async fn run_begin<S: Wire>(
     txn: &mut ConnTxn,
     isolation: Result<Option<IsolationLevel>, &'static str>,
 ) -> Result<bool, WireError> {
-    let level = match isolation {
-        Ok(level) => level.unwrap_or_default(),
-        Err(msg) => return reject_isolation(stream, txn, msg).await,
-    };
     if matches!(txn, ConnTxn::Idle) {
+        // Only the idle-to-active transition interprets the requested level; a
+        // `BEGIN` inside an existing block ignores the modes (Postgres parity), so
+        // an unsupported level there is *not* an error.
+        let level = match isolation {
+            Ok(level) => level.unwrap_or_default(),
+            Err(msg) => return reject_isolation(stream, txn, msg).await,
+        };
         // Pin the read snapshot now, at BEGIN. The guard is taken and released
         // entirely within this synchronous call — never held across the `await`
         // below — and a poisoned mutex is recovered, as in `run_ddl`.
@@ -1581,19 +1589,36 @@ async fn run_begin<S: Wire>(
 /// `SET TRANSACTION ISOLATION LEVEL …` — select the isolation level of the open
 /// transaction block ([STL-248]).
 ///
-/// Inside an active block this changes the transaction's level in place (it takes
-/// effect from the next statement — under `READ COMMITTED` the snapshot then
-/// re-pins per statement). With no transaction open it is a warning-only no-op, as
-/// in Postgres (the next `BEGIN` chooses its own level), and a `SET` with no
-/// isolation mode (e.g. `READ ONLY` alone) is likewise accepted as a no-op. An
-/// unsupported level (`SERIALIZABLE`) is rejected. Always reports `SET`.
+/// Matches Postgres's state rules for `SET TRANSACTION`:
+/// * **Active block** — changes the transaction's level in place (it takes effect
+///   from the next statement; under `READ COMMITTED` the snapshot then re-pins per
+///   statement). A `SET` with no isolation mode (e.g. `READ ONLY` alone) is a no-op
+///   that still reports `SET`; an unsupported level (`SERIALIZABLE`) is rejected.
+/// * **No transaction open** — refused with `25P01` ("SET TRANSACTION can only be
+///   used in transaction blocks"). (The session-default form,
+///   `SET SESSION CHARACTERISTICS AS TRANSACTION …`, is not classified as
+///   transaction control and routes to the engine; Stele does not model session
+///   defaults.)
+/// * **Aborted block** — refused with `25P02`, like every other statement there,
+///   until the block ends ([STL-205]).
 ///
-/// Returns whether the batch may continue (`Ok(false)` only on the rejected level).
+/// Returns whether the batch may continue (`Ok(false)` on any of the refusals).
+///
+/// [STL-205]: https://allegromusic.atlassian.net/browse/STL-205
 async fn run_set_transaction<S: Wire>(
     stream: &mut S,
     txn: &mut ConnTxn,
     isolation: Result<Option<IsolationLevel>, &'static str>,
 ) -> Result<bool, WireError> {
+    // State takes precedence over the level, as in Postgres: an aborted block
+    // refuses everything, and `SET TRANSACTION` outside a block is invalid — both
+    // independent of which level was named.
+    if matches!(txn, ConnTxn::Failed(_)) {
+        return savepoint_in_aborted_txn(stream).await;
+    }
+    if matches!(txn, ConnTxn::Idle) {
+        return savepoint_not_in_txn(stream, "SET TRANSACTION").await;
+    }
     let level = match isolation {
         Ok(level) => level,
         Err(msg) => return reject_isolation(stream, txn, msg).await,

@@ -756,3 +756,88 @@ async fn serializable_isolation_is_rejected_not_downgraded() {
     drop(client);
     let _ = driver.await;
 }
+
+/// A `BEGIN` already inside a transaction is a warning-only no-op in Postgres, so a
+/// nested `BEGIN ISOLATION LEVEL SERIALIZABLE` is **ignored**, not validated — the
+/// modes are only interpreted on the idle-to-active transition (STL-248). The block
+/// keeps its existing level and stays open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_nested_begin_isolation_level_is_ignored_not_validated() {
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+    let (client, driver) = account_client(addr).await;
+
+    client.simple_query("BEGIN").await.expect("begin");
+    client
+        .simple_query("INSERT INTO account VALUES (1, 100)")
+        .await
+        .expect("insert in the open block");
+    // A nested BEGIN — even naming the unsupported SERIALIZABLE — is a no-op, not an
+    // error: the block is untouched and continues to a clean COMMIT.
+    client
+        .simple_query("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("a nested BEGIN ISOLATION LEVEL SERIALIZABLE is ignored, not rejected");
+    client.simple_query("COMMIT").await.expect("commit");
+
+    let after = client
+        .simple_query("SELECT id FROM account")
+        .await
+        .expect("select after commit");
+    assert_eq!(
+        ids(&after),
+        vec!["1"],
+        "the block was untouched by the nested BEGIN and committed normally"
+    );
+
+    drop(client);
+    let _ = driver.await;
+}
+
+/// `SET TRANSACTION ISOLATION LEVEL …` is only valid inside a transaction block:
+/// with none open it is refused with `25P01` (Postgres parity), not a silent no-op
+/// (STL-248); inside an **aborted** block it is refused with `25P02` like every
+/// other statement, until the block ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_transaction_is_refused_outside_a_block_and_in_an_aborted_one() {
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+    let (client, driver) = account_client(addr).await;
+
+    // (1) No transaction open — 25P01.
+    let err = client
+        .simple_query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .await
+        .expect_err("SET TRANSACTION outside a block is refused");
+    assert_eq!(
+        sqlstate(&err),
+        Some("25P01"),
+        "SET TRANSACTION can only be used in transaction blocks"
+    );
+
+    // (2) Inside an aborted block — 25P02 (refused until the block ends).
+    client.simple_query("BEGIN").await.expect("begin");
+    let err = client
+        .simple_query("INSERT INTO nope VALUES (9, 9)")
+        .await
+        .expect_err("the bad write aborts the block");
+    assert_eq!(sqlstate(&err), Some("42P01"), "unknown table");
+    let err = client
+        .simple_query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .await
+        .expect_err("SET TRANSACTION is refused in an aborted block");
+    assert_eq!(
+        sqlstate(&err),
+        Some("25P02"),
+        "commands are ignored until the aborted block ends"
+    );
+    client
+        .simple_query("ROLLBACK")
+        .await
+        .expect("rollback ends it");
+
+    drop(client);
+    let _ = driver.await;
+}
