@@ -48,6 +48,9 @@ data_dir = "/var/lib/stele"
 # key       = "/etc/stele/server.key"   # PEM private key (PKCS#8/PKCS#1/SEC1)
 # client_ca = "/etc/stele/clients.crt"  # optional: require mTLS — every client
 #                                       # must present a cert chaining to this CA
+# Hot-reload (STL-293): after a rotator rewrites cert/key in place, send SIGHUP
+# (`kill -HUP <pid>`) to swap the cert with NO restart — new connections get the
+# new cert, in-flight sessions keep theirs; a bad pair keeps the old one serving.
 
 # [auth]                         # pg-wire authentication (active; STL-252)
 # SASL SCRAM-SHA-256 (RFC 7677), the standard Postgres password exchange:

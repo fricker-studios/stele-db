@@ -23,7 +23,7 @@
 //! [STL-291]: https://allegromusic.atlassian.net/browse/STL-291
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use rustls::ServerConfig;
 use rustls::server::WebPkiClientVerifier;
@@ -181,6 +181,107 @@ impl ServerTls {
             acceptor: TlsAcceptor::from(Arc::new(config)),
             mode,
         })
+    }
+}
+
+/// A hot-swappable holder for the active [`ServerTls`]. The accept loop reads the
+/// current acceptor out of this cell once per connection (see the listener loop in
+/// `lib.rs`); a [`TlsReloader::reload`] swaps the inner `Arc` atomically. Reads are
+/// uncontended in the steady state and never held across `await`, so the `RwLock`
+/// is effectively a cheap read-mostly pointer.
+pub(crate) type SharedServerTls = Arc<RwLock<Arc<ServerTls>>>;
+
+/// Wrap an already-loaded [`ServerTls`] in a [`SharedServerTls`] cell — the
+/// static (non-reloadable) path behind [`Server::with_tls`](crate::Server::with_tls).
+pub(crate) fn shared_tls(tls: ServerTls) -> SharedServerTls {
+    Arc::new(RwLock::new(Arc::new(tls)))
+}
+
+/// Owns the live TLS material and the policy to re-read it from disk, so a running
+/// server can pick up a rotated certificate/key **without a restart** ([STL-293]).
+///
+/// STL-251 loaded the `[tls]` cert/key once into a fixed acceptor; operators with
+/// short-lived certificates (cert-manager / Let's Encrypt) had to restart to
+/// rotate. A reloader instead holds a shared, hot-swappable acceptor cell that the
+/// accept loop reads per connection, plus the [`TlsSettings`] paths needed to
+/// rebuild the acceptor on demand. The trigger (a SIGHUP handler in `stele-server`)
+/// lives with the daemon; this type is the runtime-agnostic mechanism it drives,
+/// and the unit + wire tests exercise it directly.
+///
+/// Cloning is cheap — every clone shares the same cell, so the copy the listener
+/// holds and the copy the signal handler calls [`reload`](Self::reload) on stay in
+/// lock-step.
+///
+/// # Failure posture
+/// A failed [`reload`](Self::reload) — a torn write, a non-PEM file, or a
+/// cert/key mismatch — leaves the previously loaded acceptor in place and returns
+/// the error. A bad rotation never takes the listener down.
+///
+/// [STL-293]: https://allegromusic.atlassian.net/browse/STL-293
+#[derive(Clone)]
+pub struct TlsReloader {
+    active: SharedServerTls,
+    settings: Arc<TlsSettings>,
+}
+
+impl TlsReloader {
+    /// Load the initial certificate material and build the reloader. The boot-time
+    /// error posture matches [`ServerTls::load`]: a bad pair *at startup* still
+    /// fails fast (only *subsequent* reloads keep the old material on failure).
+    ///
+    /// # Errors
+    /// Returns a [`TlsError`] when the initial load fails — see [`ServerTls::load`].
+    pub fn load(settings: TlsSettings) -> Result<Self, TlsError> {
+        let initial = ServerTls::load(&settings)?;
+        Ok(Self {
+            active: shared_tls(initial),
+            settings: Arc::new(settings),
+        })
+    }
+
+    /// The cell the [`Server`](crate::Server) reads the live acceptor out of.
+    pub(crate) fn cell(&self) -> SharedServerTls {
+        Arc::clone(&self.active)
+    }
+
+    /// The acceptor currently installed — a snapshot, as the accept loop sees it.
+    /// Test-only: the accept loop reads the cell directly, and the wire tests
+    /// observe the live cert from the client side of a real handshake.
+    #[cfg(test)]
+    pub(crate) fn current(&self) -> Arc<ServerTls> {
+        Arc::clone(&self.active.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Re-read the cert/key (and any mTLS client CA) from the configured paths and
+    /// swap the active acceptor atomically. New connections handshake with the new
+    /// certificate; connections already established keep the acceptor they used.
+    ///
+    /// On failure the active acceptor is **left untouched** — the listener keeps
+    /// serving the previously loaded material — and the error is both logged and
+    /// returned so the caller can surface it.
+    ///
+    /// # Errors
+    /// Returns a [`TlsError`] when the rotated material is unreadable / not PEM or
+    /// rustls rejects the pair. The previously loaded acceptor stays live.
+    pub fn reload(&self) -> Result<(), TlsError> {
+        match ServerTls::load(&self.settings) {
+            Ok(reloaded) => {
+                *self.active.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(reloaded);
+                tracing::info!(
+                    cert = %self.settings.cert.display(),
+                    "TLS certificate reloaded; new connections present the rotated cert"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    cert = %self.settings.cert.display(),
+                    "TLS reload failed; keeping the certificate already in use"
+                );
+                Err(error)
+            }
+        }
     }
 }
 
@@ -352,5 +453,61 @@ mod tests {
     #[test]
     fn identity_is_none_for_non_certificate_bytes() {
         assert!(identity_from_cert_der(b"this is not a certificate").is_none());
+    }
+
+    /// A self-signed server (cert, key) PEM pair for `localhost` — enough material
+    /// for [`ServerTls::load`] (which builds the acceptor, it does not verify a
+    /// chain). The end-to-end handshake across a rotation lives in tests/tls_wire.rs.
+    fn self_signed_server_pem() -> (String, String) {
+        let key = rcgen::KeyPair::generate().expect("generate key");
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
+        let cert = params.self_signed(&key).expect("self-sign");
+        (cert.pem(), key.serialize_pem())
+    }
+
+    #[test]
+    fn reloader_swaps_on_success_and_keeps_the_old_acceptor_on_failure() {
+        // STL-293: a good rotation installs a new acceptor; a broken one returns an
+        // error and leaves the live acceptor untouched (the listener never drops).
+        let dir = std::env::temp_dir().join(format!("stele-tls-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let cert_path = dir.join("server.crt");
+        let key_path = dir.join("server.key");
+
+        let (cert_a, key_a) = self_signed_server_pem();
+        std::fs::write(&cert_path, &cert_a).expect("write cert");
+        std::fs::write(&key_path, &key_a).expect("write key");
+
+        let reloader = TlsReloader::load(TlsSettings {
+            cert: cert_path.clone(),
+            key: key_path.clone(),
+            client_ca: None,
+            mode: TlsMode::Required,
+        })
+        .expect("initial load");
+        let first = reloader.current();
+
+        // A good rotation swaps the active acceptor for a freshly built one.
+        let (cert_b, key_b) = self_signed_server_pem();
+        std::fs::write(&cert_path, &cert_b).expect("rotate cert");
+        std::fs::write(&key_path, &key_b).expect("rotate key");
+        reloader.reload().expect("good reload");
+        let second = reloader.current();
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a successful reload installs a new acceptor"
+        );
+
+        // A broken rotation (non-PEM cert, e.g. a torn write) fails and keeps the
+        // acceptor that was already serving.
+        std::fs::write(&cert_path, b"not a certificate").expect("corrupt cert");
+        reloader
+            .reload()
+            .expect_err("a broken pair must not swap in");
+        let third = reloader.current();
+        assert!(
+            Arc::ptr_eq(&second, &third),
+            "a failed reload keeps the previously loaded acceptor"
+        );
     }
 }
