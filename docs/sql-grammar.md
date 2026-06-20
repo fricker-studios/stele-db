@@ -74,6 +74,25 @@ point names both. A `VALID_TIME AS OF` against a table with no valid-time period
 is rejected at bind time (`SelectError::ValidTimeUnsupported`) — there is no valid
 axis to travel.
 
+**Over a `JOIN` (STL-243).** A `FOR … AS OF` on either axis applies to a two-table
+join too, and the rule is one **consistent `(sys, valid)` snapshot across the whole
+query** — every input is read at the *same* pinned point
+([docs/16 §8](16-bitemporal-semantics.md#8-temporal-joins)). v0.3 supports the
+**statement-level** form (`SELECT … FROM a JOIN b … FOR SYSTEM_TIME AS OF s
+[FOR VALID_TIME AS OF v]`), which applies to all inputs; this is the floor. At most
+**one qualifier per axis per statement** is allowed: every `FOR … AS OF` is lifted
+off the token stream regardless of placement, so the SQL:2011 *per-table* spelling
+(`FROM a FOR SYSTEM_TIME AS OF s JOIN b …`) is just syntactic sugar for that single
+statement-level pin. Writing the qualifier on *both* inputs is rejected
+(`SelectError::MultipleAsOf`) **even when the two name the same instant** — the
+binder rejects a repeated axis by count, not by value — so joining inputs at
+distinct points (`a FOR SYSTEM_TIME AS OF s1 JOIN b FOR SYSTEM_TIME AS OF s2`) is
+out of scope a fortiori. A `FOR VALID_TIME AS OF` pin requires **every** input to
+have a valid axis; a system-only side (a plain table, or a CTE / derived table) is
+rejected (`ValidTimeUnsupported`), since the pin cannot travel an axis that side
+lacks. Inner / left / semi / anti joins are covered; a `WHERE` / aggregate over a
+join, and `RIGHT` / `FULL` joins, remain follow-ups (STL-264, STL-172).
+
 ### `SET stele.{system,valid}_time` — session time context (STL-246)
 
 ```sql
@@ -112,8 +131,9 @@ A connection can pin its read snapshot on either axis so **every** subsequent ba
   block's reads time-travel exactly as an explicit `AS OF` does there — so under a
   system pin, read-your-own-writes is suppressed (a past read shows only committed
   history), while a valid pin keeps it ([STL-203], [STL-223]). The pin does **not**
-  apply over a `JOIN` (joins do not yet time-travel — [STL-243]); a join under a
-  pin reads live.
+  apply over a `JOIN`: a join honors an *explicit* `FOR … AS OF` ([STL-243]), but
+  session-pin *injection* over a join stays deferred — a valid-axis pin could land
+  on a system-only input and error — so a join under a pin reads live.
 * **Tolerant `SET`.** Every variable other than the two `stele.*` time variables is
   accepted as a **no-op** (reported `SET`/`RESET`). This lets a stock Postgres
   driver's connect-time preamble — pgjdbc's `extra_float_digits` /
@@ -367,8 +387,9 @@ WHERE → [GROUP BY/aggregates] → DISTINCT → ORDER BY → OFFSET → LIMIT
 
 Result shaping over a **join** read is rejected (`ORDER BY`/`LIMIT`/`DISTINCT`
 over a `JOIN`, the same posture as `WHERE` and aggregates over a join) — join
-composability is STL-264. Top-N pushdown and sort spill are performance work,
-deliberately out of v0.3 scope.
+composability is STL-264. (A `FOR … AS OF` over a join is the exception: it binds
+and executes, since time-travel over a join is a defined v0.3 behavior — STL-243.)
+Top-N pushdown and sort spill are performance work, deliberately out of v0.3 scope.
 
 ### Default row cap on the simple-query path (STL-306)
 

@@ -1103,7 +1103,8 @@ fn bind_select_scoped(
     // rejected over a join rather than silently dropped.
     if let Some(join) = detect_join(select)? {
         reject_shaping_over_join(query, select)?;
-        let (mut bound, mut side_ctes) = bind_join(stmt, ctx, select, join, &sigs)?;
+        let (mut bound, mut side_ctes) =
+            bind_join(stmt, ctx, select, join, &sigs, snapshot, valid_snapshot)?;
         // The `WITH` relations materialize first (a derived join side may reference
         // one), then any derived tables the join sides introduced.
         ctes.append(&mut side_ctes);
@@ -1938,24 +1939,32 @@ fn detect_join(select: &Select) -> Result<Option<&TableWithJoins>, SelectError> 
 /// Bind a two-table `JOIN` `SELECT` into a [`BoundSelect`] carrying a
 /// [`BoundJoin`] ([STL-172]).
 ///
-/// Resolves both tables at the transaction snapshot, lowers the join operator to a
+/// Resolves both tables at the statement's `(sys, valid)` snapshot — the single
+/// per-statement pin every input reads at (docs/16 §8: a temporal join takes one
+/// consistent snapshot across the query) — lowers the join operator to a
 /// [`JoinType`], binds the `ON left.col = right.col` equi-condition to a key column
 /// per side, and binds the projection to output columns drawn from the two sides.
-/// A `WHERE` / aggregate / `FOR … AS OF` *over* the join, and `RIGHT` / `FULL` /
-/// `CROSS` joins, are rejected (each a tracked follow-up) rather than mis-bound.
+///
+/// A `FOR … AS OF` qualifier on *either* axis is honored ([STL-243]): it is the
+/// statement-level pin lifted off the token stream ([STL-162]), applied to every
+/// input. (`resolve_snapshots` already rejects two qualifiers on one axis, so a
+/// per-input "different instant per table" join cannot reach here.) A `FOR
+/// VALID_TIME AS OF` pin is meaningful only where every input has a valid axis, so
+/// a system-only side under one is rejected, mirroring the single-table
+/// [`SelectError::ValidTimeUnsupported`]. A `WHERE` / aggregate / period predicate
+/// *over* the join, and `RIGHT` / `FULL` / `CROSS` joins, stay rejected (each a
+/// tracked follow-up) rather than mis-bound.
 fn bind_join<'a>(
     stmt: &Statement,
     ctx: &'a BindContext<'a>,
     select: &'a Select,
     from: &'a TableWithJoins,
     sigs: &[CteSig],
+    snapshot: SystemTimeMicros,
+    valid_snapshot: Option<SystemTimeMicros>,
 ) -> Result<(BoundSelect, Vec<BoundCte>), SelectError> {
-    // Clauses v0.2 does not yet support over a join: rejected, never dropped.
-    if !stmt.temporal.as_of.is_empty() {
-        return Err(SelectError::UnsupportedJoin(
-            "FOR … AS OF over a JOIN".to_owned(),
-        ));
-    }
+    // Clauses v0.3 does not yet support over a join: rejected, never dropped. (A
+    // `FOR … AS OF` on either axis *is* threaded — [STL-243].)
     if stmt.temporal.period_predicate.is_some() {
         return Err(SelectError::UnsupportedJoin(
             "a period predicate over a JOIN".to_owned(),
@@ -1972,14 +1981,29 @@ fn bind_join<'a>(
         ));
     }
 
-    let snapshot = ctx.snapshot;
     let join_ast: &Join = &from.joins[0];
     let (join_type, constraint) = join_kind_and_constraint(&join_ast.join_operator)?;
 
     // Either side may be a base table, a CTE in scope, or a derived table ([STL-242]);
-    // a derived side is bound into a single-use CTE the query must register.
+    // a derived side is bound into a single-use CTE the query must register. Both
+    // resolve at the *statement* snapshot, so a `FOR SYSTEM_TIME AS OF s` travels
+    // each input's schema to the same instant.
     let (left, left_cte) = resolve_join_side(&from.relation, ctx, snapshot, sigs)?;
     let (right, right_cte) = resolve_join_side(&join_ast.relation, ctx, snapshot, sigs)?;
+
+    // A `FOR VALID_TIME AS OF v` pin only travels an input that has a valid axis; a
+    // system-only side (a base table without `VALID TIME`, or a CTE / derived
+    // table, whose ephemeral schema is always system-only) has none, so reject
+    // rather than silently ignore the pin on that side ([STL-243], docs/16 §8).
+    if valid_snapshot.is_some() {
+        for side in [&left, &right] {
+            if !side.schema.temporal().valid_time_enabled() {
+                return Err(SelectError::ValidTimeUnsupported {
+                    table: side.table.to_owned(),
+                });
+            }
+        }
+    }
 
     let (left_key, right_key) = bind_join_condition(constraint, &left, &right)?;
     let (output, columns) = bind_join_projection(select, join_type, &left, &right)?;
@@ -1994,7 +2018,7 @@ fn bind_join<'a>(
         table: String::new(),
         schema_id: left.schema.schema_id(),
         snapshot,
-        valid_snapshot: None,
+        valid_snapshot,
         projection: Projection::All,
         filter: None,
         period_filter: None,
@@ -2579,13 +2603,15 @@ fn select_table_alias(select: &Select) -> Option<&str> {
 /// applied here. A system-only inner has no valid axis to pin (it is left
 /// unpinned — there is no valid axis to travel).
 ///
-/// A **join** inner is the one case that **fails closed**: the executor's join
-/// path (STL-172) cannot carry a valid-time pin, so an outer `FOR VALID_TIME
-/// AS OF` over a subquery that joins tables would read the join's valid-time
-/// sides *unpinned* — silently violating the one-snapshot-per-statement rule.
-/// Rather than return rows from the wrong valid slice, it is rejected
-/// ([`SelectError::Subquery`]) until joins can apply a valid pin (a tracked
-/// follow-up alongside the other clauses-over-a-join, STL-264).
+/// A **join** inner is the one case that **fails closed**. A direct join now
+/// carries a valid-time pin ([STL-243], applied + side-validated in
+/// [`bind_join`]), but *this* path sets the pin on an already-bound join plan
+/// without re-checking that each side has a valid axis — and the subquery + join
+/// composition is itself not yet wired ([STL-264]). Rather than set a pin that
+/// might land on a system-only join side, or read the join's valid-time sides
+/// *unpinned* (silently violating the one-snapshot-per-statement rule), an outer
+/// `FOR VALID_TIME AS OF` over a subquery that joins tables is rejected
+/// ([`SelectError::Subquery`]) until that composition lands.
 fn inherit_valid_snapshot(
     inner: &mut BoundSelect,
     outer_valid: Option<SystemTimeMicros>,
@@ -2597,7 +2623,8 @@ fn inherit_valid_snapshot(
     if inner.join.is_some() {
         return Err(SelectError::Subquery(
             "a FOR VALID_TIME AS OF read cannot pin the valid axis of a subquery that joins \
-             tables (the join path carries no valid-time pin yet)"
+             tables (inheriting an outer valid pin into a joined subquery is not wired yet — \
+             STL-264)"
                 .to_owned(),
         ));
     }
@@ -3976,9 +4003,12 @@ pub fn cap_unbounded_select(stmt: &mut Statement, max_rows: u64) {
 /// Deliberately narrow, mirroring [`cap_unbounded_select`]:
 /// * **Plain single-table reads only.** A `JOIN`, a table-valued introspection
 ///   call (`stele_history('t')`), a set operation, and a `FROM`-less constant
-///   `SELECT` are left untouched — a `JOIN`/TVF rejects `AS OF`, so injecting one
-///   would turn a working query into an error. The session pin simply does not
-///   apply over a join (joins do not yet time-travel — see [STL-243]).
+///   `SELECT` are left untouched. A `JOIN` now honors an *explicit* `FOR … AS OF`
+///   on either axis ([STL-243]), but session-pin *injection* over a join stays
+///   deferred: a valid-axis pin requires every input to have a valid axis, so
+///   blanket-injecting one would turn a working join over a system-only table into
+///   an error. A TVF still rejects `AS OF` outright. The session pin therefore
+///   does not apply over a join (it reads live).
 /// * **Per-axis, explicit wins.** An axis the statement already qualifies with its
 ///   own `FOR <dim> AS OF` keeps that qualifier; the session pin fills only the
 ///   axes left unqualified.
@@ -5806,6 +5836,113 @@ mod tests {
         }
     }
 
+    /// Two valid-time tables sharing a key column, plus a system-only one — the
+    /// mixed shapes a bitemporal join's `AS OF` binding must distinguish ([STL-243]).
+    fn catalog_with_bitemporal_join_tables() -> Catalog {
+        let mut catalog = Catalog::new();
+        for name in ["la", "lb"] {
+            catalog
+                .create_table(
+                    name,
+                    vec![
+                        ColumnDef::new("k", LogicalType::Int4).expect("col"),
+                        ColumnDef::new("v", LogicalType::Int4).expect("col"),
+                        ColumnDef::new("vf", LogicalType::Timestamp).expect("col"),
+                        ColumnDef::new("vt", LogicalType::Timestamp).expect("col"),
+                    ],
+                    TableTemporal::with_valid_time(ValidTimeSpec::new("vf", "vt").expect("spec")),
+                    SystemTimeMicros(1_000),
+                )
+                .expect("create valid-time table");
+        }
+        catalog
+            .create_table(
+                "sys",
+                vec![
+                    ColumnDef::new("k", LogicalType::Int4).expect("col"),
+                    ColumnDef::new("v", LogicalType::Int4).expect("col"),
+                ],
+                TableTemporal::system_only(),
+                SystemTimeMicros(1_000),
+            )
+            .expect("create system-only table");
+        catalog
+    }
+
+    #[test]
+    fn both_axes_as_of_over_a_join_pins_every_input() {
+        // The headline ([STL-243]): a `FOR SYSTEM_TIME AS OF s FOR VALID_TIME AS OF v`
+        // over a join carries one statement-level `(sys, valid)` pin every input
+        // reads at (docs/16 §8) — no longer rejected.
+        let catalog = catalog_with_bitemporal_join_tables();
+        let bound = bind(
+            "SELECT la.k, lb.v FROM la JOIN lb ON la.k = lb.k \
+             FOR SYSTEM_TIME AS OF 5000 FOR VALID_TIME AS OF 25",
+            &catalog,
+        )
+        .expect("bind both-axes AS OF join");
+        assert!(bound.join.is_some(), "the join plan is set");
+        assert_eq!(bound.snapshot, SystemTimeMicros(5_000));
+        assert_eq!(bound.valid_snapshot, Some(SystemTimeMicros(25)));
+    }
+
+    #[test]
+    fn a_system_time_as_of_over_a_join_pins_only_the_system_axis() {
+        // A system-axis pin needs no valid axis, so it binds over plain
+        // system-only join tables; the valid axis stays unset.
+        let catalog = catalog_with_join_tables();
+        let bound = bind(
+            "SELECT users.id FROM users JOIN orders ON users.id = orders.uid \
+             FOR SYSTEM_TIME AS OF 5000",
+            &catalog,
+        )
+        .expect("bind system-axis AS OF join");
+        assert_eq!(bound.snapshot, SystemTimeMicros(5_000));
+        assert_eq!(bound.valid_snapshot, None);
+    }
+
+    #[test]
+    fn a_valid_time_pin_over_a_system_only_join_side_is_rejected() {
+        // `la` has a valid axis but `sys` does not; a `FOR VALID_TIME AS OF` pin
+        // must travel *every* input, so the system-only side is rejected rather
+        // than read at the wrong valid slice — mirroring the single-table rule.
+        let catalog = catalog_with_bitemporal_join_tables();
+        let err = bind(
+            "SELECT la.k FROM la JOIN sys ON la.k = sys.k FOR VALID_TIME AS OF 25",
+            &catalog,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SelectError::ValidTimeUnsupported { table } if table == "sys"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn two_system_qualifiers_across_join_inputs_are_rejected() {
+        // The per-table SQL:2011 form is sugar for one statement-level pin
+        // ([STL-243] — the v0.3 floor). The parser lifts both qualifiers regardless
+        // of placement, and the binder rejects a repeated axis by *count*, not
+        // value: two `SYSTEM_TIME` qualifiers are `MultipleAsOf` whether they name
+        // different instants or the same one.
+        let catalog = catalog_with_join_tables();
+        for sql in [
+            "SELECT users.id FROM users FOR SYSTEM_TIME AS OF 5000 \
+             JOIN orders FOR SYSTEM_TIME AS OF 6000 ON users.id = orders.uid",
+            // Same instant on both inputs — still two qualifiers, still rejected.
+            "SELECT users.id FROM users FOR SYSTEM_TIME AS OF 5000 \
+             JOIN orders FOR SYSTEM_TIME AS OF 5000 ON users.id = orders.uid",
+        ] {
+            assert!(
+                matches!(
+                    bind(sql, &catalog),
+                    Err(SelectError::MultipleAsOf(TimeDimension::System))
+                ),
+                "expected MultipleAsOf for: {sql}"
+            );
+        }
+    }
+
     #[test]
     fn unsupported_join_conditions_are_rejected() {
         let catalog = catalog_with_join_tables();
@@ -6045,9 +6182,10 @@ mod tests {
 
     #[test]
     fn rejects_a_valid_time_pin_over_a_join_subquery() {
-        // A subquery that joins tables cannot inherit the outer's FOR VALID_TIME
-        // AS OF pin (the join path carries no valid-time pin yet), so it fails
-        // closed rather than reading the join's valid-time sides unpinned.
+        // A direct join now time-travels ([STL-243]), but inheriting the outer's
+        // FOR VALID_TIME AS OF pin into a subquery that joins tables is a separate
+        // composition ([STL-264]); until it lands the subquery fails closed rather
+        // than pinning a side that may have no valid axis.
         let mut catalog = Catalog::new();
         catalog
             .create_table(
@@ -6157,8 +6295,9 @@ mod tests {
 
     #[test]
     fn session_time_does_not_touch_joins_or_non_selects() {
-        // A JOIN rejects `AS OF`, so the pin must leave it untouched (read live),
-        // not turn it into an error.
+        // A JOIN honors an explicit `AS OF` ([STL-243]) but session-pin injection
+        // over a join stays deferred (a valid-axis pin would error over a
+        // system-only input), so the pin must leave it untouched (read live).
         let mut join = parse_one("SELECT a.x FROM a JOIN b ON a.id = b.id");
         apply_session_time(&mut join, Some(SystemTimeMicros(111)), None);
         assert!(join.temporal.as_of.is_empty());
