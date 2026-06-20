@@ -999,9 +999,11 @@ const fn map_isolation(iso: TransactionIsolationLevel) -> Result<IsolationLevel,
     }
 }
 
-// The `user` field starts empty and is recorded once SCRAM authentication
-// succeeds, so the connection span carries the *authenticated* identity
-// (STL-107 × STL-252) — never the unverified startup parameter.
+// The span's `user` field starts empty and is filled in `run_session`: the
+// SCRAM-verified user under `scram` (STL-107 × STL-252), or the startup `user`
+// taken on faith under `trust`. `cert_identity` carries the verified mTLS client
+// identity when the peer presented a certificate (STL-291) — the authenticated
+// counterpart to a `trust` `user`.
 #[instrument(skip(stream, session, tls, auth, metrics), fields(%peer, user = tracing::field::Empty, cert_identity = tracing::field::Empty))]
 async fn handle_connection(
     stream: TcpStream,

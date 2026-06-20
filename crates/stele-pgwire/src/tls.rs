@@ -198,7 +198,8 @@ impl ServerTls {
 /// The `name` is the certificate's subject **Common Name** when present — the
 /// field Postgres `cert` authentication maps onto a user — and otherwise the
 /// first **Subject Alternative Name** (a DNS name, e-mail, or URI). A
-/// certificate that carries neither names no principal and yields `None`.
+/// certificate carrying neither a CN nor a usable SAN names no principal, so it
+/// yields `None`.
 ///
 /// [STL-291]: https://allegromusic.atlassian.net/browse/STL-291
 #[derive(Debug, Clone, PartialEq, Eq)]

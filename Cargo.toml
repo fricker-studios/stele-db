@@ -117,9 +117,13 @@ rcgen              = { version = "0.14", default-features = false, features = ["
 # handshake it already verified; turning that into a name needs an X.509 parser.
 # Already resolved in the lockfile (rcgen's optional `x509-parser` feature pins the
 # same 0.18.1, MIT/Apache-2.0), so naming it directly only *activates* an
-# already-vetted crate. Default features are empty — we parse, never verify (the
-# chain was already checked by rustls), so this pulls no `ring`/`aws-lc` provider.
-x509-parser        = "0.18"
+# already-vetted crate. `default-features = false`: x509-parser's `ring` /
+# `aws-lc-rs` are optional, gated behind its `verify` / `verify-aws` features —
+# the lockfile lists them, but they are NOT compiled (we parse, never verify; the
+# chain was already checked by rustls). `cargo tree -i x509-parser` confirms it
+# pulls only the parse stack (asn1-rs / der-parser / oid-registry / nom / time),
+# all already in the tree. Disabling defaults guards against a future default too.
+x509-parser        = { version = "0.18", default-features = false }
 # Dev-only: a real Postgres client driving the pgwire front end end-to-end in an
 # integration test (STL-147 DoD). Never a runtime dependency of a shipped crate.
 tokio-postgres     = "0.7"
