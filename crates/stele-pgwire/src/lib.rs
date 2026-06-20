@@ -113,7 +113,7 @@ use stele_common::hashkey::hash_key;
 use stele_common::metrics::SharedMetrics;
 use stele_common::provenance::Principal;
 use stele_common::scram::ScramVerifier;
-use stele_common::time::Clock;
+use stele_common::time::{Clock, SystemTimeMicros};
 use stele_common::types::{DecodeError, LogicalType, ScalarValue};
 use stele_engine::{
     DmlSummary, EngineError, IsolationLevel, SelectResult, SessionEngine, SessionTransaction,
@@ -129,7 +129,8 @@ use stele_sql::sqlparser::ast::{
     Statement as SqlStatement, TransactionIsolationLevel, TransactionMode, UnaryOperator, Value,
 };
 use stele_sql::{
-    BindError, CopyError, CopyShape, DmlError, Statement, bind_ddl, cap_unbounded_select,
+    BindError, CopyError, CopyShape, DmlError, SessionCommand, Statement, StatementBody,
+    TimeDimension, apply_session_time, bind_ddl, cap_unbounded_select,
 };
 
 use pg_catalog::Introspection;
@@ -460,6 +461,19 @@ pub trait SessionHandle: Send {
     fn set_principal(&mut self, principal: Principal) {
         let _ = principal;
     }
+
+    /// Resolve a `SET stele.{system,valid}_time = <expr>` value to a concrete
+    /// instant ([STL-246]); see [`SessionEngine::resolve_session_time`]. Folds the
+    /// expression like a `FOR … AS OF` operand against the engine's clock, so the
+    /// per-connection session layer can pin it and replay it as an explicit `AS OF`
+    /// on each read. Defaults to "unsupported" so session fakes that serve no time
+    /// travel need not implement it.
+    fn resolve_session_time(&self, value: &Expr) -> Result<SystemTimeMicros, EngineError> {
+        let _ = value;
+        Err(EngineError::Unsupported(
+            "session time context not supported by this session",
+        ))
+    }
 }
 
 impl<C, D> SessionHandle for SessionEngine<C, D>
@@ -473,6 +487,10 @@ where
 
     fn set_principal(&mut self, principal: Principal) {
         Self::set_principal(self, principal);
+    }
+
+    fn resolve_session_time(&self, value: &Expr) -> Result<SystemTimeMicros, EngineError> {
+        Self::resolve_session_time(self, value)
     }
 
     fn describe_live_tables(&self) -> Vec<TableDescription> {
@@ -837,6 +855,49 @@ impl ConnTxn {
     }
 }
 
+/// A connection's **session time context** ([STL-246]): the per-axis read snapshot
+/// a `SET stele.{system,valid}_time` has pinned, or `None` for live reads on that
+/// axis.
+///
+/// Like [`ConnTxn`], it lives on the connection task's stack — never on the shared
+/// engine — so each connection's time travel is independent. A read replays the
+/// pinned instants as an explicit `FOR <dim> AS OF` qualifier
+/// ([`apply_session_time`]) just before dispatch, so a session-pinned read is the
+/// explicit-`AS OF` read by construction. It is **session** state, not
+/// transactional: a pin set inside a `BEGIN` block survives a `ROLLBACK`
+/// (`SET LOCAL` — which would not — is out of scope), matching Postgres `SET`.
+#[derive(Debug, Clone, Copy, Default)]
+struct SessionTime {
+    /// The pinned system-time instant, or `None` for live system-time reads.
+    system: Option<SystemTimeMicros>,
+    /// The pinned valid-time instant, or `None` for no valid-time filter.
+    valid: Option<SystemTimeMicros>,
+}
+
+impl SessionTime {
+    /// Whether either axis is pinned — the cheap guard the read path checks before
+    /// cloning a statement to inject the qualifiers.
+    const fn is_set(&self) -> bool {
+        self.system.is_some() || self.valid.is_some()
+    }
+
+    /// Pin one axis to `micros`.
+    const fn set(&mut self, dimension: TimeDimension, micros: SystemTimeMicros) {
+        match dimension {
+            TimeDimension::System => self.system = Some(micros),
+            TimeDimension::Valid => self.valid = Some(micros),
+        }
+    }
+
+    /// Clear one axis, restoring live reads on it.
+    const fn reset(&mut self, dimension: TimeDimension) {
+        match dimension {
+            TimeDimension::System => self.system = None,
+            TimeDimension::Valid => self.valid = None,
+        }
+    }
+}
+
 /// The transaction-control statements the front end handles itself rather than
 /// routing to the engine ([STL-174], savepoints [STL-176]). These manage the
 /// connection's `txn` state and never reach the engine's routing.
@@ -1050,7 +1111,7 @@ async fn negotiate_startup(
 // making it clearer — the same call made for `handle_simple_query`. (The
 // flush-before-read added for the TLS reply deadlock nudged it one over the
 // threshold; the shape is unchanged.)
-#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn run_session<S: Wire>(
     stream: &mut S,
     startup: StartupMessage,
@@ -1103,6 +1164,12 @@ async fn run_session<S: Wire>(
     // connection (STL-174).
     let mut txn = ConnTxn::Idle;
 
+    // The connection's session time context ([STL-246]): the snapshot a
+    // `SET stele.{system,valid}_time` pins for subsequent reads. Like `txn`, it
+    // lives here on the connection task — not the shared engine — and persists for
+    // the connection's life until `RESET` (or session end).
+    let mut session_time = SessionTime::default();
+
     // --- 4. Message loop --------------------------------------------------
     // The extended-query caches (prepared statements + portals) and the
     // "skip until Sync" error latch live for the whole connection.
@@ -1154,6 +1221,7 @@ async fn run_session<S: Wire>(
                     &session,
                     &mut txn,
                     &principal,
+                    &mut session_time,
                 )
                 .await?;
             }
@@ -1165,6 +1233,7 @@ async fn run_session<S: Wire>(
                     &session,
                     &mut txn,
                     &principal,
+                    &mut session_time,
                 )
                 .await?;
             }
@@ -1211,6 +1280,7 @@ async fn run_session<S: Wire>(
                     metrics,
                     &principal,
                     stats_enabled,
+                    &mut session_time,
                 )
                 .await?;
                 write_ready_for_query(stream, txn.status_byte()).await?;
@@ -1354,7 +1424,11 @@ struct ResultColumn {
 /// automated consumer already fetches exactly what it asked for.
 const SIMPLE_QUERY_ROW_CAP: u64 = 1000;
 
-#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    clippy::too_many_arguments
+)]
 async fn handle_simple_query<S: Wire>(
     stream: &mut S,
     sql: &str,
@@ -1363,6 +1437,7 @@ async fn handle_simple_query<S: Wire>(
     metrics: &SharedMetrics,
     principal: &Principal,
     stats_enabled: bool,
+    session_time: &mut SessionTime,
 ) -> Result<(), WireError> {
     if sql.trim().is_empty() {
         debug!("empty simple query");
@@ -1442,6 +1517,18 @@ async fn handle_simple_query<S: Wire>(
             return Ok(());
         }
 
+        // (0b2) `SET` / `RESET` — per-connection session state ([STL-246]): pin or
+        // clear the time context, or tolerate a driver's connect-time preamble
+        // ([STL-184]). Handled here, never routed to the engine. A failed resolve
+        // (`SET stele.system_time = <bad>`) aborts the batch like any statement error.
+        if let StatementBody::Session(cmd) = &stmt.body {
+            if !run_session_command(stream, cmd, session, session_time).await? {
+                txn.mark_failed();
+                return Ok(());
+            }
+            continue;
+        }
+
         // (0c) `COPY ... FROM STDIN` — the bulk-load sub-protocol ([STL-236]).
         // It reads its own `CopyData` stream off the wire, so it is driven here
         // rather than routed through the engine's statement router. The trailing
@@ -1493,7 +1580,17 @@ async fn handle_simple_query<S: Wire>(
                 // `DELETE` — routed inline or through the session engine. On an
                 // error the reply is already on the wire and the batch aborts
                 // (Postgres stops on the first error), like the DDL arm above.
-                if !run_non_ddl(stream, stmt, session, txn, principal, stats_enabled).await? {
+                if !run_non_ddl(
+                    stream,
+                    stmt,
+                    session,
+                    txn,
+                    principal,
+                    stats_enabled,
+                    *session_time,
+                )
+                .await?
+                {
                     txn.mark_failed();
                     return Ok(());
                 }
@@ -1528,6 +1625,7 @@ async fn run_non_ddl<S: Wire>(
     txn: &mut ConnTxn,
     principal: &Principal,
     stats_enabled: bool,
+    session_time: SessionTime,
 ) -> Result<bool, WireError> {
     if let Some(columns) = constant_select(stmt) {
         write_row_description(stream, &columns, &[]).await?;
@@ -1536,7 +1634,16 @@ async fn run_non_ddl<S: Wire>(
         return Ok(true);
     }
     cap_unbounded_select(stmt, SIMPLE_QUERY_ROW_CAP);
-    run_statement(stream, stmt, session, txn, principal, stats_enabled).await
+    run_statement(
+        stream,
+        stmt,
+        session,
+        txn,
+        principal,
+        stats_enabled,
+        session_time,
+    )
+    .await
 }
 
 /// `BEGIN` / `START TRANSACTION` — open an explicit transaction block ([STL-174]).
@@ -1928,8 +2035,9 @@ async fn run_statement<S: Wire>(
     txn: &mut ConnTxn,
     principal: &Principal,
     stats_enabled: bool,
+    session_time: SessionTime,
 ) -> Result<bool, WireError> {
-    match run_query(session, stmt, txn, principal) {
+    match run_query(session, stmt, txn, principal, session_time) {
         Ok(StatementOutcome::Rows(result)) => match decode_result_rows(&result) {
             Ok(data_rows) => {
                 write_row_description(stream, &result_header(&result), &[]).await?;
@@ -1992,6 +2100,7 @@ fn run_query(
     stmt: &Statement,
     txn: &mut ConnTxn,
     principal: &Principal,
+    session_time: SessionTime,
 ) -> Result<StatementOutcome, EngineError> {
     let mut engine = session.lock().unwrap_or_else(PoisonError::into_inner);
     // Stamp this connection's identity before dispatch, under the same lock, so an
@@ -1999,11 +2108,82 @@ fn run_query(
     // buffered write in an open block stamps at `COMMIT` instead (see `commit_txn`),
     // but setting it here too keeps the path uniform and harmless.
     engine.set_principal(principal.clone());
+    // Replay the session time context ([STL-246]) as an explicit `FOR … AS OF` on a
+    // bare single-table read, the one choke point both the simple- and
+    // extended-query paths funnel through. The engine then resolves a session-pinned
+    // read byte-for-byte like the explicit-`AS OF` form (`apply_session_time` is a
+    // no-op for writes, joins, and statements that already qualify an axis). Clone
+    // only when an axis is actually pinned.
+    let pinned = session_time.is_set().then(|| {
+        let mut owned = stmt.clone();
+        apply_session_time(&mut owned, session_time.system, session_time.valid);
+        owned
+    });
+    let stmt = pinned.as_ref().unwrap_or(stmt);
     match txn {
         ConnTxn::Active(buffered) => engine.execute_in_txn(stmt, buffered),
         // `Idle` auto-commits; `Failed` never reaches here (the dispatch refuses
         // statements in an aborted block before routing).
         ConnTxn::Idle | ConnTxn::Failed(_) => engine.execute(stmt),
+    }
+}
+
+/// Apply a `SET` / `RESET` to the connection's [`SessionTime`] context ([STL-246]),
+/// returning the `CommandComplete` tag (`SET` / `RESET`).
+///
+/// A `SET stele.{system,valid}_time` value is resolved to a concrete instant by the
+/// engine (briefly locking it for its clock — the same fold a `FOR … AS OF` operand
+/// gets), then pinned; `RESET` clears an axis (or both, for `RESET ALL`); any other
+/// variable is a tolerated no-op so a driver's connect-time preamble does not error.
+/// Shared by the simple- and extended-query paths.
+fn apply_session_command(
+    cmd: &SessionCommand,
+    session: &SharedSession,
+    session_time: &mut SessionTime,
+) -> Result<&'static str, EngineError> {
+    match cmd {
+        SessionCommand::SetTime { dimension, value } => {
+            // Lock the shared engine only to fold the value against its clock; the
+            // pin itself lives in this connection's `session_time`, not the engine.
+            let micros = session
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .resolve_session_time(value)?;
+            session_time.set(*dimension, micros);
+            Ok("SET")
+        }
+        SessionCommand::ResetTime { dimension } => {
+            session_time.reset(*dimension);
+            Ok("RESET")
+        }
+        SessionCommand::ResetAll => {
+            *session_time = SessionTime::default();
+            Ok("RESET")
+        }
+        SessionCommand::Tolerated { is_reset, .. } => Ok(if *is_reset { "RESET" } else { "SET" }),
+    }
+}
+
+/// Handle a `SET` / `RESET` on the simple-query path: apply it to the session time
+/// context and reply `CommandComplete`, or write an `ErrorResponse` (and return
+/// `false`, aborting the batch) if a `SET stele.<axis>_time` value cannot be
+/// resolved ([STL-246]).
+async fn run_session_command<S: Wire>(
+    stream: &mut S,
+    cmd: &SessionCommand,
+    session: &SharedSession,
+    session_time: &mut SessionTime,
+) -> Result<bool, WireError> {
+    match apply_session_command(cmd, session, session_time) {
+        Ok(tag) => {
+            write_command_complete_tag(stream, tag).await?;
+            Ok(true)
+        }
+        Err(e) => {
+            info!(error = %e, "SET failed");
+            write_error_response(stream, "ERROR", sqlstate_for_query(&e), &e.to_string()).await?;
+            Ok(false)
+        }
     }
 }
 
@@ -2727,7 +2907,20 @@ fn execute_stmt(
     stmt: &Statement,
     txn: &mut ConnTxn,
     principal: &Principal,
+    session_time: &mut SessionTime,
 ) -> Result<Executed, ExecError> {
+    // `SET` / `RESET` is per-connection session state ([STL-246]) — apply it to the
+    // time context and report the tag, just as the simple-query path does, so a
+    // driver issuing its preamble over the extended protocol works too.
+    if let StatementBody::Session(cmd) = &stmt.body {
+        let tag = apply_session_command(cmd, session, session_time).map_err(|e| ExecError {
+            sqlstate: sqlstate_for_query(&e),
+            message: e.to_string(),
+        })?;
+        return Ok(Executed::Completed {
+            tag: tag.to_owned(),
+        });
+    }
     if let Some(intro) = pg_catalog::classify(stmt) {
         let (header, rows) = introspection_reply(&intro, session);
         return Ok(Executed::Rows {
@@ -2755,7 +2948,7 @@ fn execute_stmt(
                     sent: 0,
                 });
             }
-            match run_query(session, stmt, txn, principal) {
+            match run_query(session, stmt, txn, principal, *session_time) {
                 Ok(StatementOutcome::Rows(result)) => {
                     let rows = decode_result_rows(&result).map_err(|e| ExecError {
                         sqlstate: SQLSTATE_INTERNAL_ERROR,
@@ -2795,6 +2988,7 @@ fn ensure_executed(
     stmt: &Statement,
     txn: &mut ConnTxn,
     principal: &Principal,
+    session_time: &mut SessionTime,
 ) -> Result<(), ExecError> {
     if state
         .portals
@@ -2803,7 +2997,7 @@ fn ensure_executed(
     {
         return Ok(());
     }
-    let executed = execute_stmt(session, stmt, txn, principal)?;
+    let executed = execute_stmt(session, stmt, txn, principal, session_time)?;
     if let Some(entry) = state.portals.get_mut(portal) {
         entry.executed = Some(executed);
     }
@@ -2954,6 +3148,7 @@ fn describe_statement_columns(
     session: &SharedSession,
     stmt: &Statement,
     txn: &ConnTxn,
+    session_time: SessionTime,
 ) -> Result<Option<Vec<ResultColumn>>, ExecError> {
     if let Some(intro) = pg_catalog::classify(stmt) {
         return Ok(Some(introspection_reply(&intro, session).0));
@@ -2961,6 +3156,16 @@ fn describe_statement_columns(
     if let Some(columns) = constant_select(stmt) {
         return Ok(Some(columns.iter().map(|c| field(&c.name, c.ty)).collect()));
     }
+    // Resolve the shape at the session-pinned snapshot ([STL-246]) so the described
+    // columns agree with the rows a later `Execute` returns under the same pin (a
+    // column added after the pinned instant is not yet present). Clone only when an
+    // axis is pinned.
+    let pinned = session_time.is_set().then(|| {
+        let mut owned = stmt.clone();
+        apply_session_time(&mut owned, session_time.system, session_time.valid);
+        owned
+    });
+    let stmt = pinned.as_ref().unwrap_or(stmt);
     let described = {
         let engine = session.lock().unwrap_or_else(PoisonError::into_inner);
         match txn {
@@ -2991,6 +3196,7 @@ async fn handle_describe<S: Wire>(
     session: &SharedSession,
     txn: &mut ConnTxn,
     principal: &Principal,
+    session_time: &mut SessionTime,
 ) -> Result<(), WireError> {
     let Some(target) = extended::parse_target(payload) else {
         return Err(WireError::Protocol("malformed Describe message"));
@@ -3011,7 +3217,7 @@ async fn handle_describe<S: Wire>(
             // statement (`None`) has no rows.
             let header = match &stmt {
                 None => None,
-                Some(stmt) => match describe_statement_columns(session, stmt, txn) {
+                Some(stmt) => match describe_statement_columns(session, stmt, txn, *session_time) {
                     Ok(header) => header,
                     Err(e) => return fail_extended(stream, state, e.sqlstate, &e.message).await,
                 },
@@ -3029,7 +3235,8 @@ async fn handle_describe<S: Wire>(
             Ok(())
         }
         extended::Target::Portal(name) => {
-            handle_describe_portal(stream, state, &name, session, txn, principal).await
+            handle_describe_portal(stream, state, &name, session, txn, principal, session_time)
+                .await
         }
     }
 }
@@ -3043,6 +3250,7 @@ async fn handle_describe_portal<S: Wire>(
     session: &SharedSession,
     txn: &mut ConnTxn,
     principal: &Principal,
+    session_time: &mut SessionTime,
 ) -> Result<(), WireError> {
     let Some(portal) = state.portals.get(name) else {
         let m = format!("portal \"{name}\" does not exist");
@@ -3057,7 +3265,7 @@ async fn handle_describe_portal<S: Wire>(
     // Only a row-returning (read) statement reaches here, so the principal never
     // actually stamps a write on the Describe path; it is threaded for a uniform
     // `ensure_executed` contract shared with `handle_execute` ([STL-300]).
-    if let Err(e) = ensure_executed(state, name, session, &stmt, txn, principal) {
+    if let Err(e) = ensure_executed(state, name, session, &stmt, txn, principal, session_time) {
         return fail_extended(stream, state, e.sqlstate, &e.message).await;
     }
     // The portal was present above and `ensure_executed` only populates its cached
@@ -3095,6 +3303,7 @@ async fn handle_execute<S: Wire>(
     session: &SharedSession,
     txn: &mut ConnTxn,
     principal: &Principal,
+    session_time: &mut SessionTime,
 ) -> Result<(), WireError> {
     let Some(msg) = extended::parse_execute(payload) else {
         return Err(WireError::Protocol("malformed Execute message"));
@@ -3147,7 +3356,15 @@ async fn handle_execute<S: Wire>(
         }
     }
 
-    if let Err(e) = ensure_executed(state, &msg.portal, session, &stmt, txn, principal) {
+    if let Err(e) = ensure_executed(
+        state,
+        &msg.portal,
+        session,
+        &stmt,
+        txn,
+        principal,
+        session_time,
+    ) {
         return fail_extended(stream, state, e.sqlstate, &e.message).await;
     }
 

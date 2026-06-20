@@ -66,7 +66,7 @@ use stele_common::time::SystemTimeMicros;
 use stele_common::types::{LogicalType, ScalarValue};
 
 use crate::ast::{
-    PeriodExpr, PeriodPredicateClause, Statement, StatementBody, Temporal, TimeDimension,
+    AsOf, PeriodExpr, PeriodPredicateClause, Statement, StatementBody, Temporal, TimeDimension,
 };
 use crate::fold::{self, FoldError};
 
@@ -3454,6 +3454,80 @@ pub fn cap_unbounded_select(stmt: &mut Statement, max_rows: u64) {
     }
 }
 
+/// Apply a connection's session time context ([STL-246]) to a statement.
+///
+/// Works by **injecting an explicit `FOR <dim> AS OF <instant>` qualifier** for
+/// each axis the session pins and the statement does not already qualify itself.
+///
+/// This is the whole mechanism behind `SET stele.system_time = …`: a session-pinned
+/// read is rewritten into the exact explicit-`AS OF` form, so the engine's existing
+/// snapshot resolution, read-your-own-writes overlay rules, and query-stats path all
+/// handle it unchanged — and a session-pinned read is byte-for-byte the explicit-`AS
+/// OF` read by construction (the equivalence the ticket's oracle pins down). The
+/// instants are pre-resolved microsecond values (folded once, at the time of the
+/// `SET`), injected as integer literals that re-fold to themselves.
+///
+/// Deliberately narrow, mirroring [`cap_unbounded_select`]:
+/// * **Plain single-table reads only.** A `JOIN`, a table-valued introspection
+///   call (`stele_history('t')`), a set operation, and a `FROM`-less constant
+///   `SELECT` are left untouched — a `JOIN`/TVF rejects `AS OF`, so injecting one
+///   would turn a working query into an error. The session pin simply does not
+///   apply over a join (joins do not yet time-travel — see [STL-243]).
+/// * **Per-axis, explicit wins.** An axis the statement already qualifies with its
+///   own `FOR <dim> AS OF` keeps that qualifier; the session pin fills only the
+///   axes left unqualified.
+/// * **Reads only.** A non-`SELECT` statement is returned unchanged.
+///
+/// [STL-246]: https://allegromusic.atlassian.net/browse/STL-246
+/// [STL-243]: https://allegromusic.atlassian.net/browse/STL-243
+pub fn apply_session_time(
+    stmt: &mut Statement,
+    system: Option<SystemTimeMicros>,
+    valid: Option<SystemTimeMicros>,
+) {
+    if system.is_none() && valid.is_none() {
+        return;
+    }
+    // Only a plain single-table read accepts an `AS OF`; everything else would
+    // error if one were injected, so leave it (and the session pin) untouched.
+    let eligible =
+        matches!(stmt.sql(), Some(SqlStatement::Query(q)) if is_plain_single_table_read(q));
+    if !eligible {
+        return;
+    }
+    let has_system = stmt
+        .temporal
+        .as_of
+        .iter()
+        .any(|a| a.dimension == TimeDimension::System);
+    let has_valid = stmt
+        .temporal
+        .as_of
+        .iter()
+        .any(|a| a.dimension == TimeDimension::Valid);
+    // An explicit microsecond instant, the form `resolve_as_of` reads straight back
+    // to the same value — so the injected qualifier is identical to one a user
+    // could have written by hand.
+    let instant =
+        |micros: SystemTimeMicros| Expr::Value(Value::Number(micros.0.to_string(), false).into());
+    if let Some(micros) = system
+        && !has_system
+    {
+        stmt.temporal.as_of.push(AsOf {
+            dimension: TimeDimension::System,
+            timestamp: instant(micros),
+        });
+    }
+    if let Some(micros) = valid
+        && !has_valid
+    {
+        stmt.temporal.as_of.push(AsOf {
+            dimension: TimeDimension::Valid,
+            timestamp: instant(micros),
+        });
+    }
+}
+
 /// Whether `query` is a one-table `SELECT` over a **named relation** — the only
 /// shape that accepts a `LIMIT` in Stele, and so the only shape
 /// [`cap_unbounded_select`] may rewrite. A `JOIN`, a table-valued function (an
@@ -5502,5 +5576,102 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, SelectError::Subquery(_)), "got {err:?}");
+    }
+
+    // ---- session time context injection ([STL-246]) ---------------------------
+
+    #[test]
+    fn session_time_injects_an_as_of_per_axis() {
+        let mut stmt = parse_one("SELECT * FROM booking");
+        apply_session_time(
+            &mut stmt,
+            Some(SystemTimeMicros(111)),
+            Some(SystemTimeMicros(222)),
+        );
+        // Both axes are now qualified, each folding back to the pinned instant —
+        // exactly as if the user had typed the explicit `FOR … AS OF` form.
+        let mut by_dim: Vec<_> = stmt
+            .temporal
+            .as_of
+            .iter()
+            .map(|a| (a.dimension, resolve_as_of(&a.timestamp, NOW).expect("fold")))
+            .collect();
+        by_dim.sort_by_key(|(d, _)| matches!(d, TimeDimension::Valid));
+        assert_eq!(
+            by_dim,
+            vec![
+                (TimeDimension::System, SystemTimeMicros(111)),
+                (TimeDimension::Valid, SystemTimeMicros(222)),
+            ]
+        );
+    }
+
+    #[test]
+    fn session_pinned_read_binds_identically_to_the_explicit_as_of() {
+        // The core equivalence at the binder layer: a session-pinned bare read and
+        // the hand-written `FOR … AS OF` read bind to the same snapshots.
+        let catalog = catalog_with_booking(1_000);
+        let ctx = BindContext {
+            snapshot: NOW,
+            catalog: &catalog,
+        };
+
+        let mut pinned = parse_one("SELECT id FROM booking");
+        apply_session_time(
+            &mut pinned,
+            Some(SystemTimeMicros(5_000)),
+            Some(SystemTimeMicros(6_000)),
+        );
+        let pinned = bind_select(&pinned, &ctx).expect("bind pinned");
+
+        let explicit = parse_one(
+            "SELECT id FROM booking \
+             FOR SYSTEM_TIME AS OF 5000 FOR VALID_TIME AS OF 6000",
+        );
+        let explicit = bind_select(&explicit, &ctx).expect("bind explicit");
+
+        assert_eq!(pinned.snapshot, explicit.snapshot);
+        assert_eq!(pinned.valid_snapshot, explicit.valid_snapshot);
+        assert_eq!(pinned.snapshot, SystemTimeMicros(5_000));
+        assert_eq!(pinned.valid_snapshot, Some(SystemTimeMicros(6_000)));
+    }
+
+    #[test]
+    fn an_explicit_as_of_wins_over_the_session_pin() {
+        let mut stmt = parse_one("SELECT * FROM account FOR SYSTEM_TIME AS OF 999");
+        apply_session_time(&mut stmt, Some(SystemTimeMicros(111)), None);
+        // The statement's own qualifier is kept; the pin does not add a second one
+        // (which would be a `MultipleAsOf` error at bind time).
+        assert_eq!(stmt.temporal.as_of.len(), 1);
+        assert_eq!(
+            resolve_as_of(&stmt.temporal.as_of[0].timestamp, NOW),
+            Ok(SystemTimeMicros(999))
+        );
+    }
+
+    #[test]
+    fn session_time_does_not_touch_joins_or_non_selects() {
+        // A JOIN rejects `AS OF`, so the pin must leave it untouched (read live),
+        // not turn it into an error.
+        let mut join = parse_one("SELECT a.x FROM a JOIN b ON a.id = b.id");
+        apply_session_time(&mut join, Some(SystemTimeMicros(111)), None);
+        assert!(join.temporal.as_of.is_empty());
+
+        // A write never time-travels.
+        let mut dml = parse_one("INSERT INTO account VALUES (1, 2)");
+        apply_session_time(&mut dml, Some(SystemTimeMicros(111)), None);
+        assert!(dml.temporal.as_of.is_empty());
+
+        // A FROM-less constant SELECT has no table to pin.
+        let mut constant = parse_one("SELECT 1");
+        apply_session_time(&mut constant, Some(SystemTimeMicros(111)), None);
+        assert!(constant.temporal.as_of.is_empty());
+    }
+
+    #[test]
+    fn an_empty_session_context_is_a_no_op() {
+        let mut stmt = parse_one("SELECT * FROM account");
+        apply_session_time(&mut stmt, None, None);
+        assert!(stmt.temporal.as_of.is_empty());
     }
 }

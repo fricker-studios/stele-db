@@ -12,9 +12,11 @@
 // statement mid-loop — exercising the [STL-182] statement cache and, once
 // named, pgjdbc's binary result transfer ([STL-183]).
 //
-// `assumeMinServerVersion=9.4` makes pgjdbc send its session defaults
-// (extra_float_digits, application_name) as startup-packet parameters instead
-// of a post-connect `SET …` round trip — Stele has no `SET` yet (v0.3 surface).
+// No `assumeMinServerVersion` workaround: Stele now tolerates pgjdbc's
+// post-connect `SET …` preamble (extra_float_digits, application_name) as a
+// no-op ([STL-246]), so the driver connects with its defaults. This connection —
+// a stock pgjdbc with no Stele-specific options — is itself the regression test
+// for that.
 //
 // Run via ci/jdbc-smoke.sh (which pins + verifies the pgjdbc jar), or directly:
 //   java -cp postgresql-<ver>.jar ci/JdbcSmoke.java [host] [port]
@@ -37,7 +39,7 @@ public final class JdbcSmoke {
         String user = args.length > 3 ? args[3] : "stele";
         String password = args.length > 4 ? args[4] : "";
         String url = "jdbc:postgresql://" + host + ":" + port + "/stele"
-                + "?assumeMinServerVersion=9.4&sslmode=" + sslmode;
+                + "?sslmode=" + sslmode;
 
         try (Connection conn = connectWithRetry(url, user, password)) {
             try (Statement st = conn.createStatement()) {

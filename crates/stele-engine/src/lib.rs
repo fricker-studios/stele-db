@@ -93,7 +93,7 @@ use stele_sql::select::{
 use stele_sql::{
     AdminCommand, BindContext, BindError, BoundCopy, CopyError, CopyShape, Statement,
     StatementBody, TimeDimension, bind_copy, bind_copy_rows, bind_ddl, bind_dml, bind_select,
-    without_filter,
+    resolve_as_of, without_filter,
 };
 use stele_storage::backend::Disk;
 use stele_storage::delta::{BusinessKey, Snapshot, Version};
@@ -2002,6 +2002,33 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         self.write_principal = principal;
     }
 
+    /// Resolve a `SET stele.{system,valid}_time = <expr>` value to a concrete
+    /// instant ([STL-246]).
+    ///
+    /// Folds the expression exactly as a `FOR … AS OF <expr>` qualifier does — against
+    /// the clock observed fresh, so `now()` is the live instant at the moment of the
+    /// `SET` ([STL-227]) — and additionally accepts the Postgres special string
+    /// `'now'` as an alias for `now()`. The session (wire) layer pins the result and
+    /// replays it as an explicit `AS OF` on each subsequent read
+    /// ([`stele_sql::apply_session_time`]), so a session-pinned read resolves byte-for-byte
+    /// like the explicit form.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Select`] wrapping the binder's [`AsOfError`](stele_sql::AsOfError)
+    /// when the value is not a supported instant expression.
+    pub fn resolve_session_time(
+        &self,
+        value: &stele_sql::sqlparser::ast::Expr,
+    ) -> Result<SystemTimeMicros, EngineError> {
+        let now = self.clock.observe();
+        // `'now'` (Postgres's special datetime input string) is an alias for now().
+        if is_now_string(value) {
+            return Ok(now);
+        }
+        resolve_as_of(value, now).map_err(|e| EngineError::Select(e.into()))
+    }
+
     /// Execute one parsed [`Statement`] against the session.
     ///
     /// Routes by binding, in order: a `CREATE TABLE` / `DROP TABLE` applies to the
@@ -2575,6 +2602,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // `clone` (not `Copy`) because `BACKUP` carries an owned path.
         if let StatementBody::Admin(cmd) = &stmt.body {
             return self.apply_admin(cmd.clone());
+        }
+
+        // `SET` / `RESET` is per-connection session state handled by the wire layer
+        // before the engine ([STL-246]) — it never reaches the engine's routing.
+        // Guard explicitly so a stray one fails loudly rather than falling through
+        // to the generic "not routable" error.
+        if let StatementBody::Session(_) = &stmt.body {
+            return Err(EngineError::Unsupported(
+                "SET / RESET is handled at the session layer, not the engine",
+            ));
         }
 
         // Stele-native temporal introspection: `SELECT * FROM stele_history('t'[, key])`
@@ -5831,6 +5868,20 @@ fn decode_key_bound(bound: Option<&[u8]>, key_ty: LogicalType) -> Option<Vec<u8>
 /// key matches across operations.
 fn business_key(value: &ScalarValue) -> BusinessKey {
     BusinessKey::new(encode_value(value))
+}
+
+/// Whether `expr` is the Postgres special datetime string `'now'`
+/// (case-insensitive), possibly parenthesized — the `SET stele.system_time = 'now'`
+/// spelling the ticket lists alongside `now()` ([STL-246]).
+fn is_now_string(expr: &stele_sql::sqlparser::ast::Expr) -> bool {
+    use stele_sql::sqlparser::ast::{Expr, Value};
+    match expr {
+        Expr::Nested(inner) => is_now_string(inner),
+        Expr::Value(v) => {
+            matches!(&v.value, Value::SingleQuotedString(s) if s.eq_ignore_ascii_case("now"))
+        }
+        _ => false,
+    }
 }
 
 /// Recognize the Stele-native temporal introspection call `stele_history('t'[,

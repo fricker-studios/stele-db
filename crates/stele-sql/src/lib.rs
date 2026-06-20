@@ -77,8 +77,8 @@ pub mod select;
 pub mod types;
 
 pub use ast::{
-    AdminCommand, AsOf, Password, PeriodExpr, PeriodPredicateClause, Statement, StatementBody,
-    Temporal, TimeDimension, UserDdl, ValidTimePeriod,
+    AdminCommand, AsOf, Password, PeriodExpr, PeriodPredicateClause, SessionCommand, Statement,
+    StatementBody, Temporal, TimeDimension, UserDdl, ValidTimePeriod,
 };
 pub use copy::{
     BoundCopy, CopyError, CopyFormat, CopyFormatKind, CopyShape, bind_copy, bind_copy_rows,
@@ -93,7 +93,8 @@ pub use parser::parse;
 pub use select::{
     ArithOp, AsOfError, BindContext, BoundJoin, BoundJoinSide, BoundPeriod, BoundPeriodPredicate,
     BoundPredicate, BoundScalar, BoundSelect, CompareOp, JoinColumnRef, JoinType, PeriodEndpoint,
-    Projection, SelectError, bind_select, cap_unbounded_select, resolve_as_of, without_filter,
+    Projection, SelectError, apply_session_time, bind_select, cap_unbounded_select, resolve_as_of,
+    without_filter,
 };
 pub use types::logical_type;
 

@@ -26,8 +26,8 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 use stele_common::period::PeriodPredicate;
 
 use crate::ast::{
-    AdminCommand, AsOf, Password, PeriodExpr, PeriodPredicateClause, Statement, StatementBody,
-    Temporal, TimeDimension, UserDdl, ValidTimePeriod,
+    AdminCommand, AsOf, Password, PeriodExpr, PeriodPredicateClause, SessionCommand, Statement,
+    StatementBody, Temporal, TimeDimension, UserDdl, ValidTimePeriod,
 };
 use crate::dialect::SteleDialect;
 use crate::error::ParseError;
@@ -112,6 +112,18 @@ fn parse_one(mut tokens: Vec<Token>) -> Result<Statement, ParseError> {
     if let Some(user) = lift_user_ddl(&tokens)? {
         return Ok(Statement {
             body: StatementBody::User(user),
+            temporal: Temporal::default(),
+        });
+    }
+
+    // `SET` / `RESET` ([STL-246]) is lifted the same way: Stele owns the session
+    // time-context surface (`SET stele.system_time = …`) and tolerates every other
+    // variable as a no-op, so the whole family is recognized here rather than
+    // handed to `sqlparser`'s own `SET` grammar. Like the lifts above it carries no
+    // temporal grammar of its own.
+    if let Some(session) = lift_session_command(&tokens, &dialect)? {
+        return Ok(Statement {
+            body: StatementBody::Session(session),
             temporal: Temporal::default(),
         });
     }
@@ -301,6 +313,127 @@ fn lift_user_ddl(tokens: &[Token]) -> Result<Option<UserDdl>, ParseError> {
             password,
         }
     }))
+}
+
+/// Recognize a `SET` / `RESET` session command ([STL-246]).
+///
+/// Returns `None` when the tokens are not a `SET`/`RESET` (the statement belongs
+/// to another route). Otherwise:
+///
+/// * `SET stele.system_time = <expr>` / `… TO <expr>` (and the `valid_time` twin)
+///   → [`SessionCommand::SetTime`]; the value parses as a full scalar expression,
+///   resolved later exactly as a `FOR … AS OF` operand.
+/// * `RESET stele.{system,valid}_time` → [`SessionCommand::ResetTime`];
+///   `RESET ALL` → [`SessionCommand::ResetAll`].
+/// * Any other variable → [`SessionCommand::Tolerated`], a no-op so a driver's
+///   connect-time `SET` preamble does not error ([STL-184]).
+///
+/// A malformed `SET` of a Stele time variable (no `=`/`TO`, or no value) is a loud
+/// syntax error rather than a silent tolerated no-op.
+fn lift_session_command(
+    tokens: &[Token],
+    dialect: &SteleDialect,
+) -> Result<Option<SessionCommand>, ParseError> {
+    let Some(first) = tokens.first() else {
+        return Ok(None);
+    };
+    let is_reset = if word_is(first, "SET") {
+        false
+    } else if word_is(first, "RESET") {
+        true
+    } else {
+        return Ok(None);
+    };
+    let rest = &tokens[1..];
+    let syntax = |msg: &str| ParseError::Syntax(ParserError::ParserError(msg.to_owned()));
+
+    if is_reset {
+        // `RESET ALL` clears every session setting — for the time context, both axes.
+        if let [only] = rest
+            && word_is(only, "ALL")
+        {
+            return Ok(Some(SessionCommand::ResetAll));
+        }
+        // A `RESET` of a Stele time axis is **ours**: it must be exactly the
+        // three-token name, so a trailing token (`RESET stele.system_time = 1`) is a
+        // loud error rather than a silent tolerated no-op that leaves the session
+        // pinned. Any non-`stele.*` variable stays tolerated.
+        if let Some(dimension) = stele_time_axis(rest) {
+            if rest.len() != 3 {
+                return Err(syntax(
+                    "RESET of a session time variable takes no arguments",
+                ));
+            }
+            return Ok(Some(SessionCommand::ResetTime { dimension }));
+        }
+        return Ok(Some(SessionCommand::Tolerated {
+            name: variable_name(rest),
+            is_reset: true,
+        }));
+    }
+
+    // `SET <variable> { = | TO } <value…>`.
+    let Some(dimension) = stele_time_axis(rest) else {
+        // A `SET` of any non-Stele variable is tolerated as a no-op (the value is
+        // not even parsed — a driver's preamble may use forms Stele cannot bind).
+        return Ok(Some(SessionCommand::Tolerated {
+            name: variable_name(rest),
+            is_reset: false,
+        }));
+    };
+    // The qualified name spans three tokens (`stele` `.` `<axis>_time`); the
+    // assignment operator and value follow.
+    let after = &rest[3..];
+    let value_tokens = match after.first() {
+        Some(Token::Eq) => &after[1..],
+        Some(t) if word_is(t, "TO") => &after[1..],
+        _ => return Err(syntax("expected `=` or TO after a session time variable")),
+    };
+    if value_tokens.is_empty() {
+        return Err(syntax(
+            "expected a value after a session time variable assignment",
+        ));
+    }
+    let value = parse_full_expr(value_tokens, dialect)?;
+    Ok(Some(SessionCommand::SetTime {
+        dimension,
+        value: Box::new(value),
+    }))
+}
+
+/// If `tokens` begins with the qualified name `stele.system_time` /
+/// `stele.valid_time` (the three tokens `word` `.` `word`), the time axis it
+/// names. The match is case-insensitive; the caller knows the name spans three
+/// tokens.
+fn stele_time_axis(tokens: &[Token]) -> Option<TimeDimension> {
+    let [namespace, dot, name, ..] = tokens else {
+        return None;
+    };
+    if !word_is(namespace, "stele") || !matches!(dot, Token::Period) {
+        return None;
+    }
+    if word_is(name, "system_time") {
+        Some(TimeDimension::System)
+    } else if word_is(name, "valid_time") {
+        Some(TimeDimension::Valid)
+    } else {
+        None
+    }
+}
+
+/// A best-effort variable name for a tolerated `SET`/`RESET`, for diagnostics: the
+/// leading run of word / `.` tokens (e.g. `extra_float_digits`, `stele.unknown`).
+/// Empty when there is no leading identifier.
+fn variable_name(tokens: &[Token]) -> String {
+    let mut name = String::new();
+    for tok in tokens {
+        match tok {
+            Token::Word(w) => name.push_str(&w.value),
+            Token::Period => name.push('.'),
+            _ => break,
+        }
+    }
+    name
 }
 
 /// Whether a token is an (unquoted) word equal to `kw`, case-insensitively.
@@ -768,5 +901,132 @@ mod period_tests {
         ] {
             assert!(parse(sql).is_err(), "expected a parse error for: {sql}");
         }
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    fn parse_one_ok(sql: &str) -> Statement {
+        let mut stmts = parse(sql).expect("parse");
+        assert_eq!(stmts.len(), 1);
+        stmts.remove(0)
+    }
+
+    fn session(sql: &str) -> SessionCommand {
+        match parse_one_ok(sql).body {
+            StatementBody::Session(cmd) => cmd,
+            other => panic!("expected a session command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lifts_set_stele_time_on_both_axes() {
+        for (sql, want) in [
+            ("SET stele.system_time = 100", TimeDimension::System),
+            ("SET stele.valid_time = 100", TimeDimension::Valid),
+            // `TO` is accepted in place of `=`, and the name is case-insensitive.
+            ("SET STELE.SYSTEM_TIME TO 100", TimeDimension::System),
+        ] {
+            match session(sql) {
+                SessionCommand::SetTime { dimension, .. } => assert_eq!(dimension, want, "{sql}"),
+                other => panic!("expected SetTime, got {other:?} for {sql}"),
+            }
+        }
+    }
+
+    #[test]
+    fn set_time_value_is_a_full_as_of_expression() {
+        // The value parses with the same grammar a `FOR … AS OF` operand does.
+        for sql in [
+            "SET stele.system_time = now()",
+            "SET stele.system_time = now() - interval '1 hour'",
+            "SET stele.system_time = 1750000000000000",
+        ] {
+            assert!(
+                matches!(session(sql), SessionCommand::SetTime { .. }),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifts_reset_of_the_time_axes_and_all() {
+        assert_eq!(
+            session("RESET stele.system_time"),
+            SessionCommand::ResetTime {
+                dimension: TimeDimension::System
+            }
+        );
+        assert_eq!(
+            session("RESET stele.valid_time"),
+            SessionCommand::ResetTime {
+                dimension: TimeDimension::Valid
+            }
+        );
+        assert_eq!(session("RESET ALL"), SessionCommand::ResetAll);
+    }
+
+    #[test]
+    fn unknown_variables_are_tolerated_no_ops() {
+        // A driver's connect-time preamble must not error ([STL-184]).
+        match session("SET extra_float_digits = 3") {
+            SessionCommand::Tolerated { name, is_reset } => {
+                assert_eq!(name, "extra_float_digits");
+                assert!(!is_reset);
+            }
+            other => panic!("expected Tolerated, got {other:?}"),
+        }
+        match session("SET application_name = 'PostgreSQL JDBC Driver'") {
+            SessionCommand::Tolerated { is_reset, .. } => assert!(!is_reset),
+            other => panic!("expected Tolerated, got {other:?}"),
+        }
+        match session("RESET extra_float_digits") {
+            SessionCommand::Tolerated { name, is_reset } => {
+                assert_eq!(name, "extra_float_digits");
+                assert!(is_reset);
+            }
+            other => panic!("expected Tolerated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_stele_time_set_is_a_loud_error() {
+        // The Stele time variables are ours: a malformed assignment errors rather
+        // than being swallowed as a tolerated no-op.
+        for sql in [
+            "SET stele.system_time",     // no `= value`
+            "SET stele.system_time = ",  // no value
+            "SET stele.system_time 100", // missing `=`/`TO`
+        ] {
+            assert!(parse(sql).is_err(), "expected a parse error for: {sql}");
+        }
+    }
+
+    #[test]
+    fn reset_of_a_stele_time_variable_is_strict() {
+        // A trailing token on `RESET stele.<axis>_time` is a loud error, not a
+        // silent tolerated no-op that would leave the session pinned.
+        for sql in [
+            "RESET stele.system_time = 1",
+            "RESET stele.system_time now()",
+            "RESET stele.valid_time junk",
+        ] {
+            assert!(parse(sql).is_err(), "expected a parse error for: {sql}");
+        }
+        // A non-Stele `RESET` with trailing tokens stays tolerated (we do not own it).
+        assert!(matches!(
+            session("RESET extra_float_digits"),
+            SessionCommand::Tolerated { is_reset: true, .. }
+        ));
+    }
+
+    #[test]
+    fn a_plain_select_is_not_a_session_command() {
+        assert!(matches!(
+            parse_one_ok("SELECT 1").body,
+            StatementBody::Sql(_)
+        ));
     }
 }
