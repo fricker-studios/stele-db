@@ -579,7 +579,12 @@ fn spawn_tls_sighup_reload(reloader: TlsReloader) {
         // dropped; the reloader logs the success / failure of each attempt itself.
         while hup.recv().await.is_some() {
             info!("received SIGHUP: reloading [tls] certificate material");
-            let _ = reloader.reload();
+            // `reload()` does blocking file I/O + rustls config building, so run it
+            // on the blocking pool rather than the async worker — SIGHUP is
+            // out-of-band, so the detour is free. A `JoinError` (the blocking task
+            // panicking) is ignored: `reload()` returns its errors, it never panics.
+            let reloader = reloader.clone();
+            let _ = tokio::task::spawn_blocking(move || reloader.reload()).await;
         }
     });
 }
