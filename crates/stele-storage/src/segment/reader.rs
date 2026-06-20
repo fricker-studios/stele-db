@@ -838,8 +838,9 @@ fn parse_footer(bytes: &[u8]) -> Result<Footer, SegmentError> {
         return Err(SegmentError::Corrupt("unknown schema id in footer"));
     }
     // The flags word signals the optional trailing sections — the bloom
-    // ([STL-238], v11) and the valid-time interval summary ([STL-241], v12). Any
-    // other bit is reserved and must be clear: a set reserved bit means either
+    // ([STL-238], v11), the per-segment valid-time interval summary ([STL-241],
+    // v12), and the per-row-group valid-time interval sequence ([STL-316], v14).
+    // Any other bit is reserved and must be clear: a set reserved bit means either
     // corruption or a writer from a format generation that should have bumped the
     // version, so fail closed rather than silently ignore it (the same posture the
     // parser takes on an unknown column or schema id).

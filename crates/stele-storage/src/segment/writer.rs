@@ -314,8 +314,11 @@ impl<F: DiskFile> SegmentWriter<F> {
         let mut row_groups: Vec<RowGroupChunks> = Vec::with_capacity(groups.len());
         // One valid-interval summary per row-group ([STL-316]), computed from that
         // row-group's own `(valid_from, valid_to)` slice as the loop walks them.
-        // `None` for a system-only segment (kept empty, never emitted) or for an
-        // individual degenerate/empty row-group (an admit-all slot).
+        // Each entry is `None` for an individual degenerate/empty row-group (an
+        // admit-all slot), and every entry is `None` for a system-only segment
+        // (no valid pairs). The whole vector is dropped below — never emitted —
+        // when the per-segment summary is absent, so the section rides exactly
+        // with it.
         let mut rg_valid_summaries: Vec<Option<ValidIntervalSummary>> =
             Vec::with_capacity(groups.len());
         let mut offset: u64 = HEADER_LEN as u64;
