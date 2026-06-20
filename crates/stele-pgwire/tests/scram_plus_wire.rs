@@ -22,7 +22,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 
 use rustls::pki_types::pem::PemObject as _;
@@ -92,6 +92,25 @@ fn mint_pki(test: &str) -> Pki {
         server_key,
         ca_pem: ca_cert.pem(),
     }
+}
+
+/// A throwaway password for the test users, generated once at runtime from OS
+/// entropy. Both sides use it — the server stores it via `CREATE USER`, the
+/// client proves it — so any value works; generating it avoids a hard-coded
+/// credential in the source (and the matching CodeQL finding).
+fn test_password() -> &'static str {
+    static PW: OnceLock<String> = OnceLock::new();
+    PW.get_or_init(|| {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).expect("OS entropy");
+        let mut pw = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            pw.push(HEX[usize::from(b >> 4)] as char);
+            pw.push(HEX[usize::from(b & 0x0f)] as char);
+        }
+        pw
+    })
 }
 
 /// Boot a TLS-required, SCRAM-required server on an ephemeral port, with one
@@ -430,7 +449,7 @@ async fn tls_server_advertises_scram_sha_256_plus_first() {
     // On TLS both mechanisms are offered, PLUS first so a channel-binding-capable
     // client prefers it (libpq's selection rule).
     let pki = mint_pki("advertise");
-    let addr = spawn_server(&pki, "alice", "s3cret").await;
+    let addr = spawn_server(&pki, "alice", test_password()).await;
     let mut stream = tls_connect(addr, client_config(&pki.ca_pem)).await;
     write_startup(&mut stream, "alice").await;
     let (code, data) = read_auth(&mut stream).await;
@@ -447,10 +466,11 @@ async fn tokio_postgres_negotiates_scram_sha_256_plus_over_tls() {
     // both advertised PLUS and validated the binding. Independent SCRAM
     // implementation ⇒ true interoperability.
     let pki = mint_pki("interop");
-    let addr = spawn_server(&pki, "alice", "s3cret").await;
+    let addr = spawn_server(&pki, "alice", test_password()).await;
     let connector = RustlsConnect(Arc::new(client_config(&pki.ca_pem)));
+    let password = test_password();
     let conn_str = format!(
-        "host=127.0.0.1 port={} user=alice password=s3cret dbname=stele \
+        "host=127.0.0.1 port={} user=alice password={password} dbname=stele \
          sslmode=require channel_binding=require",
         addr.port()
     );
@@ -468,7 +488,7 @@ async fn correct_channel_binding_authenticates() {
     // Hand-rolled PLUS with the genuine endpoint binding: the c= check and the
     // proof both pass.
     let pki = mint_pki("plus-ok");
-    let addr = spawn_server(&pki, "alice", "s3cret").await;
+    let addr = spawn_server(&pki, "alice", test_password()).await;
     let mut stream = tls_connect(addr, client_config(&pki.ca_pem)).await;
     let cbind = peer_endpoint_binding(&stream);
     write_startup(&mut stream, "alice").await;
@@ -477,7 +497,7 @@ async fn correct_channel_binding_authenticates() {
         "SCRAM-SHA-256-PLUS",
         "p=tls-server-end-point,,",
         Some(&cbind),
-        "s3cret",
+        test_password(),
         "plusnonce",
     )
     .await;
@@ -490,7 +510,7 @@ async fn a_tampered_channel_binding_is_refused() {
     // not the one the server computes from its own certificate, so the c= check
     // fails. This is the property channel binding exists to enforce.
     let pki = mint_pki("tamper");
-    let addr = spawn_server(&pki, "alice", "s3cret").await;
+    let addr = spawn_server(&pki, "alice", test_password()).await;
     let mut stream = tls_connect(addr, client_config(&pki.ca_pem)).await;
     let mut cbind = peer_endpoint_binding(&stream);
     cbind[0] ^= 0xFF; // a different endpoint than the one the server presents
@@ -500,7 +520,7 @@ async fn a_tampered_channel_binding_is_refused() {
         "SCRAM-SHA-256-PLUS",
         "p=tls-server-end-point,,",
         Some(&cbind),
-        "s3cret",
+        test_password(),
         "tampernonce",
     )
     .await;
@@ -518,7 +538,7 @@ async fn the_y_flag_is_refused_when_plus_is_advertised() {
     // having stripped the offer — the RFC 5802 §6 downgrade rule (STL-297 flips
     // the STL-252 accept here).
     let pki = mint_pki("downgrade");
-    let addr = spawn_server(&pki, "alice", "s3cret").await;
+    let addr = spawn_server(&pki, "alice", test_password()).await;
     let mut stream = tls_connect(addr, client_config(&pki.ca_pem)).await;
     write_startup(&mut stream, "alice").await;
     let result = scram_exchange(
@@ -526,7 +546,7 @@ async fn the_y_flag_is_refused_when_plus_is_advertised() {
         "SCRAM-SHA-256",
         "y,,",
         None,
-        "s3cret",
+        test_password(),
         "downgradenonce",
     )
     .await;
@@ -542,7 +562,7 @@ async fn plain_scram_still_authenticates_over_tls() {
     // A client that opts out of channel binding (`n`) still authenticates with
     // plain SCRAM over the encrypted channel — PLUS is offered, never required.
     let pki = mint_pki("plain-over-tls");
-    let addr = spawn_server(&pki, "alice", "s3cret").await;
+    let addr = spawn_server(&pki, "alice", test_password()).await;
     let mut stream = tls_connect(addr, client_config(&pki.ca_pem)).await;
     write_startup(&mut stream, "alice").await;
     let result = scram_exchange(
@@ -550,7 +570,7 @@ async fn plain_scram_still_authenticates_over_tls() {
         "SCRAM-SHA-256",
         "n,,",
         None,
-        "s3cret",
+        test_password(),
         "plainnonce",
     )
     .await;
