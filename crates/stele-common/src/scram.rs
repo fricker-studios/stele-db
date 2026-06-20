@@ -22,16 +22,25 @@
 //! where a hidden transitive dependency is least welcome. Correctness is
 //! pinned to the published known-answer vectors in the tests below — [RFC
 //! 4231] for HMAC, [RFC 7914] §11 for PBKDF2-HMAC-SHA-256, [RFC 4648] §10 for
-//! base64, and the full [RFC 7677] §3 example exchange end-to-end.
+//! base64, and the full [RFC 7677] §3 example exchange end-to-end. The one
+//! deliberate exception is the SASLprep normalization below ([ADR-0033]): its
+//! Unicode tables are too large to vendor and would have to track Unicode
+//! versions by hand, so [`prepare_password`] leans on the `stringprep` crate.
 //!
-//! ## Normalization (deliberate v0.3 floor)
+//! ## Normalization (SASLprep, [STL-298])
 //!
-//! Postgres applies SASLprep ([RFC 4013]) to passwords before hashing and
-//! falls back to the raw bytes when normalization fails. Stele v0.3 uses the
-//! raw UTF-8 bytes unconditionally: ASCII passwords — the overwhelming case —
-//! are byte-identical under SASLprep, and a vendored Unicode normalization
-//! table is not. A non-ASCII password whose client normalizes differently can
-//! fail to authenticate; SASLprep is a filed follow-up, not silent scope.
+//! Postgres applies SASLprep ([RFC 4013]) to passwords before hashing and falls
+//! back to the raw bytes when normalization fails; SCRAM clients normalize the
+//! same way before computing their proof ([RFC 5802] §5.1, `SaltedPassword :=
+//! Hi(Normalize(password), …)`). [`prepare_password`] does exactly this, and
+//! both password-ingesting paths — [`ScramVerifier::derive`] (the `CREATE`/
+//! `ALTER USER` verifier) and [`client_proof`] (the client's proof) — run
+//! through it, so the two sides always normalize identically. ASCII passwords —
+//! the overwhelming case — take the crate's zero-alloc fast path and stay
+//! byte-identical; a non-ASCII password decomposed on one side and composed on
+//! the other now NFKC-fold to the same bytes and interoperate. Inputs SASLprep
+//! rejects (prohibited control/bidi characters) fall back to their raw bytes on
+//! both sides, matching Postgres, so they still authenticate against themselves.
 //!
 //! [RFC 4013]: https://www.rfc-editor.org/rfc/rfc4013
 //! [RFC 4231]: https://www.rfc-editor.org/rfc/rfc4231
@@ -40,9 +49,12 @@
 //! [RFC 7677]: https://www.rfc-editor.org/rfc/rfc7677
 //! [RFC 7914]: https://www.rfc-editor.org/rfc/rfc7914
 //! [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
+//! [STL-298]: https://allegromusic.atlassian.net/browse/STL-298
 //! [ADR-0010]: ../../../docs/adr/0010-deterministic-simulation-testing.md
+//! [ADR-0033]: ../../../docs/adr/0033-saslprep-password-normalization.md
 
 use core::fmt;
+use std::borrow::Cow;
 
 use crate::hash::{SHA256_LEN, sha256};
 
@@ -99,7 +111,7 @@ impl ScramVerifier {
     /// [RFC 5802]: https://www.rfc-editor.org/rfc/rfc5802
     #[must_use]
     pub fn derive(password: &str, salt: &[u8], iterations: u32) -> Self {
-        let salted = hi(password.as_bytes(), salt, iterations);
+        let salted = hi(&prepare_password(password), salt, iterations);
         let client_key = hmac_sha256(&salted, b"Client Key");
         let stored_key = sha256(&client_key).0;
         let server_key = hmac_sha256(&salted, b"Server Key");
@@ -145,7 +157,7 @@ pub fn client_proof(
     iterations: u32,
     auth_message: &[u8],
 ) -> [u8; SHA256_LEN] {
-    let salted = hi(password.as_bytes(), salt, iterations);
+    let salted = hi(&prepare_password(password), salt, iterations);
     let client_key = hmac_sha256(&salted, b"Client Key");
     let stored_key = sha256(&client_key).0;
     let signature = hmac_sha256(&stored_key, auth_message);
@@ -154,6 +166,35 @@ pub fn client_proof(
         *out = k ^ s;
     }
     proof
+}
+
+/// Normalize a password with SASLprep ([RFC 4013]) before it is fed to [`hi`].
+///
+/// This is the single seam both derivation sites ([`ScramVerifier::derive`] and
+/// [`client_proof`]) route through, so a verifier and the proof checked against
+/// it always agree on the bytes ([STL-298], [ADR-0033]). It returns the prepared
+/// bytes on success and **falls back to the raw UTF-8 bytes** when SASLprep
+/// rejects the input (a prohibited control or bidi character) — exactly what
+/// Postgres's `pg_saslprep` does. Because both sides fall back identically, even
+/// an un-preppable password authenticates against itself; what the normalization
+/// buys is that a client which NFKC-composes a decomposed password (or maps a
+/// non-ASCII space) still matches a verifier derived from the other form. ASCII
+/// input takes `stringprep`'s zero-alloc fast path and is returned borrowed,
+/// byte-for-byte unchanged.
+///
+/// [RFC 4013]: https://www.rfc-editor.org/rfc/rfc4013
+/// [STL-298]: https://allegromusic.atlassian.net/browse/STL-298
+/// [ADR-0033]: ../../../docs/adr/0033-saslprep-password-normalization.md
+#[must_use]
+pub fn prepare_password(password: &str) -> Cow<'_, [u8]> {
+    match stringprep::saslprep(password) {
+        // `saslprep` borrows ASCII unchanged and owns a normalized String
+        // otherwise; either way we hand `hi` the bytes.
+        Ok(Cow::Borrowed(s)) => Cow::Borrowed(s.as_bytes()),
+        Ok(Cow::Owned(s)) => Cow::Owned(s.into_bytes()),
+        // Prohibited / bidi / unassigned input: hash the raw bytes, like Postgres.
+        Err(_) => Cow::Borrowed(password.as_bytes()),
+    }
 }
 
 /// HMAC-SHA-256 ([RFC 2104]): `H((K' ^ opad) || H((K' ^ ipad) || msg))` with
@@ -499,5 +540,82 @@ mod tests {
         let rendered = format!("{verifier:?}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
         assert!(!rendered.contains(&hex(&verifier.stored_key)), "{rendered}");
+    }
+
+    /// SASLprep ([STL-298]) closes the interop gap a raw-bytes floor leaves
+    /// open: a verifier derived from one Unicode form of a password accepts a
+    /// proof computed from another, because both derivation sites NFKC-normalize
+    /// first. This is the case that fails byte-for-byte today.
+    #[test]
+    fn saslprep_composed_and_decomposed_passwords_interoperate() {
+        let salt = unhex("00112233445566778899aabbccddeeff");
+        let msg = b"n=u,r=abc,r=abcdef,s=ABCD,i=4096,c=biws,r=abcdef";
+
+        // "café": precomposed U+00E9 vs. "e" + combining acute U+0301 — distinct
+        // byte strings that fold to the same thing under NFKC.
+        let composed = "caf\u{e9}";
+        let decomposed = "cafe\u{301}";
+        assert_ne!(
+            composed.as_bytes(),
+            decomposed.as_bytes(),
+            "the two forms must differ on the wire, or this proves nothing"
+        );
+
+        // Server stores a verifier for one form; a client proves with the other.
+        let verifier = ScramVerifier::derive(composed, &salt, DEFAULT_ITERATIONS);
+        let proof = client_proof(decomposed, &salt, DEFAULT_ITERATIONS, msg);
+        assert!(
+            verifier.verify_client_proof(msg, &proof),
+            "decomposed → composed"
+        );
+
+        // …and symmetrically, to pin that neither direction is privileged.
+        let verifier = ScramVerifier::derive(decomposed, &salt, DEFAULT_ITERATIONS);
+        let proof = client_proof(composed, &salt, DEFAULT_ITERATIONS, msg);
+        assert!(
+            verifier.verify_client_proof(msg, &proof),
+            "composed → decomposed"
+        );
+    }
+
+    /// SASLprep mapping (RFC 4013 §2.1): a non-ASCII space folds to U+0020 and a
+    /// "mapped to nothing" code point is dropped, while ASCII passes through
+    /// byte-for-byte on the crate's fast path.
+    #[test]
+    fn saslprep_maps_and_passes_ascii_through() {
+        assert_eq!(
+            prepare_password("pencil").as_ref(),
+            b"pencil",
+            "ASCII unchanged"
+        );
+        assert_eq!(
+            prepare_password("a\u{a0}b").as_ref(),
+            b"a b",
+            "U+00A0 NBSP maps to a plain space"
+        );
+        assert_eq!(
+            prepare_password("a\u{ad}b").as_ref(),
+            b"ab",
+            "U+00AD soft hyphen is mapped to nothing"
+        );
+    }
+
+    /// Prohibited input (here U+0007 BEL, a C.2.1 control) makes SASLprep fail;
+    /// like Postgres we then hash the raw bytes. Both sides fall back the same
+    /// way, so the password still authenticates against itself.
+    #[test]
+    fn saslprep_falls_back_to_raw_on_prohibited_input() {
+        let pw = "pa\u{7}ss";
+        assert_eq!(
+            prepare_password(pw).as_ref(),
+            pw.as_bytes(),
+            "rejected input is hashed raw, not repaired"
+        );
+
+        let salt = unhex("00112233445566778899aabbccddeeff");
+        let msg = b"n=u,r=abc,r=abcdef,s=ABCD,i=4096,c=biws,r=abcdef";
+        let verifier = ScramVerifier::derive(pw, &salt, DEFAULT_ITERATIONS);
+        let proof = client_proof(pw, &salt, DEFAULT_ITERATIONS, msg);
+        assert!(verifier.verify_client_proof(msg, &proof));
     }
 }

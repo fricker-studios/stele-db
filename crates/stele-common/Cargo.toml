@@ -14,3 +14,8 @@ workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+# SASLprep (RFC 4013) for SCRAM password normalization (STL-298, ADR-0033) — the
+# one third-party crate in the otherwise-vendored auth path, justified by the
+# Unicode NFKC tables it carries. Pure/deterministic, so it keeps the dependency
+# root's runtime-agnostic posture.
+stringprep = { workspace = true }

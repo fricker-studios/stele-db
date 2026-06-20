@@ -131,6 +131,14 @@ psycopg, pgjdbc, and `tokio-postgres` all speak it natively:
   The crypto is vendored in `stele_common::scram` (like the commit-log
   SHA-256) and pinned to the published RFC test vectors; OS entropy
   (`getrandom`) supplies salts and per-exchange server nonces.
+- **Passwords are SASLprep-normalized** (RFC 4013) before derivation, with the
+  Postgres fallback to raw UTF-8 bytes when the input is prohibited (STL-298).
+  Both derivation sites — the server's `CREATE`/`ALTER USER` verifier and a
+  SCRAM client's proof — share one normalization step, so a non-ASCII password
+  composed on one side and decomposed on the other still authenticates; ASCII is
+  byte-identical and untouched. SASLprep is the one third-party dependency in the
+  otherwise-vendored auth path (`stringprep`, for the Unicode NFKC tables that
+  cannot be hand-vendored — [ADR-0033](adr/0033-saslprep-password-normalization.md)).
 - **Policy is `[auth] mode = trust | scram`** in `stele.toml` (dev default
   `trust`; a bare `[auth]` section means `scram` — configuring authentication
   means wanting it, the §4 posture). A non-dev `trust` boot warns unless mTLS
@@ -144,8 +152,7 @@ psycopg, pgjdbc, and `tokio-postgres` all speak it natively:
   `CREATE USER`, then enable `[auth]` and restart; verifiers are durable.
 - **Deliberate v0.3 floor, filed as follow-ups:** `SCRAM-SHA-256-PLUS`
   channel binding (plain SCRAM is the floor; a client demanding `p=…` is
-  refused), SASLprep normalization (raw UTF-8 passwords; ASCII is unaffected),
-  and client-side SCRAM in `stele shell`. The authenticated identity reaches
+  refused) and client-side SCRAM in `stele shell` (STL-296). The authenticated identity reaches
   the connection trace span (STL-107) **and the stored write provenance**: each
   wire-issued write stamps the connection's identity into `_stele_principal`
   (STL-300) — the SCRAM-verified user under `scram`, the unauthenticated startup
