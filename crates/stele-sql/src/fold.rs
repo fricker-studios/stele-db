@@ -38,9 +38,10 @@ pub(crate) enum FoldError {
         /// A short, stable explanation from the type's codec, when it has one.
         reason: Option<&'static str>,
     },
-    /// The column's type has no literal codec: `PERIOD` (period predicates build
-    /// intervals from `PERIOD(a,b)` endpoints, not a folded scalar) and `FLOAT8`
-    /// (an aggregate result type only — there is no float8 column to fold into).
+    /// The column's type has no literal codec: `PERIOD` — period predicates build
+    /// intervals from `PERIOD(a,b)` endpoints, not a folded scalar. (`FLOAT8` folds
+    /// from a numeric literal on the comparand path, [STL-327], but stays here on
+    /// the `INSERT`/`COPY` path — there is no float8 *column* to write into.)
     UnsupportedType(LogicalType),
 }
 
@@ -130,11 +131,26 @@ pub(crate) fn fold_scalar(expr: &Expr, ty: LogicalType) -> Result<ScalarValue, F
         LogicalType::Date => fold_civil(expr, ty, |s| {
             stele_common::datetime::parse_date(s).map(ScalarValue::Date)
         }),
-        // No literal codec for PERIOD (predicates build their intervals from
-        // PERIOD(a,b) endpoints, not from a folded period scalar — see
-        // stele-exec) or FLOAT8 (an aggregate result type only, [STL-209] —
-        // there is no `float8` column or literal to fold into, STL-207).
-        ty @ (LogicalType::Period | LogicalType::Float8) => Err(FoldError::UnsupportedType(ty)),
+        // A FLOAT8 comparand folds from a numeric literal — `HAVING AVG(x) > 5`
+        // (or `> 2.5`) ([STL-327]). It is the one fold target with no storage
+        // column: `AVG` produces it ([STL-209]), and the evaluator compares it by
+        // promoting the other numeric operand. The integer literal (`5`) widens to
+        // `5.0`, matching the implicit cast Postgres applies to the comparand.
+        LogicalType::Float8 => {
+            let number = signed_number(expr).ok_or(FoldError::TypeMismatch {
+                found: describe(expr),
+            })?;
+            number
+                .parse::<f64>()
+                .map(ScalarValue::float8)
+                .map_err(|_| FoldError::BadLiteral {
+                    literal: number,
+                    reason: None,
+                })
+        }
+        // No literal codec for PERIOD: predicates build their intervals from
+        // PERIOD(a,b) endpoints, not from a folded period scalar (see stele-exec).
+        LogicalType::Period => Err(FoldError::UnsupportedType(LogicalType::Period)),
     }
 }
 
@@ -479,6 +495,28 @@ mod tests {
                 "expected {bad:?} to be a bad bytea literal"
             );
         }
+    }
+
+    #[test]
+    fn folds_float8_from_integer_and_decimal_literals() {
+        // A FLOAT8 comparand (`HAVING AVG(x) > 5`) folds an integer literal to its
+        // exact `f64`, and a decimal literal too ([STL-327]).
+        let int = Expr::Value(Value::Number("5".to_owned(), false).into());
+        assert_eq!(
+            fold_scalar(&int, LogicalType::Float8),
+            Ok(ScalarValue::float8(5.0))
+        );
+        let dec = Expr::Value(Value::Number("2.5".to_owned(), false).into());
+        assert_eq!(
+            fold_scalar(&dec, LogicalType::Float8),
+            Ok(ScalarValue::float8(2.5))
+        );
+        // A non-numeric literal for a FLOAT8 comparand is a type mismatch, the same
+        // shape the integer arms report.
+        assert!(matches!(
+            fold_scalar(&str_lit("x"), LogicalType::Float8),
+            Err(FoldError::TypeMismatch { .. })
+        ));
     }
 
     /// A typed-string expression (`TIMESTAMP '…'`), the way the parser yields one.

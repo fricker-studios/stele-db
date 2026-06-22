@@ -4,8 +4,9 @@
 //!
 //! STL-172 shipped the inner / left / semi / anti hash join; STL-264 makes the
 //! join output feed the same downstream pipeline a single-table read uses — a
-//! `WHERE` over the joined columns, a hash aggregate (`GROUP BY` / `COUNT`), and
-//! the `DISTINCT` / `ORDER BY` / `LIMIT` tail — with qualified-name resolution
+//! `WHERE` over the joined columns, a hash aggregate (`GROUP BY` / `COUNT`) with an
+//! optional `HAVING` (STL-327, including two-anchor and `FLOAT8` `AVG` operands),
+//! and the `DISTINCT` / `ORDER BY` / `LIMIT` tail — with qualified-name resolution
 //! across the inputs; STL-323 chains the existing two-table joins left-deep
 //! (`a JOIN b … JOIN c …`). This sweep builds the **same** randomized three-table
 //! fixture in an in-memory `SessionEngine` and an in-memory DuckDB, runs each
@@ -74,6 +75,10 @@ const ID_QUERIES: &[&str] = &[
     "SELECT DISTINCT t.id FROM t JOIN s ON t.k = s.k JOIN u ON s.k = u.k",
     // LEFT chain: a NULL-extended middle key flows into the next join's `ON`.
     "SELECT t.id FROM t LEFT JOIN s ON t.k = s.k LEFT JOIN u ON s.k = u.k WHERE t.a >= 2",
+    // --- HAVING over a join (STL-327) ---
+    // Group the join by a key and filter on the per-group count; the key is non-NULL
+    // after the equi-join (NULL never matches), so column 0 stays never-NULL.
+    "SELECT t.k FROM t JOIN s ON t.k = s.k GROUP BY t.k HAVING count(*) > 1",
 ];
 
 /// `count(*)`-returning templates (column 0 is a `BIGINT` / `INT8` count) — the
@@ -93,6 +98,16 @@ const COUNT_QUERIES: &[&str] = &[
     "SELECT count(*) FROM t JOIN s ON t.k = s.k JOIN u ON s.k = u.k",
     // One count per group over a chain (GROUP BY a chain column).
     "SELECT count(*) FROM t JOIN s ON t.k = s.k JOIN u ON t.k = u.k GROUP BY t.k",
+    // --- HAVING over a join (STL-327) ---
+    // Per-group count kept only where the group has more than one matched row.
+    "SELECT count(*) FROM t JOIN s ON t.k = s.k GROUP BY t.k HAVING count(*) > 1",
+    // HAVING on an aggregate the SELECT list omits — SUM of a qualified right column
+    // (a NULL SUM over an all-NULL group drops the group).
+    "SELECT count(*) FROM t JOIN s ON t.k = s.k GROUP BY t.k HAVING SUM(s.a) > 4",
+    // Two-anchor over a join: COUNT(*) vs COUNT(s.a) — true where the group has a NULL a.
+    "SELECT count(*) FROM t JOIN s ON t.k = s.k GROUP BY t.k HAVING COUNT(*) > COUNT(s.a)",
+    // A FLOAT8 AVG operand in a HAVING over a join (AVG only filters; count is returned).
+    "SELECT count(*) FROM t JOIN s ON t.k = s.k GROUP BY t.k HAVING AVG(s.a) > 2",
 ];
 
 // --- harness ---------------------------------------------------------------

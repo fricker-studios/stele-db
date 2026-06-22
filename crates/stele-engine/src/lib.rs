@@ -13375,6 +13375,87 @@ mod tests {
     }
 
     #[test]
+    fn having_compares_two_anchors_and_float_operands() {
+        // STL-327: two-anchor comparisons and FLOAT8/AVG operands, end to end.
+        // Groups: a=10 (ids 2,5: sum 7, max 5, avg 3.5), a=20 (ids 1,3: sum 4, max 3,
+        // avg 2.0), a=NULL (id 4: sum 4, max 4, avg 4.0). Groups emit in key order.
+        let mut engine = seeded_wide();
+
+        // Grouping column (INT4) vs aggregate (INT8), promoted: `a > COUNT(*)` keeps
+        // a=10 (10>2) and a=20 (20>2); the NULL group drops (NULL > 1 is unknown).
+        let r = select(
+            &mut engine,
+            "SELECT a FROM t GROUP BY a HAVING a > COUNT(*)",
+        );
+        assert_eq!(r.rows, vec![vec![i4(10)], vec![i4(20)]]);
+
+        // Aggregate (INT8 SUM) vs aggregate (INT4 MAX), promoted: `SUM(id) > MAX(id)`
+        // keeps a=10 (7>5) and a=20 (4>3); the singleton NULL group drops (4 > 4).
+        let r = select(
+            &mut engine,
+            "SELECT a FROM t GROUP BY a HAVING SUM(id) > MAX(id)",
+        );
+        assert_eq!(r.rows, vec![vec![i4(10)], vec![i4(20)]]);
+
+        // FLOAT8 AVG against an integer literal: `AVG(id) < 3` keeps only a=20 (2.0);
+        // a=10 (3.5) and the NULL group (4.0) drop.
+        let r = select(&mut engine, "SELECT a FROM t GROUP BY a HAVING AVG(id) < 3");
+        assert_eq!(r.rows, vec![vec![i4(20)]]);
+
+        // FLOAT8 AVG against a decimal literal: `AVG(id) = 3.5` keeps only a=10.
+        let r = select(
+            &mut engine,
+            "SELECT a FROM t GROUP BY a HAVING AVG(id) = 3.5",
+        );
+        assert_eq!(r.rows, vec![vec![i4(10)]]);
+
+        // INT8 aggregate vs FLOAT8 aggregate, promoted to f64: `SUM(id) > AVG(id)`
+        // keeps a=10 (7 > 3.5) and a=20 (4 > 2.0); the NULL group drops (4 > 4.0).
+        let r = select(
+            &mut engine,
+            "SELECT a FROM t GROUP BY a HAVING SUM(id) > AVG(id)",
+        );
+        assert_eq!(r.rows, vec![vec![i4(10)], vec![i4(20)]]);
+    }
+
+    #[test]
+    fn having_filters_groups_over_a_join() {
+        // STL-327: HAVING composes over a join, resolving through the same scope the
+        // GROUP BY / aggregates do. alice (id 1) has orders 10 & 11, bob (id 2) has
+        // order 12, carol none (dropped by the inner join). Groups emit in key order.
+        let mut engine = joinable_session();
+
+        // Plain aggregate HAVING: alice's 2 orders survive `> 1`, bob's 1 does not.
+        let r = select(
+            &mut engine,
+            "SELECT users.name, COUNT(*) FROM users JOIN orders ON users.id = orders.uid \
+             GROUP BY users.name HAVING COUNT(*) > 1",
+        );
+        assert_eq!(
+            r.rows,
+            vec![vec![txt("alice"), cell(Some(ScalarValue::Int8(2)))]]
+        );
+
+        // Two-anchor over the join: SUM(oid) (INT8) vs MAX(oid) (INT4), promoted.
+        // alice sum 21 > max 11 (T); bob sum 12 > max 12 (F).
+        let r = select(
+            &mut engine,
+            "SELECT users.name FROM users JOIN orders ON users.id = orders.uid \
+             GROUP BY users.name HAVING SUM(orders.oid) > MAX(orders.oid)",
+        );
+        assert_eq!(r.rows, vec![vec![txt("alice")]]);
+
+        // FLOAT8 AVG over the join against a decimal literal: alice avg 10.5 (not >
+        // 10.5), bob avg 12.0 (> 10.5).
+        let r = select(
+            &mut engine,
+            "SELECT users.name FROM users JOIN orders ON users.id = orders.uid \
+             GROUP BY users.name HAVING AVG(orders.oid) > 10.5",
+        );
+        assert_eq!(r.rows, vec![vec![txt("bob")]]);
+    }
+
+    #[test]
     fn order_by_under_as_of_sorts_the_past_state() {
         // Shaping runs over the rows the snapshot resolves, so an AS OF read
         // orders by the *past* cells — deterministically.
