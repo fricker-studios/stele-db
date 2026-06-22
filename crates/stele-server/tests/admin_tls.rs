@@ -28,7 +28,7 @@ use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
-use stele_pgwire::{ServerTls, SharedSession, TlsMode, TlsSettings};
+use stele_pgwire::{ServerTls, SharedSession, TlsMode, TlsReloader, TlsSettings};
 use stele_server::admin::grpc::GrpcAdmin;
 use stele_server::admin::http::AdminHttp;
 use stele_server::admin::proto::admin_service_client::AdminServiceClient;
@@ -192,6 +192,48 @@ async fn boot_tls(pki: &Pki, mtls: bool) -> Harness {
     }
 }
 
+/// Boot the admin surface over **reloadable** TLS: the `AcceptorSource` and both
+/// transports share `reloader`'s cell, so a `ReloadTls` trigger swaps the cert the
+/// listeners present without a restart ([STL-326]). Mirrors [`boot_tls`] otherwise.
+///
+/// [STL-326]: https://allegromusic.atlassian.net/browse/STL-326
+async fn boot_tls_reloadable(reloader: &TlsReloader) -> Harness {
+    let source = AcceptorSource::reloading(reloader);
+
+    let engine = Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let core = AdminService::new(Arc::clone(&engine));
+    let auth = Arc::new(AdminAuth::new(vec![TOKEN.to_owned()]));
+
+    let state = Arc::new(OpsState::new());
+    let session: SharedSession = engine.clone();
+    state.set_ready(session);
+    state.set_admin(Arc::new(
+        AdminHttp::new(core.clone(), Arc::clone(&auth)).with_tls_reloader(reloader),
+    ));
+    let ops = OpsServer::new("127.0.0.1:0".parse().unwrap(), state)
+        .with_tls(Some(source.clone()))
+        .bind()
+        .await
+        .expect("bind ops listener");
+    let ops_addr = ops.local_addr();
+    tokio::spawn(ops.serve());
+
+    let grpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind grpc listener");
+    let grpc_addr = grpc_listener.local_addr().unwrap();
+    tokio::spawn(stele_server::admin::grpc::serve_tls(
+        grpc_listener,
+        GrpcAdmin::new(core, auth).with_tls_reloader(reloader),
+        source,
+    ));
+
+    Harness {
+        ops_addr,
+        grpc_addr,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Clients
 // ---------------------------------------------------------------------------
@@ -274,6 +316,26 @@ async fn https(
     let text = String::from_utf8(raw).expect("utf-8");
     let (head, body) = text.split_once("\r\n\r\n").expect("head/body split");
     Ok((head.lines().next().unwrap().to_owned(), body.to_owned()))
+}
+
+/// Open a TLS connection to `addr`, complete the handshake trusting `ca_pem`, and
+/// return the server's leaf-certificate DER — so a test can watch the served
+/// certificate change across a reload.
+async fn https_leaf(addr: SocketAddr, ca_pem: &str) -> Vec<u8> {
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(rustls_client_config(ca_pem, None)));
+    let tcp = TcpStream::connect(addr).await.expect("connect");
+    let server_name = ServerName::try_from(SERVER_NAME).unwrap();
+    let stream = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("tls handshake");
+    let (_io, conn) = stream.get_ref();
+    conn.peer_certificates()
+        .expect("server presented certificates")
+        .first()
+        .expect("a leaf certificate")
+        .as_ref()
+        .to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -396,4 +458,74 @@ async fn mtls_gateway_requires_a_client_certificate() {
         result.is_err(),
         "mTLS must reject a client that presents no certificate"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_tls_trigger_rotates_the_served_certificate() {
+    // The cross-platform DoD (STL-326): a signal-free, token-authenticated trigger
+    // rotates the certificate the listener serves — no restart, no SIGHUP. The
+    // oracle: capture the leaf on the wire, stage a new pair on disk, fire the
+    // trigger, and watch a NEW connection present the rotated leaf.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // One CA, two server leaves (A then B). The client trusts the CA, so it
+    // verifies either leaf; the rotation is observable as a different leaf DER.
+    let ca = mint_ca("stele admin-tls reload CA");
+    let server_leaf = |name: &str| {
+        mint_leaf(
+            &ca,
+            name,
+            Some(SERVER_NAME),
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+        )
+    };
+    let (cert_a, key_a) = server_leaf("stele server A");
+    let dir = std::env::temp_dir().join(format!("stele-admin-tls-reload-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let cert_path = dir.join("server.crt");
+    let key_path = dir.join("server.key");
+    std::fs::write(&cert_path, &cert_a).expect("write cert A");
+    std::fs::write(&key_path, &key_a).expect("write key A");
+
+    let reloader = TlsReloader::load(TlsSettings {
+        cert: cert_path.clone(),
+        key: key_path.clone(),
+        client_ca: None,
+        mode: TlsMode::Required,
+    })
+    .expect("load reloader");
+    let h = boot_tls_reloadable(&reloader).await;
+
+    // The leaf currently on the wire — cert A.
+    let leaf_a = https_leaf(h.ops_addr, &ca.pem).await;
+
+    // Stage a fresh leaf B on disk. Until the trigger fires, the listener keeps
+    // serving A — a reload is explicit, not an mtime watch.
+    let (cert_b, key_b) = server_leaf("stele server B");
+    std::fs::write(&cert_path, &cert_b).expect("rotate cert to B");
+    std::fs::write(&key_path, &key_b).expect("rotate key to B");
+    assert_eq!(
+        https_leaf(h.ops_addr, &ca.pem).await,
+        leaf_a,
+        "no trigger yet → the listener still serves cert A"
+    );
+
+    // Fire the cross-platform trigger over the HTTPS gateway (the curl face).
+    let (status, body) = https(
+        h.ops_addr,
+        rustls_client_config(&ca.pem, None),
+        "POST",
+        "/v1alpha1/reload-tls",
+        Some(TOKEN),
+    )
+    .await
+    .expect("reload-tls request");
+    assert!(status.contains("200"), "{status}: {body}");
+    assert!(body.contains("\"reloaded\":true"), "{body}");
+
+    // A new connection now presents cert B — rotated without a restart.
+    let leaf_b = https_leaf(h.ops_addr, &ca.pem).await;
+    assert_ne!(leaf_b, leaf_a, "after the trigger the served leaf is B");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
