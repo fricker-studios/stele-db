@@ -331,6 +331,43 @@ impl<F: DiskFile> SegmentReader<F> {
             .is_none_or(|entry| entry.as_ref().is_none_or(|summary| summary.covers(point)))
     }
 
+    /// Whether row-group `g` *might* hold a row whose valid interval overlaps the
+    /// half-open probe `[lo, hi)` — the per-row-group valid-time *interval* skip
+    /// test ([STL-336], format v14), the range sibling of
+    /// [`Self::row_group_might_contain_valid`]'s point stab and the
+    /// row-group-granular refinement of [`Self::might_overlap_valid`].
+    ///
+    /// Consults this row-group's footer-resident `ValidIntervalSummary` and
+    /// touches **no** column chunk. A `false` result *proves* no row in row-group
+    /// `g` overlaps `[lo, hi)`, so a scan whose per-row PERIOD predicate can match
+    /// only an overlapping row — `PERIOD(valid_from, valid_to)` related to a
+    /// constant `PERIOD(lo, hi)` by `OVERLAPS` / `CONTAINS` / `EQUALS` ([STL-193])
+    /// — can skip that one row-group even when the segment-level summary cannot
+    /// prune the whole segment ([`Self::might_overlap_valid`]): a production flush
+    /// bounds row-groups ([STL-197]), so within a scatter-heavy segment one
+    /// row-group can carry a coverage gap over `[lo, hi)` the segment-wide union
+    /// (and the per-row-group `valid_from` / `valid_to` zone-map min/max, [STL-173])
+    /// cannot see. A segment with no per-row-group summaries (system-only, format
+    /// ≤ v13, or a summary-disabled writer), an admit-all row-group, or an
+    /// out-of-range index all admit every probe, so this never prunes a real match.
+    /// Snapshot-free by design: a sealed segment's valid windows are fixed, so a
+    /// coverage gap holds at every system snapshot.
+    ///
+    /// Indices line up with [`Self::row_group_row_counts`] /
+    /// [`Self::row_group_zone_maps`].
+    #[must_use]
+    pub fn row_group_might_overlap_valid(&self, g: usize, lo: i64, hi: i64) -> bool {
+        self.footer
+            .row_group_valid_intervals
+            .as_ref()
+            .and_then(|summaries| summaries.get(g))
+            .is_none_or(|entry| {
+                entry
+                    .as_ref()
+                    .is_none_or(|summary| summary.overlaps(lo, hi))
+            })
+    }
+
     /// Read one column end-to-end across every row-group, in row order. The
     /// late-materialization path: only the requested column's chunks are
     /// touched, and each chunk's CRC32C is verified before any of its bytes
