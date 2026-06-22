@@ -21,11 +21,12 @@ use std::time::Instant;
 
 use anyhow::Context as _;
 
-use crate::client::{Client, PasswordRequired, Reply, ResultSet, ServerError};
+use crate::client::{AuthFailed, Client, PasswordRequired, Reply, ResultSet, ServerError};
 // The admin / control-plane tier ([STL-200]) rides the published `stele-client`
 // SDK ([STL-255]) — the dogfood for the crate the CLI, Studio, and the operator
 // share. Aliased so the SDK's `Client` does not shadow the pg-wire `Client` above.
 use crate::highlight;
+use crate::pgpass;
 use crate::render::{self, BorderStyle, Column, StatsMode, TableOpts};
 use crate::theme::{Role, Seg, Theme, paint_segs};
 use stele_client::{Client as AdminClient, Config as AdminConfig, Error as AdminError};
@@ -154,16 +155,29 @@ pub fn run(opts: &Opts) -> anyhow::Result<()> {
     }
 }
 
-/// Connect to the engine, prompting for a password if the server requests SCRAM
-/// authentication and none was supplied ([STL-296]).
+/// How many times an interactive shell re-prompts for a password before giving
+/// up. Capped (rather than looping until success, as older psql does) so a
+/// session can never spin forever — three tries matches the common ceiling and
+/// is plenty for a typo.
+const MAX_PASSWORD_PROMPTS: u8 = 3;
+
+/// Connect to the engine, resolving the SCRAM password the way libpq/psql does
+/// and prompting (interactively) when the server asks for one ([STL-296],
+/// [STL-335]).
 ///
-/// The `PGPASSWORD` value (if any) is tried first. A trust-auth server ignores it
-/// and this returns on the first attempt. Against a `scram` server with no
-/// password available, the first attempt fails with [`PasswordRequired`]; an
-/// **interactive** session then prompts (no echo) and reconnects once on a fresh
-/// socket — libpq's behavior. A scripted session has no terminal to prompt at, so
-/// the error propagates with its "set PGPASSWORD" guidance. A wrong password (or
-/// any other failure) is not retried — it surfaces as-is.
+/// Password sources, in order: `PGPASSWORD` (already in `opts.password`), then
+/// `~/.pgpass` (the `pgpass` module) — both consulted whether or not there is a
+/// terminal — then, **interactively only**, the no-echo prompt below. A
+/// trust-auth server ignores whatever we send and connects on the first attempt.
+///
+/// Against a `scram` server an interactive session re-prompts and reconnects on a
+/// fresh socket — up to `MAX_PASSWORD_PROMPTS` times — when the server requests
+/// a password we don't have ([`PasswordRequired`]) *or* rejects the one we sent
+/// ([`AuthFailed`], SQLSTATE `28P01`), so a wrong `PGPASSWORD`/`.pgpass` or a
+/// fat-fingered prompt no longer drops the user back to their shell. A scripted
+/// session has no terminal to prompt at, so the error propagates (with its "set
+/// PGPASSWORD" / "authentication failed" guidance). Any non-password failure
+/// (TLS, a bad host) surfaces immediately.
 fn connect(opts: &Opts, interactive: bool) -> anyhow::Result<Client> {
     let attempt = |password: Option<&str>| {
         Client::connect(
@@ -175,24 +189,58 @@ fn connect(opts: &Opts, interactive: bool) -> anyhow::Result<Client> {
             password,
         )
     };
-    match attempt(opts.password.as_deref()) {
-        Ok(client) => Ok(client),
-        Err(e) if interactive && e.downcast_ref::<PasswordRequired>().is_some() => {
-            let password = prompt_password(&opts.user)?;
-            attempt(Some(&password))
+
+    // PGPASSWORD, then ~/.pgpass; the prompt (interactive only) is the loop's
+    // fallback below.
+    let mut password = opts
+        .password
+        .clone()
+        .or_else(|| pgpass::lookup(&opts.host, opts.port, &opts.dbname, &opts.user));
+
+    let mut prompts = 0_u8;
+    loop {
+        match attempt(password.as_deref()) {
+            Ok(client) => return Ok(client),
+            Err(e) if interactive && needs_password(&e) && prompts < MAX_PASSWORD_PROMPTS => {
+                // Report a *rejected* password before asking again (psql prints the
+                // error then re-prompts), so the user knows why. The expected
+                // "no password supplied yet" case prompts silently — there is
+                // nothing to report.
+                if e.downcast_ref::<AuthFailed>().is_some() {
+                    eprintln!("{e:#}");
+                }
+                prompts += 1;
+                password = Some(prompt_password(&opts.user)?);
+            }
+            Err(e) => return Err(e),
         }
-        Err(e) => Err(e),
     }
 }
 
+/// Whether a connect failure is one an interactive shell answers by
+/// (re-)prompting: the server requires a password we didn't supply
+/// ([`PasswordRequired`]), or it rejected the one we sent ([`AuthFailed`] with
+/// SQLSTATE `28P01`). Every other failure — TLS, an unreachable host, a
+/// non-password SASL error — cannot be fixed by a new password, so it surfaces.
+fn needs_password(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<PasswordRequired>().is_some()
+        || e.downcast_ref::<AuthFailed>()
+            .is_some_and(AuthFailed::is_password_rejection)
+}
+
 /// Prompt for a password on the controlling terminal without echoing it
-/// ([STL-296]) — used when the server requests SCRAM and no `PGPASSWORD` was set.
+/// ([STL-296], [STL-335]) — used when the server requests SCRAM and no
+/// `PGPASSWORD`/`.pgpass` password was found.
 ///
-/// On unix the terminal's `ECHO` flag is cleared for the duration of the read
-/// (the prompt and the trailing newline go to stderr, so stdout stays clean and
-/// the keystrokes never appear), then restored unconditionally — the same
-/// true-no-echo recipe psql and sudo use. The prompt is unavailable off unix,
-/// where `PGPASSWORD` is the path.
+/// The terminal's echo is cleared for the duration of the read (the prompt and
+/// the trailing newline go to stderr, so stdout stays clean and the keystrokes
+/// never appear), then restored unconditionally — the true-no-echo recipe psql
+/// and sudo use. On unix that is the termios `ECHO` flag (this function); on
+/// Windows it is the console `ENABLE_ECHO_INPUT` mode (the `cfg(windows)`
+/// counterpart below). On any other platform the prompt is unavailable and
+/// `PGPASSWORD`/`.pgpass` is the path.
+///
+/// [STL-335]: https://allegromusic.atlassian.net/browse/STL-335
 #[cfg(unix)]
 fn prompt_password(user: &str) -> anyhow::Result<String> {
     use std::io::{BufRead as _, Write as _};
@@ -225,11 +273,78 @@ fn prompt_password(user: &str) -> anyhow::Result<String> {
     Ok(password)
 }
 
-#[cfg(not(unix))]
+/// Windows counterpart of the unix no-echo prompt ([STL-335]): clear the console
+/// input handle's `ENABLE_ECHO_INPUT` bit for the duration of the read, then
+/// restore the original mode. `ENABLE_LINE_INPUT` stays on, so Enter still ends
+/// the line; only the echo of the typed characters is suppressed — the same
+/// `windows-sys` console-mode recipe Windows password prompts use.
+///
+/// `windows-sys` is already compiled into the binary (it is in the dependency
+/// graph many times over), so naming it for this target adds no new
+/// supply-chain surface — the same reasoning as `nix` on unix.
+///
+/// The `unsafe` is the unavoidable FFI into the Win32 console API; each call is
+/// justified inline and operates only on the process std-input handle, so the
+/// `allow` is scoped to this one function.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn prompt_password(user: &str) -> anyhow::Result<String> {
+    use std::io::{BufRead as _, Write as _};
+
+    use anyhow::Context as _;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+    };
+
+    // SAFETY: `GetStdHandle` reads a process-wide handle and returns it (or
+    // `INVALID_HANDLE_VALUE` / null); no memory is dereferenced here.
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        anyhow::bail!(
+            "no console available for the password prompt; set the PGPASSWORD \
+             environment variable"
+        );
+    }
+
+    let mut original = 0_u32;
+    // SAFETY: `handle` is the valid std-input handle checked above; `original` is
+    // a valid out-pointer for the single `CONSOLE_MODE` the call writes.
+    if unsafe { GetConsoleMode(handle, &raw mut original) } == 0 {
+        anyhow::bail!(
+            "reading the console mode for the password prompt failed; set the \
+             PGPASSWORD environment variable"
+        );
+    }
+
+    // Disable echo *before* writing the prompt, so a user who starts typing while
+    // the prompt is still flushing cannot have those first characters echoed.
+    // SAFETY: `handle` is the valid std-input handle checked above.
+    if unsafe { SetConsoleMode(handle, original & !ENABLE_ECHO_INPUT) } == 0 {
+        anyhow::bail!("disabling console echo for the password prompt failed");
+    }
+    eprint!("Password for user {user}: ");
+    std::io::stderr().flush().ok();
+
+    let mut password = String::new();
+    let read = std::io::stdin().lock().read_line(&mut password);
+    // Restore the original console mode no matter how the read went, then end the
+    // un-echoed line.
+    // SAFETY: `handle` is the valid std-input handle checked above.
+    let _ = unsafe { SetConsoleMode(handle, original) };
+    eprintln!();
+    read.context("reading password")?;
+
+    // Drop the trailing newline the user's Enter left in the buffer.
+    password.truncate(password.trim_end_matches(['\r', '\n']).len());
+    Ok(password)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn prompt_password(_user: &str) -> anyhow::Result<String> {
     anyhow::bail!(
         "no password supplied: set the PGPASSWORD environment variable \
-         (the interactive password prompt is unix-only)"
+         (the interactive password prompt is unavailable on this platform)"
     )
 }
 

@@ -121,9 +121,12 @@ impl PtyShell {
             .stderr(stderr)
             .env("HOME", &home)
             .env("TERM", "xterm")
-            // Strip any ambient PGPASSWORD so the no-password path — and thus the
-            // interactive prompt under test — is exercised deterministically.
+            // Strip any ambient PGPASSWORD/PGPASSFILE so the no-password path — and
+            // thus the interactive prompt under test — is exercised
+            // deterministically. The private HOME has no `~/.pgpass`, so with
+            // PGPASSFILE cleared the password file never resolves (STL-335).
             .env_remove("PGPASSWORD")
+            .env_remove("PGPASSFILE")
             .spawn()
             .expect("spawn interactive shell");
         // Drop the test's own handle to the slave so the master observes EOF once
@@ -378,6 +381,76 @@ async fn interactive_shell_prompts_for_a_scram_password_without_echoing_it() {
         assert!(
             !snap.contains("hunter2pw"),
             "the password was echoed to the terminal:\n{snap}"
+        );
+    })
+    .await
+    .expect("pty shell task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interactive_shell_reprompts_on_a_wrong_scram_password() {
+    // STL-335: a wrong password at the interactive prompt no longer drops the user
+    // back to their shell — psql-style, the prompt loops until the right password is
+    // entered (or the bounded retry count is hit). Drive a real PTY: type a wrong
+    // password first (expect a *second* prompt), then the correct one (expect a
+    // connection). The only way to exercise the re-prompt loop is interactively;
+    // the scripted path surfaces the error instead.
+    let addr = spawn_scram_server(&[("alice", "hunter2pw")]).await;
+
+    tokio::task::spawn_blocking(move || {
+        let mut shell = PtyShell::spawn_args(addr, &["--user", "alice"]);
+
+        // First prompt.
+        assert!(
+            shell.wait_until(Duration::from_secs(15), Duration::from_secs(12), |o| o
+                .contains("Password for user alice")),
+            "shell never prompted for a SCRAM password:\n{}",
+            shell.snapshot()
+        );
+
+        // A wrong password: the shell must re-prompt rather than exit. The second
+        // prompt is the signal the first attempt was rejected and retried.
+        shell.send("wrong-password\n");
+        assert!(
+            shell.wait_until(Duration::from_secs(15), Duration::from_secs(12), |o| o
+                .matches("Password for user alice")
+                .count()
+                >= 2),
+            "shell did not re-prompt after a wrong password:\n{}",
+            shell.snapshot()
+        );
+        // …and it reported *why* before re-prompting (psql prints the rejection).
+        assert!(
+            shell.snapshot().contains("authentication failed"),
+            "the re-prompt should follow a reported authentication failure:\n{}",
+            shell.snapshot()
+        );
+
+        // The correct password on the re-prompt connects.
+        shell.send("hunter2pw\n");
+        assert!(
+            shell.wait_until(Duration::from_secs(15), Duration::from_secs(12), |o| o
+                .contains("Connected to database")),
+            "shell did not connect after the correct password on re-prompt:\n{}",
+            shell.snapshot()
+        );
+
+        // …and a query runs past authentication.
+        let mark = shell.snapshot().len();
+        shell.send("SELECT 1;\n");
+        assert!(
+            shell.wait_until(Duration::from_secs(15), Duration::from_secs(12), |o| o
+                .get(mark..)
+                .is_some_and(|tail| tail.contains("(1 row"))),
+            "shell did not answer a query after re-prompt auth:\n{}",
+            shell.snapshot().get(mark..).unwrap_or_default()
+        );
+
+        // Neither password was ever echoed to the terminal.
+        let snap = shell.snapshot();
+        assert!(
+            !snap.contains("hunter2pw") && !snap.contains("wrong-password"),
+            "a password was echoed to the terminal:\n{snap}"
         );
     })
     .await

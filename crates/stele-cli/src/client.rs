@@ -94,6 +94,12 @@ const AUTH_SASL: i32 = 10;
 const AUTH_SASL_CONTINUE: i32 = 11;
 const AUTH_SASL_FINAL: i32 = 12;
 
+/// SQLSTATE `28P01` (`invalid_password`) — the code the server returns for a
+/// failed SCRAM proof *and* for an unknown user (the two are deliberately
+/// indistinguishable, so an attacker cannot enumerate users). The shell treats
+/// it as "the password was wrong" and, interactively, re-prompts ([STL-335]).
+const SQLSTATE_INVALID_PASSWORD: &str = "28P01";
+
 /// Plain `SCRAM-SHA-256` — no channel binding. Always offered (alongside `-PLUS`
 /// over TLS), and the floor the shell uses off TLS, against a plain-only server,
 /// or for a certificate it cannot bind. The `n` gs2 flag the client pairs with it
@@ -184,6 +190,42 @@ impl std::fmt::Display for PasswordRequired {
 }
 
 impl std::error::Error for PasswordRequired {}
+
+/// [`Client::connect`] failed mid-SCRAM because the server rejected the
+/// credentials — an `ErrorResponse` during the SASL exchange ([STL-335]).
+/// Carries the decoded error so the caller can both report it and decide whether
+/// to retry: an **interactive** shell re-prompts for a password when this is a
+/// wrong-password rejection ([`Self::is_password_rejection`], SQLSTATE `28P01`),
+/// the way psql does; a scripted shell, or any non-password SASL error, surfaces
+/// it unchanged. Distinguished from other failures via
+/// [`anyhow::Error::downcast_ref`].
+///
+/// [STL-335]: https://allegromusic.atlassian.net/browse/STL-335
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthFailed {
+    /// The decoded `ErrorResponse` the server sent; its `code` is the SQLSTATE.
+    pub error: ServerError,
+}
+
+impl AuthFailed {
+    /// Whether the rejection is a wrong-password error (SQLSTATE `28P01`) — the
+    /// only SASL failure an interactive shell answers by re-prompting. A policy
+    /// refusal or a protocol fault is not a password problem and surfaces as-is.
+    #[must_use]
+    pub fn is_password_rejection(&self) -> bool {
+        self.error.code == SQLSTATE_INVALID_PASSWORD
+    }
+}
+
+impl std::fmt::Display for AuthFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Keeps the pre-STL-335 wording ("authentication failed — …") so existing
+        // diagnostics and tests read the same.
+        write!(f, "authentication failed — {}", self.error)
+    }
+}
+
+impl std::error::Error for AuthFailed {}
 
 /// What one statement inside a simple-query round-trip produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -540,8 +582,8 @@ impl Client {
     /// Read one backend message mid-SASL and return the SCRAM text of an
     /// `Authentication` ('R') message whose code is `expected`. An
     /// `ErrorResponse` (wrong password / unknown user — SQLSTATE `28P01`) is
-    /// surfaced as the connection error it is; any other message is a protocol
-    /// violation.
+    /// surfaced as a typed [`AuthFailed`], so an interactive caller can re-prompt;
+    /// any other message is a protocol violation.
     fn read_sasl_message(&mut self, expected: i32) -> anyhow::Result<String> {
         let (kind, payload) = self.read_message()?;
         match kind {
@@ -558,10 +600,10 @@ impl Client {
                 String::from_utf8(body.to_vec())
                     .context("SCRAM message from server is not valid UTF-8")
             }
-            MSG_ERROR_RESPONSE => Err(anyhow::anyhow!(
-                "authentication failed — {}",
-                parse_error(&payload)
-            )),
+            MSG_ERROR_RESPONSE => Err(AuthFailed {
+                error: parse_error(&payload),
+            }
+            .into()),
             other => bail!("unexpected message type {other:#04x} during SASL authentication"),
         }
     }
@@ -1509,5 +1551,37 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("alice"), "{rendered}");
         assert!(rendered.contains("PGPASSWORD"), "{rendered}");
+    }
+
+    #[test]
+    fn auth_failed_flags_only_a_wrong_password_for_re_prompting() {
+        // `rejected` is the decoded server error, not a credential — named so
+        // CodeQL's `password`-substring heuristic does not misread the Display
+        // round-trip below as cleartext logging of a secret.
+        let rejected = AuthFailed {
+            error: ServerError {
+                severity: "FATAL".to_owned(),
+                code: SQLSTATE_INVALID_PASSWORD.to_owned(),
+                message: "authentication failed for user \"alice\"".to_owned(),
+                hint: None,
+            },
+        };
+        // A 28P01 is the wrong-password case an interactive shell re-prompts on,
+        // and its rendering keeps the pre-STL-335 "authentication failed" wording.
+        assert!(rejected.is_password_rejection());
+        let rendered = rejected.to_string();
+        assert!(rendered.contains("authentication failed"), "{rendered}");
+
+        // A non-28P01 SASL-time error is not a password problem, so it is not
+        // re-prompted — it surfaces as-is.
+        let policy = AuthFailed {
+            error: ServerError {
+                severity: "FATAL".to_owned(),
+                code: "28000".to_owned(),
+                message: "connection requires TLS".to_owned(),
+                hint: None,
+            },
+        };
+        assert!(!policy.is_password_rejection());
     }
 }
