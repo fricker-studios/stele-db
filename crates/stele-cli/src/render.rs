@@ -433,6 +433,11 @@ fn detailed_stats(stats: &QueryStats) -> Vec<Line> {
             stats.segments_pruned_superseded.to_string(),
             Role::Text,
         ));
+        out.push(row(
+            "↳ valid",
+            stats.segments_pruned_valid.to_string(),
+            Role::Text,
+        ));
     }
     if stats.row_groups_total > 0 {
         out.push(row(
@@ -702,6 +707,7 @@ mod tests {
             segments_pruned_zone: 2,
             segments_pruned_bloom: 0,
             segments_pruned_superseded: 0,
+            segments_pruned_valid: 0,
             row_groups_total: 1,
             row_groups_scanned: 1,
             row_groups_pruned_zone: 0,
@@ -761,6 +767,40 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("↳ zone-map"), "{rendered}");
+        assert!(rendered.contains("↳ valid"), "{rendered}");
         assert!(rendered.contains("row-groups"), "{rendered}");
+    }
+
+    #[test]
+    fn footer_counts_valid_axis_pruning() {
+        // STL-333: a valid-axis prune (the `FOR VALID_TIME AS OF` point stab /
+        // per-row PERIOD overlap probe) must show in the footer — both broken out on
+        // the `↳ valid` line and folded into the headline "pruned" total, so the
+        // displayed `scanned + pruned == total` partition holds on the valid axis.
+        let stats = QueryStats {
+            segments_total: 3,
+            segments_scanned: 1,
+            segments_pruned_zone: 0,
+            segments_pruned_bloom: 0,
+            segments_pruned_superseded: 0,
+            segments_pruned_valid: 2,
+            ..flushed_stats()
+        };
+
+        let detailed = text(&stats_lines(&stats, StatsMode::Detailed));
+        assert!(
+            detailed.contains("3 total · 1 scanned · 2 pruned"),
+            "valid prune missing from the detailed total: {detailed}"
+        );
+        assert!(
+            detailed.contains("↳ valid") && detailed.contains('2'),
+            "valid prune missing its own line: {detailed}"
+        );
+
+        let compact = text(&stats_lines(&stats, StatsMode::Compact));
+        assert_eq!(
+            compact, "  ⤷ live @ now() · scanned 1 of 3 segments · 2 pruned",
+            "valid prune missing from the compact total",
+        );
     }
 }
