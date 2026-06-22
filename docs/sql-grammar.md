@@ -540,11 +540,11 @@ reordering / cost-based planning). Each step's `ON` may relate the freshly joine
 input to *any* already-joined input — `c.x = a.y` is as valid as `c.x = b.y`.
 
 ```sql
-SELECT u.name, p.label, count(*)
+SELECT u.name, p.label, count(*) AS n
 FROM users u JOIN orders o ON u.id = o.uid JOIN products p ON o.pid = p.pid
 WHERE o.total >= 100
 GROUP BY u.name, p.label
-ORDER BY count DESC
+ORDER BY n DESC
 LIMIT 10;
 ```
 

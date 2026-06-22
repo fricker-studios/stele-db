@@ -2691,10 +2691,11 @@ fn detect_join(select: &Select) -> Option<&TableWithJoins> {
 /// per-input "different instant per table" join cannot reach here.) A `FOR
 /// VALID_TIME AS OF` pin is meaningful only where every input has a valid axis, so
 /// a system-only side under one is rejected, mirroring the single-table
-/// [`SelectError::ValidTimeUnsupported`]. A period predicate over the join, the
-/// `RIGHT` / `FULL` / `CROSS` joins ([`join_kind_and_constraint`]), and join
-/// reordering ([STL-270]) stay rejected / out of scope (each a tracked follow-up);
-/// the chain runs in syntactic, left-deep order.
+/// [`SelectError::ValidTimeUnsupported`]. A period predicate over the join and the
+/// `RIGHT` / `FULL` / `CROSS` / non-equi joins ([`join_kind_and_constraint`],
+/// [STL-270]) stay rejected (each a tracked follow-up); join reordering /
+/// cost-based planning is out of scope — the chain runs in syntactic, left-deep
+/// order.
 // Eight inputs because the join binds the whole `SELECT` over every relation: the
 // statement (temporal qualifiers) and its `query` / `select` halves, the catalog
 // `ctx`, the `from` relations, the CTE `sigs` in scope, and the resolved
