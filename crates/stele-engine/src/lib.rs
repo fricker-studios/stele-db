@@ -3248,13 +3248,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .collect();
         let n_schema = schema_columns.len();
         // A range scan ([STL-244] system axis, [STL-328] valid axis) appends the
-        // period endpoints after the projected user columns, and has no provenance
-        // pseudo-columns in its addressable set.
-        if let Some((from_col, to_col)) = range_endpoint_names(bound) {
-            let mut columns = projected_columns(&bound.projection, &schema_columns, n_schema);
-            columns.push((from_col.to_owned(), LogicalType::TimestampTz));
-            columns.push((to_col.to_owned(), LogicalType::TimestampTz));
-            return Ok(columns);
+        // period endpoints to the schema it projects over, then exposes the
+        // provenance pseudo-columns past them ([STL-329]) — the same addressable set
+        // the executed result shapes against, so `Describe` and the run agree on the
+        // row shape (endpoints and a named provenance column included).
+        if bound.range_endpoint_names().is_some() {
+            let range_schema_columns = range_schema_columns(bound, &schema_columns);
+            let range_addressable = addressable_columns(&range_schema_columns);
+            return Ok(projected_columns(
+                &bound.projection,
+                &range_addressable,
+                range_schema_columns.len(),
+            ));
         }
         Ok(projected_columns(
             &bound.projection,
@@ -3352,19 +3357,22 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // A `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` range scan
         // ([STL-244]) returns every version overlapping the interval — many per key
         // — with the period endpoints (`sys_from`, `sys_to`) appended after the
-        // projected columns. A wholly different shape from a point read, and the
-        // binder has already rejected the clauses (aggregate / shaping / subquery /
-        // CTE / overlay-sensitive) that the single-table path below threads.
+        // projected columns. It reconstructs versions differently from a point read,
+        // then routes through the shared `finish_select` tail so result-shaping,
+        // aggregation, and the provenance pseudo-columns compose over it ([STL-329]).
+        // The scan reads committed history; the read-your-own-writes overlay is a
+        // deferred follow-up, so `overlay` rides in only for `finish_select`'s
+        // (binder-rejected over a range) subquery shapes.
         if let Some(range) = bound.system_range {
-            return self.run_system_range(bound, range);
+            return self.run_system_range(bound, range, overlay, scope);
         }
 
         // A `FOR VALID_TIME { FROM a TO b | BETWEEN a AND b }` range scan ([STL-328])
         // is the valid-axis mirror: every version system-live at the snapshot whose
         // valid interval overlaps the range, with the period endpoints (`valid_from`,
-        // `valid_to`) appended. Same wholly-different shape, same binder rejections.
+        // `valid_to`) appended. Same shape, same shared `finish_select` tail.
         if let Some(range) = bound.valid_range {
-            return self.run_valid_range(bound, range);
+            return self.run_valid_range(bound, range, overlay, scope);
         }
 
         // A `FROM` that names a materialized relation — a CTE reference or a derived
@@ -3794,20 +3802,29 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// columns. `sys_to` is `NULL` for a still-current (open) version.
     ///
     /// The version selection is the executor's interval mode
-    /// ([`SnapshotScan::execute_range`]); the engine reconstructs each version's
-    /// row from its bare payload (the row codec), applies the bound `WHERE` over the
-    /// schema columns (the appended endpoints ride along, never referenced by the
-    /// predicate), then projects the user columns and appends the endpoints. A
-    /// key-equality `WHERE` is pushed down to the scan for zone-map pruning; the
-    /// binder has rejected the aggregate / shaping / subquery / CTE clauses the
-    /// point path threads, so this stays a plain projection + filter.
+    /// ([`SnapshotScan::execute_range`]); the engine reconstructs each version's row
+    /// from its bare payload (the row codec), materializes provenance after the
+    /// endpoints when the query references it ([STL-247]), applies the bound `WHERE`,
+    /// then routes the rows through the shared [`finish_select`](Self::finish_select)
+    /// tail — so result-shaping ([STL-263]), aggregation ([STL-171]), and the
+    /// provenance pseudo-columns compose over the range output exactly as over a
+    /// point read ([STL-329]). The endpoints are *addressable* columns there: the
+    /// binder bound the projection / `ORDER BY` / `GROUP BY` against a schema that
+    /// includes them ([`range_schema_columns`]), so they line up positionally.
+    ///
+    /// A key-equality `WHERE` is pushed down to the scan for zone-map pruning; the
+    /// full predicate is re-applied over the reconstructed rows.
     ///
     /// Read-committed only: the read-your-own-writes overlay ([STL-203]) is not
-    /// applied to a range scan (a tracked follow-up), matching the join path.
+    /// applied to a range scan (a tracked follow-up), matching the join path; the
+    /// `overlay` / `scope` arguments feed only `finish_select`'s subquery shapes,
+    /// which the binder rejects over a range.
     fn run_system_range(
         &self,
         bound: &BoundSelect,
         range: SystemTimeRange,
+        overlay: &[BoundDml],
+        scope: &CteScope,
     ) -> Result<StatementOutcome, EngineError> {
         let table = bound.table.as_str();
         let snapshot = bound.snapshot;
@@ -3825,7 +3842,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .map(|c| (c.name().to_owned(), c.ty()))
             .collect();
         let value_count = schema_columns.len().saturating_sub(1);
-        let n_schema = schema_columns.len();
+
+        // The addressable set the projection / shaping / aggregate clauses bound
+        // against: the table's own columns, then the two appended endpoints
+        // (`range_schema_columns`), then the provenance pseudo-columns. A read
+        // referencing provenance materializes it after the endpoints — the fixed
+        // virtual layout the binder and `references_provenance` agree on ([STL-329]).
+        let range_schema_columns = range_schema_columns(bound, &schema_columns);
+        let range_addressable = addressable_columns(&range_schema_columns);
+        let needs_provenance =
+            references_provenance(bound, &range_addressable, range_schema_columns.len());
 
         // Push a business-key equality down to the scan for zone-map pruning when the
         // `WHERE` pins one; any richer predicate lives in the payload and is applied
@@ -3840,6 +3866,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 column: ColumnId::BusinessKey,
                 value: ZoneBound::Bytes(encode_value(value)),
             });
+        // Project provenance alongside the payload when the query references it, so
+        // each resolved version carries its writing provenance ([STL-247]).
+        let mut project = vec![ColumnId::BusinessKey, ColumnId::Payload];
+        if needs_provenance {
+            project.extend([ColumnId::TxnId, ColumnId::CommittedAt, ColumnId::Principal]);
+        }
         let readers = state.engine.open_segment_readers()?;
         let scan = SnapshotScan::new(
             state.engine.delta(),
@@ -3847,20 +3879,20 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             &readers,
             Snapshot(snapshot),
         )
-        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .project(project)
         .filter(predicate)
         .valid_time(state.valid_time)
         .system_range(range.from.0, range.to.0, range.closed_upper)
         .metrics(Arc::clone(&self.metrics));
         let (versions, stats) = scan.execute_range()?;
 
-        // Reconstruct each row as `[key, value cells…, sys_from, sys_to]`. The
-        // endpoints are appended after the schema columns: `sys_from` is the
-        // version's recorded start, `sys_to` its resolved end — `NULL` for a
-        // still-current (open) version, the same convention `version_history` uses.
+        // Reconstruct each row as `[key, value cells…, sys_from, sys_to, (provenance…)]`.
+        // `sys_from` is the version's recorded start, `sys_to` its resolved end —
+        // `NULL` for a still-current (open) version, the convention `version_history`
+        // uses. Provenance, when referenced, follows the endpoints.
         let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(versions.len());
         for v in &versions {
-            let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(n_schema + 2);
+            let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(range_addressable.len());
             row.push(Some(v.business_key.as_bytes().to_vec()));
             row.extend(row_codec::decode_payload(
                 value_count,
@@ -3869,37 +3901,30 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             let open = v.sys_to == SYSTEM_TIME_OPEN;
             row.push(Some(encode_value(&ScalarValue::TimestampTz(v.sys_from.0))));
             row.push((!open).then(|| encode_value(&ScalarValue::TimestampTz(v.sys_to.0))));
+            if needs_provenance {
+                row.extend(provenance_cells(&v.provenance));
+            }
             rows.push(row);
         }
 
-        // The bound `WHERE` is a plain value-column predicate (subquery / period are
-        // rejected at bind), so it folds to the syntactic plan and filters over the
-        // schema columns; the trailing endpoint cells (indices `n_schema`,
-        // `n_schema + 1`) are never referenced, so they ride along on the kept rows.
+        // Apply the bound `WHERE` over the reconstructed rows (a subquery / period
+        // `WHERE` is rejected over a range, so the syntactic plan is exact). The
+        // endpoints and any materialized provenance are addressable to it, so it
+        // filters over the full `range_addressable` set.
         let plan = filter_plan(bound);
-        let rows = filter_rows(&plan, &schema_columns, rows)?;
+        let rows = filter_rows(&plan, &range_addressable, rows)?;
 
-        // Project the user columns, then append the two endpoint columns.
-        let projection = projection_indices(&bound.projection, &schema_columns, n_schema);
-        let mut columns = projected_columns(&bound.projection, &schema_columns, n_schema);
-        columns.push(("sys_from".to_owned(), LogicalType::TimestampTz));
-        columns.push(("sys_to".to_owned(), LogicalType::TimestampTz));
-        let out_rows: Vec<Vec<Option<Vec<u8>>>> = rows
-            .iter()
-            .map(|row| {
-                let mut out: Vec<Option<Vec<u8>>> =
-                    projection.iter().map(|&i| row[i].clone()).collect();
-                out.push(row[n_schema].clone());
-                out.push(row[n_schema + 1].clone());
-                out
-            })
-            .collect();
-        let result_stats = query_stats(&stats, out_rows.len(), snapshot);
-        Ok(StatementOutcome::Rows(SelectResult {
-            columns,
-            rows: out_rows,
-            stats: Some(result_stats),
-        }))
+        // Route through the shared shaping / aggregate / projection tail, with the
+        // endpoints as the trailing schema columns and provenance past them.
+        self.finish_select(
+            bound,
+            &range_schema_columns,
+            &range_addressable,
+            rows,
+            Some(stats),
+            overlay,
+            scope,
+        )
     }
 
     /// Run a `FOR VALID_TIME { FROM a TO b | BETWEEN a AND b }` range scan
@@ -3914,10 +3939,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// ([`SnapshotScan::execute_valid_range`]), which surfaces each version's valid
     /// interval alongside the bare user row (read from the delta frame or the sealed
     /// `valid_from` / `valid_to` columns); the engine reconstructs the row from that
-    /// bare payload, applies the bound `WHERE` over the schema columns (the appended
-    /// endpoints ride along, never referenced), then projects and appends the
-    /// endpoints. A key-equality `WHERE` is pushed down for zone-map pruning; the
-    /// binder has rejected every other clause the point path threads.
+    /// bare payload, materializes provenance after the endpoints when referenced
+    /// ([STL-247]), applies the bound `WHERE`, then routes through the shared
+    /// [`finish_select`](Self::finish_select) tail so result-shaping, aggregation,
+    /// and the provenance pseudo-columns compose over the range output ([STL-329]) —
+    /// exactly as [`run_system_range`](Self::run_system_range) does on the system axis.
+    ///
+    /// A key-equality `WHERE` is pushed down for zone-map pruning; the full predicate
+    /// is re-applied over the reconstructed rows.
     ///
     /// Read-committed only, like the system-axis range and the join path
     /// ([STL-203] read-your-own-writes is a tracked follow-up).
@@ -3925,6 +3954,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         &self,
         bound: &BoundSelect,
         range: ValidTimeRange,
+        overlay: &[BoundDml],
+        scope: &CteScope,
     ) -> Result<StatementOutcome, EngineError> {
         let table = bound.table.as_str();
         let snapshot = bound.snapshot;
@@ -3942,7 +3973,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .map(|c| (c.name().to_owned(), c.ty()))
             .collect();
         let value_count = schema_columns.len().saturating_sub(1);
-        let n_schema = schema_columns.len();
+
+        // The endpoints and provenance pseudo-columns the rest of the SELECT surface
+        // binds against, as in [`run_system_range`](Self::run_system_range).
+        let range_schema_columns = range_schema_columns(bound, &schema_columns);
+        let range_addressable = addressable_columns(&range_schema_columns);
+        let needs_provenance =
+            references_provenance(bound, &range_addressable, range_schema_columns.len());
 
         // Push a business-key equality down for zone-map pruning when the `WHERE`
         // pins one; the row filter below re-applies the full predicate. The scan's
@@ -3957,6 +3994,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 column: ColumnId::BusinessKey,
                 value: ZoneBound::Bytes(encode_value(value)),
             });
+        let mut project = vec![ColumnId::BusinessKey, ColumnId::Payload];
+        if needs_provenance {
+            project.extend([ColumnId::TxnId, ColumnId::CommittedAt, ColumnId::Principal]);
+        }
         let readers = state.engine.open_segment_readers()?;
         let scan = SnapshotScan::new(
             state.engine.delta(),
@@ -3964,20 +4005,20 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             &readers,
             Snapshot(snapshot),
         )
-        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .project(project)
         .filter(predicate)
         .valid_range(range.from.0, range.to.0, range.closed_upper)
         .metrics(Arc::clone(&self.metrics));
         let (versions, stats) = scan.execute_valid_range()?;
 
-        // Reconstruct each row as `[key, value cells…, valid_from, valid_to]`. The
-        // value cells decode from the bare payload (the valid-time period columns
+        // Reconstruct each row as `[key, value cells…, valid_from, valid_to, (provenance…)]`.
+        // The value cells decode from the bare payload (the valid-time period columns
         // ride the row codec too, so a `SELECT *` still reads the user's `vf`/`vt`);
         // the appended endpoints are the resolved valid interval — `valid_to` is
-        // `NULL` for an open-ended (`+∞`) period.
+        // `NULL` for an open-ended (`+∞`) period. Provenance, when referenced, follows.
         let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(versions.len());
         for (v, interval) in &versions {
-            let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(n_schema + 2);
+            let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(range_addressable.len());
             row.push(Some(v.business_key.as_bytes().to_vec()));
             row.extend(row_codec::decode_payload(
                 value_count,
@@ -3988,38 +4029,27 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 interval.from.0,
             ))));
             row.push((!open).then(|| encode_value(&ScalarValue::TimestampTz(interval.to.0))));
+            if needs_provenance {
+                row.extend(provenance_cells(&v.provenance));
+            }
             rows.push(row);
         }
 
-        // The bound `WHERE` is a plain value-column predicate (subquery / period are
-        // rejected at bind); it filters over the schema columns, the trailing
-        // endpoint cells (indices `n_schema`, `n_schema + 1`) riding along untouched.
+        // Apply the bound `WHERE` over the reconstructed rows (subquery / period are
+        // rejected over a range), then route through the shared shaping / aggregate /
+        // projection tail with the endpoints as the trailing schema columns.
         let plan = filter_plan(bound);
-        let rows = filter_rows(&plan, &schema_columns, rows)?;
+        let rows = filter_rows(&plan, &range_addressable, rows)?;
 
-        // Project the user columns, then append the two endpoint columns.
-        let projection = projection_indices(&bound.projection, &schema_columns, n_schema);
-        let (from_name, to_name) =
-            range_endpoint_names(bound).expect("a valid-range scan names its endpoints");
-        let mut columns = projected_columns(&bound.projection, &schema_columns, n_schema);
-        columns.push((from_name.to_owned(), LogicalType::TimestampTz));
-        columns.push((to_name.to_owned(), LogicalType::TimestampTz));
-        let out_rows: Vec<Vec<Option<Vec<u8>>>> = rows
-            .iter()
-            .map(|row| {
-                let mut out: Vec<Option<Vec<u8>>> =
-                    projection.iter().map(|&i| row[i].clone()).collect();
-                out.push(row[n_schema].clone());
-                out.push(row[n_schema + 1].clone());
-                out
-            })
-            .collect();
-        let result_stats = query_stats(&stats, out_rows.len(), snapshot);
-        Ok(StatementOutcome::Rows(SelectResult {
-            columns,
-            rows: out_rows,
-            stats: Some(result_stats),
-        }))
+        self.finish_select(
+            bound,
+            &range_schema_columns,
+            &range_addressable,
+            rows,
+            Some(stats),
+            overlay,
+            scope,
+        )
     }
 
     /// Resolve a bound `SELECT`'s `WHERE` to a concrete [`FilterPlan`].
@@ -8286,6 +8316,44 @@ fn projection_indices(
     }
 }
 
+/// The schema columns a range scan exposes ([STL-329]): the table's own columns
+/// followed by the two period endpoints the read appends — `(sys_from, sys_to)` for
+/// a system range ([STL-244]), `(valid_from, valid_to)` for a valid range
+/// ([STL-328]), both `TIMESTAMPTZ`. The endpoints are part of this "schema" so a
+/// `SELECT *` includes them and the binder's projection / `ORDER BY` / `GROUP BY`
+/// indices (bound against the same shape) line up positionally. Callers that need
+/// the full addressable set wrap this in [`addressable_columns`], appending the
+/// provenance pseudo-columns past the endpoints; a non-range read passes its schema
+/// columns through unchanged.
+fn range_schema_columns(
+    bound: &BoundSelect,
+    schema_columns: &[(String, LogicalType)],
+) -> Vec<(String, LogicalType)> {
+    let mut columns = schema_columns.to_vec();
+    if let Some((from, to)) = bound.range_endpoint_names() {
+        columns.push((from.to_owned(), LogicalType::TimestampTz));
+        columns.push((to.to_owned(), LogicalType::TimestampTz));
+    }
+    columns
+}
+
+/// Encode a version's inline [`Provenance`](provenance::Provenance) into the three
+/// pseudo-column cells, in canonical [`PSEUDO_COLUMNS`](provenance::PSEUDO_COLUMNS)
+/// order ([STL-247]): `_stele_txn_id` (`int8`, the `u64` id's `i64` bit pattern),
+/// `_stele_committed_at` (`timestamptz`), `_stele_principal` (`text`). Byte-for-byte
+/// identical to the point path's provenance cells ([`batch_cell`] over the executor's
+/// projected provenance columns), so a range read renders a version's provenance the
+/// same way a point read does ([STL-329]).
+fn provenance_cells(prov: &provenance::Provenance) -> [Option<Vec<u8>>; 3] {
+    [
+        Some(encode_value(&ScalarValue::Int8(i64::from_ne_bytes(
+            prov.txn_id.0.to_ne_bytes(),
+        )))),
+        Some(encode_value(&ScalarValue::TimestampTz(prov.committed_at.0))),
+        Some(prov.principal.as_bytes().to_vec()),
+    ]
+}
+
 /// The `(name, type)` output columns a projection produces ([STL-303]): `All` is
 /// the addressable schema columns; a [`Projection::Items`] list takes each item's
 /// output name and type — a column item's type from the addressable set, a computed
@@ -8293,22 +8361,6 @@ fn projection_indices(
 /// streaming read (`run_select`) and the parameter-free statement `Describe`
 /// (`SessionEngine::describe`), so both agree on a `SELECT`'s `RowDescription`
 /// shape, pseudo-columns included.
-/// The names of the period-endpoint columns a range scan appends after its
-/// projected user columns, or `None` for a non-range read. A system range
-/// ([STL-244]) appends `(sys_from, sys_to)`, a valid range ([STL-328])
-/// `(valid_from, valid_to)`; both are `TIMESTAMPTZ`, with a `NULL` upper for an
-/// open-ended period. Centralized so the `Describe` shape ([`SessionEngine::output_columns`])
-/// and the executed result name them identically.
-const fn range_endpoint_names(bound: &BoundSelect) -> Option<(&'static str, &'static str)> {
-    if bound.system_range.is_some() {
-        Some(("sys_from", "sys_to"))
-    } else if bound.valid_range.is_some() {
-        Some(("valid_from", "valid_to"))
-    } else {
-        None
-    }
-}
-
 fn projected_columns(
     projection: &Projection,
     columns: &[(String, LogicalType)],
