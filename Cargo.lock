@@ -2747,6 +2747,9 @@ dependencies = [
 name = "stele-client"
 version = "0.3.0"
 dependencies = [
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "stele-common",

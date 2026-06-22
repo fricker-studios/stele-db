@@ -98,6 +98,18 @@ struct ShellArgs {
     /// Falls back to `STELE_ADMIN_TOKEN` when the flag is omitted.
     #[arg(long)]
     admin_token: Option<String>,
+    /// Reach the admin / control-plane gateway over TLS (`https://`), so the
+    /// bearer token never travels in cleartext off-loopback (STL-320). The gateway
+    /// terminates TLS once the server configures `[tls]` (STL-311). Without
+    /// `--admin-tls-ca` the server is not verified (libpq's `require`); with it,
+    /// the certificate is verified against the CA and the `--admin-host` name
+    /// (libpq's `verify-full`).
+    #[arg(long)]
+    admin_tls: bool,
+    /// PEM CA bundle to verify the admin gateway's certificate against (implies
+    /// `--admin-tls`). Mirrors `--tls-ca` for the SQL surface.
+    #[arg(long)]
+    admin_tls_ca: Option<std::path::PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -168,6 +180,18 @@ fn main() -> anyhow::Result<()> {
             // `ps` output and shell history. An empty value counts as unset, so the
             // shell prompts (interactively) rather than sending an empty password.
             let password = std::env::var("PGPASSWORD").ok().filter(|p| !p.is_empty());
+            // Admin-tier TLS (STL-320): `--admin-tls-ca` implies TLS and verifies
+            // the gateway against that CA; `--admin-tls` alone encrypts without
+            // verifying (libpq's `require`); neither stays plaintext. The
+            // verification name defaults to `--admin-host`.
+            let admin_tls = if s.admin_tls || s.admin_tls_ca.is_some() {
+                Some(stele_client::Tls {
+                    ca: s.admin_tls_ca,
+                    server_name: None,
+                })
+            } else {
+                None
+            };
             shell::run(&shell::Opts {
                 host: s.host,
                 port: s.port,
@@ -188,6 +212,7 @@ fn main() -> anyhow::Result<()> {
                     host: admin_host,
                     port: s.admin_port,
                     token: admin_token,
+                    tls: admin_tls,
                 },
             })
         }
@@ -454,6 +479,29 @@ mod tests {
         // No mTLS client certificate by default (STL-292).
         assert!(s.tls_cert.is_none());
         assert!(s.tls_key.is_none());
+        // The admin tier is plaintext by default (STL-320).
+        assert!(!s.admin_tls);
+        assert!(s.admin_tls_ca.is_none());
+    }
+
+    #[test]
+    fn shell_accepts_admin_tls_flags() {
+        // STL-320: `--admin-tls` enables the encrypted admin transport and
+        // `--admin-tls-ca` pins the CA the gateway is verified against.
+        let Cmd::Shell(s) = parse(&[
+            "stele",
+            "shell",
+            "--admin-tls",
+            "--admin-tls-ca",
+            "/etc/stele/admin-ca.pem",
+        ]) else {
+            panic!("expected shell subcommand");
+        };
+        assert!(s.admin_tls);
+        assert_eq!(
+            s.admin_tls_ca.as_deref(),
+            Some(std::path::Path::new("/etc/stele/admin-ca.pem"))
+        );
     }
 
     #[test]

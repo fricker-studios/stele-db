@@ -17,7 +17,11 @@
 //! scripts, and the desktop app). This crate speaks the HTTP/JSON gateway — the
 //! lighter dependency footprint (ADR-0016 makes gRPC optional in v0): one blocking
 //! request per call over a plain [`std::net::TcpStream`], no async runtime and no
-//! HTTP framework pulled into your dependency tree.
+//! HTTP framework pulled into your dependency tree. When [TLS](Tls) is configured
+//! the same call rides `https://` through `rustls`' blocking
+//! [`StreamOwned`](rustls::StreamOwned) adapter — the very `rustls` the SQL surface
+//! already pins ([ADR-0016]: TLS is shared with pg-wire), so still no async client
+//! crate enters your tree.
 //!
 //! # Versioning
 //!
@@ -31,23 +35,35 @@
 //! Every call carries a static bearer token ([`Config::token`]) — the admin API's
 //! `[admin] tokens` (`stele.toml`). With no token configured the server rejects
 //! every request, so a missing token is refused locally ([`Error::NoToken`])
-//! rather than spent on a round-trip. TLS for the admin surface is not yet
-//! available on the gateway; until it lands, bind the ops listener to loopback or
-//! front it with a TLS-terminating proxy.
+//! rather than spent on a round-trip.
+//!
+//! # TLS
+//!
+//! Set [`Config::tls`] to dial the admin gateway over `https://`, so a bearer token
+//! never travels in cleartext off-loopback. A [`Tls`] with no [`ca`](Tls::ca)
+//! **encrypts without verifying the server's identity** (libpq's `require` —
+//! defeats eavesdropping, not an active man-in-the-middle); supplying a PEM CA
+//! bundle verifies the server certificate against it and against the host name
+//! (libpq's `verify-full`). Leave `tls` `None` — the default — for the loopback /
+//! TLS-terminating-proxy deployments the gateway has always served in plaintext.
 //!
 //! # Example
 //!
 //! ```no_run
-//! use stele_client::{Client, Config};
+//! use stele_client::{Client, Config, Tls};
 //!
 //! # fn main() -> Result<(), stele_client::Error> {
-//! let client = Client::new(Config {
-//!     host: "127.0.0.1".to_owned(),
-//!     port: 9090, // the ops listener the HTTP/JSON gateway shares
-//!     // A missing or empty env var becomes `None`, so an unconfigured token is
-//!     // refused locally (`Error::NoToken`) rather than spent on a 401 round-trip.
-//!     token: std::env::var("STELE_ADMIN_TOKEN").ok().filter(|t| !t.is_empty()),
-//! });
+//! let client = Client::new(
+//!     Config::new(
+//!         "stele.internal",
+//!         9090, // the ops listener the HTTP/JSON gateway shares
+//!         // A missing or empty env var becomes `None`, so an unconfigured token is
+//!         // refused locally (`Error::NoToken`) rather than spent on a 401 round-trip.
+//!         std::env::var("STELE_ADMIN_TOKEN").ok().filter(|t| !t.is_empty()),
+//!     )
+//!     // Encrypted and authenticated: verify the gateway against this CA bundle.
+//!     .with_tls(Tls::verify("/etc/stele/ca.pem")),
+//! );
 //!
 //! // Liveness, then engine state.
 //! assert!(client.health()?.is_serving());
@@ -70,8 +86,14 @@
 use std::fmt;
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls_pki_types::pem::PemObject as _;
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -98,17 +120,85 @@ pub struct Config {
     /// The bearer token, or `None` when none is configured (every call then
     /// short-circuits with [`Error::NoToken`]).
     pub token: Option<String>,
+    /// TLS transport ([STL-320]). `None` (the default) dials plaintext HTTP — the
+    /// loopback / proxy-fronted posture; `Some` dials `https://` so the bearer
+    /// token is never exposed in cleartext off-loopback.
+    ///
+    /// [STL-320]: https://allegromusic.atlassian.net/browse/STL-320
+    pub tls: Option<Tls>,
 }
 
 impl Config {
-    /// Connection settings for `host:port` with an optional bearer `token`.
+    /// Plaintext connection settings for `host:port` with an optional bearer
+    /// `token`. Add [`with_tls`](Self::with_tls) to encrypt the transport.
     #[must_use]
     pub fn new(host: impl Into<String>, port: u16, token: Option<String>) -> Self {
         Self {
             host: host.into(),
             port,
             token,
+            tls: None,
         }
+    }
+
+    /// Encrypt the transport with `tls` (dial `https://`).
+    #[must_use]
+    pub fn with_tls(mut self, tls: Tls) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+}
+
+/// TLS options for the admin gateway ([STL-320]).
+///
+/// Constructing a `Tls` (and attaching it via [`Config::with_tls`]) switches the
+/// transport to `https://`. Two postures, matching libpq's `sslmode`:
+///
+/// * [`Tls::encrypt`] — no trust anchor: the server certificate is accepted
+///   without a chain or host-name check (libpq's `require`). Defeats passive
+///   eavesdropping, **not** an active man-in-the-middle.
+/// * [`Tls::verify`] — verify the certificate against a PEM CA bundle and the host
+///   name (libpq's `verify-full`). The authenticated posture.
+///
+/// [`server_name`](Self::server_name) overrides the name verified / sent via SNI;
+/// it defaults to [`Config::host`], so set it only when you connect to an IP but
+/// the certificate carries a DNS SAN (connect `127.0.0.1`, verify `localhost`).
+///
+/// [STL-320]: https://allegromusic.atlassian.net/browse/STL-320
+#[derive(Debug, Clone, Default)]
+pub struct Tls {
+    /// PEM CA bundle the server certificate must chain to. `None` accepts any
+    /// certificate (encrypt-only); `Some` is the verified posture.
+    pub ca: Option<PathBuf>,
+    /// The name to verify the certificate against and send via SNI. `None`
+    /// defaults to [`Config::host`].
+    pub server_name: Option<String>,
+}
+
+impl Tls {
+    /// Encrypt without verifying the server's identity (libpq's `require`). Use
+    /// [`verify`](Self::verify) when you can pin a CA.
+    #[must_use]
+    pub fn encrypt() -> Self {
+        Self::default()
+    }
+
+    /// Verify the server certificate against the PEM CA bundle at `ca` and against
+    /// the host name (libpq's `verify-full`).
+    #[must_use]
+    pub fn verify(ca: impl Into<PathBuf>) -> Self {
+        Self {
+            ca: Some(ca.into()),
+            server_name: None,
+        }
+    }
+
+    /// Override the name verified against and sent via SNI (defaults to
+    /// [`Config::host`]).
+    #[must_use]
+    pub fn with_server_name(mut self, name: impl Into<String>) -> Self {
+        self.server_name = Some(name.into());
+        self
     }
 }
 
@@ -405,11 +495,20 @@ impl Client {
         // front — before opening a socket — rather than emit a corrupt request.
         reject_control_chars("admin host", host)?;
         reject_control_chars("admin token", token)?;
-        let mut stream = TcpStream::connect((host.as_str(), port)).map_err(|e| {
+        let tcp = TcpStream::connect((host.as_str(), port)).map_err(|e| {
             Error::Transport(format!("connecting to the admin API at {host}:{port}: {e}"))
         })?;
-        stream.set_read_timeout(Some(self.timeout)).ok();
-        stream.set_write_timeout(Some(self.timeout)).ok();
+        tcp.set_read_timeout(Some(self.timeout)).ok();
+        tcp.set_write_timeout(Some(self.timeout)).ok();
+        // Plaintext or — when `[tls]` is configured — the rustls-wrapped stream.
+        // Either way the framing below is identical: the TLS handshake runs lazily
+        // on the first read/write of the `StreamOwned` adapter (a verification
+        // failure surfaces here as a transport error), and the encrypted record
+        // layer is transparent to the HTTP/1.1 we speak over it.
+        let mut stream: Box<dyn ReadWrite> = match &self.config.tls {
+            None => Box::new(tcp),
+            Some(tls) => Box::new(tls_stream(tls, host, tcp)?),
+        };
         // Build the request head from explicit header lines joined by CRLF — no
         // continuation/indentation trickery, so there is no chance of leading
         // whitespace folding a header. `Connection: close` lets the read below run
@@ -435,6 +534,117 @@ impl Client {
             .map_err(|e| Error::Transport(format!("reading the admin reply: {e}")))?;
         String::from_utf8(raw)
             .map_err(|_| Error::Transport("admin reply was not valid UTF-8".to_owned()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TLS transport (STL-320)
+// ---------------------------------------------------------------------------
+
+/// The blocking duplex transport the round-trip runs over — a plain
+/// [`TcpStream`] or the rustls-wrapped stream. Blanket-implemented over anything
+/// that is both [`Read`](std::io::Read) and [`Write`](std::io::Write), so the two
+/// transports box into one `dyn` object the HTTP framing is agnostic to.
+trait ReadWrite: std::io::Read + std::io::Write {}
+impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
+
+/// Wrap `tcp` in a blocking rustls client stream per `tls`. The handshake itself
+/// is deferred to the first read/write (so an untrusted certificate surfaces as
+/// the round-trip's transport error, not here); only the up-front config build —
+/// notably reading the CA bundle from disk — can fail at this point.
+fn tls_stream(
+    tls: &Tls,
+    host: &str,
+    tcp: TcpStream,
+) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, Error> {
+    let config = tls_client_config(tls)?;
+    // The name to verify against / send via SNI: the override, else the connect
+    // host. An IP literal yields an `IpAddress` server name (no SNI extension),
+    // which the encrypt-only verifier ignores and a CA-verified handshake checks
+    // against the certificate's IP SANs — exactly libpq's behaviour.
+    let name = tls.server_name.as_deref().unwrap_or(host);
+    let server_name = ServerName::try_from(name.to_owned())
+        .map_err(|e| Error::Transport(format!("invalid TLS server name {name:?}: {e}")))?;
+    let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|e| Error::Transport(format!("initializing TLS: {e}")))?;
+    Ok(rustls::StreamOwned::new(conn, tcp))
+}
+
+/// Build the rustls client config for `tls`: verify against the pinned CA bundle
+/// when one is given (chain + host name, libpq's `verify-full`), otherwise accept
+/// any server certificate (encrypt-only, libpq's `require`). No client
+/// certificate is presented — the admin SDK authenticates with the bearer token.
+fn tls_client_config(tls: &Tls) -> Result<rustls::ClientConfig, Error> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+        .map_err(|e| Error::Transport(format!("selecting TLS protocol versions: {e}")))?;
+    let config = match tls.ca.as_deref() {
+        Some(ca) => {
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in CertificateDer::pem_file_iter(ca)
+                .map_err(|e| Error::Transport(format!("reading CA bundle {}: {e}", ca.display())))?
+            {
+                let cert =
+                    cert.map_err(|e| Error::Transport(format!("parsing a CA certificate: {e}")))?;
+                roots
+                    .add(cert)
+                    .map_err(|e| Error::Transport(format!("adding a CA certificate: {e}")))?;
+            }
+            builder.with_root_certificates(roots).with_no_client_auth()
+        }
+        None => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(
+                provider.signature_verification_algorithms,
+            )))
+            .with_no_client_auth(),
+    };
+    Ok(config)
+}
+
+/// The encrypt-only verifier ([`Tls::encrypt`]): accepts any server certificate
+/// (no chain or host-name check) while still verifying the handshake *signatures*,
+/// so the peer must hold the key for the certificate it presents. The standard
+/// rustls "danger" pattern, matching libpq `sslmode=require`; it is the SDK twin
+/// of the `stele shell`'s verifier ([STL-251]).
+///
+/// [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
+#[derive(Debug)]
+struct AcceptAnyServerCert(rustls::crypto::WebPkiSupportedAlgorithms);
+
+impl ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_schemes()
     }
 }
 
@@ -560,13 +770,9 @@ mod tests {
 
     #[test]
     fn missing_token_is_refused_without_a_socket() {
-        let client = Client::new(Config {
-            host: "127.0.0.1".to_owned(),
-            // An unused port — the call must short-circuit on the missing token
-            // before any connect is attempted.
-            port: 1,
-            token: None,
-        });
+        // An unused port — the call must short-circuit on the missing token before
+        // any connect is attempted.
+        let client = Client::new(Config::new("127.0.0.1", 1, None));
         assert!(matches!(client.status(), Err(Error::NoToken)));
         assert!(matches!(client.health(), Err(Error::NoToken)));
     }
@@ -600,6 +806,52 @@ mod tests {
             }
             .to_string()
             .contains("404")
+        );
+    }
+
+    // -- TLS transport (STL-320) -------------------------------------------
+
+    #[test]
+    fn config_is_plaintext_until_tls_is_attached() {
+        let plain = Config::new("h", 9090, None);
+        assert!(plain.tls.is_none(), "the default transport is plaintext");
+        let secured = plain.with_tls(Tls::encrypt());
+        assert!(secured.tls.is_some(), "with_tls switches to https");
+    }
+
+    #[test]
+    fn tls_constructors_set_the_expected_posture() {
+        // Encrypt-only: no CA, no host override.
+        let encrypt = Tls::encrypt();
+        assert!(encrypt.ca.is_none());
+        assert!(encrypt.server_name.is_none());
+        // Verified: pins the CA bundle.
+        let verify = Tls::verify("/etc/stele/ca.pem");
+        assert_eq!(
+            verify.ca.as_deref(),
+            Some(std::path::Path::new("/etc/stele/ca.pem"))
+        );
+        // The SNI / verification-name override is independent of the trust anchor.
+        let named = Tls::encrypt().with_server_name("localhost");
+        assert_eq!(named.server_name.as_deref(), Some("localhost"));
+    }
+
+    #[test]
+    fn encrypt_only_config_builds_without_a_ca() {
+        // The encrypt-only posture needs no trust anchor on disk, so the rustls
+        // config builds offline (the handshake itself is exercised end-to-end in
+        // the live-server TLS integration test).
+        assert!(tls_client_config(&Tls::encrypt()).is_ok());
+    }
+
+    #[test]
+    fn a_missing_ca_bundle_is_a_transport_error() {
+        // `verify` against a path that does not exist fails when the config is
+        // built — before a socket is opened — with an actionable transport error.
+        let err = tls_client_config(&Tls::verify("/no/such/ca.pem")).unwrap_err();
+        assert!(
+            matches!(&err, Error::Transport(detail) if detail.contains("CA bundle")),
+            "{err:?}"
         );
     }
 }

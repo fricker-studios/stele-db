@@ -25,8 +25,10 @@ stele-client = "0.3"
 The admin API offers two transports from one contract: typed **gRPC** and an
 **HTTP/JSON gateway**. This crate speaks the HTTP/JSON gateway — the lighter
 dependency footprint. Each call is one blocking request over a plain
-`std::net::TcpStream`; there is **no async runtime and no HTTP framework** in your
-dependency tree (only `serde` + `serde_json`).
+`std::net::TcpStream` (or, with TLS, the same socket wrapped in `rustls`' blocking
+`StreamOwned` adapter); there is **no async runtime and no HTTP framework** in your
+dependency tree — body (de)serialization is `serde` + `serde_json`, and TLS reuses
+the `rustls` the SQL surface already pins.
 
 ## Versioning
 
@@ -42,22 +44,36 @@ Every call carries a static bearer token (the server's `[admin] tokens` in
 `stele.toml`). With no token configured the server rejects every request, so a
 missing token is refused locally rather than spent on a round trip.
 
-> **TLS:** the admin gateway does not yet terminate TLS. Until it does, bind the
-> ops listener to loopback or front it with a TLS-terminating proxy.
+## TLS
+
+Attach a `Tls` with `Config::with_tls` to dial the admin gateway over `https://`,
+so the bearer token never crosses in cleartext off-loopback:
+
+- `Tls::verify("/etc/stele/ca.pem")` — verify the server certificate against a CA
+  bundle and the host name (libpq's `verify-full`). The authenticated posture.
+- `Tls::encrypt()` — encrypt without verifying the server's identity (libpq's
+  `require`): defeats eavesdropping, not an active man-in-the-middle.
+
+Leave TLS unset for the loopback / TLS-terminating-proxy deployments the gateway
+has always served in plaintext.
 
 ## Example
 
 ```rust,no_run
-use stele_client::{Client, Config};
+use stele_client::{Client, Config, Tls};
 
 fn main() -> Result<(), stele_client::Error> {
-    let client = Client::new(Config {
-        host: "127.0.0.1".to_owned(),
-        port: 9090, // the ops listener the HTTP/JSON gateway shares
-        // A missing or empty env var becomes `None`, so an unconfigured token is
-        // refused locally (`Error::NoToken`) rather than spent on a 401 round-trip.
-        token: std::env::var("STELE_ADMIN_TOKEN").ok().filter(|t| !t.is_empty()),
-    });
+    let client = Client::new(
+        Config::new(
+            "stele.internal",
+            9090, // the ops listener the HTTP/JSON gateway shares
+            // A missing or empty env var becomes `None`, so an unconfigured token is
+            // refused locally (`Error::NoToken`) rather than spent on a 401 round-trip.
+            std::env::var("STELE_ADMIN_TOKEN").ok().filter(|t| !t.is_empty()),
+        )
+        // Encrypted and authenticated against the gateway's CA bundle.
+        .with_tls(Tls::verify("/etc/stele/ca.pem")),
+    );
 
     // Liveness, then engine state.
     assert!(client.health()?.is_serving());
