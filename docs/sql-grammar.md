@@ -138,16 +138,17 @@ This is the row shape STL-199's `\history` consumes. A provenance pseudo-column
 ([STL-247]) over a range read is a tracked follow-up — rejected at bind for now,
 not silently dropped.
 
-**v0.3 scope.** A range scan binds as a plain single base-table read with a
-`WHERE` predicate. The **valid axis** is the parallel form below
-([STL-328](#for-valid_time--from-a-to-b--between-a-and-b---valid-time-range-scans-stl-328)).
-Each of these is rejected at bind time (a tracked follow-up, never a
-silently-dropped clause): combining a range with an `AS OF` point qualifier; a
-`JOIN`, aggregate / `GROUP BY`, `DISTINCT` / `ORDER BY` / `LIMIT` / `OFFSET`,
-subquery or period-predicate `WHERE`, or a CTE / derived-table source; and
-`FOR SYSTEM_TIME ALL` (the trivially-full range). A range scan reads the committed
-snapshot only — the read-your-own-writes overlay is not applied (as on the join
-path) — and is exempt from the simple-query default row cap
+**v0.3 scope.** A system range binds as a plain single base-table read with a
+`WHERE` predicate. (The **valid axis** is the parallel form below
+([STL-328](#for-valid_time--from-a-to-b--between-a-and-b---valid-time-range-scans-stl-328)),
+which relaxes the `AS OF` rule.) Each of these is rejected at bind time for a
+*system* range (a tracked follow-up, never a silently-dropped clause): combining a
+system range with **any** `AS OF` point qualifier; a `JOIN`, aggregate /
+`GROUP BY`, `DISTINCT` / `ORDER BY` / `LIMIT` / `OFFSET`, subquery or
+period-predicate `WHERE`, or a CTE / derived-table source; and `FOR SYSTEM_TIME
+ALL` (the trivially-full range). A range scan reads the committed snapshot only —
+the read-your-own-writes overlay is not applied (as on the join path) — and is
+exempt from the simple-query default row cap
 ([below](#default-row-cap-on-the-simple-query-path-stl-306)).
 
 ### `FOR VALID_TIME { FROM a TO b | BETWEEN a AND b }` — valid-time range scans (STL-328)
@@ -192,7 +193,7 @@ range — it fixes the system snapshot the valid history is read at (the cross-a
 `FOR VALID_TIME AS OF` is rejected (a point and a range on the *same* axis), as is
 every shaping / aggregate / subquery / `JOIN` / CTE clause the system range
 rejects. The correctness oracle (`crates/stele-engine/tests/valid_range_oracle.rs`,
-[docs/16 §4](16-bitemporal-semantics.md#4-correctness-oracles-the-temporal-heart))
+[docs/06 §4](06-testing-strategy.md#4-correctness-oracles-the-temporal-heart))
 sweeps a bitemporal workload across both axes and the flush/seal boundary against a
 reference model, with the same off-by-one teeth check.
 

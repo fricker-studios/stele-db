@@ -62,7 +62,7 @@ use sqlparser::ast::{
 use stele_catalog::{Catalog, ColumnDef, SchemaId, TableSchema};
 use stele_common::period::{Interval, IntervalError, PeriodPredicate};
 use stele_common::provenance;
-use stele_common::time::SystemTimeMicros;
+use stele_common::time::{SystemTimeMicros, ValidTimeMicros};
 use stele_common::types::{LogicalType, ScalarValue};
 
 use crate::ast::{
@@ -396,16 +396,18 @@ pub struct SystemTimeRange {
 /// returns every version *system-live at the statement snapshot* whose valid
 /// interval `[valid_from, valid_to)` overlaps this range — many versions over the
 /// valid axis at one system instant — and appends the valid period endpoints
-/// (`valid_from`, `valid_to`) after the projected columns. The boundaries carry
-/// the same `i64` microsecond scale as the system axis (valid-time is stored as
-/// µs/UTC, [ADR-0024]); the binder has already proved the range is non-empty.
+/// (`valid_from`, `valid_to`) after the projected columns. Endpoints are typed
+/// [`ValidTimeMicros`] — the valid axis's own µs/UTC newtype ([ADR-0024]) — so a
+/// valid bound can never be mixed with a system-time one (the executor's valid
+/// APIs use the same newtype); the binder has already proved the range is
+/// non-empty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValidTimeRange {
     /// The inclusive lower bound, in valid-time microseconds.
-    pub from: SystemTimeMicros,
+    pub from: ValidTimeMicros,
     /// The upper bound, in valid-time microseconds — exclusive when
     /// [`closed_upper`](Self::closed_upper) is `false`, inclusive when `true`.
-    pub to: SystemTimeMicros,
+    pub to: ValidTimeMicros,
     /// `true` for the closed `BETWEEN` (upper inclusive), `false` for the
     /// half-open `FROM..TO` (upper exclusive).
     pub closed_upper: bool,
@@ -4643,19 +4645,12 @@ enum BoundTemporalRange {
     Valid(ValidTimeRange),
 }
 
-/// Whether a folded `[from, to]`/`[from, to)` range is non-empty — `from < to`
-/// for the half-open `FROM..TO`, `from <= to` for the closed `BETWEEN`. Mirrors
-/// the docs/16 §2 reversed / zero-length rejection, shared by both axes.
-const fn range_well_formed(
-    from: SystemTimeMicros,
-    to: SystemTimeMicros,
-    closed_upper: bool,
-) -> bool {
-    if closed_upper {
-        from.0 <= to.0
-    } else {
-        from.0 < to.0
-    }
+/// Whether a folded `[from, to]`/`[from, to)` range of raw microseconds is
+/// non-empty — `from < to` for the half-open `FROM..TO`, `from <= to` for the
+/// closed `BETWEEN`. Mirrors the docs/16 §2 reversed / zero-length rejection;
+/// takes bare `i64` so it serves either axis's microsecond newtype.
+const fn range_well_formed(from: i64, to: i64, closed_upper: bool) -> bool {
+    if closed_upper { from <= to } else { from < to }
 }
 
 /// Resolve the statement's range qualifier (if any) into an axis-tagged
@@ -4696,7 +4691,7 @@ fn resolve_temporal_range(
             }
             let from = resolve_as_of(&range.from, now)?;
             let to = resolve_as_of(&range.to, now)?;
-            if !range_well_formed(from, to, range.closed_upper) {
+            if !range_well_formed(from.0, to.0, range.closed_upper) {
                 return Err(SelectError::EmptySystemRange {
                     from: from.0,
                     to: to.0,
@@ -4724,9 +4719,11 @@ fn resolve_temporal_range(
                         .to_owned(),
                 ));
             }
-            let from = resolve_as_of(&range.from, now)?;
-            let to = resolve_as_of(&range.to, now)?;
-            if !range_well_formed(from, to, range.closed_upper) {
+            // `resolve_as_of` folds to bare µs; on the valid axis they are
+            // valid-time instants, so carry them in the valid-time newtype.
+            let from = ValidTimeMicros(resolve_as_of(&range.from, now)?.0);
+            let to = ValidTimeMicros(resolve_as_of(&range.to, now)?.0);
+            if !range_well_formed(from.0, to.0, range.closed_upper) {
                 return Err(SelectError::EmptyValidRange {
                     from: from.0,
                     to: to.0,
@@ -6729,8 +6726,8 @@ mod tests {
         )
         .unwrap();
         let range = bound.valid_range.expect("a valid range was bound");
-        assert_eq!(range.from, SystemTimeMicros(10));
-        assert_eq!(range.to, SystemTimeMicros(20));
+        assert_eq!(range.from, ValidTimeMicros(10));
+        assert_eq!(range.to, ValidTimeMicros(20));
         assert!(!range.closed_upper, "FROM..TO is half-open");
         // The valid range does not also pin the valid point, and reads at `now`.
         assert!(bound.valid_snapshot.is_none());
