@@ -71,8 +71,10 @@ type Row = Vec<Option<Vec<u8>>>;
 const KEY_POOL: i64 = 3;
 const VMAX: i64 = 10;
 const SEEDS: u64 = 48;
-/// The two valid-time tables joined on their shared key domain.
-const TABLES: [&str; 2] = ["a", "b"];
+/// The valid-time tables joined on their shared key domain. Three tables exercise an
+/// N-way left-deep chain ([STL-323]), so the overlay must reach the *intermediate*
+/// `join_step` (the middle input), not just the seed and the final step.
+const TABLES: [&str; 3] = ["a", "b", "c"];
 /// The inner join read whose buffered-vs-committed agreement is the core check (and
 /// the "did the buffer move a read?" teeth probe).
 const JOIN_PLAIN: &str = "SELECT a.id, a.val, b.val FROM a JOIN b ON a.id = b.id";
@@ -109,7 +111,8 @@ fn sorted(outcome: StatementOutcome) -> Vec<Row> {
 /// no-op. `tick` distinguishes successive values; a fraction of updates keep the
 /// prior value (period-only `SET`) to exercise the read-modify-write carry-over.
 fn gen_write(rng: &mut Rng, alive: &mut [Vec<bool>], tick: i64) -> String {
-    let t = usize::try_from(rng.below(2)).expect("table index fits");
+    let t = usize::try_from(rng.below(i64::try_from(TABLES.len()).expect("fits")))
+        .expect("table index fits");
     let table = TABLES[t];
     let k = rng.below(KEY_POOL);
     let ku = usize::try_from(k).expect("key fits usize");
@@ -193,11 +196,19 @@ fn run_seed(seed: u64) -> (u64, u64, bool) {
     }
 
     // The differential: the in-transaction join overlay equals the committed join,
-    // plain and across a swept valid grid, for an INNER and a LEFT join.
+    // plain and across a swept valid grid. Two-table `INNER` / `LEFT` joins exercise
+    // the seed + final `join_step` overlay; the three-table left-deep chains ([STL-323])
+    // add the *intermediate* `join_step` (the middle input `b`), so the overlay must
+    // reach every input of the chain, not just the ends.
     let mut probes: u64 = 0;
     let mut rows_seen: u64 = 0;
-    for join in ["JOIN", "LEFT JOIN"] {
-        let plain = format!("SELECT a.id, a.val, b.val FROM a {join} b ON a.id = b.id");
+    for plain in [
+        "SELECT a.id, a.val, b.val FROM a JOIN b ON a.id = b.id",
+        "SELECT a.id, a.val, b.val FROM a LEFT JOIN b ON a.id = b.id",
+        "SELECT a.id, a.val, b.val, c.val FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id",
+        "SELECT a.id, a.val, b.val, c.val FROM a JOIN b ON a.id = b.id LEFT JOIN c ON b.id = c.id",
+    ] {
+        let plain = plain.to_string();
         let mut reads = vec![plain.clone()];
         reads.extend((0..=VMAX).map(|v| format!("{plain} FOR VALID_TIME AS OF {v}")));
         for sql in reads {

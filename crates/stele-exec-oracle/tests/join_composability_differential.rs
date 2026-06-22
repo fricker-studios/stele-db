@@ -1,14 +1,16 @@
-//! DuckDB differential oracle for **clause composability over a join** (STL-264),
-//! driven through Stele's whole SQL bind→exec pipeline.
+//! DuckDB differential oracle for **clause composability over a join** (STL-264)
+//! and **N-way left-deep chains** (STL-323), driven through Stele's whole SQL
+//! bind→exec pipeline.
 //!
 //! STL-172 shipped the inner / left / semi / anti hash join; STL-264 makes the
 //! join output feed the same downstream pipeline a single-table read uses — a
 //! `WHERE` over the joined columns, a hash aggregate (`GROUP BY` / `COUNT`), and
 //! the `DISTINCT` / `ORDER BY` / `LIMIT` tail — with qualified-name resolution
-//! across both inputs. This sweep builds the **same** randomized two-table fixture
-//! in an in-memory `SessionEngine` and an in-memory DuckDB, runs each composed
-//! query — *verbatim*, the text is valid in both dialects — against both, and
-//! asserts agreement.
+//! across the inputs; STL-323 chains the existing two-table joins left-deep
+//! (`a JOIN b … JOIN c …`). This sweep builds the **same** randomized three-table
+//! fixture in an in-memory `SessionEngine` and an in-memory DuckDB, runs each
+//! composed query — *verbatim*, the text is valid in both dialects — against both,
+//! and asserts agreement, over both two-table and three-table chains.
 //!
 //! The fixture seeds NULLs in the join key (`k`) and the filtered value (`a`), so
 //! the NULL-key join (a NULL never matches) and the three-valued `WHERE` are
@@ -63,6 +65,15 @@ const ID_QUERIES: &[&str] = &[
     "SELECT t.id FROM t JOIN s ON t.k = s.k ORDER BY t.id LIMIT 3",
     // DISTINCT over the join output (a matched left id appears once).
     "SELECT DISTINCT t.id FROM t JOIN s ON t.k = s.k",
+    // --- N-way left-deep chains (STL-323) ---
+    // Three-table inner chain whose second `ON` references the middle input.
+    "SELECT t.id FROM t JOIN s ON t.k = s.k JOIN u ON s.k = u.k WHERE t.a >= 2",
+    // Chain + ORDER BY/LIMIT: kept multiset of the 3 smallest `t.id` is deterministic.
+    "SELECT t.id FROM t JOIN s ON t.k = s.k JOIN u ON t.k = u.k ORDER BY t.id LIMIT 3",
+    // DISTINCT over a chain's output.
+    "SELECT DISTINCT t.id FROM t JOIN s ON t.k = s.k JOIN u ON s.k = u.k",
+    // LEFT chain: a NULL-extended middle key flows into the next join's `ON`.
+    "SELECT t.id FROM t LEFT JOIN s ON t.k = s.k LEFT JOIN u ON s.k = u.k WHERE t.a >= 2",
 ];
 
 /// `count(*)`-returning templates (column 0 is a `BIGINT` / `INT8` count) — the
@@ -77,6 +88,11 @@ const COUNT_QUERIES: &[&str] = &[
     "SELECT count(*) FROM t JOIN s ON t.k = s.k GROUP BY t.k",
     // LEFT-join cardinality (every left row at least once).
     "SELECT count(*) FROM t LEFT JOIN s ON t.k = s.k",
+    // --- N-way left-deep chains (STL-323) ---
+    // Three-table inner-chain cardinality.
+    "SELECT count(*) FROM t JOIN s ON t.k = s.k JOIN u ON s.k = u.k",
+    // One count per group over a chain (GROUP BY a chain column).
+    "SELECT count(*) FROM t JOIN s ON t.k = s.k JOIN u ON t.k = u.k GROUP BY t.k",
 ];
 
 // --- harness ---------------------------------------------------------------
@@ -194,12 +210,16 @@ fn join_composability_agrees_with_duckdb() {
         let mut rng = Rng::new(seed);
         let t_rows = gen_rows(&mut rng);
         let s_rows = gen_rows(&mut rng);
+        // A third input for the N-way chains (STL-323); same key pool, so the
+        // three-table joins produce a real (overlapping) set.
+        let u_rows = gen_rows(&mut rng);
 
         // Stele: system-versioned tables, read at the present.
         let mut engine = SessionEngine::open(MemDisk::new(), OriginClock);
         for ddl in [
             "CREATE TABLE t (id INT PRIMARY KEY, k INT, a INT) WITH SYSTEM VERSIONING",
             "CREATE TABLE s (id INT PRIMARY KEY, k INT, a INT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE u (id INT PRIMARY KEY, k INT, a INT) WITH SYSTEM VERSIONING",
         ] {
             engine.execute(&parse_one(ddl)).expect("stele create");
         }
@@ -207,11 +227,12 @@ fn join_composability_agrees_with_duckdb() {
         let conn = Connection::open_in_memory().expect("open in-memory duckdb");
         conn.execute_batch(
             "CREATE TABLE t (id INTEGER, k INTEGER, a INTEGER); \
-             CREATE TABLE s (id INTEGER, k INTEGER, a INTEGER);",
+             CREATE TABLE s (id INTEGER, k INTEGER, a INTEGER); \
+             CREATE TABLE u (id INTEGER, k INTEGER, a INTEGER);",
         )
         .expect("duckdb create");
 
-        for (table, rows) in [("t", &t_rows), ("s", &s_rows)] {
+        for (table, rows) in [("t", &t_rows), ("s", &s_rows), ("u", &u_rows)] {
             for (id, k, a) in rows {
                 let values = format!("({id}, {}, {})", sql_lit(*k), sql_lit(*a));
                 engine
@@ -227,7 +248,7 @@ fn join_composability_agrees_with_duckdb() {
             let want = duck_col0(&conn, query);
             assert_eq!(
                 got, want,
-                "seed {seed}: `{query}` diverged\n  t = {t_rows:?}\n  s = {s_rows:?}"
+                "seed {seed}: `{query}` diverged\n  t = {t_rows:?}\n  s = {s_rows:?}\n  u = {u_rows:?}"
             );
             checks += 1;
         }
