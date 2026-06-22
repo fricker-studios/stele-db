@@ -1,5 +1,5 @@
 //! Per-row-group valid-time interval pruning — the finer-grained valid-axis
-//! access path (STL-316, ADR-0025).
+//! access path (STL-316, STL-336, ADR-0025).
 //!
 //! STL-241 landed the *per-segment* valid-interval summary: one coalesced union
 //! per segment, consulted at the segment level. But a production flush bounds
@@ -19,6 +19,13 @@
 //! summary-off run scans it and the row-level valid filter drops the same rows. A
 //! brute-force reference is diffed alongside so the sweep is a real correctness
 //! oracle, not just an on-vs-off consistency check.
+//!
+//! Section 3 (STL-336) exercises the same row-group summary against the *overlap*
+//! probe a per-row PERIOD predicate pushes down ([`SnapshotScan::prune_valid_overlap`],
+//! the row-group refinement of STL-315's segment-level overlap prune). That probe
+//! is a prune *hint* — it filters no row — so its exec contract is **soundness**,
+//! not byte-identity: a pruned row-group must overlap the probe nowhere, so it can
+//! hold no row the downstream predicate would keep.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -26,7 +33,7 @@
     clippy::cast_sign_loss
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use stele_common::provenance::{Principal, TxnId};
@@ -431,6 +438,300 @@ fn row_group_summary_on_matches_off_and_a_reference_across_a_scatter_sweep() {
     assert!(
         rows_seen > 0,
         "every probe was empty — the workload resolved nothing"
+    );
+    assert!(
+        total_probes > 5_000,
+        "sweep too small ({total_probes} probes) to trust"
+    );
+}
+
+// --- 3. STL-336: the overlap-probe prune at row-group granularity ------------
+//
+// STL-315 pushes a per-row PERIOD predicate's constant probe `[lo, hi)` down as a
+// *segment* skip; STL-316 (above) refined the *point* stab from segment to
+// row-group granularity. STL-336 closes the matrix: it refines the *overlap*
+// probe the same way. A scatter-heavy segment whose union overlaps `[lo, hi)` —
+// so STL-315 cannot prune it — may still hold a row-group whose own coverage
+// overlaps `[lo, hi)` nowhere, now skipped at row-group granularity.
+//
+// Unlike the point stab, the overlap probe is a prune *hint*: it filters no row
+// (the engine's per-row PERIOD predicate does that downstream). So the exec-level
+// contract is **soundness**, not byte-identity — a pruned row-group must overlap
+// the probe nowhere, hence holds no row the downstream predicate could keep — and
+// the summary-on run returns *fewer* keys than the summary-off run exactly when a
+// row-group is pruned, never dropping an overlapping one. The byte-identical
+// end-to-end result is the engine oracle's job, layering the real per-row filter.
+
+/// Resolve the system-live business-key slots a scan returns at snapshot `s`,
+/// pushing a valid-time overlap probe `[lo, hi)` down for row-group pruning
+/// (STL-336). The probe filters no row, so this is every system-live key the
+/// surviving row-groups hold, plus the run's [`ScanStats`].
+fn scan_overlap(
+    delta: &Delta<MemDisk>,
+    index: &ValidityIndex<MemDisk>,
+    segments: &[SegmentReader<MemFile>],
+    s: i64,
+    lo: i64,
+    hi: i64,
+) -> (BTreeSet<u8>, ScanStats) {
+    let out = SnapshotScan::new(delta, index, segments, Snapshot(SystemTimeMicros(s)))
+        // Mirror the engine: a valid-time table strips the delta frame even with
+        // no valid pin. The probe is a prune hint, not a filter.
+        .valid_time(true)
+        .prune_valid_overlap(lo, hi)
+        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .execute()
+        .expect("scan");
+    let keys = bytes_column(&out, ColumnId::BusinessKey)
+        .iter()
+        .map(|k| k[1])
+        .collect();
+    (keys, out.stats)
+}
+
+#[test]
+fn a_row_group_overlap_gap_is_pruned_even_when_the_segment_summary_cannot() {
+    // The same scatter layout the point-stab centerpiece uses:
+    //   row-group 0 — keys 0,1, both valid [40, 60): a mid-band *covering* group.
+    //   row-group 1 — key 2 valid [0, 10) and key 3 valid [100, +∞): a *scatter*
+    //                 group whose envelope is [0, +∞) — overlapping every probe —
+    //                 yet whose coverage gaps over [10, 100).
+    // The segment-wide union [0,10) ∪ [40,60) ∪ [100,+∞) *overlaps* the probe
+    // [45, 55) (via the mid-band window), so the per-segment overlap probe
+    // (STL-315) cannot prune the segment. Only the per-row-group summary (STL-336)
+    // can skip row-group 1, which overlaps [45, 55) nowhere.
+    let disk = MemDisk::new();
+    let (wal, mut delta, mut index) = new_tiers();
+    let mut dml = DmlWriter::new(wal, StepClock::new(1_000), true);
+
+    let inserts = [
+        (0u8, iv(40, 60), b"mid0".to_vec()),
+        (1, iv(40, 60), b"mid1".to_vec()),
+        (2, iv(0, 10), b"old2".to_vec()),
+        (3, open(100), b"new3".to_vec()),
+    ];
+    let mut snapshot = 0;
+    for (k, valid, val) in inserts {
+        snapshot = dml
+            .insert(
+                &mut delta,
+                &mut index,
+                &EmptySealed,
+                key_of(k),
+                Some(valid),
+                Some(val),
+                0,
+                TxnId(u64::from(k) + 1),
+                who(),
+            )
+            .expect("insert")
+            .commit
+            .0;
+    }
+
+    let rows = delta.flush_to_segment().expect("flush");
+    let seg_on = vec![seal_rows(&disk, "on.seg", rows.clone(), SUMMARY_ON)];
+    let seg_off = vec![seal_rows(&disk, "off.seg", rows, SUMMARY_OFF)];
+
+    // [45, 55) overlaps the mid-band group but lies wholly in the scatter group's
+    // coverage gap.
+    let (on_keys, on_stats) = scan_overlap(&delta, &index, &seg_on, snapshot, 45, 55);
+    let (off_keys, off_stats) = scan_overlap(&delta, &index, &seg_off, snapshot, 45, 55);
+
+    // The probe filters no row, so each surviving row-group's keys come back
+    // unfiltered. With the summary, row-group 1 is skipped, so only keys 0,1 (the
+    // mid-band group) return; without it, every system-live key does. The dropped
+    // keys 2 ([0,10)) and 3 ([100,+∞)) overlap [45, 55) nowhere — the soundness
+    // the prune must uphold.
+    assert_eq!(
+        on_keys,
+        BTreeSet::from([0, 1]),
+        "only the un-pruned group's keys come back"
+    );
+    assert_eq!(
+        off_keys,
+        BTreeSet::from([0, 1, 2, 3]),
+        "no prune reads every live key"
+    );
+
+    // The segment as a whole is never valid-pruned — its union overlaps [45, 55).
+    assert_eq!(
+        on_stats.segments_pruned_valid, 0,
+        "the segment summary cannot prune a probe its union overlaps"
+    );
+    assert_eq!(on_stats.segments_scanned, 1);
+    // …but the scatter row-group *is* skipped by its own summary, with no chunk
+    // I/O, while the covering row-group is scanned.
+    assert_eq!(on_stats.row_groups_total, 2);
+    assert_eq!(
+        on_stats.row_groups_pruned_valid, 1,
+        "the scatter row-group overlaps [45, 55) nowhere — it prunes"
+    );
+    assert_eq!(on_stats.row_groups_pruned_zone, 0);
+    assert_eq!(on_stats.row_groups_scanned, 1);
+
+    // Without the summaries, the min/max envelope [0, +∞) cannot prune the scatter
+    // group, so both row-groups are scanned — same live keys read, more work.
+    assert_eq!(
+        off_stats.row_groups_pruned_valid, 0,
+        "min/max cannot prune a row-group's coverage gap"
+    );
+    assert_eq!(
+        off_stats.row_groups_scanned, 2,
+        "the summary-off run scans both row-groups"
+    );
+
+    // Teeth on the other side: a probe reaching a covered window in *both*
+    // row-groups must prune neither — every live key is read.
+    let (wide_keys, wide_stats) = scan_overlap(&delta, &index, &seg_on, snapshot, 5, 105);
+    assert_eq!(
+        wide_keys,
+        BTreeSet::from([0, 1, 2, 3]),
+        "a probe overlapping every row-group reads all keys"
+    );
+    assert_eq!(
+        wide_stats.row_groups_pruned_valid, 0,
+        "a probe overlapping every row-group prunes none"
+    );
+    assert_eq!(wide_stats.row_groups_scanned, 2);
+}
+
+#[test]
+// One self-contained seeded differential oracle — the per-seed setup, the probe
+// grid, and the soundness assertions read as a unit.
+#[allow(clippy::too_many_lines)]
+fn row_group_overlap_prune_is_sound_across_a_scatter_sweep() {
+    const SEEDS: u64 = 64;
+    let mut total_rg_pruned_valid: u64 = 0;
+    let mut total_probes: u64 = 0;
+
+    for seed in 0..SEEDS {
+        let mut rng = Rng::new(seed);
+        let disk = MemDisk::new();
+        let (wal, mut delta, mut index) = new_tiers();
+        let mut dml = DmlWriter::new(wal, StepClock::new(START), true);
+        let mut refs: Vec<Ref> = Vec::new();
+
+        // The same banded scatter the point-stab sweep uses: row-group 0 (keys
+        // 0,1) straddles the old/new gap so its summary can prune a mid-band
+        // probe, while row-group 1 (keys 2,3) sits in the mid band so the
+        // segment-wide union overlaps mid-band probes and the *segment* overlap
+        // prune cannot fire — forcing the row-group path to do the work.
+        for k in 0..KEYS {
+            let band = match k {
+                0 => 0,
+                1 => 2,
+                2 | 3 => 1,
+                _ => (rng.range(3)) as u8,
+            };
+            let valid = gen_banded(&mut rng, band);
+            let val = format!("k{k}").into_bytes();
+            let commit = dml
+                .insert(
+                    &mut delta,
+                    &mut index,
+                    &EmptySealed,
+                    key_of(k),
+                    Some(valid),
+                    Some(val.clone()),
+                    0,
+                    TxnId(u64::from(k) + 1),
+                    who(),
+                )
+                .expect("insert")
+                .commit
+                .0;
+            refs.push(Ref {
+                k,
+                sys_from: commit,
+                vfrom: valid.from.0,
+                vto: valid.to.0,
+                val,
+            });
+        }
+        let hi_s = refs.iter().map(|r| r.sys_from).max().unwrap();
+
+        let rows = delta.flush_to_segment().expect("flush");
+        let seg_on = vec![seal_rows(&disk, "on.seg", rows.clone(), SUMMARY_ON)];
+        let seg_off = vec![seal_rows(&disk, "off.seg", rows, SUMMARY_OFF)];
+
+        // Keys live at `s` whose valid interval overlaps `[lo, hi)` — the only rows
+        // the downstream per-row predicate could keep, so the prune must not drop
+        // any of them. (`[a, b)` overlaps `[c, d)` ⟺ `a < d && c < b`.)
+        let overlapping = |s: i64, lo: i64, hi: i64| -> BTreeSet<u8> {
+            refs.iter()
+                .filter(|r| r.sys_from <= s && r.vfrom < hi && lo < r.vto)
+                .map(|r| r.k)
+                .collect()
+        };
+        // Every key system-live at `s` — the unfiltered scan result.
+        let all_live = |s: i64| -> BTreeSet<u8> {
+            refs.iter()
+                .filter(|r| r.sys_from <= s)
+                .map(|r| r.k)
+                .collect()
+        };
+
+        for s in (START - 1)..=(hi_s + 1) {
+            for &(lo, hi) in &[
+                (-5i64, 0i64),
+                (0, 5),
+                (5, OLD_HI),
+                (OLD_HI, MID_LO), // a gap below the mid band
+                (20, 80),         // straddles the mid band — segment can't prune
+                (MID_HI, NEW_LO), // a gap above the mid band
+                (45, 55),         // inside the mid band
+                (NEW_LO, 150),
+                (150, 250),
+                (0, 300),
+            ] {
+                let (on_keys, on_stats) = scan_overlap(&delta, &index, &seg_on, s, lo, hi);
+                let (off_keys, off_stats) = scan_overlap(&delta, &index, &seg_off, s, lo, hi);
+                let want_overlap = overlapping(s, lo, hi);
+
+                // The summary-off run never valid-prunes a row-group — that is the
+                // toggle: any valid prune the on-run shows is the row-group
+                // summary's doing.
+                assert_eq!(
+                    off_stats.row_groups_pruned_valid, 0,
+                    "seed {seed} (s={s}, [{lo}, {hi})): summary-off must not valid-prune",
+                );
+                assert_eq!(
+                    off_keys,
+                    all_live(s),
+                    "seed {seed} (s={s}): the scan returns every live key unfiltered"
+                );
+
+                // Soundness: the prune never drops a row that overlaps the probe,
+                // and never invents one — `want_overlap ⊆ on_keys ⊆ all_live`.
+                assert!(
+                    want_overlap.is_subset(&on_keys),
+                    "seed {seed} (s={s}, [{lo}, {hi})): the prune dropped an overlapping row"
+                );
+                assert!(
+                    on_keys.is_subset(&all_live(s)),
+                    "seed {seed} (s={s}, [{lo}, {hi})): the prune-only scan invented a key"
+                );
+
+                // The four row-group counts always partition the segment-level
+                // zone survivors (STL-173, STL-316, STL-336).
+                assert_eq!(
+                    on_stats.row_groups_total,
+                    on_stats.row_groups_pruned_zone
+                        + on_stats.row_groups_pruned_valid
+                        + on_stats.row_groups_scanned,
+                    "seed {seed} (s={s}, [{lo}, {hi})): row-group counts must partition",
+                );
+
+                total_rg_pruned_valid += on_stats.row_groups_pruned_valid as u64;
+                total_probes += 1;
+            }
+        }
+    }
+
+    assert!(
+        total_rg_pruned_valid > 0,
+        "the per-row-group overlap probe never pruned a row-group — the access path was untested",
     );
     assert!(
         total_probes > 5_000,

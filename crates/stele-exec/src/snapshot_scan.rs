@@ -562,7 +562,7 @@ impl GatheredColumns {
 /// What remains is [`segments_scanned`](Self::segments_scanned): the segments
 /// whose projected columns are materialized for the rows that survive resolution.
 ///
-/// ## Row-group accounting (STL-173, STL-316)
+/// ## Row-group accounting (STL-173, STL-316, STL-336)
 ///
 /// Within a segment that survives the segment-level zone prune, the scan prunes
 /// again at *row-group* granularity, two complementary ways, neither touching a
@@ -572,11 +572,14 @@ impl GatheredColumns {
 ///   prove no visible matching row even when the segment-level fold (whose
 ///   `[min, max]` spans every row-group) cannot
 ///   ([`row_groups_pruned_zone`](Self::row_groups_pruned_zone));
-/// * on a `FOR VALID_TIME AS OF v` read, each row-group's own valid-interval
-///   summary ([`SegmentReader::row_group_might_contain_valid`], STL-316) can
-///   prove no row in it is valid at `v` — the backdated scatter case its
-///   `valid_from` / `valid_to` zone-map min/max cannot, because a correction in
-///   the row-group widens the envelope to span `v` though the coverage gaps there
+/// * each row-group's own valid-interval summary can prove no row in it is on the
+///   valid axis the read needs — valid at the pinned `v` for a `FOR VALID_TIME
+///   AS OF v` point stab ([`SegmentReader::row_group_might_contain_valid`],
+///   STL-316), or overlapping a per-row PERIOD predicate's constant probe
+///   `[lo, hi)` for the range stab ([`SegmentReader::row_group_might_overlap_valid`],
+///   STL-336) — the backdated scatter case its `valid_from` / `valid_to` zone-map
+///   min/max cannot, because a correction in the row-group widens the envelope to
+///   span the timeline though the coverage gaps there
 ///   ([`row_groups_pruned_valid`](Self::row_groups_pruned_valid)).
 ///
 /// The four `row_groups_*` counts partition the row-groups of exactly the
@@ -624,11 +627,14 @@ pub struct ScanStats {
     /// identity (and bulk) chunks are never read.
     pub row_groups_pruned_zone: usize,
     /// Row-groups the per-row-group valid-time interval summary proved hold no row
-    /// valid at the pinned valid instant — skipped with no read I/O (STL-316).
-    /// Only ever non-zero for a `FOR VALID_TIME AS OF v` read against a segment
-    /// carrying per-row-group summaries; this is the backdated-write scatter case
-    /// the row-group's `valid_from` / `valid_to` zone-map min/max cannot prune,
-    /// the row-group-granular refinement of
+    /// on the valid axis the read needs — skipped with no read I/O. Non-zero for a
+    /// `FOR VALID_TIME AS OF v` read whose `v` falls in a row-group's coverage gap
+    /// (the point stab, STL-316) **and** for a per-row PERIOD predicate whose
+    /// constant probe `[lo, hi)` overlaps a row-group's covered windows nowhere
+    /// (the range stab, STL-336), in each case against a segment carrying
+    /// per-row-group summaries. Both are the backdated-write scatter case the
+    /// row-group's `valid_from` / `valid_to` zone-map min/max cannot prune, the
+    /// row-group-granular refinement of
     /// [`segments_pruned_valid`](Self::segments_pruned_valid).
     pub row_groups_pruned_valid: usize,
     /// Row-groups whose narrow identity columns were read to resolve the snapshot
@@ -1056,11 +1062,14 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
         self
     }
 
-    /// Push a half-open valid-time probe `[lo, hi)` down for **segment pruning
-    /// only** ([STL-315]): a segment whose per-segment valid-interval summary
+    /// Push a half-open valid-time probe `[lo, hi)` down for **pruning only**
+    /// ([STL-315], [STL-336]): a segment whose per-segment valid-interval summary
     /// proves no row overlaps `[lo, hi)` is skipped (counted in
-    /// [`ScanStats::segments_pruned_valid`]), the backdated-write scatter case the
-    /// `valid_from` / `valid_to` zone-map min/max cannot prune.
+    /// [`ScanStats::segments_pruned_valid`]), and within a surviving segment a
+    /// row-group whose own summary proves the same is skipped at row-group
+    /// granularity (counted in [`ScanStats::row_groups_pruned_valid`], STL-336) —
+    /// the backdated-write scatter case the `valid_from` / `valid_to` zone-map
+    /// min/max cannot prune.
     ///
     /// Unlike [`valid_as_of`](Self::valid_as_of) this filters **no row** — it only
     /// gates which segments are read. It is the access-path counterpart of a
@@ -1227,21 +1236,25 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
                 pruned_valid += 1;
                 continue;
             }
-            // Stage 2 — per-row-group skips (STL-173, STL-316): rule out
+            // Stage 2 — per-row-group skips (STL-173, STL-316, STL-336): rule out
             // individual row-groups even when the segment-level fold (its
             // `[min, max]` spanning every row-group) cannot, two complementary
             // ways, both footer-resident so neither costs chunk I/O:
             //
             //  * the row-group's own zone map proves no visible match (STL-173);
-            //  * on a valid-pinned read, the row-group's own valid-interval
-            //    summary proves no row in it is valid at `v` (STL-316) — the
-            //    backdated scatter case its `valid_from` / `valid_to` zone-map
-            //    min/max cannot prune, now caught at row-group rather than only
-            //    segment granularity. Tallied separately from the zone skip, the
-            //    row-group analogue of the segment-level `pruned_valid` split.
-            //    (The STL-315 overlap probe stays segment-level for now.)
+            //  * the row-group's own valid-interval summary proves no row in it is
+            //    on the valid axis the read needs — valid at the pinned `v` for a
+            //    `FOR VALID_TIME AS OF v` point stab (STL-316), or overlapping a
+            //    per-row PERIOD predicate's constant probe `[lo, hi)` for the range
+            //    stab (STL-336, the row-group-granular refinement of the
+            //    segment-level overlap probe STL-315), now caught at row-group
+            //    rather than only segment granularity.
             //
-            // The pruned row-groups' identity chunks are then never read.
+            // Both valid-axis stabs are the backdated scatter case the row-group's
+            // `valid_from` / `valid_to` zone-map min/max cannot prune; both are
+            // tallied in `rg_pruned_valid` (distinct from the zone skip), the
+            // row-group analogue of the segment-level `pruned_valid` split. The
+            // pruned row-groups' identity chunks are then never read.
             let rg_counts = reader.row_group_row_counts();
             let rg_maps = reader.row_group_zone_maps();
             rg_total += rg_maps.len();
@@ -1252,7 +1265,14 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
                 } else if self
                     .valid_snapshot
                     .is_some_and(|point| !reader.row_group_might_contain_valid(g, point.0))
+                    || self
+                        .valid_overlap
+                        .is_some_and(|(lo, hi)| !reader.row_group_might_overlap_valid(g, lo, hi))
                 {
+                    // Either valid-axis stab (point STL-316, overlap STL-336)
+                    // proving the row-group empty skips it; at most one is ever set
+                    // in practice, and both share the `rg_pruned_valid` bucket, so
+                    // the `||` keeps them in one arm.
                     rg_pruned_valid += 1;
                 } else {
                     candidates.insert(g);
