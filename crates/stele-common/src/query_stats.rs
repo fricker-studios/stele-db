@@ -23,8 +23,9 @@ pub const NOTICE_PREFIX: &str = "stele stats v1:";
 /// One query's execution accounting, as carried over the wire to the shell.
 ///
 /// The scan-level counts mirror the executor's `ScanStats` (STL-146): a segment
-/// is either *scanned* (its columns materialized) or *pruned* by one of three
-/// proofs — a zone map, a footer bloom, or the validity index (superseded). The
+/// is either *scanned* (its columns materialized) or *pruned* by one of four
+/// proofs — a zone map, a footer bloom, the validity index (superseded), or a
+/// valid-interval summary (valid axis, STL-241/STL-315). The
 /// row-group counts (STL-173) partition the row-groups of the segment-level zone
 /// survivors. `rows` is the count the query actually returned (post-filter,
 /// post-aggregate), not the number of versions examined.
@@ -49,6 +50,13 @@ pub struct QueryStats {
     pub segments_pruned_bloom: u64,
     /// Segments the validity index proved wholly superseded at the snapshot.
     pub segments_pruned_superseded: u64,
+    /// Segments a valid-interval summary proved hold no row on the valid axis the
+    /// read needs (no read I/O). Non-zero for a `FOR VALID_TIME AS OF v` read whose
+    /// `v` falls in a coverage gap (the point stab, STL-241) or a per-row `PERIOD`
+    /// overlap probe that matches no covered window (the range stab, STL-315) —
+    /// the backdated-write scatter case the `valid_from` / `valid_to` zone-map
+    /// min/max cannot prune.
+    pub segments_pruned_valid: u64,
     /// Row-groups across the segment-level zone survivors (the denominator the two
     /// row-group counts below partition).
     pub row_groups_total: u64,
@@ -60,9 +68,14 @@ pub struct QueryStats {
 
 impl QueryStats {
     /// Segments skipped by any prune — never had their bulk columns materialized.
+    /// Mirrors `ScanStats::segments_pruned`: the four proofs sum, so the footer's
+    /// `scanned + pruned == total` partition holds on the valid axis too.
     #[must_use]
     pub const fn segments_pruned(&self) -> u64 {
-        self.segments_pruned_zone + self.segments_pruned_bloom + self.segments_pruned_superseded
+        self.segments_pruned_zone
+            + self.segments_pruned_bloom
+            + self.segments_pruned_superseded
+            + self.segments_pruned_valid
     }
 
     /// Serialize as the body of a stats `NoticeResponse` message: the
@@ -74,7 +87,7 @@ impl QueryStats {
     pub fn to_notice(&self) -> String {
         format!(
             "{NOTICE_PREFIX} rows={} sys={} tt={} \
-             seg_total={} seg_scanned={} seg_zone={} seg_bloom={} seg_super={} \
+             seg_total={} seg_scanned={} seg_zone={} seg_bloom={} seg_super={} seg_valid={} \
              rg_total={} rg_scanned={} rg_zone={}",
             self.rows,
             self.system_snapshot,
@@ -84,6 +97,7 @@ impl QueryStats {
             self.segments_pruned_zone,
             self.segments_pruned_bloom,
             self.segments_pruned_superseded,
+            self.segments_pruned_valid,
             self.row_groups_total,
             self.row_groups_scanned,
             self.row_groups_pruned_zone,
@@ -114,6 +128,7 @@ impl QueryStats {
                 "seg_zone" => stats.segments_pruned_zone = value.parse().unwrap_or(0),
                 "seg_bloom" => stats.segments_pruned_bloom = value.parse().unwrap_or(0),
                 "seg_super" => stats.segments_pruned_superseded = value.parse().unwrap_or(0),
+                "seg_valid" => stats.segments_pruned_valid = value.parse().unwrap_or(0),
                 "rg_total" => stats.row_groups_total = value.parse().unwrap_or(0),
                 "rg_scanned" => stats.row_groups_scanned = value.parse().unwrap_or(0),
                 "rg_zone" => stats.row_groups_pruned_zone = value.parse().unwrap_or(0),
@@ -138,6 +153,7 @@ mod tests {
             segments_pruned_zone: 4,
             segments_pruned_bloom: 1,
             segments_pruned_superseded: 0,
+            segments_pruned_valid: 2,
             row_groups_total: 20,
             row_groups_scanned: 15,
             row_groups_pruned_zone: 5,
@@ -181,7 +197,8 @@ mod tests {
     }
 
     #[test]
-    fn segments_pruned_sums_the_three_proofs() {
-        assert_eq!(sample().segments_pruned(), 5);
+    fn segments_pruned_sums_the_four_proofs() {
+        // zone(4) + bloom(1) + superseded(0) + valid(2).
+        assert_eq!(sample().segments_pruned(), 7);
     }
 }

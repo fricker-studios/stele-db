@@ -425,6 +425,7 @@ const fn query_stats(scan: &ScanStats, rows: usize, snapshot: SystemTimeMicros) 
         segments_pruned_zone: scan.segments_pruned_zone as u64,
         segments_pruned_bloom: scan.segments_pruned_bloom as u64,
         segments_pruned_superseded: scan.segments_pruned_superseded as u64,
+        segments_pruned_valid: scan.segments_pruned_valid as u64,
         row_groups_total: scan.row_groups_total as u64,
         row_groups_scanned: scan.row_groups_scanned as u64,
         row_groups_pruned_zone: scan.row_groups_pruned_zone as u64,
@@ -14432,6 +14433,78 @@ mod tests {
             total_pruned > 0,
             "the overlap probe never pruned — the access path was untested"
         );
+    }
+
+    #[test]
+    fn valid_axis_segment_prune_surfaces_in_the_query_stats_footer() {
+        // STL-333 DoD: the per-query footer DTO (`QueryStats`, the "see the engine"
+        // NoticeResponse trailer) must carry the valid-axis segment prune, which the
+        // engine fold `query_stats()` previously dropped. Same backdated fixture as
+        // the STL-315 oracle above — one segment, valid envelope [0, 200), coverage
+        // gap [10, 100) — read through the full SQL bind→exec path so the assertion
+        // is on the wire DTO, not the raw `ScanStats`. A per-row `PERIOD … OVERLAPS`
+        // probe in the gap prunes the segment on the valid axis, and that prune must
+        // appear in `segments_pruned_valid` (and so in `segments_pruned()`, keeping
+        // the footer's `scanned + pruned == total` honest). A probe reaching a
+        // covered band prunes nothing on the valid axis and reads the segment.
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE booking (id INT PRIMARY KEY, vf TIMESTAMP, vt TIMESTAMP) \
+                 WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+            ))
+            .expect("create");
+
+        let rows = [(1, 0, 10), (2, 2, 8), (3, 100, 150), (4, 120, 200)];
+        for (txn, &(id, vf, vt)) in rows.iter().enumerate() {
+            let payload = row_codec::encode_payload(&[
+                cell(Some(ScalarValue::Timestamp(vf))),
+                cell(Some(ScalarValue::Timestamp(vt))),
+            ]);
+            engine
+                .insert(
+                    "booking",
+                    business_key(&ScalarValue::Int4(id)),
+                    Some(ValidInterval::new(ValidTimeMicros(vf), ValidTimeMicros(vt)).unwrap()),
+                    payload,
+                    0,
+                    TxnId(u64::try_from(txn).unwrap() + 1),
+                    Principal::new(b"demo".to_vec()),
+                )
+                .expect("insert");
+        }
+        engine.flush().expect("flush seals the backdated rows");
+
+        let footer = |engine: &mut SessionEngine<ZeroClock, MemDisk>, pred: &str| -> QueryStats {
+            let sql = format!("SELECT id FROM booking WHERE PERIOD(vf, vt) {pred}");
+            select(engine, &sql)
+                .stats
+                .expect("a sealed read reports scan stats")
+        };
+
+        // A probe wholly inside the gap [10, 100): the segment holds no row valid in
+        // the probe window, so the footer accounts it as a valid-axis prune.
+        let gap = footer(&mut engine, "OVERLAPS PERIOD(20, 80)");
+        assert_eq!(gap.segments_total, 1, "one sealed segment offered");
+        assert_eq!(
+            gap.segments_pruned_valid, 1,
+            "the gap probe prunes the segment on the valid axis — and the footer says so"
+        );
+        assert_eq!(gap.segments_scanned, 0, "no segment is materialized");
+        assert_eq!(
+            gap.segments_pruned(),
+            gap.segments_total,
+            "the valid prune keeps the footer's scanned + pruned == total honest"
+        );
+
+        // A probe reaching a covered band prunes nothing on the valid axis; the
+        // segment is read instead, so the footer shows no valid prune.
+        let covered = footer(&mut engine, "OVERLAPS PERIOD(5, 105)");
+        assert_eq!(
+            covered.segments_pruned_valid, 0,
+            "a probe reaching a covered band does not prune on the valid axis"
+        );
+        assert_eq!(covered.segments_scanned, 1, "the segment is materialized");
     }
 
     // --- STL-218: plain (no-valid-pin) reads of a both-axes table ------------
