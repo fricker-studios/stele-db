@@ -3374,9 +3374,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // the result for the "see the engine" footer ([STL-201]). Every branch now
         // reports its scan: the committed-only fast path below its fused scan; a
         // read-your-own-writes overlay and a provenance read their *base* scan — an
-        // unfiltered full scan (the `WHERE` is re-applied in the engine over the
-        // overlaid / widened rows), so the footer honestly shows the full scan those
-        // paths pay ([STL-318]).
+        // unfiltered scan (the `WHERE` is re-applied in the engine over the
+        // overlaid / widened rows, so it gets none of the zone-map / bloom pruning a
+        // pushed-down predicate would drive, though the validity index and any valid
+        // pin still prune what they prove), so the footer reports that base scan's
+        // real accounting ([STL-318]).
         let (rows, scan_stats) = if overlay.iter().any(|d| d.table() == table) {
             let (rows, stats) = Self::overlaid_rows(
                 bound,
@@ -4151,12 +4153,15 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// system-only table (which never carries a valid pin).
     ///
     /// The returned [`ScanStats`] is the **base scan's** accounting, reported as
-    /// the read's footer ([STL-318]): an unfiltered full scan (the `WHERE` is
-    /// applied in-engine after the overlay, never pushed down), so it honestly
-    /// shows every segment scanned and nothing pruned — the storage cost a
-    /// read-your-own-writes read actually pays. The buffered writes the overlay
-    /// adds are not a storage scan and so are not in this accounting; the footer's
-    /// row count is the post-overlay, post-filter total the caller folds in.
+    /// the read's footer ([STL-318]). The base scan is *unfiltered* — the `WHERE`
+    /// is applied in-engine after the overlay, never pushed down — so it gets none
+    /// of the zone-map / bloom pruning a predicate would drive (the validity index
+    /// still prunes wholly-superseded segments); the footer thus reflects the real
+    /// storage cost a read-your-own-writes read pays, which is typically a much
+    /// wider scan than the same `WHERE` on the committed fast path. The buffered
+    /// writes the overlay adds are not a storage scan and so are not in this
+    /// accounting; the footer's row count is the post-overlay, post-filter total the
+    /// caller folds in.
     // The tuple is just `(overlaid+filtered rows, base-scan stats)`; it is *not* a
     // `ScannedRows` (whose `rows` are a scan's own output, not overlaid ones), so
     // the row-vec shape trips `type_complexity` here rather than being aliased.
@@ -4418,9 +4423,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// The same `ScanSource → ExplodePayload` pipeline [`scan_rows`](Self::scan_rows)
     /// runs, minus the `WHERE` filter and a valid-axis *pin*, so each row comes back
     /// as its full `[business key, value cells…]` canonical bytes, paired with the
-    /// scan's [`ScanStats`] ([STL-318]) — an unfiltered full scan, so it reports
-    /// every segment scanned. The table's valid-time policy is still declared so a
-    /// valid-time table's delta frame is stripped ([STL-218]).
+    /// scan's [`ScanStats`] ([STL-318]) — an unfiltered scan, so it gets no
+    /// zone-map / bloom pruning (the validity index still prunes wholly-superseded
+    /// segments). The table's valid-time policy is still declared so a valid-time
+    /// table's delta frame is stripped ([STL-218]).
     fn scan_all_rows(
         state: &TableState<C, D>,
         snapshot: SystemTimeMicros,
@@ -4449,10 +4455,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         }
         // The scan's pruning accounting ([`ScanStats`], STL-146) bubbles up through
         // `ExplodePayload` from the `ScanSource` ([`Operator::stats`], STL-201) —
-        // an unfiltered full scan here, so it reports every segment scanned. The
-        // first `next` above resolved it; the default guards the un-resolved case
-        // rather than panicking. The overlay / provenance read paths report it as
-        // their base scan ([STL-318]); index maintenance ignores it.
+        // an unfiltered scan here, so it gets no zone-map / bloom pruning (the
+        // validity index can still prune wholly-superseded segments). The first
+        // `next` above resolved it; the default guards the un-resolved case rather
+        // than panicking. The overlay / provenance read paths report it as their
+        // base scan ([STL-318]); index maintenance ignores it.
         let stats = exploded.stats().unwrap_or_default();
         Ok(ScannedRows { rows, stats })
     }
@@ -4516,8 +4523,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             }
         }
         // Carry the scan's pruning accounting up for the footer ([STL-201],
-        // STL-318): an unfiltered full scan (the `WHERE` is re-applied in the
-        // engine over the widened rows), so it reports every segment scanned.
+        // STL-318): unfiltered w.r.t. the `WHERE` (re-applied in the engine over the
+        // widened rows), so it gets no zone-map / bloom pruning — but the validity
+        // index and, on a `FOR VALID_TIME AS OF v` read, the valid pin above can
+        // still prune, so this is not necessarily an all-segments scan.
         let stats = exploded.stats().unwrap_or_default();
         Ok(ScannedRows { rows, stats })
     }
