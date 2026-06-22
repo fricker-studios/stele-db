@@ -23,11 +23,18 @@ workspace = true
 [dependencies]
 # A deliberately tiny footprint: the v0 transport is the HTTP/JSON gateway over a
 # blocking std `TcpStream` (the gRPC transport is optional in v0, ADR-0016), so
-# the only external dependencies are serde + serde_json to (de)serialize request
-# and reply bodies. No async runtime, no HTTP framework — keeps the published
-# crate's dependency tree small for downstream consumers.
+# the body (de)serialization is just serde + serde_json. No async runtime, no HTTP
+# framework — keeps the published crate's dependency tree small for downstream
+# consumers.
 serde      = { workspace = true }
 serde_json = { workspace = true }
+# TLS for the admin gateway (STL-320): the same `rustls` the SQL surface already
+# pins (ADR-0016 shares TLS with pg-wire), used through its *blocking*
+# `StreamOwned` adapter — so an `https://` round-trip still pulls in NO async
+# runtime or HTTP client. `default-features = false` (workspace) keeps aws-lc out;
+# only ring is built.
+rustls           = { workspace = true }
+rustls-pki-types = { workspace = true }
 
 [dev-dependencies]
 # The live-server integration test (the DoD: health-check, backup, and
@@ -48,3 +55,9 @@ stele-storage = { path = "../stele-storage" }
 stele-common  = { path = "../stele-common" }
 stele-sql     = { path = "../stele-sql" }
 tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+# The TLS integration test (STL-320) mints throwaway PKI for a server certificate.
+# Like tokio above, `rcgen` is a real registry crate, so it keeps the workspace
+# (versioned) form — `cargo package` resolves it fine, and dev-deps never reach
+# downstream consumers. The blocking client's own TLS rides the `rustls` dep above,
+# so there is no test-only TLS *client* crate.
+rcgen         = { workspace = true }
