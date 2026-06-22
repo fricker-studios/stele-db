@@ -363,21 +363,28 @@ async fn tls_connect(
 /// the SHA-2 family. This is the test's own cert-hash logic — independent of the
 /// server's private `endpoint_channel_binding`, and the same selection libpq
 /// makes — so a passing `c=` check proves both sides land on the identical bytes.
+///
+/// Every digest is matched against explicit OIDs and an unexpected signature
+/// algorithm **panics**: the suite only mints SHA-256/384/512 leaves, so anything
+/// else means a cert wasn't built as intended — fail loudly rather than let a
+/// silent SHA-256 fallback mask it and pass a dishonest interop test.
 fn endpoint_binding(cert_der: &[u8]) -> Vec<u8> {
     use x509_parser::oid_registry::{
-        OID_PKCS1_SHA384WITHRSA, OID_PKCS1_SHA512WITHRSA, OID_SIG_ECDSA_WITH_SHA384,
-        OID_SIG_ECDSA_WITH_SHA512,
+        OID_PKCS1_SHA256WITHRSA, OID_PKCS1_SHA384WITHRSA, OID_PKCS1_SHA512WITHRSA,
+        OID_SIG_ECDSA_WITH_SHA256, OID_SIG_ECDSA_WITH_SHA384, OID_SIG_ECDSA_WITH_SHA512,
     };
     use x509_parser::prelude::{FromDer as _, X509Certificate};
 
     let (_, cert) = X509Certificate::from_der(cert_der).expect("parse leaf certificate");
     let alg = &cert.signature_algorithm.algorithm;
-    if *alg == OID_PKCS1_SHA384WITHRSA || *alg == OID_SIG_ECDSA_WITH_SHA384 {
+    if *alg == OID_PKCS1_SHA256WITHRSA || *alg == OID_SIG_ECDSA_WITH_SHA256 {
+        sha256(cert_der).as_bytes().to_vec()
+    } else if *alg == OID_PKCS1_SHA384WITHRSA || *alg == OID_SIG_ECDSA_WITH_SHA384 {
         sha384(cert_der).to_vec()
     } else if *alg == OID_PKCS1_SHA512WITHRSA || *alg == OID_SIG_ECDSA_WITH_SHA512 {
         sha512(cert_der).to_vec()
     } else {
-        sha256(cert_der).as_bytes().to_vec()
+        panic!("unexpected leaf signature algorithm in test: {alg:?}");
     }
 }
 

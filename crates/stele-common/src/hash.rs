@@ -382,8 +382,8 @@ const H0_384: [u64; 8] = [
     0x47b5_481d_befa_4fa4,
 ];
 
-/// SHA-512/384 round constants — fractional parts of the cube roots of the first
-/// eighty primes ([FIPS 180-4] §4.2.3).
+/// Round constants shared by SHA-512 and SHA-384 — fractional parts of the cube
+/// roots of the first eighty primes ([FIPS 180-4] §4.2.3).
 const K512: [u64; 80] = [
     0x428a_2f98_d728_ae22,
     0x7137_4491_23ef_65cd,
