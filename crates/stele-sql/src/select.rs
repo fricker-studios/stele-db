@@ -160,9 +160,10 @@ pub enum ProjectionValue {
     ///
     /// When the `correlation` field is `None` the subquery is
     /// **uncorrelated** ([STL-303]): the inner references no outer column, so it is
-    /// resolved **once** at the statement snapshot (the [STL-234] `resolve_filter`
-    /// fold, materializing a value instead of a row filter) and broadcast as a
-    /// constant column. When `Some` it is **correlated** ([STL-331]): the inner
+    /// resolved **once** at the statement snapshot and broadcast as a constant
+    /// column — the projection-path analogue of the [STL-234] uncorrelated `WHERE`
+    /// fold, materializing a single value instead of a row filter. When `Some` it
+    /// is **correlated** ([STL-331]): the inner
     /// references an outer column, so it is re-run once per outer row with that
     /// row's value substituted — the [STL-239] per-row machinery producing a
     /// projected cell instead of a row keep/drop.
