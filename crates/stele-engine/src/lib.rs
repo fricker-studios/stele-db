@@ -3695,7 +3695,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// `eval_expr` over the row's typed columns ([`eval_projection_scalar`]); an
     /// uncorrelated scalar subquery resolves **once** at the statement snapshot (over
     /// the same `overlay` / `scope`, [`resolve_scalar_subquery`]) and broadcasts its
-    /// single value — SQL `NULL` for an empty inner, SQLSTATE `21000` for `>1` row.
+    /// single value, while a **correlated** one ([STL-331]) re-runs per outer row
+    /// ([`materialize_correlated_subquery`]) — SQL `NULL` for an empty inner, SQLSTATE
+    /// `21000` for `>1` row, either way.
     fn materialize_projection(
         &self,
         bound: &BoundSelect,
@@ -3750,12 +3752,31 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     columns.push((item.name.clone(), *ty));
                     computed.push(column);
                 }
-                ProjectionValue::Subquery { subquery, ty } => {
-                    let value = self.resolve_scalar_subquery(subquery, overlay, scope)?;
-                    let cell = value.as_ref().map(encode_value);
+                ProjectionValue::Subquery {
+                    subquery,
+                    ty,
+                    correlation,
+                } => {
+                    // Uncorrelated: resolve once and broadcast the constant. Correlated
+                    // ([STL-331]): re-run the inner per outer row — the [STL-239] per-row
+                    // machinery producing a projected cell instead of a row keep/drop.
+                    let column = match correlation {
+                        None => {
+                            let value = self.resolve_scalar_subquery(subquery, overlay, scope)?;
+                            vec![value.as_ref().map(encode_value); row_count]
+                        }
+                        Some(correlation) => self.materialize_correlated_subquery(
+                            subquery,
+                            *correlation,
+                            schema_columns,
+                            &rows,
+                            overlay,
+                            scope,
+                        )?,
+                    };
                     indices.push(base_width + computed.len());
                     columns.push((item.name.clone(), *ty));
-                    computed.push(vec![cell; row_count]);
+                    computed.push(column);
                 }
             }
         }
@@ -3793,6 +3814,56 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             return Err(EngineError::Unsupported("a subquery must be a SELECT"));
         };
         scalar_subquery_value(&result)
+    }
+
+    /// Materialize a **correlated** projected scalar subquery ([STL-331]) into a
+    /// per-row column — the [STL-239] [`filter_correlated_subquery`] pattern, reduced
+    /// to a projected cell per outer row instead of a row keep/drop.
+    ///
+    /// For each outer row this substitutes that row's correlation value into the
+    /// inner's filter (`inner_column <op> value`, [`correlated_inner`]), re-runs the
+    /// inner over the **same** `overlay` / `scope` / snapshot the outer reads (so the
+    /// per-statement `(sys, valid)` and read-your-own-writes rules hold for every
+    /// re-execution — docs/16 §6), and reduces the result with the same
+    /// [`scalar_subquery_value`] the uncorrelated path uses: an empty inner ⇒ SQL
+    /// `NULL`, one row ⇒ its value, more than one ⇒ SQLSTATE `21000`. A **NULL**
+    /// correlation value short-circuits to a `NULL` cell without a run (`inner <op>
+    /// NULL` is unknown for every inner row ⇒ empty ⇒ `NULL`), the [`empty_inner_keeps`]
+    /// rule for a scalar.
+    ///
+    /// Performance is explicitly not the v0.3 bar (`O(outer rows × inner cost)`),
+    /// mirroring the WHERE side; decorrelation is the STL-317 follow-up.
+    fn materialize_correlated_subquery(
+        &self,
+        subquery: &BoundSelect,
+        correlation: Correlation,
+        schema_columns: &[(String, LogicalType)],
+        rows: &[Vec<Option<Vec<u8>>>],
+        overlay: &[BoundDml],
+        scope: &CteScope,
+    ) -> Result<Vec<Option<Vec<u8>>>, EngineError> {
+        // Decode the outer correlation column once, exactly as the per-row `WHERE`
+        // filter does ([`filter_correlated_subquery`]).
+        let outer_ty = schema_columns[correlation.outer_column].1;
+        let vector = key_vector(rows, correlation.outer_column, outer_ty)?;
+        let mut cells = Vec::with_capacity(rows.len());
+        for i in 0..rows.len() {
+            let cell = match vector.get(i) {
+                // A NULL correlation value makes the inner empty without a re-run.
+                None => None,
+                Some(value) => {
+                    let inner = correlated_inner(subquery, correlation, value);
+                    let StatementOutcome::Rows(result) =
+                        self.run_select_scoped(&inner, overlay, scope)?
+                    else {
+                        return Err(EngineError::Unsupported("a subquery must be a SELECT"));
+                    };
+                    scalar_subquery_value(&result)?.as_ref().map(encode_value)
+                }
+            };
+            cells.push(cell);
+        }
+        Ok(cells)
     }
 
     /// Run a `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` range scan
@@ -19777,21 +19848,201 @@ mod tests {
     }
 
     #[test]
-    fn correlated_scalar_subquery_in_the_select_list_is_rejected() {
-        // A correlated scalar subquery in the SELECT list is out of scope (it rides
-        // STL-239) — rejected at bind time, not mis-evaluated.
+    fn projected_correlated_subquery_matches_an_in_process_reference() {
+        // In-process oracle ([STL-331], the DoD shape `SELECT a, (SELECT b FROM s
+        // WHERE s.id = t.id) FROM t`): the projected correlated scalar is re-evaluated
+        // per outer row, so each cell is the matching inner value — a *different* value
+        // per row, which an uncorrelated broadcast could never produce — or SQL `NULL`
+        // when no inner row matches.
         let mut engine = subquery_session();
-        engine
-            .execute(&parse_one("INSERT INTO t VALUES (1, 10)"))
-            .expect("insert");
+        let t: &[(i32, i32)] = &[(1, 10), (2, 20), (3, 30)];
+        let s: &[(i32, i32)] = &[(1, 100), (3, 300)]; // id 2 has no matching inner row.
+        for (id, a) in t {
+            engine
+                .execute(&parse_one(&format!("INSERT INTO t VALUES ({id}, {a})")))
+                .expect("insert t");
+        }
+        for (id, a) in s {
+            engine
+                .execute(&parse_one(&format!("INSERT INTO s VALUES ({id}, {a})")))
+                .expect("insert s");
+        }
+
+        let result = select(
+            &mut engine,
+            "SELECT id, (SELECT a FROM s WHERE s.id = t.id) AS m FROM t ORDER BY id",
+        );
+        assert_eq!(column_names(&result), vec!["id", "m"]);
+        // Reference: for each outer id, the `s.a` whose `s.id` equals it, else NULL.
+        let want: Vec<Vec<Option<i64>>> = t
+            .iter()
+            .map(|&(id, _)| {
+                let m = s
+                    .iter()
+                    .find(|&&(sid, _)| sid == id)
+                    .map(|&(_, a)| i64::from(a));
+                vec![Some(i64::from(id)), m]
+            })
+            .collect();
+        assert_eq!(int_rows(&result), want);
+    }
+
+    #[test]
+    fn projected_correlated_subquery_more_than_one_row_is_cardinality_violation() {
+        // More than one inner row for an outer key, used as a projected scalar, is
+        // SQLSTATE 21000 — raised per outer row exactly as the uncorrelated and the
+        // correlated-WHERE cardinality checks do.
+        let mut engine = keyed_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 100, 5)",
+            "INSERT INTO s VALUES (10, 100, 1)",
+            "INSERT INTO s VALUES (11, 100, 2)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
         let err = engine
             .execute(&parse_one(
-                "SELECT id, (SELECT a FROM s WHERE s.id = t.id) FROM t",
+                "SELECT id, (SELECT a FROM s WHERE s.k = t.k) FROM t",
             ))
             .unwrap_err();
         assert!(
-            matches!(err, EngineError::Select(SelectError::Subquery(_))),
+            matches!(err, EngineError::ScalarSubqueryCardinality),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn projected_correlated_subquery_null_correlation_value_is_null() {
+        // A NULL correlation value makes `s.k = NULL` unknown for every inner row, so
+        // the projected scalar is SQL NULL without a re-run — distinct from a matching
+        // row, which still resolves to its value.
+        let mut engine = keyed_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, NULL, 0)",
+            "INSERT INTO t VALUES (2, 100, 0)",
+            "INSERT INTO s VALUES (10, 100, 42)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        let result = select(
+            &mut engine,
+            "SELECT id, (SELECT a FROM s WHERE s.k = t.k) AS m FROM t ORDER BY id",
+        );
+        // id 1: NULL key → NULL; id 2: k=100 → the inner's a = 42.
+        assert_eq!(
+            int_rows(&result),
+            vec![vec![Some(1), None], vec![Some(2), Some(42)]]
+        );
+    }
+
+    #[test]
+    fn projected_correlated_subquery_inherits_the_outer_statement_snapshot() {
+        // The temporal heart (docs/16 §6): a correlated SELECT-list subquery is re-run
+        // at the *outer statement's* snapshot, so its projected value under
+        // `FOR SYSTEM_TIME AS OF t` equals an independent `AS OF t` read of the inner —
+        // the per-row re-execution can never leak the present into a time-travel read.
+        let clock = SteppedClock::new(1_000);
+        let mut engine = SessionEngine::open(MemDisk::new(), clock.clone());
+        for ddl in [
+            "CREATE TABLE t (id INT PRIMARY KEY, a INT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE s (id INT PRIMARY KEY, a INT) WITH SYSTEM VERSIONING",
+        ] {
+            engine.execute(&parse_one(ddl)).expect("create");
+        }
+
+        // Era 1 @ 2_000: t = {1, 2, 3}; s carries ids {1, 2} with a = {100, 200}.
+        clock.set(2_000);
+        for sql in [
+            "INSERT INTO t VALUES (1, 10)",
+            "INSERT INTO t VALUES (2, 20)",
+            "INSERT INTO t VALUES (3, 30)",
+            "INSERT INTO s VALUES (1, 100)",
+            "INSERT INTO s VALUES (2, 200)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert era1");
+        }
+
+        // Era 2 @ 5_000: id 1's value changes, id 2 leaves, id 3 appears — every
+        // projected lookup must shift with it.
+        clock.set(5_000);
+        for sql in [
+            "UPDATE s SET a = 111 WHERE id = 1",
+            "DELETE FROM s WHERE id = 2",
+            "INSERT INTO s VALUES (3, 300)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("update era2");
+        }
+        clock.set(9_000);
+
+        let rows_of = |engine: &mut SessionEngine<SteppedClock, MemDisk>,
+                       sql: &str|
+         -> SelectResult {
+            let StatementOutcome::Rows(r) = engine.execute(&parse_one(sql)).expect("select") else {
+                panic!("SELECT must return rows");
+            };
+            r
+        };
+
+        for at in [4_000_i64, 9_000] {
+            // The outer ids visible at `at`, ascending.
+            let t_rows = rows_of(
+                &mut engine,
+                &format!("SELECT id FROM t FOR SYSTEM_TIME AS OF {at}"),
+            );
+            let mut ids: Vec<i32> = t_rows
+                .rows
+                .iter()
+                .map(|row| {
+                    match ScalarValue::decode(LogicalType::Int4, row[0].as_ref().expect("id"))
+                        .expect("decode id")
+                    {
+                        ScalarValue::Int4(v) => v,
+                        _ => panic!("id is INT"),
+                    }
+                })
+                .collect();
+            ids.sort_unstable();
+            // Reference: pair each id with an independent `AS OF at` read of the inner.
+            let want: Vec<Vec<Option<i64>>> =
+                ids.iter()
+                    .map(|&id| {
+                        let inner = rows_of(
+                            &mut engine,
+                            &format!("SELECT a FROM s WHERE id = {id} FOR SYSTEM_TIME AS OF {at}"),
+                        );
+                        let m = inner.rows.first().and_then(|row| {
+                            row[0].as_ref().map(|b| int_cell(inner.columns[0].1, b))
+                        });
+                        vec![Some(i64::from(id)), m]
+                    })
+                    .collect();
+            // The integrated correlated projection, read at the same instant.
+            let got = int_rows(&rows_of(
+                &mut engine,
+                &format!(
+                    "SELECT id, (SELECT a FROM s WHERE s.id = t.id) AS m FROM t \
+                     FOR SYSTEM_TIME AS OF {at} ORDER BY id"
+                ),
+            ));
+            assert_eq!(
+                got, want,
+                "AS OF {at}: correlated projection vs composed reference"
+            );
+        }
+
+        // And the eras genuinely differ, so the AS OF 4000 read cannot pass by reading
+        // the present: era 1 projects {100, 200, NULL}, the present {111, NULL, 300}.
+        assert_eq!(
+            int_rows(&rows_of(
+                &mut engine,
+                "SELECT id, (SELECT a FROM s WHERE s.id = t.id) AS m FROM t \
+                 FOR SYSTEM_TIME AS OF 4000 ORDER BY id",
+            )),
+            vec![
+                vec![Some(1), Some(100)],
+                vec![Some(2), Some(200)],
+                vec![Some(3), None],
+            ],
         );
     }
 

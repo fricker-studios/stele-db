@@ -154,15 +154,34 @@ pub enum ProjectionValue {
         /// The expression's result type — the output column's wire type.
         ty: LogicalType,
     },
-    /// An **uncorrelated** scalar subquery, resolved once at the statement snapshot
-    /// and broadcast as a constant column (the [STL-234] `resolve_filter` fold,
-    /// materializing a value instead of a row filter). No inner row is SQL `NULL`;
-    /// more than one is SQLSTATE `21000`.
+    /// A scalar subquery projected in the SELECT list ([STL-303], [STL-331]): its
+    /// single value becomes the output cell — no inner row is SQL `NULL`, more than
+    /// one is SQLSTATE `21000`.
+    ///
+    /// When the `correlation` field is `None` the subquery is
+    /// **uncorrelated** ([STL-303]): the inner references no outer column, so it is
+    /// resolved **once** at the statement snapshot and broadcast as a constant
+    /// column — the projection-path analogue of the [STL-234] uncorrelated `WHERE`
+    /// fold, materializing a single value instead of a row filter. When `Some` it
+    /// is **correlated** ([STL-331]): the inner
+    /// references an outer column, so it is re-run once per outer row with that
+    /// row's value substituted — the [STL-239] per-row machinery producing a
+    /// projected cell instead of a row keep/drop.
     Subquery {
-        /// The bound inner query (capped at two rows for the cardinality check).
+        /// The bound inner query (capped at two rows for the cardinality check). For
+        /// a correlated inner its single-comparison `WHERE` was lifted off at bind
+        /// time (its [`filter`](BoundSelect::filter) is `None`) and is re-applied per
+        /// outer row by the executor; see the `correlation` field.
         subquery: Box<BoundSelect>,
         /// The inner's sole output column type — the output column's wire type.
         ty: LogicalType,
+        /// The outer-column correlation the inner references, or `None` when the
+        /// subquery is uncorrelated ([STL-303]). `Some` marks the per-row
+        /// re-execution path ([STL-331]): the engine substitutes each outer row's
+        /// [`outer_column`](Correlation::outer_column) value into the inner's filter
+        /// and re-runs it, reducing each result to the projected cell, instead of
+        /// broadcasting one once-resolved value.
+        correlation: Option<Correlation>,
     },
 }
 
@@ -5490,11 +5509,15 @@ fn bind_projection_item(
     })
 }
 
-/// Bind an uncorrelated scalar subquery in the SELECT list ([STL-303]).
+/// Bind a scalar subquery in the SELECT list ([STL-303], [STL-331]).
 ///
 /// The inner binds under the same per-statement snapshot as the outer (docs/16 §6),
-/// inheriting any `FOR VALID_TIME AS OF` pin, and must be **uncorrelated** (a
-/// correlated SELECT-list scalar subquery rides STL-239) and **single-column**. The
+/// inheriting any `FOR VALID_TIME AS OF` pin, and must be **single-column**. It may
+/// be **uncorrelated** ([STL-303]) — resolved once and broadcast as a constant — or
+/// **correlated** ([STL-331]): [`bind_inner_query`] lifts a single-comparison
+/// correlated `WHERE` off the inner and returns the [`Correlation`], which rides on
+/// the [`ProjectionValue::Subquery`] for the engine's per-row re-execution (the
+/// [STL-239] machinery, producing a projected cell instead of a row keep/drop). The
 /// inner is capped at two rows so the engine can raise the `21000` cardinality
 /// violation without materializing an arbitrarily large result. An unaliased
 /// subquery inherits the inner's sole output column name (the Postgres rule).
@@ -5514,13 +5537,6 @@ fn bind_projected_subquery(
     };
     let (mut inner, correlation) =
         bind_inner_query(query, &outer, &inner_ctx, /* exists = */ false)?;
-    if correlation.is_some() {
-        return Err(SelectError::Subquery(
-            "a correlated scalar subquery in the SELECT list is not supported yet \
-             (it rides STL-239)"
-                .to_owned(),
-        ));
-    }
     let (inner_name, ty) = sole_output_column(&inner, scope.catalog)?;
     inner.limit = Some(inner.limit.map_or(2, |existing| existing.min(2)));
     inherit_valid_snapshot(&mut inner, scope.valid_snapshot, scope.catalog)?;
@@ -5530,6 +5546,7 @@ fn bind_projected_subquery(
         value: ProjectionValue::Subquery {
             subquery: Box::new(inner),
             ty,
+            correlation,
         },
     })
 }

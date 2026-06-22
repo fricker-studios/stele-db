@@ -484,9 +484,9 @@ live at the resolved system-time snapshot, that `snapshot`, an optional
 ### Expression select items (STL-303)
 
 Beyond `*` and bare column names, the select list projects a **computed
-expression** and an **uncorrelated scalar subquery**, each optionally `AS`-aliased.
-`bind_select` lowers the list to projection items the executor evaluates per row;
-`SELECT *` stays the all-columns fast path:
+expression** and a **scalar subquery** (uncorrelated or correlated), each optionally
+`AS`-aliased. `bind_select` lowers the list to projection items the executor evaluates
+per row; `SELECT *` stays the all-columns fast path:
 
 ```sql
 SELECT a, (SELECT max(b) FROM s), a + 1 AS plus, 7 AS seven FROM t
@@ -503,19 +503,24 @@ SELECT a, (SELECT max(b) FROM s), a + 1 AS plus, 7 AS seven FROM t
   Postgres `?column?` fallback name. A provenance pseudo-column is **not** usable
   inside a computed expression (the evaluator decodes schema columns only) — it is
   projectable solely as a bare column.
-- **Uncorrelated scalar subquery** — `(SELECT … )`, resolved **once** at the
-  statement snapshot (the STL-234 fold, materialising a value instead of a row
-  filter) and broadcast as a constant column. No inner row ⇒ SQL `NULL`; more than
-  one inner row ⇒ SQLSTATE `21000` (`cardinality_violation`), raised even when the
-  outer produces no rows. An unaliased subquery inherits the inner's sole output
-  column name. The inner inherits the outer's `(sys, valid)` snapshot (docs/16 §6).
+- **Scalar subquery** — `(SELECT … )`. An **uncorrelated** one (STL-303) is resolved
+  **once** at the statement snapshot (the STL-234 fold, materialising a value instead
+  of a row filter) and broadcast as a constant column; a **correlated** one (STL-331,
+  the inner references an outer column) is re-run once per outer row with that row's
+  value substituted — the STL-239 per-row machinery producing a projected cell. Either
+  way: no inner row ⇒ SQL `NULL`; more than one inner row ⇒ SQLSTATE `21000`
+  (`cardinality_violation`) — for an uncorrelated inner raised even when the outer
+  produces no rows, for a correlated inner per offending outer row. A NULL correlation
+  value short-circuits to `NULL` without a run. An unaliased subquery inherits the
+  inner's sole output column name. The inner inherits the outer's `(sys, valid)`
+  snapshot (docs/16 §6), so every re-execution of a correlated inner reads that one
+  consistent snapshot.
 - `ORDER BY` and `DISTINCT` resolve over the projected output columns — a computed
   alias sorts/deduplicates by the expression's value.
 
 **Rejected** (each a tracked follow-up): a computed expression referencing more than
-one column or composed column-free arithmetic (`a + b`, `1 + 2`); a **correlated**
-scalar subquery in the select list (rides STL-239); a scalar subquery embedded
-inside arithmetic (`a + (SELECT …)`); a scalar function call other than the
+one column or composed column-free arithmetic (`a + b`, `1 + 2`); a scalar subquery
+embedded inside arithmetic (`a + (SELECT …)`); a scalar function call other than the
 constant-folded `hash(...)`.
 
 ## Result shaping (STL-263, STL-265)
@@ -747,14 +752,14 @@ SELECT id FROM t WHERE a = (SELECT a FROM s WHERE s.id = t.id);        -- scalar
   and a correlated **scalar** lookup. Decorrelating `IN` / `NOT IN` is a tracked
   follow-up (STL-337).
 
-An **uncorrelated** scalar subquery also binds in the **select list** (STL-303, see
-[Expression select items](#expression-select-items-stl-303)).
+A scalar subquery also binds in the **select list** — **uncorrelated** (STL-303) or
+**correlated** (STL-331), see
+[Expression select items](#expression-select-items-stl-303).
 
 **Not yet bound** (each a tracked follow-up): a subquery composed with `AND` / `OR`
 or set over a join, a correlated `WHERE` with more than the one correlation
-comparison, a **correlated** scalar subquery in the select list (rides STL-239), and
-lateral joins. (`WITH` CTEs and `FROM (SELECT …)` derived tables *do* bind — see
-[CTEs and derived tables](#ctes-and-derived-tables-stl-242).)
+comparison, and lateral joins. (`WITH` CTEs and `FROM (SELECT …)` derived tables
+*do* bind — see [CTEs and derived tables](#ctes-and-derived-tables-stl-242).)
 
 ## CTEs and derived tables (STL-242)
 
