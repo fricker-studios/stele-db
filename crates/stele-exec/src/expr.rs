@@ -59,10 +59,14 @@
 //! predicates ([`Expr::Period`], over [`crate::period::evaluate`]). Integer
 //! arithmetic covers `+`/`-`/`*` and `/`/`%`.
 //!
-//! [`LogicalType::Float8`] is the one type still outside the evaluator: it exists
-//! only as the result of `AVG` ([STL-209]) — no column decodes into it, no
-//! literal of it is folded — so an expression that reaches one surfaces a typed
-//! [`ExprError`] rather than a wrong answer.
+//! [`LogicalType::Float8`] now participates in comparisons ([STL-327]): it is the
+//! result of `AVG` ([STL-209]) and a numeric literal folds into it, so a
+//! `HAVING AVG(x) > 5` (or an `AVG`-to-`COUNT` comparison) evaluates rather than
+//! erroring. Comparisons promote across the numeric types — an `int4` / `int8` /
+//! `float8` pair compares through a common type (the wider integer, or `f64` when
+//! either side is a float), the SQL implicit numeric coercion a two-anchor `HAVING`
+//! needs. It still has no storage column (none decodes into it) and no arithmetic
+//! kernel: a `float8` reaching [`arith`] is an [`ExprError::ArithTypeMismatch`].
 //!
 //! ## Divide-by-zero (and overflow) are NULL, not a trap
 //!
@@ -563,11 +567,6 @@ pub enum ExprError {
         found: LogicalType,
     },
 
-    /// A literal of a type the evaluator does not handle (only `float8`, which
-    /// exists solely as the `AVG` aggregate result).
-    #[error("the vectorized evaluator does not support {0} literals yet")]
-    UnsupportedLiteral(LogicalType),
-
     /// A period predicate ([`Expr::Period`]) got a non-`PERIOD` operand. The
     /// binder is expected to type both sides as `PERIOD`; anything else is a plan
     /// error.
@@ -632,7 +631,7 @@ pub fn eval_expr(expr: &Expr, columns: &[Vector], rows: usize) -> Result<Vector,
             }
             Ok(col.clone())
         }
-        Expr::Literal(value) => broadcast(value, rows),
+        Expr::Literal(value) => Ok(broadcast(value, rows)),
         Expr::Not(inner) => not(&eval_expr(inner, columns, rows)?),
         Expr::IsNull(inner) => Ok(is_null(&eval_expr(inner, columns, rows)?)),
         Expr::Compare { op, left, right } => {
@@ -663,9 +662,10 @@ pub fn eval_expr(expr: &Expr, columns: &[Vector], rows: usize) -> Result<Vector,
     }
 }
 
-/// Broadcast a constant to a `rows`-length [`Vector`] of the matching type.
-fn broadcast(value: &ScalarValue, rows: usize) -> Result<Vector, ExprError> {
-    Ok(match value {
+/// Broadcast a constant to a `rows`-length [`Vector`] of the matching type. Total
+/// over [`ScalarValue`] — every scalar type has a vector representation.
+fn broadcast(value: &ScalarValue, rows: usize) -> Vector {
+    match value {
         ScalarValue::Bool(b) => Vector::Bool(vec![Some(*b); rows]),
         ScalarValue::Int4(v) => Vector::Int4(vec![Some(*v); rows]),
         ScalarValue::Int8(v) => Vector::Int8(vec![Some(*v); rows]),
@@ -676,9 +676,10 @@ fn broadcast(value: &ScalarValue, rows: usize) -> Result<Vector, ExprError> {
         ScalarValue::Uuid(v) => Vector::Uuid(vec![Some(*v); rows]),
         ScalarValue::Bytea(v) => Vector::Bytea(vec![Some(v.clone()); rows]),
         ScalarValue::Period(iv) => Vector::Period(vec![Some(*iv); rows]),
-        // `float8` has no column, literal, or arithmetic in the evaluator.
-        ScalarValue::Float8(_) => return Err(ExprError::UnsupportedLiteral(value.logical_type())),
-    })
+        // A `float8` literal folds for a `HAVING AVG(x) > 5` comparand ([STL-327]);
+        // it carries `f64::to_bits`, the form `Vector::Float8` holds.
+        ScalarValue::Float8(bits) => Vector::Float8(vec![Some(*bits); rows]),
+    }
 }
 
 /// Three-valued comparison: NULL on either side ⇒ NULL, else the boolean.
@@ -700,6 +701,22 @@ fn compare(op: CmpOp, left: &Vector, right: &Vector) -> Result<Vector, ExprError
         (Vector::Bytea(a), Vector::Bytea(b)) => compare_cells(op, a, b),
         // Periods order lexicographically by `(from, to)` (`Interval`'s `Ord`).
         (Vector::Period(a), Vector::Period(b)) => compare_cells(op, a, b),
+        // Numeric operands of *different* types promote to a common type — the SQL
+        // implicit coercion a two-anchor `HAVING` introduces ([STL-327]): a
+        // `float8` on either side compares as `f64` (`AVG` against a literal or a
+        // `COUNT`), otherwise the `int4`/`int8` pair compares as `i64`. Same-width
+        // integer pairs matched above; `float8`/`float8` lands here (the only `f64`
+        // path). Only a two-anchor `HAVING` reaches this (a `WHERE`/single-anchor
+        // predicate folds both sides to one type), so it runs over the grouped batch
+        // — group-count-sized, off the per-row scan — where the widening alloc is
+        // bounded and cold.
+        (l, r) if is_numeric(l) && is_numeric(r) => {
+            if matches!(l, Vector::Float8(_)) || matches!(r, Vector::Float8(_)) {
+                compare_f64(op, &as_f64_cells(l), &as_f64_cells(r))
+            } else {
+                compare_cells(op, &as_i64_cells(l), &as_i64_cells(r))
+            }
+        }
         _ => {
             return Err(ExprError::CompareTypeMismatch {
                 left: left.logical_type(),
@@ -708,6 +725,61 @@ fn compare(op: CmpOp, left: &Vector, right: &Vector) -> Result<Vector, ExprError
         }
     };
     Ok(Vector::Bool(out))
+}
+
+/// Whether a vector holds one of the numeric types a comparison promotes across
+/// (`int4` / `int8` / `float8`) — the set [`compare`] coerces to a common type for a
+/// two-anchor `HAVING` ([STL-327]).
+const fn is_numeric(v: &Vector) -> bool {
+    matches!(v, Vector::Int4(_) | Vector::Int8(_) | Vector::Float8(_))
+}
+
+/// Widen an integer vector's cells to `i64` — the common type a mixed `int4`/`int8`
+/// comparison promotes to ([STL-327]).
+///
+/// # Panics
+///
+/// On a non-integer vector; [`compare`] calls it only for `int4` / `int8`.
+fn as_i64_cells(v: &Vector) -> Vec<Option<i64>> {
+    match v {
+        Vector::Int4(cells) => cells.iter().map(|x| x.map(i64::from)).collect(),
+        Vector::Int8(cells) => cells.clone(),
+        _ => unreachable!("as_i64_cells over a non-integer vector"),
+    }
+}
+
+/// Widen a numeric vector's cells to `f64` — the common type a comparison with a
+/// `float8` promotes to ([STL-327]). An `int8` magnitude past 2^53 loses precision,
+/// the same lossy widening Postgres's `int8`→`float8` comparison cast applies (the
+/// `AVG`/`COUNT` magnitudes a `HAVING` compares are far below it).
+///
+/// # Panics
+///
+/// On a non-numeric vector; [`compare`] calls it only for `int4` / `int8` / `float8`.
+#[allow(clippy::cast_precision_loss)] // see the doc-comment: the lossy int8→f64 is intentional
+fn as_f64_cells(v: &Vector) -> Vec<Option<f64>> {
+    match v {
+        Vector::Int4(cells) => cells.iter().map(|x| x.map(f64::from)).collect(),
+        Vector::Int8(cells) => cells.iter().map(|x| x.map(|v| v as f64)).collect(),
+        Vector::Float8(cells) => cells.iter().map(|x| x.map(f64::from_bits)).collect(),
+        _ => unreachable!("as_f64_cells over a non-numeric vector"),
+    }
+}
+
+/// Per-cell `f64` comparison through the IEEE-754 *total* order
+/// ([`f64::total_cmp`]): NULL on either side ⇒ NULL. `total_cmp` matches the natural
+/// `<` / `>` ordering for every finite value — it diverges only on signed zero and
+/// NaN (which it distinguishes by sign and payload), and `AVG` over integers (the
+/// only `float8` this path compares) produces neither — so it gives a clean total
+/// order with no NaN-induced NULL branch.
+fn compare_f64(op: CmpOp, a: &[Option<f64>], b: &[Option<f64>]) -> Vec<Option<bool>> {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| match (x, y) {
+            (Some(x), Some(y)) => Some(apply_cmp(op, x.total_cmp(y))),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The per-cell comparison kernel, generic over any totally ordered cell type.
@@ -1183,14 +1255,75 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_literal_is_rejected() {
-        // `float8` is the one type the evaluator still rejects as a literal — it
-        // exists only as the `AVG` aggregate result.
+    fn float8_literal_broadcasts() {
+        // A `float8` literal now folds (the `HAVING AVG(x) > 5` comparand) — it no
+        // longer errors ([STL-327]).
         let cols: Vec<Vector> = vec![];
         let expr = Expr::lit(ScalarValue::float8(1.5));
         assert_eq!(
-            eval_expr(&expr, &cols, 0),
-            Err(ExprError::UnsupportedLiteral(LogicalType::Float8))
+            eval_expr(&expr, &cols, 2),
+            Ok(Vector::Float8(vec![Some(1.5_f64.to_bits()); 2]))
+        );
+    }
+
+    #[test]
+    fn float8_compares_against_a_float8() {
+        // `AVG(x) > AVG(y)` — both sides `float8`; NULL on either side ⇒ NULL.
+        let cols = vec![
+            Vector::Float8(vec![Some(2.5_f64.to_bits()), Some(1.0_f64.to_bits()), None]),
+            Vector::Float8(vec![
+                Some(2.0_f64.to_bits()),
+                Some(1.0_f64.to_bits()),
+                Some(0.0_f64.to_bits()),
+            ]),
+        ];
+        let expr = Expr::col(0).compare(CmpOp::Gt, Expr::col(1));
+        assert_eq!(
+            eval_expr(&expr, &cols, 3).expect("eval"),
+            Vector::Bool(vec![Some(true), Some(false), None])
+        );
+    }
+
+    #[test]
+    fn numeric_comparison_promotes_across_widths() {
+        // A two-anchor `HAVING` mixes types the binder never folds to one width:
+        // `int4`-vs-`int8` (`dept > COUNT(*)`) promotes to `i64`; a `float8` on
+        // either side (`AVG(x) >= COUNT(*)`) promotes to `f64` ([STL-327]).
+        let cols = vec![
+            Vector::Int4(vec![Some(3), Some(1)]),
+            Vector::Int8(vec![Some(2), Some(5)]),
+            Vector::Float8(vec![Some(2.5_f64.to_bits()), Some(5.0_f64.to_bits())]),
+        ];
+        // int4 > int8
+        assert_eq!(
+            eval_expr(&Expr::col(0).compare(CmpOp::Gt, Expr::col(1)), &cols, 2).expect("eval"),
+            Vector::Bool(vec![Some(true), Some(false)])
+        );
+        // float8 >= int8 (2.5 >= 2 → T; 5.0 >= 5 → T)
+        assert_eq!(
+            eval_expr(&Expr::col(2).compare(CmpOp::Ge, Expr::col(1)), &cols, 2).expect("eval"),
+            Vector::Bool(vec![Some(true), Some(true)])
+        );
+        // int4 < float8 (3 < 2.5 → F; 1 < 5.0 → T)
+        assert_eq!(
+            eval_expr(&Expr::col(0).compare(CmpOp::Lt, Expr::col(2)), &cols, 2).expect("eval"),
+            Vector::Bool(vec![Some(false), Some(true)])
+        );
+    }
+
+    #[test]
+    fn float8_against_a_non_numeric_is_a_plan_error() {
+        // Promotion is numeric-only: a `float8` against `text` is still a mismatch.
+        let cols = vec![
+            Vector::Float8(vec![Some(1.0_f64.to_bits())]),
+            Vector::Text(vec![Some("x".to_owned())]),
+        ];
+        assert_eq!(
+            eval_expr(&Expr::col(0).compare(CmpOp::Eq, Expr::col(1)), &cols, 1),
+            Err(ExprError::CompareTypeMismatch {
+                left: LogicalType::Float8,
+                right: LogicalType::Text,
+            })
         );
     }
 

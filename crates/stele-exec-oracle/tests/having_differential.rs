@@ -13,10 +13,13 @@
 //! three-valued `HAVING` (a group whose `SUM`/`MIN` is NULL is never kept) are
 //! exercised on both engines, with DuckDB the independent witness. Each template
 //! filters on a different shape — `COUNT(*)`, a `SUM`/`COUNT`/`MIN`/`MAX` the
-//! SELECT list does not project, an arithmetic of an aggregate, and the grouping
-//! column itself. Results are compared as a sorted column-0 multiset (the
-//! surviving groups' keys or counts, NULLs included); exact ordering is asserted
-//! by the in-process engine unit tests.
+//! SELECT list does not project, an arithmetic of an aggregate, the grouping
+//! column itself, and the richer STL-327 shapes: a **two-anchor** comparison
+//! (aggregate-to-aggregate / column-to-aggregate, across promoted numeric widths)
+//! and a **`FLOAT8` `AVG`** operand against a literal or another aggregate. Results
+//! are compared as a sorted column-0 multiset (the surviving groups' keys or
+//! counts, NULLs included); exact ordering is asserted by the in-process engine
+//! unit tests.
 //!
 //! DuckDB is confined to this nightly-only crate (a dev-dependency, never linked
 //! into a shipped crate; held off the per-PR `--workspace` runs, [STL-158]), so
@@ -72,6 +75,20 @@ const QUERIES: &[&str] = &[
     "SELECT COUNT(*) FROM t GROUP BY g HAVING SUM(a) > 3",
     // The ungrouped whole-table group, filtered by HAVING.
     "SELECT COUNT(*) FROM t HAVING COUNT(*) > 2",
+    // --- STL-327: two-anchor comparisons ---
+    // Aggregate-to-aggregate (INT8 vs INT8); a NULL SUM (all-NULL group) drops it.
+    "SELECT g FROM t GROUP BY g HAVING COUNT(*) > SUM(a)",
+    // Grouping column (INT4) vs an aggregate (INT8) — different widths, promoted.
+    "SELECT g FROM t GROUP BY g HAVING g < COUNT(*)",
+    // MAX vs MIN of the nullable value (single-distinct-value & NULL groups drop).
+    "SELECT g FROM t GROUP BY g HAVING MAX(a) > MIN(a)",
+    // --- STL-327: FLOAT8 / AVG operands ---
+    // AVG (FLOAT8) vs an integer literal — the literal widens to float8.
+    "SELECT g FROM t GROUP BY g HAVING AVG(a) > 2",
+    // AVG (FLOAT8) vs a decimal literal.
+    "SELECT g FROM t GROUP BY g HAVING AVG(a) >= 1.5",
+    // AVG (FLOAT8) vs COUNT (INT8) — numeric promotion to f64.
+    "SELECT g FROM t GROUP BY g HAVING AVG(a) > COUNT(*)",
 ];
 
 // --- harness ---------------------------------------------------------------

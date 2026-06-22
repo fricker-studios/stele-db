@@ -529,22 +529,24 @@ committed rows). The executor applies them in the Postgres pipeline order:
 WHERE → [GROUP BY/aggregates → HAVING] → DISTINCT → ORDER BY → OFFSET → LIMIT
 ```
 
-- **`HAVING <predicate>`** (STL-265) — the post-aggregation filter, applied after
-  the `GROUP BY` folds and before the shaping tail: a group is kept iff the
-  predicate is **`TRUE`** for it (a `FALSE` or `NULL` group drops, the `WHERE`
-  rule). The vocabulary is the single-comparison `WHERE` surface lifted to the
-  grouped batch — exactly one **anchor** (a grouping column **or** an aggregate call)
-  per predicate, the other side a literal or an integer arithmetic of it, through
-  any of the six comparisons. An aggregate the `HAVING` names but the select list
-  does not (`SELECT region … HAVING SUM(amount) > 100`) is computed and filtered
-  on without being emitted. A bare column that is not a grouping column is
-  Postgres's **42803** (`grouping_error`), the same code a non-aggregated select
-  item draws. **Rejected** with the reason: a non-comparison or boolean-connective
-  `HAVING`, a two-anchor comparison (aggregate-to-aggregate / column-to-aggregate,
-  the analog of `WHERE`'s deferred column-to-column), a `FLOAT8` `AVG` operand
-  (outside the evaluator's comparison set), and a subquery inside `HAVING` (rides
-  the subquery tickets). `HAVING` over a **join** is a tracked follow-up — rejected
-  there, never dropped.
+- **`HAVING <predicate>`** (STL-265, richer predicates STL-327) — the
+  post-aggregation filter, applied after the `GROUP BY` folds and before the
+  shaping tail: a group is kept iff the predicate is **`TRUE`** for it (a `FALSE`
+  or `NULL` group drops, the `WHERE` rule). One of the six comparisons, each side a
+  grouping column, an aggregate call, a literal, or an integer arithmetic of one.
+  **Both sides may anchor** (`COUNT(*) > SUM(amount)`, `dept > COUNT(*)` — the
+  aggregate-to-aggregate / column-to-aggregate analog of a column-to-column
+  `WHERE`), comparing across the numeric types the evaluator promotes to a common
+  type, and a **`FLOAT8` `AVG`** operand compares against a literal or another
+  aggregate (STL-327). An aggregate the `HAVING` names but the select list does not
+  (`SELECT region … HAVING SUM(amount) > 100`) is computed and filtered on without
+  being emitted. A bare column that is not a grouping column is Postgres's **42803**
+  (`grouping_error`), the same code a non-aggregated select item draws. `HAVING`
+  composes over a **join** too, resolving its operands through the join scope
+  (STL-327). **Rejected** with the reason: a non-comparison or boolean-connective
+  `HAVING`, a comparison of two incomparable types (a text grouping column against a
+  numeric aggregate), `FLOAT8` arithmetic (the evaluator has no float arithmetic
+  kernel), and a subquery inside `HAVING` (rides the subquery tickets).
 - **`ORDER BY col [ASC|DESC], …`** — bare column names, multi-key, first key
   outermost. A name resolves against the **select list first** (an aggregate
   query's output columns, aliases included); a plain non-`DISTINCT` query may
@@ -617,7 +619,7 @@ LIMIT 10;
 
 The join's **output is a relation like any other**, and the rest of the `SELECT`
 surface composes over it (STL-264), in the Postgres pipeline order
-(`WHERE → [GROUP BY/aggregates] → DISTINCT → ORDER BY → OFFSET → LIMIT`):
+(`WHERE → [GROUP BY/aggregates → HAVING] → DISTINCT → ORDER BY → OFFSET → LIMIT`):
 
 - **Addressable columns.** The output is the seed input's columns, then each
   `INNER` / `LEFT` step's right input's, in the chain's left-deep order (a `SEMI` /
@@ -629,8 +631,11 @@ surface composes over it (STL-264), in the Postgres pipeline order
 - **`WHERE`** over the joined columns, including a column the projection does not
   select, applied after the join. The same single-comparison shape the single-table
   path binds (six operators, integer arithmetic of one anchor column — STL-213).
-- **Aggregates / `GROUP BY`** over the join output (STL-171): `COUNT` / `SUM` /
-  `MIN` / `MAX` / `AVG`, grouped on any output column(s).
+- **Aggregates / `GROUP BY` / `HAVING`** over the join output (STL-171, STL-327):
+  `COUNT` / `SUM` / `MIN` / `MAX` / `AVG`, grouped on any output column(s), with an
+  optional post-aggregation `HAVING` (the same predicate vocabulary as a
+  single-table read, two-anchor and `FLOAT8` operands included) resolving through
+  the join scope.
 - **`DISTINCT` / `ORDER BY` / `OFFSET` / `LIMIT`** over the join output (STL-263),
   with the same semantics (NULL placement, the `DISTINCT` 42P10 rule) as a
   single-table read.
@@ -650,9 +655,8 @@ single-table read does ([STL-203] / [STL-223]), and `ROLLBACK` discards it. A se
 
 **Not yet** (rejected, never silently mis-bound): `RIGHT` / `FULL OUTER` and
 non-equi `ON` conditions (STL-270); join reordering / cost-based planning (the chain
-runs in syntactic, left-deep order); a period predicate over a join; a `HAVING`
-over a join's aggregate (STL-265 — the single-table path only, since the operands
-would need join-scope name resolution). A join read is also not auto-capped by the
+runs in syntactic, left-deep order); a period predicate over a join. A join read is
+also not auto-capped by the
 [default row cap](#default-row-cap-on-the-simple-query-path-stl-306) — give it an
 explicit `LIMIT`.
 
