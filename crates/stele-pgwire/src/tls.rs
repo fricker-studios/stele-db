@@ -326,6 +326,16 @@ impl TlsReloader {
         Arc::clone(&self.active)
     }
 
+    /// The configured certificate path this reloader re-reads on
+    /// [`reload`](Self::reload). The admin `ReloadTls` trigger ([STL-326]) echoes
+    /// it back so an operator confirms which `[tls]` material a rotation picked up.
+    ///
+    /// [STL-326]: https://allegromusic.atlassian.net/browse/STL-326
+    #[must_use]
+    pub fn cert_path(&self) -> &Path {
+        &self.settings.cert
+    }
+
     /// The TLS acceptor currently installed — the one a [`reload`](Self::reload)
     /// most recently swapped in. Callers that run their own accept loop (the
     /// admin / control-plane gRPC and ops HTTP transports, [STL-311]) read this

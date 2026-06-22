@@ -21,6 +21,7 @@
 //! | POST | `/segments` | `{"table":"…"}` | tabular |
 //! | POST | `/versions` | `{"table":"…","key":"…"?}` | tabular |
 //! | POST | `/audit-chain` | `{"table":"…","key":"…"?}` | tabular |
+//! | POST | `/reload-tls` | — | `{"reloaded":true,"cert_path":"…"}` |
 //!
 //! [STL-254]: https://allegromusic.atlassian.net/browse/STL-254
 //! [STL-253]: https://allegromusic.atlassian.net/browse/STL-253
@@ -30,6 +31,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use stele_common::time::Clock;
+use stele_pgwire::TlsReloader;
 use stele_storage::backend::Disk;
 
 use super::{
@@ -79,13 +81,33 @@ pub trait AdminHttpResponder: Send + Sync + 'static {
 pub struct AdminHttp<C: Clock + Clone, D: Disk + Clone> {
     core: AdminService<C, D>,
     auth: std::sync::Arc<AdminAuth>,
+    /// The hot-reloadable `[tls]` material, when the server booted with it; `None`
+    /// for plaintext / loopback / self-signed-fallback boots, where `reload-tls`
+    /// answers `409 Conflict` ([STL-326]).
+    ///
+    /// [STL-326]: https://allegromusic.atlassian.net/browse/STL-326
+    tls_reloader: Option<TlsReloader>,
 }
 
 impl<C: Clock + Clone, D: Disk + Clone> AdminHttp<C, D> {
     /// Wrap the shared core + authenticator.
     #[must_use]
     pub const fn new(core: AdminService<C, D>, auth: std::sync::Arc<AdminAuth>) -> Self {
-        Self { core, auth }
+        Self {
+            core,
+            auth,
+            tls_reloader: None,
+        }
+    }
+
+    /// Install the hot-reloadable `[tls]` material so `POST /v1alpha1/reload-tls`
+    /// rotates the certificate without a restart ([STL-326]); without it the route
+    /// reports the surface has nothing to reload. Mirrors
+    /// [`PgServer::with_tls_reloader`](stele_pgwire::Server::with_tls_reloader).
+    #[must_use]
+    pub fn with_tls_reloader(mut self, reloader: &TlsReloader) -> Self {
+        self.tls_reloader = Some(reloader.clone());
+        self
     }
 }
 
@@ -134,6 +156,11 @@ where
             "/v1alpha1/audit-chain" => self.guard_post(request, |core, body| {
                 let TableBody { table, key } = parse_body(body)?;
                 Ok(table_json(&core.audit_chain(&table, key.as_deref())?))
+            }),
+            // A mutating action with no body — POST, the body (if any) is ignored.
+            "/v1alpha1/reload-tls" => self.guard_post(request, |_core, _body| {
+                let cert_path = super::reload_tls(self.tls_reloader.as_ref())?;
+                Ok(json!({ "reloaded": true, "cert_path": cert_path }))
             }),
             _ => json(
                 "404 Not Found",
@@ -248,6 +275,7 @@ fn error_response(err: &AdminError) -> HttpResponse {
     let status = match err {
         AdminError::NotFound(_) => "404 Not Found",
         AdminError::InvalidArgument(_) => "400 Bad Request",
+        AdminError::FailedPrecondition(_) => "409 Conflict",
         AdminError::Internal(_) => "500 Internal Server Error",
     };
     json(status, &json!({ "error": err.to_string() }))
