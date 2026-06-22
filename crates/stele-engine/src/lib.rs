@@ -7827,9 +7827,12 @@ fn composite_key_vector(
     let cells: Vec<Option<Vec<u8>>> = (0..rows.len())
         .map(|i| match (a.get(i), b.get(i)) {
             (Some(va), Some(vb)) => {
-                let mut bytes = Vec::new();
-                push_len_prefixed(&mut bytes, &encode_value(&va));
-                push_len_prefixed(&mut bytes, &encode_value(&vb));
+                let (ea, eb) = (encode_value(&va), encode_value(&vb));
+                // Pre-size to the exact composite length (two `u64` prefixes + both
+                // components) so the cell buffer never reallocates on this hot path.
+                let mut bytes = Vec::with_capacity(2 * size_of::<u64>() + ea.len() + eb.len());
+                push_len_prefixed(&mut bytes, &ea);
+                push_len_prefixed(&mut bytes, &eb);
                 Some(bytes)
             }
             // A NULL in either component → a NULL composite key → never matches.
@@ -19489,6 +19492,30 @@ mod tests {
             "SELECT id FROM t WHERE a IN (SELECT a FROM s WHERE s.k = t.k)",
         ));
         assert!(got.is_empty(), "got {got:?}");
+    }
+
+    #[test]
+    fn decorrelated_in_handles_a_computed_membership() {
+        // The `IN` membership may be a *computed* projection (type-checked to the
+        // outer column's type), not just a bare column. It still decorrelates: the
+        // binder preserves the computed value at inner result position 0 and appends
+        // the correlation key at 1, and the composite join reads the computed value
+        // as the membership component ([STL-337]).
+        let mut engine = keyed_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 100, 6)",
+            "INSERT INTO t VALUES (2, 100, 9)",
+            "INSERT INTO s VALUES (10, 100, 5)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // For k=100 the inner membership set is {s.a + 1} = {6}: id 1 (a=6) ∈ {6} →
+        // keep; id 2 (a=9) ∉ → drop.
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a IN (SELECT a + 1 FROM s WHERE s.k = t.k)",
+        ));
+        assert_eq!(got, vec![1]);
     }
 
     #[test]

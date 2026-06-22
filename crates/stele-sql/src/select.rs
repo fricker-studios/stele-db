@@ -4436,12 +4436,13 @@ fn bind_in_subquery(
 /// two components the composite-key semi join
 /// ([`BoundSubqueryFilter::composite_semi_decorrelation`]) reads per inner row.
 ///
-/// The `IN` membership column stays at result position `0`, so the [STL-239] per-row
-/// fold (which reads column `0`) is unaffected for any `IN` that does not in fact
-/// decorrelate; the correlation key (`s.k`, by inner schema index
-/// [`Correlation::inner_column`]) lands at position `1`. Both are plain columns, so
-/// the inner stays on the gather (non-materialized) projection path, and the binder
-/// already type-checked the membership column before this widened the result.
+/// The membership the `IN` projects is preserved unchanged at result position `0`
+/// (so the [STL-239] per-row fold, which reads column `0`, is unaffected for any `IN`
+/// that does not in fact decorrelate) — it is whatever single column the `IN`
+/// selected, a plain column or a computed expression already type-checked to the
+/// outer column's type. The appended correlation key (`s.k`, a plain column by inner
+/// schema index [`Correlation::inner_column`]) lands at position `1`. The binder
+/// type-checked the membership before this widened the result to two columns.
 fn project_in_correlation_key(
     inner: &mut BoundSelect,
     correlation: Correlation,
