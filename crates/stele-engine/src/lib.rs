@@ -90,7 +90,7 @@ use stele_sql::select::{
     AggregateFunc, ArithOp, BoundAggregate, BoundCte, BoundHaving, BoundJoinSide, BoundPeriod,
     BoundPeriodPredicate, BoundPredicate, BoundScalar, BoundSelect, BoundSubqueryFilter, CompareOp,
     Correlation, HavingScalar, JoinType, OutputItem, PeriodEndpoint, Projection, ProjectionItem,
-    ProjectionValue, SelectError, SortTarget, SubqueryKind, SystemTimeRange,
+    ProjectionValue, SelectError, SemiAntiDecorrelation, SortTarget, SubqueryKind, SystemTimeRange,
 };
 use stele_sql::{
     AdminCommand, BindContext, BindError, BoundCopy, CopyError, CopyShape, Statement,
@@ -3879,16 +3879,27 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let correlation = sub
             .correlation
             .expect("filter_correlated_subquery called on an uncorrelated subquery");
+
+        // A correlated `EXISTS` / `NOT EXISTS` on an equality key decorrelates onto
+        // a single set-based semi / anti hash join ([STL-317]) — one inner scan
+        // instead of `O(outer rows)` re-executions — when the binder recognizes the
+        // shape. Every other correlation (a range comparison, `[NOT] IN`, a scalar
+        // lookup, or a non-plain inner) keeps the per-row fallback below.
+        if let Some(plan) = sub.semi_anti_decorrelation() {
+            return self.filter_semi_anti_decorrelated(
+                plan,
+                sub,
+                schema_columns,
+                rows,
+                overlay,
+                scope,
+            );
+        }
+
         // Decode the outer correlation column once, the same way the uncorrelated
         // fold decodes an inner column ([`subquery_column_values`]).
         let outer_ty = schema_columns[correlation.outer_column].1;
-        let cells: Vec<Option<Vec<u8>>> = rows
-            .iter()
-            .map(|row| row.get(correlation.outer_column).cloned().flatten())
-            .collect();
-        let column = Column::Bytes(cells.into());
-        let vector = Vector::from_column(outer_ty, &column)
-            .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
+        let vector = key_vector(&rows, correlation.outer_column, outer_ty)?;
         let outer_values: Vec<Option<ScalarValue>> =
             (0..rows.len()).map(|i| vector.get(i)).collect();
 
@@ -3912,6 +3923,70 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             }
         }
         Ok(kept)
+    }
+
+    /// Filter the reconstructed outer `rows` by a **decorrelated** correlated
+    /// `EXISTS` / `NOT EXISTS` — the set-based semi / anti hash-join path ([STL-317])
+    /// the [`semi_anti_decorrelation`](BoundSubqueryFilter::semi_anti_decorrelation)
+    /// recognizer selects, replacing the [STL-239] per-row re-execution.
+    ///
+    /// The inner is run **once**, unfiltered, over the same `overlay` and snapshot
+    /// the outer reads — so the per-statement `(sys, valid)` and read-your-own-writes
+    /// rules still hold across both inputs (docs/16 §6, [STL-203]), exactly as the
+    /// per-row path's per-row re-runs did. Its correlation column (`inner_column`,
+    /// read straight off the `SELECT *` inner result) and the outer's (`outer_column`)
+    /// become the join keys; [`hash_join`] then computes a `SEMI` join (`EXISTS`) or
+    /// `ANTI` join (`NOT EXISTS`) and returns the surviving outer-row indices.
+    ///
+    /// NULL-key semantics fall out of the join for free: a NULL key never matches
+    /// ([`hash_join`]), so a NULL outer correlation value drops under `SEMI` and
+    /// survives under `ANTI` — the same answer
+    /// [`empty_inner_keeps`] gives the per-row path for a NULL.
+    fn filter_semi_anti_decorrelated(
+        &self,
+        plan: SemiAntiDecorrelation,
+        sub: &BoundSubqueryFilter,
+        schema_columns: &[(String, LogicalType)],
+        rows: Vec<Vec<Option<Vec<u8>>>>,
+        overlay: &[BoundDml],
+        scope: &CteScope,
+    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+        // One inner scan, at the outer's snapshot and overlay. The inner projects
+        // `*` (an `EXISTS` inner is normalized by the binder), so its column
+        // `inner_column` is the correlation key in schema order.
+        let StatementOutcome::Rows(inner) =
+            self.run_select_scoped(&sub.subquery, overlay, scope)?
+        else {
+            return Err(EngineError::Unsupported("a subquery must be a SELECT"));
+        };
+
+        // The correlation key is decoded with the *outer* column's type; the binder
+        // proved the inner column shares it ([`match_correlation`]).
+        let key_ty = schema_columns[plan.outer_column].1;
+        let outer_keys = key_vector(&rows, plan.outer_column, key_ty)?;
+        let inner_keys = key_vector(&inner.rows, plan.inner_column, key_ty)?;
+
+        let indices = hash_join(
+            lower_join_type(plan.join_type),
+            std::slice::from_ref(&outer_keys),
+            rows.len(),
+            &Expr::col(0),
+            std::slice::from_ref(&inner_keys),
+            inner.rows.len(),
+            &Expr::col(0),
+        )
+        .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
+
+        // `indices.left` are the surviving outer-row positions in ascending,
+        // duplicate-free order (a `SEMI` / `ANTI` join emits each probe row at most
+        // once, in probe order), so taking each keeps the outer scan order — exactly
+        // what the per-row filter preserved.
+        let mut rows = rows;
+        Ok(indices
+            .left
+            .iter()
+            .map(|&l| std::mem::take(&mut rows[l]))
+            .collect())
     }
 
     /// Resolve a bound `SELECT`'s rows through the vectorized operator pipeline
@@ -7079,6 +7154,26 @@ fn subquery_column_values(result: &SelectResult) -> Result<Vec<Option<ScalarValu
     let vector =
         Vector::from_column(ty, &column).map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
     Ok((0..n).map(|i| vector.get(i)).collect())
+}
+
+/// Decode column `col` of each reconstructed row into a typed [`Vector`] of `ty` —
+/// the correlation-key currency the correlated-subquery filters work in.
+///
+/// Shared by the [STL-239] per-row path (the outer correlation column, read once
+/// then probed per row) and the [STL-317] decorrelated path (both the outer and
+/// inner join-key columns). A missing cell or a short row reads as a SQL `NULL`,
+/// which the comparison / join treats as never-matching.
+fn key_vector(
+    rows: &[Vec<Option<Vec<u8>>>],
+    col: usize,
+    ty: LogicalType,
+) -> Result<Vector, EngineError> {
+    let cells: Vec<Option<Vec<u8>>> = rows
+        .iter()
+        .map(|row| row.get(col).cloned().flatten())
+        .collect();
+    let column = Column::Bytes(cells.into());
+    Vector::from_column(ty, &column).map_err(|e| EngineError::Scan(ScanError::Eval(e)))
 }
 
 /// Reduce a once-materialized scalar subquery `result` to its single value
@@ -18179,6 +18274,42 @@ mod tests {
             "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM s WHERE s.k = t.k)",
         ));
         assert_eq!(got, vec![1]);
+    }
+
+    #[test]
+    fn decorrelated_exists_dedups_multiple_inner_matches() {
+        // The set-based semi / anti decorrelation ([STL-317]) must agree with the
+        // per-row reference on the cases that distinguish a join from a fold: a key
+        // with *several* matching inner rows is kept exactly once (not once per
+        // match), a key with none is dropped, and a NULL key follows
+        // `empty_inner_keeps`.
+        let mut engine = keyed_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 100, 0)",
+            "INSERT INTO t VALUES (2, 200, 0)",
+            "INSERT INTO t VALUES (3, 300, 0)",
+            "INSERT INTO t VALUES (4, NULL, 0)",
+            // k=100 has two inner rows (the multi-match dedup case), k=200 one,
+            // k=300 none.
+            "INSERT INTO s VALUES (10, 100, 0)",
+            "INSERT INTO s VALUES (11, 100, 0)",
+            "INSERT INTO s VALUES (12, 200, 0)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        // SEMI: keep the outer rows whose `k` is in the inner key set {100, 200},
+        // each once despite k=100's two matches; drop k=300 (no match) and the NULL.
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.k = t.k)",
+        ));
+        assert_eq!(got, vec![1, 2]);
+        // ANTI: the exact complement — the unmatched key and the NULL key survive.
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM s WHERE s.k = t.k)",
+        ));
+        assert_eq!(got, vec![3, 4]);
     }
 
     #[test]
