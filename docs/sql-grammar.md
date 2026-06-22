@@ -524,6 +524,25 @@ SELECT a + b, 1 + 2, a + (SELECT max(b) FROM s), 7 AS seven FROM t
   consistent snapshot.
 - `ORDER BY` and `DISTINCT` resolve over the projected output columns — a computed
   alias sorts/deduplicates by the expression's value.
+- **Evaluation timing is eager** (STL-341). Every projection item is evaluated for
+  **every qualifying row** (each row that survives `WHERE`), and only then does the
+  result-shaping pipeline ([Result shaping](#result-shaping-stl-263-stl-265)) apply
+  `DISTINCT` / `ORDER BY` / `OFFSET` / `LIMIT` over the materialized columns (eager
+  materialize → shape → gather). A computed expression, an uncorrelated scalar
+  subquery, and a correlated scalar subquery are therefore all evaluated even for a
+  row that `LIMIT` / `OFFSET` ultimately discards. The single **observable** divergence
+  from Postgres follows: a malformed **correlated** scalar — one returning more than
+  one inner row for some outer row — behind a `LIMIT` / `OFFSET` with **no `ORDER BY`**
+  raises SQLSTATE `21000` (`cardinality_violation`) for that row even when it lies
+  outside the window, where Postgres evaluates a SELECT-list SubPlan **lazily** (only
+  for the rows it emits) and returns the windowed rows without ever touching it. The
+  posture is **intentional** and fail-safe — it can only ever substitute an *error* for
+  rows, never wrong data, and only for a malformed query — and it is narrow: an
+  `ORDER BY` or `DISTINCT` erases the gap (Postgres must likewise evaluate the target
+  list for every row it sorts or deduplicates), and the rule is uniform across the three
+  projection paths — the uncorrelated InitPlan case (STL-303) raises `21000` even when
+  the outer produces no rows, and STL-331 only extended the same eager evaluation to the
+  correlated case.
 
 **Rejected** (each a tracked follow-up): a scalar **function** call other than the
 constant-folded `hash(...)`; a *correlated* subquery embedded inside an expression
