@@ -641,9 +641,24 @@ SELECT id FROM t WHERE a = (SELECT a FROM s WHERE s.id = t.id);        -- scalar
   `IN` false, a scalar `NULL`. The `NOT IN`-with-a-NULL-member trap is evaluated
   against *each* outer row's inner set. Both are checked against DuckDB in the
   nightly differential oracle (`correlated_subquery_differential.rs`).
-- This is the **per-row** fallback the v0.3 bar permits — correctness, not
-  performance (`O(outer rows × inner cost)`). Decorrelating the common
-  `EXISTS` / `IN` cases onto a semi/anti join is a tracked follow-up.
+- **Decorrelation (STL-317).** A correlated `EXISTS` / `NOT EXISTS` whose
+  correlation is an **equality** on the key (`inner.k = outer.k`) and whose inner is
+  a plain single-table scan is lowered to a **semi / anti hash join** on that key
+  (STL-172's machinery) — one inner scan instead of `O(outer rows)` re-executions.
+  "∃ an inner row for this outer row" is exactly "the outer key is a member of the
+  inner key set", so a `SEMI` join answers `EXISTS` and an `ANTI` join `NOT EXISTS`;
+  a NULL key never matches, which reproduces the per-row rule above (a NULL outer key
+  drops under `EXISTS`, survives under `NOT EXISTS`) with no per-row run. The inner
+  still runs at the outer's `(sys, valid)` snapshot and over the read-your-own-writes
+  overlay, so the per-statement snapshot rule (docs/16 §6) holds across both join
+  inputs. The decorrelated and per-row paths return identical results — the nightly
+  DuckDB oracle covers both.
+- **Still per-row** (the `O(outer rows × inner cost)` fallback the v0.3 bar permits):
+  a **non-equality** correlation (`<` / `>` / … — a range, not key-set membership);
+  correlated `[NOT] IN` (it carries a second equality — the membership column — so it
+  needs a composite-key join, and `NOT IN`'s NULL-in-set trap is not an anti join);
+  and a correlated **scalar** lookup. Decorrelating `IN` / `NOT IN` is a tracked
+  follow-up (STL-337).
 
 An **uncorrelated** scalar subquery also binds in the **select list** (STL-303, see
 [Expression select items](#expression-select-items-stl-303)).

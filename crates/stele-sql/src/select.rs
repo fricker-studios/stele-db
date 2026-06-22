@@ -499,6 +499,34 @@ pub struct BoundSelect {
     pub limit: Option<u64>,
 }
 
+impl BoundSelect {
+    /// Whether this is a **plain single base-table scan**: no aggregate, join,
+    /// subquery, CTE / derived relation, period or system-range read, `DISTINCT`,
+    /// `ORDER BY`, or `LIMIT` / `OFFSET`, and no residual `WHERE` ([STL-317]).
+    ///
+    /// Gates semi / anti decorrelation of a correlated `EXISTS`
+    /// ([`BoundSubqueryFilter::semi_anti_decorrelation`]): only such an inner has
+    /// row-*presence* equal to "∃ a row whose correlation key equals the outer
+    /// key", so only it may fold onto a key-set join. Any of these clauses can
+    /// change whether the inner yields a row — an aggregate inner always returns
+    /// one, a `LIMIT 0` or empty-overshooting `OFFSET` returns none — so each forces
+    /// the [STL-239] per-row fallback rather than risk a wrong answer.
+    pub(crate) const fn is_plain_scan(&self) -> bool {
+        self.filter.is_none()
+            && self.period_filter.is_none()
+            && self.aggregate.is_none()
+            && self.subquery_filter.is_none()
+            && self.join.is_none()
+            && self.system_range.is_none()
+            && self.relation_columns.is_none()
+            && self.ctes.is_empty()
+            && !self.distinct
+            && self.order_by.is_empty()
+            && self.offset == 0
+            && self.limit.is_none()
+    }
+}
+
 /// A bound `WHERE` clause whose predicate is a subquery — a scalar comparison,
 /// `[NOT] IN`, or `[NOT] EXISTS` ([STL-234], [STL-239]).
 ///
@@ -563,6 +591,89 @@ pub struct Correlation {
     /// (`outer.k < inner.k`) is [mirrored](CompareOp::mirror) here so the executor
     /// always builds `inner_column op literal`.
     pub op: CompareOp,
+}
+
+/// A correlated `EXISTS` / `NOT EXISTS` subquery lowered to a **semi / anti hash
+/// join** ([STL-317]).
+///
+/// The set-based replacement for the [STL-239] per-row re-execution, for the shape
+/// that decorrelates onto STL-172's single-key join.
+///
+/// Recognized by [`BoundSubqueryFilter::semi_anti_decorrelation`]: the correlation
+/// is an **equality** on the key (`inner.k = outer.k`), so "∃ an inner row for this
+/// outer row" is exactly "the outer key is a member of the inner key set" — a hash
+/// **semi** join for `EXISTS`, an **anti** join for `NOT EXISTS`. The join key is
+/// the correlation key on each side; a NULL key never matches, which reproduces the
+/// per-row [`empty_inner_keeps`](https://allegromusic.atlassian.net/browse/STL-239)
+/// rule (a NULL outer key drops under `EXISTS`, survives under `NOT EXISTS`) without
+/// any per-row run.
+///
+/// `IN` / `NOT IN` (which carry a second equality — the membership column — so they
+/// need a composite key, and whose `NOT IN` NULL-in-set trap is not an anti join)
+/// and a correlated scalar lookup keep the per-row fallback, so this is `None` for
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemiAntiDecorrelation {
+    /// The join to compute: [`JoinType::Semi`] for `EXISTS`, [`JoinType::Anti`] for
+    /// `NOT EXISTS`.
+    pub join_type: JoinType,
+    /// The outer correlation column (by **outer** schema index) — the join's probe
+    /// key, read from each outer row.
+    pub outer_column: usize,
+    /// The inner correlation column (by **inner** schema index) — the join's build
+    /// key, read from each inner row. The two key columns share a type (the binder
+    /// enforced it on the [`Correlation`]).
+    pub inner_column: usize,
+}
+
+impl BoundSubqueryFilter {
+    /// Recognize a correlated `EXISTS` / `NOT EXISTS` that decorrelates onto a
+    /// single-key semi / anti hash join ([STL-317]), or `None` to keep the
+    /// [STL-239] per-row fallback.
+    ///
+    /// Decorrelation is sound only when the inner's row-*presence* for an outer row
+    /// is exactly "∃ an inner row whose correlation key equals the outer key":
+    ///
+    /// * the predicate is `[NOT] EXISTS` — a scalar comparison or `[NOT] IN` is not
+    ///   a bare presence test (an `IN` adds the membership equality, a scalar a
+    ///   value), so neither folds onto a single-key join; and
+    /// * the correlation comparison is an **equality** (`=`) — a `<` / `>` / … is a
+    ///   range, not key-set membership; and
+    /// * the inner is a **plain single base-table scan** (`is_plain_scan`): an
+    ///   aggregate inner always returns one row, and a join / nested subquery / CTE /
+    ///   `DISTINCT` / `LIMIT`-`OFFSET` / period or range read can each change
+    ///   presence, so each keeps the per-row path.
+    ///
+    /// The inner binds with its correlation `WHERE` lifted off (so its `filter` is
+    /// `None`) and its projection normalized to `*` — the binder does this for any
+    /// `[NOT] EXISTS` inner (the `bind_inner_query` step keys off the predicate, not
+    /// the negation) — so the executor reads the correlation key straight out of the
+    /// inner result at [`inner_column`](SemiAntiDecorrelation::inner_column).
+    #[must_use]
+    pub fn semi_anti_decorrelation(&self) -> Option<SemiAntiDecorrelation> {
+        let correlation = self.correlation?;
+        if correlation.op != CompareOp::Eq {
+            return None;
+        }
+        let join_type = match self.kind {
+            SubqueryKind::Exists { negated } => {
+                if negated {
+                    JoinType::Anti
+                } else {
+                    JoinType::Semi
+                }
+            }
+            SubqueryKind::In { .. } | SubqueryKind::Scalar { .. } => return None,
+        };
+        if !self.subquery.is_plain_scan() {
+            return None;
+        }
+        Some(SemiAntiDecorrelation {
+            join_type,
+            outer_column: correlation.outer_column,
+            inner_column: correlation.inner_column,
+        })
+    }
 }
 
 /// The shape of an uncorrelated-subquery `WHERE` predicate ([STL-234]).
@@ -7813,6 +7924,97 @@ mod tests {
         assert_eq!(
             kind("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM s)"),
             SubqueryKind::Exists { negated: true }
+        );
+    }
+
+    // ---- STL-317: semi / anti decorrelation recognition ----
+
+    /// The [`SemiAntiDecorrelation`] a subquery `WHERE` lowers to, if any.
+    fn decorrelation(sql: &str, catalog: &Catalog) -> Option<SemiAntiDecorrelation> {
+        bind(sql, catalog)
+            .expect("bind subquery")
+            .subquery_filter
+            .expect("a subquery filter")
+            .semi_anti_decorrelation()
+    }
+
+    #[test]
+    fn correlated_exists_on_an_equality_key_decorrelates_to_a_semi_anti_join() {
+        let catalog = catalog_with_subquery_tables();
+        // `EXISTS` on the equality correlation `s.id = t.id` → a SEMI join on the
+        // key column (index 0 on both sides).
+        assert_eq!(
+            decorrelation(
+                "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.id = t.id)",
+                &catalog,
+            ),
+            Some(SemiAntiDecorrelation {
+                join_type: JoinType::Semi,
+                outer_column: 0,
+                inner_column: 0,
+            })
+        );
+        // `NOT EXISTS` is the ANTI join; the value column (index 1) correlates too.
+        assert_eq!(
+            decorrelation(
+                "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM s WHERE s.a = t.a)",
+                &catalog,
+            ),
+            Some(SemiAntiDecorrelation {
+                join_type: JoinType::Anti,
+                outer_column: 1,
+                inner_column: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn non_equality_or_non_exists_correlations_keep_the_per_row_fallback() {
+        let catalog = catalog_with_subquery_tables();
+        // A `>` correlation is a range, not key-set membership.
+        assert_eq!(
+            decorrelation(
+                "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.a > t.a)",
+                &catalog,
+            ),
+            None
+        );
+        // Correlated `IN` carries a second equality (the membership column) — a
+        // composite-key join, not the single-key shape — so it stays per-row.
+        assert_eq!(
+            decorrelation(
+                "SELECT id FROM t WHERE a IN (SELECT a FROM s WHERE s.id = t.id)",
+                &catalog,
+            ),
+            None
+        );
+        // A correlated scalar lookup has no set form.
+        assert_eq!(
+            decorrelation(
+                "SELECT id FROM t WHERE a = (SELECT a FROM s WHERE s.id = t.id)",
+                &catalog,
+            ),
+            None
+        );
+        // An *uncorrelated* EXISTS folds to a constant, not a join.
+        assert_eq!(
+            decorrelation("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s)", &catalog),
+            None
+        );
+    }
+
+    #[test]
+    fn an_aggregate_inner_exists_keeps_the_per_row_fallback() {
+        let catalog = catalog_with_subquery_tables();
+        // An aggregate inner always returns exactly one row, so its row-presence is
+        // not "∃ a row with the correlation key" — a SEMI join would be wrong. The
+        // inner is no longer a plain scan, so it stays on the per-row path.
+        assert_eq!(
+            decorrelation(
+                "SELECT id FROM t WHERE EXISTS (SELECT count(*) FROM s WHERE s.id = t.id)",
+                &catalog,
+            ),
+            None
         );
     }
 
