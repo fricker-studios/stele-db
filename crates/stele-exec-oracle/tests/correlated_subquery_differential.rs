@@ -2,22 +2,29 @@
 //! through Stele's whole SQL bind→exec pipeline.
 //!
 //! Correlated `EXISTS` / `NOT EXISTS` / `IN` / `NOT IN` and a correlated scalar
-//! lookup are each re-executed per outer row in Stele ([STL-239]'s per-row
-//! fallback — performance is explicitly not the v0.3 bar). This sweep builds the
-//! **same** randomized two-table fixture in an in-memory `SessionEngine` and an
-//! in-memory DuckDB, runs each correlated query — *verbatim*, the text is valid in
-//! both dialects — against both, and asserts the returned `id` set agrees.
+//! lookup were each first shipped on [STL-239]'s per-row re-execution (performance
+//! is explicitly not the v0.3 bar). Some shapes now **decorrelate** onto a single
+//! hash join — `EXISTS` / `NOT EXISTS` onto a semi / anti join ([STL-317]), `IN`
+//! onto a composite-key semi join ([STL-337]) — while `NOT IN`, a non-equality
+//! correlation, and the scalar lookup stay per-row. This oracle is **path-agnostic**:
+//! it builds the **same** randomized two-table fixture in an in-memory
+//! `SessionEngine` and an in-memory DuckDB, runs each correlated query — *verbatim*,
+//! the text is valid in both dialects — against both, and asserts the returned `id`
+//! set agrees, so it witnesses that the decorrelated and per-row paths alike match
+//! the reference.
 //!
 //! The fixture deliberately seeds NULLs in both the correlation key (`k`) and the
 //! membership value (`a`), because the interesting divergences live there:
 //!
-//! * a **NULL correlation key** makes the inner empty for that outer row (Stele's
-//!   short-circuit, [`empty_inner_keeps`]) — DuckDB agrees by evaluating `s.k =
-//!   NULL` as unknown;
-//! * **`NOT IN` over an inner set that contains a NULL** is never TRUE for any
-//!   outer row whose set it lands in (the classic three-valued trap, the bug a
-//!   naïve membership fold ships) — DuckDB is the independent witness that Stele's
-//!   per-row fold gets the 3VL right.
+//! * a **NULL correlation key** drops the outer row (the inner is empty for it — the
+//!   per-row short-circuit `empty_inner_keeps`, or, decorrelated, a NULL join key
+//!   that never matches) — DuckDB agrees by evaluating `s.k = NULL` as unknown;
+//! * **`IN` / `NOT IN` over an inner set or membership value that is NULL** — `IN` is
+//!   never TRUE when the membership value (either side) is NULL, and `NOT IN` over a
+//!   set containing a NULL is never TRUE for any outer row whose set it lands in (the
+//!   classic three-valued trap) — DuckDB is the independent witness that Stele gets
+//!   the 3VL right, whether `IN` decorrelates to the composite semi join or `NOT IN`
+//!   folds per row.
 //!
 //! DuckDB is confined to this nightly-only crate (a dev-dependency, never linked
 //! into a shipped crate; held off the per-PR `--workspace` runs, [STL-158]), so

@@ -159,7 +159,8 @@ async fn tokio_postgres_runs_correlated_subqueries() {
         .expect("correlated NOT EXISTS");
     assert_eq!(ids(&reply), vec![4]);
 
-    // Correlated IN, per-row set membership:
+    // Correlated IN — `(k, a)` composite-key set membership (decorrelates to a
+    // composite semi join, STL-337):
     //   id 1 (k=100, a=5): {5, 6} ∋ 5 → keep; id 2 (a=7): ∌ → drop; id 3 (k=200,
     //   a=9): {NULL} → not TRUE → drop; id 4 (k=300): {} → drop.
     let reply = client
