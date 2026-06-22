@@ -638,6 +638,10 @@ enum Meta<'a> {
         table: Option<&'a str>,
         id: &'a str,
     },
+    /// `\reload-tls` (alias `\reload`) — hot-reload the server's TLS cert/key in
+    /// place over the admin API ([STL-340]), the cross-platform counterpart to the
+    /// Unix-only SIGHUP trigger ([STL-293] / [STL-326]). Takes no arguments.
+    ReloadTls,
     /// A recognized command with arguments it cannot honor.
     BadArgs {
         message: String,
@@ -753,9 +757,8 @@ fn parse_meta(line: &str) -> Option<Meta<'_>> {
         "audit" => Meta::Audit { table: arg },
         // The admin / control-plane tier ([STL-200]) is parsed in its own helper
         // to keep this dispatcher under one screen.
-        c @ ("status" | "backup" | "restore" | "pitr" | "inspect-segment" | "inspect") => {
-            parse_admin_meta(c, remainder, arg, parts.next())
-        }
+        c @ ("status" | "backup" | "restore" | "pitr" | "inspect-segment" | "inspect"
+        | "reload-tls" | "reload") => parse_admin_meta(c, remainder, arg, parts.next()),
         _ => Meta::Unknown(trimmed),
     })
 }
@@ -764,8 +767,9 @@ fn parse_meta(line: &str) -> Option<Meta<'_>> {
 /// gateway. `\backup` takes an optional `--to PATH`; `\restore` a required backup
 /// directory; `\pitr` a single-token target time (`now()` or an integer-
 /// microsecond instant — the AS OF resolver's forms), a table, and an optional
-/// witness key; `\inspect-segment` an optional table then a segment id. `arg` is
-/// the first token and `second` the next (for `\inspect-segment table id`).
+/// witness key; `\inspect-segment` an optional table then a segment id;
+/// `\reload-tls` (alias `\reload`) takes no arguments ([STL-340]). `arg` is the
+/// first token and `second` the next (for `\inspect-segment table id`).
 fn parse_admin_meta<'a>(
     cmd: &str,
     remainder: &'a str,
@@ -800,6 +804,9 @@ fn parse_admin_meta<'a>(
                 hint: r"e.g. \pitr now() account 1  (ts is now() or an instant in microseconds)",
             },
         },
+        // `\reload-tls` / `\reload` take no arguments (any are ignored, as `\status`
+        // ignores its remainder).
+        "reload-tls" | "reload" => Meta::ReloadTls,
         // "inspect-segment" / "inspect": an optional table then the segment id.
         _ => match (arg, second) {
             (Some(table), Some(id)) => Meta::InspectSegment {
@@ -914,6 +921,7 @@ fn dispatch_meta(
         Meta::Restore { src } => restore(session, src, out)?,
         Meta::Pitr { ts, table, key } => pitr(client, session, ts, table, *key, out)?,
         Meta::InspectSegment { table, id } => inspect_segment(client, session, *table, id, out)?,
+        Meta::ReloadTls => reload_tls(session, out)?,
         Meta::BadArgs { message, hint } => {
             print_error(session, &usage_error(message.clone(), hint));
         }
@@ -985,6 +993,10 @@ fn help(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
         (
             r"\inspect-segment [T] ID",
             "a segment footer summary  (control-plane)",
+        ),
+        (
+            r"\reload-tls",
+            "hot-reload the TLS cert/key  (control-plane)",
         ),
     ] {
         lines.push(entry(cmd, desc));
@@ -2031,6 +2043,20 @@ fn print_admin_error(session: &Session, err: &AdminError) {
                     "42704",
                     Some("no such admin endpoint — the server may predate STL-254".to_owned()),
                 ),
+                // A well-formed request the server cannot honor in its current
+                // state — e.g. `\reload-tls` against a server with no reloadable
+                // `[tls]` material ([STL-340]). SQLSTATE 55000 is
+                // `object_not_in_prerequisite_state`, the precondition-failure code,
+                // not the XX000 that would imply a server fault.
+                "409" => (
+                    "55000",
+                    Some(
+                        "the server is not in a state for this action — e.g. TLS hot-reload \
+                         needs the server booted with reloadable [tls] cert/key paths (not \
+                         plaintext, loopback, or the self-signed fallback)"
+                            .to_owned(),
+                    ),
+                ),
                 _ => ("XX000", None),
             };
             ServerError {
@@ -2322,6 +2348,37 @@ fn inspect_segment(
                 Role::Mut,
                 "a key predicate outside this zone skips the segment entirely.".to_owned(),
             ),
+        ],
+    ];
+    write_lines(session, out, &lines)
+}
+
+/// `\reload-tls` (alias `\reload`) — hot-reload the server's TLS certificate/key
+/// in place over the admin / control-plane API ([STL-340]). This is the
+/// cross-platform, signal-free counterpart to the Unix-only SIGHUP trigger
+/// ([STL-293] / [STL-326]): live connections stay up and the server confirms which
+/// certificate path the rotation picked up, which is what we print. A server with
+/// no reloadable `[tls]` material (plaintext, loopback, or the ephemeral
+/// self-signed fallback) answers 409 / `FAILED_PRECONDITION`, rendered by
+/// [`print_admin_error`].
+fn reload_tls(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
+    let cert_path = match AdminClient::new(session.admin.clone()).reload_tls() {
+        Ok(path) => path,
+        Err(e) => {
+            print_admin_error(session, &e);
+            return Ok(());
+        }
+    };
+    let lines = vec![
+        cp_head("Reload TLS", "ReloadTls"),
+        vec![(
+            Role::Mut,
+            "  hot certificate rotation — live connections stay up".to_owned(),
+        )],
+        vec![
+            (Role::Ok, "  ✓ ".to_owned()),
+            (Role::Mut, "reloaded certificate from ".to_owned()),
+            (Role::Acc, cert_path),
         ],
     ];
     write_lines(session, out, &lines)
@@ -2912,6 +2969,7 @@ const META_NAMES: &[&str] = &[
     r"\restore",
     r"\pitr",
     r"\inspect-segment",
+    r"\reload-tls",
     r"\timing",
     r"\x",
     r"\json",
@@ -3206,6 +3264,9 @@ mod tests {
             parse_meta(r"\inspect-segment"),
             Some(Meta::BadArgs { .. })
         ));
+        // `\reload-tls` (alias `\reload`) takes no arguments ([STL-340]).
+        assert_eq!(parse_meta(r"\reload-tls"), Some(Meta::ReloadTls));
+        assert_eq!(parse_meta(r"\reload"), Some(Meta::ReloadTls));
     }
 
     #[test]
@@ -3412,6 +3473,16 @@ mod tests {
         // `\t` prefixes both \timing and \timeline — no menu, no completion.
         let (_, cands) = complete(r"\t", 2, &[]);
         assert!(cands.is_empty(), "{cands:?}");
+    }
+
+    #[test]
+    fn completes_reload_tls() {
+        // `\rel` uniquely prefixes \reload-tls (\restore diverges at `\res`), so ⇥
+        // completes it — the new admin verb is in the completion pool ([STL-340]).
+        assert_eq!(
+            complete(r"\rel", 4, &[]),
+            (0, vec![r"\reload-tls ".to_owned()])
+        );
     }
 
     #[test]
