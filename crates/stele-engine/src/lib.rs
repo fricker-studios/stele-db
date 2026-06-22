@@ -3747,7 +3747,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     indices.push(idx);
                 }
                 ProjectionValue::Computed { scalar, ty } => {
-                    let column = eval_projection_scalar(scalar, schema_columns, &rows)?;
+                    let column = self.eval_computed_projection(
+                        scalar,
+                        schema_columns,
+                        &rows,
+                        overlay,
+                        scope,
+                    )?;
                     indices.push(base_width + computed.len());
                     columns.push((item.name.clone(), *ty));
                     computed.push(column);
@@ -3814,6 +3820,69 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             return Err(EngineError::Unsupported("a subquery must be a SELECT"));
         };
         scalar_subquery_value(&result)
+    }
+
+    /// Evaluate a computed projection item ([STL-303], [STL-332]) into a column of
+    /// canonical-encoded cells.
+    ///
+    /// Any embedded **uncorrelated** scalar subquery operand
+    /// (`a + (SELECT max(b) FROM s)`) is resolved **once** at the statement snapshot
+    /// ([`resolve_scalar_subquery`](Self::resolve_scalar_subquery)) and substituted as
+    /// a constant, after which the arithmetic evaluates per row over the typed columns
+    /// exactly as a column-only computed expression does. A subquery resolving to SQL
+    /// `NULL` makes the whole arithmetic expression `NULL` for every row — NULL
+    /// propagates through arithmetic (3VL), and the computed scalar vocabulary is
+    /// arithmetic-only — so the column is all-`NULL` with no per-row evaluation. A
+    /// `>1`-row inner still raises SQLSTATE `21000` (propagated from the resolve).
+    fn eval_computed_projection(
+        &self,
+        scalar: &BoundScalar,
+        schema_columns: &[(String, LogicalType)],
+        rows: &[Vec<Option<Vec<u8>>>],
+        overlay: &[BoundDml],
+        scope: &CteScope,
+    ) -> Result<Vec<Option<Vec<u8>>>, EngineError> {
+        self.resolve_scalar_subqueries(scalar, overlay, scope)?
+            .map_or_else(
+                || Ok(vec![None; rows.len()]),
+                |resolved| eval_projection_scalar(&resolved, schema_columns, rows),
+            )
+    }
+
+    /// Resolve every embedded uncorrelated scalar subquery in a computed-projection
+    /// scalar to a constant ([STL-332]), returning the scalar with each
+    /// [`BoundScalar::Subquery`] replaced by the resolved [`BoundScalar::Literal`] —
+    /// or `Ok(None)` if **any** subquery resolves to SQL `NULL`, the signal that the
+    /// whole arithmetic expression is `NULL` for every row.
+    ///
+    /// Both operands of an arithmetic node are resolved eagerly (Postgres's
+    /// uncorrelated-subquery / InitPlan posture), so a `>1`-row cardinality violation
+    /// in either side surfaces even when the other resolved to `NULL`.
+    fn resolve_scalar_subqueries(
+        &self,
+        scalar: &BoundScalar,
+        overlay: &[BoundDml],
+        scope: &CteScope,
+    ) -> Result<Option<BoundScalar>, EngineError> {
+        Ok(match scalar {
+            BoundScalar::Column(index) => Some(BoundScalar::Column(*index)),
+            BoundScalar::Literal(value) => Some(BoundScalar::Literal(value.clone())),
+            BoundScalar::Subquery(inner) => self
+                .resolve_scalar_subquery(inner, overlay, scope)?
+                .map(BoundScalar::Literal),
+            BoundScalar::Arith { op, left, right } => {
+                let left = self.resolve_scalar_subqueries(left, overlay, scope)?;
+                let right = self.resolve_scalar_subqueries(right, overlay, scope)?;
+                match (left, right) {
+                    (Some(left), Some(right)) => Some(BoundScalar::Arith {
+                        op: *op,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    }),
+                    _ => None,
+                }
+            }
+        })
     }
 
     /// Materialize a **correlated** projected scalar subquery ([STL-331]) into a
@@ -7369,6 +7438,14 @@ fn lower_scalar(scalar: &BoundScalar) -> Expr {
             left: Box::new(lower_scalar(left)),
             right: Box::new(lower_scalar(right)),
         },
+        // A computed-projection subquery operand ([STL-332]) is resolved to a
+        // `Literal` by [`SessionEngine::resolve_scalar_subqueries`] before the scalar
+        // is lowered, and a `WHERE` `BoundScalar` never carries one — so a subquery
+        // cannot reach the lowerer. Lowering it has no meaning (it is not a per-row
+        // expression), so this is an enforced invariant, not a fallback value.
+        BoundScalar::Subquery(_) => {
+            unreachable!("a projected subquery operand is resolved to a literal before lowering")
+        }
     }
 }
 
@@ -8519,10 +8596,15 @@ fn predicate_references_pseudo(predicate: &BoundPredicate, n_schema: usize) -> b
 fn scalar_references_pseudo(scalar: &BoundScalar, n_schema: usize) -> bool {
     match scalar {
         BoundScalar::Column(index) => *index >= n_schema,
-        BoundScalar::Literal(_) => false,
         BoundScalar::Arith { left, right, .. } => {
             scalar_references_pseudo(left, n_schema) || scalar_references_pseudo(right, n_schema)
         }
+        // A subquery operand ([STL-332]) only appears in a computed projection (whose
+        // pseudo-column detection is handled separately, never descending into the
+        // scalar), and never in a `WHERE` scalar — this checker's only caller. Its
+        // own column references are inner-schema, not the outer's pseudo-columns, so
+        // it joins the literal in never naming an outer pseudo-column.
+        BoundScalar::Literal(_) | BoundScalar::Subquery(_) => false,
     }
 }
 
@@ -20047,15 +20129,172 @@ mod tests {
     }
 
     #[test]
-    fn multi_column_computed_projection_is_rejected() {
-        // A computed select item referencing more than one column is a tracked
-        // follow-up — rejected, never silently mis-anchored.
+    fn multi_column_computed_projection_evaluates() {
+        // A computed select item over more than one column ([STL-332]): `k + a` adds
+        // the two value columns per row. This lifts the STL-303 single-anchor
+        // restriction the test used to pin.
+        let mut engine = keyed_session();
+        for (id, k, a) in [(1, 100, 5), (2, 200, 7)] {
+            engine
+                .execute(&parse_one(&format!(
+                    "INSERT INTO t VALUES ({id}, {k}, {a})"
+                )))
+                .expect("insert");
+        }
+        let result = select(&mut engine, "SELECT id, k + a AS sum FROM t ORDER BY id");
+        assert_eq!(column_names(&result), vec!["id", "sum"]);
+        assert_eq!(
+            int_rows(&result),
+            vec![vec![Some(1), Some(105)], vec![Some(2), Some(207)]]
+        );
+    }
+
+    #[test]
+    fn multi_column_computed_projection_propagates_null() {
+        // A NULL in either column makes the whole arithmetic NULL for that row (3VL),
+        // exactly as a single-column computed expression does ([STL-332]).
+        let mut engine = keyed_session();
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (1, 100, 5)"))
+            .expect("insert");
+        engine
+            .execute(&parse_one("INSERT INTO t VALUES (2, NULL, 7)"))
+            .expect("insert null k");
+        let result = select(&mut engine, "SELECT id, k + a AS sum FROM t ORDER BY id");
+        assert_eq!(
+            int_rows(&result),
+            vec![vec![Some(1), Some(105)], vec![Some(2), None]]
+        );
+    }
+
+    #[test]
+    fn column_free_arithmetic_projection_evaluates() {
+        // Column-free arithmetic ([STL-332]): `1 + 2` is no longer rejected — it
+        // broadcasts its computed value (3) on every row, evaluated by the same
+        // arithmetic kernel the per-row path uses (so div-by-zero etc. stay
+        // consistent), not folded by a separate bind-time path.
+        let mut engine = keyed_session();
+        for id in [1, 2] {
+            engine
+                .execute(&parse_one(&format!("INSERT INTO t VALUES ({id}, 0, 0)")))
+                .expect("insert");
+        }
+        let result = select(&mut engine, "SELECT id, 1 + 2 AS three FROM t ORDER BY id");
+        assert_eq!(
+            int_rows(&result),
+            vec![vec![Some(1), Some(3)], vec![Some(2), Some(3)]]
+        );
+    }
+
+    #[test]
+    fn embedded_scalar_subquery_in_arithmetic_resolves_once() {
+        // A scalar subquery embedded inside an arithmetic expression ([STL-332]):
+        // `a + (SELECT max(a) FROM s)` resolves the inner once and adds it to each
+        // outer row's `a`. `s` holds {5, 25}, so max is 25.
+        let mut engine = keyed_session();
+        for (id, a) in [(1, 10), (2, 20)] {
+            engine
+                .execute(&parse_one(&format!("INSERT INTO t VALUES ({id}, 0, {a})")))
+                .expect("insert t");
+        }
+        for (id, a) in [(10, 5), (11, 25)] {
+            engine
+                .execute(&parse_one(&format!("INSERT INTO s VALUES ({id}, 0, {a})")))
+                .expect("insert s");
+        }
+        let result = select(
+            &mut engine,
+            "SELECT id, a + (SELECT max(a) FROM s) AS shifted FROM t ORDER BY id",
+        );
+        assert_eq!(
+            int_rows(&result),
+            vec![vec![Some(1), Some(35)], vec![Some(2), Some(45)]]
+        );
+    }
+
+    #[test]
+    fn embedded_scalar_subquery_null_propagates_through_arithmetic() {
+        // An embedded subquery that resolves to SQL NULL makes the whole arithmetic
+        // NULL for every row ([STL-332]) — NULL propagates through arithmetic (3VL).
+        // `s` is empty, so `max(a)` is NULL.
+        let mut engine = keyed_session();
+        for id in [1, 2] {
+            engine
+                .execute(&parse_one(&format!("INSERT INTO t VALUES ({id}, 0, {id})")))
+                .expect("insert t");
+        }
+        let result = select(
+            &mut engine,
+            "SELECT id, a + (SELECT max(a) FROM s) AS shifted FROM t ORDER BY id",
+        );
+        assert_eq!(
+            int_rows(&result),
+            vec![vec![Some(1), None], vec![Some(2), None]]
+        );
+    }
+
+    #[test]
+    fn embedded_scalar_subquery_many_rows_is_cardinality_violation() {
+        // An embedded subquery returning more than one row is SQLSTATE 21000, the same
+        // rule a whole-projection scalar subquery enforces ([STL-303]/[STL-332]); the
+        // uncorrelated inner resolves once up front, so it fires even with no outer row.
+        let mut engine = keyed_session();
+        // `t` stays empty; `s` has two rows, so a bare `SELECT a FROM s` is >1 row.
+        for (id, a) in [(10, 5), (11, 25)] {
+            engine
+                .execute(&parse_one(&format!("INSERT INTO s VALUES ({id}, 0, {a})")))
+                .expect("insert s");
+        }
+        let err = engine
+            .execute(&parse_one("SELECT id, a + (SELECT a FROM s) FROM t"))
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::ScalarSubqueryCardinality),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn computed_projection_rejects_a_cross_type_operand() {
+        // Stele does not implicitly coerce ([STL-332]): an integer column added to a
+        // string literal is a bind-time error, not a silent cast or a per-row failure.
         let mut engine = keyed_session();
         engine
             .execute(&parse_one("INSERT INTO t VALUES (1, 100, 5)"))
             .expect("insert");
         let err = engine
-            .execute(&parse_one("SELECT id, k + a AS sum FROM t"))
+            .execute(&parse_one("SELECT id, a + 'x' FROM t"))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::Select(SelectError::UnsupportedProjection(_))
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn computed_projection_reconciles_int4_and_int8_operands() {
+        // No implicit coercion ([STL-332]): an `int4` *literal* widens to meet an
+        // `int8` column (`big + 1` is `int8`), but two concrete columns of different
+        // integer widths (`small + big`) do not coerce — that is a bind error.
+        let mut engine = session();
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE w (id INT PRIMARY KEY, small INT, big BIGINT) WITH SYSTEM VERSIONING",
+            ))
+            .expect("create");
+        engine
+            .execute(&parse_one("INSERT INTO w VALUES (1, 5, 5000000000)"))
+            .expect("insert");
+        // `int8` column + `int4` literal: the literal widens, the result is `int8`.
+        let result = select(&mut engine, "SELECT id, big + 1 AS c FROM w");
+        assert_eq!(result.columns[1].1, LogicalType::Int8);
+        assert_eq!(int_rows(&result), vec![vec![Some(1), Some(5_000_000_001)]]);
+        // `int4` column + `int8` column: two concrete operands, no coercion → rejected.
+        let err = engine
+            .execute(&parse_one("SELECT id, small + big FROM w"))
             .unwrap_err();
         assert!(
             matches!(

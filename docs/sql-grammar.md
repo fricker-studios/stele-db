@@ -489,20 +489,27 @@ expression** and a **scalar subquery** (uncorrelated or correlated), each option
 per row; `SELECT *` stays the all-columns fast path:
 
 ```sql
-SELECT a, (SELECT max(b) FROM s), a + 1 AS plus, 7 AS seven FROM t
+SELECT a + b, 1 + 2, a + (SELECT max(b) FROM s), 7 AS seven FROM t
 ```
 
 - **Bare column** — `a`, optionally `AS x`. The output name is the alias, else the
   column's own name. A provenance pseudo-column (STL-247) is projectable here on a
   base table.
-- **Computed expression** — the `WHERE` scalar vocabulary (STL-213): one **schema**
-  column **anchor** with integer arithmetic and folded literals (`a + 1`, `qty % 2`),
-  or a single column-free literal (`1` → `int4`, `'x'` → `text`, `TRUE` → `bool`). The
-  result type is the anchor's (or the literal's). NULL propagates through arithmetic
-  (3VL), exactly as in a `WHERE`. An unaliased computed expression takes the
-  Postgres `?column?` fallback name. A provenance pseudo-column is **not** usable
-  inside a computed expression (the evaluator decodes schema columns only) — it is
-  projectable solely as a bare column.
+- **Computed expression** — the `WHERE` scalar vocabulary (STL-213, STL-332):
+  integer arithmetic over **any number of columns** (`a + b`, `k * a - 1`), with
+  folded literals (`a + 1`), **column-free** arithmetic (`1 + 2`), and an embedded
+  uncorrelated **scalar subquery** operand (`a + (SELECT max(b) FROM s)`, resolved
+  once and substituted as a constant). Each column / subquery types itself
+  independently; Stele does not implicitly coerce, so an arithmetic node's two
+  operands must share one integer type — an `int4` *literal* widens to meet an
+  `int8` operand, but two concrete operands of different types are rejected. A
+  column-free literal is `1` → `int4`, `'x'` → `text`, `TRUE` → `bool`. NULL
+  propagates through arithmetic (3VL), exactly as in a `WHERE`; an embedded subquery
+  resolving to no row makes the whole expression NULL, and one returning more than
+  one row is SQLSTATE `21000`. An unaliased computed expression takes the Postgres
+  `?column?` fallback name. A provenance pseudo-column is **not** usable inside a
+  computed expression (the evaluator decodes schema columns only) — it is projectable
+  solely as a bare column.
 - **Scalar subquery** — `(SELECT … )`. An **uncorrelated** one (STL-303) is resolved
   **once** at the statement snapshot (the STL-234 fold, materialising a value instead
   of a row filter) and broadcast as a constant column; a **correlated** one (STL-331,
@@ -518,10 +525,9 @@ SELECT a, (SELECT max(b) FROM s), a + 1 AS plus, 7 AS seven FROM t
 - `ORDER BY` and `DISTINCT` resolve over the projected output columns — a computed
   alias sorts/deduplicates by the expression's value.
 
-**Rejected** (each a tracked follow-up): a computed expression referencing more than
-one column or composed column-free arithmetic (`a + b`, `1 + 2`); a scalar subquery
-embedded inside arithmetic (`a + (SELECT …)`); a scalar function call other than the
-constant-folded `hash(...)`.
+**Rejected** (each a tracked follow-up): a scalar **function** call other than the
+constant-folded `hash(...)`; a *correlated* subquery embedded inside an expression
+(an uncorrelated embedded subquery binds — STL-332).
 
 ## Result shaping (STL-263, STL-265)
 

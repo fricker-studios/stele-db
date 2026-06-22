@@ -145,9 +145,12 @@ pub enum ProjectionValue {
     /// [`ProjectionItem::name`].
     Column(String),
     /// A computed scalar expression over the row, with its resolved result type.
-    /// Reuses the `WHERE` [`BoundScalar`] vocabulary (a single column anchor,
-    /// integer arithmetic, a folded literal); the engine evaluates it per row with
-    /// the same `eval_expr` the filter uses.
+    /// Reuses the `WHERE` [`BoundScalar`] vocabulary — integer arithmetic over any
+    /// number of columns (`a + b`), folded literals, column-free arithmetic
+    /// (`1 + 2`), and an embedded uncorrelated scalar subquery operand
+    /// (`a + (SELECT max(b) FROM s)`, [STL-332]); the engine evaluates it per row
+    /// with the same `eval_expr` the filter uses, after resolving any embedded
+    /// subquery to a constant.
     Computed {
         /// The scalar to evaluate per row.
         scalar: BoundScalar,
@@ -275,13 +278,19 @@ pub enum ArithOp {
     Mod,
 }
 
-/// One side of a bound `WHERE` comparison: a value column, a folded literal, or an
-/// integer arithmetic combination of them ([STL-213]).
+/// One side of a bound `WHERE` comparison or a computed select item ([STL-213]).
+///
+/// A value column, a folded literal, an integer arithmetic combination of them, or
+/// — only inside a computed projection ([STL-332]) — an embedded scalar subquery
+/// resolved to a constant operand.
 ///
 /// Columns are referenced by **schema index** (`0` is the business key, the rest
 /// value columns) — the same positional convention [`BoundPredicate`] and
 /// [`BoundAggregate`] use. The executor lowers this straight to a vectorized
-/// `stele_exec::Expr` over the reconstructed row.
+/// `stele_exec::Expr` over the reconstructed row, after resolving any [`Subquery`]
+/// operand to a literal.
+///
+/// [`Subquery`]: BoundScalar::Subquery
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoundScalar {
     /// The value column at this schema index.
@@ -297,6 +306,15 @@ pub enum BoundScalar {
         /// The right operand.
         right: Box<BoundScalar>,
     },
+    /// An **uncorrelated** scalar subquery used as an operand inside a computed
+    /// select item ([STL-332]): `a + (SELECT max(b) FROM s)`. The engine resolves it
+    /// **once** at the statement snapshot ([STL-303] `resolve_scalar_subquery`) and
+    /// substitutes its single value as a constant before lowering the surrounding
+    /// arithmetic — no inner row ⇒ the whole expression is SQL `NULL` (NULL
+    /// propagates through arithmetic), more than one ⇒ SQLSTATE `21000`. Only ever
+    /// produced by the projection binder; a `WHERE` [`BoundScalar`] never carries
+    /// one (subquery `WHERE`s ride [`BoundSubqueryFilter`]).
+    Subquery(Box<BoundSelect>),
 }
 
 /// A bound `WHERE <scalar> <compare> <scalar>` predicate ([STL-151], [STL-213]).
@@ -5500,8 +5518,9 @@ fn bind_projection_item(
     if let Some(query) = as_subquery(expr) {
         return bind_projected_subquery(query, alias, scope);
     }
-    // 3. A computed scalar expression (`a + 1`, `1`).
-    let (scalar, ty) = bind_projection_scalar(expr, scope.schema, scope.table)?;
+    // 3. A computed scalar expression (`a + 1`, `a + b`, `1 + 2`,
+    //    `a + (SELECT max(b) FROM s)`).
+    let (scalar, ty) = bind_projection_scalar(expr, scope)?;
     let name = alias.unwrap_or_else(|| "?column?".to_owned());
     Ok(ProjectionItem {
         name,
@@ -5551,57 +5570,233 @@ fn bind_projected_subquery(
     })
 }
 
-/// Bind a computed (non-column, non-subquery) projection expression to a
-/// [`BoundScalar`] and its result type ([STL-303]).
+/// Bind a computed (non-bare-column) projection expression to a [`BoundScalar`]
+/// and its result type ([STL-303], [STL-332]).
 ///
-/// Reuses the `WHERE` scalar vocabulary: an expression referencing exactly one
-/// column anchors on that column's type (`a + 1`, `qty % 2`); a column-free
-/// expression must be a single literal, whose type is inferred from its shape (`1`
-/// is `int4`, `'x'` is `text`). Two or more distinct columns, or column-free
-/// arithmetic, is an [`UnsupportedProjection`](SelectError::UnsupportedProjection)
-/// (a tracked follow-up).
+/// Reuses the `WHERE` scalar vocabulary, generalized past the single-column anchor:
+/// integer arithmetic over **any number of columns** (`a + b`), folded literals
+/// (`a + 1`), **column-free** arithmetic (`1 + 2`), and an embedded **uncorrelated
+/// scalar subquery** operand (`a + (SELECT max(b) FROM s)`). Each column / subquery
+/// types itself independently; Stele does not implicitly coerce, so the two
+/// operands of an arithmetic node must share one integer type — with the single
+/// exception that an `int4` *literal* widens to meet an `int8` operand, exactly as
+/// the single-anchor fold did. A non-integer operand in arithmetic, or two concrete
+/// operands of different types, is an
+/// [`UnsupportedProjection`](SelectError::UnsupportedProjection).
 ///
-/// The anchor resolves against **schema columns only** — unlike a `WHERE` scalar,
-/// a provenance pseudo-column ([STL-247]) is *not* usable inside a computed
+/// Columns resolve against **schema columns only** — unlike a `WHERE` scalar, a
+/// provenance pseudo-column ([STL-247]) is *not* usable inside a computed
 /// expression (the engine's `eval_projection_scalar` decodes schema columns alone),
 /// so a pseudo-column here is [`SelectError::UnknownColumn`]; it stays projectable
 /// only as a bare column.
 fn bind_projection_scalar(
     expr: &Expr,
-    schema: &TableSchema,
-    table: &str,
+    scope: &ProjectionScope,
 ) -> Result<(BoundScalar, LogicalType), SelectError> {
-    let mut names: Vec<&str> = Vec::new();
-    collect_where_columns(expr, &mut names);
-    names.sort_unstable();
-    names.dedup();
-    match names.as_slice() {
-        [name] => {
-            let index = column_index(schema, name).ok_or_else(|| SelectError::UnknownColumn {
-                table: table.to_owned(),
-                column: (*name).to_owned(),
-            })?;
-            let ty = schema.columns()[index].ty();
-            let anchor = FilterAnchor { name, index, ty };
-            let scalar = bind_scalar(expr, &anchor, schema, table)?;
-            Ok((scalar, ty))
+    let (scalar, kind) = bind_computed_operand(expr, scope)?;
+    Ok((scalar, kind.ty()))
+}
+
+/// Whether a bound computed-projection operand's type is fixed by a column or
+/// subquery — which never coerces — or came from a literal, which re-folds to a
+/// sibling's concrete integer type (an `int4` literal widens to `int8`). This is
+/// what lets `a + b` require an exact type match while `a + 1` lets the literal
+/// adapt, the projection mirror of the single-anchor `WHERE` fold.
+#[derive(Clone, Copy)]
+enum OperandKind {
+    /// A column or subquery operand: its type is fixed and never coerces.
+    Concrete(LogicalType),
+    /// A literal (or all-literal subtree): its natural type, re-foldable from
+    /// `int4` to `int8` to meet an `int8` sibling.
+    Literal(LogicalType),
+}
+
+impl OperandKind {
+    /// The operand's resolved type.
+    const fn ty(self) -> LogicalType {
+        match self {
+            Self::Concrete(ty) | Self::Literal(ty) => ty,
         }
-        [] => {
-            let value = infer_constant_projection(expr)?;
-            let ty = value.logical_type();
-            Ok((BoundScalar::Literal(value), ty))
-        }
-        _ => Err(SelectError::UnsupportedProjection(
-            "a computed select item may reference at most one column".to_owned(),
-        )),
+    }
+
+    /// Whether the operand came from a literal (so it may widen `int4` → `int8`).
+    const fn is_literal(self) -> bool {
+        matches!(self, Self::Literal(_))
     }
 }
 
-/// Infer the value and type of a column-free constant projection item ([STL-303]):
+/// Bind one operand of a computed projection expression bottom-up, returning the
+/// [`BoundScalar`] and its [`OperandKind`] ([STL-332]). A bare column resolves to
+/// its schema index, an embedded `(SELECT …)` to a resolve-once [`BoundScalar::Subquery`],
+/// an arithmetic node recurses and [reconciles](reconcile_arith) its operand types,
+/// and any other leaf is a column-free literal ([`infer_constant_projection`]).
+fn bind_computed_operand(
+    expr: &Expr,
+    scope: &ProjectionScope,
+) -> Result<(BoundScalar, OperandKind), SelectError> {
+    let expr = unwrap_nested(expr);
+    if let Expr::Identifier(id) = expr {
+        let index =
+            column_index(scope.schema, &id.value).ok_or_else(|| SelectError::UnknownColumn {
+                table: scope.table.to_owned(),
+                column: id.value.clone(),
+            })?;
+        let ty = scope.schema.columns()[index].ty();
+        return Ok((BoundScalar::Column(index), OperandKind::Concrete(ty)));
+    }
+    if let Some(query) = as_subquery(expr) {
+        let (scalar, ty) = bind_embedded_subquery(query, scope)?;
+        return Ok((scalar, OperandKind::Concrete(ty)));
+    }
+    if let Expr::BinaryOp { left, op, right } = expr {
+        let Some(arith) = arith_op(op) else {
+            return Err(SelectError::UnsupportedProjection(format!(
+                "operator `{op}` is not supported in a computed select item"
+            )));
+        };
+        let (left_scalar, left_kind) = bind_computed_operand(left, scope)?;
+        let (right_scalar, right_kind) = bind_computed_operand(right, scope)?;
+        let (ty, left_scalar, right_scalar) =
+            reconcile_arith(left_kind, left_scalar, right_kind, right_scalar)?;
+        // The node is constant only when *both* sides are — a column or subquery
+        // anywhere fixes the type concretely (no further widening).
+        let kind = if left_kind.is_literal() && right_kind.is_literal() {
+            OperandKind::Literal(ty)
+        } else {
+            OperandKind::Concrete(ty)
+        };
+        return Ok((
+            BoundScalar::Arith {
+                op: arith,
+                left: Box::new(left_scalar),
+                right: Box::new(right_scalar),
+            },
+            kind,
+        ));
+    }
+    // A column-free literal leaf (`1`, `'x'`, `TRUE`): its natural type.
+    let value = infer_constant_projection(expr)?;
+    let ty = value.logical_type();
+    Ok((BoundScalar::Literal(value), OperandKind::Literal(ty)))
+}
+
+/// Reconcile the operand types of a computed arithmetic node, returning the result
+/// type and the (possibly widened) operands ([STL-332]).
+///
+/// Arithmetic is integer-only (`int4` / `int8` — the evaluator's two kernels), and
+/// Stele does not implicitly coerce: two operands must share one integer type. The
+/// sole give is that an `int4` **literal** widens to `int8` to meet an `int8`
+/// sibling (a concrete `int4` column / subquery does not), exactly the latitude the
+/// single-anchor `WHERE` fold took when it folded a literal to its anchor column.
+fn reconcile_arith(
+    left_kind: OperandKind,
+    left_scalar: BoundScalar,
+    right_kind: OperandKind,
+    right_scalar: BoundScalar,
+) -> Result<(LogicalType, BoundScalar, BoundScalar), SelectError> {
+    let is_int = |ty| matches!(ty, LogicalType::Int4 | LogicalType::Int8);
+    if !is_int(left_kind.ty()) || !is_int(right_kind.ty()) {
+        return Err(SelectError::UnsupportedProjection(format!(
+            "arithmetic in a computed select item needs integer operands, got {} and {}",
+            left_kind.ty(),
+            right_kind.ty()
+        )));
+    }
+    // Same integer type ⇒ no coercion needed.
+    if left_kind.ty() == right_kind.ty() {
+        return Ok((left_kind.ty(), left_scalar, right_scalar));
+    }
+    // Mixed `int4` / `int8`: only an `int4` *literal* may widen to meet an `int8`
+    // sibling. A concrete `int4` (a column / subquery) does not coerce.
+    match (left_kind, right_kind) {
+        (OperandKind::Literal(LogicalType::Int4), _) if right_kind.ty() == LogicalType::Int8 => {
+            Ok((
+                LogicalType::Int8,
+                widen_int4_literal(left_scalar),
+                right_scalar,
+            ))
+        }
+        (_, OperandKind::Literal(LogicalType::Int4)) if left_kind.ty() == LogicalType::Int8 => {
+            Ok((
+                LogicalType::Int8,
+                left_scalar,
+                widen_int4_literal(right_scalar),
+            ))
+        }
+        _ => Err(SelectError::UnsupportedProjection(format!(
+            "operands of a computed select item have incompatible types {} and {} \
+             (Stele does not implicitly coerce)",
+            left_kind.ty(),
+            right_kind.ty()
+        ))),
+    }
+}
+
+/// Widen every `int4` literal in an all-literal computed subtree to `int8`
+/// ([STL-332]), so an `int4` constant can meet an `int8` operand under the
+/// evaluator's same-type arithmetic. Only ever called on an
+/// [`OperandKind::Literal`] `int4` subtree, which by construction holds nothing but
+/// `int4` literals and arithmetic over them; the final arm is an unreachable
+/// pass-through kept total rather than panicking.
+fn widen_int4_literal(scalar: BoundScalar) -> BoundScalar {
+    match scalar {
+        BoundScalar::Literal(ScalarValue::Int4(v)) => {
+            BoundScalar::Literal(ScalarValue::Int8(i64::from(v)))
+        }
+        BoundScalar::Arith { op, left, right } => BoundScalar::Arith {
+            op,
+            left: Box::new(widen_int4_literal(*left)),
+            right: Box::new(widen_int4_literal(*right)),
+        },
+        other => other,
+    }
+}
+
+/// Bind a scalar subquery used as an **operand** inside a computed projection
+/// expression ([STL-332]): `a + (SELECT max(b) FROM s)`.
+///
+/// The inner binds under the outer's per-statement snapshot (docs/16 §6), inheriting
+/// any `FOR VALID_TIME AS OF` pin, and must be **single-column**. It must be
+/// **uncorrelated** — resolved once by the engine ([STL-303] `resolve_scalar_subquery`)
+/// and fed into the surrounding per-row arithmetic as a constant. A *correlated*
+/// embedded operand (the inner referencing an outer column) is not bound here yet:
+/// the whole-projection STL-331 path handles correlation, but threading a per-row
+/// re-resolved value into per-row arithmetic is a tracked follow-up. The inner is
+/// capped at two rows so a `>1`-row result raises the `21000` cardinality violation
+/// without materializing an unbounded inner.
+fn bind_embedded_subquery(
+    query: &Query,
+    scope: &ProjectionScope,
+) -> Result<(BoundScalar, LogicalType), SelectError> {
+    let inner_ctx = BindContext {
+        snapshot: scope.snapshot,
+        catalog: scope.catalog,
+    };
+    let outer = OuterScope {
+        table: scope.table,
+        alias: scope.alias,
+        schema: scope.schema,
+    };
+    let (mut inner, correlation) =
+        bind_inner_query(query, &outer, &inner_ctx, /* exists = */ false)?;
+    if correlation.is_some() {
+        return Err(SelectError::Subquery(
+            "a correlated subquery inside a computed expression is not supported yet — only an \
+             uncorrelated, resolve-once embedded subquery (`a + (SELECT max(b) FROM s)`)"
+                .to_owned(),
+        ));
+    }
+    let (_inner_name, ty) = sole_output_column(&inner, scope.catalog)?;
+    inner.limit = Some(inner.limit.map_or(2, |existing| existing.min(2)));
+    inherit_valid_snapshot(&mut inner, scope.valid_snapshot, scope.catalog)?;
+    Ok((BoundScalar::Subquery(Box::new(inner)), ty))
+}
+
+/// Infer the value and type of a column-free constant projection **leaf** ([STL-303]):
 /// an integer literal (`int4`, or `int8` if it overflows `i32`), a single-quoted
-/// string (`text`), or a boolean (`bool`) — the literal shapes the smoke-test /
-/// `hash` constant paths already fold. Anything else (NULL, a float, column-free
-/// arithmetic, a non-literal) is an
+/// string (`text`), or a boolean (`bool`). Column-free *arithmetic* (`1 + 2`) is
+/// composed from these leaves by [`bind_computed_operand`]; anything else here (NULL,
+/// a float, a non-literal) is an
 /// [`UnsupportedProjection`](SelectError::UnsupportedProjection).
 fn infer_constant_projection(expr: &Expr) -> Result<ScalarValue, SelectError> {
     if let Some(digits) = fold::signed_number(expr) {
