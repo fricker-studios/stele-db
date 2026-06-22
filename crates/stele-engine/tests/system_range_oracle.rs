@@ -253,6 +253,38 @@ fn engine_rows(
     rows
 }
 
+/// Execute a `SELECT`, returning its full result (columns + rows) — for the
+/// composed-clause tests that check the output *shape*, not just the row set.
+fn run_rows(engine: &mut SessionEngine<ZeroClock, MemDisk>, sql: &str) -> SelectResult {
+    let stmt = parse(sql).expect("parse").remove(0);
+    let StatementOutcome::Rows(result) = engine
+        .execute(&stmt)
+        .unwrap_or_else(|e| panic!("`{sql}`: {e}"))
+    else {
+        panic!("a SELECT must return rows for `{sql}`");
+    };
+    result
+}
+
+/// Run a `SELECT count(*) …`, decoding its single `int8` cell.
+fn engine_count(engine: &mut SessionEngine<ZeroClock, MemDisk>, sql: &str) -> i64 {
+    let result = run_rows(engine, sql);
+    assert_eq!(result.rows.len(), 1, "count(*) returns one row: {sql}");
+    dec_i64(result.rows[0][0].as_deref())
+}
+
+/// Decode a non-NULL `int4` cell.
+fn dec_i32(cell: Option<&[u8]>) -> i32 {
+    let bytes = cell.expect("non-NULL int4 cell");
+    i32::from_le_bytes(bytes.try_into().expect("int4 is 4 bytes"))
+}
+
+/// Decode a non-NULL `int8` / `timestamptz` cell (both are little-endian `i64`).
+fn dec_i64(cell: Option<&[u8]>) -> i64 {
+    let bytes = cell.expect("non-NULL int8 cell");
+    i64::from_le_bytes(bytes.try_into().expect("int8 is 8 bytes"))
+}
+
 /// The distinct boundary instants worth probing: every `sys_from` / `sys_to` in
 /// the timeline, each also `±1`, so a query edge lands exactly on, just before,
 /// and just after every version boundary — the off-by-one surface.
@@ -383,9 +415,10 @@ fn endpoint_columns_and_open_versions_render_as_expected() {
 }
 
 #[test]
-fn a_named_projection_and_where_still_append_the_endpoints() {
-    // `SELECT a … WHERE id = 1` over a range projects `[a, sys_from, sys_to]` and
-    // returns only key 1's versions overlapping the range.
+fn a_named_projection_returns_its_columns_with_endpoints_nameable() {
+    // The endpoints are addressable columns now ([STL-329]): a named projection
+    // returns exactly what it lists — no auto-appended endpoints — and `sys_from` /
+    // `sys_to` are projectable by name alongside user columns.
     let mut engine = SessionEngine::open(MemDisk::new(), ZeroClock);
     run(
         &mut engine,
@@ -397,21 +430,41 @@ fn a_named_projection_and_where_still_append_the_endpoints() {
     let t2 = engine.commit_clock().0;
     run(&mut engine, "INSERT INTO t VALUES (2, 900)"); // key 2: must be filtered out
     let t3 = engine.commit_clock().0;
+    let upper = t3 + 1;
 
-    let stmt = parse(&format!(
-        "SELECT a FROM t FOR SYSTEM_TIME FROM {t1} TO {} WHERE id = 1",
-        t3 + 1
-    ))
-    .expect("parse")
-    .remove(0);
-    let StatementOutcome::Rows(result) = engine.execute(&stmt).expect("range select") else {
-        panic!("expected rows");
-    };
+    // `SELECT a … WHERE id = 1` projects exactly `[a]`; the endpoints are not
+    // auto-appended (only key 1's versions survive the `WHERE`).
+    let result = run_rows(
+        &mut engine,
+        &format!("SELECT a FROM t FOR SYSTEM_TIME FROM {t1} TO {upper} WHERE id = 1"),
+    );
+    let names: Vec<&str> = result.columns.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        ["a"],
+        "a named projection returns exactly its columns"
+    );
+    let mut rows = result.rows;
+    rows.sort();
+    let mut want = vec![
+        vec![Some(enc(&ScalarValue::Int4(100)))],
+        vec![Some(enc(&ScalarValue::Int4(200)))],
+    ];
+    want.sort();
+    assert_eq!(rows, want, "only key 1's versions");
+
+    // Naming the endpoints projects them, in the requested position.
+    let result = run_rows(
+        &mut engine,
+        &format!(
+            "SELECT a, sys_from, sys_to FROM t FOR SYSTEM_TIME FROM {t1} TO {upper} WHERE id = 1"
+        ),
+    );
     let names: Vec<&str> = result.columns.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(
         names,
         ["a", "sys_from", "sys_to"],
-        "projected col then endpoints"
+        "endpoints projectable by name"
     );
     let mut rows = result.rows;
     rows.sort();
@@ -428,5 +481,157 @@ fn a_named_projection_and_where_still_append_the_endpoints() {
         ],
     ];
     want.sort();
-    assert_eq!(rows, want, "only key 1's versions, endpoints appended");
+    assert_eq!(rows, want, "named endpoints render, open sys_to = NULL");
+}
+
+#[test]
+fn count_over_a_range_matches_the_reference_size() {
+    // `COUNT(*)` over a range folds exactly the versions the reference says overlap
+    // the interval ([STL-329]): the aggregate count equals the reference set size,
+    // swept across seeds, flush boundaries, and every probe interval.
+    for seed in 0..16u64 {
+        for flush in [FlushMode::Never, FlushMode::Midway, FlushMode::Full] {
+            let World {
+                mut engine,
+                versions,
+            } = build(seed, flush);
+            let marks = boundary_instants(&versions);
+            for (i, &lo) in marks.iter().enumerate() {
+                for &hi in &marks[i..] {
+                    if lo >= hi {
+                        continue;
+                    }
+                    let sql = format!("SELECT count(*) FROM t FOR SYSTEM_TIME FROM {lo} TO {hi}");
+                    let want = i64::try_from(reference_rows(&versions, lo, hi, false).len())
+                        .expect("count fits i64");
+                    assert_eq!(
+                        engine_count(&mut engine, &sql),
+                        want,
+                        "seed {seed}, {flush:?}: {sql}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn group_by_key_over_a_range_counts_each_key() {
+    // `GROUP BY id` over a range groups the range output by business key ([STL-329]):
+    // key 1 has three versions over the whole timeline, key 2 has one.
+    let mut engine = SessionEngine::open(MemDisk::new(), ZeroClock);
+    run(
+        &mut engine,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT) WITH SYSTEM VERSIONING",
+    );
+    run(&mut engine, "INSERT INTO t VALUES (1, 100)");
+    run(&mut engine, "UPDATE t SET a = 200 WHERE id = 1");
+    run(&mut engine, "UPDATE t SET a = 300 WHERE id = 1");
+    run(&mut engine, "INSERT INTO t VALUES (2, 900)");
+    let hi = engine.commit_clock().0 + 1;
+
+    let result = run_rows(
+        &mut engine,
+        &format!("SELECT id, count(*) FROM t FOR SYSTEM_TIME FROM 0 TO {hi} GROUP BY id"),
+    );
+    let mut counts: Vec<(i32, i64)> = result
+        .rows
+        .iter()
+        .map(|r| (dec_i32(r[0].as_deref()), dec_i64(r[1].as_deref())))
+        .collect();
+    counts.sort_unstable();
+    assert_eq!(
+        counts,
+        [(1, 3), (2, 1)],
+        "per-key version counts over the range"
+    );
+}
+
+#[test]
+fn ordering_and_limit_compose_over_a_range() {
+    // `ORDER BY` on an appended endpoint and `LIMIT` both compose over a range
+    // ([STL-329]): the endpoints are addressable, so ordering on `sys_from` is legal.
+    let mut engine = SessionEngine::open(MemDisk::new(), ZeroClock);
+    run(
+        &mut engine,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT) WITH SYSTEM VERSIONING",
+    );
+    run(&mut engine, "INSERT INTO t VALUES (1, 100)");
+    run(&mut engine, "UPDATE t SET a = 200 WHERE id = 1");
+    run(&mut engine, "UPDATE t SET a = 300 WHERE id = 1");
+    let hi = engine.commit_clock().0 + 1;
+
+    // Three versions of key 1; newest-first by `sys_from`.
+    let desc = run_rows(
+        &mut engine,
+        &format!("SELECT a FROM t FOR SYSTEM_TIME FROM 0 TO {hi} ORDER BY sys_from DESC"),
+    );
+    let a_vals: Vec<i32> = desc.rows.iter().map(|r| dec_i32(r[0].as_deref())).collect();
+    assert_eq!(
+        a_vals,
+        [300, 200, 100],
+        "ORDER BY sys_from DESC: newest first"
+    );
+
+    // `LIMIT 1` over that order keeps only the newest.
+    let limited = run_rows(
+        &mut engine,
+        &format!("SELECT a FROM t FOR SYSTEM_TIME FROM 0 TO {hi} ORDER BY sys_from DESC LIMIT 1"),
+    );
+    assert_eq!(limited.rows.len(), 1, "LIMIT 1 caps the range output");
+    assert_eq!(dec_i32(limited.rows[0][0].as_deref()), 300);
+}
+
+#[test]
+fn provenance_over_a_range_matches_a_point_read() {
+    // The provenance pseudo-columns materialize over a range ([STL-329]) and render
+    // identically to a point `AS OF` read of the same version ([STL-247]) — proving
+    // the range path both populates provenance (across tiers) and positions it after
+    // the appended endpoints.
+    let mut engine = SessionEngine::open(MemDisk::new(), ZeroClock);
+    run(
+        &mut engine,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT) WITH SYSTEM VERSIONING",
+    );
+    run(&mut engine, "INSERT INTO t VALUES (1, 100)");
+    run(&mut engine, "UPDATE t SET a = 200 WHERE id = 1");
+    run(&mut engine, "INSERT INTO t VALUES (2, 900)");
+    let hi = engine.commit_clock().0 + 1;
+
+    let range = run_rows(
+        &mut engine,
+        &format!(
+            "SELECT id, sys_from, _stele_txn_id, _stele_committed_at \
+             FROM t FOR SYSTEM_TIME FROM 0 TO {hi}"
+        ),
+    );
+    assert_eq!(
+        range.rows.len(),
+        3,
+        "three versions over the whole timeline"
+    );
+
+    for row in &range.rows {
+        let id = dec_i32(row[0].as_deref());
+        let sys_from = dec_i64(row[1].as_deref());
+        // The same version, read at its own start instant, must carry identical
+        // provenance bytes.
+        let point = run_rows(
+            &mut engine,
+            &format!(
+                "SELECT _stele_txn_id, _stele_committed_at \
+                 FROM t FOR SYSTEM_TIME AS OF {sys_from} WHERE id = {id}"
+            ),
+        );
+        assert_eq!(point.rows.len(), 1, "one live version at its own start");
+        assert!(
+            row[2].is_some() && row[3].is_some(),
+            "provenance is never NULL"
+        );
+        assert_eq!(row[2], point.rows[0][0], "txn_id matches the point read");
+        assert_eq!(
+            row[3], point.rows[0][1],
+            "committed_at matches the point read"
+        );
+    }
 }

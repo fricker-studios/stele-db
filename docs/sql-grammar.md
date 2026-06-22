@@ -132,26 +132,34 @@ difference is the "off-by-one on a half-open interval" bug class the §4 oracle
 (`crates/stele-engine/tests/system_range_oracle.rs`) pins against a reference
 model across the flush/seal boundary.
 
-**Output shape (the projection contract).** A range read appends the period
-endpoints **`sys_from`** and **`sys_to`** (both `TIMESTAMPTZ`) after the projected
-columns — `SELECT *` is `[user columns…, sys_from, sys_to]`, `SELECT a` is
-`[a, sys_from, sys_to]`. `sys_to` is `NULL` for a still-current (open) version.
-This is the row shape STL-199's `\history` consumes. A provenance pseudo-column
-([STL-247]) over a range read is a tracked follow-up — rejected at bind for now,
-not silently dropped.
+**Output shape (the projection contract).** A range read's output **schema** is the
+table's own columns followed by the appended period endpoints **`sys_from`** and
+**`sys_to`** (both `TIMESTAMPTZ`) — so `SELECT *` is `[user columns…, sys_from,
+sys_to]`. The endpoints are *addressable* columns ([STL-329]): a named projection
+returns exactly what it lists (`SELECT a` is `[a]`; `SELECT a, sys_from` is
+`[a, sys_from]`), and they are nameable in the projection, `ORDER BY`, and a value
+`WHERE` like any column. `sys_to` is `NULL` for a still-current (open) version. This
+is the row shape STL-199's `\history` consumes (it names the endpoints explicitly).
 
-**v0.3 scope.** A system range binds as a plain single base-table read with a
-`WHERE` predicate. (The **valid axis** is the parallel form below
+**Composing the SELECT surface ([STL-329]).** The rest of the read surface composes
+over a range, routed through the shared `finish_select` pipeline exactly as a point
+read is: result-shaping (`DISTINCT` / `ORDER BY` — including on `sys_from` /
+`sys_to` — / `LIMIT` / `OFFSET`), aggregation / `GROUP BY` over the range output,
+and the provenance pseudo-columns ([STL-247]) projected from the range. (Grouping
+on the endpoints is bounded by the same rule as any read: `GROUP BY` keys are
+restricted to `INT4` / `INT8` / `BOOL` / `TEXT` today, so `GROUP BY sys_from` —
+`TIMESTAMPTZ` — is the pre-existing unsupported-grouping-type error, not range-specific.)
+A range scan is now subject to the simple-query default row cap too, like any plain
+read ([below](#default-row-cap-on-the-simple-query-path-stl-306)).
+
+**Still rejected (tracked follow-ups), never silently dropped.** Combining a system
+range with **any** `AS OF` point qualifier; a `JOIN`; a subquery or period-predicate
+`WHERE`; a computed / scalar-subquery select item; a CTE / derived-table source; the
+read-your-own-writes overlay (a range reads the committed snapshot only, unlike a
+point read or a join, [STL-325]); and `FOR SYSTEM_TIME ALL` (the trivially-full
+range). (The **valid axis** is the parallel form below
 ([STL-328](#for-valid_time--from-a-to-b--between-a-and-b---valid-time-range-scans-stl-328)),
-which relaxes the `AS OF` rule.) Each of these is rejected at bind time for a
-*system* range (a tracked follow-up, never a silently-dropped clause): combining a
-system range with **any** `AS OF` point qualifier; a `JOIN`, aggregate /
-`GROUP BY`, `DISTINCT` / `ORDER BY` / `LIMIT` / `OFFSET`, subquery or
-period-predicate `WHERE`, or a CTE / derived-table source; and `FOR SYSTEM_TIME
-ALL` (the trivially-full range). A range scan reads the committed snapshot only —
-the read-your-own-writes overlay is not applied to it (unlike a point read or a
-join, [STL-325]) — and is exempt from the simple-query default row cap
-([below](#default-row-cap-on-the-simple-query-path-stl-306)).
+which relaxes the `AS OF` rule.)
 
 ### `FOR VALID_TIME { FROM a TO b | BETWEEN a AND b }` — valid-time range scans (STL-328)
 
@@ -183,18 +191,22 @@ contract, same empty/reversed bind error — applied to the version's
 | `FROM a TO b` | `[a, b)` (half-open) | `vf < vt` and `vt > a` and `vf < b` |
 | `BETWEEN a AND b` | `[a, b]` (closed) | `vf < vt` and `vt > a` and `vf ≤ b` |
 
-**Output shape.** A valid range appends the period endpoints **`valid_from`** and
-**`valid_to`** (both `TIMESTAMPTZ`) after the projected columns — `SELECT *` is
-`[user columns…, valid_from, valid_to]`. `valid_to` is `NULL` for an open-ended
-("until changed", `+∞`) fact, mirroring how `sys_to` renders for an open system
-period.
+**Output shape.** A valid range's output schema appends the period endpoints
+**`valid_from`** and **`valid_to`** (both `TIMESTAMPTZ`) to the table's columns — so
+`SELECT *` is `[user columns…, valid_from, valid_to]`, and the endpoints are
+addressable by name just like the system axis ([STL-329]). `valid_to` is `NULL` for
+an open-ended ("until changed", `+∞`) fact, mirroring how `sys_to` renders for an
+open system period.
 
 **As-of composition.** A `FOR SYSTEM_TIME AS OF s` pin is *allowed* with a valid
 range — it fixes the system snapshot the valid history is read at (the cross-axis
 `v(k, S, V_range)`, the range-extension of the both-axes point read). A
-`FOR VALID_TIME AS OF` is rejected (a point and a range on the *same* axis), as is
-every shaping / aggregate / subquery / `JOIN` / CTE clause the system range
-rejects. The correctness oracle (`crates/stele-engine/tests/valid_range_oracle.rs`,
+`FOR VALID_TIME AS OF` is rejected (a point and a range on the *same* axis). The
+same SELECT surface composes over a valid range as a system one ([STL-329]):
+result-shaping, aggregation / `GROUP BY`, and projected provenance pseudo-columns;
+the same shapes a system range rejects (subquery / period `WHERE`, `JOIN`, CTE,
+computed projection, read-your-own-writes) are rejected here too. The correctness
+oracle (`crates/stele-engine/tests/valid_range_oracle.rs`,
 [docs/06 §4](06-testing-strategy.md#4-correctness-oracles-the-temporal-heart))
 sweeps a bitemporal workload across both axes and the flush/seal boundary against a
 reference model, with the same off-by-one teeth check.
@@ -517,22 +529,24 @@ committed rows). The executor applies them in the Postgres pipeline order:
 WHERE → [GROUP BY/aggregates → HAVING] → DISTINCT → ORDER BY → OFFSET → LIMIT
 ```
 
-- **`HAVING <predicate>`** (STL-265) — the post-aggregation filter, applied after
-  the `GROUP BY` folds and before the shaping tail: a group is kept iff the
-  predicate is **`TRUE`** for it (a `FALSE` or `NULL` group drops, the `WHERE`
-  rule). The vocabulary is the single-comparison `WHERE` surface lifted to the
-  grouped batch — exactly one **anchor** (a grouping column **or** an aggregate call)
-  per predicate, the other side a literal or an integer arithmetic of it, through
-  any of the six comparisons. An aggregate the `HAVING` names but the select list
-  does not (`SELECT region … HAVING SUM(amount) > 100`) is computed and filtered
-  on without being emitted. A bare column that is not a grouping column is
-  Postgres's **42803** (`grouping_error`), the same code a non-aggregated select
-  item draws. **Rejected** with the reason: a non-comparison or boolean-connective
-  `HAVING`, a two-anchor comparison (aggregate-to-aggregate / column-to-aggregate,
-  the analog of `WHERE`'s deferred column-to-column), a `FLOAT8` `AVG` operand
-  (outside the evaluator's comparison set), and a subquery inside `HAVING` (rides
-  the subquery tickets). `HAVING` over a **join** is a tracked follow-up — rejected
-  there, never dropped.
+- **`HAVING <predicate>`** (STL-265, richer predicates STL-327) — the
+  post-aggregation filter, applied after the `GROUP BY` folds and before the
+  shaping tail: a group is kept iff the predicate is **`TRUE`** for it (a `FALSE`
+  or `NULL` group drops, the `WHERE` rule). One of the six comparisons, each side a
+  grouping column, an aggregate call, a literal, or an integer arithmetic of one.
+  **Both sides may anchor** (`COUNT(*) > SUM(amount)`, `dept > COUNT(*)` — the
+  aggregate-to-aggregate / column-to-aggregate analog of a column-to-column
+  `WHERE`), comparing across the numeric types the evaluator promotes to a common
+  type, and a **`FLOAT8` `AVG`** operand compares against a literal or another
+  aggregate (STL-327). An aggregate the `HAVING` names but the select list does not
+  (`SELECT region … HAVING SUM(amount) > 100`) is computed and filtered on without
+  being emitted. A bare column that is not a grouping column is Postgres's **42803**
+  (`grouping_error`), the same code a non-aggregated select item draws. `HAVING`
+  composes over a **join** too, resolving its operands through the join scope
+  (STL-327). **Rejected** with the reason: a non-comparison or boolean-connective
+  `HAVING`, a comparison of two incomparable types (a text grouping column against a
+  numeric aggregate), `FLOAT8` arithmetic (the evaluator has no float arithmetic
+  kernel), and a subquery inside `HAVING` (rides the subquery tickets).
 - **`ORDER BY col [ASC|DESC], …`** — bare column names, multi-key, first key
   outermost. A name resolves against the **select list first** (an aggregate
   query's output columns, aliases included); a plain non-`DISTINCT` query may
@@ -605,7 +619,7 @@ LIMIT 10;
 
 The join's **output is a relation like any other**, and the rest of the `SELECT`
 surface composes over it (STL-264), in the Postgres pipeline order
-(`WHERE → [GROUP BY/aggregates] → DISTINCT → ORDER BY → OFFSET → LIMIT`):
+(`WHERE → [GROUP BY/aggregates → HAVING] → DISTINCT → ORDER BY → OFFSET → LIMIT`):
 
 - **Addressable columns.** The output is the seed input's columns, then each
   `INNER` / `LEFT` step's right input's, in the chain's left-deep order (a `SEMI` /
@@ -617,8 +631,11 @@ surface composes over it (STL-264), in the Postgres pipeline order
 - **`WHERE`** over the joined columns, including a column the projection does not
   select, applied after the join. The same single-comparison shape the single-table
   path binds (six operators, integer arithmetic of one anchor column — STL-213).
-- **Aggregates / `GROUP BY`** over the join output (STL-171): `COUNT` / `SUM` /
-  `MIN` / `MAX` / `AVG`, grouped on any output column(s).
+- **Aggregates / `GROUP BY` / `HAVING`** over the join output (STL-171, STL-327):
+  `COUNT` / `SUM` / `MIN` / `MAX` / `AVG`, grouped on any output column(s), with an
+  optional post-aggregation `HAVING` (the same predicate vocabulary as a
+  single-table read, two-anchor and `FLOAT8` operands included) resolving through
+  the join scope.
 - **`DISTINCT` / `ORDER BY` / `OFFSET` / `LIMIT`** over the join output (STL-263),
   with the same semantics (NULL placement, the `DISTINCT` 42P10 rule) as a
   single-table read.
@@ -638,9 +655,8 @@ single-table read does ([STL-203] / [STL-223]), and `ROLLBACK` discards it. A se
 
 **Not yet** (rejected, never silently mis-bound): `RIGHT` / `FULL OUTER` and
 non-equi `ON` conditions (STL-270); join reordering / cost-based planning (the chain
-runs in syntactic, left-deep order); a period predicate over a join; a `HAVING`
-over a join's aggregate (STL-265 — the single-table path only, since the operands
-would need join-scope name resolution). A join read is also not auto-capped by the
+runs in syntactic, left-deep order); a period predicate over a join. A join read is
+also not auto-capped by the
 [default row cap](#default-row-cap-on-the-simple-query-path-stl-306) — give it an
 explicit `LIMIT`.
 

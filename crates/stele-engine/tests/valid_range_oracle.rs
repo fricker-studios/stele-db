@@ -212,8 +212,9 @@ fn run(engine: &mut SessionEngine<ZeroClock, MemDisk>, sql: &str) {
 
 /// The reference's expected rows for a valid range query at system snapshot `s`:
 /// every version system-live at `s` whose valid interval `[vf, vt)` overlaps the
-/// query window, projected as `[id, balance, valid_from, valid_to]` — the engine's
-/// `SELECT id, balance` range shape. `closed` selects `BETWEEN [lo, hi]` over
+/// query window, projected as `[id, balance, valid_from, valid_to]` — the shape of
+/// the engine's `SELECT id, balance, valid_from, valid_to` range read (the
+/// endpoints named explicitly, [STL-329]). `closed` selects `BETWEEN [lo, hi]` over
 /// `FROM..TO [lo, hi)`; `inclusive_vto` (the teeth variant) wrongly treats the
 /// version's own upper as inclusive.
 ///
@@ -258,8 +259,8 @@ fn reference_rows(
     rows
 }
 
-/// The engine's rows for a `SELECT id, balance` valid range, sorted to compare as
-/// a set.
+/// The engine's rows for a `SELECT id, balance, valid_from, valid_to` valid range,
+/// sorted to compare as a set.
 fn engine_rows(
     engine: &mut SessionEngine<ZeroClock, MemDisk>,
     sql: &str,
@@ -273,6 +274,31 @@ fn engine_rows(
     };
     rows.sort();
     rows
+}
+
+/// Execute a `SELECT`, returning its full result (columns + rows) — for the
+/// composed-clause tests that check the output *shape*, not just the row set.
+fn run_rows(engine: &mut SessionEngine<ZeroClock, MemDisk>, sql: &str) -> SelectResult {
+    let stmt = parse(sql).expect("parse").remove(0);
+    let StatementOutcome::Rows(result) = engine
+        .execute(&stmt)
+        .unwrap_or_else(|e| panic!("`{sql}`: {e}"))
+    else {
+        panic!("a SELECT must return rows for `{sql}`");
+    };
+    result
+}
+
+/// Decode a non-NULL `int4` cell.
+fn dec_i32(cell: Option<&[u8]>) -> i32 {
+    let bytes = cell.expect("non-NULL int4 cell");
+    i32::from_le_bytes(bytes.try_into().expect("int4 is 4 bytes"))
+}
+
+/// Decode a non-NULL `int8` cell.
+fn dec_i64(cell: Option<&[u8]>) -> i64 {
+    let bytes = cell.expect("non-NULL int8 cell");
+    i64::from_le_bytes(bytes.try_into().expect("int8 is 8 bytes"))
 }
 
 /// The distinct system commit boundaries worth probing as the snapshot `s`: every
@@ -319,7 +345,7 @@ fn valid_range_scans_match_the_reference_across_seeds_axes_flush_and_boundaries(
                     for hi in lo..=(VMAX + 1) {
                         if lo < hi {
                             let sql = format!(
-                                "SELECT id, balance FROM acct \
+                                "SELECT id, balance, valid_from, valid_to FROM acct \
                                  FOR SYSTEM_TIME AS OF {s} FOR VALID_TIME FROM {lo} TO {hi}"
                             );
                             let got = engine_rows(&mut engine, &sql);
@@ -332,7 +358,7 @@ fn valid_range_scans_match_the_reference_across_seeds_axes_flush_and_boundaries(
                             total_probes += 1;
                         }
                         let sql = format!(
-                            "SELECT id, balance FROM acct \
+                            "SELECT id, balance, valid_from, valid_to FROM acct \
                              FOR SYSTEM_TIME AS OF {s} FOR VALID_TIME BETWEEN {lo} AND {hi}"
                         );
                         assert_eq!(
@@ -375,7 +401,7 @@ fn the_oracle_has_teeth_off_by_one_on_the_half_open_valid_upper() {
         for lo in 0..=VMAX {
             for hi in (lo + 1)..=(VMAX + 1) {
                 let sql = format!(
-                    "SELECT id, balance FROM acct \
+                    "SELECT id, balance, valid_from, valid_to FROM acct \
                      FOR SYSTEM_TIME AS OF {s} FOR VALID_TIME FROM {lo} TO {hi}"
                 );
                 let engine = engine_rows(&mut engine, &sql);
@@ -454,9 +480,10 @@ fn select_star_shape_and_open_valid_to_renders_null() {
 }
 
 #[test]
-fn a_named_projection_and_where_still_append_the_endpoints() {
-    // `SELECT balance … WHERE id = 1` over a valid range projects
-    // `[balance, valid_from, valid_to]` and returns only key 1's row.
+fn a_named_projection_returns_its_columns_with_endpoints_nameable() {
+    // The endpoints are addressable columns now ([STL-329]): a named projection over
+    // a valid range returns exactly what it lists, and `valid_from` / `valid_to` are
+    // projectable by name.
     let mut engine = SessionEngine::open(MemDisk::new(), ZeroClock);
     run(
         &mut engine,
@@ -466,23 +493,109 @@ fn a_named_projection_and_where_still_append_the_endpoints() {
     run(&mut engine, "INSERT INTO acct VALUES (1, 100, 10, 20)");
     run(&mut engine, "INSERT INTO acct VALUES (2, 900, 10, 20)"); // filtered out
 
-    let stmt = parse("SELECT balance FROM acct FOR VALID_TIME FROM 0 TO 100 WHERE id = 1")
-        .expect("parse")
-        .remove(0);
-    let StatementOutcome::Rows(result) = engine.execute(&stmt).expect("range select") else {
-        panic!("expected rows");
-    };
-    let names: Vec<&str> = result.columns.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(names, ["balance", "valid_from", "valid_to"]);
+    // `SELECT balance … WHERE id = 1` projects exactly `[balance]`.
+    let bare = run_rows(
+        &mut engine,
+        "SELECT balance FROM acct FOR VALID_TIME FROM 0 TO 100 WHERE id = 1",
+    );
     assert_eq!(
-        result.rows,
+        bare.columns
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>(),
+        ["balance"],
+        "a named projection returns exactly its columns",
+    );
+    assert_eq!(bare.rows, vec![vec![Some(enc(&ScalarValue::Int4(100)))]]);
+
+    // Naming the endpoints projects them.
+    let named = run_rows(
+        &mut engine,
+        "SELECT balance, valid_from, valid_to FROM acct FOR VALID_TIME FROM 0 TO 100 WHERE id = 1",
+    );
+    assert_eq!(
+        named
+            .columns
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>(),
+        ["balance", "valid_from", "valid_to"],
+        "endpoints projectable by name",
+    );
+    assert_eq!(
+        named.rows,
         vec![vec![
             Some(enc(&ScalarValue::Int4(100))),
             Some(enc(&ScalarValue::TimestampTz(10))),
             Some(enc(&ScalarValue::TimestampTz(20))),
         ]],
-        "only key 1's row, endpoints appended",
+        "only key 1's row, named endpoints",
     );
+}
+
+#[test]
+fn shaping_aggregates_and_provenance_compose_over_a_valid_range() {
+    // The rest of the SELECT surface composes over a valid range ([STL-329]):
+    // result-shaping (incl. ordering on `valid_from`), aggregation, and the
+    // provenance pseudo-columns.
+    let mut engine = SessionEngine::open(MemDisk::new(), ZeroClock);
+    run(
+        &mut engine,
+        "CREATE TABLE acct (id INT PRIMARY KEY, balance INT, vf TIMESTAMP, vt TIMESTAMP) \
+         WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+    );
+    run(&mut engine, "INSERT INTO acct VALUES (1, 100, 10, 20)");
+    run(&mut engine, "INSERT INTO acct VALUES (2, 200, 30, 40)");
+    run(&mut engine, "INSERT INTO acct VALUES (3, 300, 50, 60)");
+
+    // ORDER BY valid_from DESC + LIMIT 2 returns the two latest-starting windows.
+    let shaped = run_rows(
+        &mut engine,
+        "SELECT balance FROM acct FOR VALID_TIME FROM 0 TO 100 ORDER BY valid_from DESC LIMIT 2",
+    );
+    let balances: Vec<i32> = shaped
+        .rows
+        .iter()
+        .map(|r| dec_i32(r[0].as_deref()))
+        .collect();
+    assert_eq!(balances, [300, 200], "ORDER BY valid_from DESC, LIMIT 2");
+
+    // COUNT(*) folds the whole valid range — all three windows overlap [0, 100).
+    let count = run_rows(
+        &mut engine,
+        "SELECT count(*) FROM acct FOR VALID_TIME FROM 0 TO 100",
+    );
+    assert_eq!(
+        dec_i64(count.rows[0][0].as_deref()),
+        3,
+        "three overlapping windows"
+    );
+
+    // Provenance projects from a valid range and matches a point read of the same
+    // version (read at `now` on the system axis, the version's own valid start).
+    let prov = run_rows(
+        &mut engine,
+        "SELECT id, _stele_txn_id, _stele_committed_at \
+         FROM acct FOR VALID_TIME FROM 0 TO 100",
+    );
+    assert_eq!(prov.rows.len(), 3);
+    for row in &prov.rows {
+        let id = dec_i32(row[0].as_deref());
+        let point = run_rows(
+            &mut engine,
+            &format!("SELECT _stele_txn_id, _stele_committed_at FROM acct WHERE id = {id}"),
+        );
+        assert_eq!(point.rows.len(), 1, "one live row per key at now");
+        assert!(
+            row[1].is_some() && row[2].is_some(),
+            "provenance is never NULL"
+        );
+        assert_eq!(row[1], point.rows[0][0], "txn_id matches the point read");
+        assert_eq!(
+            row[2], point.rows[0][1],
+            "committed_at matches the point read"
+        );
+    }
 }
 
 #[test]
