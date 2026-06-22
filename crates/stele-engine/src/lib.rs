@@ -4820,6 +4820,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// right input's scan accounting. Only the key columns are decoded; the
     /// accumulated and right value columns stay opaque bytes (gathered by index), so
     /// a carried-through column is never forced through the evaluator.
+    #[allow(clippy::too_many_arguments)] // accumulated state + step + both pins + RYOW overlay + scope
     fn join_step(
         &self,
         acc_cols: &[Column],
