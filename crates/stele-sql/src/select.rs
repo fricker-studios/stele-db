@@ -5480,6 +5480,15 @@ pub fn apply_session_time(
     if system.is_none() && valid.is_none() {
         return;
     }
+    // A `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` range scan ([STL-244])
+    // lifts its qualifier off the token stream like an `AS OF` point, so the residual
+    // query still looks like a plain single-table read here. The binder rejects a
+    // range combined with a point `AS OF`, so injecting a session pin would turn an
+    // otherwise-valid range scan into a bind error — leave it untouched, mirroring
+    // [`cap_unbounded_select`].
+    if stmt.temporal.range.is_some() {
+        return;
+    }
     // Only a read whose shape accepts an `AS OF` is eligible: a plain single-table
     // read or a two-table join of named base tables. Everything else would error if
     // one were injected, so leave it (and the session pin) untouched.
@@ -5488,16 +5497,6 @@ pub fn apply_session_time(
     };
     let Some(targets) = session_pin_targets(query) else {
         return;
-    };
-    // Resolve valid-axis eligibility before mutating `stmt` (the borrow of `query` is
-    // immutable; the injection below needs `&mut stmt.temporal`). A CTE / derived name
-    // shadows any base table of the same name and is system-only, so a target the
-    // `WITH` list names never carries a valid pin.
-    let valid_eligible = {
-        let cte_names = cte_names(query);
-        targets
-            .iter()
-            .all(|t| !cte_names.contains(t) && is_valid_time_table(t))
     };
     let has_system = stmt
         .temporal
@@ -5509,13 +5508,25 @@ pub fn apply_session_time(
         .as_of
         .iter()
         .any(|a| a.dimension == TimeDimension::Valid);
+    // Resolve valid-axis eligibility only when a valid pin is actually set and the
+    // statement does not already qualify the valid axis — a system-only pin consults
+    // neither the catalog predicate nor the `WITH` list (`&&` short-circuits). The
+    // borrow of `query` is immutable and ends here, before the injection mutates
+    // `stmt.temporal`. A CTE / derived name shadows any same-named base table and is
+    // system-only, so a target the `WITH` list names never carries a valid pin.
+    let valid_eligible = valid.is_some() && !has_valid && {
+        let cte_names = cte_names(query);
+        targets
+            .iter()
+            .all(|t| !cte_names.contains(t) && is_valid_time_table(t))
+    };
     // An explicit microsecond instant, the form `resolve_as_of` reads straight back
     // to the same value — so the injected qualifier is identical to one a user
     // could have written by hand.
     let instant =
         |micros: SystemTimeMicros| Expr::Value(Value::Number(micros.0.to_string(), false).into());
     // The system pin applies over any eligible shape; the valid pin only when every
-    // input has a valid axis (else withheld, not an error — see the doc comment).
+    // input has a valid axis (`valid_eligible`, else withheld — not an error).
     if let Some(micros) = system
         && !has_system
     {
@@ -5525,7 +5536,6 @@ pub fn apply_session_time(
         });
     }
     if let Some(micros) = valid
-        && !has_valid
         && valid_eligible
     {
         stmt.temporal.as_of.push(AsOf {
@@ -8371,6 +8381,45 @@ mod tests {
         );
         let [as_of] = stmt.temporal.as_of.as_slice() else {
             panic!("only the system pin injects over a system-only single table");
+        };
+        assert_eq!(as_of.dimension, TimeDimension::System);
+    }
+
+    #[test]
+    fn session_time_leaves_a_system_range_scan_untouched() {
+        // A `FOR SYSTEM_TIME FROM/BETWEEN` range scan ([STL-244]) lifts its qualifier
+        // off the token stream like an `AS OF` point, so its residual query looks
+        // single-table here — but the binder rejects a range combined with a point
+        // `AS OF`, so the session pin must not inject one ([STL-325], mirroring
+        // `cap_unbounded_select`).
+        let mut range = parse_one("SELECT id FROM booking FOR SYSTEM_TIME FROM 100 TO 200");
+        assert!(
+            range.temporal.range.is_some(),
+            "the range qualifier is lifted off the token stream"
+        );
+        apply_session_time(
+            &mut range,
+            Some(SystemTimeMicros(111)),
+            Some(SystemTimeMicros(222)),
+            |_| true,
+        );
+        assert!(
+            range.temporal.as_of.is_empty(),
+            "a session pin must not inject an AS OF into a range scan"
+        );
+    }
+
+    #[test]
+    fn a_system_only_pin_does_not_consult_the_valid_axis_predicate() {
+        // With no valid pin set the catalog predicate must not be consulted ([STL-325]):
+        // a system-only pin needs no valid-axis resolution. A panicking closure proves
+        // the `valid.is_some()` short-circuit.
+        let mut stmt = parse_one("SELECT a.x FROM a JOIN b ON a.id = b.id");
+        apply_session_time(&mut stmt, Some(SystemTimeMicros(111)), None, |_| {
+            panic!("the valid-axis predicate was consulted with no valid pin set")
+        });
+        let [as_of] = stmt.temporal.as_of.as_slice() else {
+            panic!("the system pin injects exactly one AS OF");
         };
         assert_eq!(as_of.dimension, TimeDimension::System);
     }
