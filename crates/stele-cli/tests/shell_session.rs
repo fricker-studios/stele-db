@@ -938,7 +938,7 @@ async fn scram_session_authenticates_via_pgpass_file() {
     // The shell dials --host 127.0.0.1, the database defaults to "stele", and the
     // user is alice — so this is an all-fields-pinned match, port included.
     let line = format!("127.0.0.1:{}:stele:alice:s3cret\n", addr.port());
-    let (_dir, pgpass) = write_pgpass("pgpass-ok", &line, 0o600);
+    let (dir, pgpass) = write_pgpass("pgpass-ok", &line, 0o600);
     let output = tokio::task::spawn_blocking(move || {
         run_shell_env(
             addr,
@@ -949,6 +949,10 @@ async fn scram_session_authenticates_via_pgpass_file() {
     })
     .await
     .expect("shell task");
+    // The scratch dir (and its .pgpass) must outlive the child the shell spawns;
+    // `dir` already lives to end-of-scope, but drop it explicitly here so the
+    // requirement reads at the call site rather than relying on the binding name.
+    drop(dir);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -974,7 +978,7 @@ async fn a_group_readable_pgpass_file_is_ignored_with_a_warning() {
     let addr = spawn_scram_server(&[("alice", "s3cret")]).await;
     let line = format!("127.0.0.1:{}:stele:alice:s3cret\n", addr.port());
     // 0640 — group-readable, so too permissive for a password file.
-    let (_dir, pgpass) = write_pgpass("pgpass-perm", &line, 0o640);
+    let (dir, pgpass) = write_pgpass("pgpass-perm", &line, 0o640);
     let output = tokio::task::spawn_blocking(move || {
         run_shell_env(
             addr,
@@ -985,6 +989,8 @@ async fn a_group_readable_pgpass_file_is_ignored_with_a_warning() {
     })
     .await
     .expect("shell task");
+    // Keep the scratch .pgpass alive until the shell process has finished with it.
+    drop(dir);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
