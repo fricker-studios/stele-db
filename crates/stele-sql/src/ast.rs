@@ -259,7 +259,7 @@ pub struct Temporal {
 }
 
 /// A parsed `FOR <dimension> { FROM <from> TO <to> | BETWEEN <from> AND <to> }`
-/// range qualifier ([STL-244]).
+/// range qualifier ([STL-244] system axis, [STL-328] valid axis).
 ///
 /// The SQL:2011 temporal range forms return **all** versions whose interval
 /// overlaps the range, not just the one live at a point.
@@ -271,8 +271,9 @@ pub struct Temporal {
 /// to a concrete microsecond instant, the same way an `AS OF` operand folds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemporalRange {
-    /// Which time axis the range applies to. Only `SYSTEM_TIME` binds at v0.3;
-    /// the valid axis is rejected at bind time as a tracked follow-up.
+    /// Which time axis the range applies to. Both bind: `SYSTEM_TIME` returns the
+    /// version history over a system interval ([STL-244]), `VALID_TIME` every
+    /// version whose valid interval overlaps the range ([STL-328]).
     pub dimension: TimeDimension,
     /// The inclusive lower bound of the range.
     pub from: Expr,
