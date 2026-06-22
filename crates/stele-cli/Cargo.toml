@@ -61,6 +61,19 @@ x509-parser      = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["term"] }
 
+# The Windows half of the no-echo password prompt (STL-335) clears the console
+# input handle's `ENABLE_ECHO_INPUT` bit via `windows-sys`'s console API — the
+# echo-suppression recipe Windows password prompts use, the cross-platform mate
+# of the `nix` termios path above. `windows-sys` is already compiled into the
+# binary many times over (tokio, mio, rustls, … all pull it), so naming it for
+# this target adds no new supply-chain surface; the auth path takes no new
+# external dependency.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
 [dev-dependencies]
 # The scripted-shell integration test boots an in-process engine + pgwire
 # server on an ephemeral port, then drives the real `stele` binary against it.

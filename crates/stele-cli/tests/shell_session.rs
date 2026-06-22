@@ -124,6 +124,14 @@ fn run_shell_env(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // STL-335: the shell now consults `~/.pgpass`/`$PGPASSFILE` between PGPASSWORD
+    // and the prompt. Make every scripted session hermetic — a private empty HOME
+    // and no PGPASSFILE — so a developer's real password file cannot leak in and
+    // silently authenticate a "no-password" test. The `.pgpass` tests below
+    // override these through `env`. (HOME is otherwise unused by a scripted shell —
+    // history is interactive-only.)
+    let home = Scratch::new("home");
+    command.env("HOME", home.path()).env_remove("PGPASSFILE");
     for (key, value) in env {
         match value {
             Some(v) => {
@@ -898,6 +906,100 @@ async fn scram_session_without_a_password_points_at_pgpassword() {
     assert!(
         stderr.contains("PGPASSWORD"),
         "expected guidance to set PGPASSWORD, got: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `~/.pgpass` password file (STL-335)
+// ---------------------------------------------------------------------------
+
+/// Write a `.pgpass` file with `contents` and unix mode `mode` under a fresh
+/// scratch dir (kept alive by the returned [`Scratch`]); returns its path as a
+/// UTF-8 string for `$PGPASSFILE`. The permission bits are the point of the
+/// test, so they are set explicitly rather than left to the umask.
+#[cfg(unix)]
+fn write_pgpass(label: &str, contents: &str, mode: u32) -> (Scratch, String) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = Scratch::new(label);
+    let path = dir.path().join("pgpass");
+    std::fs::write(&path, contents).expect("write pgpass");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod pgpass");
+    let path = path.to_str().expect("utf-8 path").to_owned();
+    (dir, path)
+}
+
+/// With no `PGPASSWORD`, the shell reads the SCRAM password from the libpq
+/// password file (`$PGPASSFILE`), in psql's resolution slot. A `0600` file whose
+/// line matches host/port/database/user authenticates end to end.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scram_session_authenticates_via_pgpass_file() {
+    let addr = spawn_scram_server(&[("alice", "s3cret")]).await;
+    // The shell dials --host 127.0.0.1, the database defaults to "stele", and the
+    // user is alice — so this is an all-fields-pinned match, port included.
+    let line = format!("127.0.0.1:{}:stele:alice:s3cret\n", addr.port());
+    let (_dir, pgpass) = write_pgpass("pgpass-ok", &line, 0o600);
+    let output = tokio::task::spawn_blocking(move || {
+        run_shell_env(
+            addr,
+            "SELECT 1;\n\\q\n",
+            &["--user", "alice"],
+            &[("PGPASSWORD", None), ("PGPASSFILE", Some(&pgpass))],
+        )
+    })
+    .await
+    .expect("shell task");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "a clean .pgpass session wrote to stderr: {stderr}"
+    );
+    // The query ran past authentication — the password came from the file.
+    assert!(stdout.contains("(1 row)"), "{stdout}");
+}
+
+/// libpq behavior: a `.pgpass` with group or world access is ignored — the shell
+/// warns and falls through to the no-password path rather than read a secret from
+/// a file other users can see. Scripted, that surfaces the "set PGPASSWORD"
+/// guidance (proving the exposed file was *not* silently used).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_group_readable_pgpass_file_is_ignored_with_a_warning() {
+    let addr = spawn_scram_server(&[("alice", "s3cret")]).await;
+    let line = format!("127.0.0.1:{}:stele:alice:s3cret\n", addr.port());
+    // 0640 — group-readable, so too permissive for a password file.
+    let (_dir, pgpass) = write_pgpass("pgpass-perm", &line, 0o640);
+    let output = tokio::task::spawn_blocking(move || {
+        run_shell_env(
+            addr,
+            "SELECT 1;\n\\q\n",
+            &["--user", "alice"],
+            &[("PGPASSWORD", None), ("PGPASSFILE", Some(&pgpass))],
+        )
+    })
+    .await
+    .expect("shell task");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "an ignored .pgpass must not authenticate"
+    );
+    // The libpq permissions warning…
+    assert!(
+        stderr.contains("group or world access"),
+        "expected a permissions warning, got: {stderr}"
+    );
+    // …and the fall-through to the no-password guidance (the secret was not used).
+    assert!(
+        stderr.contains("PGPASSWORD"),
+        "expected fall-through to PGPASSWORD guidance, got: {stderr}"
     );
 }
 

@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 
 mod client;
 mod highlight;
+mod pgpass;
 mod render;
 mod shell;
 mod theme;
