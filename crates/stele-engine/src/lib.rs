@@ -73,7 +73,9 @@ use stele_common::provenance::{self, Principal, TxnId};
 use stele_common::query_stats::QueryStats;
 use stele_common::row_codec::{self, RowCodecError};
 use stele_common::scram::{self, ScramVerifier};
-use stele_common::time::{Clock, SYSTEM_TIME_OPEN, SystemTimeMicros, ValidTimeMicros};
+use stele_common::time::{
+    Clock, SYSTEM_TIME_OPEN, SystemTimeMicros, VALID_TIME_OPEN, ValidTimeMicros,
+};
 use stele_common::types::{LogicalType, ScalarValue};
 use stele_exec::{
     AggregateFunc as ExecAggregateFunc, Aggregator, ArithOp as ExecArithOp, Batch, CmpOp, Column,
@@ -91,6 +93,7 @@ use stele_sql::select::{
     BoundPeriodPredicate, BoundPredicate, BoundScalar, BoundSelect, BoundSubqueryFilter, CompareOp,
     Correlation, HavingScalar, JoinType, OutputItem, PeriodEndpoint, Projection, ProjectionItem,
     ProjectionValue, SelectError, SemiAntiDecorrelation, SortTarget, SubqueryKind, SystemTimeRange,
+    ValidTimeRange,
 };
 use stele_sql::{
     AdminCommand, BindContext, BindError, BoundCopy, CopyError, CopyShape, Statement,
@@ -3221,12 +3224,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .map(|c| (c.name().to_owned(), c.ty()))
             .collect();
         let n_schema = schema_columns.len();
-        // A range scan ([STL-244]) appends the period endpoints after the projected
-        // user columns, and has no provenance pseudo-columns in its addressable set.
-        if bound.system_range.is_some() {
+        // A range scan ([STL-244] system axis, [STL-328] valid axis) appends the
+        // period endpoints after the projected user columns, and has no provenance
+        // pseudo-columns in its addressable set.
+        if let Some((from_col, to_col)) = range_endpoint_names(bound) {
             let mut columns = projected_columns(&bound.projection, &schema_columns, n_schema);
-            columns.push(("sys_from".to_owned(), LogicalType::TimestampTz));
-            columns.push(("sys_to".to_owned(), LogicalType::TimestampTz));
+            columns.push((from_col.to_owned(), LogicalType::TimestampTz));
+            columns.push((to_col.to_owned(), LogicalType::TimestampTz));
             return Ok(columns);
         }
         Ok(projected_columns(
@@ -3327,6 +3331,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // CTE / overlay-sensitive) that the single-table path below threads.
         if let Some(range) = bound.system_range {
             return self.run_system_range(bound, range);
+        }
+
+        // A `FOR VALID_TIME { FROM a TO b | BETWEEN a AND b }` range scan ([STL-328])
+        // is the valid-axis mirror: every version system-live at the snapshot whose
+        // valid interval overlaps the range, with the period endpoints (`valid_from`,
+        // `valid_to`) appended. Same wholly-different shape, same binder rejections.
+        if let Some(range) = bound.valid_range {
+            return self.run_valid_range(bound, range);
         }
 
         // A `FROM` that names a materialized relation — a CTE reference or a derived
@@ -3846,6 +3858,126 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let mut columns = projected_columns(&bound.projection, &schema_columns, n_schema);
         columns.push(("sys_from".to_owned(), LogicalType::TimestampTz));
         columns.push(("sys_to".to_owned(), LogicalType::TimestampTz));
+        let out_rows: Vec<Vec<Option<Vec<u8>>>> = rows
+            .iter()
+            .map(|row| {
+                let mut out: Vec<Option<Vec<u8>>> =
+                    projection.iter().map(|&i| row[i].clone()).collect();
+                out.push(row[n_schema].clone());
+                out.push(row[n_schema + 1].clone());
+                out
+            })
+            .collect();
+        let result_stats = query_stats(&stats, out_rows.len(), snapshot);
+        Ok(StatementOutcome::Rows(SelectResult {
+            columns,
+            rows: out_rows,
+            stats: Some(result_stats),
+        }))
+    }
+
+    /// Run a `FOR VALID_TIME { FROM a TO b | BETWEEN a AND b }` range scan
+    /// ([STL-328]) — the valid-axis mirror of [`run_system_range`](Self::run_system_range).
+    /// Return every version **system-live at the statement snapshot** whose valid
+    /// interval `[valid_from, valid_to)` overlaps the range, with the period
+    /// endpoints (`valid_from`, `valid_to`, both `TIMESTAMPTZ`) appended after the
+    /// projected columns. `valid_to` is `NULL` for an open-ended ("until changed")
+    /// fact, mirroring how `sys_to` renders for a still-current version.
+    ///
+    /// The version selection is the executor's valid-interval mode
+    /// ([`SnapshotScan::execute_valid_range`]), which surfaces each version's valid
+    /// interval alongside the bare user row (read from the delta frame or the sealed
+    /// `valid_from` / `valid_to` columns); the engine reconstructs the row from that
+    /// bare payload, applies the bound `WHERE` over the schema columns (the appended
+    /// endpoints ride along, never referenced), then projects and appends the
+    /// endpoints. A key-equality `WHERE` is pushed down for zone-map pruning; the
+    /// binder has rejected every other clause the point path threads.
+    ///
+    /// Read-committed only, like the system-axis range and the join path
+    /// ([STL-203] read-your-own-writes is a tracked follow-up).
+    fn run_valid_range(
+        &self,
+        bound: &BoundSelect,
+        range: ValidTimeRange,
+    ) -> Result<StatementOutcome, EngineError> {
+        let table = bound.table.as_str();
+        let snapshot = bound.snapshot;
+        let state = self
+            .tables
+            .get(table)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
+        let schema = self
+            .catalog
+            .resolve(table, snapshot)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
+        let schema_columns: Vec<(String, LogicalType)> = schema
+            .columns()
+            .iter()
+            .map(|c| (c.name().to_owned(), c.ty()))
+            .collect();
+        let value_count = schema_columns.len().saturating_sub(1);
+        let n_schema = schema_columns.len();
+
+        // Push a business-key equality down for zone-map pruning when the `WHERE`
+        // pins one; the row filter below re-applies the full predicate. The scan's
+        // [`valid_range`](SnapshotScan::valid_range) builder declares the valid-time
+        // policy itself (a valid range is always over a valid-time table — the binder
+        // proved it), so the delta tier's framed payload is stripped to the bare row.
+        let predicate = bound
+            .filter
+            .as_ref()
+            .and_then(BoundPredicate::key_equality)
+            .map_or(Predicate::All, |value| Predicate::Eq {
+                column: ColumnId::BusinessKey,
+                value: ZoneBound::Bytes(encode_value(value)),
+            });
+        let readers = state.engine.open_segment_readers()?;
+        let scan = SnapshotScan::new(
+            state.engine.delta(),
+            state.engine.index(),
+            &readers,
+            Snapshot(snapshot),
+        )
+        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .filter(predicate)
+        .valid_range(range.from.0, range.to.0, range.closed_upper)
+        .metrics(Arc::clone(&self.metrics));
+        let (versions, stats) = scan.execute_valid_range()?;
+
+        // Reconstruct each row as `[key, value cells…, valid_from, valid_to]`. The
+        // value cells decode from the bare payload (the valid-time period columns
+        // ride the row codec too, so a `SELECT *` still reads the user's `vf`/`vt`);
+        // the appended endpoints are the resolved valid interval — `valid_to` is
+        // `NULL` for an open-ended (`+∞`) period.
+        let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(versions.len());
+        for (v, interval) in &versions {
+            let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(n_schema + 2);
+            row.push(Some(v.business_key.as_bytes().to_vec()));
+            row.extend(row_codec::decode_payload(
+                value_count,
+                v.payload.as_deref(),
+            )?);
+            let open = interval.to == VALID_TIME_OPEN;
+            row.push(Some(encode_value(&ScalarValue::TimestampTz(
+                interval.from.0,
+            ))));
+            row.push((!open).then(|| encode_value(&ScalarValue::TimestampTz(interval.to.0))));
+            rows.push(row);
+        }
+
+        // The bound `WHERE` is a plain value-column predicate (subquery / period are
+        // rejected at bind); it filters over the schema columns, the trailing
+        // endpoint cells (indices `n_schema`, `n_schema + 1`) riding along untouched.
+        let plan = filter_plan(bound);
+        let rows = filter_rows(&plan, &schema_columns, rows)?;
+
+        // Project the user columns, then append the two endpoint columns.
+        let projection = projection_indices(&bound.projection, &schema_columns, n_schema);
+        let (from_name, to_name) =
+            range_endpoint_names(bound).expect("a valid-range scan names its endpoints");
+        let mut columns = projected_columns(&bound.projection, &schema_columns, n_schema);
+        columns.push((from_name.to_owned(), LogicalType::TimestampTz));
+        columns.push((to_name.to_owned(), LogicalType::TimestampTz));
         let out_rows: Vec<Vec<Option<Vec<u8>>>> = rows
             .iter()
             .map(|row| {
@@ -4892,6 +5024,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // A range scan is never lowered to one of these synthetic DML
             // probe/scan plans ([STL-244]).
             system_range: None,
+            valid_range: None,
             projection: Projection::Items(vec![ProjectionItem::column(key_col.name())]),
             filter: Some(BoundPredicate {
                 left: BoundScalar::Column(0),
@@ -4982,6 +5115,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // A range scan is never lowered to one of these synthetic DML
             // probe/scan plans ([STL-244]).
             system_range: None,
+            valid_range: None,
             projection: Projection::Items(vec![ProjectionItem::column(key_col)]),
             filter: Some(BoundPredicate {
                 left: BoundScalar::Column(0),
@@ -5193,6 +5327,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // A range scan is never lowered to one of these synthetic DML
             // probe/scan plans ([STL-244]).
             system_range: None,
+            valid_range: None,
             projection: Projection::Items(vec![ProjectionItem::column(key_col.name())]),
             filter,
             period_filter: None,
@@ -5318,6 +5453,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // A range scan is never lowered to one of these synthetic DML
             // probe/scan plans ([STL-244]).
             system_range: None,
+            valid_range: None,
             projection: Projection::Items(vec![ProjectionItem::column(key_name)]),
             filter: None,
             period_filter: None,
@@ -5514,6 +5650,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     snapshot,
                     valid_snapshot: None,
                     system_range: None,
+                    valid_range: None,
                     projection: Projection::Items(
                         columns
                             .iter()
@@ -7951,6 +8088,22 @@ fn projection_indices(
 /// streaming read (`run_select`) and the parameter-free statement `Describe`
 /// (`SessionEngine::describe`), so both agree on a `SELECT`'s `RowDescription`
 /// shape, pseudo-columns included.
+/// The names of the period-endpoint columns a range scan appends after its
+/// projected user columns, or `None` for a non-range read. A system range
+/// ([STL-244]) appends `(sys_from, sys_to)`, a valid range ([STL-328])
+/// `(valid_from, valid_to)`; both are `TIMESTAMPTZ`, with a `NULL` upper for an
+/// open-ended period. Centralized so the `Describe` shape ([`SessionEngine::output_columns`])
+/// and the executed result name them identically.
+const fn range_endpoint_names(bound: &BoundSelect) -> Option<(&'static str, &'static str)> {
+    if bound.system_range.is_some() {
+        Some(("sys_from", "sys_to"))
+    } else if bound.valid_range.is_some() {
+        Some(("valid_from", "valid_to"))
+    } else {
+        None
+    }
+}
+
 fn projected_columns(
     projection: &Projection,
     columns: &[(String, LogicalType)],

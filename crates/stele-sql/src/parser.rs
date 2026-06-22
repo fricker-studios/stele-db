@@ -1228,6 +1228,19 @@ mod range_tests {
     }
 
     #[test]
+    fn valid_time_range_lifts_on_the_valid_axis() {
+        // The grammar is symmetric across axes ([STL-328]): a `FOR VALID_TIME`
+        // range lifts the same way, tagged with the valid dimension.
+        let from_to = range("SELECT * FROM t FOR VALID_TIME FROM 10 TO 20");
+        assert_eq!(from_to.dimension, TimeDimension::Valid);
+        assert!(!from_to.closed_upper, "FROM..TO is half-open");
+
+        let between = range("SELECT * FROM t FOR VALID_TIME BETWEEN 10 AND 20");
+        assert_eq!(between.dimension, TimeDimension::Valid);
+        assert!(between.closed_upper, "BETWEEN..AND is closed");
+    }
+
+    #[test]
     fn range_leaves_a_clean_standard_sql_body() {
         // The qualifier is lifted off, so the body is a plain `SELECT … WHERE`.
         let stmt = parse_one_ok("SELECT id FROM t FOR SYSTEM_TIME FROM 1 TO 9 WHERE id = 1");

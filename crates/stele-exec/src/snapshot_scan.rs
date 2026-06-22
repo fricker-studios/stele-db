@@ -116,7 +116,9 @@ use stele_storage::segment::{
     ColumnData, ColumnId, Predicate, SegmentError, SegmentReader, ZoneBound,
 };
 use stele_storage::validity::{ValidityError, ValidityIndex};
-use stele_storage::validtime::{VALID_TIME_PREFIX_LEN, ValidTimeError, unframe_payload};
+use stele_storage::validtime::{
+    VALID_TIME_PREFIX_LEN, ValidInterval, ValidTimeError, unframe_payload,
+};
 
 /// A sealed row's identity — its `(business_key, sys_from, seq)` triple, the key
 /// the validity index and the per-key version chains are keyed by (STL-145).
@@ -776,6 +778,71 @@ impl SystemRange {
     }
 }
 
+/// A valid-time **range** for an interval read ([STL-328]) — the valid-axis
+/// mirror of [`SystemRange`]. The [`SnapshotScan`]'s valid-interval mode keeps
+/// every system-live version whose valid interval `[valid_from, valid_to)`
+/// overlaps it.
+///
+/// [`closed_upper`](Self::closed_upper) selects the upper bound's inclusivity:
+/// `false` is the half-open `FROM lo TO hi` (`[lo, hi)`), `true` the closed
+/// `BETWEEN lo AND hi` (`[lo, hi]`). The half-open vs closed distinction is the
+/// single `<` vs `<=` difference [`overlaps`](Self::overlaps) draws — the
+/// "off-by-one on a half-open interval" boundary class (docs/16 §4). The
+/// boundary microseconds are raw `i64`, the same scale the sealed
+/// `valid_from` / `valid_to` columns and the framed delta payload carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidRange {
+    /// The inclusive lower bound, in valid-time microseconds.
+    pub lo: i64,
+    /// The upper bound, in valid-time microseconds — exclusive when
+    /// [`closed_upper`](Self::closed_upper) is `false`, inclusive when `true`.
+    pub hi: i64,
+    /// `true` for the closed `BETWEEN` (upper inclusive), `false` for the
+    /// half-open `FROM..TO` (upper exclusive).
+    pub closed_upper: bool,
+}
+
+impl ValidRange {
+    /// Whether a version's valid interval `[vf, vt)` overlaps this range.
+    ///
+    /// Identical in form to [`SystemRange::overlaps`] — both decide whether a
+    /// half-open interval reaches into a half-open / closed query window — but on
+    /// the valid axis the interval's end is the stored
+    /// [`VALID_TIME_OPEN`](stele_common::time::VALID_TIME_OPEN) (`i64::MAX`) for an
+    /// open-ended ("until changed") fact rather than the index-overlaid `sys_to`.
+    /// The test is:
+    ///
+    /// * the interval is **non-empty** (`vf < vt`);
+    /// * it **reaches into** the range (`vt > lo`); and
+    /// * it **begins within** the range — `vf < hi` for the half-open form, or
+    ///   `vf <= hi` for the closed form.
+    #[must_use]
+    pub const fn overlaps(self, vf: i64, vt: i64) -> bool {
+        let begins_in_range = if self.closed_upper {
+            vf <= self.hi
+        } else {
+            vf < self.hi
+        };
+        vf < vt && vt > self.lo && begins_in_range
+    }
+
+    /// The half-open `[lo, hi)` probe the per-segment valid-interval summary
+    /// ([STL-315], [`SegmentReader::might_overlap_valid`]) is pruned against. For
+    /// the closed `BETWEEN [lo, hi]` the inclusive upper edge widens to `hi + 1`
+    /// so a row beginning exactly at `hi` is never pruned away; the prune is
+    /// advisory (the exact [`overlaps`](Self::overlaps) filter re-applies per row),
+    /// so a wider-than-necessary probe only costs a missed skip, never a dropped
+    /// match.
+    const fn prune_probe(self) -> (i64, i64) {
+        let hi = if self.closed_upper {
+            self.hi.saturating_add(1)
+        } else {
+            self.hi
+        };
+        (self.lo, hi)
+    }
+}
+
 /// The `SnapshotScan { table, snapshot, projection, predicates }` operator.
 ///
 /// A "table" at v0.1 is its storage tiers: the `delta` handle, the `index`
@@ -808,6 +875,15 @@ pub struct SnapshotScan<'a, D: Disk, I: Disk, F: DiskFile> {
     /// [`execute_range`](Self::execute_range) return **every** version whose system
     /// interval `[sys_from, sys_to)` overlaps the range.
     interval: Option<SystemRange>,
+    /// The valid-time range to resolve in **valid-interval mode**, set via
+    /// [`valid_range`](Self::valid_range) ([STL-328]). `None` is the default; with
+    /// `Some(range)` [`execute_valid_range`](Self::execute_valid_range) returns
+    /// every version system-live at [`snapshot`](Self::new) whose valid interval
+    /// `[valid_from, valid_to)` overlaps the range, paired with that interval. The
+    /// valid-axis mirror of [`interval`](Self::interval); the two are mutually
+    /// exclusive (the engine routes a system range and a valid range to different
+    /// execute methods).
+    valid_interval: Option<ValidRange>,
     /// A half-open valid-time probe `[lo, hi)` to prune segments against, set via
     /// [`prune_valid_overlap`](Self::prune_valid_overlap) ([STL-315]). **Prune
     /// hint only** — unlike [`valid_snapshot`](Self::valid_snapshot) it filters no
@@ -850,6 +926,7 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             valid_snapshot: None,
             valid_time: false,
             interval: None,
+            valid_interval: None,
             valid_overlap: None,
             projection: ColumnId::ALL.to_vec(),
             predicate: Predicate::All,
@@ -945,6 +1022,37 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             hi,
             closed_upper,
         });
+        self
+    }
+
+    /// Turn this scan into a **valid-interval** read over the valid-time range
+    /// `[lo, hi)` (half-open, `closed_upper == false`) or `[lo, hi]` (closed,
+    /// `closed_upper == true`) ([STL-328]) — the valid-axis mirror of
+    /// [`system_range`](Self::system_range).
+    ///
+    /// [`execute_valid_range`](Self::execute_valid_range) then returns every
+    /// version **system-live at [`snapshot`](Self::new)** whose valid interval
+    /// `[valid_from, valid_to)` overlaps the range, each paired with that interval
+    /// so the caller can expose the period endpoints. The system axis is a point
+    /// (the snapshot), the valid axis the range — `v(k, snapshot, V_range)`. Only
+    /// meaningful for a valid-time table, so this sets [`valid_time`](Self::valid_time)
+    /// (the delta payload is framed) and a segment-pruning probe
+    /// ([`prune_valid_overlap`](Self::prune_valid_overlap)) for the backdated-write
+    /// scatter case.
+    #[must_use]
+    pub const fn valid_range(mut self, lo: i64, hi: i64, closed_upper: bool) -> Self {
+        let range = ValidRange {
+            lo,
+            hi,
+            closed_upper,
+        };
+        self.valid_interval = Some(range);
+        // A valid range is only ever supplied for a valid-time table: its delta
+        // payload is framed, so keep `valid_time` consistent (like `valid_as_of`).
+        self.valid_time = true;
+        // Reuse the STL-315 per-segment valid-interval summary as a segment skip —
+        // a sound, advisory prune the exact row filter below re-applies.
+        self.valid_overlap = Some(range.prune_probe());
         self
     }
 
@@ -1455,6 +1563,179 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
             by_id.insert((v.business_key.clone(), v.sys_from, v.seq), v);
         }
         Ok((by_id.into_values().collect(), stats))
+    }
+
+    /// Execute the scan in **valid-interval mode** ([STL-328]): resolve every
+    /// version system-live at [`snapshot`](Self::new) whose valid interval
+    /// `[valid_from, valid_to)` overlaps the range set by
+    /// [`valid_range`](Self::valid_range), across both tiers, with the projected
+    /// bulk columns materialized. Each returned [`Version`] is paired with its
+    /// resolved [`ValidInterval`] — read from the delta tier's framed payload
+    /// ([`unframe_payload`]) or the sealed tier's first-class `valid_from` /
+    /// `valid_to` columns ([STL-117]) — so the caller can expose the period
+    /// endpoints. The returned payload is the **bare** user row (the delta frame
+    /// stripped), exactly as a no-pin valid-time read emits it ([STL-218]).
+    ///
+    /// The valid-axis mirror of [`execute_range`](Self::execute_range), but pinned
+    /// to one system instant: a key has one system-live version per system snapshot
+    /// (corrections supersede on the system axis, docs/16 §5), so this returns at
+    /// most one row per key — the one whose current valid window overlaps the
+    /// range.
+    ///
+    /// # Panics
+    ///
+    /// If [`valid_range`](Self::valid_range) was not set — the caller routes a
+    /// valid range scan here and a point scan to [`execute`](Self::execute).
+    ///
+    /// # Errors
+    ///
+    /// [`ScanError`] if a tier read fails or a framed delta payload cannot be
+    /// decoded.
+    pub fn execute_valid_range(
+        &self,
+    ) -> Result<(Vec<(Version, ValidInterval)>, ScanStats), ScanError> {
+        let range = self
+            .valid_interval
+            .expect("execute_valid_range requires a valid_range to be set");
+        let (rows, stats) = self.resolve_rows_in_valid_range(range)?;
+        if let Some(m) = &self.metrics {
+            stats.record(m);
+        }
+        // Apply the pushed-down predicate exactly as the point path does — the
+        // engine pushes only the business-key zone constraint (the full `WHERE` runs
+        // over the reconstructed rows), so this is the same exact row filter.
+        let filtered = rows
+            .into_iter()
+            .filter(|(v, _)| predicate_matches(&self.predicate, v))
+            .collect();
+        Ok((filtered, stats))
+    }
+
+    /// Resolve every version system-live at the snapshot whose valid interval
+    /// overlaps `range`, across both tiers, paired with that interval — the
+    /// valid-interval-mode resolver. Mirrors [`resolve_rows`](Self::resolve_rows)
+    /// (a system-time point read), but instead of stripping the valid axis it
+    /// **keeps** the interval and filters by overlap rather than returning the one
+    /// version live on both axes at a point.
+    fn resolve_rows_in_valid_range(
+        &self,
+        range: ValidRange,
+    ) -> Result<(Vec<(Version, ValidInterval)>, ScanStats), ScanError> {
+        // Delta tier: the one version per key system-live at the snapshot, its valid
+        // interval unframed from the payload; kept iff that interval overlaps the
+        // range, then the 16-byte prefix stripped to the bare user row (the sealed
+        // tier already stores it bare).
+        let key_range = predicate_key_range(&self.predicate);
+        let delta_live = self
+            .delta
+            .range_scan(key_range, self.snapshot, self.index)?;
+        let mut delta_out: Vec<(Version, ValidInterval)> = Vec::new();
+        for mut v in delta_live {
+            let interval = {
+                let stored = v.payload.as_deref().unwrap_or_default();
+                let (interval, _user) = unframe_payload(true, stored)?;
+                interval.expect("a valid-time table's payload frames an interval")
+            };
+            if range.overlaps(interval.from.0, interval.to.0) {
+                if let Some(payload) = v.payload.as_mut() {
+                    payload.drain(0..VALID_TIME_PREFIX_LEN);
+                }
+                delta_out.push((v, interval));
+            }
+        }
+
+        let needed = self.materialized_columns();
+
+        // Sealed tier: the system-live survivors at the snapshot (the point-read
+        // bounds — begins-after and ends-before are both the snapshot), with their
+        // valid interval read from the first-class `valid_from` / `valid_to`
+        // columns; kept iff overlapping, then late-materialized so a row dropped on
+        // the valid axis never has its payload read.
+        let (survivors, stats) = self.prune_segments(self.snapshot, self.snapshot.0)?;
+        let mut locator: BTreeMap<VersionId, (usize, usize)> = BTreeMap::new();
+        let mut identities: Vec<Version> = Vec::new();
+        for (seg_idx, keys) in &survivors {
+            for (row_idx, (bk, sys_from, seq)) in keys {
+                locator.insert((bk.clone(), *sys_from, *seq), (*seg_idx, *row_idx));
+                identities.push(identity_version(bk.clone(), *sys_from, *seq));
+            }
+        }
+        let sealed_chains = merge::fold_chains(identities, self.index)?;
+        let mut sealed_live = merge::resolve_snapshot(&sealed_chains, self.snapshot);
+        let sealed_intervals = self.retain_sealed_overlapping(&mut sealed_live, &locator, range)?;
+        self.materialize_bulk_columns(&mut sealed_live, &locator, &needed)?;
+        let sealed_out = sealed_live.into_iter().map(|v| {
+            let interval = sealed_intervals[&(v.business_key.clone(), v.sys_from, v.seq)];
+            (v, interval)
+        });
+
+        // Union the two per-tier results, deduplicated per key — the intervals are
+        // disjoint across tiers (a key resolves to at most one version in each), so
+        // this only defends a mid-flush overlap, where the greater `(sys_from, seq)`
+        // wins ("latest visible version"), exactly as [`resolve_rows`] does.
+        let mut by_key: BTreeMap<BusinessKey, (Version, ValidInterval)> = BTreeMap::new();
+        for (v, interval) in sealed_out.chain(delta_out) {
+            match by_key.get(&v.business_key) {
+                Some((existing, _)) if (existing.sys_from, existing.seq) >= (v.sys_from, v.seq) => {
+                }
+                _ => {
+                    by_key.insert(v.business_key.clone(), (v, interval));
+                }
+            }
+        }
+        Ok((by_key.into_values().collect(), stats))
+    }
+
+    /// Drop, in place, every system-live sealed row whose valid interval does not
+    /// overlap `range`, returning the kept rows' resolved intervals keyed by
+    /// version identity. The valid-range mirror of
+    /// [`filter_sealed_by_valid`](Self::filter_sealed_by_valid): it reads the same
+    /// two narrow `valid_from` / `valid_to` columns (only the row-groups holding a
+    /// live row, [`RowGroupSelection`]) and runs before bulk materialization, but
+    /// keeps each surviving row's interval so the caller can expose the endpoints.
+    fn retain_sealed_overlapping(
+        &self,
+        sealed_live: &mut Vec<Version>,
+        locator: &BTreeMap<VersionId, (usize, usize)>,
+        range: ValidRange,
+    ) -> Result<BTreeMap<VersionId, ValidInterval>, ScanError> {
+        let live_rows = live_rows_by_segment(sealed_live, locator);
+        let mut valid_by_seg: BTreeMap<usize, (RowGroupSelection, Vec<i64>, Vec<i64>)> =
+            BTreeMap::new();
+        for (seg_idx, rows) in live_rows {
+            let sel = RowGroupSelection::new(&self.segments[seg_idx].row_group_row_counts(), &rows);
+            let from = read_i64_column(&self.segments[seg_idx], ColumnId::ValidFrom, &sel.groups)?;
+            let to = read_i64_column(&self.segments[seg_idx], ColumnId::ValidTo, &sel.groups)?;
+            if from.len() != sel.selected_rows || to.len() != sel.selected_rows {
+                return Err(ScanError::Segment(SegmentError::Corrupt(
+                    "valid-time column value count disagrees with the selected row-groups' row count",
+                )));
+            }
+            valid_by_seg.insert(seg_idx, (sel, from, to));
+        }
+        let mut intervals: BTreeMap<VersionId, ValidInterval> = BTreeMap::new();
+        sealed_live.retain(|v| {
+            let (seg_idx, row_idx) = locate(locator, v);
+            let (sel, from, to) = &valid_by_seg[&seg_idx];
+            let local_idx = sel.local_index(row_idx);
+            let (vf, vt) = (from[local_idx], to[local_idx]);
+            if range.overlaps(vf, vt) {
+                // The stored boundaries are a well-formed interval by construction
+                // (the write path rejects an empty valid interval); carry them
+                // verbatim rather than re-validating, so a `+∞` valid_to round-trips.
+                intervals.insert(
+                    (v.business_key.clone(), v.sys_from, v.seq),
+                    ValidInterval {
+                        from: ValidTimeMicros(vf),
+                        to: ValidTimeMicros(vt),
+                    },
+                );
+                true
+            } else {
+                false
+            }
+        });
+        Ok(intervals)
     }
 
     /// The predicate the zone maps (segment- and row-group-level) prune against.
@@ -2188,5 +2469,80 @@ mod range_overlap_tests {
         assert!(!half_open(0, 100).overlaps(10, 10));
         assert!(!closed(0, 100).overlaps(10, 10));
         assert!(!closed(10, 10).overlaps(10, 10));
+    }
+}
+
+#[cfg(test)]
+mod valid_range_overlap_tests {
+    use super::ValidRange;
+    use stele_common::time::VALID_TIME_OPEN;
+
+    const fn half_open(lo: i64, hi: i64) -> ValidRange {
+        ValidRange {
+            lo,
+            hi,
+            closed_upper: false,
+        }
+    }
+
+    const fn closed(lo: i64, hi: i64) -> ValidRange {
+        ValidRange {
+            lo,
+            hi,
+            closed_upper: true,
+        }
+    }
+
+    // The valid axis draws the same half-open / closed boundary the system axis
+    // does (docs/16 §2), over a version valid `[10, 20)`.
+    #[test]
+    fn half_open_and_closed_boundaries() {
+        let (vf, vt) = (10, 20);
+        // Half-open `FROM..TO`: a query starting at the version's exclusive end, or
+        // ending at its inclusive start, just misses.
+        assert!(
+            !half_open(20, 30).overlaps(vf, vt),
+            "[20,30) misses [10,20)"
+        );
+        assert!(!half_open(5, 10).overlaps(vf, vt), "[5,10) misses [10,20)");
+        assert!(half_open(15, 25).overlaps(vf, vt), "[15,25) overlaps");
+        assert!(
+            half_open(10, 20).overlaps(vf, vt),
+            "the exact interval overlaps"
+        );
+        // Closed `BETWEEN` includes its upper instant — the single `<=` difference.
+        assert!(closed(5, 10).overlaps(vf, vt), "[5,10] includes instant 10");
+        assert!(!closed(20, 30).overlaps(vf, vt), "[20,30] misses [10,20)");
+    }
+
+    #[test]
+    fn an_open_ended_fact_overlaps_any_range_reaching_its_start() {
+        // A `+∞` (until-changed) valid_to, the valid-axis analogue of an open
+        // system version.
+        let vt = VALID_TIME_OPEN.0;
+        assert!(half_open(5, 20).overlaps(10, vt), "reaches into [10, +∞)");
+        assert!(half_open(50, 60).overlaps(10, vt), "still valid at 50");
+        assert!(!half_open(5, 8).overlaps(10, vt), "ends before [10, +∞)");
+        assert!(
+            !half_open(5, 10).overlaps(10, vt),
+            "[5,10) excludes instant 10"
+        );
+        assert!(closed(5, 10).overlaps(10, vt), "[5,10] includes instant 10");
+    }
+
+    #[test]
+    fn a_degenerate_interval_never_overlaps() {
+        assert!(!half_open(0, 100).overlaps(10, 10));
+        assert!(!closed(0, 100).overlaps(10, 10));
+    }
+
+    #[test]
+    fn prune_probe_widens_only_the_closed_upper_edge() {
+        // The advisory segment prune is half-open `[lo, hi)`; a closed query widens
+        // the upper edge by one so a row beginning exactly at `hi` survives it.
+        assert_eq!(half_open(10, 20).prune_probe(), (10, 20));
+        assert_eq!(closed(10, 20).prune_probe(), (10, 21));
+        // `i64::MAX` saturates rather than overflowing.
+        assert_eq!(closed(0, i64::MAX).prune_probe(), (0, i64::MAX));
     }
 }
