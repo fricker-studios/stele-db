@@ -45,6 +45,12 @@ getrandom    = { workspace = true }
 # through its blocking `StreamOwned` adapter — still no async client crate.
 rustls           = { workspace = true }
 rustls-pki-types = { workspace = true }
+# Client-side SCRAM-SHA-256-PLUS channel binding (STL-334) selects the RFC 5929
+# `tls-server-end-point` hash from the negotiated leaf certificate's signature
+# algorithm, exactly as the server's `stele-pgwire::tls` does. `x509-parser` is
+# already compiled into the binary (via stele-server → stele-pgwire), so naming
+# it here adds no new supply-chain surface.
+x509-parser      = { workspace = true }
 
 # The interactive no-echo password prompt (STL-296) toggles the terminal's ECHO
 # flag off via `nix`'s `term` (termios) feature, the true-no-echo recipe psql and

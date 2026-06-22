@@ -15,6 +15,16 @@
 //! framing, the mirror of the server's `stele_pgwire::scram` (a dev-only
 //! dependency here, so it is named, not linked).
 //!
+//! **Channel binding** ([STL-334]): over TLS, when the server advertises
+//! `SCRAM-SHA-256-PLUS` ([STL-297]), the client prefers it — computing the RFC
+//! 5929 `tls-server-end-point` binding from the *negotiated* server certificate
+//! and folding it into the `c=` value, so a man-in-the-middle that terminates TLS
+//! with a different certificate cannot relay the proof. The binding's hash is
+//! selected from the leaf certificate's signature algorithm exactly as the server
+//! does (`endpoint_channel_binding`), so both sides compute the identical `c=`.
+//! Off TLS, against a plain-only server, or for a certificate we cannot bind, the
+//! client keeps the plain `SCRAM-SHA-256` + `n` path (it never sends `y`).
+//!
 //! Deliberately hand-rolled rather than pulling in a client crate:
 //! `tokio-postgres` is pinned as a **dev-only** dependency workspace-wide (a
 //! shipped `stele` binary must not grow its supply-chain surface), and the
@@ -40,6 +50,8 @@
 //! [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
 //! [STL-292]: https://allegromusic.atlassian.net/browse/STL-292
 //! [STL-296]: https://allegromusic.atlassian.net/browse/STL-296
+//! [STL-297]: https://allegromusic.atlassian.net/browse/STL-297
+//! [STL-334]: https://allegromusic.atlassian.net/browse/STL-334
 
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
@@ -52,8 +64,11 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::pem::PemObject as _;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
+use stele_common::hash::sha256;
 use stele_common::query_stats::QueryStats;
 use stele_common::scram::{self, ScramVerifier};
+use x509_parser::oid_registry::{OID_PKCS1_SHA256WITHRSA, OID_SIG_ECDSA_WITH_SHA256};
+use x509_parser::prelude::{FromDer as _, X509Certificate};
 
 use crate::render::Column;
 
@@ -79,11 +94,26 @@ const AUTH_SASL: i32 = 10;
 const AUTH_SASL_CONTINUE: i32 = 11;
 const AUTH_SASL_FINAL: i32 = 12;
 
-/// The one SASL mechanism the shell speaks — plain `SCRAM-SHA-256`, no channel
-/// binding. A server that advertises `SCRAM-SHA-256-PLUS` over TLS still offers
-/// plain `SCRAM-SHA-256` alongside it, and the `n` gs2 flag the client sends ("I
-/// do not support channel binding") is accepted on either transport (STL-297).
+/// Plain `SCRAM-SHA-256` — no channel binding. Always offered (alongside `-PLUS`
+/// over TLS), and the floor the shell uses off TLS, against a plain-only server,
+/// or for a certificate it cannot bind. The `n` gs2 flag the client pairs with it
+/// ("I do not support channel binding") is accepted on either transport.
 const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
+
+/// `SCRAM-SHA-256-PLUS` — `tls-server-end-point` channel binding (STL-334), the
+/// mechanism the shell prefers when it runs over TLS and the server advertises it
+/// (STL-297). Selecting it binds the SASL proof to the certificate the TLS
+/// handshake actually negotiated.
+const SCRAM_SHA_256_PLUS: &str = "SCRAM-SHA-256-PLUS";
+
+/// The gs2 header for plain SCRAM: no channel binding (`n`), no authzid. Its
+/// base64 (`biws`) is the whole `c=` value under plain SCRAM.
+const GS2_HEADER_PLAIN: &str = "n,,";
+
+/// The gs2 header for `SCRAM-SHA-256-PLUS`: channel binding required (`p=`) of the
+/// `tls-server-end-point` type, no authzid. Under PLUS the `c=` value is the
+/// base64 of this header followed by the binding data.
+const GS2_HEADER_PLUS: &str = "p=tls-server-end-point,,";
 
 /// Raw client-nonce entropy — 18 bytes → 24 base64 characters, matching the
 /// server's nonce width and Postgres.
@@ -209,12 +239,28 @@ pub struct TlsOpts {
 trait Transport: Read + Write + Send {}
 impl<T: Read + Write + Send> Transport for T {}
 
+/// A negotiated transport paired with the connection's `tls-server-end-point`
+/// channel binding (`None` off TLS or for an unbindable certificate) — what
+/// [`negotiate_tls`] hands back to [`Client::connect`].
+type NegotiatedTransport = (Box<dyn Transport>, Option<Vec<u8>>);
+
 /// A live connection running the simple-query protocol.
 pub struct Client {
     stream: BufReader<Box<dyn Transport>>,
     /// Transaction status byte from the last `ReadyForQuery`:
     /// `I` idle, `T` in a transaction, `E` in a failed transaction.
     txn_status: u8,
+    /// The connection's RFC 5929 `tls-server-end-point` channel binding (STL-334),
+    /// computed once from the server certificate the TLS handshake negotiated.
+    /// `Some` ⇒ over TLS with a bindable leaf certificate, so SCRAM prefers
+    /// `SCRAM-SHA-256-PLUS` and folds these bytes into `c=`; `None` ⇒ plaintext,
+    /// or a certificate whose signature hash we do not bind (plain SCRAM then).
+    channel_binding: Option<Vec<u8>>,
+    /// The SCRAM mechanism this connection authenticated with (STL-334), surfaced
+    /// by `\conninfo`: `Some("SCRAM-SHA-256-PLUS")` when channel binding was
+    /// negotiated over TLS, `Some("SCRAM-SHA-256")` for plain SCRAM, `None` for a
+    /// trust-auth connection that ran no SASL exchange.
+    scram_mechanism: Option<&'static str>,
 }
 
 impl Client {
@@ -242,13 +288,17 @@ impl Client {
         let stream = TcpStream::connect((host, port))
             .with_context(|| format!("connecting to {host}:{port}"))?;
         stream.set_nodelay(true).ok();
-        let transport = match tls.mode {
-            SslMode::Disable => Box::new(stream) as Box<dyn Transport>,
+        // The TLS path also yields the channel binding for the negotiated
+        // certificate (STL-334); plaintext has none.
+        let (transport, channel_binding) = match tls.mode {
+            SslMode::Disable => (Box::new(stream) as Box<dyn Transport>, None),
             _ => negotiate_tls(stream, host, tls)?,
         };
         let mut client = Self {
             stream: BufReader::new(transport),
             txn_status: b'I',
+            channel_binding,
+            scram_mechanism: None,
         };
 
         client.send(0, &startup_payload(user, database))?;
@@ -364,6 +414,16 @@ impl Client {
         self.txn_status
     }
 
+    /// The SCRAM mechanism this connection authenticated with, if any — what
+    /// `\conninfo` reports ([STL-334]). `Some("SCRAM-SHA-256-PLUS")` over a
+    /// channel-bound TLS connection, `Some("SCRAM-SHA-256")` for plain SCRAM,
+    /// `None` for a trust-auth connection.
+    ///
+    /// [STL-334]: https://allegromusic.atlassian.net/browse/STL-334
+    pub const fn scram_mechanism(&self) -> Option<&'static str> {
+        self.scram_mechanism
+    }
+
     /// Write one frontend message. `kind == 0` means the untyped startup shape
     /// (length + payload, no message-type byte).
     ///
@@ -416,18 +476,17 @@ impl Client {
     /// trailing `AuthenticationOk` is consumed by the [`connect`](Self::connect)
     /// loop.
     fn scram_authenticate(&mut self, password: &str, mechanisms: &[u8]) -> anyhow::Result<()> {
-        if !mechanism_offered(mechanisms, SCRAM_SHA_256) {
-            bail!(
-                "server offered SASL mechanisms {:?}, but stele shell only speaks {SCRAM_SHA_256}",
-                String::from_utf8_lossy(mechanisms)
-            );
-        }
+        // Prefer SCRAM-SHA-256-PLUS when this connection carries a channel binding
+        // and the server advertises it; otherwise plain SCRAM (STL-334). Cloned out
+        // of `self` so the borrow does not outlive the `&mut self` wire writes.
+        let binding = self.channel_binding.clone();
+        let (mechanism, cb) = select_mechanism(mechanisms, binding.as_deref())?;
 
         // --- C: SASLInitialResponse — mechanism + client-first-message.
         let client_nonce = client_nonce()?;
-        let client_first = scram_client_first(&client_nonce);
-        let mut initial = Vec::with_capacity(SCRAM_SHA_256.len() + 5 + client_first.len());
-        initial.extend_from_slice(SCRAM_SHA_256.as_bytes());
+        let client_first = scram_client_first(cb.gs2_header, &client_nonce);
+        let mut initial = Vec::with_capacity(mechanism.len() + 5 + client_first.len());
+        initial.extend_from_slice(mechanism.as_bytes());
         initial.push(0);
         initial.extend_from_slice(
             &i32::try_from(client_first.len())
@@ -447,9 +506,12 @@ impl Client {
         }
 
         // --- C: SASLResponse — the client-final-message and the server signature
-        // to expect back, both folded over the same AuthMessage.
+        // to expect back, both folded over the same AuthMessage. Under PLUS the
+        // channel binding rides the `c=` value, binding the proof to the server
+        // certificate the TLS handshake negotiated.
         let (client_final, expected_sig) = scram_client_final(
             password,
+            cb,
             &client_nonce,
             &server_first,
             &server_nonce,
@@ -471,6 +533,7 @@ impl Client {
                  password (possible impostor or man-in-the-middle)"
             );
         }
+        self.scram_mechanism = Some(mechanism);
         Ok(())
     }
 
@@ -508,14 +571,18 @@ impl Client {
 // TLS negotiation (STL-251)
 // ---------------------------------------------------------------------------
 
-/// Send the `SSLRequest`, and on `S` run the rustls handshake over the socket.
+/// Send the `SSLRequest`, and on `S` run the rustls handshake over the socket,
+/// returning the encrypted transport and the connection's `tls-server-end-point`
+/// channel binding (STL-334) — `Some` for a bindable negotiated certificate,
+/// `None` otherwise. On a `Prefer` fallback to plaintext (`N`) there is no
+/// binding.
 ///
 /// `tls.mode` is never [`SslMode::Disable`] here (the caller short-circuits it).
 fn negotiate_tls(
     mut stream: TcpStream,
     host: &str,
     tls: &TlsOpts,
-) -> anyhow::Result<Box<dyn Transport>> {
+) -> anyhow::Result<NegotiatedTransport> {
     let mode = tls.mode;
     let mut request = [0_u8; 8];
     request[..4].copy_from_slice(&8_i32.to_be_bytes());
@@ -531,14 +598,27 @@ fn negotiate_tls(
             let config = tls_config(tls)?;
             let name = ServerName::try_from(host.to_owned())
                 .with_context(|| format!("{host:?} is not a valid TLS server name"))?;
-            let conn = rustls::ClientConnection::new(Arc::new(config), name)
+            let mut conn = rustls::ClientConnection::new(Arc::new(config), name)
                 .context("initializing TLS")?;
-            // The handshake itself runs lazily on the first read/write; a
-            // failure (e.g. an untrusted certificate under verify-full)
-            // surfaces as the startup round-trip's transport error.
-            Ok(Box::new(rustls::StreamOwned::new(conn, stream)))
+            // The handshake would otherwise run lazily on the first read/write;
+            // drive it to completion now so the negotiated server certificate is
+            // available (`peer_certificates()` is populated only post-handshake)
+            // for the channel binding. The socket is blocking, so `complete_io`
+            // runs the handshake fully; a failure — an untrusted certificate under
+            // verify-full, or an mTLS server we cannot satisfy — surfaces here with
+            // a precise context instead of as a later startup transport error.
+            conn.complete_io(&mut stream)
+                .context("completing the TLS handshake")?;
+            let channel_binding = conn
+                .peer_certificates()
+                .and_then(<[_]>::first)
+                .and_then(|leaf| endpoint_channel_binding(leaf.as_ref()));
+            Ok((
+                Box::new(rustls::StreamOwned::new(conn, stream)),
+                channel_binding,
+            ))
         }
-        b'N' if mode == SslMode::Prefer => Ok(Box::new(stream)),
+        b'N' if mode == SslMode::Prefer => Ok((Box::new(stream), None)),
         b'N' => bail!(
             "server refused TLS but --tls {} requires it (configure [tls] on the server, \
              or connect with --tls prefer/disable)",
@@ -706,11 +786,83 @@ fn mechanism_offered(list: &[u8], wanted: &str) -> bool {
     list.split(|&b| b == 0).any(|m| m == wanted.as_bytes())
 }
 
-/// The SCRAM client-first message — `n,,n=,r=<nonce>`: the `n,,` gs2 header (no
-/// channel binding, no authzid), an empty `n=` username (the identity is the
-/// startup `user`, as Postgres does), and the client nonce.
-fn scram_client_first(client_nonce: &str) -> String {
-    format!("n,,n=,r={client_nonce}")
+/// The channel-binding inputs the SCRAM client messages carry (STL-334): the gs2
+/// header (always) and, under `SCRAM-SHA-256-PLUS`, the `tls-server-end-point`
+/// data folded into `c=`. Bundling the two keeps them consistent — a `p=` header
+/// always travels with cbind-data, an `n,,` header never does — and is what
+/// [`scram_client_first`] and [`scram_client_final`] thread through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChannelBinding<'a> {
+    /// The gs2 header — `n,,` plain, `p=tls-server-end-point,,` under PLUS.
+    gs2_header: &'static str,
+    /// The cbind-data appended after the header in `c=` — `Some` only under PLUS.
+    cbind: Option<&'a [u8]>,
+}
+
+/// Choose the SASL mechanism and its [`ChannelBinding`] for this connection
+/// (STL-334): `SCRAM-SHA-256-PLUS` with the `tls-server-end-point` binding when
+/// the transport carries one (`binding` is `Some`) and the server advertises
+/// PLUS; otherwise plain `SCRAM-SHA-256` with the `n` header and no binding — the
+/// path used off TLS, against a plain-only server, or for a certificate we cannot
+/// bind.
+///
+/// The shell never sends the `y` flag: it always claims "no channel binding"
+/// (`n`) when it does not use PLUS, rather than "you didn't offer it", which a
+/// PLUS-advertising server refuses as a downgrade (RFC 5802 §6). `Err` only when
+/// the server offers neither mechanism the shell speaks.
+fn select_mechanism<'a>(
+    mechanisms: &[u8],
+    binding: Option<&'a [u8]>,
+) -> anyhow::Result<(&'static str, ChannelBinding<'a>)> {
+    match binding {
+        Some(data) if mechanism_offered(mechanisms, SCRAM_SHA_256_PLUS) => Ok((
+            SCRAM_SHA_256_PLUS,
+            ChannelBinding {
+                gs2_header: GS2_HEADER_PLUS,
+                cbind: Some(data),
+            },
+        )),
+        _ if mechanism_offered(mechanisms, SCRAM_SHA_256) => Ok((
+            SCRAM_SHA_256,
+            ChannelBinding {
+                gs2_header: GS2_HEADER_PLAIN,
+                cbind: None,
+            },
+        )),
+        _ => bail!(
+            "server offered SASL mechanisms {:?}, but stele shell speaks {SCRAM_SHA_256} \
+             (and {SCRAM_SHA_256_PLUS} over TLS)",
+            String::from_utf8_lossy(mechanisms)
+        ),
+    }
+}
+
+/// The RFC 5929 `tls-server-end-point` channel binding for the negotiated server
+/// certificate: the DER-encoded leaf hashed with the digest of its signature
+/// algorithm. Mirrors the server's selection (`stele_pgwire::tls`) so both sides
+/// compute the identical `c=`.
+///
+/// RFC 5929 §4.1 derives the hash from the certificate's `signatureAlgorithm`.
+/// This binds the SHA-256 case — an RSA-SHA-256 or ECDSA-SHA-256 leaf, every
+/// modern certificate — and returns `None` for any other signature hash
+/// (SHA-384/512 is the filed follow-up STL-330; legacy MD5/SHA-1 is not worth a
+/// path). `None` means the client degrades to plain SCRAM over the encrypted
+/// channel rather than computing a binding the server would not — the safe
+/// degrade, and the symmetric mirror of the server advertising PLUS only for the
+/// certificates it can bind.
+fn endpoint_channel_binding(cert_der: &[u8]) -> Option<Vec<u8>> {
+    let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
+    let sig_alg = &cert.signature_algorithm.algorithm;
+    (*sig_alg == OID_PKCS1_SHA256WITHRSA || *sig_alg == OID_SIG_ECDSA_WITH_SHA256)
+        .then(|| sha256(cert_der).as_bytes().to_vec())
+}
+
+/// The SCRAM client-first message — `<gs2-header>n=,r=<nonce>`: the gs2 header
+/// (`n,,` for plain SCRAM, `p=tls-server-end-point,,` under channel binding), an
+/// empty `n=` username (the identity is the startup `user`, as Postgres does), and
+/// the client nonce.
+fn scram_client_first(gs2_header: &str, client_nonce: &str) -> String {
+    format!("{gs2_header}n=,r={client_nonce}")
 }
 
 /// Build the client-final message and the `ServerSignature` to expect back,
@@ -720,15 +872,23 @@ fn scram_client_first(client_nonce: &str) -> String {
 /// tested against `stele_common::scram`'s server side without a socket.
 fn scram_client_final(
     password: &str,
+    cb: ChannelBinding<'_>,
     client_nonce: &str,
     server_first: &str,
     server_nonce: &str,
     salt: &[u8],
     iterations: u32,
 ) -> (String, [u8; 32]) {
-    // `c=` is base64 of the gs2 header the client-first message sent (`n,,` →
-    // `biws`); under plain SCRAM no cbind-data follows it.
-    let channel_binding = scram::b64_encode(b"n,,");
+    // `c=` is base64 of the gs2 header followed by the channel-binding data
+    // (RFC 5802 §6): just the header under plain SCRAM (`n,,` → `biws`), the header
+    // plus the `tls-server-end-point` bytes under PLUS — exactly what the server
+    // recomputes and checks, so a proof captured against a different TLS endpoint
+    // fails the server's `c=` comparison.
+    let mut cbind_input = cb.gs2_header.as_bytes().to_vec();
+    if let Some(data) = cb.cbind {
+        cbind_input.extend_from_slice(data);
+    }
+    let channel_binding = scram::b64_encode(&cbind_input);
     let without_proof = format!("c={channel_binding},r={server_nonce}");
     let auth_message = format!("n=,r={client_nonce},{server_first},{without_proof}");
     let proof = scram::client_proof(password, salt, iterations, auth_message.as_bytes());
@@ -880,6 +1040,43 @@ fn be_u32(payload: &[u8], at: usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plain-SCRAM [`ChannelBinding`] — gs2 `n,,`, no cbind-data.
+    fn plain_cb() -> ChannelBinding<'static> {
+        ChannelBinding {
+            gs2_header: GS2_HEADER_PLAIN,
+            cbind: None,
+        }
+    }
+
+    /// A `SCRAM-SHA-256-PLUS` [`ChannelBinding`] over `data` — gs2
+    /// `p=tls-server-end-point,,` with the endpoint bytes folded into `c=`.
+    fn plus_cb(data: &[u8]) -> ChannelBinding<'_> {
+        ChannelBinding {
+            gs2_header: GS2_HEADER_PLUS,
+            cbind: Some(data),
+        }
+    }
+
+    /// `N` bytes of OS entropy — the seed for the throwaway test credentials.
+    fn test_bytes<const N: usize>() -> [u8; N] {
+        let mut bytes = [0u8; N];
+        getrandom::fill(&mut bytes).expect("OS entropy");
+        bytes
+    }
+
+    /// A throwaway SCRAM password from OS entropy. The proof/round-trip tests hold
+    /// for any value, so generating it keeps a hard-coded credential — and CodeQL's
+    /// `hard-coded-cryptographic-value` finding — out of the source, the same
+    /// reason the pgwire `scram_plus_wire` tests generate theirs (STL-297).
+    fn test_password() -> String {
+        scram::b64_encode(&test_bytes::<12>())
+    }
+
+    /// A throwaway 16-byte SCRAM salt from OS entropy (see [`test_password`]).
+    fn test_salt() -> [u8; 16] {
+        test_bytes::<16>()
+    }
 
     /// Build a `RowDescription` payload for the given `(name, type oid)`s.
     fn row_description(fields: &[(&str, u32)]) -> Vec<u8> {
@@ -1050,7 +1247,72 @@ mod tests {
 
     #[test]
     fn client_first_is_the_no_channel_binding_gs2_shape() {
-        assert_eq!(scram_client_first("noncenonce"), "n,,n=,r=noncenonce");
+        assert_eq!(
+            scram_client_first(GS2_HEADER_PLAIN, "noncenonce"),
+            "n,,n=,r=noncenonce"
+        );
+    }
+
+    #[test]
+    fn client_first_carries_the_plus_gs2_header_under_channel_binding() {
+        // Under PLUS the gs2 header names the binding type; the bare part (the
+        // identity + nonce) is identical to plain SCRAM.
+        assert_eq!(
+            scram_client_first(GS2_HEADER_PLUS, "noncenonce"),
+            "p=tls-server-end-point,,n=,r=noncenonce"
+        );
+    }
+
+    /// The mechanism/header/binding choice (STL-334): PLUS only with a binding AND
+    /// the server's offer; plain `n` (never `y`) for every fallback; an error when
+    /// the server speaks neither.
+    #[test]
+    fn select_mechanism_prefers_plus_only_when_bound_and_offered() {
+        let binding = [7u8; 32];
+        let both = b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0";
+        let plain_only = b"SCRAM-SHA-256\0\0";
+
+        // Over TLS with a binding, PLUS offered: prefer PLUS, fold the binding in.
+        assert_eq!(
+            select_mechanism(both, Some(&binding)).unwrap(),
+            (SCRAM_SHA_256_PLUS, plus_cb(&binding))
+        );
+        // A binding we have, but the server lists only plain: plain `n`, no binding.
+        assert_eq!(
+            select_mechanism(plain_only, Some(&binding)).unwrap(),
+            (SCRAM_SHA_256, plain_cb())
+        );
+        // TLS but no usable binding (unbindable cert), PLUS offered: still plain `n`
+        // — never `y`, which a PLUS-advertising server treats as a downgrade.
+        assert_eq!(
+            select_mechanism(both, None).unwrap(),
+            (SCRAM_SHA_256, plain_cb())
+        );
+        // Off TLS (no binding), plain only: the unchanged plain path.
+        assert_eq!(
+            select_mechanism(plain_only, None).unwrap(),
+            (SCRAM_SHA_256, plain_cb())
+        );
+        // A server speaking neither (e.g. a future-only mechanism) is an error.
+        assert!(select_mechanism(b"SCRAM-SHA-512\0\0", Some(&binding)).is_err());
+    }
+
+    /// `endpoint_channel_binding` mirrors the server: the SHA-256 of an
+    /// ECDSA-SHA-256 leaf's DER (rcgen's default), and `None` for non-certificate
+    /// bytes (never a panic — the certificate arrives over the wire).
+    #[test]
+    fn endpoint_channel_binding_is_the_sha256_of_a_sha256_cert() {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+            .expect("params")
+            .self_signed(&key)
+            .expect("self-sign");
+        let der = cert.der().as_ref();
+
+        let cbind = endpoint_channel_binding(der).expect("SHA-256 binding");
+        assert_eq!(cbind, sha256(der).as_bytes().to_vec());
+        assert_eq!(cbind.len(), 32, "SHA-256 is 32 bytes");
+        assert!(endpoint_channel_binding(b"not a certificate").is_none());
     }
 
     /// The proof the client builds verifies against a verifier derived from the
@@ -1072,6 +1334,7 @@ mod tests {
 
         let (client_final, expected_sig) = scram_client_final(
             password,
+            plain_cb(),
             client_nonce,
             &server_first,
             server_nonce,
@@ -1102,23 +1365,139 @@ mod tests {
         );
     }
 
+    /// The channel-binding interop oracle (STL-334): under PLUS the client's `c=`
+    /// is exactly `base64(gs2-header || tls-server-end-point)` — the value the
+    /// server recomputes (`stele_pgwire::scram`) — its proof verifies against the
+    /// server verifier, and the expected signature matches. This is the cross-side
+    /// `c=` agreement the wire check enforces, run with the server played
+    /// in-process by `stele_common::scram`.
+    #[test]
+    fn plus_client_final_binds_to_the_endpoint_and_interoperates() {
+        let password = test_password();
+        let salt = test_salt();
+        let iterations = scram::DEFAULT_ITERATIONS;
+        let client_nonce = "clientnonce";
+        let server_nonce = "clientnonceSERVERENTROPY";
+        let server_first = format!(
+            "r={server_nonce},s={},i={iterations}",
+            scram::b64_encode(&salt)
+        );
+        // Stands in for the SHA-256 of the negotiated server certificate.
+        let cbind = test_bytes::<32>();
+
+        let (client_final, expected_sig) = scram_client_final(
+            &password,
+            plus_cb(&cbind),
+            client_nonce,
+            &server_first,
+            server_nonce,
+            &salt,
+            iterations,
+        );
+
+        // The `c=` the client sends is exactly what the server folds and checks:
+        // base64 of the gs2 header followed by the endpoint binding.
+        let (without_proof, proof_b64) = client_final
+            .rsplit_once(",p=")
+            .expect("client-final has a proof");
+        let mut expected_cbind = GS2_HEADER_PLUS.as_bytes().to_vec();
+        expected_cbind.extend_from_slice(&cbind);
+        assert_eq!(
+            without_proof,
+            format!("c={},r={server_nonce}", scram::b64_encode(&expected_cbind)),
+            "the c= value must match the server's expected channel binding"
+        );
+
+        // The proof verifies against the verifier, and the client expects exactly
+        // the server's signature back.
+        let proof: [u8; 32] = scram::b64_decode(proof_b64)
+            .expect("proof base64")
+            .try_into()
+            .expect("32-byte proof");
+        let auth_message = format!("n=,r={client_nonce},{server_first},{without_proof}");
+        let verifier = ScramVerifier::derive(&password, &salt, iterations);
+        assert!(
+            verifier.verify_client_proof(auth_message.as_bytes(), &proof),
+            "the PLUS client proof must satisfy the server verifier"
+        );
+        assert_eq!(
+            expected_sig,
+            verifier.server_signature(auth_message.as_bytes()),
+            "the client must expect exactly the server's signature"
+        );
+    }
+
+    /// A `c=` computed against a *different* endpoint does not match the one for the
+    /// genuine certificate — the property the server's `c=` check turns into a
+    /// rejection of a MITM that terminates TLS with its own certificate (STL-334).
+    #[test]
+    fn plus_channel_binding_differs_by_endpoint() {
+        let password = test_password();
+        let salt = test_salt();
+        let iterations = scram::DEFAULT_ITERATIONS;
+        let client_nonce = "cn";
+        let server_nonce = "cnSERVER";
+        let server_first = format!(
+            "r={server_nonce},s={},i={iterations}",
+            scram::b64_encode(&salt)
+        );
+        let bind_a = [0x11u8; 32]; // the genuine server certificate's hash
+        let bind_b = [0x22u8; 32]; // a MITM certificate's hash (distinct on purpose)
+
+        let c_value = |cbind: &[u8]| {
+            let (final_msg, _) = scram_client_final(
+                &password,
+                plus_cb(cbind),
+                client_nonce,
+                &server_first,
+                server_nonce,
+                &salt,
+                iterations,
+            );
+            final_msg
+                .split_once(',')
+                .expect("c= is the first field")
+                .0
+                .to_owned()
+        };
+
+        // Different endpoints ⇒ different c=, so the server's comparison rejects the
+        // wrong one; the genuine binding matches its own expected value.
+        assert_ne!(c_value(&bind_a), c_value(&bind_b));
+        let mut expected = GS2_HEADER_PLUS.as_bytes().to_vec();
+        expected.extend_from_slice(&bind_a);
+        assert_eq!(
+            c_value(&bind_a),
+            format!("c={}", scram::b64_encode(&expected))
+        );
+    }
+
     #[test]
     fn a_wrong_password_proof_is_refused_by_the_verifier() {
-        let salt = b"0123456789abcdef";
+        let salt = test_salt();
         let iterations = scram::DEFAULT_ITERATIONS;
         let server_nonce = "cnSERVER";
         let server_first = format!(
             "r={server_nonce},s={},i={iterations}",
-            scram::b64_encode(salt)
+            scram::b64_encode(&salt)
         );
         // The client proves with the wrong password against a verifier for the
-        // right one — the proof must not verify.
-        let (client_final, _) =
-            scram_client_final("wrong", "cn", &server_first, server_nonce, salt, iterations);
+        // right one — the proof must not verify. The two differ by construction.
+        let right = test_password();
+        let wrong = format!("{right}-wrong");
+        let (client_final, _) = scram_client_final(
+            &wrong,
+            plain_cb(),
+            "cn",
+            &server_first,
+            server_nonce,
+            &salt,
+            iterations,
+        );
         let (without_proof, proof_b64) = client_final.rsplit_once(",p=").unwrap();
         let proof: [u8; 32] = scram::b64_decode(proof_b64).unwrap().try_into().unwrap();
         let auth_message = format!("n=,r=cn,{server_first},{without_proof}");
-        let verifier = ScramVerifier::derive("right", salt, iterations);
+        let verifier = ScramVerifier::derive(&right, &salt, iterations);
         assert!(!verifier.verify_client_proof(auth_message.as_bytes(), &proof));
     }
 

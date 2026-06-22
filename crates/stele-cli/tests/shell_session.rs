@@ -901,6 +901,95 @@ async fn scram_session_without_a_password_points_at_pgpassword() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// SCRAM-SHA-256-PLUS channel binding over TLS (STL-334)
+// ---------------------------------------------------------------------------
+
+/// Boot a TLS-required **and** SCRAM-required server — the STL-334 combination —
+/// with `users` pre-created through the SQL path. `mint_tls` mints an
+/// ECDSA/SHA-256-signed leaf, so the server advertises `SCRAM-SHA-256-PLUS`
+/// alongside plain SCRAM. Returns the address and the CA path for `verify-full`.
+async fn spawn_tls_scram_server(test: &str, users: &[(&str, &str)]) -> (SocketAddr, PathBuf) {
+    let (cert, key, ca) = mint_tls(test);
+    let tls = ServerTls::load(&TlsSettings {
+        cert,
+        key,
+        client_ca: None,
+        mode: TlsMode::Required,
+    })
+    .expect("load TLS material");
+    let mut engine = SessionEngine::open(MemDisk::new(), SystemClock);
+    for (name, password) in users {
+        let sql = format!("CREATE USER {name} PASSWORD '{password}'");
+        let stmt = &stele_sql::parse(&sql).expect("parse CREATE USER")[0];
+        engine.execute(stmt).expect("create user");
+    }
+    let session: SharedSession = Arc::new(Mutex::new(engine));
+    let bound = Server::new("127.0.0.1:0".parse().unwrap(), session)
+        .with_tls(tls)
+        .with_auth(AuthMode::Scram)
+        .bind()
+        .await
+        .expect("bind ephemeral port");
+    let addr = bound.local_addr();
+    tokio::spawn(bound.serve());
+    (addr, ca)
+}
+
+/// STL-334 Definition of Done: over TLS against a PLUS-advertising server the
+/// shell authenticates with `SCRAM-SHA-256-PLUS` end to end.
+///
+/// `\conninfo` reports the mechanism the connection actually negotiated, which is
+/// what pins the **PLUS** path rather than a silent fallback. Auth merely
+/// *succeeding* would not prove it: the server accepts plain SCRAM with the `n`
+/// flag even when it advertises PLUS (it only refuses `y` as a downgrade), so a
+/// client that failed to compute the channel binding and fell back to plain
+/// `SCRAM-SHA-256` over TLS would still connect. By asserting `\conninfo` shows
+/// `SCRAM-SHA-256-PLUS` we require the channel-bound mechanism specifically — and
+/// because the server validates `c=` against its own certificate, that mechanism
+/// only succeeds when the shell computed the binding from the certificate the
+/// handshake actually presented. Driven over `verify-full` so the whole
+/// handshake → channel-binding → SCRAM path runs end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scram_plus_session_authenticates_over_tls() {
+    let (addr, ca) = spawn_tls_scram_server("scram-plus", &[("alice", "s3cret")]).await;
+    let ca = ca.to_str().expect("utf-8 path").to_owned();
+    let script = "\\conninfo\nSELECT 1;\n\\q\n";
+    let output = tokio::task::spawn_blocking(move || {
+        run_shell_env(
+            addr,
+            script,
+            &["--user", "alice", "--tls", "verify-full", "--tls-ca", &ca],
+            &[("PGPASSWORD", Some("s3cret"))],
+        )
+    })
+    .await
+    .expect("shell task");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "SCRAM-SHA-256-PLUS over TLS must authenticate:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "a clean SCRAM-PLUS session wrote to stderr: {stderr}"
+    );
+    // The pin: the shell negotiated channel binding, not a silent plain-`n`
+    // fallback (which the server would also accept over TLS).
+    assert!(
+        stdout.contains("Authenticated with SCRAM-SHA-256-PLUS"),
+        "the shell must negotiate SCRAM-SHA-256-PLUS over TLS, not plain SCRAM:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("channel binding"),
+        "conninfo should note the channel binding is in force:\n{stdout}"
+    );
+    // The query also ran past authentication over the channel-bound connection.
+    assert!(stdout.contains("(1 row)"), "{stdout}");
+}
+
 /// `\segments` (STL-301) renders the columnar segment + zone-map table end to
 /// end: a sealed segment (after `FLUSH`) plus the resident hot tier, the key zone
 /// over the flushed range, and the inspect-segment trailer. A bare `\segments`
