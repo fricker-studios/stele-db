@@ -256,6 +256,11 @@ pub struct Client {
     /// `SCRAM-SHA-256-PLUS` and folds these bytes into `c=`; `None` ⇒ plaintext,
     /// or a certificate whose signature hash we do not bind (plain SCRAM then).
     channel_binding: Option<Vec<u8>>,
+    /// The SCRAM mechanism this connection authenticated with (STL-334), surfaced
+    /// by `\conninfo`: `Some("SCRAM-SHA-256-PLUS")` when channel binding was
+    /// negotiated over TLS, `Some("SCRAM-SHA-256")` for plain SCRAM, `None` for a
+    /// trust-auth connection that ran no SASL exchange.
+    scram_mechanism: Option<&'static str>,
 }
 
 impl Client {
@@ -293,6 +298,7 @@ impl Client {
             stream: BufReader::new(transport),
             txn_status: b'I',
             channel_binding,
+            scram_mechanism: None,
         };
 
         client.send(0, &startup_payload(user, database))?;
@@ -408,6 +414,16 @@ impl Client {
         self.txn_status
     }
 
+    /// The SCRAM mechanism this connection authenticated with, if any — what
+    /// `\conninfo` reports ([STL-334]). `Some("SCRAM-SHA-256-PLUS")` over a
+    /// channel-bound TLS connection, `Some("SCRAM-SHA-256")` for plain SCRAM,
+    /// `None` for a trust-auth connection.
+    ///
+    /// [STL-334]: https://allegromusic.atlassian.net/browse/STL-334
+    pub const fn scram_mechanism(&self) -> Option<&'static str> {
+        self.scram_mechanism
+    }
+
     /// Write one frontend message. `kind == 0` means the untyped startup shape
     /// (length + payload, no message-type byte).
     ///
@@ -517,6 +533,7 @@ impl Client {
                  password (possible impostor or man-in-the-middle)"
             );
         }
+        self.scram_mechanism = Some(mechanism);
         Ok(())
     }
 

@@ -937,19 +937,24 @@ async fn spawn_tls_scram_server(test: &str, users: &[(&str, &str)]) -> (SocketAd
 }
 
 /// STL-334 Definition of Done: over TLS against a PLUS-advertising server the
-/// shell authenticates with `SCRAM-SHA-256-PLUS` end to end. The shell prefers
-/// PLUS (the selection is unit-tested in `client.rs`), so it sends
-/// `p=tls-server-end-point` with the binding it computes from the *negotiated*
-/// certificate. The server's `c=` check passes **only because that binding equals
-/// the hash of its own certificate** — a binding computed against a different
-/// endpoint (a MITM's certificate, or a client bug) would be refused (`08P01`)
-/// and fail this test. Driven over `verify-full` so the whole
+/// shell authenticates with `SCRAM-SHA-256-PLUS` end to end.
+///
+/// `\conninfo` reports the mechanism the connection actually negotiated, which is
+/// what pins the **PLUS** path rather than a silent fallback. Auth merely
+/// *succeeding* would not prove it: the server accepts plain SCRAM with the `n`
+/// flag even when it advertises PLUS (it only refuses `y` as a downgrade), so a
+/// client that failed to compute the channel binding and fell back to plain
+/// `SCRAM-SHA-256` over TLS would still connect. By asserting `\conninfo` shows
+/// `SCRAM-SHA-256-PLUS` we require the channel-bound mechanism specifically — and
+/// because the server validates `c=` against its own certificate, that mechanism
+/// only succeeds when the shell computed the binding from the certificate the
+/// handshake actually presented. Driven over `verify-full` so the whole
 /// handshake → channel-binding → SCRAM path runs end to end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scram_plus_session_authenticates_over_tls() {
     let (addr, ca) = spawn_tls_scram_server("scram-plus", &[("alice", "s3cret")]).await;
     let ca = ca.to_str().expect("utf-8 path").to_owned();
-    let script = "SELECT 1;\n\\q\n";
+    let script = "\\conninfo\nSELECT 1;\n\\q\n";
     let output = tokio::task::spawn_blocking(move || {
         run_shell_env(
             addr,
@@ -971,7 +976,17 @@ async fn scram_plus_session_authenticates_over_tls() {
         stderr.is_empty(),
         "a clean SCRAM-PLUS session wrote to stderr: {stderr}"
     );
-    // The query ran past authentication over the channel-bound connection.
+    // The pin: the shell negotiated channel binding, not a silent plain-`n`
+    // fallback (which the server would also accept over TLS).
+    assert!(
+        stdout.contains("Authenticated with SCRAM-SHA-256-PLUS"),
+        "the shell must negotiate SCRAM-SHA-256-PLUS over TLS, not plain SCRAM:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("channel binding"),
+        "conninfo should note the channel binding is in force:\n{stdout}"
+    );
+    // The query also ran past authentication over the channel-bound connection.
     assert!(stdout.contains("(1 row)"), "{stdout}");
 }
 

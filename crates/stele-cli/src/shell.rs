@@ -718,7 +718,7 @@ fn dispatch_meta(
         Meta::Describe(Some(name)) => describe(client, session, name, out)?,
         Meta::Describe(None) | Meta::ListTables => list_tables(client, session, out)?,
         Meta::ListDbs => list_databases(session, out)?,
-        Meta::ConnInfo => conninfo(session, out)?,
+        Meta::ConnInfo => conninfo(client, session, out)?,
         Meta::Timing(arg) => match toggle_value(session.timing, *arg) {
             Err(e) => print_error(session, &e),
             Ok(v) => {
@@ -1128,8 +1128,11 @@ fn list_databases(session: &Session, out: &mut impl Write) -> anyhow::Result<()>
     write_lines(session, out, &lines)
 }
 
-/// `\conninfo` — one segmented status line.
-fn conninfo(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
+/// `\conninfo` — one segmented status line, plus the SCRAM mechanism the
+/// connection authenticated with when one was negotiated (STL-334): like psql
+/// reporting the SSL line, this shows whether channel binding
+/// (`SCRAM-SHA-256-PLUS`) or plain `SCRAM-SHA-256` is in force.
+fn conninfo(client: &Client, session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
     write_segs(
         session,
         out,
@@ -1142,7 +1145,24 @@ fn conninfo(session: &Session, out: &mut impl Write) -> anyhow::Result<()> {
             (Role::Acc, session.host.clone()),
             (Role::Dim, format!(":{} (dev).", session.port)),
         ],
-    )
+    )?;
+    if let Some(mechanism) = client.scram_mechanism() {
+        let detail = if mechanism.ends_with("-PLUS") {
+            " (tls-server-end-point channel binding).".to_owned()
+        } else {
+            ".".to_owned()
+        };
+        write_segs(
+            session,
+            out,
+            &[
+                (Role::Mut, "Authenticated with ".to_owned()),
+                (Role::Head, mechanism.to_owned()),
+                (Role::Dim, detail),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
