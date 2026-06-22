@@ -172,13 +172,12 @@ fn fresh_backup_dir(tag: &str) -> PathBuf {
 }
 
 /// Connection settings for the booted gateway, with the valid bearer token and the
-/// given TLS posture.
+/// given TLS posture — built through the public construction API.
 fn config(addr: SocketAddr, tls: Option<Tls>) -> Config {
-    Config {
-        host: addr.ip().to_string(),
-        port: addr.port(),
-        token: Some(TOKEN.to_owned()),
-        tls,
+    let base = Config::new(addr.ip().to_string(), addr.port(), Some(TOKEN.to_owned()));
+    match tls {
+        Some(tls) => base.with_tls(tls),
+        None => base,
     }
 }
 

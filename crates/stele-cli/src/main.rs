@@ -183,14 +183,19 @@ fn main() -> anyhow::Result<()> {
             // Admin-tier TLS (STL-320): `--admin-tls-ca` implies TLS and verifies
             // the gateway against that CA; `--admin-tls` alone encrypts without
             // verifying (libpq's `require`); neither stays plaintext. The
-            // verification name defaults to `--admin-host`.
-            let admin_tls = if s.admin_tls || s.admin_tls_ca.is_some() {
-                Some(stele_client::Tls {
-                    ca: s.admin_tls_ca,
-                    server_name: None,
-                })
-            } else {
-                None
+            // verification name defaults to `--admin-host`. Built through the SDK's
+            // constructors so the CLI is not coupled to `Tls`'s field set.
+            let admin_tls = match s.admin_tls_ca {
+                Some(ca) => Some(stele_client::Tls::verify(ca)),
+                None if s.admin_tls => Some(stele_client::Tls::encrypt()),
+                None => None,
+            };
+            let admin = {
+                let base = stele_client::Config::new(admin_host, s.admin_port, admin_token);
+                match admin_tls {
+                    Some(tls) => base.with_tls(tls),
+                    None => base,
+                }
             };
             shell::run(&shell::Opts {
                 host: s.host,
@@ -208,12 +213,7 @@ fn main() -> anyhow::Result<()> {
                 row_nums: s.row_numbers,
                 no_color: s.no_color,
                 stats: s.stats,
-                admin: stele_client::Config {
-                    host: admin_host,
-                    port: s.admin_port,
-                    token: admin_token,
-                    tls: admin_tls,
-                },
+                admin,
             })
         }
         Cmd::Restore(r) => run_restore(&r),

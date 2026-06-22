@@ -87,7 +87,7 @@ use std::fmt;
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -110,7 +110,12 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// The gateway shares the server's ops listener (default port `9090`), not a port
 /// of its own. `token` is the static bearer credential; leave it `None` only to
 /// exercise the local-refusal path ([`Error::NoToken`]).
+///
+/// Construct via [`Config::new`] (plus [`with_tls`](Self::with_tls)); the struct is
+/// `#[non_exhaustive]` so a later field addition stays backward-compatible for a
+/// published-crate consumer.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Config {
     /// The ops-listener host serving the admin HTTP/JSON gateway.
     pub host: String,
@@ -166,6 +171,7 @@ impl Config {
 ///
 /// [STL-320]: https://allegromusic.atlassian.net/browse/STL-320
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct Tls {
     /// PEM CA bundle the server certificate must chain to. `None` accepts any
     /// certificate (encrypt-only); `Some` is the verified posture.
@@ -342,6 +348,10 @@ pub struct TableData {
 pub struct Client {
     config: Config,
     timeout: Duration,
+    /// The TLS client config, built once on first use from [`Config::tls`] and
+    /// reused across calls — so the CA bundle is read and parsed off disk a single
+    /// time, not on every `round_trip`. Empty for a plaintext client.
+    tls_config: OnceLock<Arc<rustls::ClientConfig>>,
 }
 
 impl Client {
@@ -351,6 +361,7 @@ impl Client {
         Self {
             config,
             timeout: DEFAULT_TIMEOUT,
+            tls_config: OnceLock::new(),
         }
     }
 
@@ -359,6 +370,22 @@ impl Client {
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// The shared [`rustls::ClientConfig`] for this client's [`Tls`] settings,
+    /// built once and memoized. The CA bundle (when one is pinned) is read off disk
+    /// only on this first build; later calls reuse the `Arc`. A build error (a
+    /// missing/invalid CA) is not cached — it re-attempts next call, which is the
+    /// rare path anyway.
+    fn shared_tls_config(&self, tls: &Tls) -> Result<Arc<rustls::ClientConfig>, Error> {
+        if let Some(config) = self.tls_config.get() {
+            return Ok(Arc::clone(config));
+        }
+        let built = Arc::new(tls_client_config(tls)?);
+        // A concurrent call may have installed one first; `set` then no-ops and we
+        // return the installed winner so every caller shares the same config.
+        let _ = self.tls_config.set(Arc::clone(&built));
+        Ok(self.tls_config.get().map_or(built, Arc::clone))
     }
 
     /// `GET /v1alpha1/health` — liveness. `SERVING` whenever the process can
@@ -507,7 +534,10 @@ impl Client {
         // layer is transparent to the HTTP/1.1 we speak over it.
         let mut stream: Box<dyn ReadWrite> = match &self.config.tls {
             None => Box::new(tcp),
-            Some(tls) => Box::new(tls_stream(tls, host, tcp)?),
+            Some(tls) => {
+                let config = self.shared_tls_config(tls)?;
+                Box::new(tls_stream(config, tls.server_name.as_deref(), host, tcp)?)
+            }
         };
         // Build the request head from explicit header lines joined by CRLF — no
         // continuation/indentation trickery, so there is no chance of leading
@@ -548,24 +578,23 @@ impl Client {
 trait ReadWrite: std::io::Read + std::io::Write {}
 impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
 
-/// Wrap `tcp` in a blocking rustls client stream per `tls`. The handshake itself
-/// is deferred to the first read/write (so an untrusted certificate surfaces as
-/// the round-trip's transport error, not here); only the up-front config build —
-/// notably reading the CA bundle from disk — can fail at this point.
+/// Wrap `tcp` in a blocking rustls client stream over the (already-built, shared)
+/// `config`. The handshake itself is deferred to the first read/write — so an
+/// untrusted certificate surfaces as the round-trip's transport error, not here.
 fn tls_stream(
-    tls: &Tls,
+    config: Arc<rustls::ClientConfig>,
+    server_name_override: Option<&str>,
     host: &str,
     tcp: TcpStream,
 ) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, Error> {
-    let config = tls_client_config(tls)?;
     // The name to verify against / send via SNI: the override, else the connect
     // host. An IP literal yields an `IpAddress` server name (no SNI extension),
     // which the encrypt-only verifier ignores and a CA-verified handshake checks
     // against the certificate's IP SANs — exactly libpq's behaviour.
-    let name = tls.server_name.as_deref().unwrap_or(host);
+    let name = server_name_override.unwrap_or(host);
     let server_name = ServerName::try_from(name.to_owned())
         .map_err(|e| Error::Transport(format!("invalid TLS server name {name:?}: {e}")))?;
-    let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
+    let conn = rustls::ClientConnection::new(config, server_name)
         .map_err(|e| Error::Transport(format!("initializing TLS: {e}")))?;
     Ok(rustls::StreamOwned::new(conn, tcp))
 }
@@ -852,6 +881,20 @@ mod tests {
         assert!(
             matches!(&err, Error::Transport(detail) if detail.contains("CA bundle")),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn tls_config_is_built_once_and_shared() {
+        // The rustls config is memoized: two resolutions hand back the same `Arc`,
+        // so a reused client does not rebuild it (or re-read a CA) per call.
+        let client = Client::new(Config::new("h", 9090, None));
+        let tls = Tls::encrypt();
+        let first = client.shared_tls_config(&tls).expect("build");
+        let second = client.shared_tls_config(&tls).expect("cached");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the TLS config must be built once and reused"
         );
     }
 }
