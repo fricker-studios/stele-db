@@ -2741,6 +2741,7 @@ dependencies = [
  "stele-storage",
  "tokio",
  "unicode-width",
+ "x509-parser",
 ]
 
 [[package]]

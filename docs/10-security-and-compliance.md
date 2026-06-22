@@ -159,11 +159,15 @@ psycopg, pgjdbc, and `tokio-postgres` all speak it natively:
   channel binding) is refused. Off TLS — or for a certificate whose signature
   hash is not one we bind with SHA-256 — only plain SCRAM is offered, and a
   `p=…` demand is refused as before. The plain floor still authenticates over TLS
-  for a client that opts out with `n`.
-- **Deliberate v0.3 floor, filed as follow-ups:** `tls-server-end-point` binding
+  for a client that opts out with `n`. The bundled `stele shell` client is
+  symmetric (STL-334): over TLS it prefers `SCRAM-SHA-256-PLUS`, computing the
+  binding from the certificate the handshake negotiated with the same RFC 5929
+  §4.1 hash selection as the server, so both sides derive the identical `c=`; it
+  falls back to plain `n` (never `y`) off TLS or for a certificate it cannot bind.
+- **Deliberate v0.3 floor, filed as a follow-up:** `tls-server-end-point` binding
   for SHA-384/512-signed server certificates (today PLUS is advertised only for
-  SHA-256-signed certs; a stronger-hash cert falls back to plain SCRAM) and
-  client-side SCRAM in `stele shell` (STL-296). The authenticated identity reaches
+  SHA-256-signed certs; a stronger-hash cert falls back to plain SCRAM — STL-330,
+  on both the server and the shell client). The authenticated identity reaches
   the connection trace span (STL-107) **and the stored write provenance**: each
   wire-issued write stamps the connection's identity into `_stele_principal`
   (STL-300/STL-291), set per statement under the engine lock so a shared engine
