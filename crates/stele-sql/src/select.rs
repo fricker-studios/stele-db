@@ -645,9 +645,10 @@ impl BoundSubqueryFilter {
     ///   presence, so each keeps the per-row path.
     ///
     /// The inner binds with its correlation `WHERE` lifted off (so its `filter` is
-    /// `None`) and, for `EXISTS`, its projection normalized to `*` (the `bind_inner_query`
-    /// step), so the executor reads the correlation key straight out of the inner
-    /// result at [`inner_column`](SemiAntiDecorrelation::inner_column).
+    /// `None`) and its projection normalized to `*` — the binder does this for any
+    /// `[NOT] EXISTS` inner (the `bind_inner_query` step keys off the predicate, not
+    /// the negation) — so the executor reads the correlation key straight out of the
+    /// inner result at [`inner_column`](SemiAntiDecorrelation::inner_column).
     #[must_use]
     pub fn semi_anti_decorrelation(&self) -> Option<SemiAntiDecorrelation> {
         let correlation = self.correlation?;

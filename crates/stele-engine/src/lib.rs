@@ -3952,8 +3952,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         scope: &CteScope,
     ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
         // One inner scan, at the outer's snapshot and overlay. The inner projects
-        // `*` (an `EXISTS` inner is normalized by the binder), so its column
-        // `inner_column` is the correlation key in schema order.
+        // `*` (the binder normalizes any `[NOT] EXISTS` inner — it keys off the
+        // predicate, not the negation), so its column `inner_column` is the
+        // correlation key in schema order.
         let StatementOutcome::Rows(inner) =
             self.run_select_scoped(&sub.subquery, overlay, scope)?
         else {
