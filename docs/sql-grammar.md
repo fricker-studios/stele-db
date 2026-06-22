@@ -149,8 +149,8 @@ system range with **any** `AS OF` point qualifier; a `JOIN`, aggregate /
 `GROUP BY`, `DISTINCT` / `ORDER BY` / `LIMIT` / `OFFSET`, subquery or
 period-predicate `WHERE`, or a CTE / derived-table source; and `FOR SYSTEM_TIME
 ALL` (the trivially-full range). A range scan reads the committed snapshot only —
-the read-your-own-writes overlay is not applied (as on the join path) — and is
-exempt from the simple-query default row cap
+the read-your-own-writes overlay is not applied to it (unlike a point read or a
+join, [STL-325]) — and is exempt from the simple-query default row cap
 ([below](#default-row-cap-on-the-simple-query-path-stl-306)).
 
 ### `FOR VALID_TIME { FROM a TO b | BETWEEN a AND b }` — valid-time range scans (STL-328)
@@ -236,10 +236,17 @@ A connection can pin its read snapshot on either axis so **every** subsequent ba
   transactional `SET LOCAL` is not supported). Inside a transaction a pin makes the
   block's reads time-travel exactly as an explicit `AS OF` does there — so under a
   system pin, read-your-own-writes is suppressed (a past read shows only committed
-  history), while a valid pin keeps it ([STL-203], [STL-223]). The pin does **not**
-  apply over a `JOIN`: a join honors an *explicit* `FOR … AS OF` ([STL-243]), but
-  session-pin *injection* over a join stays deferred — a valid-axis pin could land
-  on a system-only input and error — so a join under a pin reads live.
+  history), while a valid pin keeps it ([STL-203], [STL-223]).
+* **Over a `JOIN` (STL-325).** The pin applies over a two-table join too, per axis by
+  applicability: the **system** pin is always injected (the system axis is always
+  present), and the **valid** pin is injected only when *every* input has a valid
+  axis — the same check an explicit `FOR VALID_TIME AS OF` over a join makes
+  ([STL-243]). When an input is system-only the valid pin is **silently withheld**
+  (the join reads live on the valid axis), never injected into a `ValidTimeUnsupported`
+  error — so a session valid pin can never break a working join (or a system-only
+  single-table read). Read-your-own-writes threads through the join the same way it
+  does a single-table read: an in-transaction join overlays the transaction's own
+  buffered writes on each side ([STL-203], [STL-223]).
 * **Tolerant `SET`.** Every variable other than the two `stele.*` time variables is
   accepted as a **no-op** (reported `SET`/`RESET`). This lets a stock Postgres
   driver's connect-time preamble — pgjdbc's `extra_float_digits` /
@@ -620,6 +627,14 @@ A join also **time-travels**: a statement-level `FOR … AS OF` on either axis r
 every input at one consistent `(sys, valid)` snapshot (STL-243, see
 [Over a `JOIN`](#for--system_time--valid_time--as-of-expr--time-travel-select) and
 docs/16 §8); the composed clauses above run over that snapshot's output.
+
+A join is also **read-your-own-writes** consistent (STL-325): inside a transaction
+each input's scan — every input in the left-deep chain — is overlaid with the
+transaction's own buffered `INSERT` / `UPDATE` / `DELETE` for that table before the
+join, so a `SELECT … JOIN …` after a staged write reflects it, exactly as a
+single-table read does ([STL-203] / [STL-223]), and `ROLLBACK` discards it. A session
+`SET stele.{system,valid}_time` pin also applies over a join (see
+[session time context](#set-stelesystemvalid_time--session-time-context-stl-246)).
 
 **Not yet** (rejected, never silently mis-bound): `RIGHT` / `FULL OUTER` and
 non-equi `ON` conditions (STL-270); join reordering / cost-based planning (the chain

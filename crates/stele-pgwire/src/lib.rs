@@ -482,6 +482,18 @@ pub trait SessionHandle: Send {
             "session time context not supported by this session",
         ))
     }
+
+    /// Whether `table` opts into a valid axis at the live catalog — the predicate a
+    /// session `SET stele.valid_time` pin consults before injecting a valid `AS OF`
+    /// over this read ([STL-325]); see [`SessionEngine::table_has_valid_axis`].
+    /// Defaults to `false` so a session fake withholds the valid pin (the
+    /// conservative, never-error choice) without implementing this.
+    ///
+    /// [STL-325]: https://allegromusic.atlassian.net/browse/STL-325
+    fn table_has_valid_axis(&self, table: &str) -> bool {
+        let _ = table;
+        false
+    }
 }
 
 impl<C, D> SessionHandle for SessionEngine<C, D>
@@ -499,6 +511,10 @@ where
 
     fn resolve_session_time(&self, value: &Expr) -> Result<SystemTimeMicros, EngineError> {
         Self::resolve_session_time(self, value)
+    }
+
+    fn table_has_valid_axis(&self, table: &str) -> bool {
+        Self::table_has_valid_axis(self, table)
     }
 
     fn describe_live_tables(&self) -> Vec<TableDescription> {
@@ -2201,14 +2217,18 @@ fn run_query(
     // but setting it here too keeps the path uniform and harmless.
     engine.set_principal(principal.clone());
     // Replay the session time context ([STL-246]) as an explicit `FOR … AS OF` on a
-    // bare single-table read, the one choke point both the simple- and
+    // single-table read or a join, the one choke point both the simple- and
     // extended-query paths funnel through. The engine then resolves a session-pinned
     // read byte-for-byte like the explicit-`AS OF` form (`apply_session_time` is a
-    // no-op for writes, joins, and statements that already qualify an axis). Clone
-    // only when an axis is actually pinned.
+    // no-op for writes, TVFs, and statements that already qualify an axis). A valid
+    // pin is injected only over inputs that have a valid axis ([STL-325]) — the
+    // engine answers `table_has_valid_axis` against the live catalog. Clone only when
+    // an axis is actually pinned.
     let pinned = session_time.is_set().then(|| {
         let mut owned = stmt.clone();
-        apply_session_time(&mut owned, session_time.system, session_time.valid);
+        apply_session_time(&mut owned, session_time.system, session_time.valid, |t| {
+            engine.table_has_valid_axis(t)
+        });
         owned
     });
     let stmt = pinned.as_ref().unwrap_or(stmt);
@@ -3273,26 +3293,27 @@ fn describe_statement_columns(
     }
     // Resolve the shape at the session-pinned snapshot ([STL-246]) so the described
     // columns agree with the rows a later `Execute` returns under the same pin (a
-    // column added after the pinned instant is not yet present). Clone only when an
-    // axis is pinned.
+    // column added after the pinned instant is not yet present). Lock the engine
+    // first so the valid-axis check the join-eligible pin makes ([STL-325]) can
+    // consult the live catalog; clone the statement only when an axis is pinned.
+    let engine = session.lock().unwrap_or_else(PoisonError::into_inner);
     let pinned = session_time.is_set().then(|| {
         let mut owned = stmt.clone();
-        apply_session_time(&mut owned, session_time.system, session_time.valid);
+        apply_session_time(&mut owned, session_time.system, session_time.valid, |t| {
+            engine.table_has_valid_axis(t)
+        });
         owned
     });
     let stmt = pinned.as_ref().unwrap_or(stmt);
-    let described = {
-        let engine = session.lock().unwrap_or_else(PoisonError::into_inner);
-        match txn {
-            // Inside a transaction block — open or aborted ([STL-205] retains the
-            // pinned snapshot on `Failed`) — describe at the block's pinned snapshot
-            // so the shape agrees with the rows a portal `Execute` would read.
-            ConnTxn::Active(buffered) | ConnTxn::Failed(buffered) => {
-                engine.describe_in_txn(stmt, buffered)
-            }
-            // No transaction open: describe against committed state.
-            ConnTxn::Idle => engine.describe(stmt),
+    let described = match txn {
+        // Inside a transaction block — open or aborted ([STL-205] retains the
+        // pinned snapshot on `Failed`) — describe at the block's pinned snapshot
+        // so the shape agrees with the rows a portal `Execute` would read.
+        ConnTxn::Active(buffered) | ConnTxn::Failed(buffered) => {
+            engine.describe_in_txn(stmt, buffered)
         }
+        // No transaction open: describe against committed state.
+        ConnTxn::Idle => engine.describe(stmt),
     }
     .map_err(|e| ExecError {
         sqlstate: sqlstate_for_query(&e),
