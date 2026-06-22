@@ -45,3 +45,7 @@ tokio-postgres = { workspace = true }
 # and ship in no published artifact — dev-deps only, workspace-pinned.
 bytes = { workspace = true }
 futures-util = { workspace = true }
+# SCRAM-PLUS interop test (STL-330): the client side picks the channel-binding
+# digest from the leaf certificate's signature algorithm, exactly as libpq does.
+# Already a normal dependency above, so naming it here adds no crate to the tree.
+x509-parser = { workspace = true }
