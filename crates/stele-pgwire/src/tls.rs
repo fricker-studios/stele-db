@@ -23,11 +23,13 @@
 //! binding ([STL-297]): [`ServerTls::endpoint_cbind`] holds the `tls-server-end-point`
 //! binding data (RFC 5929) for the configured certificate, computed once at load,
 //! which the SASL exchange folds into the client's `c=` check to bind the proof
-//! to this TLS channel.
+//! to this TLS channel. The binding hash tracks the certificate's signature
+//! algorithm across the SHA-2 family (SHA-256/384/512; [STL-330]).
 //!
 //! [STL-251]: https://allegromusic.atlassian.net/browse/STL-251
 //! [STL-291]: https://allegromusic.atlassian.net/browse/STL-291
 //! [STL-297]: https://allegromusic.atlassian.net/browse/STL-297
+//! [STL-330]: https://allegromusic.atlassian.net/browse/STL-330
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
@@ -36,9 +38,12 @@ use rustls::ServerConfig;
 use rustls::server::WebPkiClientVerifier;
 use rustls_pki_types::pem::PemObject as _;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use stele_common::hash::sha256;
+use stele_common::hash::{sha256, sha384, sha512};
 use tokio_rustls::TlsAcceptor;
-use x509_parser::oid_registry::{OID_PKCS1_SHA256WITHRSA, OID_SIG_ECDSA_WITH_SHA256};
+use x509_parser::oid_registry::{
+    OID_PKCS1_SHA256WITHRSA, OID_PKCS1_SHA384WITHRSA, OID_PKCS1_SHA512WITHRSA,
+    OID_SIG_ECDSA_WITH_SHA256, OID_SIG_ECDSA_WITH_SHA384, OID_SIG_ECDSA_WITH_SHA512,
+};
 use x509_parser::prelude::{FromDer as _, GeneralName, X509Certificate};
 
 /// What happens to a client that skips the `SSLRequest` and opens with a
@@ -106,13 +111,14 @@ pub struct ServerTls {
     config: std::sync::Arc<ServerConfig>,
     pub(crate) mode: TlsMode,
     /// The RFC 5929 `tls-server-end-point` channel-binding data for the server's
-    /// end-entity certificate — the certificate DER hashed with SHA-256 — or
-    /// `None` when that certificate's signature hash is not one we bind with
-    /// SHA-256. It is computed once at load (the single configured certificate is
-    /// what every handshake presents), and gates the **SCRAM-SHA-256-PLUS** offer:
-    /// `Some` ⇒ the SASL exchange advertises PLUS and folds this into the `c=`
-    /// check; `None` ⇒ PLUS is simply not advertised and plain SCRAM still runs
-    /// over the encrypted channel (STL-297).
+    /// end-entity certificate — the certificate DER hashed with the digest its
+    /// signature algorithm names (SHA-256/384/512; STL-330) — or `None` when that
+    /// certificate's signature algorithm names no such digest (see
+    /// [`endpoint_channel_binding`]). It is computed once at load (the single
+    /// configured certificate is what every handshake presents), and gates the
+    /// **SCRAM-SHA-256-PLUS** offer: `Some` ⇒ the SASL exchange advertises PLUS and
+    /// folds this into the `c=` check; `None` ⇒ PLUS is simply not advertised and
+    /// plain SCRAM still runs over the encrypted channel (STL-297).
     pub(crate) endpoint_cbind: Option<Vec<u8>>,
 }
 
@@ -249,21 +255,34 @@ impl ServerTls {
 /// certificate: the DER-encoded certificate hashed with the digest of its
 /// signature algorithm.
 ///
-/// RFC 5929 §4.1 derives the hash from the certificate's `signatureAlgorithm`
-/// (using SHA-256 where the signature itself uses MD5 or SHA-1). This
-/// implementation binds **only** the SHA-256 case directly: a leaf signed
-/// RSA-SHA-256 or ECDSA-SHA-256 — every modern certificate, including the
-/// `rcgen` certs we mint for the self-signed fallback and the tests. Every other
-/// signature hash returns `None`: the stronger SHA-384/512 (a filed follow-up,
-/// STL-330) and the legacy MD5/SHA-1 (deprecated, not worth a binding path).
-/// `None` means PLUS is *not advertised* (plain SCRAM still runs over TLS),
-/// which is the safe degrade — better than advertising PLUS and computing a hash
-/// the client would compute differently, which would fail the `c=` check.
+/// RFC 5929 §4.1 selects the hash from the certificate's `signatureAlgorithm`:
+/// the signature's own hash, except that MD5 or SHA-1 are upgraded to SHA-256.
+/// This maps the SHA-2 family directly — a leaf signed RSA/ECDSA with SHA-256,
+/// SHA-384, or SHA-512 binds with that same digest (STL-330 lifts the original
+/// SHA-256-only floor of STL-297). A client computing the binding from the cert
+/// it received — libpq picks the digest the same way — derives the identical
+/// bytes, which is what makes the `c=` check bind the proof to this channel.
+///
+/// Every other signature algorithm returns `None`: the legacy MD5/SHA-1
+/// (deprecated, and unverifiable by the modern rustls/ring handshake, so a
+/// binding would never be exercised — the RFC's SHA-256 upgrade is deliberately
+/// not wired up), plus RSASSA-PSS, Ed25519, and the post-quantum schemes (no
+/// single fixed hash named in the algorithm OID). `None` means PLUS is *not
+/// advertised* (plain SCRAM still runs over TLS), the safe degrade — better than
+/// advertising PLUS and computing a hash the client would compute differently,
+/// which would fail the `c=` check.
 fn endpoint_channel_binding(cert_der: &[u8]) -> Option<Vec<u8>> {
     let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
     let sig_alg = &cert.signature_algorithm.algorithm;
-    (*sig_alg == OID_PKCS1_SHA256WITHRSA || *sig_alg == OID_SIG_ECDSA_WITH_SHA256)
-        .then(|| sha256(cert_der).as_bytes().to_vec())
+    if *sig_alg == OID_PKCS1_SHA256WITHRSA || *sig_alg == OID_SIG_ECDSA_WITH_SHA256 {
+        Some(sha256(cert_der).as_bytes().to_vec())
+    } else if *sig_alg == OID_PKCS1_SHA384WITHRSA || *sig_alg == OID_SIG_ECDSA_WITH_SHA384 {
+        Some(sha384(cert_der).to_vec())
+    } else if *sig_alg == OID_PKCS1_SHA512WITHRSA || *sig_alg == OID_SIG_ECDSA_WITH_SHA512 {
+        Some(sha512(cert_der).to_vec())
+    } else {
+        None
+    }
 }
 
 /// A hot-swappable holder for the active [`ServerTls`]. The accept loop reads the
@@ -545,6 +564,29 @@ mod tests {
         let cbind = endpoint_channel_binding(&der).expect("SHA-256 binding");
         assert_eq!(cbind, sha256(&der).as_bytes().to_vec());
         assert_eq!(cbind.len(), 32, "SHA-256 is 32 bytes");
+    }
+
+    #[test]
+    fn channel_binding_tracks_a_sha384_signature() {
+        // RFC 5929 §4.1: the binding digest follows the certificate's signature
+        // algorithm. A P-384 (ECDSA-with-SHA-384) self-signed leaf must bind with
+        // SHA-384, not SHA-256 — the property STL-330 adds over the STL-297 floor.
+        // (The SHA-512/RSA leg needs a provided RSA key and is exercised
+        // end-to-end in tests/scram_plus_wire.rs.)
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).expect("P-384 key");
+        let params = rcgen::CertificateParams::new(vec!["svc.local".to_owned()]).expect("params");
+        let der = params
+            .self_signed(&key)
+            .expect("self-sign P-384 leaf")
+            .der()
+            .as_ref()
+            .to_vec();
+
+        let cbind = endpoint_channel_binding(&der).expect("SHA-384 binding");
+        assert_eq!(cbind, sha384(&der).to_vec());
+        assert_eq!(cbind.len(), 48, "SHA-384 is 48 bytes");
+        // And it is *not* the SHA-256 the pre-STL-330 floor would have produced.
+        assert_ne!(cbind, sha256(&der).as_bytes().to_vec());
     }
 
     #[test]
