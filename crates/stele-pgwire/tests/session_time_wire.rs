@@ -95,6 +95,171 @@ async fn select(client: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
     rows_of(&client.simple_query(sql).await.expect("simple query"))
 }
 
+/// Result rows sorted so a join's unspecified row order is compared as a multiset.
+fn sorted(mut rows: Vec<Vec<Option<String>>>) -> Vec<Vec<Option<String>>> {
+    rows.sort();
+    rows
+}
+
+/// Create two valid-time tables `a`, `b` and a system-only `s_only` over the wire,
+/// each carrying a small history: `a`/`b` hold `id=1` valid `[10,20)` and `id=2`
+/// valid `[20,30)` (distinct value columns so a join carries both sides); `s_only`
+/// holds `id=1` (no valid axis). The shared key domain makes the join match.
+async fn setup_join_tables(client: &Client) {
+    for t in ["a", "b"] {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {t} (id INT PRIMARY KEY, val INT, vf TIMESTAMP, vt TIMESTAMP) \
+                 WITH SYSTEM VERSIONING VALID TIME (vf, vt)"
+            ))
+            .await
+            .expect("create valid-time table");
+    }
+    client
+        .batch_execute("CREATE TABLE s_only (id INT PRIMARY KEY, note INT) WITH SYSTEM VERSIONING")
+        .await
+        .expect("create system-only table");
+    for sql in [
+        "INSERT INTO a VALUES (1, 100, 10, 20)",
+        "INSERT INTO a VALUES (2, 200, 20, 30)",
+        "INSERT INTO b VALUES (1, 11, 10, 20)",
+        "INSERT INTO b VALUES (2, 22, 20, 30)",
+        "INSERT INTO s_only VALUES (1, 7)",
+    ] {
+        client.simple_query(sql).await.expect("seed join history");
+    }
+}
+
+/// A system instant past every real (wall-clock) commit, so `AS OF` it reads the
+/// latest committed system state — leaving the valid axis as the only era selector.
+const LATEST_SYSTEM: &str = "9000000000000000";
+
+/// The session-pin ≡ explicit-`AS OF` equivalence ([STL-246]) extended to a **join**
+/// ([STL-325]): a session-pinned bare join returns byte-for-byte what the explicit
+/// `FOR SYSTEM_TIME AS OF s FOR VALID_TIME AS OF v` join returns, swept across the
+/// valid eras of two joined valid-time tables.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_pin_over_a_join_matches_explicit_as_of() {
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+    let (client, connection) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect");
+    let driver = tokio::spawn(connection);
+    setup_join_tables(&client).await;
+
+    let join = "SELECT a.id, a.val, b.val FROM a JOIN b ON a.id = b.id";
+    // Each valid instant lands in a different era: 5 is before both, 15 in the
+    // [10,20) rows, 25 in the [20,30) rows.
+    for valid in [5, 15, 25] {
+        client
+            .simple_query(&format!("SET stele.system_time = {LATEST_SYSTEM}"))
+            .await
+            .expect("set system_time");
+        client
+            .simple_query(&format!("SET stele.valid_time = {valid}"))
+            .await
+            .expect("set valid_time");
+        let pinned = sorted(select(&client, join).await);
+        client.simple_query("RESET ALL").await.expect("reset all");
+
+        let explicit = sorted(
+            select(
+                &client,
+                &format!(
+                    "{join} FOR SYSTEM_TIME AS OF {LATEST_SYSTEM} FOR VALID_TIME AS OF {valid}"
+                ),
+            )
+            .await,
+        );
+        assert_eq!(
+            pinned, explicit,
+            "session-pinned join must equal the explicit AS OF join at valid={valid}"
+        );
+    }
+
+    // Teeth: the sweep actually time-travels the valid axis (not all empty / equal).
+    client
+        .simple_query(&format!("SET stele.system_time = {LATEST_SYSTEM}"))
+        .await
+        .expect("set system_time");
+    client
+        .simple_query("SET stele.valid_time = 15")
+        .await
+        .expect("set valid_time");
+    assert_eq!(
+        sorted(select(&client, join).await),
+        vec![vec![
+            Some("1".into()),
+            Some("100".into()),
+            Some("11".into())
+        ]],
+        "valid 15 selects the [10,20) era of both joined sides"
+    );
+
+    drop(client);
+    driver
+        .await
+        .expect("driver joined")
+        .expect("clean shutdown");
+}
+
+/// A session valid pin over a join with a **system-only** input is silently withheld
+/// ([STL-325]): the query must not error (a `FOR VALID_TIME AS OF` over that join
+/// would), and it must read exactly the system-only explicit form — the valid axis
+/// stays live, the system pin still applies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_valid_pin_is_withheld_over_a_join_with_a_system_only_input() {
+    let session: SharedSession =
+        Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let addr = common::spawn_server(session).await;
+    let (client, connection) = tokio_postgres::connect(&common::conn_str(addr), NoTls)
+        .await
+        .expect("connect");
+    let driver = tokio::spawn(connection);
+    setup_join_tables(&client).await;
+
+    let join = "SELECT a.id, a.val, s_only.note FROM a JOIN s_only ON a.id = s_only.id";
+    // Both axes pinned, but `s_only` has no valid axis — the valid pin is withheld.
+    client
+        .simple_query(&format!("SET stele.system_time = {LATEST_SYSTEM}"))
+        .await
+        .expect("set system_time");
+    client
+        .simple_query("SET stele.valid_time = 15")
+        .await
+        .expect("set valid_time");
+    let pinned = sorted(select(&client, join).await);
+    client.simple_query("RESET ALL").await.expect("reset all");
+
+    // The form the pin actually injects: the system axis only (no valid pin), so `a`
+    // reads live on the valid axis (both eras) and inner-joins `s_only`'s id=1.
+    let explicit = sorted(
+        select(
+            &client,
+            &format!("{join} FOR SYSTEM_TIME AS OF {LATEST_SYSTEM}"),
+        )
+        .await,
+    );
+    assert_eq!(
+        pinned, explicit,
+        "a valid pin over a join with a system-only input is withheld (not an error), \
+         equaling the system-only explicit form"
+    );
+    assert_eq!(
+        pinned,
+        vec![vec![Some("1".into()), Some("100".into()), Some("7".into())]],
+        "the join reads `a` unfiltered on the valid axis, inner-joined to s_only's id=1"
+    );
+
+    drop(client);
+    driver
+        .await
+        .expect("driver joined")
+        .expect("clean shutdown");
+}
+
 /// Stage the bitemporal identity-demo history on a fresh session and return the two
 /// commit ticks:
 ///   INSERT id=1, balance=100, valid [10, 20)  → c1

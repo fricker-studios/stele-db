@@ -1657,6 +1657,29 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         self.clock.current()
     }
 
+    /// Whether `table` resolves to a live schema that opts into a valid-time axis —
+    /// the predicate the session-time front end consults to decide whether a session
+    /// `SET stele.valid_time` pin may be injected over this read ([STL-325],
+    /// [`stele_sql::apply_session_time`]). A system-only table (and an unknown name)
+    /// is `false`, so a blanket valid pin is withheld from a join with any
+    /// system-only input rather than turning it into a bind error — the same
+    /// `valid_time_enabled` check the binder makes per join side ([STL-243]).
+    ///
+    /// Resolved at the commit clock's current instant ([`describe_live_tables`](Self::describe_live_tables)),
+    /// the latest committed schema. A table's valid-time policy is fixed at
+    /// `CREATE TABLE` (there is no `ALTER … VALID TIME`), so the answer is stable
+    /// across snapshots for a live name; the binder does the authoritative per-side
+    /// resolution at the read snapshot.
+    ///
+    /// [STL-243]: https://allegromusic.atlassian.net/browse/STL-243
+    /// [STL-325]: https://allegromusic.atlassian.net/browse/STL-325
+    #[must_use]
+    pub fn table_has_valid_axis(&self, table: &str) -> bool {
+        self.catalog
+            .resolve(table, self.clock.current())
+            .is_some_and(|schema| schema.temporal().valid_time_enabled())
+    }
+
     /// How many reads have consulted a secondary index this session
     /// ([STL-233]) — monotonic, counting every probe (whether it proved
     /// emptiness or produced a candidate window). The indexed≡unindexed
@@ -3311,12 +3334,15 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // both sides and combines their rows, rather than projecting one table's
         // reconstructed rows. The single-table fields below are unused for it. Every
         // input reads at the one statement-level `(sys, valid)` pin ([STL-243],
-        // docs/16 §8) — a `FOR … AS OF` on either axis threads through here. A join
-        // inside a transaction still reads the committed snapshot only — the
-        // read-your-own-writes overlay ([STL-203]) is single-table and not yet
-        // threaded through the join path.
+        // docs/16 §8) — a `FOR … AS OF` on either axis threads through here. The
+        // read-your-own-writes overlay ([STL-203], [STL-223]) rides into the join
+        // too ([STL-325]): each side's scan is overlaid with the transaction's
+        // buffered writes for that table before the hash join. The caller already
+        // dropped the overlay for a system time-travel read (`execute_at` passes an
+        // empty slice), so a `FOR SYSTEM_TIME AS OF` join sees committed history and
+        // a `FOR VALID_TIME AS OF` join keeps the overlay.
         if bound.join.is_some() {
-            return self.run_join(bound, scope);
+            return self.run_join(bound, overlay, scope);
         }
 
         // A `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` range scan
@@ -4362,17 +4388,31 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// derived table aliased `t` must not shadow the base table `t` on the other
     /// side.
     ///
+    /// A base side inside a transaction is **read-your-own-writes** consistent
+    /// ([STL-325]): when `overlay` holds buffered writes for the side's table, the
+    /// side is scanned row-major with the valid axis left open
+    /// ([`scan_all_rows`](Self::scan_all_rows)), the buffer is layered on
+    /// ([`overlay_table_writes`]), any `FOR VALID_TIME AS OF` pin is re-applied to the
+    /// overlaid rows ([`filter_overlaid_valid`], [STL-223]), and the result is
+    /// transposed back into the columnar shape the join consumes — the exact pipeline
+    /// the single-table overlay path runs ([`overlaid_rows`](Self::overlaid_rows)). A
+    /// side with no buffered writes keeps the zero-copy columnar scan. A materialized
+    /// (CTE / derived) side already reflects the overlay: it was materialized over the
+    /// same buffer ([`materialize_cte`](Self::materialize_cte)).
+    ///
     /// The returned [`ScanStats`] is the side's storage-scan accounting for the
-    /// join footer ([STL-318]) — `Some` for a base-table scan, `None` for a
-    /// materialized relation, whose storage reads happened (and were accounted)
-    /// when it was materialized ([`materialize_cte`](Self::materialize_cte)), not
-    /// here. A join with a materialized side therefore carries no single
-    /// accounting and suppresses the footer.
+    /// join footer ([STL-318]) — `Some` for a base-table scan (the overlay reports its
+    /// base scan, as the single-table path does), `None` for a materialized relation,
+    /// whose storage reads happened (and were accounted) when it was materialized
+    /// ([`materialize_cte`](Self::materialize_cte)), not here. A join with a
+    /// materialized side therefore carries no single accounting and suppresses the
+    /// footer.
     fn join_side_columns(
         &self,
         side: &BoundJoinSide,
         snapshot: SystemTimeMicros,
         valid_snapshot: Option<SystemTimeMicros>,
+        overlay: &[BoundDml],
         scope: &CteScope,
     ) -> Result<(Vec<Column>, Option<ScanStats>), EngineError> {
         if side.schema_id == SchemaId(0) {
@@ -4408,9 +4448,55 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .get(&side.table)
             .ok_or_else(|| EngineError::UnknownTable(side.table.clone()))?;
         let value_count = side.columns.len().saturating_sub(1);
+        // Read-your-own-writes ([STL-325]): this side has buffered writes in the open
+        // transaction, so overlay them before the join — the same row-major pipeline a
+        // single-table read runs ([`overlaid_rows`]). The base scan leaves the valid
+        // axis open; a `FOR VALID_TIME AS OF` pin is re-applied after the overlay
+        // ([`filter_overlaid_valid`], [STL-223]), then the rows are transposed into the
+        // columnar shape `decode_key_column` / the output assembly consume.
+        if overlay.iter().any(|d| d.table() == side.table) {
+            let base = Self::scan_all_rows(state, snapshot, value_count, &self.metrics)?;
+            let overlaid =
+                overlay_table_writes(base.rows, overlay, &side.table, value_count, false);
+            let pinned = match valid_snapshot {
+                Some(v) => {
+                    let (from_idx, to_idx) = self.side_valid_cols(&side.table, snapshot)?;
+                    filter_overlaid_valid(overlaid, from_idx, to_idx, v.0)?
+                }
+                None => overlaid,
+            };
+            let columns = columns_from_rows(pinned, value_count + 1);
+            return Ok((columns, Some(base.stats)));
+        }
         let (columns, stats) =
             Self::scan_all_columns(state, snapshot, valid_snapshot, value_count)?;
         Ok((columns, Some(stats)))
+    }
+
+    /// The `(from, to)` indices of a valid-time join side's period columns within its
+    /// schema row (`[business key, value cells…]`) — the positions
+    /// [`filter_overlaid_valid`] re-applies a `FOR VALID_TIME AS OF` pin over after a
+    /// read-your-own-writes overlay ([STL-325]). The binder only pins the valid axis
+    /// of a join when **every** input has one ([STL-243]), so a valid-pinned side is
+    /// always a valid-time table here; a side whose schema or period columns cannot be
+    /// resolved is an internal contract break, surfaced (never silently dropping the
+    /// pin and admitting rows outside it).
+    fn side_valid_cols(
+        &self,
+        table: &str,
+        snapshot: SystemTimeMicros,
+    ) -> Result<(usize, usize), EngineError> {
+        let schema = self
+            .catalog
+            .resolve(table, snapshot)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?;
+        let columns = schema.columns();
+        let idx = |name: &str| columns.iter().position(|c| c.name() == name);
+        schema
+            .temporal()
+            .valid_time()
+            .and_then(|spec| Some((idx(spec.from_column())?, idx(spec.to_column())?)))
+            .ok_or(EngineError::MalformedValidBound)
     }
 
     /// Run a bound two-table `JOIN` ([STL-172], [STL-264]).
@@ -4433,8 +4519,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// read uses ([`filter_rows`] / [`run_aggregate`] / [`shape_rows`]), addressing
     /// the addressable columns by the indices the binder bound them against (the
     /// binder's `JoinScope`, STL-264) — so the join composes with the rest of the
-    /// SELECT surface. The read-your-own-writes overlay is not threaded through the
-    /// join path (a single-table feature, [STL-203]).
+    /// SELECT surface. A join inside a transaction is **read-your-own-writes**
+    /// consistent ([STL-325]): each side's scan is overlaid with the transaction's
+    /// buffered writes for that table ([`join_side_columns`](Self::join_side_columns))
+    /// exactly as a single-table read is ([STL-203], [STL-223]). The caller gates the
+    /// overlay by AS-OF dimension — `execute_at` drops it for a system time-travel
+    /// read — so `overlay` is already empty for a `FOR SYSTEM_TIME AS OF` join.
     ///
     /// The "see the engine" footer ([STL-201]) reports both sides' scan accounting
     /// summed ([`ScanStats::combine`], STL-318) over the join's returned row count —
@@ -4444,6 +4534,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     fn run_join(
         &self,
         bound: &BoundSelect,
+        overlay: &[BoundDml],
         scope: &CteScope,
     ) -> Result<StatementOutcome, EngineError> {
         let join = bound
@@ -4457,11 +4548,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // ([STL-243]), or a materialized CTE / derived table read from the scope
         // ([STL-242]) — both yield the same shared-`Cells` columnar shape the join
         // consumes. Both sides resolve at the *same* pins, so the result is a
-        // consistent snapshot across every input (docs/16 §8).
+        // consistent snapshot across every input (docs/16 §8). A base side is overlaid
+        // with the transaction's buffered writes for that table ([STL-325]); the same
+        // `overlay` reaches both sides, so a self-join's two scans agree.
         let (left_cols, left_stats) =
-            self.join_side_columns(&join.left, snapshot, valid_snapshot, scope)?;
+            self.join_side_columns(&join.left, snapshot, valid_snapshot, overlay, scope)?;
         let (right_cols, right_stats) =
-            self.join_side_columns(&join.right, snapshot, valid_snapshot, scope)?;
+            self.join_side_columns(&join.right, snapshot, valid_snapshot, overlay, scope)?;
         let left_rows = left_cols[0].len();
         let right_rows = right_cols[0].len();
 
@@ -7628,6 +7721,30 @@ fn filter_overlaid_valid(
         }
     }
     Ok(kept)
+}
+
+/// Transpose row-major overlaid rows back into the columnar shape the hash join
+/// consumes ([STL-325]). Each of the `ncols` output columns is a [`Column::Bytes`]
+/// buffer carrying that position's cell across every row — the same shape
+/// [`scan_all_columns`](SessionEngine::scan_all_columns) returns, so
+/// [`decode_key_column`] and the join's output assembly read an overlaid side exactly
+/// as a committed-only scan. An empty row set still yields `ncols` empty columns (a
+/// zero-height side the join scans cleanly). Cells move (no byte copy); a row is
+/// `resize`d to `ncols` first, so the overlay pipeline's fixed `value_count + 1`
+/// width holds even if a malformed buffered row were ever shorter (padded `NULL`).
+fn columns_from_rows(rows: Vec<Vec<Option<Vec<u8>>>>, ncols: usize) -> Vec<Column> {
+    let mut columns: Vec<Vec<Option<Vec<u8>>>> =
+        (0..ncols).map(|_| Vec::with_capacity(rows.len())).collect();
+    for mut row in rows {
+        row.resize(ncols, None);
+        for (slot, cell) in columns.iter_mut().zip(row) {
+            slot.push(cell);
+        }
+    }
+    columns
+        .into_iter()
+        .map(|cells| Column::Bytes(cells.into()))
+        .collect()
 }
 
 /// Read one valid-time period bound (`valid_from` / `valid_to`) out of an overlaid

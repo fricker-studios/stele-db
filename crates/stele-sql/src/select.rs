@@ -5444,37 +5444,61 @@ pub fn cap_unbounded_select(stmt: &mut Statement, max_rows: u64) {
 /// instants are pre-resolved microsecond values (folded once, at the time of the
 /// `SET`), injected as integer literals that re-fold to themselves.
 ///
-/// Deliberately narrow, mirroring [`cap_unbounded_select`]:
-/// * **Plain single-table reads only.** A `JOIN`, a table-valued introspection
-///   call (`stele_history('t')`), a set operation, and a `FROM`-less constant
-///   `SELECT` are left untouched. A `JOIN` now honors an *explicit* `FOR … AS OF`
-///   on either axis ([STL-243]), but session-pin *injection* over a join stays
-///   deferred: a valid-axis pin requires every input to have a valid axis, so
-///   blanket-injecting one would turn a working join over a system-only table into
-///   an error. A TVF still rejects `AS OF` outright. The session pin therefore
-///   does not apply over a join (it reads live).
+/// Deliberately narrow:
+/// * **Plain single-table reads and two-table joins** of named base tables are
+///   eligible ([STL-325]). A table-valued introspection call (`stele_history('t')`),
+///   a set operation, a derived table, a `FROM`-less constant `SELECT`, and an N-way
+///   join are left untouched — the session pin does not apply (they read live), as
+///   for [`cap_unbounded_select`].
+/// * **Per-axis, by applicability.** The **system** pin is injected over any eligible
+///   shape — the system axis is always present, so a `FOR SYSTEM_TIME AS OF` binds
+///   over a single table or a join alike ([STL-243]). The **valid** pin is injected
+///   only when *every* input opts into a valid axis (`is_valid_time_table`, the same
+///   check the binder makes per join side, [STL-243]); when an input is system-only
+///   the valid pin is silently withheld (the read stays live on the valid axis)
+///   rather than injected into a bind error — mirroring `inherit_valid_snapshot`, the
+///   subquery-inheritance twin. A CTE / derived name shadows any same-named base
+///   table and is system-only, so it never carries a valid pin.
 /// * **Per-axis, explicit wins.** An axis the statement already qualifies with its
 ///   own `FOR <dim> AS OF` keeps that qualifier; the session pin fills only the
 ///   axes left unqualified.
 /// * **Reads only.** A non-`SELECT` statement is returned unchanged.
 ///
+/// `is_valid_time_table` answers whether a base table opts into a valid axis — the
+/// engine resolves it against the live catalog (`SessionEngine::table_has_valid_axis`);
+/// it is consulted only when a valid pin is set and the shape is eligible.
+///
 /// [STL-246]: https://allegromusic.atlassian.net/browse/STL-246
 /// [STL-243]: https://allegromusic.atlassian.net/browse/STL-243
+/// [STL-325]: https://allegromusic.atlassian.net/browse/STL-325
 pub fn apply_session_time(
     stmt: &mut Statement,
     system: Option<SystemTimeMicros>,
     valid: Option<SystemTimeMicros>,
+    is_valid_time_table: impl Fn(&str) -> bool,
 ) {
     if system.is_none() && valid.is_none() {
         return;
     }
-    // Only a plain single-table read accepts an `AS OF`; everything else would
-    // error if one were injected, so leave it (and the session pin) untouched.
-    let eligible =
-        matches!(stmt.sql(), Some(SqlStatement::Query(q)) if is_plain_single_table_read(q));
-    if !eligible {
+    // Only a read whose shape accepts an `AS OF` is eligible: a plain single-table
+    // read or a two-table join of named base tables. Everything else would error if
+    // one were injected, so leave it (and the session pin) untouched.
+    let Some(SqlStatement::Query(query)) = stmt.sql() else {
         return;
-    }
+    };
+    let Some(targets) = session_pin_targets(query) else {
+        return;
+    };
+    // Resolve valid-axis eligibility before mutating `stmt` (the borrow of `query` is
+    // immutable; the injection below needs `&mut stmt.temporal`). A CTE / derived name
+    // shadows any base table of the same name and is system-only, so a target the
+    // `WITH` list names never carries a valid pin.
+    let valid_eligible = {
+        let cte_names = cte_names(query);
+        targets
+            .iter()
+            .all(|t| !cte_names.contains(t) && is_valid_time_table(t))
+    };
     let has_system = stmt
         .temporal
         .as_of
@@ -5490,6 +5514,8 @@ pub fn apply_session_time(
     // could have written by hand.
     let instant =
         |micros: SystemTimeMicros| Expr::Value(Value::Number(micros.0.to_string(), false).into());
+    // The system pin applies over any eligible shape; the valid pin only when every
+    // input has a valid axis (else withheld, not an error — see the doc comment).
     if let Some(micros) = system
         && !has_system
     {
@@ -5500,12 +5526,67 @@ pub fn apply_session_time(
     }
     if let Some(micros) = valid
         && !has_valid
+        && valid_eligible
     {
         stmt.temporal.as_of.push(AsOf {
             dimension: TimeDimension::Valid,
             timestamp: instant(micros),
         });
     }
+}
+
+/// The base-table inputs a session pin may target ([STL-325]), or `None` if the
+/// read's shape is not pinnable. A plain single-table read returns its one table; a
+/// two-table join of named base tables returns both, in `(left, right)` order. A
+/// table-valued function (an `args`-carrying relation, e.g. `stele_history('t')`), a
+/// derived table, a set operation (`UNION`), a `FROM`-less constant `SELECT`, a
+/// schema-qualified name, and an N-way join all return `None` — the session pin is
+/// left un-injected for them, exactly the shapes [`is_plain_single_table_read`]
+/// already excludes plus the now-included two-table join.
+///
+/// A returned name may be a CTE / derived-table reference (indistinguishable from a
+/// base table at this layer); the caller resolves valid-axis eligibility against the
+/// catalog and the `WITH` list, which such a relation fails.
+fn session_pin_targets(query: &Query) -> Option<Vec<&str>> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let [from] = select.from.as_slice() else {
+        return None;
+    };
+    let left = base_table_name(&from.relation)?;
+    match from.joins.as_slice() {
+        [] => Some(vec![left]),
+        [join] => Some(vec![left, base_table_name(&join.relation)?]),
+        _ => None,
+    }
+}
+
+/// The single unqualified identifier of a base-table [`TableFactor`], or `None` for a
+/// table-valued function (`args` present), a derived table, or a schema-qualified
+/// name — the relations a session pin must not inject an `AS OF` over ([STL-325]).
+fn base_table_name(factor: &TableFactor) -> Option<&str> {
+    match factor {
+        TableFactor::Table {
+            name, args: None, ..
+        } => match name.0.as_slice() {
+            [part] => part.as_ident().map(|id| id.value.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The relation names a query's `WITH` list introduces — the CTEs / derived tables
+/// that shadow any same-named base table. A session valid pin is withheld from a
+/// target named here (a CTE's ephemeral schema is system-only — [STL-325]).
+fn cte_names(query: &Query) -> Vec<&str> {
+    query.with.as_ref().map_or_else(Vec::new, |with| {
+        with.cte_tables
+            .iter()
+            .map(|cte| cte.alias.name.value.as_str())
+            .collect()
+    })
 }
 
 /// Whether `query` is a one-table `SELECT` over a **named relation** — the only
@@ -5583,6 +5664,15 @@ mod tests {
             )
             .expect("create booking");
         catalog
+    }
+
+    /// The real session-pin valid-axis predicate ([STL-325]) against a catalog: a
+    /// base table opts into a valid axis at `NOW`. The closure form
+    /// [`apply_session_time`] consults to decide whether a valid pin is injectable.
+    fn valid_axis(catalog: &Catalog, table: &str) -> bool {
+        catalog
+            .resolve(table, NOW)
+            .is_some_and(|schema| schema.temporal().valid_time_enabled())
     }
 
     /// A fully-constant `PERIOD(from, to)` operand, the STL-165 shape.
@@ -8132,6 +8222,7 @@ mod tests {
             &mut stmt,
             Some(SystemTimeMicros(111)),
             Some(SystemTimeMicros(222)),
+            |t| t == "booking",
         );
         // Both axes are now qualified, each folding back to the pinned instant —
         // exactly as if the user had typed the explicit `FOR … AS OF` form.
@@ -8166,6 +8257,7 @@ mod tests {
             &mut pinned,
             Some(SystemTimeMicros(5_000)),
             Some(SystemTimeMicros(6_000)),
+            |t| valid_axis(&catalog, t),
         );
         let pinned = bind_select(&pinned, &ctx).expect("bind pinned");
 
@@ -8184,7 +8276,7 @@ mod tests {
     #[test]
     fn an_explicit_as_of_wins_over_the_session_pin() {
         let mut stmt = parse_one("SELECT * FROM account FOR SYSTEM_TIME AS OF 999");
-        apply_session_time(&mut stmt, Some(SystemTimeMicros(111)), None);
+        apply_session_time(&mut stmt, Some(SystemTimeMicros(111)), None, |_| false);
         // The statement's own qualifier is kept; the pin does not add a second one
         // (which would be a `MultipleAsOf` error at bind time).
         assert_eq!(stmt.temporal.as_of.len(), 1);
@@ -8195,29 +8287,98 @@ mod tests {
     }
 
     #[test]
-    fn session_time_does_not_touch_joins_or_non_selects() {
-        // A JOIN honors an explicit `AS OF` ([STL-243]) but session-pin injection
-        // over a join stays deferred (a valid-axis pin would error over a
-        // system-only input), so the pin must leave it untouched (read live).
-        let mut join = parse_one("SELECT a.x FROM a JOIN b ON a.id = b.id");
-        apply_session_time(&mut join, Some(SystemTimeMicros(111)), None);
-        assert!(join.temporal.as_of.is_empty());
-
+    fn session_time_leaves_writes_tvfs_and_constants_untouched() {
         // A write never time-travels.
         let mut dml = parse_one("INSERT INTO account VALUES (1, 2)");
-        apply_session_time(&mut dml, Some(SystemTimeMicros(111)), None);
+        apply_session_time(&mut dml, Some(SystemTimeMicros(111)), None, |_| true);
         assert!(dml.temporal.as_of.is_empty());
 
         // A FROM-less constant SELECT has no table to pin.
         let mut constant = parse_one("SELECT 1");
-        apply_session_time(&mut constant, Some(SystemTimeMicros(111)), None);
+        apply_session_time(&mut constant, Some(SystemTimeMicros(111)), None, |_| true);
         assert!(constant.temporal.as_of.is_empty());
+
+        // A table-valued introspection call (`args` present) rejects `AS OF`
+        // outright, so the session pin must not inject one — kept out by the TVF
+        // exclusion the join change preserves ([STL-325]).
+        let mut tvf = parse_one("SELECT * FROM stele_history('account')");
+        apply_session_time(&mut tvf, Some(SystemTimeMicros(111)), None, |_| true);
+        assert!(tvf.temporal.as_of.is_empty());
+    }
+
+    #[test]
+    fn session_system_pin_injects_over_a_join() {
+        // [STL-325]: the system axis is always present, so a session system pin is
+        // injected over a join just as an explicit `FOR SYSTEM_TIME AS OF` binds over
+        // one ([STL-243]) — the join no longer reads live under a system pin.
+        let mut join = parse_one("SELECT a.x FROM a JOIN b ON a.id = b.id");
+        apply_session_time(&mut join, Some(SystemTimeMicros(111)), None, |_| true);
+        let [as_of] = join.temporal.as_of.as_slice() else {
+            panic!("the system pin injects exactly one AS OF over the join");
+        };
+        assert_eq!(as_of.dimension, TimeDimension::System);
+        assert_eq!(
+            resolve_as_of(&as_of.timestamp, NOW),
+            Ok(SystemTimeMicros(111))
+        );
+    }
+
+    #[test]
+    fn session_valid_pin_over_a_join_needs_every_input_to_have_a_valid_axis() {
+        // [STL-325]: a valid pin is injected over a join when *both* inputs opt into a
+        // valid axis (the same check the binder makes per side, [STL-243]).
+        let mut both_valid = parse_one("SELECT a.x FROM a JOIN b ON a.id = b.id");
+        apply_session_time(
+            &mut both_valid,
+            Some(SystemTimeMicros(111)),
+            Some(SystemTimeMicros(222)),
+            |t| matches!(t, "a" | "b"),
+        );
+        assert_eq!(both_valid.temporal.as_of.len(), 2, "both axes pin");
+        let has = |stmt: &Statement, dim| stmt.temporal.as_of.iter().any(|a| a.dimension == dim);
+        assert!(
+            has(&both_valid, TimeDimension::System) && has(&both_valid, TimeDimension::Valid),
+            "both axes pin over a join of two valid-time tables"
+        );
+
+        // But withheld (not an error) when an input is system-only: the system pin
+        // still applies; the valid pin is simply not injected (the join reads live on
+        // the valid axis), so a working join over a system-only table never breaks.
+        let mut mixed = parse_one("SELECT a.x FROM a JOIN b ON a.id = b.id");
+        apply_session_time(
+            &mut mixed,
+            Some(SystemTimeMicros(111)),
+            Some(SystemTimeMicros(222)),
+            |t| t == "a",
+        );
+        let [as_of] = mixed.temporal.as_of.as_slice() else {
+            panic!("only the system pin injects over a join with a system-only input");
+        };
+        assert_eq!(as_of.dimension, TimeDimension::System);
+    }
+
+    #[test]
+    fn session_valid_pin_is_withheld_from_a_system_only_single_table() {
+        // [STL-325]: the valid-axis gate applies to single-table reads too — a session
+        // valid pin over a system-only table is withheld (the read stays live on the
+        // valid axis), not injected into a `ValidTimeUnsupported` bind error.
+        let mut stmt = parse_one("SELECT * FROM account");
+        apply_session_time(
+            &mut stmt,
+            Some(SystemTimeMicros(111)),
+            Some(SystemTimeMicros(222)),
+            |_| false,
+        );
+        let [as_of] = stmt.temporal.as_of.as_slice() else {
+            panic!("only the system pin injects over a system-only single table");
+        };
+        assert_eq!(as_of.dimension, TimeDimension::System);
     }
 
     #[test]
     fn an_empty_session_context_is_a_no_op() {
         let mut stmt = parse_one("SELECT * FROM account");
-        apply_session_time(&mut stmt, None, None);
+        apply_session_time(&mut stmt, None, None, |_| false);
         assert!(stmt.temporal.as_of.is_empty());
     }
 
