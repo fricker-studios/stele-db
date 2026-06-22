@@ -440,11 +440,12 @@ pub struct BoundSelect {
     /// ([STL-244]), or `None` for a point-in-time / plain read. When `Some`, the
     /// query is a **range scan**: the executor returns every version whose system
     /// interval `[sys_from, sys_to)` overlaps the range — not just the one live at
-    /// [`snapshot`](Self::snapshot) — and the result appends the period endpoints
-    /// (`sys_from`, `sys_to`) after the projected columns. Mutually exclusive with
-    /// an `AS OF` point read; the binder rejects a range combined with a `JOIN`,
-    /// aggregate, `DISTINCT`/`ORDER BY`/`LIMIT`, subquery, or period predicate
-    /// (each a tracked follow-up).
+    /// [`snapshot`](Self::snapshot) — exposing the period endpoints (`sys_from`,
+    /// `sys_to`) as addressable columns after the table's own ([STL-329]). Result
+    /// shaping, aggregation, and projected provenance pseudo-columns compose over it;
+    /// mutually exclusive with an `AS OF` point read, and the binder still rejects a
+    /// range combined with a `JOIN`, a subquery / period `WHERE`, a computed
+    /// projection, or a CTE / derived source (each a tracked follow-up).
     pub system_range: Option<SystemTimeRange>,
     /// A bound `FOR VALID_TIME { FROM a TO b | BETWEEN a AND b }` range ([STL-328]),
     /// or `None`. When `Some`, the query is a **valid-time range scan**: the
@@ -454,8 +455,10 @@ pub struct BoundSelect {
     /// columns. Requires a valid-time table; mutually exclusive with a
     /// [`system_range`](Self::system_range) and with a `FOR VALID_TIME AS OF`
     /// [`valid_snapshot`](Self::valid_snapshot) (a system `AS OF` pin is allowed and
-    /// sets [`snapshot`](Self::snapshot)). The binder rejects the same shaping /
-    /// aggregate / subquery / `JOIN` / CTE clauses the system range does.
+    /// sets [`snapshot`](Self::snapshot)). The same SELECT surface composes over it
+    /// as the system range — shaping, aggregation, projected provenance ([STL-329]) —
+    /// and the binder rejects the same residual shapes (subquery / period `WHERE`,
+    /// `JOIN`, computed projection, CTE / derived source).
     pub valid_range: Option<ValidTimeRange>,
     /// The columns the query projects.
     pub projection: Projection,
@@ -562,6 +565,79 @@ impl BoundSelect {
             && self.offset == 0
             && self.limit.is_none()
     }
+
+    /// The names of the period-endpoint columns a range scan appends after the
+    /// table's own columns, or `None` for a non-range read ([STL-244], [STL-328]).
+    ///
+    /// A system range exposes `(sys_from, sys_to)`, a valid range
+    /// `(valid_from, valid_to)`; both are `TIMESTAMPTZ` with a `NULL` upper for an
+    /// open-ended period. These are *addressable* columns ([STL-329]): the
+    /// projection, `ORDER BY`, `GROUP BY`, and aggregate clauses resolve them by
+    /// name, the binder appends them to the schema it binds those clauses against,
+    /// and the engine names them identically in the executed result and the
+    /// statement `Describe`.
+    #[must_use]
+    pub const fn range_endpoint_names(&self) -> Option<(&'static str, &'static str)> {
+        range_endpoint_names(self.system_range.is_some(), self.valid_range.is_some())
+    }
+}
+
+/// The period-endpoint column names for a range scan over the given axis, or
+/// `None` when neither axis ranges ([STL-329]). Shared by [`BoundSelect`] and the
+/// binder's range-schema construction so both agree on `(sys_from, sys_to)` /
+/// `(valid_from, valid_to)`.
+const fn range_endpoint_names(system: bool, valid: bool) -> Option<(&'static str, &'static str)> {
+    if system {
+        Some(("sys_from", "sys_to"))
+    } else if valid {
+        Some(("valid_from", "valid_to"))
+    } else {
+        None
+    }
+}
+
+/// Build the schema a **range scan** binds its projection, result-shaping,
+/// aggregate, and `WHERE` clauses against ([STL-329]): the table's own columns
+/// followed by the two period endpoints the read appends (`sys_from`/`sys_to`, or
+/// `valid_from`/`valid_to`). With the endpoints in the bound schema, `SELECT *`
+/// expands to include them, and `ORDER BY sys_from` / a named projection /
+/// `GROUP BY` resolve them — the engine appends them at the matching positions.
+/// Returns `None` for a non-range read, which binds against the catalog schema
+/// unchanged.
+///
+/// The endpoints are `TIMESTAMPTZ`, appended in `(from, to)` order. The provenance
+/// pseudo-columns are deliberately *not* part of this schema: they stay virtual,
+/// resolved past it exactly as on a point read ([STL-247]), so a projected
+/// `_stele_txn_id` lands after the endpoints in the engine's addressable set.
+///
+/// # Errors
+///
+/// [`SelectError::UnsupportedSystemRange`] / [`SelectError::UnsupportedValidRange`]
+/// if the table already has a column named like an appended endpoint — the output
+/// name would be ambiguous, so the range read is rejected rather than silently
+/// shadowing the user's column.
+fn range_effective_schema(
+    schema: &TableSchema,
+    system_range: bool,
+    valid_range: bool,
+) -> Result<Option<TableSchema>, SelectError> {
+    let Some((from_name, to_name)) = range_endpoint_names(system_range, valid_range) else {
+        return Ok(None);
+    };
+    let mut columns: Vec<ColumnDef> = schema.columns().to_vec();
+    let endpoint = |name: &str| {
+        ColumnDef::new(name, LogicalType::TimestampTz).expect("a static endpoint name is non-empty")
+    };
+    columns.push(endpoint(from_name));
+    columns.push(endpoint(to_name));
+    TableSchema::ephemeral(columns).map(Some).map_err(|_| {
+        let what = "over a table with a column named like the appended endpoint".to_owned();
+        if valid_range {
+            SelectError::UnsupportedValidRange(what)
+        } else {
+            SelectError::UnsupportedSystemRange(what)
+        }
+    })
 }
 
 /// A bound `WHERE` clause whose predicate is a subquery — a scalar comparison,
@@ -1586,6 +1662,18 @@ fn bind_select_scoped(
         });
     }
 
+    // A range scan ([STL-244], [STL-328]) binds its projection, result-shaping,
+    // aggregate, and `WHERE` clauses against the table's columns *plus* the two
+    // period endpoints it appends (`sys_from`/`sys_to`, or `valid_from`/`valid_to`),
+    // so the rest of the SELECT surface composes over the range output the way it
+    // does a point read ([STL-329]): `SELECT *` includes the endpoints, `ORDER BY
+    // sys_from` and a named projection resolve them, and the provenance
+    // pseudo-columns stay virtual past them. A non-range read binds against the
+    // catalog schema unchanged (`range_schema` is `None`).
+    let range_schema =
+        range_effective_schema(schema, system_range.is_some(), valid_range.is_some())?;
+    let bind_schema: &TableSchema = range_schema.as_ref().unwrap_or(schema);
+
     // Bind the projection list ([STL-303]): `*`, or one item per select-list entry
     // — a bare column (optionally `AS`-aliased), a computed scalar expression, or an
     // uncorrelated scalar subquery. An aggregate query takes its output columns from
@@ -1601,7 +1689,7 @@ fn bind_select_scoped(
     } else {
         bind_projection(
             select,
-            schema,
+            bind_schema,
             table,
             materialized,
             ctx,
@@ -1613,7 +1701,7 @@ fn bind_select_scoped(
     // Bind the `GROUP BY` + aggregate plan against the resolved schema, which
     // gives the grouping/argument columns their indices and types.
     let aggregate = if aggregate_query {
-        Some(bind_aggregate(select, schema, table)?)
+        Some(bind_aggregate(select, bind_schema, table)?)
     } else {
         None
     };
@@ -1624,7 +1712,7 @@ fn bind_select_scoped(
     let distinct = bind_distinct(select)?;
     let order_by = bind_order_by(
         query,
-        schema,
+        bind_schema,
         table,
         distinct,
         aggregate.as_ref(),
@@ -1639,7 +1727,7 @@ fn bind_select_scoped(
     // comparison whose operand is a `(SELECT …)` is its shape, not the plain
     // predicate binder's.
     let (filter, subquery_filter) =
-        bind_where(select, schema, table, ctx, snapshot, valid_snapshot)?;
+        bind_where(select, bind_schema, table, ctx, snapshot, valid_snapshot)?;
 
     // A period predicate is lifted off the token stream (the executor-glue
     // `WHERE` is gone by the time `bind_where` runs), so the two filter shapes
@@ -1663,11 +1751,17 @@ fn bind_select_scoped(
     });
 
     // A range scan ([STL-244] system axis, [STL-328] valid axis) is the "all
-    // versions over an interval" read. v0.3 binds it only as a plain single
-    // base-table read (projection + a `WHERE`); the result-shaping, aggregation,
-    // subquery, period-predicate, and materialized-relation shapes are each a
-    // tracked follow-up — rejected here so a range scan never silently drops a
-    // clause. Both axes reject the same shapes; only the error axis differs.
+    // versions over an interval" read. Result-shaping ([STL-263]), aggregation
+    // ([STL-171]), and the provenance pseudo-columns ([STL-247]) now compose over
+    // it ([STL-329]): they bind against `bind_schema` above (the table's columns
+    // plus the appended endpoints) and run through the engine's shared
+    // `finish_select` pipeline. What does *not* yet compose is rejected here so a
+    // range scan never silently drops a clause — a subquery `WHERE` ([STL-234]), a
+    // period-predicate `WHERE` ([STL-165]), a CTE / derived relation, and a
+    // computed / scalar-subquery select item ([STL-303]), each a tracked follow-up.
+    // (The read-your-own-writes overlay and a range over a `JOIN` are deferred too,
+    // handled at the engine / join paths respectively.) Both axes reject the same
+    // shapes; only the error axis differs.
     if system_range.is_some() || valid_range.is_some() {
         let valid_axis = valid_range.is_some();
         let reject = |what: &str| {
@@ -1677,18 +1771,6 @@ fn bind_select_scoped(
                 SelectError::UnsupportedSystemRange(what.to_owned())
             })
         };
-        if aggregate.is_some() {
-            return reject("with an aggregate / GROUP BY");
-        }
-        if distinct {
-            return reject("with DISTINCT");
-        }
-        if !order_by.is_empty() {
-            return reject("with ORDER BY");
-        }
-        if limit.is_some() || offset != 0 {
-            return reject("with LIMIT / OFFSET");
-        }
         if subquery_filter.is_some() {
             return reject("with a subquery WHERE");
         }
@@ -1698,28 +1780,17 @@ fn bind_select_scoped(
         if materialized {
             return reject("over a CTE / derived table");
         }
-        // The range path appends the period endpoints (`sys_from`/`sys_to`, or
-        // `valid_from`/`valid_to` on the valid axis) after plain projected columns.
-        // A computed expression or scalar-subquery select item ([STL-303]) and a
-        // provenance pseudo-column ([STL-247]) over a range are both tracked
-        // follow-ups — rejected here rather than mis-projected by the engine's
-        // positional range path. (The general binder accepts both in any projection.)
+        // A bare-column list — the table's columns, the appended endpoints, and the
+        // provenance pseudo-columns — is what composes today; a computed expression
+        // or scalar-subquery select item ([STL-303]) over a range is a tracked
+        // follow-up.
         if !projection.is_all_columns() {
             return reject("with a computed or subquery projection");
-        }
-        if let Projection::Items(items) = &projection {
-            for item in items {
-                if let ProjectionValue::Column(source) = &item.value
-                    && schema.column(source).is_none()
-                {
-                    return reject("with a provenance pseudo-column");
-                }
-            }
         }
     }
 
     let header = aggregate.as_ref().map_or_else(
-        || projected_header(schema, &projection),
+        || projected_header(bind_schema, &projection),
         |agg| agg.columns.clone(),
     );
 
@@ -5620,12 +5691,11 @@ fn row_count(expr: &Expr, clause: &str) -> Result<u64, SelectError> {
 ///
 /// [STL-306]: https://allegromusic.atlassian.net/browse/STL-306
 pub fn cap_unbounded_select(stmt: &mut Statement, max_rows: u64) {
-    // A `FOR SYSTEM_TIME` range scan ([STL-244]) is an explicit history read whose
-    // binder rejects a `LIMIT`; injecting one would turn every range scan into a
-    // bind error. Leave it uncapped — like a join or a table-valued read.
-    if stmt.temporal.range.is_some() {
-        return;
-    }
+    // A `FOR { SYSTEM_TIME | VALID_TIME }` range scan now binds a `LIMIT` like any
+    // plain single-table read ([STL-329]), so it is capped too: a `… FROM big_table
+    // FOR SYSTEM_TIME FROM a TO b` history read can return far more rows than a point
+    // read and would flood an interactive client just the same. An explicit `LIMIT`
+    // or the extended protocol still reads it all.
     let Some(SqlStatement::Query(query)) = stmt.sql_mut() else {
         return;
     };
@@ -6898,14 +6968,13 @@ mod tests {
     fn a_range_combined_with_unsupported_clauses_is_rejected() {
         let catalog = catalog_with_account(1_000);
         for sql in [
-            // mixing a point AS OF with a range
+            // A point AS OF and a range are contradictory reads of one table.
             "SELECT * FROM account FOR SYSTEM_TIME AS OF 5 FOR SYSTEM_TIME FROM 1 TO 9",
-            "SELECT * FROM account FOR SYSTEM_TIME FROM 1 TO 9 ORDER BY id",
-            "SELECT * FROM account FOR SYSTEM_TIME FROM 1 TO 9 LIMIT 10",
-            "SELECT DISTINCT id FROM account FOR SYSTEM_TIME FROM 1 TO 9",
-            "SELECT count(*) FROM account FOR SYSTEM_TIME FROM 1 TO 9",
-            // A provenance pseudo-column over a range is a tracked follow-up.
-            "SELECT _stele_txn_id FROM account FOR SYSTEM_TIME FROM 1 TO 9",
+            // A subquery WHERE over a range is a tracked follow-up ([STL-329]).
+            "SELECT * FROM account FOR SYSTEM_TIME FROM 1 TO 9 WHERE id IN (SELECT id FROM account)",
+            // A computed / scalar-subquery select item over a range is a tracked
+            // follow-up ([STL-303] does not yet compose over a range).
+            "SELECT id + 1 FROM account FOR SYSTEM_TIME FROM 1 TO 9",
         ] {
             assert!(
                 matches!(
@@ -6915,6 +6984,57 @@ mod tests {
                 "expected UnsupportedSystemRange for: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn a_range_composes_shaping_aggregates_and_provenance() {
+        let catalog = catalog_with_account(1_000);
+
+        // Result-shaping ([STL-263]) binds over a range ([STL-329]), including
+        // ordering on the appended `sys_from` / `sys_to` endpoints.
+        let shaped = bind(
+            "SELECT * FROM account FOR SYSTEM_TIME FROM 1 TO 9 \
+             ORDER BY sys_from DESC LIMIT 10 OFFSET 2",
+            &catalog,
+        )
+        .expect("shaping binds over a range");
+        assert!(shaped.system_range.is_some());
+        assert_eq!(shaped.limit, Some(10));
+        assert_eq!(shaped.offset, 2);
+        assert_eq!(shaped.order_by.len(), 1, "ORDER BY sys_from bound");
+
+        assert!(
+            bind(
+                "SELECT DISTINCT id FROM account FOR SYSTEM_TIME FROM 1 TO 9",
+                &catalog,
+            )
+            .expect("DISTINCT binds over a range")
+            .distinct
+        );
+
+        // An aggregate / GROUP BY ([STL-171]) folds the range output.
+        assert!(
+            bind(
+                "SELECT id, count(*) FROM account FOR SYSTEM_TIME FROM 1 TO 9 GROUP BY id",
+                &catalog,
+            )
+            .expect("an aggregate binds over a range")
+            .aggregate
+            .is_some()
+        );
+
+        // A provenance pseudo-column ([STL-247]) projects from a range, alongside a
+        // user column and an endpoint.
+        let prov = bind(
+            "SELECT id, _stele_txn_id, sys_to FROM account FOR SYSTEM_TIME FROM 1 TO 9",
+            &catalog,
+        )
+        .expect("a provenance pseudo-column projects from a range");
+        assert!(prov.system_range.is_some());
+        let Projection::Items(items) = &prov.projection else {
+            panic!("expected a named projection");
+        };
+        assert_eq!(items.len(), 3, "id, _stele_txn_id, sys_to");
     }
 
     #[test]
@@ -6997,13 +7117,12 @@ mod tests {
     fn a_valid_range_combined_with_unsupported_clauses_is_rejected() {
         let catalog = catalog_with_booking(1_000);
         for sql in [
-            // a valid point AS OF and a valid range are the same axis — contradictory
+            // A valid point AS OF and a valid range are the same axis — contradictory.
             "SELECT * FROM booking FOR VALID_TIME AS OF 5 FOR VALID_TIME FROM 1 TO 9",
-            "SELECT * FROM booking FOR VALID_TIME FROM 1 TO 9 ORDER BY id",
-            "SELECT * FROM booking FOR VALID_TIME FROM 1 TO 9 LIMIT 10",
-            "SELECT DISTINCT id FROM booking FOR VALID_TIME FROM 1 TO 9",
-            "SELECT count(*) FROM booking FOR VALID_TIME FROM 1 TO 9",
-            "SELECT _stele_txn_id FROM booking FOR VALID_TIME FROM 1 TO 9",
+            // A subquery WHERE over a range is a tracked follow-up ([STL-329]).
+            "SELECT * FROM booking FOR VALID_TIME FROM 1 TO 9 WHERE id IN (SELECT id FROM booking)",
+            // A computed select item over a range is a tracked follow-up.
+            "SELECT id + 1 FROM booking FOR VALID_TIME FROM 1 TO 9",
         ] {
             assert!(
                 matches!(
@@ -7013,6 +7132,43 @@ mod tests {
                 "expected UnsupportedValidRange for: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn a_valid_range_composes_shaping_aggregates_and_provenance() {
+        let catalog = catalog_with_booking(1_000);
+
+        // Result-shaping binds over a valid range ([STL-329]), ordering on the
+        // appended `valid_from` / `valid_to` endpoints included.
+        let shaped = bind(
+            "SELECT * FROM booking FOR VALID_TIME FROM 1 TO 9 \
+             ORDER BY valid_to LIMIT 5",
+            &catalog,
+        )
+        .expect("shaping binds over a valid range");
+        assert!(shaped.valid_range.is_some());
+        assert_eq!(shaped.limit, Some(5));
+        assert_eq!(shaped.order_by.len(), 1, "ORDER BY valid_to bound");
+
+        // An aggregate and a projected provenance pseudo-column both bind.
+        assert!(
+            bind(
+                "SELECT count(*) FROM booking FOR VALID_TIME FROM 1 TO 9",
+                &catalog,
+            )
+            .expect("an aggregate binds over a valid range")
+            .aggregate
+            .is_some()
+        );
+        assert!(
+            bind(
+                "SELECT id, _stele_txn_id FROM booking FOR VALID_TIME FROM 1 TO 9",
+                &catalog,
+            )
+            .expect("a provenance pseudo-column projects from a valid range")
+            .valid_range
+            .is_some()
+        );
     }
 
     #[test]

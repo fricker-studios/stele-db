@@ -132,26 +132,31 @@ difference is the "off-by-one on a half-open interval" bug class the §4 oracle
 (`crates/stele-engine/tests/system_range_oracle.rs`) pins against a reference
 model across the flush/seal boundary.
 
-**Output shape (the projection contract).** A range read appends the period
-endpoints **`sys_from`** and **`sys_to`** (both `TIMESTAMPTZ`) after the projected
-columns — `SELECT *` is `[user columns…, sys_from, sys_to]`, `SELECT a` is
-`[a, sys_from, sys_to]`. `sys_to` is `NULL` for a still-current (open) version.
-This is the row shape STL-199's `\history` consumes. A provenance pseudo-column
-([STL-247]) over a range read is a tracked follow-up — rejected at bind for now,
-not silently dropped.
+**Output shape (the projection contract).** A range read's output **schema** is the
+table's own columns followed by the appended period endpoints **`sys_from`** and
+**`sys_to`** (both `TIMESTAMPTZ`) — so `SELECT *` is `[user columns…, sys_from,
+sys_to]`. The endpoints are *addressable* columns ([STL-329]): a named projection
+returns exactly what it lists (`SELECT a` is `[a]`; `SELECT a, sys_from` is
+`[a, sys_from]`), and they are nameable in `ORDER BY` / `GROUP BY` / a value `WHERE`
+like any column. `sys_to` is `NULL` for a still-current (open) version. This is the
+row shape STL-199's `\history` consumes (it names the endpoints explicitly).
 
-**v0.3 scope.** A system range binds as a plain single base-table read with a
-`WHERE` predicate. (The **valid axis** is the parallel form below
-([STL-328](#for-valid_time--from-a-to-b--between-a-and-b---valid-time-range-scans-stl-328)),
-which relaxes the `AS OF` rule.) Each of these is rejected at bind time for a
-*system* range (a tracked follow-up, never a silently-dropped clause): combining a
-system range with **any** `AS OF` point qualifier; a `JOIN`, aggregate /
-`GROUP BY`, `DISTINCT` / `ORDER BY` / `LIMIT` / `OFFSET`, subquery or
-period-predicate `WHERE`, or a CTE / derived-table source; and `FOR SYSTEM_TIME
-ALL` (the trivially-full range). A range scan reads the committed snapshot only —
-the read-your-own-writes overlay is not applied to it (unlike a point read or a
-join, [STL-325]) — and is exempt from the simple-query default row cap
+**Composing the SELECT surface ([STL-329]).** The rest of the read surface composes
+over a range, routed through the shared `finish_select` pipeline exactly as a point
+read is: result-shaping (`DISTINCT` / `ORDER BY` — including on `sys_from` /
+`sys_to` — / `LIMIT` / `OFFSET`), aggregation / `GROUP BY` over the range output,
+and the provenance pseudo-columns ([STL-247]) projected from the range. A range
+scan is now subject to the simple-query default row cap too, like any plain read
 ([below](#default-row-cap-on-the-simple-query-path-stl-306)).
+
+**Still rejected (tracked follow-ups), never silently dropped.** Combining a system
+range with **any** `AS OF` point qualifier; a `JOIN`; a subquery or period-predicate
+`WHERE`; a computed / scalar-subquery select item; a CTE / derived-table source; the
+read-your-own-writes overlay (a range reads the committed snapshot only, unlike a
+point read or a join, [STL-325]); and `FOR SYSTEM_TIME ALL` (the trivially-full
+range). (The **valid axis** is the parallel form below
+([STL-328](#for-valid_time--from-a-to-b--between-a-and-b---valid-time-range-scans-stl-328)),
+which relaxes the `AS OF` rule.)
 
 ### `FOR VALID_TIME { FROM a TO b | BETWEEN a AND b }` — valid-time range scans (STL-328)
 
@@ -183,18 +188,22 @@ contract, same empty/reversed bind error — applied to the version's
 | `FROM a TO b` | `[a, b)` (half-open) | `vf < vt` and `vt > a` and `vf < b` |
 | `BETWEEN a AND b` | `[a, b]` (closed) | `vf < vt` and `vt > a` and `vf ≤ b` |
 
-**Output shape.** A valid range appends the period endpoints **`valid_from`** and
-**`valid_to`** (both `TIMESTAMPTZ`) after the projected columns — `SELECT *` is
-`[user columns…, valid_from, valid_to]`. `valid_to` is `NULL` for an open-ended
-("until changed", `+∞`) fact, mirroring how `sys_to` renders for an open system
-period.
+**Output shape.** A valid range's output schema appends the period endpoints
+**`valid_from`** and **`valid_to`** (both `TIMESTAMPTZ`) to the table's columns — so
+`SELECT *` is `[user columns…, valid_from, valid_to]`, and the endpoints are
+addressable by name just like the system axis ([STL-329]). `valid_to` is `NULL` for
+an open-ended ("until changed", `+∞`) fact, mirroring how `sys_to` renders for an
+open system period.
 
 **As-of composition.** A `FOR SYSTEM_TIME AS OF s` pin is *allowed* with a valid
 range — it fixes the system snapshot the valid history is read at (the cross-axis
 `v(k, S, V_range)`, the range-extension of the both-axes point read). A
-`FOR VALID_TIME AS OF` is rejected (a point and a range on the *same* axis), as is
-every shaping / aggregate / subquery / `JOIN` / CTE clause the system range
-rejects. The correctness oracle (`crates/stele-engine/tests/valid_range_oracle.rs`,
+`FOR VALID_TIME AS OF` is rejected (a point and a range on the *same* axis). The
+same SELECT surface composes over a valid range as a system one ([STL-329]):
+result-shaping, aggregation / `GROUP BY`, and projected provenance pseudo-columns;
+the same shapes a system range rejects (subquery / period `WHERE`, `JOIN`, CTE,
+computed projection, read-your-own-writes) are rejected here too. The correctness
+oracle (`crates/stele-engine/tests/valid_range_oracle.rs`,
 [docs/06 §4](06-testing-strategy.md#4-correctness-oracles-the-temporal-heart))
 sweeps a bitemporal workload across both axes and the flush/seal boundary against a
 reference model, with the same off-by-one teeth check.
