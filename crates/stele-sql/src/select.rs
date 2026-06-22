@@ -55,7 +55,7 @@
 
 use sqlparser::ast::{
     BinaryOperator, Distinct, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, Join, JoinConstraint, JoinOperator, LimitClause, OrderByExpr,
+    FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, OrderByExpr,
     OrderByKind, Query, Select, SelectItem, SetExpr, Statement as SqlStatement, TableFactor,
     TableWithJoins, Value, WildcardAdditionalOptions,
 };
@@ -977,42 +977,61 @@ pub struct BoundJoinSide {
     pub columns: Vec<(String, LogicalType)>,
 }
 
-/// A bound two-table equi-join ([STL-172], [STL-264]).
+/// A bound equi-join — a two-table join ([STL-172], [STL-264]) or an N-way
+/// left-deep chain ([STL-323]).
 ///
-/// The executor scans each side at the read snapshot, joins their rows on
-/// `left[left_key] = right[right_key]`, and materializes the **addressable output**
-/// — the left side's columns, then the right's for an `INNER` / `LEFT` join (a
-/// `SEMI` / `ANTI` join keeps only the left). A `WHERE`, an aggregate, and the
-/// `DISTINCT` / `ORDER BY` / `OFFSET` / `LIMIT` tail then run over that flat row
-/// exactly as the single-table path runs them over a reconstructed row ([STL-264]):
-/// the bound [`BoundSelect`] carries them, addressing columns by their index in the
-/// addressable output. [`output`](Self::output) is the projection — the indices the
-/// `SELECT` list selects from it.
+/// The executor scans [`left`](Self::left) (the leftmost input) at the read
+/// snapshot, then folds the [`steps`](Self::steps) **left-deep**: each step joins
+/// the accumulated output so far against a freshly scanned right input, growing the
+/// **addressable output** — the accumulated columns, then the step's right columns
+/// for an `INNER` / `LEFT` join (a `SEMI` / `ANTI` step keeps only the accumulated
+/// left). A `WHERE`, an aggregate, and the `DISTINCT` / `ORDER BY` / `OFFSET` /
+/// `LIMIT` tail then run over the final flat row exactly as the single-table path
+/// runs them over a reconstructed row ([STL-264]): the bound [`BoundSelect`] carries
+/// them, addressing columns by their index in the addressable output.
+/// [`output`](Self::output) is the projection — the indices the `SELECT` list
+/// selects from it.
 ///
-/// v0.3 binds a single equality condition over one column per side. `AS OF` over
-/// the join ([STL-243]), N-way joins ([STL-323]), and `RIGHT` / `FULL` / non-equi
-/// joins ([STL-270]) are tracked follow-ups.
+/// A two-table join is the degenerate chain of one step. Each step binds a single
+/// equality over one column of the accumulated output and one of the new input.
+/// `AS OF` over the join ([STL-243]) and `RIGHT` / `FULL` / non-equi joins
+/// ([STL-270]) are tracked follow-ups; join reordering is out of scope (the chain
+/// runs in syntactic, left-deep order).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundJoin {
-    /// Which join to compute.
-    pub join_type: JoinType,
-    /// The left (probe) side.
+    /// The leftmost (seed) input — the left side of the first join in the chain.
     pub left: BoundJoinSide,
-    /// The right (build) side.
-    pub right: BoundJoinSide,
-    /// The equi-join key's column index in the left side's schema.
-    pub left_key: usize,
-    /// The equi-join key's column index in the right side's schema. The two key
-    /// columns share a [`LogicalType`] (the binder enforces it).
-    pub right_key: usize,
+    /// The left-deep chain of joins, in syntactic order: one [`BoundJoinStep`] per
+    /// `JOIN` keyword. A two-table join has exactly one step; an N-way join
+    /// `a JOIN b … JOIN c …` has one step per added input ([STL-323]). Always
+    /// non-empty (the join path is routed only when at least one `JOIN` is present).
+    pub steps: Vec<BoundJoinStep>,
     /// The projection: the `SELECT`-list output columns, as indices into the
-    /// **addressable output** (the left side's columns, then the right's for an
-    /// `INNER` / `LEFT` join). `SELECT *` is every index in order. Unused on the
-    /// aggregate path, whose output columns come from [`BoundSelect::aggregate`].
+    /// **addressable output** (the accumulated columns the whole chain produces).
+    /// `SELECT *` is every index in order. Unused on the aggregate path, whose
+    /// output columns come from [`BoundSelect::aggregate`].
     pub output: Vec<usize>,
     /// The result columns `(name, type)`, aligned to [`output`](Self::output) — a
     /// `RowDescription` header for the projected (non-aggregate) join result.
     pub columns: Vec<(String, LogicalType)>,
+}
+
+/// One join in a [`BoundJoin`]'s left-deep chain ([STL-323]): the right input
+/// folded in at this step and the equi-condition relating it to the accumulated
+/// output so far.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundJoinStep {
+    /// Which join to compute at this step.
+    pub join_type: JoinType,
+    /// The right (build) input joined in at this step.
+    pub right: BoundJoinSide,
+    /// The equi-join key as a **flat addressable index** into the accumulated
+    /// output the chain has built *before* this step (for the first step, that is
+    /// just [`BoundJoin::left`]'s columns).
+    pub left_key: usize,
+    /// The equi-join key's column index in [`right`](Self::right)'s schema. The two
+    /// key columns share a [`LogicalType`] (the binder enforces it).
+    pub right_key: usize,
 }
 
 /// A bound non-recursive common-table-expression or derived table ([STL-242]).
@@ -1421,11 +1440,12 @@ fn bind_select_scoped(
     };
     let (mut ctes, sigs) = bind_with_list(query, &cte_ctx, outer_ctes)?;
 
-    // A two-table `JOIN` binds to a wholly different shape (two sides, a join
-    // condition, a combined header), so it is routed before the single-table path.
-    // The `WHERE` / aggregate / `DISTINCT` / `ORDER BY` / `LIMIT` clauses compose
-    // over the join's output ([STL-264]) — bound against its addressable columns.
-    if let Some(join) = detect_join(select)? {
+    // A `JOIN` chain binds to a wholly different shape (a seed input, a left-deep
+    // chain of join steps, a combined header), so it is routed before the
+    // single-table path. The `WHERE` / aggregate / `DISTINCT` / `ORDER BY` / `LIMIT`
+    // clauses compose over the join's output ([STL-264]) — bound against its
+    // addressable columns.
+    if let Some(join) = detect_join(select) {
         // A range scan over a join is a tracked follow-up — the single consistent
         // `(sys, valid)` snapshot rule a join pins (docs/16 §8) does not generalize
         // to an interval read of every input.
@@ -2635,42 +2655,35 @@ fn resolve_filter_column(schema: &TableSchema, name: &str) -> Option<(usize, Log
         .map(|k| (n_schema + k, provenance::PSEUDO_COLUMNS[k].1))
 }
 
-/// A single two-table `JOIN` in the `FROM` clause, or `None` for any other shape
-/// (a single table, a comma join, an N-way join — each handled or rejected
-/// elsewhere).
+/// A `JOIN` chain in the `FROM` clause, or `None` for any other shape (a single
+/// table, or a comma join — each handled or rejected elsewhere).
 ///
-/// Returns the [`TableWithJoins`] (its `relation` the left table, its lone join
-/// the right) only for exactly one table with exactly one join. More than one join
-/// is the explicit [`SelectError::UnsupportedJoin`] (N-way joins are a follow-up);
-/// zero joins or a non-singleton `FROM` returns `None` so the single-table path
-/// reports it.
-fn detect_join(select: &Select) -> Result<Option<&TableWithJoins>, SelectError> {
+/// Returns the [`TableWithJoins`] — its `relation` the leftmost (seed) input and
+/// its `joins` the left-deep chain folded onto it ([STL-323]) — for exactly one
+/// `FROM` item carrying at least one `JOIN`. Zero joins or a comma-separated
+/// (multi-item) `FROM` returns `None`, so the single-table path reports it.
+fn detect_join(select: &Select) -> Option<&TableWithJoins> {
     let [from] = select.from.as_slice() else {
-        return Ok(None);
+        return None;
     };
-    match from.joins.len() {
-        0 => Ok(None),
-        1 => Ok(Some(from)),
-        _ => Err(SelectError::UnsupportedJoin(
-            "only a single JOIN is supported (N-way left-deep joins are STL-323)".to_owned(),
-        )),
-    }
+    (!from.joins.is_empty()).then_some(from)
 }
 
-/// Bind a two-table `JOIN` `SELECT` into a [`BoundSelect`] carrying a
-/// [`BoundJoin`] ([STL-172], [STL-264]).
+/// Bind a `JOIN`-chain `SELECT` into a [`BoundSelect`] carrying a [`BoundJoin`]
+/// ([STL-172], [STL-264], [STL-323]).
 ///
-/// Resolves both tables at the statement's `(sys, valid)` snapshot — the single
+/// Resolves every input at the statement's `(sys, valid)` snapshot — the single
 /// per-statement pin every input reads at (docs/16 §8: a temporal join takes one
-/// consistent snapshot across the query) — lowers the join operator to a
-/// [`JoinType`], and binds the `ON left.col = right.col` equi-condition to a key
-/// column per side. The join's **addressable output** (the two sides' columns,
-/// [`JoinScope`]) is then the surface the rest of the `SELECT` binds against — the
-/// projection, a `WHERE` ([STL-213]), a `GROUP BY` + aggregates ([STL-171]), and
-/// the `DISTINCT` / `ORDER BY` / `OFFSET` / `LIMIT` tail ([STL-263]) — each
-/// resolving its (bare or qualified) column references to an addressable index, so
-/// the executor runs the same downstream pipeline a single-table read does
-/// ([STL-264]).
+/// consistent snapshot across the query) — then folds the chain **left-deep**: the
+/// leftmost input seeds the accumulated output, and each `JOIN` lowers to a
+/// [`JoinType`] and binds its `ON acc.col = new.col` equi-condition (one key from
+/// the accumulated output, one from the freshly joined input). The growing
+/// **addressable output** ([`JoinScope`]) is the surface the rest of the `SELECT`
+/// binds against — the projection, a `WHERE` ([STL-213]), a `GROUP BY` + aggregates
+/// ([STL-171]), and the `DISTINCT` / `ORDER BY` / `OFFSET` / `LIMIT` tail
+/// ([STL-263]) — each resolving its (bare or qualified) column references to an
+/// addressable index, so the executor runs the same downstream pipeline a
+/// single-table read does ([STL-264]). A two-table join is the one-step chain.
 ///
 /// A `FOR … AS OF` qualifier on *either* axis is honored ([STL-243]): it is the
 /// statement-level pin lifted off the token stream ([STL-162]), applied to every
@@ -2679,9 +2692,10 @@ fn detect_join(select: &Select) -> Result<Option<&TableWithJoins>, SelectError> 
 /// VALID_TIME AS OF` pin is meaningful only where every input has a valid axis, so
 /// a system-only side under one is rejected, mirroring the single-table
 /// [`SelectError::ValidTimeUnsupported`]. A period predicate over the join, the
-/// `RIGHT` / `FULL` / `CROSS` joins ([`join_kind_and_constraint`]), and N-way joins
-/// ([`detect_join`], [STL-323]) stay rejected (each a tracked follow-up).
-// Eight inputs because the join binds the whole `SELECT` over both relations: the
+/// `RIGHT` / `FULL` / `CROSS` joins ([`join_kind_and_constraint`]), and join
+/// reordering ([STL-270]) stay rejected / out of scope (each a tracked follow-up);
+/// the chain runs in syntactic, left-deep order.
+// Eight inputs because the join binds the whole `SELECT` over every relation: the
 // statement (temporal qualifiers) and its `query` / `select` halves, the catalog
 // `ctx`, the `from` relations, the CTE `sigs` in scope, and the resolved
 // `(snapshot, valid_snapshot)` pin every input reads at. Bundling any subset only
@@ -2713,22 +2727,28 @@ fn bind_join<'a>(
         ));
     }
 
-    let join_ast: &Join = &from.joins[0];
-    let (join_type, constraint) = join_kind_and_constraint(&join_ast.join_operator)?;
-
-    // Either side may be a base table, a CTE in scope, or a derived table ([STL-242]);
-    // a derived side is bound into a single-use CTE the query must register. Both
-    // resolve at the *statement* snapshot, so a `FOR SYSTEM_TIME AS OF s` travels
-    // each input's schema to the same instant.
-    let (left, left_cte) = resolve_join_side(&from.relation, ctx, snapshot, sigs)?;
-    let (right, right_cte) = resolve_join_side(&join_ast.relation, ctx, snapshot, sigs)?;
+    // Resolve every input up front — the seed (`from.relation`) then each chained
+    // `JOIN`'s relation. Any input may be a base table, a CTE in scope, or a derived
+    // table ([STL-242]); a derived input is bound into a single-use CTE the query
+    // must register. Every input resolves at the *statement* snapshot, so a
+    // `FOR SYSTEM_TIME AS OF s` travels each schema to the same instant.
+    let mut sides: Vec<SideSchema<'a>> = Vec::with_capacity(from.joins.len() + 1);
+    let mut ctes: Vec<BoundCte> = Vec::new();
+    let (seed, seed_cte) = resolve_join_side(&from.relation, ctx, snapshot, sigs)?;
+    sides.push(seed);
+    ctes.extend(seed_cte);
+    for join_ast in &from.joins {
+        let (side, side_cte) = resolve_join_side(&join_ast.relation, ctx, snapshot, sigs)?;
+        sides.push(side);
+        ctes.extend(side_cte);
+    }
 
     // A `FOR VALID_TIME AS OF v` pin only travels an input that has a valid axis; a
     // system-only side (a base table without `VALID TIME`, or a CTE / derived
     // table, whose ephemeral schema is always system-only) has none, so reject
     // rather than silently ignore the pin on that side ([STL-243], docs/16 §8).
     if valid_snapshot.is_some() {
-        for side in [&left, &right] {
+        for side in &sides {
             if !side.schema.temporal().valid_time_enabled() {
                 return Err(SelectError::ValidTimeUnsupported {
                     table: side.table.to_owned(),
@@ -2737,11 +2757,24 @@ fn bind_join<'a>(
         }
     }
 
-    let (left_key, right_key) = bind_join_condition(constraint, &left, &right)?;
-
-    // The join's addressable output — the surface every clause below resolves its
-    // column references against (bare or qualified, STL-172's `resolve_join_column`).
-    let scope = JoinScope::new(&left, &right, join_type);
+    // Fold the chain left-deep. `scope` accumulates the addressable output; each
+    // step binds its `ON` condition against (the accumulated output) + (the new
+    // input), then — for an `INNER` / `LEFT` join — widens the scope with the new
+    // input's columns (a `SEMI` / `ANTI` step keeps only the accumulated left).
+    let mut scope = JoinScope::seed(&sides[0]);
+    let mut steps: Vec<BoundJoinStep> = Vec::with_capacity(from.joins.len());
+    for (i, join_ast) in from.joins.iter().enumerate() {
+        let (join_type, constraint) = join_kind_and_constraint(&join_ast.join_operator)?;
+        let new_side = &sides[i + 1];
+        let (left_key, right_key) = bind_step_condition(constraint, &scope, new_side)?;
+        steps.push(BoundJoinStep {
+            join_type,
+            right: bound_side(new_side),
+            left_key,
+            right_key,
+        });
+        scope.push(new_side, join_type);
+    }
 
     // An aggregate query (`GROUP BY`, or an aggregate in the SELECT list) replaces
     // the plain projection with a grouped plan that names its own output columns;
@@ -2778,15 +2811,11 @@ fn bind_join<'a>(
         .map(|expr| bind_join_filter(expr, &scope))
         .transpose()?;
 
-    let mut ctes = Vec::new();
-    ctes.extend(left_cte);
-    ctes.extend(right_cte);
-
     let bound = BoundSelect {
         // The single-table relation fields are unused on the join path (see
         // `BoundSelect`): the executor routes to the join plan, never reading these.
         table: String::new(),
-        schema_id: left.schema.schema_id(),
+        schema_id: sides[0].schema.schema_id(),
         snapshot,
         valid_snapshot,
         // A range scan over a join is rejected at bind time (see the join path in
@@ -2798,11 +2827,8 @@ fn bind_join<'a>(
         subquery_filter: None,
         aggregate,
         join: Some(BoundJoin {
-            join_type,
-            left: bound_side(&left),
-            right: bound_side(&right),
-            left_key,
-            right_key,
+            left: bound_side(&sides[0]),
+            steps,
             output,
             columns,
         }),
@@ -2903,13 +2929,6 @@ fn join_table_name(name: &sqlparser::ast::ObjectName) -> Result<&str, SelectErro
             "a schema-qualified table name in a JOIN".to_owned(),
         )),
     }
-}
-
-/// Which side of a join a resolved column came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Side {
-    Left,
-    Right,
 }
 
 /// A join side during binding: its table name, optional alias, and resolved
@@ -3036,13 +3055,19 @@ fn join_kind_and_constraint(op: &JoinOperator) -> Result<(JoinType, &JoinConstra
     })
 }
 
-/// Bind a join's `ON` constraint to the `(left_key, right_key)` schema indices of
-/// a single `left.col = right.col` equality. The two key columns must share a
-/// type.
-fn bind_join_condition(
+/// Bind one chain step's `ON` constraint to `(left_key, right_key)` — a flat
+/// addressable index into the accumulated output and a schema index into the freshly
+/// joined input ([STL-323]).
+///
+/// The single `acc.col = new.col` equality must relate one column of the
+/// accumulated output (the chain so far, addressed through `scope`) and one of
+/// `new_side`; either operand order is fine. The two key columns must share a type.
+/// For a two-table join the accumulated output is just the seed input, so this
+/// reduces to STL-172's `left.col = right.col`.
+fn bind_step_condition(
     constraint: &JoinConstraint,
-    left: &SideSchema,
-    right: &SideSchema,
+    scope: &JoinScope,
+    new_side: &SideSchema,
 ) -> Result<(usize, usize), SelectError> {
     let JoinConstraint::On(expr) = constraint else {
         return Err(SelectError::JoinCondition(match constraint {
@@ -3063,53 +3088,64 @@ fn bind_join_condition(
             "the ON condition is not an equality".to_owned(),
         ));
     };
-    // The two operands must be one column from each side; either order is fine.
-    let a = resolve_join_column(lhs, left, right)?;
-    let b = resolve_join_column(rhs, left, right)?;
-    let (((Side::Left, li), (Side::Right, ri)) | ((Side::Right, ri), (Side::Left, li))) = (a, b)
-    else {
-        return Err(SelectError::JoinCondition(
-            "the ON equality must relate a column of each joined table".to_owned(),
-        ));
+    // Resolve each operand against (the accumulated output) + (the new input), the
+    // new input addressed past the accumulated width. Exactly one operand must come
+    // from each: one flat index below the boundary (an accumulated column), one at
+    // or above it (a column of the new input).
+    let boundary = scope.width();
+    let combined = scope.with_new_side(new_side);
+    let a = resolve_scope_column(lhs, &combined)?;
+    let b = resolve_scope_column(rhs, &combined)?;
+    let (left_key, right_flat) = match (a < boundary, b < boundary) {
+        (true, false) => (a, b),
+        (false, true) => (b, a),
+        _ => {
+            return Err(SelectError::JoinCondition(
+                "the ON equality must relate a column of each joined table".to_owned(),
+            ));
+        }
     };
-    let left_ty = left.schema.columns()[li].ty();
-    let right_ty = right.schema.columns()[ri].ty();
+    let right_key = right_flat - boundary;
+    let left_ty = scope.columns()[left_key].1;
+    let right_ty = new_side.schema.columns()[right_key].ty();
     if left_ty != right_ty {
         return Err(SelectError::JoinColumnTypeMismatch {
-            left_column: left.schema.columns()[li].name().to_owned(),
-            right_column: right.schema.columns()[ri].name().to_owned(),
+            left_column: scope.columns()[left_key].0.clone(),
+            right_column: new_side.schema.columns()[right_key].name().to_owned(),
             left_type: left_ty,
             right_type: right_ty,
         });
     }
-    Ok((li, ri))
+    Ok((left_key, right_key))
 }
 
-/// Resolve a column reference in a join (a bare `c` or qualified `t.c`) to the
-/// side it belongs to and its index in that side's schema.
+/// Resolve a column reference (a bare `c` or qualified `t.c`) against an ordered
+/// list of join inputs to its **flat addressable index** ([STL-323]).
 ///
-/// A bare column must be in exactly one side (in both is
-/// [`SelectError::AmbiguousColumn`], in neither
-/// [`SelectError::UnknownJoinColumn`]). A qualified `t.c`'s qualifier must name one
-/// side (by table name or alias), and `c` must be a column of it.
-fn resolve_join_column(
-    expr: &Expr,
-    left: &SideSchema,
-    right: &SideSchema,
-) -> Result<(Side, usize), SelectError> {
+/// A bare column must be in exactly one input (in several is
+/// [`SelectError::AmbiguousColumn`], in none [`SelectError::UnknownJoinColumn`]). A
+/// qualified `t.c`'s qualifier must name exactly one input (by table name or alias),
+/// and `c` must be a column of it. Generalizes STL-172's two-side resolution to the
+/// N inputs a left-deep chain addresses.
+fn resolve_scope_column(expr: &Expr, sides: &[ScopeSide]) -> Result<usize, SelectError> {
     match expr {
-        Expr::Nested(inner) => resolve_join_column(inner, left, right),
-        Expr::Identifier(id) => match (left.column_index(&id.value), right.column_index(&id.value))
-        {
-            (Some(i), None) => Ok((Side::Left, i)),
-            (None, Some(j)) => Ok((Side::Right, j)),
-            (Some(_), Some(_)) => Err(SelectError::AmbiguousColumn {
+        Expr::Nested(inner) => resolve_scope_column(inner, sides),
+        Expr::Identifier(id) => {
+            let mut found: Option<usize> = None;
+            for side in sides {
+                if let Some(i) = side.schema.column_index(&id.value) {
+                    if found.is_some() {
+                        return Err(SelectError::AmbiguousColumn {
+                            column: id.value.clone(),
+                        });
+                    }
+                    found = Some(side.offset + i);
+                }
+            }
+            found.ok_or_else(|| SelectError::UnknownJoinColumn {
                 column: id.value.clone(),
-            }),
-            (None, None) => Err(SelectError::UnknownJoinColumn {
-                column: id.value.clone(),
-            }),
-        },
+            })
+        }
         Expr::CompoundIdentifier(parts) => {
             let [qualifier, column] = parts.as_slice() else {
                 return Err(SelectError::UnknownJoinColumn {
@@ -3117,29 +3153,27 @@ fn resolve_join_column(
                 });
             };
             let (q, c) = (qualifier.value.as_str(), column.value.as_str());
-            let on_left = left.qualifier_matches(q);
-            let on_right = right.qualifier_matches(q);
             let qualified = || format!("{q}.{c}");
-            match (on_left, on_right) {
-                (true, false) => left
-                    .column_index(c)
-                    .map(|i| (Side::Left, i))
-                    .ok_or_else(|| SelectError::UnknownJoinColumn {
-                        column: qualified(),
-                    }),
-                (false, true) => right
-                    .column_index(c)
-                    .map(|j| (Side::Right, j))
-                    .ok_or_else(|| SelectError::UnknownJoinColumn {
-                        column: qualified(),
-                    }),
-                (true, true) => Err(SelectError::AmbiguousColumn {
-                    column: qualified(),
-                }),
-                (false, false) => Err(SelectError::UnknownJoinColumn {
-                    column: qualified(),
-                }),
+            let mut matched: Option<&ScopeSide> = None;
+            for side in sides {
+                if side.schema.qualifier_matches(q) {
+                    if matched.is_some() {
+                        return Err(SelectError::AmbiguousColumn {
+                            column: qualified(),
+                        });
+                    }
+                    matched = Some(side);
+                }
             }
+            let side = matched.ok_or_else(|| SelectError::UnknownJoinColumn {
+                column: qualified(),
+            })?;
+            side.schema
+                .column_index(c)
+                .map(|i| side.offset + i)
+                .ok_or_else(|| SelectError::UnknownJoinColumn {
+                    column: qualified(),
+                })
         }
         other => Err(SelectError::JoinCondition(format!(
             "operand `{other}` is not a column reference"
@@ -3156,47 +3190,91 @@ fn compound_name(parts: &[sqlparser::ast::Ident]) -> String {
         .join(".")
 }
 
-/// The combined output of a two-table join, as the surface a projection / `WHERE`
-/// / `GROUP BY` / `ORDER BY` resolves its column references against ([STL-264]).
+/// One addressable input in a [`JoinScope`]: a join side and the flat index of its
+/// first column in the accumulated output.
+#[derive(Clone, Copy)]
+struct ScopeSide<'a> {
+    schema: &'a SideSchema<'a>,
+    /// The flat addressable index of this input's first column.
+    offset: usize,
+}
+
+/// The accumulated output of a `JOIN` chain, as the surface a projection / `WHERE`
+/// / `GROUP BY` / `ORDER BY` resolves its column references against ([STL-264],
+/// [STL-323]).
 ///
-/// The **addressable** columns are the left side's, then — for an `INNER` / `LEFT`
-/// join — the right side's, in schema order (a `SEMI` / `ANTI` join exposes only
-/// the left). A reference (bare `c` or qualified `t.c`) resolves through the
-/// STL-172 [`resolve_join_column`] machinery to a `(side, index)`, which this
-/// flattens to a single addressable index — `i` for the left, `left_width + j` for
-/// the right — so the clause binders address one flat row, exactly as the
-/// single-table path addresses a schema row.
+/// The **addressable** columns are the seed input's, then each `INNER` / `LEFT`
+/// step's right input's, in the chain's left-deep order (a `SEMI` / `ANTI` step
+/// keeps only the accumulated left, so its right input is *not* addressable). A
+/// reference (bare `c` or qualified `t.c`) resolves through [`resolve_scope_column`]
+/// to a single flat addressable index, so the clause binders address one flat row,
+/// exactly as the single-table path addresses a schema row.
 struct JoinScope<'a> {
-    left: &'a SideSchema<'a>,
-    right: &'a SideSchema<'a>,
-    join_type: JoinType,
+    /// The addressable inputs, in output order, each with its flat column offset.
+    sides: Vec<ScopeSide<'a>>,
+    /// Inputs dropped by a `SEMI` / `ANTI` step, kept only so a reference to one
+    /// yields the "exposes only its left" diagnostic rather than a bare "unknown
+    /// column".
+    dropped: Vec<&'a SideSchema<'a>>,
     /// The flat addressable columns `(name, type)`, in output order.
     columns: Vec<(String, LogicalType)>,
 }
 
 impl<'a> JoinScope<'a> {
-    fn new(left: &'a SideSchema<'a>, right: &'a SideSchema<'a>, join_type: JoinType) -> Self {
-        let mut columns: Vec<(String, LogicalType)> = left
+    /// The scope of a chain's leftmost (seed) input alone — every column addressable.
+    fn seed(side: &'a SideSchema<'a>) -> Self {
+        let columns = side
             .schema
             .columns()
             .iter()
             .map(|c| (c.name().to_owned(), c.ty()))
             .collect();
+        Self {
+            sides: vec![ScopeSide {
+                schema: side,
+                offset: 0,
+            }],
+            dropped: Vec::new(),
+            columns,
+        }
+    }
+
+    /// Fold a freshly joined input into the scope: an `INNER` / `LEFT` step widens
+    /// the addressable output with the input's columns; a `SEMI` / `ANTI` step keeps
+    /// only the accumulated left, dropping the input (retained for diagnostics).
+    fn push(&mut self, side: &'a SideSchema<'a>, join_type: JoinType) {
         if join_type.keeps_right() {
-            columns.extend(
-                right
-                    .schema
+            let offset = self.columns.len();
+            self.columns.extend(
+                side.schema
                     .columns()
                     .iter()
                     .map(|c| (c.name().to_owned(), c.ty())),
             );
+            self.sides.push(ScopeSide {
+                schema: side,
+                offset,
+            });
+        } else {
+            self.dropped.push(side);
         }
-        Self {
-            left,
-            right,
-            join_type,
-            columns,
-        }
+    }
+
+    /// The number of addressable columns — the boundary a chain step's new input is
+    /// addressed past.
+    const fn width(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// The addressable inputs plus `new_side` appended past the current width — the
+    /// scope a chain step's `ON` condition resolves against ([`bind_step_condition`]).
+    fn with_new_side(&self, new_side: &'a SideSchema<'a>) -> Vec<ScopeSide<'a>> {
+        let mut sides = self.sides.clone();
+        sides.push(ScopeSide {
+            schema: new_side,
+            offset: self.width(),
+        });
+        sides
     }
 
     /// The addressable output columns `(name, type)`, in order.
@@ -3205,27 +3283,44 @@ impl<'a> JoinScope<'a> {
     }
 
     /// Resolve a column reference (bare or qualified) to its addressable index and
-    /// type. A `SEMI` / `ANTI` join exposes only its left columns, so a right-side
-    /// reference is rejected here rather than addressing a column the output omits.
+    /// type. A reference naming an input dropped by a `SEMI` / `ANTI` step is
+    /// rejected with a pointed diagnostic rather than addressing a column the output
+    /// omits.
     fn resolve(&self, expr: &Expr) -> Result<(usize, LogicalType), SelectError> {
-        let (side, idx) = resolve_join_column(expr, self.left, self.right)?;
-        let index = match side {
-            Side::Left => idx,
-            Side::Right => {
-                if !self.join_type.keeps_right() {
-                    return Err(SelectError::UnsupportedJoinProjection(
-                        "a SEMI/ANTI join exposes only its left table's columns".to_owned(),
-                    ));
-                }
-                self.left.schema.columns().len() + idx
+        match resolve_scope_column(expr, &self.sides) {
+            Ok(index) => Ok((index, self.columns[index].1)),
+            Err(SelectError::UnknownJoinColumn { .. }) if self.names_dropped(expr) => {
+                Err(SelectError::UnsupportedJoinProjection(
+                    "a SEMI/ANTI join exposes only its left table's columns".to_owned(),
+                ))
             }
-        };
-        Ok((index, self.columns[index].1))
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether `expr` names a column of an input dropped by a `SEMI` / `ANTI` step —
+    /// a bare column in one, or a qualifier naming one.
+    fn names_dropped(&self, expr: &Expr) -> bool {
+        match unwrap_nested(expr) {
+            Expr::Identifier(id) => self
+                .dropped
+                .iter()
+                .any(|s| s.column_index(&id.value).is_some()),
+            Expr::CompoundIdentifier(parts) => matches!(
+                parts.as_slice(),
+                [qualifier, _] if self.dropped.iter().any(|s| s.qualifier_matches(&qualifier.value))
+            ),
+            _ => false,
+        }
     }
 
     /// A label naming the joined relations, for an ungrouped-column diagnostic.
     fn relation_label(&self) -> String {
-        format!("{} JOIN {}", self.left.table, self.right.table)
+        self.sides
+            .iter()
+            .map(|s| s.schema.table)
+            .collect::<Vec<_>>()
+            .join(" JOIN ")
     }
 }
 
@@ -7469,6 +7564,20 @@ mod tests {
                 SystemTimeMicros(1_000),
             )
             .expect("create orders");
+        // A third relation for N-way chains ([STL-323]): `items.oid` joins the
+        // accumulated `orders.oid`, so a chain's second `ON` references a non-seed
+        // input.
+        catalog
+            .create_table(
+                "items",
+                vec![
+                    ColumnDef::new("item_id", LogicalType::Int4).expect("col"),
+                    ColumnDef::new("oid", LogicalType::Int4).expect("col"),
+                ],
+                TableTemporal::system_only(),
+                SystemTimeMicros(1_000),
+            )
+            .expect("create items");
         catalog
     }
 
@@ -7486,11 +7595,13 @@ mod tests {
             "SELECT * FROM users JOIN orders ON users.id = orders.uid",
             &catalog,
         );
-        assert_eq!(join.join_type, JoinType::Inner);
+        // A two-table join is the one-step chain.
+        assert_eq!(join.steps.len(), 1);
+        assert_eq!(join.steps[0].join_type, JoinType::Inner);
         assert_eq!(join.left.table, "users");
-        assert_eq!(join.right.table, "orders");
+        assert_eq!(join.steps[0].right.table, "orders");
         // users.id is index 0; orders.uid is index 1.
-        assert_eq!((join.left_key, join.right_key), (0, 1));
+        assert_eq!((join.steps[0].left_key, join.steps[0].right_key), (0, 1));
         // `SELECT *` over an inner join = every addressable index in order (the
         // left's columns then the right's).
         assert_eq!(join.output, vec![0, 1, 2, 3]);
@@ -7520,7 +7631,7 @@ mod tests {
         ];
         for (kw, want) in cases {
             let sql = format!("SELECT users.id FROM users {kw} orders ON users.id = orders.uid");
-            assert_eq!(join_of(&sql, &catalog).join_type, want, "{kw}");
+            assert_eq!(join_of(&sql, &catalog).steps[0].join_type, want, "{kw}");
         }
     }
 
@@ -7548,7 +7659,11 @@ mod tests {
         for on in ["users.id = orders.uid", "orders.uid = users.id"] {
             let sql = format!("SELECT users.id FROM users JOIN orders ON {on}");
             let join = join_of(&sql, &catalog);
-            assert_eq!((join.left_key, join.right_key), (0, 1), "{on}");
+            assert_eq!(
+                (join.steps[0].left_key, join.steps[0].right_key),
+                (0, 1),
+                "{on}"
+            );
         }
     }
 
@@ -7573,7 +7688,7 @@ mod tests {
             "SELECT name, oid FROM users JOIN orders ON id = uid",
             &catalog,
         );
-        assert_eq!((bare.left_key, bare.right_key), (0, 1));
+        assert_eq!((bare.steps[0].left_key, bare.steps[0].right_key), (0, 1));
         assert_eq!(bare.output, vec![1, 2]);
     }
 
@@ -7593,15 +7708,71 @@ mod tests {
     }
 
     #[test]
-    fn an_n_way_join_is_rejected() {
+    fn an_n_way_join_binds_a_left_deep_chain() {
         let catalog = catalog_with_join_tables();
-        let sql = "SELECT users.id FROM users \
-                   JOIN orders ON users.id = orders.uid \
-                   JOIN orders o2 ON users.id = o2.uid";
-        assert!(matches!(
-            bind(sql, &catalog),
-            Err(SelectError::UnsupportedJoin(_))
-        ));
+        // The chain's second `ON` references a *non-seed* accumulated input
+        // (`orders.oid`) and the new input (`items.oid`) ([STL-323]).
+        let join = join_of(
+            "SELECT users.id FROM users \
+             JOIN orders ON users.id = orders.uid \
+             JOIN items ON orders.oid = items.oid",
+            &catalog,
+        );
+        assert_eq!(join.left.table, "users");
+        assert_eq!(join.steps.len(), 2);
+        // Step 0: users(0,1) ⋈ orders(2,3) on users.id (flat 0) = orders.uid (1).
+        assert_eq!(join.steps[0].join_type, JoinType::Inner);
+        assert_eq!(join.steps[0].right.table, "orders");
+        assert_eq!((join.steps[0].left_key, join.steps[0].right_key), (0, 1));
+        // Step 1: (…) ⋈ items(4,5) on orders.oid (flat 2) = items.oid (1) — the
+        // left key addresses the *accumulated* output, not the seed alone.
+        assert_eq!(join.steps[1].join_type, JoinType::Inner);
+        assert_eq!(join.steps[1].right.table, "items");
+        assert_eq!((join.steps[1].left_key, join.steps[1].right_key), (2, 1));
+        // `SELECT users.id` projects flat index 0.
+        assert_eq!(join.output, vec![0]);
+    }
+
+    #[test]
+    fn a_chain_resolves_qualified_names_across_every_input() {
+        let catalog = catalog_with_join_tables();
+        // A projection / WHERE may name any input in the chain by table or alias.
+        let join = join_of(
+            "SELECT users.name, items.item_id FROM users \
+             JOIN orders o ON users.id = o.uid \
+             JOIN items i ON o.oid = i.oid \
+             WHERE i.item_id > 0",
+            &catalog,
+        );
+        // users.name is flat 1; items.item_id is flat 4 (after users 0-1, orders 2-3).
+        assert_eq!(join.output, vec![1, 4]);
+        assert_eq!(
+            join.columns,
+            vec![
+                ("name".to_owned(), LogicalType::Text),
+                ("item_id".to_owned(), LogicalType::Int4),
+            ]
+        );
+        // The aliased second step binds against the accumulated `o.oid`.
+        assert_eq!((join.steps[1].left_key, join.steps[1].right_key), (2, 1));
+    }
+
+    #[test]
+    fn a_semi_step_drops_its_input_from_the_chain_scope() {
+        let catalog = catalog_with_join_tables();
+        // A SEMI step keeps only the accumulated left, so `items` is not addressable
+        // after it — a projection of an `items` column is rejected, pointedly.
+        let err = bind(
+            "SELECT items.item_id FROM users \
+             JOIN orders ON users.id = orders.uid \
+             SEMI JOIN items ON orders.oid = items.oid",
+            &catalog,
+        )
+        .expect_err("a SEMI step's input is not projectable");
+        assert!(
+            matches!(err, SelectError::UnsupportedJoinProjection(_)),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -8315,13 +8486,13 @@ mod tests {
         .expect("bind CTE joined to base table");
         let join = bound.join.expect("a join plan");
         assert_eq!(join.left.table, "c");
-        assert_eq!(join.right.table, "account");
+        assert_eq!(join.steps[0].right.table, "account");
         // The side's schema id is the executor's materialized-vs-storage signal:
         // the CTE side carries the ephemeral SchemaId(0) sentinel, the base table a
         // catalog-allocated id (never 0). `join_side_columns` reads the CTE from the
         // scope and always scans the base table from storage on that basis.
         assert_eq!(join.left.schema_id, SchemaId(0));
-        assert_ne!(join.right.schema_id, SchemaId(0));
+        assert_ne!(join.steps[0].right.schema_id, SchemaId(0));
         // The CTE side is registered for the executor to materialize.
         assert_eq!(bound.ctes.len(), 1);
         assert_eq!(bound.ctes[0].name, "c");

@@ -74,9 +74,10 @@ point names both. A `VALID_TIME AS OF` against a table with no valid-time period
 is rejected at bind time (`SelectError::ValidTimeUnsupported`) — there is no valid
 axis to travel.
 
-**Over a `JOIN` (STL-243).** A `FOR … AS OF` on either axis applies to a two-table
-join too, and the rule is one **consistent `(sys, valid)` snapshot across the whole
-query** — every input is read at the *same* pinned point
+**Over a `JOIN` (STL-243).** A `FOR … AS OF` on either axis applies to a join too —
+a two-table join or an N-way left-deep chain (STL-323) — and the rule is one
+**consistent `(sys, valid)` snapshot across the whole query**: every input is read
+at the *same* pinned point
 ([docs/16 §8](16-bitemporal-semantics.md#8-temporal-joins)). v0.3 supports the
 **statement-level** form (`SELECT … FROM a JOIN b … FOR SYSTEM_TIME AS OF s
 [FOR VALID_TIME AS OF v]`), which applies to all inputs; this is the floor. At most
@@ -92,8 +93,9 @@ have a valid axis; a system-only side (a plain table, or a CTE / derived table) 
 rejected (`ValidTimeUnsupported`), since the pin cannot travel an axis that side
 lacks. Inner / left / semi / anti joins are covered, and the pinned snapshot
 composes with a `WHERE` / aggregates / `ORDER BY` / `LIMIT` / `DISTINCT` over the
-join output (STL-264, see [Joins](#joins-stl-172-stl-264)); N-way joins (STL-323)
-and `RIGHT` / `FULL` / non-equi joins (STL-270) remain follow-ups.
+join output (STL-264) and across an N-way chain (STL-323, see
+[Joins](#joins-stl-172-stl-264-stl-323)); `RIGHT` / `FULL` / non-equi joins
+(STL-270) remain follow-ups.
 
 ### `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` — temporal range scans (STL-244)
 
@@ -398,10 +400,11 @@ live at the resolved system-time snapshot, that `snapshot`, an optional
   validity index — [ADR-0023], STL-133). The binder does not re-implement the
   prune; carrying the snapshot *is* the rewrite. Joint `(sys, valid)` version
   resolution from `valid_snapshot` is the executor's job (STL-163).
-- **Beyond the single-table scan**: a two-table join binds (STL-172) and composes
-  with the rest of the `SELECT` surface — `WHERE`, aggregates / `GROUP BY`, and the
-  `DISTINCT` / `ORDER BY` / `LIMIT` tail over the join output, with qualified-name
-  resolution across both inputs (STL-264, see [Joins](#joins-stl-172-stl-264)) — a
+- **Beyond the single-table scan**: an equi-join binds (STL-172) — two-table or an
+  N-way left-deep chain (STL-323) — and composes with the rest of the `SELECT`
+  surface — `WHERE`, aggregates / `GROUP BY`, and the `DISTINCT` / `ORDER BY` /
+  `LIMIT` tail over the join output, with qualified-name resolution across every
+  input (STL-264, see [Joins](#joins-stl-172-stl-264-stl-323)) — a
   `WHERE` subquery binds — uncorrelated (STL-234) and correlated (STL-239), see
   [Subquery predicates](#subquery-predicates-stl-234-stl-239) — and a `WITH` list
   of non-recursive CTEs plus `FROM (SELECT …)` derived tables binds (STL-242, see
@@ -497,7 +500,7 @@ WHERE → [GROUP BY/aggregates → HAVING] → DISTINCT → ORDER BY → OFFSET 
   approximated).
 
 Result shaping composes over a **join** read too (STL-264): the same pipeline runs
-over the join's output rows — see [Joins](#joins-stl-172-stl-264). Top-N pushdown
+over the join's output rows — see [Joins](#joins-stl-172-stl-264-stl-323). Top-N pushdown
 and sort spill are performance work, deliberately out of v0.3 scope.
 
 ### Default row cap on the simple-query path (STL-306)
@@ -525,18 +528,22 @@ The **extended** query protocol is exempt: a driver (JDBC, psycopg, pgAdmin)
 sets its own row count through the portal's `Execute` `max_rows`, so an
 automated consumer fetches exactly what it requested.
 
-## Joins (STL-172, STL-264)
+## Joins (STL-172, STL-264, STL-323)
 
-A two-table equi-join binds and runs (STL-172): `INNER` / `JOIN`, `LEFT [OUTER]`,
-and `LEFT SEMI` / `LEFT ANTI`, joined on a single `ON left.col = right.col`
-equality (either operand order; the two key columns must share a type). Either
-side may be a base table, a CTE, or a `FROM (SELECT …)` derived table.
+An equi-join binds and runs (STL-172): `INNER` / `JOIN`, `LEFT [OUTER]`, and
+`LEFT SEMI` / `LEFT ANTI`, joined on a single `ON left.col = right.col` equality
+(either operand order; the two key columns must share a type). Either side may be a
+base table, a CTE, or a `FROM (SELECT …)` derived table. **N-way joins** chain these
+two-table joins **left-deep** (STL-323): `a JOIN b ON … JOIN c ON …` materializes
+`a ⋈ b`, then joins that output against `c`, and so on in syntactic order (no join
+reordering / cost-based planning). Each step's `ON` may relate the freshly joined
+input to *any* already-joined input — `c.x = a.y` is as valid as `c.x = b.y`.
 
 ```sql
-SELECT u.name, count(*)
-FROM users u JOIN orders o ON u.id = o.uid
+SELECT u.name, p.label, count(*)
+FROM users u JOIN orders o ON u.id = o.uid JOIN products p ON o.pid = p.pid
 WHERE o.total >= 100
-GROUP BY u.name
+GROUP BY u.name, p.label
 ORDER BY count DESC
 LIMIT 10;
 ```
@@ -545,12 +552,13 @@ The join's **output is a relation like any other**, and the rest of the `SELECT`
 surface composes over it (STL-264), in the Postgres pipeline order
 (`WHERE → [GROUP BY/aggregates] → DISTINCT → ORDER BY → OFFSET → LIMIT`):
 
-- **Addressable columns.** The output is the left side's columns, then the right's
-  for an `INNER` / `LEFT` join (a `SEMI` / `ANTI` join keeps only the left). A
-  column reference — in the projection, `WHERE`, `GROUP BY`, or `ORDER BY` — is a
-  bare name (resolved if it is unique across the output) or a qualified `table.col`
-  / `alias.col`; an ambiguous bare name is an error (`42702`-style), as Postgres
-  requires.
+- **Addressable columns.** The output is the seed input's columns, then each
+  `INNER` / `LEFT` step's right input's, in the chain's left-deep order (a `SEMI` /
+  `ANTI` step keeps only the accumulated left, so its right input is not
+  addressable). A column reference — in the projection, `WHERE`, `GROUP BY`, or
+  `ORDER BY` — is a bare name (resolved if it is unique across the output) or a
+  qualified `table.col` / `alias.col`; an ambiguous bare name is an error
+  (`42702`-style), as Postgres requires.
 - **`WHERE`** over the joined columns, including a column the projection does not
   select, applied after the join. The same single-comparison shape the single-table
   path binds (six operators, integer arithmetic of one anchor column — STL-213).
@@ -565,9 +573,9 @@ every input at one consistent `(sys, valid)` snapshot (STL-243, see
 [Over a `JOIN`](#for--system_time--valid_time--as-of-expr--time-travel-select) and
 docs/16 §8); the composed clauses above run over that snapshot's output.
 
-**Not yet** (rejected, never silently mis-bound): **N-way** joins
-(`a JOIN b … JOIN c …` — left-deep chains are STL-323); `RIGHT` / `FULL OUTER`
-and non-equi `ON` conditions (STL-270); a period predicate over a join; a `HAVING`
+**Not yet** (rejected, never silently mis-bound): `RIGHT` / `FULL OUTER` and
+non-equi `ON` conditions (STL-270); join reordering / cost-based planning (the chain
+runs in syntactic, left-deep order); a period predicate over a join; a `HAVING`
 over a join's aggregate (STL-265 — the single-table path only, since the operands
 would need join-scope name resolution). A join read is also not auto-capped by the
 [default row cap](#default-row-cap-on-the-simple-query-path-stl-306) — give it an
