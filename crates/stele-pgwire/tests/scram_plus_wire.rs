@@ -384,7 +384,14 @@ fn endpoint_binding(cert_der: &[u8]) -> Vec<u8> {
     } else if *alg == OID_PKCS1_SHA512WITHRSA || *alg == OID_SIG_ECDSA_WITH_SHA512 {
         sha512(cert_der).to_vec()
     } else {
-        panic!("unexpected leaf signature algorithm in test: {alg:?}");
+        // Fail fast rather than silently degrade to SHA-256. The message stays
+        // static and does NOT format `alg`/`cert` into it: the parsed certificate
+        // is taint-tracked sensitive data, so interpolating it trips CodeQL's
+        // cleartext-logging rule. The suite only mints SHA-256/384/512 leaves, so
+        // "unexpected" already points squarely at a mis-minted fixture.
+        panic!(
+            "test leaf has an unexpected signature algorithm (expected RSA/ECDSA SHA-256/384/512)"
+        );
     }
 }
 
