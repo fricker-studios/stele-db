@@ -1041,6 +1041,26 @@ mod tests {
         }
     }
 
+    /// `N` bytes of OS entropy — the seed for the throwaway test credentials.
+    fn test_bytes<const N: usize>() -> [u8; N] {
+        let mut bytes = [0u8; N];
+        getrandom::fill(&mut bytes).expect("OS entropy");
+        bytes
+    }
+
+    /// A throwaway SCRAM password from OS entropy. The proof/round-trip tests hold
+    /// for any value, so generating it keeps a hard-coded credential — and CodeQL's
+    /// `hard-coded-cryptographic-value` finding — out of the source, the same
+    /// reason the pgwire `scram_plus_wire` tests generate theirs (STL-297).
+    fn test_password() -> String {
+        scram::b64_encode(&test_bytes::<12>())
+    }
+
+    /// A throwaway 16-byte SCRAM salt from OS entropy (see [`test_password`]).
+    fn test_salt() -> [u8; 16] {
+        test_bytes::<16>()
+    }
+
     /// Build a `RowDescription` payload for the given `(name, type oid)`s.
     fn row_description(fields: &[(&str, u32)]) -> Vec<u8> {
         let mut p = Vec::new();
@@ -1336,25 +1356,25 @@ mod tests {
     /// in-process by `stele_common::scram`.
     #[test]
     fn plus_client_final_binds_to_the_endpoint_and_interoperates() {
-        let password = "pencil";
-        let salt = b"0123456789abcdef";
+        let password = test_password();
+        let salt = test_salt();
         let iterations = scram::DEFAULT_ITERATIONS;
         let client_nonce = "clientnonce";
         let server_nonce = "clientnonceSERVERENTROPY";
         let server_first = format!(
             "r={server_nonce},s={},i={iterations}",
-            scram::b64_encode(salt)
+            scram::b64_encode(&salt)
         );
         // Stands in for the SHA-256 of the negotiated server certificate.
-        let cbind = [0x5au8; 32];
+        let cbind = test_bytes::<32>();
 
         let (client_final, expected_sig) = scram_client_final(
-            password,
+            &password,
             plus_cb(&cbind),
             client_nonce,
             &server_first,
             server_nonce,
-            salt,
+            &salt,
             iterations,
         );
 
@@ -1378,7 +1398,7 @@ mod tests {
             .try_into()
             .expect("32-byte proof");
         let auth_message = format!("n=,r={client_nonce},{server_first},{without_proof}");
-        let verifier = ScramVerifier::derive(password, salt, iterations);
+        let verifier = ScramVerifier::derive(&password, &salt, iterations);
         assert!(
             verifier.verify_client_proof(auth_message.as_bytes(), &proof),
             "the PLUS client proof must satisfy the server verifier"
@@ -1395,26 +1415,26 @@ mod tests {
     /// rejection of a MITM that terminates TLS with its own certificate (STL-334).
     #[test]
     fn plus_channel_binding_differs_by_endpoint() {
-        let password = "pencil";
-        let salt = &b"0123456789abcdef"[..];
+        let password = test_password();
+        let salt = test_salt();
         let iterations = scram::DEFAULT_ITERATIONS;
         let client_nonce = "cn";
         let server_nonce = "cnSERVER";
         let server_first = format!(
             "r={server_nonce},s={},i={iterations}",
-            scram::b64_encode(salt)
+            scram::b64_encode(&salt)
         );
         let bind_a = [0x11u8; 32]; // the genuine server certificate's hash
-        let bind_b = [0x22u8; 32]; // a MITM certificate's hash
+        let bind_b = [0x22u8; 32]; // a MITM certificate's hash (distinct on purpose)
 
         let c_value = |cbind: &[u8]| {
             let (final_msg, _) = scram_client_final(
-                password,
+                &password,
                 plus_cb(cbind),
                 client_nonce,
                 &server_first,
                 server_nonce,
-                salt,
+                &salt,
                 iterations,
             );
             final_msg
@@ -1437,28 +1457,30 @@ mod tests {
 
     #[test]
     fn a_wrong_password_proof_is_refused_by_the_verifier() {
-        let salt = b"0123456789abcdef";
+        let salt = test_salt();
         let iterations = scram::DEFAULT_ITERATIONS;
         let server_nonce = "cnSERVER";
         let server_first = format!(
             "r={server_nonce},s={},i={iterations}",
-            scram::b64_encode(salt)
+            scram::b64_encode(&salt)
         );
         // The client proves with the wrong password against a verifier for the
-        // right one — the proof must not verify.
+        // right one — the proof must not verify. The two differ by construction.
+        let right = test_password();
+        let wrong = format!("{right}-wrong");
         let (client_final, _) = scram_client_final(
-            "wrong",
+            &wrong,
             plain_cb(),
             "cn",
             &server_first,
             server_nonce,
-            salt,
+            &salt,
             iterations,
         );
         let (without_proof, proof_b64) = client_final.rsplit_once(",p=").unwrap();
         let proof: [u8; 32] = scram::b64_decode(proof_b64).unwrap().try_into().unwrap();
         let auth_message = format!("n=,r=cn,{server_first},{without_proof}");
-        let verifier = ScramVerifier::derive("right", salt, iterations);
+        let verifier = ScramVerifier::derive(&right, &salt, iterations);
         assert!(!verifier.verify_client_proof(auth_message.as_bytes(), &proof));
     }
 
