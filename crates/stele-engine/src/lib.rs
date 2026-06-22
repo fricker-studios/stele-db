@@ -336,19 +336,62 @@ struct ScannedRows {
     stats: ScanStats,
 }
 
-/// A common-table-expression / derived table's **materialized** rows ([STL-242]),
+/// A common-table-expression / derived table's **materialized** result ([STL-242]),
 /// computed once at the statement snapshot.
 ///
 /// A `WITH name AS (…)` entry, or a `FROM (…) AS d` derived table, runs once and
-/// is then referenced like a table. Its rows are the same canonical-bytes shape a
-/// base-table scan reconstructs (`[col cells…]`, each cell `Some(bytes)` or `None`
-/// for NULL), so the outer query's `WHERE` / aggregate / projection / join feed
-/// from it through the very same downstream pipeline as a base table. The relation's
-/// column header is carried on the bound plan ([`BoundSelect::relation_columns`] /
-/// [`BoundJoinSide::columns`]), so only the rows are kept here.
+/// is then referenced like a table. It is held **columnar** — one shared
+/// [`Cells`](stele_exec::Cells) buffer per column, the same shape
+/// [`scan_all_columns`](SessionEngine::scan_all_columns) returns for a base table —
+/// so a reference never re-copies the stored cells ([STL-321]): a join side clones
+/// the columns by `Arc` refcount bump ([`join_side_columns`](SessionEngine::join_side_columns)),
+/// and a read decodes only the `WHERE`-referenced columns straight off the shared
+/// buffers and gathers just the surviving rows ([`filter_relation_rows`]). Each cell
+/// is the canonical-bytes form a base-table scan reconstructs (`Some(bytes)`, or
+/// `None` for a SQL `NULL`), so the outer query's `WHERE` / aggregate / projection /
+/// join feed from it through the very same downstream pipeline as a base table. The
+/// relation's column header is carried on the bound plan
+/// ([`BoundSelect::relation_columns`] / [`BoundJoinSide::columns`]), so only the
+/// cells are kept here.
 #[derive(Debug, Clone)]
 struct MaterializedRelation {
-    rows: Vec<Vec<Option<Vec<u8>>>>,
+    /// One column per relation column, in bound-plan order. An empty relation still
+    /// holds its full complement of zero-length columns, so a join side's row count
+    /// (`columns[0].len()`) stays well-defined.
+    columns: Vec<Column>,
+    /// The relation's row count — the length of every column. Kept explicitly so a
+    /// zero-column edge case (no `columns[0]` to measure) and the `KeepAll` selection
+    /// stay unambiguous.
+    row_count: usize,
+}
+
+impl MaterializedRelation {
+    /// Transpose a finished query's row-major `result.rows` into the columnar shape
+    /// kept here — done **once** per materialization (not per reference). `ncols` is
+    /// the relation's column count (`result.columns.len()`); an empty result still
+    /// yields `ncols` zero-length columns so a join side scans it as a well-formed
+    /// zero-height input.
+    fn from_rows(rows: Vec<Vec<Option<Vec<u8>>>>, ncols: usize) -> Self {
+        let row_count = rows.len();
+        let mut columns: Vec<Vec<Option<Vec<u8>>>> =
+            (0..ncols).map(|_| Vec::with_capacity(row_count)).collect();
+        for mut row in rows {
+            // `finish_select` produces rectangular rows (each `ncols` wide); pad /
+            // truncate defensively so every column ends exactly `row_count` long and
+            // the per-column push never indexes out of range.
+            row.resize(ncols, None);
+            for (i, cell) in row.into_iter().enumerate() {
+                columns[i].push(cell);
+            }
+        }
+        Self {
+            columns: columns
+                .into_iter()
+                .map(|c| Column::Bytes(c.into()))
+                .collect(),
+            row_count,
+        }
+    }
 }
 
 /// The common-table-expressions / derived tables in scope while a `SELECT` runs
@@ -3293,7 +3336,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 .ok_or_else(|| EngineError::UnknownTable(bound.table.clone()))?;
             let schema_columns = columns.clone();
             let plan = self.resolve_filter(bound, overlay, scope)?;
-            let rows = filter_rows(&plan, &schema_columns, relation.rows.clone())?;
+            // Filter over the relation's shared columns ([STL-321]): the `WHERE`
+            // decodes only the columns it references, straight off those buffers,
+            // and only the surviving rows are gathered row-major for the tail —
+            // never the unconditional full copy `relation.rows.clone()` once made.
+            let rows = filter_relation_rows(&plan, &schema_columns, relation)?;
             return self.finish_select(
                 bound,
                 &schema_columns,
@@ -3467,7 +3514,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         else {
             return Err(EngineError::Unsupported("a CTE body must be a SELECT"));
         };
-        Ok(MaterializedRelation { rows: result.rows })
+        // Capture the result columnar (one shared buffer per column), so each later
+        // reference reads the same buffers without re-cloning the rows ([STL-321]).
+        let ncols = result.columns.len();
+        Ok(MaterializedRelation::from_rows(result.rows, ncols))
     }
 
     /// The shared result-shaping tail of a single-relation read ([STL-242]): the
@@ -4274,10 +4324,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// scanned at `snapshot` ([`scan_all_columns`](Self::scan_all_columns)), or a
     /// materialized CTE / derived table read from the scope ([STL-242]).
     ///
-    /// A CTE side's rows are already the canonical-bytes form a scan produces, so
-    /// each column is rebuilt as a [`Column::Bytes`] of its cells — the same shape
-    /// `scan_all_columns` returns, so [`decode_key_column`] and the join output
-    /// assembly consume it unchanged.
+    /// A CTE side is already held columnar in the same `scan_all_columns` shape —
+    /// one shared [`Cells`](stele_exec::Cells) buffer per column — so the side is its
+    /// columns cloned by `Arc` refcount bump, no cell copied however many times the
+    /// CTE is joined ([STL-321]); [`decode_key_column`] and the join output assembly
+    /// consume it exactly as a base-table scan's columns.
     ///
     /// Whether a side is materialized is decided by its **schema id**, not its name:
     /// the binder stamps a CTE / derived table with the ephemeral `SchemaId(0)`
@@ -4301,7 +4352,23 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             let relation = scope
                 .get(side.table.as_str())
                 .ok_or_else(|| EngineError::UnknownTable(side.table.clone()))?;
-            return Ok(materialized_columns(relation, side.columns.len()));
+            // The relation is already columnar in the `scan_all_columns` shape, with
+            // one column per `BoundJoinSide::columns` entry (an empty relation still
+            // carries its full complement of zero-length columns). Clone the columns
+            // by `Arc` refcount bump — no cell is copied, however many times the CTE
+            // is joined ([STL-321]).
+            //
+            // A full `assert_eq!` (not `debug_assert_eq!`): the binder guarantees the
+            // counts match, but a contract break must fail fast here with context
+            // rather than slip through to a less actionable `columns[key]` index panic
+            // in `decode_key_column` / the join output assembly. The check is one
+            // length compare per join side — negligible next to the scan it guards.
+            assert_eq!(
+                relation.columns.len(),
+                side.columns.len(),
+                "a materialized relation carries exactly its bound column count"
+            );
+            return Ok(relation.columns.clone());
         }
         let state = self
             .tables
@@ -7547,6 +7614,31 @@ fn collect_expr_columns(expr: &Expr, out: &mut BTreeSet<usize>) {
     }
 }
 
+/// Evaluate a boolean `WHERE` predicate over already-decoded typed columns,
+/// returning the per-row keep mask. The semantics match the committed-only
+/// [`Filter`]: only a `TRUE` keeps a row; a `FALSE` *or* `NULL` drops it. Shared by
+/// the row-major [`rows_passing_filter`] and the columnar [`relation_selection`]
+/// ([STL-321]).
+///
+/// The binder types every predicate as boolean, so a non-boolean result is a plan
+/// break rather than a data error — surfaced as [`ExprError::NotBoolean`], never
+/// silently kept.
+fn predicate_mask(
+    predicate: &Expr,
+    columns: &[Vector],
+    row_count: usize,
+) -> Result<Vec<Option<bool>>, EngineError> {
+    match eval_expr(predicate, columns, row_count)
+        .map_err(|err| EngineError::Scan(ScanError::Eval(err)))?
+    {
+        Vector::Bool(mask) => Ok(mask),
+        other => Err(EngineError::Scan(ScanError::Eval(ExprError::NotBoolean {
+            op: "WHERE",
+            found: other.logical_type(),
+        }))),
+    }
+}
+
 /// Evaluate a vectorized `WHERE` predicate over already-materialized rows, keeping
 /// the rows it reports TRUE ([STL-213]).
 ///
@@ -7556,9 +7648,7 @@ fn collect_expr_columns(expr: &Expr, out: &mut BTreeSet<usize>) {
 /// **references** are decoded; the rest stay empty placeholders the evaluator never
 /// reads (the [`run_aggregate`] discipline), so this stays cheap when used over a
 /// large materialized set — a provenance read of a wide table ([STL-247]) decodes
-/// just its predicate's columns, not every column of every row. The semantics match
-/// the committed-only `Filter`: a `FALSE` *or* `NULL` row is dropped (only a `TRUE`
-/// keeps a row).
+/// just its predicate's columns, not every column of every row.
 fn rows_passing_filter(
     predicate: &Expr,
     schema_columns: &[(String, LogicalType)],
@@ -7585,19 +7675,7 @@ fn rows_passing_filter(
         columns[position] = Vector::from_column(*ty, &column)
             .map_err(|err| EngineError::Scan(ScanError::Eval(err)))?;
     }
-    let mask = match eval_expr(predicate, &columns, row_count)
-        .map_err(|err| EngineError::Scan(ScanError::Eval(err)))?
-    {
-        Vector::Bool(mask) => mask,
-        // The binder types every predicate as boolean, so a non-boolean result is
-        // a plan break rather than a data error — surface it, do not silently keep.
-        other => {
-            return Err(EngineError::Scan(ScanError::Eval(ExprError::NotBoolean {
-                op: "WHERE",
-                found: other.logical_type(),
-            })));
-        }
-    };
+    let mask = predicate_mask(predicate, &columns, row_count)?;
     Ok(rows
         .into_iter()
         .zip(mask)
@@ -7605,25 +7683,97 @@ fn rows_passing_filter(
         .collect())
 }
 
-/// A materialized CTE / derived table's rows as the executor's per-column shared
-/// buffers ([STL-242]) — one [`Column::Bytes`] per column, matching the shape
-/// [`scan_all_columns`](SessionEngine::scan_all_columns) returns for a base table,
-/// so a join consumes a CTE side identically.
+/// The rows of a materialized CTE / derived table its `WHERE` keeps, as row indices
+/// into the relation's shared columns — a selection vector, computed without copying
+/// a single row ([STL-321], mirroring the [`Filter`] selection-vector posture of
+/// [STL-214]).
 ///
-/// `ncols` is the side's expected column count (the binder's
-/// [`BoundJoinSide::columns`] length); an empty relation yields `ncols` empty
-/// columns so the join's `[0].len()` row count is still well-defined.
-fn materialized_columns(relation: &MaterializedRelation, ncols: usize) -> Vec<Column> {
-    (0..ncols)
-        .map(|i| {
-            let cells: Vec<Option<Vec<u8>>> = relation
-                .rows
-                .iter()
-                .map(|row| row.get(i).cloned().flatten())
-                .collect();
-            Column::Bytes(cells.into())
-        })
-        .collect()
+/// `Empty` keeps nothing and `KeepAll` keeps every row; a `Predicate` decodes **only
+/// the columns it references** straight off the relation's shared
+/// [`Cells`](stele_exec::Cells) buffers (the [`rows_passing_filter`] discipline,
+/// minus the per-column re-collection a row-major set would need), evaluates the
+/// mask, and keeps the `TRUE` rows.
+fn relation_selection(
+    plan: &FilterPlan,
+    schema_columns: &[(String, LogicalType)],
+    relation: &MaterializedRelation,
+) -> Result<Vec<usize>, EngineError> {
+    let row_count = relation.row_count;
+    let predicate = match plan {
+        FilterPlan::Empty => return Ok(Vec::new()),
+        FilterPlan::KeepAll => return Ok((0..row_count).collect()),
+        FilterPlan::Predicate(predicate) => predicate,
+    };
+    if row_count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut referenced = BTreeSet::new();
+    collect_expr_columns(predicate, &mut referenced);
+    let mut columns: Vec<Vector> = (0..schema_columns.len())
+        .map(|_| Vector::Bool(Vec::new()))
+        .collect();
+    for position in referenced {
+        // The relation's columns and `schema_columns` are the same bound header, so
+        // a referenced position resolves in both; guard rather than index, so a stale
+        // out-of-range reference surfaces as "unfilled placeholder" not a panic.
+        let (Some((_, ty)), Some(column)) =
+            (schema_columns.get(position), relation.columns.get(position))
+        else {
+            continue;
+        };
+        columns[position] = Vector::from_column(*ty, column)
+            .map_err(|err| EngineError::Scan(ScanError::Eval(err)))?;
+    }
+    let mask = predicate_mask(predicate, &columns, row_count)?;
+    Ok((0..row_count)
+        .zip(mask)
+        .filter_map(|(i, keep)| (keep == Some(true)).then_some(i))
+        .collect())
+}
+
+/// Read one cell of a resolved columnar [`Column`] as the row-major canonical-bytes
+/// form the shared `finish_select` tail consumes — the non-batch counterpart of
+/// [`batch_cell`]. A materialized relation's columns are always [`Column::Bytes`];
+/// a fixed-width column is reinterpreted losslessly rather than panicking if one
+/// ever appeared.
+fn relation_cell(column: &Column, row: usize) -> Option<Vec<u8>> {
+    match column {
+        Column::Bytes(cells) => cells[row].clone(),
+        Column::I64(values) => Some(values[row].to_le_bytes().to_vec()),
+    }
+}
+
+/// Apply a materialized relation's `WHERE` and reconstruct just the surviving rows
+/// row-major ([STL-321]), the shape the shared [`finish_select`](SessionEngine::finish_select)
+/// tail consumes.
+///
+/// A `Predicate` filters by a [`relation_selection`] over the shared columns — no
+/// row copied to filter, the selection bounded by the survivors it keeps (which the
+/// read must materialize anyway). `KeepAll` / `Empty` need no selection vector at
+/// all, so they iterate the row range directly rather than first allocating O(n)
+/// indices for an unfiltered read. Either way a row is gathered once for the tail,
+/// never the **extra** full copy `relation.rows.clone()` once paid before filtering.
+fn filter_relation_rows(
+    plan: &FilterPlan,
+    schema_columns: &[(String, LogicalType)],
+    relation: &MaterializedRelation,
+) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+    // Gather one row's cells off the shared columns, row-major.
+    let row = |r: usize| -> Vec<Option<Vec<u8>>> {
+        relation
+            .columns
+            .iter()
+            .map(|col| relation_cell(col, r))
+            .collect()
+    };
+    Ok(match plan {
+        FilterPlan::Empty => Vec::new(),
+        FilterPlan::KeepAll => (0..relation.row_count).map(row).collect(),
+        FilterPlan::Predicate(_) => relation_selection(plan, schema_columns, relation)?
+            .into_iter()
+            .map(row)
+            .collect(),
+    })
 }
 
 /// Map a bound [`JoinType`] to the executor's `ExecJoinType`. The two enums are
@@ -15741,6 +15891,109 @@ mod tests {
     /// One single-cell `Int4` row, in the canonical encoding `SelectResult` carries.
     fn int_row(v: i32) -> Vec<Option<Vec<u8>>> {
         vec![cell(Some(ScalarValue::Int4(v)))]
+    }
+
+    /// The address of a [`Column::Bytes`]' first cell — its shared-buffer identity.
+    /// Two columns sharing one [`Cells`](stele_exec::Cells) allocation (a clone, not
+    /// a copy) report the same address; a fresh per-cell copy would not.
+    fn bytes_addr(column: &Column) -> *const Option<Vec<u8>> {
+        match column {
+            Column::Bytes(cells) => cells.as_ptr(),
+            Column::I64(_) => panic!("a materialized relation column is always Bytes"),
+        }
+    }
+
+    #[test]
+    fn cte_join_reference_clones_share_buffers_not_cells() {
+        // A materialized relation is held columnar over shared `Cells` buffers; a
+        // join side (`join_side_columns`) reads it by cloning those columns — an
+        // `Arc` refcount bump, not a per-cell copy — so a CTE joined N times never
+        // re-copies its rows ([STL-321]).
+        let rows = vec![
+            vec![Some(b"k0".to_vec()), Some(b"v0".to_vec())],
+            vec![Some(b"k1".to_vec()), None],
+            vec![Some(b"k2".to_vec()), Some(b"v2".to_vec())],
+        ];
+        let relation = MaterializedRelation::from_rows(rows, 2);
+        assert_eq!(relation.row_count, 3);
+        assert_eq!(relation.columns.len(), 2);
+
+        // Every reference clones the stored columns; each clone shares the exact
+        // buffer the relation holds, however many references there are.
+        let refs: Vec<Vec<Column>> = (0..4).map(|_| relation.columns.clone()).collect();
+        for (i, stored) in relation.columns.iter().enumerate() {
+            for reference in &refs {
+                assert_eq!(
+                    bytes_addr(stored),
+                    bytes_addr(&reference[i]),
+                    "a join-side reference shares the relation's buffer, not a copy"
+                );
+            }
+        }
+        // The shared buffers still read the right cells (NULL preserved distinct
+        // from an empty value).
+        assert_eq!(relation_cell(&refs[0][0], 1), Some(b"k1".to_vec()));
+        assert_eq!(relation_cell(&refs[0][1], 1), None);
+        assert_eq!(relation_cell(&refs[3][1], 2), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn cte_empty_relation_keeps_its_column_complement() {
+        // An empty CTE still carries its full column complement (zero-length
+        // columns), so a join side's row count `columns[0].len()` is well-defined.
+        let relation = MaterializedRelation::from_rows(Vec::new(), 2);
+        assert_eq!(relation.row_count, 0);
+        assert_eq!(relation.columns.len(), 2);
+        assert!(relation.columns.iter().all(Column::is_empty));
+        // A `KeepAll` / `Empty` selection over zero rows is empty either way.
+        let cols = vec![("a".to_owned(), LogicalType::Int4)];
+        assert!(
+            relation_selection(&FilterPlan::KeepAll, &cols, &relation)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cte_read_filters_over_shared_columns() {
+        // The read path filters a CTE reference via a selection vector over the
+        // shared columns and gathers only the survivors — the same answer the old
+        // clone-then-filter row-major path gave ([STL-321]). The wire suite and the
+        // `cte_differential` oracle guard the broader no-behavior-change contract.
+        let mut engine = session();
+        run_sql(&mut engine, CREATE);
+        for (id, bal) in [(1, 100), (2, 200), (3, 300)] {
+            run_sql(
+                &mut engine,
+                &format!("INSERT INTO account (id, balance) VALUES ({id}, {bal})"),
+            );
+        }
+        // A `WHERE` over a reference keeps only the matching rows.
+        assert_eq!(
+            query_rows(
+                &mut engine,
+                "WITH c AS (SELECT id, balance FROM account) SELECT id FROM c WHERE balance >= 200"
+            ),
+            vec![int_row(2), int_row(3)]
+        );
+        // A passthrough reference returns every row, in business-key order.
+        assert_eq!(
+            query_rows(
+                &mut engine,
+                "WITH c AS (SELECT id, balance FROM account) SELECT id FROM c"
+            ),
+            vec![int_row(1), int_row(2), int_row(3)]
+        );
+        // The same CTE referenced twice in one statement (a self-join) answers
+        // consistently — each side a zero-copy clone of the one materialization.
+        assert_eq!(
+            query_rows(
+                &mut engine,
+                "WITH c AS (SELECT id, balance FROM account) \
+                 SELECT a.id FROM c AS a JOIN c AS b ON a.balance = b.balance WHERE a.id >= 2"
+            ),
+            vec![int_row(2), int_row(3)]
+        );
     }
 
     #[test]
