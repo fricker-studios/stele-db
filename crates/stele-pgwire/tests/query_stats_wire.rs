@@ -8,6 +8,11 @@
 //!   carrying the parseable stats line — after the rows, before `CommandComplete`;
 //! * a connection that did **not** opt in (every psql / JDBC / psycopg client)
 //!   receives no such notice, so the trailer is invisible to the driver gate.
+//!
+//! The same gating holds on the **extended-query** path — `Parse`/`Bind`/`Execute`/
+//! `Sync` (STL-319), the protocol JDBC / psycopg / pgAdmin speak — where the trailer
+//! is emitted once the portal fully drains, and never on a `PortalSuspended` partial
+//! fetch.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -208,5 +213,216 @@ async fn a_connection_that_did_not_opt_in_gets_no_stats_trailer() {
         frames.iter().filter(|f| f.kind == b'D').count(),
         1,
         "the row is still streamed",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Extended-query (Parse / Bind / Execute / Sync) path (STL-319)
+// ---------------------------------------------------------------------------
+
+/// A `Parse` body: statement name + query (both NUL-terminated), then an `Int16`
+/// parameter-OID count (zero — the SELECTs under test take no parameters).
+fn parse_body(name: &str, query: &str) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(name.as_bytes());
+    b.push(0);
+    b.extend_from_slice(query.as_bytes());
+    b.push(0);
+    b.extend_from_slice(&0i16.to_be_bytes()); // no parameter type OIDs
+    b
+}
+
+/// A `Bind` body for a parameterless portal: no parameter format codes, no
+/// parameters, no result format codes (every column ships text).
+fn bind_body(portal: &str, statement: &str) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(portal.as_bytes());
+    b.push(0);
+    b.extend_from_slice(statement.as_bytes());
+    b.push(0);
+    b.extend_from_slice(&0i16.to_be_bytes()); // zero parameter format codes
+    b.extend_from_slice(&0i16.to_be_bytes()); // zero parameters
+    b.extend_from_slice(&0i16.to_be_bytes()); // zero result format codes
+    b
+}
+
+/// An `Execute` body: portal name then an `Int32` row cap (`0` = every remaining
+/// row; a positive cap stops with `PortalSuspended` and resumes on the next one).
+fn execute_body(portal: &str, max_rows: i32) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(portal.as_bytes());
+    b.push(0);
+    b.extend_from_slice(&max_rows.to_be_bytes());
+    b
+}
+
+/// A `Describe` body targeting a *portal* ('P'): the message a JDBC / psycopg
+/// client sends before Execute to learn the result shape.
+fn describe_portal_body(name: &str) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.push(b'P'); // 'P' = portal (vs 'S' = prepared statement)
+    b.extend_from_slice(name.as_bytes());
+    b.push(0);
+    b
+}
+
+/// Seed the shared two-row versioned fixture over the simple-query path, leaving
+/// the stream idle at `ReadyForQuery` for the extended-query batch that reads it.
+async fn seed_two_rows(stream: &mut TcpStream) {
+    run_query(
+        stream,
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT) WITH SYSTEM VERSIONING",
+    )
+    .await;
+    run_query(stream, "INSERT INTO t VALUES (1, 10), (2, 20)").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_opted_in_extended_query_gets_the_stats_trailer_before_command_complete() {
+    let addr = spawn().await;
+    let mut stream = connect(addr, true).await;
+    seed_two_rows(&mut stream).await;
+
+    // Parse / Bind / Execute / Sync the SELECT — the path `stele shell` never takes
+    // but JDBC / psycopg / pgAdmin do. One batch, then the trailing Sync.
+    let mut batch = frame(b'P', &parse_body("", "SELECT id, v FROM t"));
+    batch.extend(frame(b'B', &bind_body("", "")));
+    batch.extend(frame(b'E', &execute_body("", 0)));
+    batch.extend(frame(b'S', &[]));
+    stream.write_all(&batch).await.expect("write P/B/E/S");
+    stream.flush().await.expect("flush");
+    let frames = drain_until_ready(&mut stream).await;
+
+    let stats =
+        stats_from(&frames).expect("the extended-query SELECT carries a stats NoticeResponse");
+    assert_eq!(stats.rows, 2, "the footer reports the scanned row count");
+    assert!(!stats.time_travel, "a live read is not time-travel");
+    assert_eq!(stats.segments_total, 0, "unflushed → no sealed segments");
+
+    // The trailer annotates the just-finished portal: after the final DataRow,
+    // before CommandComplete.
+    let last_row_at = frames
+        .iter()
+        .rposition(|f| f.kind == b'D')
+        .expect("DataRow");
+    let notice_at = frames.iter().position(|f| f.kind == b'N').expect("notice");
+    let complete_at = frames
+        .iter()
+        .position(|f| f.kind == b'C')
+        .expect("CommandComplete");
+    assert!(
+        last_row_at < notice_at,
+        "the notice follows the final DataRow"
+    );
+    assert!(
+        notice_at < complete_at,
+        "the stats notice comes before CommandComplete",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_opted_in_extended_query_gets_no_stats_trailer() {
+    let addr = spawn().await;
+    let mut stream = connect(addr, false).await;
+    seed_two_rows(&mut stream).await;
+
+    let mut batch = frame(b'P', &parse_body("", "SELECT id, v FROM t"));
+    batch.extend(frame(b'B', &bind_body("", "")));
+    batch.extend(frame(b'E', &execute_body("", 0)));
+    batch.extend(frame(b'S', &[]));
+    stream.write_all(&batch).await.expect("write P/B/E/S");
+    stream.flush().await.expect("flush");
+    let frames = drain_until_ready(&mut stream).await;
+
+    // A stock driver's extended-query stream stays byte-identical: no NoticeResponse.
+    assert!(
+        !frames.iter().any(|f| f.kind == b'N'),
+        "a non-opted-in extended query receives no NoticeResponse",
+    );
+    assert_eq!(
+        frames.iter().filter(|f| f.kind == b'D').count(),
+        2,
+        "both rows still stream",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_portal_suspended_partial_fetch_defers_the_trailer_until_completion() {
+    let addr = spawn().await;
+    let mut stream = connect(addr, true).await;
+    seed_two_rows(&mut stream).await;
+
+    // Cap the first Execute at a single row (it stops with `PortalSuspended`), then
+    // a second Execute drains the rest. The trailer must appear exactly once, and
+    // only at completion — not riding the partial fetch.
+    let mut batch = frame(b'P', &parse_body("", "SELECT id, v FROM t"));
+    batch.extend(frame(b'B', &bind_body("", "")));
+    batch.extend(frame(b'E', &execute_body("", 1)));
+    batch.extend(frame(b'E', &execute_body("", 0)));
+    batch.extend(frame(b'S', &[]));
+    stream.write_all(&batch).await.expect("write P/B/E/E/S");
+    stream.flush().await.expect("flush");
+    let frames = drain_until_ready(&mut stream).await;
+
+    assert_eq!(
+        frames.iter().filter(|f| f.kind == b'N').count(),
+        1,
+        "exactly one stats trailer for the whole portal, not one per Execute",
+    );
+    let suspended_at = frames
+        .iter()
+        .position(|f| f.kind == b's')
+        .expect("PortalSuspended");
+    let notice_at = frames.iter().position(|f| f.kind == b'N').expect("notice");
+    let complete_at = frames
+        .iter()
+        .position(|f| f.kind == b'C')
+        .expect("CommandComplete");
+    assert!(
+        suspended_at < notice_at,
+        "the partial fetch's PortalSuspended carries no trailer; it waits for completion",
+    );
+    assert!(
+        notice_at < complete_at,
+        "the trailer precedes the final CommandComplete",
+    );
+    let stats = stats_from(&frames).expect("the completed portal carries the stats");
+    assert_eq!(
+        stats.rows, 2,
+        "the footer reports the full scan, not the final chunk",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn describe_then_execute_still_emits_the_trailer() {
+    // A realistic driver issues `Describe('P')` before `Execute`; that runs and
+    // caches the read, so the Execute must still find — and emit — the stats.
+    let addr = spawn().await;
+    let mut stream = connect(addr, true).await;
+    seed_two_rows(&mut stream).await;
+
+    let mut batch = frame(b'P', &parse_body("", "SELECT id, v FROM t"));
+    batch.extend(frame(b'B', &bind_body("", "")));
+    batch.extend(frame(b'D', &describe_portal_body("")));
+    batch.extend(frame(b'E', &execute_body("", 0)));
+    batch.extend(frame(b'S', &[]));
+    stream.write_all(&batch).await.expect("write P/B/D/E/S");
+    stream.flush().await.expect("flush");
+    let frames = drain_until_ready(&mut stream).await;
+
+    assert!(
+        frames.iter().any(|f| f.kind == b'T'),
+        "Describe('P') replies a RowDescription",
+    );
+    let stats = stats_from(&frames).expect("a Describe before Execute does not consume the stats");
+    assert_eq!(stats.rows, 2, "the footer reports the scanned row count");
+    let notice_at = frames.iter().position(|f| f.kind == b'N').expect("notice");
+    let complete_at = frames
+        .iter()
+        .position(|f| f.kind == b'C')
+        .expect("CommandComplete");
+    assert!(
+        notice_at < complete_at,
+        "the stats notice still precedes CommandComplete",
     );
 }
