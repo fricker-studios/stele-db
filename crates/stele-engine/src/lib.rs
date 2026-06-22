@@ -4281,7 +4281,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // carries its full complement of zero-length columns). Clone the columns
             // by `Arc` refcount bump — no cell is copied, however many times the CTE
             // is joined ([STL-321]).
-            debug_assert_eq!(
+            //
+            // A full `assert_eq!` (not `debug_assert_eq!`): the binder guarantees the
+            // counts match, but a contract break must fail fast here with context
+            // rather than slip through to a less actionable `columns[key]` index panic
+            // in `decode_key_column` / the join output assembly. The check is one
+            // length compare per join side — negligible next to the scan it guards.
+            assert_eq!(
                 relation.columns.len(),
                 side.columns.len(),
                 "a materialized relation carries exactly its bound column count"
@@ -7645,27 +7651,33 @@ fn relation_cell(column: &Column, row: usize) -> Option<Vec<u8>> {
 /// row-major ([STL-321]), the shape the shared [`finish_select`](SessionEngine::finish_select)
 /// tail consumes.
 ///
-/// Filtering is a [`relation_selection`] over the shared columns — no row copied to
-/// filter — and only the kept rows' cells are then gathered. A `WHERE` that drops
-/// rows copies just the survivors; an unfiltered read materializes its result once,
-/// as any read must, but never the **extra** full copy `relation.rows.clone()` once
-/// paid before filtering.
+/// A `Predicate` filters by a [`relation_selection`] over the shared columns — no
+/// row copied to filter, the selection bounded by the survivors it keeps (which the
+/// read must materialize anyway). `KeepAll` / `Empty` need no selection vector at
+/// all, so they iterate the row range directly rather than first allocating O(n)
+/// indices for an unfiltered read. Either way a row is gathered once for the tail,
+/// never the **extra** full copy `relation.rows.clone()` once paid before filtering.
 fn filter_relation_rows(
     plan: &FilterPlan,
     schema_columns: &[(String, LogicalType)],
     relation: &MaterializedRelation,
 ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
-    let selection = relation_selection(plan, schema_columns, relation)?;
-    Ok(selection
-        .iter()
-        .map(|&r| {
-            relation
-                .columns
-                .iter()
-                .map(|col| relation_cell(col, r))
-                .collect()
-        })
-        .collect())
+    // Gather one row's cells off the shared columns, row-major.
+    let row = |r: usize| -> Vec<Option<Vec<u8>>> {
+        relation
+            .columns
+            .iter()
+            .map(|col| relation_cell(col, r))
+            .collect()
+    };
+    Ok(match plan {
+        FilterPlan::Empty => Vec::new(),
+        FilterPlan::KeepAll => (0..relation.row_count).map(row).collect(),
+        FilterPlan::Predicate(_) => relation_selection(plan, schema_columns, relation)?
+            .into_iter()
+            .map(row)
+            .collect(),
+    })
 }
 
 /// Map a bound [`JoinType`] to the executor's `ExecJoinType`. The two enums are
