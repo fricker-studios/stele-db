@@ -25,10 +25,11 @@ pub const NOTICE_PREFIX: &str = "stele stats v1:";
 /// The scan-level counts mirror the executor's `ScanStats` (STL-146): a segment
 /// is either *scanned* (its columns materialized) or *pruned* by one of four
 /// proofs — a zone map, a footer bloom, the validity index (superseded), or a
-/// valid-interval summary (valid axis, STL-241/STL-315). The
-/// row-group counts (STL-173) partition the row-groups of the segment-level zone
-/// survivors. `rows` is the count the query actually returned (post-filter,
-/// post-aggregate), not the number of versions examined.
+/// valid-interval summary (valid axis, STL-241/STL-315). The row-group counts
+/// (STL-173, STL-316/STL-336) partition the row-groups of the segment-level zone
+/// survivors the same way: each is *scanned* or *pruned* by its own zone map or
+/// valid-interval summary. `rows` is the count the query actually returned
+/// (post-filter, post-aggregate), not the number of versions examined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct QueryStats {
     /// Rows the query returned to the client.
@@ -64,6 +65,13 @@ pub struct QueryStats {
     pub row_groups_scanned: u64,
     /// Row-groups a per-row-group zone map proved hold no visible match.
     pub row_groups_pruned_zone: u64,
+    /// Row-groups a per-row-group valid-interval summary proved hold no row on the
+    /// valid axis the read needs (no read I/O) — the row-group-granular refinement
+    /// of [`segments_pruned_valid`](Self::segments_pruned_valid). Non-zero when a
+    /// `FOR VALID_TIME AS OF v` point stab (STL-316) or a per-row `PERIOD` overlap
+    /// probe (STL-336) prunes individual row-groups of a segment whose own
+    /// segment-level summary could not prune it wholesale.
+    pub row_groups_pruned_valid: u64,
 }
 
 impl QueryStats {
@@ -78,6 +86,16 @@ impl QueryStats {
             + self.segments_pruned_valid
     }
 
+    /// Row-groups skipped by any per-row-group prune — never had their identity or
+    /// bulk chunks read. The zone-map (STL-173) and valid-interval (STL-316/STL-336)
+    /// proofs sum, so the footer's `scanned + pruned == total` partition holds on
+    /// the row-group axis just as [`segments_pruned`](Self::segments_pruned) keeps
+    /// it on the segment axis.
+    #[must_use]
+    pub const fn row_groups_pruned(&self) -> u64 {
+        self.row_groups_pruned_zone + self.row_groups_pruned_valid
+    }
+
     /// Serialize as the body of a stats `NoticeResponse` message: the
     /// [`NOTICE_PREFIX`] tag followed by space-separated `key=value` pairs.
     ///
@@ -88,7 +106,7 @@ impl QueryStats {
         format!(
             "{NOTICE_PREFIX} rows={} sys={} tt={} \
              seg_total={} seg_scanned={} seg_zone={} seg_bloom={} seg_super={} seg_valid={} \
-             rg_total={} rg_scanned={} rg_zone={}",
+             rg_total={} rg_scanned={} rg_zone={} rg_valid={}",
             self.rows,
             self.system_snapshot,
             u8::from(self.time_travel),
@@ -101,6 +119,7 @@ impl QueryStats {
             self.row_groups_total,
             self.row_groups_scanned,
             self.row_groups_pruned_zone,
+            self.row_groups_pruned_valid,
         )
     }
 
@@ -132,6 +151,7 @@ impl QueryStats {
                 "rg_total" => stats.row_groups_total = value.parse().unwrap_or(0),
                 "rg_scanned" => stats.row_groups_scanned = value.parse().unwrap_or(0),
                 "rg_zone" => stats.row_groups_pruned_zone = value.parse().unwrap_or(0),
+                "rg_valid" => stats.row_groups_pruned_valid = value.parse().unwrap_or(0),
                 _ => {}
             }
         }
@@ -157,6 +177,7 @@ mod tests {
             row_groups_total: 20,
             row_groups_scanned: 15,
             row_groups_pruned_zone: 5,
+            row_groups_pruned_valid: 3,
         }
     }
 
@@ -200,5 +221,12 @@ mod tests {
     fn segments_pruned_sums_the_four_proofs() {
         // zone(4) + bloom(1) + superseded(0) + valid(2).
         assert_eq!(sample().segments_pruned(), 7);
+    }
+
+    #[test]
+    fn row_groups_pruned_sums_the_two_proofs() {
+        // zone(5) + valid(3) — so the footer's `scanned + pruned == total`
+        // partition holds on the row-group axis too (STL-339).
+        assert_eq!(sample().row_groups_pruned(), 8);
     }
 }

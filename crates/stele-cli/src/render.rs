@@ -444,8 +444,20 @@ fn detailed_stats(stats: &QueryStats) -> Vec<Line> {
             "row-groups",
             format!(
                 "{} total · {} scanned · {} pruned",
-                stats.row_groups_total, stats.row_groups_scanned, stats.row_groups_pruned_zone
+                stats.row_groups_total,
+                stats.row_groups_scanned,
+                stats.row_groups_pruned()
             ),
+            Role::Text,
+        ));
+        out.push(row(
+            "↳ zone-map",
+            stats.row_groups_pruned_zone.to_string(),
+            Role::Text,
+        ));
+        out.push(row(
+            "↳ valid",
+            stats.row_groups_pruned_valid.to_string(),
             Role::Text,
         ));
     }
@@ -711,6 +723,7 @@ mod tests {
             row_groups_total: 1,
             row_groups_scanned: 1,
             row_groups_pruned_zone: 0,
+            row_groups_pruned_valid: 0,
         }
     }
 
@@ -808,6 +821,40 @@ mod tests {
         assert_eq!(
             compact, "  ⤷ live @ now() · scanned 1 of 3 segments · 2 pruned",
             "valid prune missing from the compact total",
+        );
+    }
+
+    #[test]
+    fn footer_counts_valid_axis_row_group_pruning() {
+        // STL-339: a row-group-level valid prune (the per-row-group `FOR VALID_TIME
+        // AS OF` point stab / PERIOD overlap probe) must show in the footer — broken
+        // out on the row-groups `↳ valid` line and folded into the row-groups
+        // "pruned" total, so `scanned + pruned == total` holds on the row-group axis.
+        let stats = QueryStats {
+            row_groups_total: 4,
+            row_groups_scanned: 1,
+            row_groups_pruned_zone: 1,
+            row_groups_pruned_valid: 2,
+            ..flushed_stats()
+        };
+
+        let detailed = text(&stats_lines(&stats, StatsMode::Detailed));
+        assert!(
+            detailed.contains("4 total · 1 scanned · 3 pruned"),
+            "row-group valid prune missing from the detailed total: {detailed}"
+        );
+        // The row-group breakdown lines follow the `row-groups` summary line; the
+        // segment block above has its own `↳ valid`, so anchor on position — the
+        // first `↳ valid` at or after the `row-groups` line is the row-group one.
+        let rg_valid = detailed
+            .lines()
+            .skip_while(|l| !l.contains("row-groups"))
+            .find(|l| l.contains("↳ valid"))
+            .expect("a ↳ valid line under the row-groups block");
+        assert_eq!(
+            rg_valid.split_whitespace().last(),
+            Some("2"),
+            "the row-groups ↳ valid line must show the valid-prune count: {rg_valid:?}"
         );
     }
 }

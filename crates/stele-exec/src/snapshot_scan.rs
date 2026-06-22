@@ -662,11 +662,10 @@ impl ScanStats {
     /// the row-group axis — the combined value still describes the read's whole
     /// storage cost across both inputs.
     ///
-    /// (The *footer's* displayed `scanned + pruned == total` can nonetheless look
-    /// off on the *row-group* axis, independent of this method: the wire
-    /// `QueryStats` now carries the segment-level valid prune (STL-333) but not yet
-    /// the row-group one (`row_groups_pruned_valid`), so that count is dropped on
-    /// the way out — tracked by STL-339, not a property of the sum here.)
+    /// (The wire `QueryStats` the footer renders now carries every prune proof on
+    /// both axes — the segment-level valid prune (STL-333) and the row-group one
+    /// (`row_groups_pruned_valid`, STL-339) — so the footer's displayed
+    /// `scanned + pruned == total` holds on both axes, matching this sum.)
     ///
     /// [STL-318]: https://allegromusic.atlassian.net/browse/STL-318
     #[must_use]
