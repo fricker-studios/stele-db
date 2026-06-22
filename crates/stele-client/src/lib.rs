@@ -480,6 +480,27 @@ impl Client {
         decode(value)
     }
 
+    /// `POST /v1alpha1/reload-tls` — reload the server's TLS certificate/key from
+    /// the configured `[tls]` paths without a restart ([STL-326]), the
+    /// cross-platform / programmatic counterpart to the Unix-only SIGHUP trigger.
+    /// Returns the reloaded certificate path the server confirms.
+    ///
+    /// # Errors
+    /// As [`health`](Self::health); a `409` when the server has no reloadable
+    /// `[tls]` material (plaintext, loopback, or the self-signed fallback), or a
+    /// `500` when the new pair is unreadable / mismatched — in both cases the live
+    /// certificate keeps serving.
+    ///
+    /// [STL-326]: https://allegromusic.atlassian.net/browse/STL-326
+    pub fn reload_tls(&self) -> Result<String, Error> {
+        let value = self.request("POST", "/v1alpha1/reload-tls", None)?;
+        value
+            .get("cert_path")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| Error::Decode("reload-tls reply missing `cert_path`".to_owned()))
+    }
+
     /// One request/response round-trip. Returns the parsed 2xx JSON body, or an
     /// [`Error`] carrying the gateway's failure.
     fn request(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value, Error> {

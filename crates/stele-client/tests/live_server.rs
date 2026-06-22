@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use stele_client::{Client, Config, Error};
 use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
-use stele_pgwire::SharedSession;
+use stele_pgwire::{SharedSession, TlsMode, TlsReloader, TlsSettings};
 use stele_server::admin::http::AdminHttp;
 use stele_server::admin::{AdminAuth, AdminService};
 use stele_server::ops::{OpsServer, OpsState};
@@ -52,6 +52,51 @@ async fn boot() -> Harness {
     tokio::spawn(ops.serve());
 
     Harness { addr, engine }
+}
+
+/// As [`boot`], but installs `reloader` on the gateway so `reload_tls()` has
+/// reloadable `[tls]` material to rotate (STL-326).
+async fn boot_reloadable(reloader: &TlsReloader) -> Harness {
+    let engine = Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
+    let core = AdminService::new(Arc::clone(&engine));
+    let auth = Arc::new(AdminAuth::new(vec![TOKEN.to_owned()]));
+
+    let state = Arc::new(OpsState::new());
+    let session: SharedSession = engine.clone();
+    state.set_ready(session);
+    state.set_admin(Arc::new(
+        AdminHttp::new(core, Arc::clone(&auth)).with_tls_reloader(reloader),
+    ));
+    let ops = OpsServer::new("127.0.0.1:0".parse().unwrap(), state)
+        .bind()
+        .await
+        .expect("bind ops listener");
+    let addr = ops.local_addr();
+    tokio::spawn(ops.serve());
+
+    Harness { addr, engine }
+}
+
+/// A [`TlsReloader`] over a freshly self-signed cert/key pair on disk — enough for
+/// `reload()` to re-read and succeed without standing up a TLS listener.
+fn temp_reloader(tag: &str) -> TlsReloader {
+    let key = rcgen::KeyPair::generate().expect("generate key");
+    let params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).expect("cert params");
+    let cert = params.self_signed(&key).expect("self-sign");
+    let dir =
+        std::env::temp_dir().join(format!("stele-client-reload-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let cert_path = dir.join("server.crt");
+    let key_path = dir.join("server.key");
+    std::fs::write(&cert_path, cert.pem()).expect("write cert");
+    std::fs::write(&key_path, key.serialize_pem()).expect("write key");
+    TlsReloader::load(TlsSettings {
+        cert: cert_path,
+        key: key_path,
+        client_ca: None,
+        mode: TlsMode::Required,
+    })
+    .expect("load reloader")
 }
 
 /// Run SQL statements through the engine to give the test durable, introspectable
@@ -182,6 +227,44 @@ async fn rejects_missing_and_wrong_tokens() {
         match wrong.health() {
             Err(Error::Status { code, .. }) => assert_eq!(code, "401"),
             other => panic!("expected a 401, got {other:?}"),
+        }
+    })
+    .await
+    .expect("blocking client task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_tls_rotates_the_certificate_through_the_sdk() {
+    // The SDK's face of the cross-platform reload trigger (STL-326): against a
+    // gateway with reloadable [tls] material it returns the reloaded cert path.
+    let reloader = temp_reloader("sdk-reload");
+    let h = boot_reloadable(&reloader).await;
+    let config = config(h.addr);
+
+    tokio::task::spawn_blocking(move || {
+        let client = Client::new(config);
+        let cert_path = client.reload_tls().expect("reload-tls through the SDK");
+        assert!(
+            cert_path.ends_with("server.crt"),
+            "the reloaded cert path is echoed back: {cert_path}"
+        );
+    })
+    .await
+    .expect("blocking client task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_tls_without_material_is_a_conflict_status() {
+    // A plaintext gateway (no reloadable material) reports the SDK a 409 rather
+    // than pretending to rotate — the FailedPrecondition posture over HTTP.
+    let h = boot().await;
+    let config = config(h.addr);
+
+    tokio::task::spawn_blocking(move || {
+        let client = Client::new(config);
+        match client.reload_tls() {
+            Err(Error::Status { code, .. }) => assert_eq!(code, "409"),
+            other => panic!("expected a 409 with no reloadable TLS, got {other:?}"),
         }
     })
     .await

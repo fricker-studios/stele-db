@@ -116,6 +116,7 @@ use stele_catalog::CatalogError;
 use stele_common::hashkey::hash_key;
 use stele_common::metrics::SharedMetrics;
 use stele_common::provenance::Principal;
+use stele_common::query_stats::QueryStats;
 use stele_common::scram::ScramVerifier;
 use stele_common::time::{Clock, SystemTimeMicros};
 use stele_common::types::{DecodeError, LogicalType, ScalarValue};
@@ -1339,6 +1340,7 @@ async fn run_session<S: Wire>(
                     &session,
                     &mut txn,
                     &principal,
+                    stats_enabled,
                     &mut session_time,
                 )
                 .await?;
@@ -2959,6 +2961,12 @@ enum Executed {
         header: Vec<ResultColumn>,
         rows: Vec<Vec<ResultColumn>>,
         sent: usize,
+        /// The opt-in query-stats trailer payload ([STL-201]): `Some` for a
+        /// scan-backed read and `None` for a synthetic `pg_catalog` /
+        /// constant-`SELECT` result. [`handle_execute`] emits it once the portal
+        /// fully drains ([STL-319]), taking it out so a re-`Execute` of the
+        /// already-drained portal does not repeat it.
+        stats: Option<QueryStats>,
     },
     /// A statement that completes with only a `CommandComplete` tag (DML / DDL).
     Completed { tag: String },
@@ -3041,6 +3049,9 @@ fn execute_stmt(
             header,
             rows,
             sent: 0,
+            // A synthetic catalog result runs no storage scan, so it carries no
+            // footer — the same suppression the simple-query path applies.
+            stats: None,
         });
     }
     match bind_ddl(stmt) {
@@ -3060,6 +3071,9 @@ fn execute_stmt(
                     header,
                     rows: vec![columns],
                     sent: 0,
+                    // A constant `SELECT` is computed without touching storage, so
+                    // there is no scan to report.
+                    stats: None,
                 });
             }
             match run_query(session, stmt, txn, principal, *session_time) {
@@ -3068,10 +3082,17 @@ fn execute_stmt(
                         sqlstate: SQLSTATE_INTERNAL_ERROR,
                         message: e.to_string(),
                     })?;
+                    let header = result_header(&result);
                     Ok(Executed::Rows {
-                        header: result_header(&result),
+                        header,
                         rows,
                         sent: 0,
+                        // Carry the engine's scan accounting onto the portal so a
+                        // later `Execute` can emit the opt-in footer ([STL-319]).
+                        // `None` for the read paths the engine leaves unscored (a
+                        // join over a materialized CTE side, etc.), mirroring the
+                        // simple-query trailer's suppression.
+                        stats: result.stats,
                     })
                 }
                 Ok(StatementOutcome::Dml(summary)) => Ok(Executed::Completed {
@@ -3411,6 +3432,10 @@ async fn handle_describe_portal<S: Wire>(
 /// issuing `Describe` on the statement or portal first (every mainstream driver
 /// does); re-sending the row description on Execute would be a duplicate the
 /// Describe-then-Execute flow does not expect.
+// `stats_enabled` joins the already-threaded session/txn/principal/time context so
+// the opt-in query-stats trailer ([STL-319]) can fire here; one over clippy's arg
+// cap, localized like the simple-query handler above.
+#[allow(clippy::too_many_arguments)]
 async fn handle_execute<S: Wire>(
     stream: &mut S,
     state: &mut ConnState,
@@ -3418,6 +3443,7 @@ async fn handle_execute<S: Wire>(
     session: &SharedSession,
     txn: &mut ConnTxn,
     principal: &Principal,
+    stats_enabled: bool,
     session_time: &mut SessionTime,
 ) -> Result<(), WireError> {
     let Some(msg) = extended::parse_execute(payload) else {
@@ -3500,7 +3526,9 @@ async fn handle_execute<S: Wire>(
     // cached `executed` rows; clone them so the streaming borrow below is clean.
     let formats = entry.result_formats.clone();
     match entry.executed.as_mut().expect("executed cached") {
-        Executed::Rows { rows, sent, .. } => {
+        Executed::Rows {
+            rows, sent, stats, ..
+        } => {
             let remaining = rows.len() - *sent;
             // `max_rows <= 0` means "every remaining row"; a positive cap is
             // clamped to what is left.
@@ -3518,8 +3546,22 @@ async fn handle_execute<S: Wire>(
             }
             *sent = end;
             if *sent < rows.len() {
+                // A row-capped Execute stops short with rows still to come; the
+                // footer waits for the Execute that drains the last row (the ticket
+                // is explicit: never on a `PortalSuspended` partial fetch).
                 write_portal_suspended(stream).await?;
             } else {
+                // The opt-in "see the engine" query-stats trailer ([STL-201]) on the
+                // extended-query path ([STL-319]): a `NoticeResponse` carrying the
+                // read's scan accounting, after the final `DataRow` and before
+                // `CommandComplete` — exactly as `run_statement` emits it on the
+                // simple-query path. `.take()` fires it once: a re-`Execute` of the
+                // drained portal finds `None`. Suppressed when the client did not
+                // opt in or the read ran no scan (a synthetic / constant result).
+                if stats_enabled && let Some(stats) = stats.take() {
+                    let notice = stats.to_notice();
+                    write_notice_response(stream, "NOTICE", SQLSTATE_SUCCESS, &notice).await?;
+                }
                 let n = u64::try_from(take).unwrap_or(u64::MAX);
                 write_command_complete(stream, &CommandTag::Select(n)).await?;
             }

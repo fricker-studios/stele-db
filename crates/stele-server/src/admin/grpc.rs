@@ -13,6 +13,7 @@ use std::io;
 use std::sync::Arc;
 
 use stele_common::time::Clock;
+use stele_pgwire::TlsReloader;
 use stele_storage::backend::Disk;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -26,9 +27,9 @@ use crate::tls::AcceptorSource;
 use super::proto::admin_service_server::{AdminService as AdminServiceRpc, AdminServiceServer};
 use super::proto::{
     AuditChainRequest, BackupRequest, BackupResponse, Cell, Column, HealthRequest, HealthResponse,
-    ManifestSummary as ProtoManifest, RestorePlanRequest, RestorePlanResponse, Row,
-    SegmentsRequest, StatusRequest, StatusResponse, TableResponse, TableStatus as ProtoTableStatus,
-    VersionsRequest, health_response::ServingStatus,
+    ManifestSummary as ProtoManifest, ReloadTlsRequest, ReloadTlsResponse, RestorePlanRequest,
+    RestorePlanResponse, Row, SegmentsRequest, StatusRequest, StatusResponse, TableResponse,
+    TableStatus as ProtoTableStatus, VersionsRequest, health_response::ServingStatus,
 };
 use super::{
     AdminAuth, AdminError, AdminService, ManifestSummary, RestorePlan, StatusReport, TableData,
@@ -39,6 +40,12 @@ use super::{
 pub struct GrpcAdmin<C: Clock + Clone, D: Disk + Clone> {
     core: AdminService<C, D>,
     auth: Arc<AdminAuth>,
+    /// The hot-reloadable `[tls]` material, when the server booted with it; `None`
+    /// for plaintext / loopback / self-signed-fallback boots, where `ReloadTls`
+    /// answers `FAILED_PRECONDITION` ([STL-326]).
+    ///
+    /// [STL-326]: https://allegromusic.atlassian.net/browse/STL-326
+    tls_reloader: Option<TlsReloader>,
 }
 
 impl<C, D> GrpcAdmin<C, D>
@@ -49,7 +56,21 @@ where
     /// Wrap the shared core + authenticator.
     #[must_use]
     pub const fn new(core: AdminService<C, D>, auth: Arc<AdminAuth>) -> Self {
-        Self { core, auth }
+        Self {
+            core,
+            auth,
+            tls_reloader: None,
+        }
+    }
+
+    /// Install the hot-reloadable `[tls]` material so `ReloadTls` rotates the
+    /// certificate without a restart ([STL-326]); without it the RPC reports the
+    /// surface has nothing to reload. Mirrors
+    /// [`PgServer::with_tls_reloader`](stele_pgwire::Server::with_tls_reloader).
+    #[must_use]
+    pub fn with_tls_reloader(mut self, reloader: &TlsReloader) -> Self {
+        self.tls_reloader = Some(reloader.clone());
+        self
     }
 
     /// Reject the request unless it carries a valid `authorization: Bearer …`
@@ -184,6 +205,7 @@ fn to_status(err: AdminError) -> Status {
     match err {
         AdminError::NotFound(m) => Status::not_found(m),
         AdminError::InvalidArgument(m) => Status::invalid_argument(m),
+        AdminError::FailedPrecondition(m) => Status::failed_precondition(m),
         AdminError::Internal(m) => Status::internal(m),
     }
 }
@@ -292,6 +314,23 @@ where
         .await?
         .map_err(to_status)?;
         Ok(Response::new(table_to_proto(data)))
+    }
+
+    async fn reload_tls(
+        &self,
+        request: Request<ReloadTlsRequest>,
+    ) -> Result<Response<ReloadTlsResponse>, Status> {
+        self.authenticate(&request)?;
+        // `reload()` does blocking file I/O + rustls config building, so run it off
+        // the gRPC reactor — exactly as the SIGHUP path runs it off the async
+        // worker. A `JoinError` means the blocking task panicked; `reload_tls`
+        // returns its errors and never panics, so that is a genuine INTERNAL.
+        let reloader = self.tls_reloader.clone();
+        let cert_path = tokio::task::spawn_blocking(move || super::reload_tls(reloader.as_ref()))
+            .await
+            .map_err(|e| Status::internal(format!("admin task failed: {e}")))?
+            .map_err(to_status)?;
+        Ok(Response::new(ReloadTlsResponse { cert_path }))
     }
 }
 

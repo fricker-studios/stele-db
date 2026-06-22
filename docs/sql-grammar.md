@@ -138,16 +138,64 @@ This is the row shape STL-199's `\history` consumes. A provenance pseudo-column
 ([STL-247]) over a range read is a tracked follow-up — rejected at bind for now,
 not silently dropped.
 
-**v0.3 scope.** A range scan binds as a plain single base-table read with a
-`WHERE` predicate. Each of these is rejected at bind time (a tracked follow-up,
-never a silently-dropped clause): the **valid axis** (`FOR VALID_TIME FROM…` — the
-valid axis can carry many overlapping versions per key, a distinct resolution
-problem); combining a range with an `AS OF` point qualifier; a `JOIN`, aggregate /
+**v0.3 scope.** A system range binds as a plain single base-table read with a
+`WHERE` predicate. (The **valid axis** is the parallel form below
+([STL-328](#for-valid_time--from-a-to-b--between-a-and-b---valid-time-range-scans-stl-328)),
+which relaxes the `AS OF` rule.) Each of these is rejected at bind time for a
+*system* range (a tracked follow-up, never a silently-dropped clause): combining a
+system range with **any** `AS OF` point qualifier; a `JOIN`, aggregate /
 `GROUP BY`, `DISTINCT` / `ORDER BY` / `LIMIT` / `OFFSET`, subquery or
 period-predicate `WHERE`, or a CTE / derived-table source; and `FOR SYSTEM_TIME
 ALL` (the trivially-full range). A range scan reads the committed snapshot only —
 the read-your-own-writes overlay is not applied to it (unlike a point read or a
-join, [STL-325]) — and is exempt from the simple-query default row cap ([below](#default-row-cap-on-the-simple-query-path-stl-306)).
+join, [STL-325]) — and is exempt from the simple-query default row cap
+([below](#default-row-cap-on-the-simple-query-path-stl-306)).
+
+### `FOR VALID_TIME { FROM a TO b | BETWEEN a AND b }` — valid-time range scans (STL-328)
+
+```sql
+-- Every version whose valid interval overlaps the business window [a, b),
+-- as understood at the current system time:
+SELECT * FROM booking FOR VALID_TIME FROM 1700000000000000 TO 1700003600000000;
+-- Pinned to a past system snapshot — the history over a valid window *as we
+-- believed it as of* a past instant (`v(k, S_past, V_range)`):
+SELECT id, room FROM booking
+  FOR SYSTEM_TIME AS OF 1699990000000000 FOR VALID_TIME BETWEEN 1700000000000000 AND 1700003600000000
+  WHERE id = 1;
+```
+
+The valid-axis mirror of the system range above ([STL-244](#for-system_time--from-a-to-b--between-a-and-b---temporal-range-scans-stl-244)),
+bound into `BoundSelect::valid_range`. Where the system range ranges over the
+*recording* axis at every system instant, the valid range fixes **one** system
+snapshot (now, or a `FOR SYSTEM_TIME AS OF` pin) and returns every version
+system-live there whose valid interval `[valid_from, valid_to)` *overlaps* the
+window — "our current (or as-of-past) understanding of the business history over
+`[a, b)`". Requires a valid-time table (`ValidTimeUnsupported` otherwise).
+
+**Half-open vs closed** is identical to the system axis — same `<`/`≤` upper-bound
+contract, same empty/reversed bind error — applied to the version's
+`[valid_from, valid_to)`:
+
+| Spelling | Query range | A version `[vf, vt)` is returned iff |
+|---|---|---|
+| `FROM a TO b` | `[a, b)` (half-open) | `vf < vt` and `vt > a` and `vf < b` |
+| `BETWEEN a AND b` | `[a, b]` (closed) | `vf < vt` and `vt > a` and `vf ≤ b` |
+
+**Output shape.** A valid range appends the period endpoints **`valid_from`** and
+**`valid_to`** (both `TIMESTAMPTZ`) after the projected columns — `SELECT *` is
+`[user columns…, valid_from, valid_to]`. `valid_to` is `NULL` for an open-ended
+("until changed", `+∞`) fact, mirroring how `sys_to` renders for an open system
+period.
+
+**As-of composition.** A `FOR SYSTEM_TIME AS OF s` pin is *allowed* with a valid
+range — it fixes the system snapshot the valid history is read at (the cross-axis
+`v(k, S, V_range)`, the range-extension of the both-axes point read). A
+`FOR VALID_TIME AS OF` is rejected (a point and a range on the *same* axis), as is
+every shaping / aggregate / subquery / `JOIN` / CTE clause the system range
+rejects. The correctness oracle (`crates/stele-engine/tests/valid_range_oracle.rs`,
+[docs/06 §4](06-testing-strategy.md#4-correctness-oracles-the-temporal-heart))
+sweeps a bitemporal workload across both axes and the flush/seal boundary against a
+reference model, with the same off-by-one teeth check.
 
 ### `SET stele.{system,valid}_time` — session time context (STL-246)
 

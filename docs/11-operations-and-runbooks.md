@@ -149,7 +149,7 @@ flowchart LR
 | **Storage cost spiking** | Tiering misconfigured / hot data not aging down. | Review [tiering policy](adr/0021-storage-lifecycle-tiered-archival.md) + tier mix; verify time-era compaction is running. |
 | **Boot warns: "generated an ephemeral self-signed certificate"** | Secure-defaults posture ([10 §4](10-security-and-compliance.md#4-data-protection--encryption), STL-304): a non-dev server without `[tls]` on a non-loopback bind encrypts with a generated cert (rather than refusing to boot or serving plaintext) — but the cert is unauthenticated and regenerated each restart. | Configure `[tls]` in `stele.toml` with a **CA-issued** `cert`/`key` (see [`stele.example.toml`](../stele.example.toml)) so clients can verify the server and the cert survives restarts. Don't ship the self-signed fallback to production, and don't "fix" it by running `--dev`. |
 | **Clients failing with `FATAL 28000: connection requires TLS`** | `[tls] mode = "required"` and the client connected plaintext. | Point the client at TLS (`sslmode=require`/`verify-full`, `stele shell --tls require`); for a migration window set `mode = "optional"` (the boot log warns while it's on). |
-| **TLS clients failing after a certificate change** | Expired/rotated cert; key/cert mismatch. | Check expiry (`openssl x509 -enddate -noout -in server.crt`); fix the cert/key pair in place, then **hot-reload without dropping connections**: `kill -HUP $(pgrep stele-server)` (STL-293). New connections present the rotated cert; in-flight sessions keep the one they handshook with. A bad pair (torn write, non-PEM, mismatch) is rejected and the previous cert keeps serving — the listener never drops — and the failure is logged (`TLS reload failed; keeping the certificate already in use`). The cert/key paths are fixed; point `[tls]` at a stable path your rotator writes through (cert-manager / certbot deploy hook → `kill -HUP`). mTLS rejects also mean a client cert no longer chains to `client_ca`. |
+| **TLS clients failing after a certificate change** | Expired/rotated cert; key/cert mismatch. | Check expiry (`openssl x509 -enddate -noout -in server.crt`); fix the cert/key pair in place, then **hot-reload without dropping connections**. On Unix: `kill -HUP $(pgrep stele-server)` (STL-293). Cross-platform (Windows has no SIGHUP) or for programmatic control: fire the same reload over the admin API — `POST /v1alpha1/reload-tls` (or the `ReloadTls` gRPC), token-authenticated (STL-326). New connections present the rotated cert; in-flight sessions keep the one they handshook with. A bad pair (torn write, non-PEM, mismatch) is rejected and the previous cert keeps serving — the listener never drops — and the failure is logged (`TLS reload failed; keeping the certificate already in use`) and returned to the API caller (HTTP `500`). The cert/key paths are fixed; point `[tls]` at a stable path your rotator writes through (cert-manager / certbot deploy hook → `kill -HUP` or `POST /v1alpha1/reload-tls`). mTLS rejects also mean a client cert no longer chains to `client_ca`. |
 
 > Recurring rule across all rows: **diagnose with time-travel, remediate without mutating history.** The engine's own primitives are the best forensic tools.
 
@@ -263,7 +263,9 @@ metadata. Tokens are **never logged**.
 > configured, **both** transports serve over TLS with that one certificate: the
 > gRPC listener and the HTTPS `/v1alpha1` gateway (and, because they share the
 > port, the metrics/probe endpoints), including the optional `client_ca` mTLS and
-> SIGHUP hot-reload. Without `[tls]`, the same secure-defaults posture as pg-wire
+> certificate hot-reload (SIGHUP on Unix, or the cross-platform `ReloadTls` /
+> `POST /v1alpha1/reload-tls` trigger — STL-326). Without `[tls]`, the same
+> secure-defaults posture as pg-wire
 > applies: a non-loopback admin bind mints an **ephemeral self-signed**
 > certificate (STL-304 — encrypted but unauthenticated; replace it with a
 > CA-issued cert) rather than serving tokens in cleartext, a loopback-only bind
@@ -283,12 +285,15 @@ metadata. Tokens are **never logged**.
 | `Segments` | `POST /v1alpha1/segments` | `{"table":"…"}` | per-segment + zone-map rows |
 | `Versions` | `POST /v1alpha1/versions` | `{"table":"…","key":"…"?}` | per-version history; `key` is a SQL literal (`42`, `'alice'`) |
 | `AuditChain` | `POST /v1alpha1/audit-chain` | `{"table":"…","key":"…"?}` | commit hash-chain links + an intact/broken verdict |
+| `ReloadTls` | `POST /v1alpha1/reload-tls` | — | `{"reloaded":true,"cert_path":"…"}` — reload the `[tls]` cert/key without a restart, cross-platform (STL-326) |
 
 Tabular replies (`Segments`/`Versions`/`AuditChain`) carry `columns` (`name` +
 type) and `rows` of text cells (`null` for SQL `NULL`), rendered identically to the
 SQL wire. HTTP error mapping: `400` invalid argument, `401` missing/invalid token,
-`404` unknown table/endpoint, `500` engine error (gRPC `INVALID_ARGUMENT` /
-`UNAUTHENTICATED` / `NOT_FOUND` / `INTERNAL`).
+`404` unknown table/endpoint, `409` precondition failed (e.g. `reload-tls` on a
+server with no reloadable `[tls]`), `500` engine error or a failed reload — the
+live cert keeps serving (gRPC `INVALID_ARGUMENT` / `UNAUTHENTICATED` / `NOT_FOUND`
+/ `FAILED_PRECONDITION` / `INTERNAL`).
 
 ### 9.3 Examples
 
@@ -306,6 +311,11 @@ curl -fsS -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' 
   -d '{"path":"/srv/backups/stele-2026-06-14"}' http://localhost:9090/v1alpha1/backup
 curl -fsS -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"path":"/srv/backups/stele-2026-06-14"}' http://localhost:9090/v1alpha1/restore-plan
+
+# Reload the [tls] cert/key in place without a restart — the cross-platform trigger
+# (Windows has no SIGHUP). Stage the new pair at the configured [tls] paths first;
+# a bad pair is refused and the live cert keeps serving (the call returns 500).
+curl -fsS -X POST -H "Authorization: Bearer $TOKEN" http://localhost:9090/v1alpha1/reload-tls
 ```
 
 The `Backup`/`RestorePlan` pair is the API face of [§5 backup & restore](#5-backup--restore):
