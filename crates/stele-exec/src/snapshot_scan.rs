@@ -646,6 +646,32 @@ impl ScanStats {
             + self.segments_pruned_valid
     }
 
+    /// Sum two scans' accounting into one — the per-query total for a read that
+    /// runs more than one scan, e.g. a two-table join's two side scans
+    /// ([STL-318]). Every field is an additive count, so the partitioning
+    /// invariants hold for the sum just as they do each operand
+    /// (`segments_scanned + segments_pruned == segments_total`, and likewise on
+    /// the row-group axis) — the footer then reports the read's whole storage
+    /// cost across both inputs.
+    ///
+    /// [STL-318]: https://allegromusic.atlassian.net/browse/STL-318
+    #[must_use]
+    pub const fn combine(self, other: Self) -> Self {
+        Self {
+            segments_total: self.segments_total + other.segments_total,
+            segments_pruned_zone: self.segments_pruned_zone + other.segments_pruned_zone,
+            segments_pruned_bloom: self.segments_pruned_bloom + other.segments_pruned_bloom,
+            segments_pruned_superseded: self.segments_pruned_superseded
+                + other.segments_pruned_superseded,
+            segments_pruned_valid: self.segments_pruned_valid + other.segments_pruned_valid,
+            segments_scanned: self.segments_scanned + other.segments_scanned,
+            row_groups_total: self.row_groups_total + other.row_groups_total,
+            row_groups_pruned_zone: self.row_groups_pruned_zone + other.row_groups_pruned_zone,
+            row_groups_pruned_valid: self.row_groups_pruned_valid + other.row_groups_pruned_valid,
+            row_groups_scanned: self.row_groups_scanned + other.row_groups_scanned,
+        }
+    }
+
     /// Add this run's accounting into the process-wide scan counters
     /// ([STL-253]).
     ///
@@ -2006,6 +2032,62 @@ fn key_in_bounds(key: &BusinessKey, bounds: &(Bound<BusinessKey>, Bound<Business
         Bound::Excluded(high) => key < high,
     };
     above_low && below_high
+}
+
+#[cfg(test)]
+mod scan_stats_tests {
+    use super::ScanStats;
+
+    #[test]
+    fn combine_sums_every_field_and_keeps_the_partitions_consistent() {
+        // Two side scans of a join: a fully-scanned side and a partly-pruned one.
+        let left = ScanStats {
+            segments_total: 2,
+            segments_scanned: 2,
+            row_groups_total: 3,
+            row_groups_scanned: 3,
+            ..ScanStats::default()
+        };
+        let right = ScanStats {
+            segments_total: 5,
+            segments_pruned_zone: 1,
+            segments_pruned_bloom: 1,
+            segments_pruned_superseded: 1,
+            segments_pruned_valid: 1,
+            segments_scanned: 1,
+            row_groups_total: 4,
+            row_groups_pruned_zone: 1,
+            row_groups_pruned_valid: 1,
+            row_groups_scanned: 2,
+        };
+        let both = left.combine(right);
+
+        assert_eq!(both.segments_total, 7);
+        assert_eq!(both.segments_scanned, 3);
+        assert_eq!(both.segments_pruned(), 4);
+        assert_eq!(both.row_groups_total, 7);
+        assert_eq!(both.row_groups_scanned, 5);
+        // The summed counts still partition: scanned + pruned == total on both
+        // axes, so the footer's "X of Y" arithmetic stays coherent over a join.
+        assert_eq!(
+            both.segments_scanned + both.segments_pruned(),
+            both.segments_total,
+        );
+        assert_eq!(
+            both.row_groups_scanned + both.row_groups_pruned_zone + both.row_groups_pruned_valid,
+            both.row_groups_total,
+        );
+    }
+
+    #[test]
+    fn combine_with_default_is_identity() {
+        let s = ScanStats {
+            segments_total: 3,
+            segments_scanned: 3,
+            ..ScanStats::default()
+        };
+        assert_eq!(s.combine(ScanStats::default()), s);
+    }
 }
 
 #[cfg(test)]

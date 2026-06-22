@@ -319,18 +319,22 @@ pub struct SelectResult {
     /// which the wire layer renders as the length-`-1` `DataRow` sentinel.
     pub rows: Vec<Vec<Option<Vec<u8>>>>,
     /// Per-query execution accounting for the "see the engine" footer ([STL-201]),
-    /// folded from the scan's `ScanStats`. `Some` only for a read that ran the
-    /// committed-only snapshot-scan fast path (the common `SELECT`); `None` for a
-    /// read whose rows came another way — a read-your-own-writes overlay, a
-    /// provenance-pseudo-column read, a join, or a synthetic catalog/history
-    /// result — so the wire layer suppresses the footer rather than reporting a
-    /// scan that did not happen.
+    /// folded from the scan's `ScanStats`. `Some` for any read backed by a storage
+    /// scan: the committed-only fast path (the common `SELECT`), a
+    /// read-your-own-writes overlay or a provenance read (their unfiltered base
+    /// scan), and a join (both sides' scans summed, [STL-318]). `None` only when
+    /// there is no single scan to report — a synthetic catalog/history result, or a
+    /// join whose side is a materialized CTE / derived table — so the wire layer
+    /// suppresses the footer rather than reporting a scan that did not happen.
     pub stats: Option<QueryStats>,
 }
 
 /// A committed-only snapshot scan's reconstructed rows plus its pruning
-/// accounting ([`scan_rows`](SessionEngine::scan_rows)) — paired so the
-/// "see the engine" footer ([STL-201]) can report the scan that produced them.
+/// accounting — paired so the "see the engine" footer ([STL-201]) can report the
+/// scan that produced them. Returned by the fused fast path
+/// ([`scan_rows`](SessionEngine::scan_rows)) and by the unfiltered full scans an
+/// overlay / provenance read takes as its base
+/// ([`scan_all_rows`](SessionEngine::scan_all_rows), [STL-318]).
 struct ScannedRows {
     rows: Vec<Vec<Option<Vec<u8>>>>,
     stats: ScanStats,
@@ -1392,7 +1396,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             })?;
         let value_count = columns.len().saturating_sub(1);
         let mut index = IndexState::new(def.kind(), columns[position].ty(), floor);
-        for row in Self::scan_all_rows(state, floor, value_count, metrics)? {
+        // Index maintenance reads every row; the scan's pruning accounting is for
+        // the query footer ([STL-201]), irrelevant here, so the rows alone are taken.
+        for row in Self::scan_all_rows(state, floor, value_count, metrics)?.rows {
             let Some(key) = row.first().cloned().flatten() else {
                 continue; // a row always carries its key; nothing to note without one
             };
@@ -3365,26 +3371,25 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // business key like a system-only table, and a `FOR VALID_TIME AS OF` pin is
         // re-applied to the overlaid rows ([STL-223]).
         // The scan's pruning accounting ([`ScanStats`], STL-146), threaded up into
-        // the result for the "see the engine" footer ([STL-201]) — but only on the
-        // committed-only snapshot-scan fast path below. A read-your-own-writes
-        // overlay or a provenance read reconstructs its rows another way and has no
-        // single scan to account for, so it leaves this `None` and the footer is
-        // suppressed.
+        // the result for the "see the engine" footer ([STL-201]). Every branch now
+        // reports its scan: the committed-only fast path below its fused scan; a
+        // read-your-own-writes overlay and a provenance read their *base* scan — an
+        // unfiltered full scan (the `WHERE` is re-applied in the engine over the
+        // overlaid / widened rows), so the footer honestly shows the full scan those
+        // paths pay ([STL-318]).
         let (rows, scan_stats) = if overlay.iter().any(|d| d.table() == table) {
-            (
-                Self::overlaid_rows(
-                    bound,
-                    state,
-                    &addressable,
-                    value_count,
-                    overlay,
-                    valid_cols,
-                    &plan,
-                    needs_provenance,
-                    &self.metrics,
-                )?,
-                None,
-            )
+            let (rows, stats) = Self::overlaid_rows(
+                bound,
+                state,
+                &addressable,
+                value_count,
+                overlay,
+                valid_cols,
+                &plan,
+                needs_provenance,
+                &self.metrics,
+            )?;
+            (rows, Some(stats))
         } else if needs_provenance {
             // A provenance pseudo-column ([STL-247]) is referenced: materialize each
             // version's provenance after its value columns and filter over the
@@ -3399,7 +3404,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 value_count,
                 &self.metrics,
             )?;
-            (filter_rows(&plan, &addressable, base)?, None)
+            (
+                filter_rows(&plan, &addressable, base.rows)?,
+                Some(base.stats),
+            )
         } else {
             // Rule-based index use ([STL-233], ranges [STL-237]): an equality
             // or one-sided range comparison on an indexed value column probes
@@ -4141,7 +4149,18 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// makes with [`SnapshotScan::valid_as_of`] ([STL-164]) — before the `WHERE`.
     /// `valid_cols` is the `(from, to)` period-column positions, `None` for a
     /// system-only table (which never carries a valid pin).
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// The returned [`ScanStats`] is the **base scan's** accounting, reported as
+    /// the read's footer ([STL-318]): an unfiltered full scan (the `WHERE` is
+    /// applied in-engine after the overlay, never pushed down), so it honestly
+    /// shows every segment scanned and nothing pruned — the storage cost a
+    /// read-your-own-writes read actually pays. The buffered writes the overlay
+    /// adds are not a storage scan and so are not in this accounting; the footer's
+    /// row count is the post-overlay, post-filter total the caller folds in.
+    // The tuple is just `(overlaid+filtered rows, base-scan stats)`; it is *not* a
+    // `ScannedRows` (whose `rows` are a scan's own output, not overlaid ones), so
+    // the row-vec shape trips `type_complexity` here rather than being aliased.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn overlaid_rows(
         bound: &BoundSelect,
         state: &TableState<C, D>,
@@ -4152,7 +4171,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         plan: &FilterPlan,
         needs_provenance: bool,
         metrics: &SharedMetrics,
-    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+    ) -> Result<(Vec<Vec<Option<Vec<u8>>>>, ScanStats), EngineError> {
         // The valid-axis pin is applied *after* the overlay (`filter_overlaid_valid`
         // below), so the base scan leaves the valid axis open — `valid_snapshot` is
         // `None` here even on a `FOR VALID_TIME AS OF` read. When a provenance
@@ -4166,7 +4185,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             Self::scan_all_rows(state, bound.snapshot, value_count, metrics)?
         };
         let overlaid = overlay_table_writes(
-            base,
+            base.rows,
             overlay,
             bound.table.as_str(),
             value_count,
@@ -4191,7 +4210,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         } else {
             &addressable[..n_schema]
         };
-        filter_rows(plan, columns, pinned)
+        Ok((filter_rows(plan, columns, pinned)?, base.stats))
     }
 
     /// One join side's columns in the executor's columnar shape — a base table
@@ -4210,13 +4229,20 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// relation is in scope — e.g. `FROM (SELECT …) AS t JOIN t AS t2`, where the
     /// derived table aliased `t` must not shadow the base table `t` on the other
     /// side.
+    ///
+    /// The returned [`ScanStats`] is the side's storage-scan accounting for the
+    /// join footer ([STL-318]) — `Some` for a base-table scan, `None` for a
+    /// materialized relation, whose storage reads happened (and were accounted)
+    /// when it was materialized ([`materialize_cte`](Self::materialize_cte)), not
+    /// here. A join with a materialized side therefore carries no single
+    /// accounting and suppresses the footer.
     fn join_side_columns(
         &self,
         side: &BoundJoinSide,
         snapshot: SystemTimeMicros,
         valid_snapshot: Option<SystemTimeMicros>,
         scope: &CteScope,
-    ) -> Result<Vec<Column>, EngineError> {
+    ) -> Result<(Vec<Column>, Option<ScanStats>), EngineError> {
         if side.schema_id == SchemaId(0) {
             // A materialized relation (CTE / derived table) is system-only, so it
             // carries no valid axis; the binder rejects a `FOR VALID_TIME AS OF`
@@ -4225,14 +4251,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             let relation = scope
                 .get(side.table.as_str())
                 .ok_or_else(|| EngineError::UnknownTable(side.table.clone()))?;
-            return Ok(materialized_columns(relation, side.columns.len()));
+            return Ok((materialized_columns(relation, side.columns.len()), None));
         }
         let state = self
             .tables
             .get(&side.table)
             .ok_or_else(|| EngineError::UnknownTable(side.table.clone()))?;
         let value_count = side.columns.len().saturating_sub(1);
-        Self::scan_all_columns(state, snapshot, valid_snapshot, value_count)
+        let (columns, stats) =
+            Self::scan_all_columns(state, snapshot, valid_snapshot, value_count)?;
+        Ok((columns, Some(stats)))
     }
 
     /// Run a bound two-table `JOIN` ([STL-172], [STL-264]).
@@ -4257,6 +4285,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// binder's `JoinScope`, STL-264) — so the join composes with the rest of the
     /// SELECT surface. The read-your-own-writes overlay is not threaded through the
     /// join path (a single-table feature, [STL-203]).
+    ///
+    /// The "see the engine" footer ([STL-201]) reports both sides' scan accounting
+    /// summed ([`ScanStats::combine`], STL-318) over the join's returned row count —
+    /// unless a side is a materialized CTE / derived table, which was accounted at
+    /// materialization, not here, so the join then carries no single accounting and
+    /// the footer is suppressed.
     fn run_join(
         &self,
         bound: &BoundSelect,
@@ -4274,10 +4308,22 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // ([STL-242]) — both yield the same shared-`Cells` columnar shape the join
         // consumes. Both sides resolve at the *same* pins, so the result is a
         // consistent snapshot across every input (docs/16 §8).
-        let left_cols = self.join_side_columns(&join.left, snapshot, valid_snapshot, scope)?;
-        let right_cols = self.join_side_columns(&join.right, snapshot, valid_snapshot, scope)?;
+        let (left_cols, left_stats) =
+            self.join_side_columns(&join.left, snapshot, valid_snapshot, scope)?;
+        let (right_cols, right_stats) =
+            self.join_side_columns(&join.right, snapshot, valid_snapshot, scope)?;
         let left_rows = left_cols[0].len();
         let right_rows = right_cols[0].len();
+
+        // The join's footer accounting ([STL-318]): both sides' scans summed — but
+        // only when both are base-table scans. A materialized side (CTE / derived
+        // table) was scanned and accounted when it was materialized, not here, so it
+        // contributes `None`; a join with such a side has no single accounting and
+        // suppresses the footer rather than under-report half the read.
+        let join_stats = match (left_stats, right_stats) {
+            (Some(l), Some(r)) => Some(l.combine(r)),
+            _ => None,
+        };
 
         // Decode only the join-key column of each side into a typed vector; every
         // other column stays opaque bytes (gathered by index below), so a column
@@ -4338,14 +4384,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let rows = filter_rows(&plan, &addressable, rows)?;
 
         if let Some(agg) = &bound.aggregate {
-            // A join reads two scans; per-query stats over a join is a follow-up
-            // ([STL-318]), so the footer is suppressed (the aggregate sets it `None`).
-            return Ok(StatementOutcome::Rows(run_aggregate(
-                bound,
-                agg,
-                &addressable,
-                &rows,
-            )?));
+            // A join reads two scans; the footer reports their summed accounting
+            // ([STL-318]) over the rows the aggregate *returned* (its grouped
+            // output), mirroring the single-table aggregate path ([`finish_select`]).
+            let mut result = run_aggregate(bound, agg, &addressable, &rows)?;
+            result.stats = join_stats.map(|s| query_stats(&s, result.rows.len(), snapshot));
+            return Ok(StatementOutcome::Rows(result));
         }
 
         // The projection: the output columns, by addressable index. `DISTINCT` /
@@ -4357,31 +4401,32 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .iter()
             .map(|&r| projection.iter().map(|&i| rows[r][i].clone()).collect())
             .collect();
+        // Both sides' scan accounting summed ([STL-318]), over the join's returned
+        // row count; `None` (footer suppressed) if a side was a materialized relation.
+        let stats = join_stats.map(|s| query_stats(&s, out_rows.len(), snapshot));
         Ok(StatementOutcome::Rows(SelectResult {
             columns: join.columns.clone(),
             rows: out_rows,
-            // A join reads two scans; per-query accounting over a join is a
-            // follow-up ([STL-318]), so the footer is suppressed for now.
-            stats: None,
+            stats,
         }))
     }
 
-    /// Scan a table's reconstructed rows at `snapshot`, unfiltered — the join's
-    /// per-side input ([STL-172]).
+    /// Scan a table's reconstructed rows at `snapshot`, unfiltered — the base a
+    /// read-your-own-writes overlay ([`overlaid_rows`](Self::overlaid_rows)) and
+    /// index maintenance ([`build_index_state`](Self::build_index_state)) read over.
     ///
     /// The same `ScanSource → ExplodePayload` pipeline [`scan_rows`](Self::scan_rows)
-    /// runs, minus the `WHERE` filter and a valid-axis *pin* (a join carries no
-    /// per-side predicate or `FOR VALID_TIME AS OF` at v0.2), so each row comes
-    /// back as its full `[business key, value cells…]` canonical bytes. The
-    /// table's valid-time policy is still declared so a valid-time side's delta
-    /// frame is stripped ([STL-218]); full sequenced temporal joins (intersecting
-    /// both axes) stay deferred to [STL-172].
+    /// runs, minus the `WHERE` filter and a valid-axis *pin*, so each row comes back
+    /// as its full `[business key, value cells…]` canonical bytes, paired with the
+    /// scan's [`ScanStats`] ([STL-318]) — an unfiltered full scan, so it reports
+    /// every segment scanned. The table's valid-time policy is still declared so a
+    /// valid-time table's delta frame is stripped ([STL-218]).
     fn scan_all_rows(
         state: &TableState<C, D>,
         snapshot: SystemTimeMicros,
         value_count: usize,
         metrics: &SharedMetrics,
-    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+    ) -> Result<ScannedRows, EngineError> {
         let readers = state.engine.open_segment_readers()?;
         let scan = SnapshotScan::new(
             state.engine.delta(),
@@ -4402,7 +4447,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 rows.push((0..ncols).map(|i| batch_cell(&batch, i, r)).collect());
             }
         }
-        Ok(rows)
+        // The scan's pruning accounting ([`ScanStats`], STL-146) bubbles up through
+        // `ExplodePayload` from the `ScanSource` ([`Operator::stats`], STL-201) —
+        // an unfiltered full scan here, so it reports every segment scanned. The
+        // first `next` above resolved it; the default guards the un-resolved case
+        // rather than panicking. The overlay / provenance read paths report it as
+        // their base scan ([STL-318]); index maintenance ignores it.
+        let stats = exploded.stats().unwrap_or_default();
+        Ok(ScannedRows { rows, stats })
     }
 
     /// Scan a table's reconstructed rows at `snapshot`, **with provenance** — each
@@ -4431,7 +4483,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         valid_snapshot: Option<SystemTimeMicros>,
         value_count: usize,
         metrics: &SharedMetrics,
-    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+    ) -> Result<ScannedRows, EngineError> {
         let readers = state.engine.open_segment_readers()?;
         let mut scan = SnapshotScan::new(
             state.engine.delta(),
@@ -4463,7 +4515,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 rows.push((0..ncols).map(|i| batch_cell(&batch, i, r)).collect());
             }
         }
-        Ok(rows)
+        // Carry the scan's pruning accounting up for the footer ([STL-201],
+        // STL-318): an unfiltered full scan (the `WHERE` is re-applied in the
+        // engine over the widened rows), so it reports every segment scanned.
+        let stats = exploded.stats().unwrap_or_default();
+        Ok(ScannedRows { rows, stats })
     }
 
     /// Scan a table's reconstructed rows at `snapshot` into **columns** — the join's
@@ -4493,7 +4549,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         snapshot: SystemTimeMicros,
         valid_snapshot: Option<SystemTimeMicros>,
         value_count: usize,
-    ) -> Result<Vec<Column>, EngineError> {
+    ) -> Result<(Vec<Column>, ScanStats), EngineError> {
         let readers = state.engine.open_segment_readers()?;
         let mut scan = SnapshotScan::new(
             state.engine.delta(),
@@ -4519,24 +4575,31 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // the shape explicit so a column read below never has to honor a selection.
             batches.push(batch.into_dense());
         }
+        // This side's pruning accounting ([`ScanStats`], STL-146), to be summed
+        // with the other side's for the join footer ([STL-318]). Captured before the
+        // returns below — a zero-row side still resolved the scan on the first
+        // `next`, so its (all-zero / delta-only) accounting is real, not the default.
+        let stats = exploded.stats().unwrap_or_default();
 
         // No rows: `ncols` empty columns the join scans as a zero-height side.
         if batches.is_empty() {
-            return Ok((0..ncols)
+            let empty = (0..ncols)
                 .map(|_| Column::Bytes(Vec::new().into()))
-                .collect());
+                .collect();
+            return Ok((empty, stats));
         }
         // One batch: its columns are already the shared buffers — hand them back
         // untouched (zero-copy), dropping the per-column `ColumnId` tag the join
         // addresses positionally.
         if batches.len() == 1 {
-            return Ok(batches
+            let columns = batches
                 .pop()
                 .expect("one batch")
                 .columns
                 .into_iter()
                 .map(|(_, col)| col)
-                .collect());
+                .collect();
+            return Ok((columns, stats));
         }
         // Several batches: concatenate each column's cells into one buffer.
         let mut columns: Vec<Vec<Option<Vec<u8>>>> = (0..ncols).map(|_| Vec::new()).collect();
@@ -4550,10 +4613,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 }
             }
         }
-        Ok(columns
+        let columns = columns
             .into_iter()
             .map(|cells| Column::Bytes(cells.into()))
-            .collect())
+            .collect();
+        Ok((columns, stats))
     }
 
     /// Apply a bound DML statement to the table's tiers under fresh provenance,
