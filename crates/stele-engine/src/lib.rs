@@ -79,7 +79,7 @@ use stele_common::time::{
 use stele_common::types::{LogicalType, ScalarValue};
 use stele_exec::{
     AggregateFunc as ExecAggregateFunc, Aggregator, ArithOp as ExecArithOp, Batch, CmpOp, Column,
-    DEFAULT_BATCH_SIZE, ExplodePayload, Expr, ExprError, Filter, GatheredColumns,
+    DEFAULT_BATCH_SIZE, ExplodePayload, Expr, ExprError, Filter, GatheredColumns, JoinIndices,
     JoinType as ExecJoinType, LogicOp, Operator, ScanError, ScanSource, ScanStats, SnapshotScan,
     SortKey, Vector, distinct_selection, eval_expr, evaluate, hash_aggregate, hash_join,
     limit_selection, sort_selection,
@@ -89,11 +89,11 @@ use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::dml::{BoundDml, DmlError, InsertRow};
 use stele_sql::merge::{BoundMerge, MergeBound, MergeSource, MergeValid, MergeValue};
 use stele_sql::select::{
-    AggregateFunc, ArithOp, BoundAggregate, BoundCte, BoundHaving, BoundJoinSide, BoundPeriod,
-    BoundPeriodPredicate, BoundPredicate, BoundScalar, BoundSelect, BoundSubqueryFilter, CompareOp,
-    Correlation, HavingScalar, JoinType, OutputItem, PeriodEndpoint, Projection, ProjectionItem,
-    ProjectionValue, SelectError, SemiAntiDecorrelation, SortTarget, SubqueryKind, SystemTimeRange,
-    ValidTimeRange,
+    AggregateFunc, ArithOp, BoundAggregate, BoundCte, BoundHaving, BoundJoinSide, BoundJoinStep,
+    BoundPeriod, BoundPeriodPredicate, BoundPredicate, BoundScalar, BoundSelect,
+    BoundSubqueryFilter, CompareOp, Correlation, HavingScalar, JoinType, OutputItem,
+    PeriodEndpoint, Projection, ProjectionItem, ProjectionValue, SelectError,
+    SemiAntiDecorrelation, SortTarget, SubqueryKind, SystemTimeRange, ValidTimeRange,
 };
 use stele_sql::{
     AdminCommand, BindContext, BindError, BoundCopy, CopyError, CopyShape, Statement,
@@ -4545,20 +4545,25 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         Ok((columns, Some(stats)))
     }
 
-    /// Run a bound two-table `JOIN` ([STL-172], [STL-264]).
+    /// Run a bound `JOIN` — a two-table join ([STL-172], [STL-264]) or an N-way
+    /// left-deep chain ([STL-323]).
     ///
-    /// Both sides are scanned at the one statement `(sys, valid)` pin ([STL-243];
-    /// `AS OF` on either axis threads through here, every input read at the *same*
-    /// point — docs/16 §8) into the executor's columnar shape
+    /// The leftmost input is scanned at the one statement `(sys, valid)` pin
+    /// ([STL-243]; `AS OF` on either axis threads through here, every input read at
+    /// the *same* point — docs/16 §8) into the executor's columnar shape
     /// ([`scan_all_columns`](Self::scan_all_columns)) — shared
-    /// [`Cells`](stele_exec::Cells) buffers, not a row-major copy; the join key
-    /// column of each side is decoded into a typed [`Vector`] and handed to the
-    /// [`hash_join`] operator, which returns the surviving rows as input-row
-    /// indices. A zero-copy [`GatheredColumns`] view per side ([STL-224]) then
-    /// materializes the join's **addressable output** — every kept column (the
-    /// left's, then the right's for an `INNER` / `LEFT` join; a `LEFT` join's
-    /// unmatched row draws `NULL` for every right column), `SEMI` / `ANTI` keeping
-    /// the left alone.
+    /// [`Cells`](stele_exec::Cells) buffers, not a row-major copy. The chain then
+    /// folds **left-deep** ([`join_step`](Self::join_step)): each step scans its
+    /// right input, decodes the two join-key columns into typed [`Vector`]s, and
+    /// hands them to the [`hash_join`] operator, which returns the surviving rows as
+    /// input-row indices. A zero-copy [`GatheredColumns`] view ([STL-224])
+    /// materializes the step's **addressable output** — the accumulated columns,
+    /// then the right's for an `INNER` / `LEFT` join (a `LEFT` join's unmatched row
+    /// draws `NULL` for every right column), `SEMI` / `ANTI` keeping the accumulated
+    /// left alone. Intermediate steps stay columnar (the next step joins their
+    /// gathered buffers); the final step materializes row-major for the shaping
+    /// tail. A two-table join is the one-step chain, so its hot path is unchanged —
+    /// the intermediate loop is empty and the single step materializes directly.
     ///
     /// The `WHERE` / aggregate / `DISTINCT` / `ORDER BY` / `OFFSET` / `LIMIT` tail
     /// then runs over those rows through the **same** shared helpers a single-table
@@ -4568,9 +4573,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// SELECT surface. The read-your-own-writes overlay is not threaded through the
     /// join path (a single-table feature, [STL-203]).
     ///
-    /// The "see the engine" footer ([STL-201]) reports both sides' scan accounting
+    /// The "see the engine" footer ([STL-201]) reports every input's scan accounting
     /// summed ([`ScanStats::combine`], STL-318) over the join's returned row count —
-    /// unless a side is a materialized CTE / derived table, which was accounted at
+    /// unless any input is a materialized CTE / derived table, which was accounted at
     /// materialization, not here, so the join then carries no single accounting and
     /// the footer is suppressed.
     fn run_join(
@@ -4585,55 +4590,58 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let snapshot = bound.snapshot;
         let valid_snapshot = bound.valid_snapshot;
 
-        // Each side is a base table scanned at the one statement `(sys, valid)` pin
-        // ([STL-243]), or a materialized CTE / derived table read from the scope
-        // ([STL-242]) — both yield the same shared-`Cells` columnar shape the join
-        // consumes. Both sides resolve at the *same* pins, so the result is a
-        // consistent snapshot across every input (docs/16 §8).
-        let (left_cols, left_stats) =
+        // The leftmost input seeds the accumulated output; the chain folds the rest
+        // onto it. Each input is a base table scanned at the one statement
+        // `(sys, valid)` pin ([STL-243]), or a materialized CTE / derived table read
+        // from the scope ([STL-242]) — both yield the same shared-`Cells` columnar
+        // shape the join consumes, every input at the *same* pins (docs/16 §8).
+        let (mut acc_cols, mut acc_stats) =
             self.join_side_columns(&join.left, snapshot, valid_snapshot, scope)?;
-        let (right_cols, right_stats) =
-            self.join_side_columns(&join.right, snapshot, valid_snapshot, scope)?;
-        let left_rows = left_cols[0].len();
-        let right_rows = right_cols[0].len();
+        let mut acc_meta = join.left.columns.clone();
 
-        // The join's footer accounting ([STL-318]): both sides' scans summed — but
-        // only when both are base-table scans. A materialized side (CTE / derived
-        // table) was scanned and accounted when it was materialized, not here, so it
-        // contributes `None`; a join with such a side has no single accounting and
-        // suppresses the footer rather than under-report half the read.
-        let join_stats = match (left_stats, right_stats) {
-            (Some(l), Some(r)) => Some(l.combine(r)),
-            _ => None,
-        };
+        // Intermediate steps fold left-deep, staying columnar: each gathers the
+        // surviving accumulated + right cells into fresh column buffers the next step
+        // joins against ([STL-323]). The final step is materialized row-major below,
+        // so the two-table case (no intermediate steps) is unchanged.
+        let (last, rest) = join
+            .steps
+            .split_last()
+            .expect("a bound join carries at least one step");
+        for step in rest {
+            let (right_cols, indices, right_stats) =
+                self.join_step(&acc_cols, &acc_meta, step, snapshot, valid_snapshot, scope)?;
+            let keeps_right = lower_join_type(step.join_type).keeps_right();
+            let left =
+                GatheredColumns::new(acc_cols, indices.left.iter().map(|&l| Some(l)).collect());
+            let mut next: Vec<Column> = (0..acc_meta.len())
+                .map(|c| gather_column(&left, c))
+                .collect();
+            if keeps_right {
+                let right = GatheredColumns::new(right_cols, indices.right);
+                next.extend((0..step.right.columns.len()).map(|j| gather_column(&right, j)));
+                acc_meta.extend(step.right.columns.iter().cloned());
+            }
+            acc_cols = next;
+            acc_stats = combine_join_stats(acc_stats, right_stats);
+        }
 
-        // Decode only the join-key column of each side into a typed vector; every
-        // other column stays opaque bytes (gathered by index below), so a column
-        // the join merely carries through is never forced through the evaluator.
-        let left_keys = decode_key_column(&left_cols, &join.left.columns, join.left_key)?;
-        let right_keys = decode_key_column(&right_cols, &join.right.columns, join.right_key)?;
+        // The final step joins the accumulated output against the last right input
+        // and materializes the **addressable output** row-major. The accumulated
+        // columns first, then the right's for an `INNER` / `LEFT` join (a `None`
+        // right index — a `LEFT` join's unmatched row — draws NULL right cells);
+        // `SEMI` / `ANTI` keep the accumulated left alone. Each surviving cell is
+        // copied once here, off the shared buffers ([STL-224]).
+        let (right_cols, indices, right_stats) =
+            self.join_step(&acc_cols, &acc_meta, last, snapshot, valid_snapshot, scope)?;
+        // Every input's scan accounting summed ([STL-318]) — `None` (footer
+        // suppressed) if any input was a materialized relation.
+        let join_stats = combine_join_stats(acc_stats, right_stats);
 
-        let join_type = lower_join_type(join.join_type);
-        let indices = hash_join(
-            join_type,
-            &left_keys,
-            left_rows,
-            &Expr::col(join.left_key),
-            &right_keys,
-            right_rows,
-            &Expr::col(join.right_key),
-        )
-        .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
-
-        // Materialize the addressable output — every kept column, row-major. The
-        // left's columns first, then the right's for an `INNER` / `LEFT` join (a
-        // `None` right index — a `LEFT` join's unmatched row — draws NULL right
-        // cells); `SEMI` / `ANTI` keep the left alone. Each surviving cell is copied
-        // once here, off the shared buffers ([STL-224]).
-        let left_width = join.left.columns.len();
-        let left = GatheredColumns::new(left_cols, indices.left.iter().map(|&l| Some(l)).collect());
+        let join_type = lower_join_type(last.join_type);
+        let left_width = acc_meta.len();
+        let left = GatheredColumns::new(acc_cols, indices.left.iter().map(|&l| Some(l)).collect());
         let rows: Vec<Vec<Option<Vec<u8>>>> = if join_type.keeps_right() {
-            let right_width = join.right.columns.len();
+            let right_width = last.right.columns.len();
             let right = GatheredColumns::new(right_cols, indices.right);
             (0..left.rows())
                 .map(|t| {
@@ -4655,9 +4663,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
 
         // The addressable columns `(name, type)` the bound `WHERE` / aggregate /
         // `ORDER BY` index into — the same layout the binder bound them against.
-        let mut addressable = join.left.columns.clone();
+        let mut addressable = acc_meta;
         if join_type.keeps_right() {
-            addressable.extend(join.right.columns.iter().cloned());
+            addressable.extend(last.right.columns.iter().cloned());
         }
 
         // The WHERE over the materialized rows, then the aggregate or the
@@ -4666,9 +4674,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let rows = filter_rows(&plan, &addressable, rows)?;
 
         if let Some(agg) = &bound.aggregate {
-            // A join reads two scans; the footer reports their summed accounting
-            // ([STL-318]) over the rows the aggregate *returned* (its grouped
-            // output), mirroring the single-table aggregate path ([`finish_select`]).
+            // A join reads every input's scan; the footer reports their summed
+            // accounting ([STL-318]) over the rows the aggregate *returned* (its
+            // grouped output), mirroring the single-table aggregate path
+            // ([`finish_select`]).
             let mut result = run_aggregate(bound, agg, &addressable, &rows)?;
             result.stats = join_stats.map(|s| query_stats(&s, result.rows.len(), snapshot));
             return Ok(StatementOutcome::Rows(result));
@@ -4683,14 +4692,51 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .iter()
             .map(|&r| projection.iter().map(|&i| rows[r][i].clone()).collect())
             .collect();
-        // Both sides' scan accounting summed ([STL-318]), over the join's returned
-        // row count; `None` (footer suppressed) if a side was a materialized relation.
+        // Every input's scan accounting summed ([STL-318]), over the join's returned
+        // row count; `None` (footer suppressed) if any input was a materialized relation.
         let stats = join_stats.map(|s| query_stats(&s, out_rows.len(), snapshot));
         Ok(StatementOutcome::Rows(SelectResult {
             columns: join.columns.clone(),
             rows: out_rows,
             stats,
         }))
+    }
+
+    /// Scan and hash-join one chain step ([STL-323]).
+    ///
+    /// Scans the step's right input at the statement pin, decodes the two join-key
+    /// columns — the accumulated left key by its flat addressable index, the right
+    /// key by its schema index — and runs [`hash_join`], returning the right input's
+    /// columns (for the caller's gather), the surviving-row [`JoinIndices`], and the
+    /// right input's scan accounting. Only the key columns are decoded; the
+    /// accumulated and right value columns stay opaque bytes (gathered by index), so
+    /// a carried-through column is never forced through the evaluator.
+    fn join_step(
+        &self,
+        acc_cols: &[Column],
+        acc_meta: &[(String, LogicalType)],
+        step: &BoundJoinStep,
+        snapshot: SystemTimeMicros,
+        valid_snapshot: Option<SystemTimeMicros>,
+        cte_scope: &CteScope,
+    ) -> Result<(Vec<Column>, JoinIndices, Option<ScanStats>), EngineError> {
+        let (right_cols, right_stats) =
+            self.join_side_columns(&step.right, snapshot, valid_snapshot, cte_scope)?;
+        let acc_rows = acc_cols[0].len();
+        let right_rows = right_cols[0].len();
+        let left_keys = decode_key_column(acc_cols, acc_meta, step.left_key)?;
+        let right_keys = decode_key_column(&right_cols, &step.right.columns, step.right_key)?;
+        let indices = hash_join(
+            lower_join_type(step.join_type),
+            &left_keys,
+            acc_rows,
+            &Expr::col(step.left_key),
+            &right_keys,
+            right_rows,
+            &Expr::col(step.right_key),
+        )
+        .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
+        Ok((right_cols, indices, right_stats))
     }
 
     /// Scan a table's reconstructed rows at `snapshot`, unfiltered — the base a
@@ -8023,6 +8069,30 @@ fn decode_key_column(
     cols[key] = Vector::from_column(schema[key].1, &columns[key])
         .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
     Ok(cols)
+}
+
+/// Materialize one gathered column into an owned [`Column::Bytes`] — the surviving
+/// cells of an intermediate `JOIN`-chain step ([STL-323]), copied once off the
+/// shared buffers so the next step joins against fresh column buffers ([STL-224]).
+/// The scanned and gathered join columns are always [`Column::Bytes`] (canonical
+/// cell encodings), so the next step's [`decode_key_column`] reads them back
+/// identically to a fresh scan.
+fn gather_column(gather: &GatheredColumns, col: usize) -> Column {
+    Column::Bytes(
+        (0..gather.rows())
+            .map(|row| gather.bytes(col, row).map(<[u8]>::to_vec))
+            .collect(),
+    )
+}
+
+/// Sum two inputs' scan accounting for the join footer ([STL-318]): `Some` only when
+/// both are base-table scans, since a materialized CTE / derived table contributes
+/// `None` (it was scanned and accounted at materialization, not at the join).
+const fn combine_join_stats(a: Option<ScanStats>, b: Option<ScanStats>) -> Option<ScanStats> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.combine(b)),
+        _ => None,
+    }
 }
 
 /// Read the cell at `position`/logical `row` of an exploded pipeline batch as the
@@ -14404,6 +14474,229 @@ mod tests {
             result.rows,
             vec![vec![txt("alice"), cell(Some(ScalarValue::Int8(2)))]]
         );
+    }
+
+    // ---- N-way left-deep join chains (STL-323) ----
+
+    /// `users ⋈ orders ⋈ products`: orders link a user (`uid`) to a product
+    /// (`pid`). Order 13 references a missing product (300), so it survives the first
+    /// inner join but is dropped by an inner/semi join to `products` — exercising the
+    /// chain's second `ON` against a non-seed accumulated input.
+    fn three_table_session() -> SessionEngine<ZeroClock, MemDisk> {
+        let mut engine = session();
+        for ddl in [
+            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE orders (oid INT PRIMARY KEY, uid INT, pid INT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE products (pid INT PRIMARY KEY, label TEXT) WITH SYSTEM VERSIONING",
+        ] {
+            engine.execute(&parse_one(ddl)).expect("create");
+        }
+        for dml in [
+            "INSERT INTO users VALUES (1, 'alice')",
+            "INSERT INTO users VALUES (2, 'bob')",
+            "INSERT INTO users VALUES (3, 'carol')",
+            "INSERT INTO orders VALUES (10, 1, 100)",
+            "INSERT INTO orders VALUES (11, 1, 200)",
+            "INSERT INTO orders VALUES (12, 2, 100)",
+            "INSERT INTO orders VALUES (13, 2, 300)",
+            "INSERT INTO products VALUES (100, 'widget')",
+            "INSERT INTO products VALUES (200, 'gadget')",
+        ] {
+            engine.execute(&parse_one(dml)).expect("insert");
+        }
+        engine
+    }
+
+    #[test]
+    fn three_way_inner_join_chains_left_deep() {
+        // The second `ON` references the *middle* input (`orders.pid`): the chain
+        // joins (users ⋈ orders) against products, so the left key addresses the
+        // accumulated output, not the seed alone ([STL-323]).
+        let mut engine = three_table_session();
+        let result = select(
+            &mut engine,
+            "SELECT users.name, orders.oid, products.label FROM users \
+             JOIN orders ON users.id = orders.uid \
+             JOIN products ON orders.pid = products.pid",
+        );
+        assert_eq!(
+            result.columns,
+            vec![
+                ("name".to_owned(), LogicalType::Text),
+                ("oid".to_owned(), LogicalType::Int4),
+                ("label".to_owned(), LogicalType::Text),
+            ]
+        );
+        // Order 13 (product 300, missing) is dropped by the inner join to products;
+        // carol (no order) by the first inner join.
+        assert_eq!(
+            sorted(result.rows),
+            sorted(vec![
+                vec![txt("alice"), i4(10), txt("widget")],
+                vec![txt("alice"), i4(11), txt("gadget")],
+                vec![txt("bob"), i4(12), txt("widget")],
+            ])
+        );
+    }
+
+    #[test]
+    fn a_left_join_in_a_chain_null_extends_downstream() {
+        // A LEFT chain keeps every left row: carol (no order) and order 13 (missing
+        // product) both survive, NULL-extended on the unmatched side.
+        let mut engine = three_table_session();
+        let result = select(
+            &mut engine,
+            "SELECT users.name, orders.oid, products.label FROM users \
+             LEFT JOIN orders ON users.id = orders.uid \
+             LEFT JOIN products ON orders.pid = products.pid",
+        );
+        assert_eq!(
+            sorted(result.rows),
+            sorted(vec![
+                vec![txt("alice"), i4(10), txt("widget")],
+                vec![txt("alice"), i4(11), txt("gadget")],
+                vec![txt("bob"), i4(12), txt("widget")],
+                vec![txt("bob"), i4(13), None],
+                vec![txt("carol"), None, None],
+            ])
+        );
+    }
+
+    #[test]
+    fn a_semi_or_anti_step_filters_the_accumulated_left() {
+        // A SEMI step keeps the accumulated (users ⋈ orders) rows that have a product
+        // (dropping order 13); an ANTI step keeps only those that don't.
+        let mut engine = three_table_session();
+        let semi = select(
+            &mut engine,
+            "SELECT users.name, orders.oid FROM users \
+             JOIN orders ON users.id = orders.uid \
+             SEMI JOIN products ON orders.pid = products.pid",
+        );
+        assert_eq!(
+            sorted(semi.rows),
+            sorted(vec![
+                vec![txt("alice"), i4(10)],
+                vec![txt("alice"), i4(11)],
+                vec![txt("bob"), i4(12)],
+            ])
+        );
+        let anti = select(
+            &mut engine,
+            "SELECT users.name, orders.oid FROM users \
+             JOIN orders ON users.id = orders.uid \
+             ANTI JOIN products ON orders.pid = products.pid",
+        );
+        assert_eq!(anti.rows, vec![vec![txt("bob"), i4(13)]]);
+    }
+
+    #[test]
+    fn n_way_join_composes_with_the_full_clause_stack() {
+        // The DoD shape over three inputs: WHERE / GROUP BY / ORDER BY over the
+        // chain's output ([STL-323]).
+        let mut engine = three_table_session();
+        let result = select(
+            &mut engine,
+            "SELECT products.label, COUNT(*) FROM users \
+             JOIN orders ON users.id = orders.uid \
+             JOIN products ON orders.pid = products.pid \
+             WHERE users.id = 1 GROUP BY products.label ORDER BY label",
+        );
+        assert_eq!(
+            result.columns,
+            vec![
+                ("label".to_owned(), LogicalType::Text),
+                ("count".to_owned(), LogicalType::Int8),
+            ]
+        );
+        // alice (id 1) bought widget (order 10) and gadget (order 11): one each,
+        // ordered by label.
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![txt("gadget"), cell(Some(ScalarValue::Int8(1)))],
+                vec![txt("widget"), cell(Some(ScalarValue::Int8(1)))],
+            ]
+        );
+    }
+
+    #[test]
+    fn n_way_join_under_as_of_reads_one_consistent_snapshot() {
+        // A statement-level `FOR SYSTEM_TIME AS OF s` over a three-input chain reads
+        // *every* input at the one pin ([STL-243], [STL-323]): the join at `s1` sees
+        // all three tables' first version, never a mix with the later updates.
+        let mut engine = session();
+        for ddl in [
+            "CREATE TABLE a (k INT PRIMARY KEY, av INT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE b (k INT PRIMARY KEY, bv INT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE c (k INT PRIMARY KEY, cv INT) WITH SYSTEM VERSIONING",
+        ] {
+            engine.execute(&parse_one(ddl)).expect("create");
+        }
+        for dml in [
+            "INSERT INTO a VALUES (1, 10)",
+            "INSERT INTO b VALUES (1, 20)",
+            "INSERT INTO c VALUES (1, 30)",
+        ] {
+            engine.execute(&parse_one(dml)).expect("insert v1");
+        }
+        let s1 = engine.commit_clock();
+        for dml in [
+            "UPDATE a SET av = 11 WHERE k = 1",
+            "UPDATE b SET bv = 21 WHERE k = 1",
+            "UPDATE c SET cv = 31 WHERE k = 1",
+        ] {
+            engine.execute(&parse_one(dml)).expect("update v2");
+        }
+
+        let chain = "SELECT a.av, b.bv, c.cv FROM a \
+                     JOIN b ON a.k = b.k \
+                     JOIN c ON b.k = c.k";
+        // At `s1`: every input's first version, the one consistent snapshot.
+        let as_of = select(
+            &mut engine,
+            &format!("{chain} FOR SYSTEM_TIME AS OF {}", s1.0),
+        );
+        assert_eq!(as_of.rows, vec![vec![i4(10), i4(20), i4(30)]]);
+        // At the present: every input's updated version.
+        let live = select(&mut engine, chain);
+        assert_eq!(live.rows, vec![vec![i4(11), i4(21), i4(31)]]);
+    }
+
+    #[test]
+    fn a_four_table_chain_folds_through_two_intermediate_steps() {
+        // Three steps: two intermediate columnar folds feed each other before the
+        // final row-major step ([STL-323]) — so a gathered accumulated column is
+        // itself re-gathered by the next step, the path a 3-table chain never hits.
+        let mut engine = session();
+        for ddl in [
+            "CREATE TABLE a (k INT PRIMARY KEY, av INT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE b (k INT PRIMARY KEY, bv INT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE c (k INT PRIMARY KEY, cv INT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE d (k INT PRIMARY KEY, dv INT) WITH SYSTEM VERSIONING",
+        ] {
+            engine.execute(&parse_one(ddl)).expect("create");
+        }
+        for dml in [
+            "INSERT INTO a VALUES (1, 10)",
+            "INSERT INTO a VALUES (2, 20)",
+            "INSERT INTO b VALUES (1, 11)",
+            "INSERT INTO c VALUES (1, 12)",
+            "INSERT INTO d VALUES (1, 13)",
+            "INSERT INTO d VALUES (2, 23)",
+        ] {
+            engine.execute(&parse_one(dml)).expect("insert");
+        }
+        // Only key 1 is present in all four inputs; key 2 (missing from b/c) is
+        // dropped by the inner chain.
+        let result = select(
+            &mut engine,
+            "SELECT a.av, b.bv, c.cv, d.dv FROM a \
+             JOIN b ON a.k = b.k \
+             JOIN c ON b.k = c.k \
+             JOIN d ON c.k = d.k",
+        );
+        assert_eq!(result.rows, vec![vec![i4(10), i4(11), i4(12), i4(13)]]);
     }
 
     // ---- durable catalog + cold-boot recovery (STL-210, ADR-0028) ----
