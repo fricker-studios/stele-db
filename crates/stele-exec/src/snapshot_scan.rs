@@ -1072,17 +1072,17 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
     /// min/max cannot prune.
     ///
     /// Unlike [`valid_as_of`](Self::valid_as_of) this filters **no row** — it only
-    /// gates which segments are read. It is the access-path counterpart of a
-    /// per-row PERIOD predicate (`PERIOD(valid_from, valid_to) OVERLAPS / CONTAINS
-    /// PERIOD(lo, hi)`, [STL-193]) that the query executor evaluates over each
-    /// decoded row downstream: the predicate's truth *requires* the row's valid
-    /// interval to overlap `[lo, hi)`, so a segment proven to hold no overlapping
-    /// row holds no matching row. Because the executor re-applies the exact
-    /// predicate, the surviving rows are returned unfiltered here and the result
-    /// is byte-identical to an unpruned scan — the summary changes speed, never
-    /// results. The caller derives `[lo, hi)` only for predicates where overlap is
-    /// a necessary condition; the prune never fires for a segment carrying no
-    /// summary, so it never drops a real match.
+    /// gates which segments and row-groups are read. It is the access-path
+    /// counterpart of a per-row PERIOD predicate (`PERIOD(valid_from, valid_to)
+    /// OVERLAPS / CONTAINS PERIOD(lo, hi)`, [STL-193]) that the query executor
+    /// evaluates over each decoded row downstream: the predicate's truth *requires*
+    /// the row's valid interval to overlap `[lo, hi)`, so a segment (or row-group)
+    /// proven to hold no overlapping row holds no matching row. Because the
+    /// executor re-applies the exact predicate, the surviving rows are returned
+    /// unfiltered here and the result is byte-identical to an unpruned scan — the
+    /// summary changes speed, never results. The caller derives `[lo, hi)` only for
+    /// predicates where overlap is a necessary condition; the prune never fires for
+    /// a segment (or row-group) carrying no summary, so it never drops a real match.
     #[must_use]
     pub const fn prune_valid_overlap(mut self, lo: i64, hi: i64) -> Self {
         self.valid_overlap = Some((lo, hi));
@@ -1270,9 +1270,15 @@ impl<'a, D: Disk, I: Disk, F: DiskFile> SnapshotScan<'a, D, I, F> {
                         .is_some_and(|(lo, hi)| !reader.row_group_might_overlap_valid(g, lo, hi))
                 {
                     // Either valid-axis stab (point STL-316, overlap STL-336)
-                    // proving the row-group empty skips it; at most one is ever set
-                    // in practice, and both share the `rg_pruned_valid` bucket, so
-                    // the `||` keeps them in one arm.
+                    // proving the row-group empty skips it. Both can be set on one
+                    // scan — a `FOR VALID_TIME AS OF v` read whose `WHERE` also
+                    // carries a per-row PERIOD predicate sets both `valid_snapshot`
+                    // and `valid_overlap` — and the `||` is sound for that case:
+                    // either stab proving emptiness alone means no row in the group
+                    // can reach the result (the `v` filter, resp. the re-applied
+                    // PERIOD predicate, drops the rest), so skipping is correct
+                    // whichever fires. Both share the `rg_pruned_valid` bucket, so
+                    // one arm keeps the tally a single bucket.
                     rg_pruned_valid += 1;
                 } else {
                     candidates.insert(g);
