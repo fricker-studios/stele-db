@@ -91,8 +91,8 @@ use stele_sql::merge::{BoundMerge, MergeBound, MergeSource, MergeValid, MergeVal
 use stele_sql::select::{
     AggregateFunc, ArithOp, BoundAggregate, BoundCte, BoundHaving, BoundJoinSide, BoundJoinStep,
     BoundPeriod, BoundPeriodPredicate, BoundPredicate, BoundScalar, BoundSelect,
-    BoundSubqueryFilter, CompareOp, Correlation, HavingScalar, JoinType, OutputItem,
-    PeriodEndpoint, Projection, ProjectionItem, ProjectionValue, SelectError,
+    BoundSubqueryFilter, CompareOp, CompositeSemiDecorrelation, Correlation, HavingScalar,
+    JoinType, OutputItem, PeriodEndpoint, Projection, ProjectionItem, ProjectionValue, SelectError,
     SemiAntiDecorrelation, SortTarget, SubqueryKind, SystemTimeRange, ValidTimeRange,
 };
 use stele_sql::{
@@ -4202,10 +4202,24 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // A correlated `EXISTS` / `NOT EXISTS` on an equality key decorrelates onto
         // a single set-based semi / anti hash join ([STL-317]) — one inner scan
         // instead of `O(outer rows)` re-executions — when the binder recognizes the
-        // shape. Every other correlation (a range comparison, `[NOT] IN`, a scalar
-        // lookup, or a non-plain inner) keeps the per-row fallback below.
+        // shape.
         if let Some(plan) = sub.semi_anti_decorrelation() {
             return self.filter_semi_anti_decorrelated(
+                plan,
+                sub,
+                schema_columns,
+                rows,
+                overlay,
+                scope,
+            );
+        }
+        // A correlated non-negated `IN` on an equality key decorrelates onto a single
+        // **composite-key** semi join ([STL-337]) — the same one-scan win for the
+        // two-key shape `EXISTS` could not fold. Every remaining correlation (a range
+        // comparison, `NOT IN`, a scalar lookup, or a non-plain inner) keeps the
+        // per-row fallback below.
+        if let Some(plan) = sub.composite_semi_decorrelation() {
+            return self.filter_composite_semi_decorrelated(
                 plan,
                 sub,
                 schema_columns,
@@ -4301,6 +4315,82 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // duplicate-free order (a `SEMI` / `ANTI` join emits each probe row at most
         // once, in probe order), so taking each keeps the outer scan order — exactly
         // what the per-row filter preserved.
+        let mut rows = rows;
+        Ok(indices
+            .left
+            .iter()
+            .map(|&l| std::mem::take(&mut rows[l]))
+            .collect())
+    }
+
+    /// Filter the reconstructed outer `rows` by a **decorrelated** correlated `IN` —
+    /// the set-based **composite-key** semi-join path ([STL-337]) the
+    /// [`composite_semi_decorrelation`](BoundSubqueryFilter::composite_semi_decorrelation)
+    /// recognizer selects, replacing the [STL-239] per-row re-execution for the one
+    /// shape `EXISTS` could not fold (an `IN` carries a second equality — the
+    /// membership column — so "∃ an inner row for this outer row" is a *two-key* test:
+    /// `s.k = t.k` **and** `s.a = t.a`).
+    ///
+    /// The inner runs **once**, over the same `overlay` and snapshot the outer reads,
+    /// so the per-statement `(sys, valid)` and read-your-own-writes rules hold across
+    /// both inputs (docs/16 §6, [STL-203]) exactly as the per-row re-runs did. It
+    /// projects `[membership, correlation key]` (the binder appended the key).
+    /// [`hash_join`] is single-key, so each side's
+    /// `(correlation key, membership)` pair is folded into one **synthetic composite
+    /// key** ([`composite_key_vector`]); a `SEMI` join then yields the outer rows
+    /// whose composite is a member of the inner's composite set.
+    ///
+    /// This reproduces `IN`'s three-valued logic exactly: the composite is NULL when
+    /// *either* component is NULL, and a NULL key never matches ([`hash_join`]), so a
+    /// NULL outer membership value (or correlation key) — and a NULL inner one — can
+    /// never make `IN` `TRUE`, matching the per-row fold ([`in_subquery_plan`], and
+    /// [`empty_inner_keeps`] for a NULL correlation key). `NOT IN` is deliberately
+    /// *not* decorrelated (its per-group NULL-in-set trap is not an anti join), so it
+    /// never reaches here — it keeps the per-row fallback.
+    fn filter_composite_semi_decorrelated(
+        &self,
+        plan: CompositeSemiDecorrelation,
+        sub: &BoundSubqueryFilter,
+        schema_columns: &[(String, LogicalType)],
+        rows: Vec<Vec<Option<Vec<u8>>>>,
+        overlay: &[BoundDml],
+        scope: &CteScope,
+    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+        let StatementOutcome::Rows(inner) =
+            self.run_select_scoped(&sub.subquery, overlay, scope)?
+        else {
+            return Err(EngineError::Unsupported("a subquery must be a SELECT"));
+        };
+
+        // Each composite component decodes with its outer column's type: the binder
+        // proved the inner correlation key shares the outer key column's type and the
+        // inner membership the outer tested column's type.
+        let key_ty = schema_columns[plan.outer_key_column].1;
+        let member_ty = schema_columns[plan.outer_member_column].1;
+        let outer_keys = composite_key_vector(
+            &rows,
+            (plan.outer_key_column, key_ty),
+            (plan.outer_member_column, member_ty),
+        )?;
+        let inner_keys = composite_key_vector(
+            &inner.rows,
+            (plan.inner_key_column, key_ty),
+            (plan.inner_member_column, member_ty),
+        )?;
+
+        let indices = hash_join(
+            ExecJoinType::Semi,
+            std::slice::from_ref(&outer_keys),
+            rows.len(),
+            &Expr::col(0),
+            std::slice::from_ref(&inner_keys),
+            inner.rows.len(),
+            &Expr::col(0),
+        )
+        .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
+
+        // A `SEMI` join emits each surviving outer row once, in ascending probe
+        // order, so taking each keeps the outer scan order the per-row filter kept.
         let mut rows = rows;
         Ok(indices
             .left
@@ -7712,6 +7802,49 @@ fn key_vector(
         .collect();
     let column = Column::Bytes(cells.into());
     Vector::from_column(ty, &column).map_err(|e| EngineError::Scan(ScanError::Eval(e)))
+}
+
+/// Build a **synthetic composite-key** [`Vector`] from two columns of `rows` — the
+/// join currency the [STL-337] composite-key `IN` semi join needs, since
+/// [`hash_join`] joins on a single key per side.
+///
+/// Each cell is the length-prefixed concatenation of the two components' canonical
+/// encodings (length-prefixing each so `(x, y)` and `(xy, ⟨⟩)` cannot collide on the
+/// same bytes), carried as opaque [`Vector::Bytea`] so [`hash_join`] hashes it by
+/// exactly those bytes. The cell is **NULL when either component is NULL**, so the
+/// join's "a NULL key never matches" rule reproduces the composite equality's
+/// three-valued logic (`a = b AND c = d` is never `TRUE` when any operand is NULL).
+/// Each component decodes through [`key_vector`], so a malformed cell surfaces the
+/// same [`ScanError::Eval`] the single-key path raises, and the round-trip yields the
+/// canonical encoding [`hash_join`] would hash a single key by.
+fn composite_key_vector(
+    rows: &[Vec<Option<Vec<u8>>>],
+    first: (usize, LogicalType),
+    second: (usize, LogicalType),
+) -> Result<Vector, EngineError> {
+    let a = key_vector(rows, first.0, first.1)?;
+    let b = key_vector(rows, second.0, second.1)?;
+    let cells: Vec<Option<Vec<u8>>> = (0..rows.len())
+        .map(|i| match (a.get(i), b.get(i)) {
+            (Some(va), Some(vb)) => {
+                let mut bytes = Vec::new();
+                push_len_prefixed(&mut bytes, &encode_value(&va));
+                push_len_prefixed(&mut bytes, &encode_value(&vb));
+                Some(bytes)
+            }
+            // A NULL in either component → a NULL composite key → never matches.
+            _ => None,
+        })
+        .collect();
+    Ok(Vector::Bytea(cells))
+}
+
+/// Append `bytes` to `out`, framed by a big-endian `u64` length prefix, so the
+/// concatenation of two framed components is injective in the components — the
+/// identity a [`composite_key_vector`] cell needs.
+fn push_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    out.extend_from_slice(bytes);
 }
 
 /// Reduce a once-materialized scalar subquery `result` to its single value
@@ -19268,22 +19401,61 @@ mod tests {
     }
 
     #[test]
-    fn correlated_in_membership_is_per_row() {
+    fn correlated_in_decorrelates_to_a_composite_semi_join() {
+        // `a IN (SELECT a FROM s WHERE s.k = t.k)` folds onto a composite-key SEMI
+        // join on `(k, a)` ([STL-337]). This checks the cases that distinguish the
+        // join from a per-row fold: a key with *several* matching inner rows is kept
+        // once (not once per match), and membership requires *both* components — a
+        // right `k` with a wrong `a` (and a right `a` under the wrong `k`) drops.
         let mut engine = keyed_session();
         for sql in [
             "INSERT INTO t VALUES (1, 100, 5)",
             "INSERT INTO t VALUES (2, 100, 7)",
-            "INSERT INTO t VALUES (3, 200, 9)",
+            "INSERT INTO t VALUES (3, 200, 8)",
+            "INSERT INTO t VALUES (4, 200, 9)",
+            "INSERT INTO t VALUES (5, 100, 8)",
+            // The distinct inner `(k, a)` set is {(100,5), (100,6), (200,8)};
+            // (100,5) appears twice — the multi-match dedup case.
             "INSERT INTO s VALUES (10, 100, 5)",
-            "INSERT INTO s VALUES (11, 100, 6)",
-            "INSERT INTO s VALUES (12, 200, 8)",
+            "INSERT INTO s VALUES (11, 100, 5)",
+            "INSERT INTO s VALUES (12, 100, 6)",
+            "INSERT INTO s VALUES (13, 200, 8)",
         ] {
             engine.execute(&parse_one(sql)).expect("insert");
         }
-        // Per outer row, the inner set is the `s.a` for that row's `k`:
-        //   id 1 (k=100, a=5): {5, 6} ∋ 5  → keep
-        //   id 2 (k=100, a=7): {5, 6} ∌ 7  → drop
-        //   id 3 (k=200, a=9): {8}    ∌ 9  → drop
+        //   id 1 (100,5): ∈ set, matches s twice → kept once (dedup)
+        //   id 2 (100,7): a=7 ∉ {5,6} under k=100 → drop (right k, wrong a)
+        //   id 3 (200,8): ∈ set                   → keep
+        //   id 4 (200,9): a=9 ∉ {8}    under k=200 → drop
+        //   id 5 (100,8): 8 is in s, but under k=200 not k=100 → drop (wrong k)
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a IN (SELECT a FROM s WHERE s.k = t.k)",
+        ));
+        assert_eq!(got, vec![1, 3]);
+    }
+
+    #[test]
+    fn decorrelated_in_drops_a_null_key_or_member() {
+        // The composite key is NULL when *either* component is NULL, so the join's
+        // NULL-never-matches rule reproduces `IN`'s 3VL ([STL-337]): a NULL correlation
+        // key, a NULL outer membership value, and a NULL inner membership value all
+        // fail to match — the same answers the per-row fold gives.
+        let mut engine = keyed_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 100, 5)",
+            "INSERT INTO t VALUES (2, NULL, 5)",
+            "INSERT INTO t VALUES (3, 100, NULL)",
+            "INSERT INTO t VALUES (4, 200, 7)",
+            "INSERT INTO s VALUES (10, 100, 5)",
+            "INSERT INTO s VALUES (11, 200, NULL)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        //   id 1 (100,5):    ∈ {(100,5)}                          → keep
+        //   id 2 (NULL,5):   NULL key → empty group → 5 IN ()     → drop
+        //   id 3 (100,NULL): NULL member → never TRUE             → drop
+        //   id 4 (200,7):    inner for k=200 is {NULL} (excluded) → drop
         let got = subquery_ids(&select(
             &mut engine,
             "SELECT id FROM t WHERE a IN (SELECT a FROM s WHERE s.k = t.k)",
@@ -19565,6 +19737,59 @@ mod tests {
             )),
             vec![2, 3]
         );
+    }
+
+    #[test]
+    fn decorrelated_in_inherits_the_outer_statement_snapshot() {
+        // STL-337 DoD (docs/16 §6): the composite-key IN decorrelation runs the inner
+        // once at the *outer statement's* snapshot, so the one consistent `(sys,
+        // valid)` snapshot holds across both join inputs — an `AS OF` read can never
+        // leak the present into the membership set. The two eras give genuinely
+        // different answers, so reading the present at either would fail.
+        let clock = SteppedClock::new(1_000);
+        let mut engine = SessionEngine::open(MemDisk::new(), clock.clone());
+        for ddl in [
+            "CREATE TABLE t (id INT PRIMARY KEY, k INT, a INT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE s (id INT PRIMARY KEY, k INT, a INT) WITH SYSTEM VERSIONING",
+        ] {
+            engine.execute(&parse_one(ddl)).expect("create");
+        }
+        // Era 1 @ 2_000: s's `(k, a)` set is {(100,5), (200,9)}.
+        clock.set(2_000);
+        for sql in [
+            "INSERT INTO t VALUES (1, 100, 5)",
+            "INSERT INTO t VALUES (2, 100, 6)",
+            "INSERT INTO t VALUES (3, 200, 7)",
+            "INSERT INTO s VALUES (10, 100, 5)",
+            "INSERT INTO s VALUES (11, 200, 9)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert era1");
+        }
+        // Era 2 @ 5_000: (100,5) leaves, (100,6) joins — so the IN answer shifts from
+        // t id 1 to t id 2.
+        clock.set(5_000);
+        for sql in [
+            "DELETE FROM s WHERE id = 10",
+            "INSERT INTO s VALUES (12, 100, 6)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("update era2");
+        }
+        clock.set(9_000);
+
+        let at = |engine: &mut SessionEngine<SteppedClock, MemDisk>, instant: i64| -> Vec<i32> {
+            let sql = format!(
+                "SELECT id FROM t WHERE a IN (SELECT a FROM s WHERE s.k = t.k) \
+                 FOR SYSTEM_TIME AS OF {instant}"
+            );
+            let StatementOutcome::Rows(r) = engine.execute(&parse_one(&sql)).expect("select")
+            else {
+                panic!("SELECT must return rows");
+            };
+            subquery_ids(&r)
+        };
+        // Era 1: only t id 1 (100,5) is in s's set; era 2 / present: only t id 2 (100,6).
+        assert_eq!(at(&mut engine, 4_000), vec![1]);
+        assert_eq!(at(&mut engine, 9_000), vec![2]);
     }
 
     #[test]
