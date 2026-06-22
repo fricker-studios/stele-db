@@ -7035,6 +7035,17 @@ mod tests {
             panic!("expected a named projection");
         };
         assert_eq!(items.len(), 3, "id, _stele_txn_id, sys_to");
+
+        // `GROUP BY` on an endpoint is bounded by the same grouping-key type rule as
+        // any read — `TIMESTAMPTZ` is not yet a groupable type — so it is the
+        // pre-existing `UnsupportedAggregate`, not a range-specific rejection.
+        assert!(matches!(
+            bind(
+                "SELECT sys_from, count(*) FROM account FOR SYSTEM_TIME FROM 1 TO 9 GROUP BY sys_from",
+                &catalog,
+            ),
+            Err(SelectError::UnsupportedAggregate(_))
+        ));
     }
 
     #[test]

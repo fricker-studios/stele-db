@@ -137,17 +137,20 @@ table's own columns followed by the appended period endpoints **`sys_from`** and
 **`sys_to`** (both `TIMESTAMPTZ`) — so `SELECT *` is `[user columns…, sys_from,
 sys_to]`. The endpoints are *addressable* columns ([STL-329]): a named projection
 returns exactly what it lists (`SELECT a` is `[a]`; `SELECT a, sys_from` is
-`[a, sys_from]`), and they are nameable in `ORDER BY` / `GROUP BY` / a value `WHERE`
-like any column. `sys_to` is `NULL` for a still-current (open) version. This is the
-row shape STL-199's `\history` consumes (it names the endpoints explicitly).
+`[a, sys_from]`), and they are nameable in the projection, `ORDER BY`, and a value
+`WHERE` like any column. `sys_to` is `NULL` for a still-current (open) version. This
+is the row shape STL-199's `\history` consumes (it names the endpoints explicitly).
 
 **Composing the SELECT surface ([STL-329]).** The rest of the read surface composes
 over a range, routed through the shared `finish_select` pipeline exactly as a point
 read is: result-shaping (`DISTINCT` / `ORDER BY` — including on `sys_from` /
 `sys_to` — / `LIMIT` / `OFFSET`), aggregation / `GROUP BY` over the range output,
-and the provenance pseudo-columns ([STL-247]) projected from the range. A range
-scan is now subject to the simple-query default row cap too, like any plain read
-([below](#default-row-cap-on-the-simple-query-path-stl-306)).
+and the provenance pseudo-columns ([STL-247]) projected from the range. (Grouping
+on the endpoints is bounded by the same rule as any read: `GROUP BY` keys are
+restricted to `INT4` / `INT8` / `BOOL` / `TEXT` today, so `GROUP BY sys_from` —
+`TIMESTAMPTZ` — is the pre-existing unsupported-grouping-type error, not range-specific.)
+A range scan is now subject to the simple-query default row cap too, like any plain
+read ([below](#default-row-cap-on-the-simple-query-path-stl-306)).
 
 **Still rejected (tracked follow-ups), never silently dropped.** Combining a system
 range with **any** `AS OF` point qualifier; a `JOIN`; a subquery or period-predicate
