@@ -792,9 +792,16 @@ mod tests {
             detailed.contains("3 total · 1 scanned · 2 pruned"),
             "valid prune missing from the detailed total: {detailed}"
         );
-        assert!(
-            detailed.contains("↳ valid") && detailed.contains('2'),
-            "valid prune missing its own line: {detailed}"
+        // Validate the count on the `↳ valid` line itself, not just that a '2'
+        // appears somewhere (the "2 pruned" total already has one).
+        let valid_line = detailed
+            .lines()
+            .find(|l| l.contains("↳ valid"))
+            .expect("a ↳ valid line in the detailed footer");
+        assert_eq!(
+            valid_line.split_whitespace().last(),
+            Some("2"),
+            "the ↳ valid line must show the valid-prune count: {valid_line:?}"
         );
 
         let compact = text(&stats_lines(&stats, StatsMode::Compact));
