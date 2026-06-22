@@ -38,10 +38,11 @@ pub(crate) enum FoldError {
         /// A short, stable explanation from the type's codec, when it has one.
         reason: Option<&'static str>,
     },
-    /// The column's type has no literal codec: `PERIOD` — period predicates build
-    /// intervals from `PERIOD(a,b)` endpoints, not a folded scalar. (`FLOAT8` folds
-    /// from a numeric literal on the comparand path, [STL-327], but stays here on
-    /// the `INSERT`/`COPY` path — there is no float8 *column* to write into.)
+    /// A type with no literal codec on the path that raised this. `PERIOD` has none
+    /// on either path — its predicates build intervals from `PERIOD(a,b)` endpoints,
+    /// not a folded scalar. `FLOAT8` is path-dependent: the comparand fold takes a
+    /// numeric literal ([STL-327]), but the `INSERT` / `COPY` value path still raises
+    /// this, since there is no float8 *column* to write into.
     UnsupportedType(LogicalType),
 }
 

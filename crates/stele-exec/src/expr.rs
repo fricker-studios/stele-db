@@ -706,7 +706,10 @@ fn compare(op: CmpOp, left: &Vector, right: &Vector) -> Result<Vector, ExprError
         // `float8` on either side compares as `f64` (`AVG` against a literal or a
         // `COUNT`), otherwise the `int4`/`int8` pair compares as `i64`. Same-width
         // integer pairs matched above; `float8`/`float8` lands here (the only `f64`
-        // path).
+        // path). Only a two-anchor `HAVING` reaches this (a `WHERE`/single-anchor
+        // predicate folds both sides to one type), so it runs over the grouped batch
+        // — group-count-sized, off the per-row scan — where the widening alloc is
+        // bounded and cold.
         (l, r) if is_numeric(l) && is_numeric(r) => {
             if matches!(l, Vector::Float8(_)) || matches!(r, Vector::Float8(_)) {
                 compare_f64(op, &as_f64_cells(l), &as_f64_cells(r))
@@ -764,10 +767,11 @@ fn as_f64_cells(v: &Vector) -> Vec<Option<f64>> {
 }
 
 /// Per-cell `f64` comparison through the IEEE-754 *total* order
-/// ([`f64::total_cmp`]): NULL on either side ⇒ NULL. The total order agrees with
-/// Postgres/DuckDB float ordering for every finite value (and orders NaN greatest,
-/// `NaN == NaN`); `AVG` over integers is always finite, so the signed-zero /
-/// signed-NaN nuances `total_cmp` encodes never arise on this path.
+/// ([`f64::total_cmp`]): NULL on either side ⇒ NULL. `total_cmp` matches the natural
+/// `<` / `>` ordering for every finite value — it diverges only on signed zero and
+/// NaN (which it distinguishes by sign and payload), and `AVG` over integers (the
+/// only `float8` this path compares) produces neither — so it gives a clean total
+/// order with no NaN-induced NULL branch.
 fn compare_f64(op: CmpOp, a: &[Option<f64>], b: &[Option<f64>]) -> Vec<Option<bool>> {
     a.iter()
         .zip(b)
