@@ -52,6 +52,15 @@ service AdminService {
 
   // Per-version commit hash-chain links + an intact/broken verdict ([STL-302]).
   rpc AuditChain(AuditChainRequest) returns (TableResponse);
+
+  // Reload the server's TLS certificate/key from the configured `[tls]` paths
+  // without a restart ([STL-326]) — the cross-platform, token-authenticated
+  // counterpart to the Unix-only SIGHUP trigger ([STL-293]). New connections
+  // present the rotated certificate; in-flight ones keep theirs. A bad pair
+  // (torn write, non-PEM, mismatch) leaves the live certificate in place and
+  // fails with INTERNAL; a server with no reloadable `[tls]` material answers
+  // FAILED_PRECONDITION.
+  rpc ReloadTls(ReloadTlsRequest) returns (ReloadTlsResponse);
 }
 
 message HealthRequest {}
@@ -142,6 +151,14 @@ message AuditChainRequest {
   string table = 1;
   // See VersionsRequest.key.
   optional string key = 2;
+}
+
+message ReloadTlsRequest {}
+
+message ReloadTlsResponse {
+  // The certificate path that was reloaded — the configured `[tls].cert` — so
+  // the operator can confirm which material the rotation picked up.
+  string cert_path = 1;
 }
 
 // A generic tabular introspection result — the gRPC/JSON shape of the engine's

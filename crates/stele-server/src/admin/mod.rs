@@ -42,6 +42,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use stele_common::time::Clock;
 use stele_engine::{SelectResult, SessionEngine, backup as engine_backup};
+use stele_pgwire::TlsReloader;
 use stele_storage::backend::{Disk, LocalDisk};
 
 /// The `stele-server` crate version this API reports as the server version.
@@ -126,6 +127,11 @@ pub enum AdminError {
     /// The request was malformed (e.g. an unparsable key literal, a bad path) →
     /// HTTP 400 / `INVALID_ARGUMENT`.
     InvalidArgument(String),
+    /// The server is not in a state to serve this request (e.g. a TLS reload was
+    /// asked of a server with no reloadable `[tls]` material) → HTTP 409 /
+    /// `FAILED_PRECONDITION`. The request is well-formed; the server's
+    /// configuration simply cannot satisfy it.
+    FailedPrecondition(String),
     /// The engine or storage failed → HTTP 500 / `INTERNAL`.
     Internal(String),
 }
@@ -133,7 +139,10 @@ pub enum AdminError {
 impl fmt::Display for AdminError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotFound(m) | Self::InvalidArgument(m) | Self::Internal(m) => f.write_str(m),
+            Self::NotFound(m)
+            | Self::InvalidArgument(m)
+            | Self::FailedPrecondition(m)
+            | Self::Internal(m) => f.write_str(m),
         }
     }
 }
@@ -424,6 +433,40 @@ where
     }
 }
 
+/// Reload the server's TLS certificate material on demand — the cross-platform,
+/// token-authenticated counterpart to the Unix-only SIGHUP trigger ([STL-293]),
+/// driven by the admin `ReloadTls` RPC / `POST /v1alpha1/reload-tls` ([STL-326]).
+/// Both transports call this one core so they behave identically.
+///
+/// `reloader` is `Some` exactly when the server booted with operator `[tls]`
+/// material behind a hot-reloadable acceptor; the ephemeral self-signed fallback
+/// and the plaintext / loopback postures have nothing to reload.
+///
+/// On success returns the reloaded certificate path, so the operator can confirm
+/// which material the rotation picked up. The failure posture is
+/// [`TlsReloader::reload`]'s and is unchanged from SIGHUP: a bad pair (torn write,
+/// non-PEM, cert/key mismatch) leaves the live certificate in place and the error
+/// is logged and returned (here [`AdminError::Internal`]). A server with no
+/// reloadable material answers [`AdminError::FailedPrecondition`] rather than
+/// pretending to rotate.
+///
+/// [STL-293]: https://allegromusic.atlassian.net/browse/STL-293
+/// [STL-326]: https://allegromusic.atlassian.net/browse/STL-326
+pub(crate) fn reload_tls(reloader: Option<&TlsReloader>) -> Result<String, AdminError> {
+    let Some(reloader) = reloader else {
+        return Err(AdminError::FailedPrecondition(
+            "TLS hot-reload is unavailable: the server has no reloadable [tls] \
+             certificate configured (it is running plaintext, on loopback, or with \
+             the ephemeral self-signed fallback)"
+                .to_owned(),
+        ));
+    };
+    reloader
+        .reload()
+        .map(|()| reloader.cert_path().display().to_string())
+        .map_err(|e| AdminError::Internal(format!("TLS reload failed: {e}")))
+}
+
 /// Render a [`SelectResult`] into the transport-agnostic [`TableData`], decoding
 /// each cell to text by its column type exactly as the SQL wire does
 /// ([`stele_pgwire::render_cell`]).
@@ -544,5 +587,19 @@ mod tests {
                 "{key:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn reload_tls_without_a_reloader_is_a_precondition_failure() {
+        // A server with no reloadable [tls] material (plaintext, loopback, or the
+        // ephemeral self-signed fallback) cannot rotate — the request is well-formed
+        // but the configuration cannot satisfy it. The success path needs real cert
+        // files and is covered end-to-end in tests/admin_api.rs + tests/admin_tls.rs.
+        let err = reload_tls(None).expect_err("no reloader must fail");
+        assert!(
+            matches!(err, AdminError::FailedPrecondition(_)),
+            "expected FailedPrecondition, got {err:?}"
+        );
+        assert!(err.to_string().contains("no reloadable"), "{err}");
     }
 }

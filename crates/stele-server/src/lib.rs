@@ -508,6 +508,15 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         spawn_tls_sighup_reload(reloader.clone());
     }
     let admin_tls = tls.as_ref().map(TlsContext::acceptor_source);
+    // The same reloader, also surfaced to the admin API as a non-signal trigger:
+    // the cross-platform `ReloadTls` RPC / `POST /v1alpha1/reload-tls` rotates the
+    // certificate without a restart where SIGHUP cannot reach (Windows, or an
+    // operator who prefers programmatic control) — STL-326. `None` outside the
+    // `[tls]` reloadable posture, where there is nothing to reload.
+    let tls_reloader = match &tls {
+        Some(TlsContext::Reloading(reloader)) => Some(reloader.clone()),
+        _ => None,
+    };
 
     // Stand the ops HTTP listener up FIRST, before recovery runs (STL-253):
     // `/healthz` answers as soon as the process holds the port, while
@@ -573,11 +582,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // engine's WAL-poison state live.
     ops_state.set_ready(Arc::clone(&session));
     // Mount the admin HTTP/JSON gateway on the ops listener — always present
-    // (it authenticates every request, rejecting all when no token is set).
-    ops_state.set_admin(Arc::new(admin::http::AdminHttp::new(
-        admin_core.clone(),
-        Arc::clone(&admin_auth),
-    )));
+    // (it authenticates every request, rejecting all when no token is set). When
+    // TLS is reloadable, `POST /v1alpha1/reload-tls` rotates the cert (STL-326).
+    let mut admin_http = admin::http::AdminHttp::new(admin_core.clone(), Arc::clone(&admin_auth));
+    if let Some(reloader) = &tls_reloader {
+        admin_http = admin_http.with_tls_reloader(reloader);
+    }
+    ops_state.set_admin(Arc::new(admin_http));
     let mut pg = PgServer::new(cfg.listen, session).with_auth(cfg.auth);
     if cfg.auth == AuthMode::Scram {
         info!("SCRAM-SHA-256 authentication enabled on pg-wire");
@@ -594,7 +605,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // when a token is configured (secure default: no token ⇒ no surface). The
     // HTTP/JSON gateway is already live on the ops listener regardless. Both reuse
     // `admin_tls`, the same material pg-wire just took (STL-311).
-    let admin_grpc = build_admin_grpc(&cfg, admin_core, admin_auth, admin_tls).await?;
+    let admin_grpc =
+        build_admin_grpc(&cfg, admin_core, admin_auth, admin_tls, tls_reloader).await?;
 
     tokio::select! {
         res = pg.run() => res.context("pgwire listener exited")?,
@@ -659,13 +671,18 @@ fn spawn_tls_sighup_reload(reloader: TlsReloader) {
     });
 }
 
-/// On a platform without SIGHUP, hot-reload is unavailable: the listener keeps
-/// serving the certificate loaded at boot, and rotation needs a restart.
+/// On a platform without SIGHUP (Windows), the signal trigger is unavailable — but
+/// hot-reload itself is not: the cross-platform admin-API trigger (`ReloadTls` /
+/// `POST /v1alpha1/reload-tls`, [STL-326]) rotates the certificate without a
+/// restart, wired separately when `[admin]` tokens are configured.
+///
+/// [STL-326]: https://allegromusic.atlassian.net/browse/STL-326
 #[cfg(not(unix))]
 fn spawn_tls_sighup_reload(_reloader: TlsReloader) {
-    warn!(
+    info!(
         "TLS hot-reload via SIGHUP is not available on this platform; rotate the \
-         certificate with a restart"
+         certificate without a restart via the admin API (ReloadTls / \
+         POST /v1alpha1/reload-tls, requires [admin] tokens), or restart"
     );
 }
 
@@ -681,6 +698,7 @@ async fn build_admin_grpc(
     admin_core: AdminService<SystemClock, AnyDisk>,
     admin_auth: Arc<AdminAuth>,
     tls: Option<AcceptorSource>,
+    tls_reloader: Option<TlsReloader>,
 ) -> anyhow::Result<Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>> {
     if !admin_auth.is_enabled() {
         info!(
@@ -708,7 +726,10 @@ async fn build_admin_grpc(
             );
         }
     }
-    let service = admin::grpc::GrpcAdmin::new(admin_core, admin_auth);
+    let mut service = admin::grpc::GrpcAdmin::new(admin_core, admin_auth);
+    if let Some(reloader) = &tls_reloader {
+        service = service.with_tls_reloader(reloader);
+    }
     Ok(Box::pin(async move {
         match tls {
             Some(tls) => admin::grpc::serve_tls(listener, service, tls).await,

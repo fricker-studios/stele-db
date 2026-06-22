@@ -22,12 +22,13 @@ use std::sync::{Arc, Mutex};
 
 use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
-use stele_pgwire::SharedSession;
+use stele_pgwire::{SharedSession, TlsMode, TlsReloader, TlsSettings};
 use stele_server::admin::grpc::GrpcAdmin;
 use stele_server::admin::http::AdminHttp;
 use stele_server::admin::proto::admin_service_client::AdminServiceClient;
 use stele_server::admin::proto::{
-    BackupRequest, HealthRequest, RestorePlanRequest, StatusRequest, VersionsRequest,
+    BackupRequest, HealthRequest, ReloadTlsRequest, RestorePlanRequest, StatusRequest,
+    VersionsRequest,
 };
 use stele_server::admin::{AdminAuth, AdminService};
 use stele_server::ops::{OpsServer, OpsState};
@@ -51,6 +52,13 @@ struct Harness {
 /// Boot an in-memory engine behind both admin transports on ephemeral ports, with
 /// `TOKEN` configured. Mirrors the composition `stele_server::run` makes.
 async fn boot() -> Harness {
+    boot_inner(None).await
+}
+
+/// As [`boot`], but installs `reloader` on both transports so the `ReloadTls`
+/// trigger has reloadable `[tls]` material (STL-326); `None` mirrors a plaintext /
+/// loopback / self-signed-fallback boot, where `ReloadTls` reports nothing to do.
+async fn boot_inner(reloader: Option<TlsReloader>) -> Harness {
     let engine = Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
     let core = AdminService::new(Arc::clone(&engine));
     let auth = Arc::new(AdminAuth::new(vec![TOKEN.to_owned()]));
@@ -61,7 +69,11 @@ async fn boot() -> Harness {
     let state = Arc::new(OpsState::new());
     let session: SharedSession = engine.clone();
     state.set_ready(session);
-    state.set_admin(Arc::new(AdminHttp::new(core.clone(), Arc::clone(&auth))));
+    let mut admin_http = AdminHttp::new(core.clone(), Arc::clone(&auth));
+    if let Some(reloader) = &reloader {
+        admin_http = admin_http.with_tls_reloader(reloader);
+    }
+    state.set_admin(Arc::new(admin_http));
     let ops = OpsServer::new("127.0.0.1:0".parse().unwrap(), state)
         .bind()
         .await
@@ -74,16 +86,40 @@ async fn boot() -> Harness {
         .await
         .expect("bind grpc listener");
     let grpc_addr = grpc_listener.local_addr().unwrap();
-    tokio::spawn(stele_server::admin::grpc::serve(
-        grpc_listener,
-        GrpcAdmin::new(core, auth),
-    ));
+    let mut grpc = GrpcAdmin::new(core, auth);
+    if let Some(reloader) = &reloader {
+        grpc = grpc.with_tls_reloader(reloader);
+    }
+    tokio::spawn(stele_server::admin::grpc::serve(grpc_listener, grpc));
 
     Harness {
         ops_addr,
         grpc_addr,
         engine,
     }
+}
+
+/// A [`TlsReloader`] over a freshly self-signed cert/key pair written to a unique
+/// temp dir — enough material for `reload()` to re-read and succeed, without
+/// standing up a TLS listener (the cert-actually-rotates-on-the-wire oracle lives
+/// in tests/admin_tls.rs).
+fn temp_reloader(tag: &str) -> TlsReloader {
+    let key = rcgen::KeyPair::generate().expect("generate key");
+    let params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).expect("cert params");
+    let cert = params.self_signed(&key).expect("self-sign");
+    let dir = std::env::temp_dir().join(format!("stele-admin-reload-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let cert_path = dir.join("server.crt");
+    let key_path = dir.join("server.key");
+    std::fs::write(&cert_path, cert.pem()).expect("write cert");
+    std::fs::write(&key_path, key.serialize_pem()).expect("write key");
+    TlsReloader::load(TlsSettings {
+        cert: cert_path,
+        key: key_path,
+        client_ca: None,
+        mode: TlsMode::Required,
+    })
+    .expect("load reloader")
 }
 
 /// One raw HTTP request, returning `(status line, body)`. `token`/`body` are
@@ -365,6 +401,82 @@ async fn introspection_versions_renders_rows() {
         .await
         .expect_err("unknown table");
     assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_tls_requires_a_token() {
+    // Auth gates the trigger before it ever consults the reloader, so a tokenless
+    // call is rejected even on a boot with no reloadable material.
+    let h = boot().await;
+
+    let (status, _) = http(h.ops_addr, "POST", "/v1alpha1/reload-tls", None, Some("")).await;
+    assert!(status.contains("401"), "no token must 401: {status}");
+
+    let mut client = connect_grpc(h.grpc_addr).await;
+    let err = client
+        .reload_tls(Request::new(ReloadTlsRequest {}))
+        .await
+        .expect_err("missing token must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated, "{err:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_tls_without_reloadable_material_is_a_precondition_failure() {
+    // A plaintext / loopback / self-signed-fallback boot has nothing to reload: the
+    // request is well-formed but the server cannot satisfy it — HTTP 409 / gRPC
+    // FAILED_PRECONDITION, the live posture untouched.
+    let h = boot().await;
+
+    let (status, body) = http(
+        h.ops_addr,
+        "POST",
+        "/v1alpha1/reload-tls",
+        Some(TOKEN),
+        Some(""),
+    )
+    .await;
+    assert!(status.contains("409"), "{status}: {body}");
+    assert!(body.contains("no reloadable"), "{body}");
+
+    let mut client = connect_grpc(h.grpc_addr).await;
+    let err = client
+        .reload_tls(authed(ReloadTlsRequest {}))
+        .await
+        .expect_err("no reloadable material must fail");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_tls_with_a_reloader_succeeds_on_both_transports() {
+    // With reloadable [tls] material installed, an authenticated trigger reloads it
+    // and echoes the cert path back — the cross-platform, signal-free path that
+    // Windows operators take in place of SIGHUP.
+    let reloader = temp_reloader("api-success");
+    let h = boot_inner(Some(reloader)).await;
+
+    let (status, body) = http(
+        h.ops_addr,
+        "POST",
+        "/v1alpha1/reload-tls",
+        Some(TOKEN),
+        Some(""),
+    )
+    .await;
+    assert!(status.contains("200"), "{status}: {body}");
+    assert!(body.contains("\"reloaded\":true"), "{body}");
+    assert!(body.contains("server.crt"), "echoes the cert path: {body}");
+
+    let mut client = connect_grpc(h.grpc_addr).await;
+    let reply = client
+        .reload_tls(authed(ReloadTlsRequest {}))
+        .await
+        .expect("reload over gRPC")
+        .into_inner();
+    assert!(
+        reply.cert_path.ends_with("server.crt"),
+        "cert path echoed: {}",
+        reply.cert_path
+    );
 }
 
 /// Minimal JSON string-escape for embedding a filesystem path in a request body
