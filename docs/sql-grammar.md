@@ -97,6 +97,24 @@ join output (STL-264) and across an N-way chain (STL-323, see
 [Joins](#joins-stl-172-stl-264-stl-323)); `RIGHT` / `FULL` / non-equi joins
 (STL-270) remain follow-ups.
 
+A `FOR { SYSTEM_TIME | VALID_TIME } { FROM a TO b | BETWEEN a AND b }` **range**
+over a join (STL-344) is the interval generalization of that pinned read — "the
+history of the joined result over the queried window" (`[a, b)` for the half-open
+`FROM..TO`, `[a, b]` for the closed `BETWEEN`, the same boundary contract as the
+single-table range below). Instead of one version per input at a point, every input
+is range-scanned and the matched versions' intervals are **intersected**: a joined
+tuple's period is `[max(from), min(to))` over its inputs —
+docs/16 §8's pointwise intersection lifted to an interval, so a pair whose intervals
+never overlap does not join, and the intersected period endpoints (`sys_from` /
+`sys_to`, or `valid_from` / `valid_to`) are exposed on the join output exactly as a
+single-table range exposes them (STL-244/STL-328/STL-329). The whole left-deep
+`INNER` chain is supported; a `LEFT` / `SEMI` / `ANTI` range join (each needs
+interval *difference* over the unmatched side) and a range join with a CTE / derived
+input (no axis to range) remain follow-ups. The differential oracle
+(`crates/stele-engine/tests/bitemporal_join_range_oracle.rs`) checks the range join
+against joining the inputs' single-table range reads, both axes, across the
+flush/seal boundary.
+
 ### `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` — temporal range scans (STL-244)
 
 ```sql
@@ -152,8 +170,23 @@ restricted to `INT4` / `INT8` / `BOOL` / `TEXT` today, so `GROUP BY sys_from` �
 A range scan is now subject to the simple-query default row cap too, like any plain
 read ([below](#default-row-cap-on-the-simple-query-path-stl-306)).
 
+**Over an `INNER` `JOIN` ([STL-344]).** A range qualifies a join too — the "history
+of the joined result over an interval". Each input is range-scanned and the matched
+versions' intervals are **intersected**: a joined tuple's period is `[max(from),
+min(to))` over its inputs (docs/16 §8's point intersection lifted to an interval), so
+a pair whose intervals don't overlap never joins, and the **intersected** endpoints
+(`sys_from` / `sys_to`, unclipped — the tuple's actual period) are exposed on the
+output. The whole left-deep `INNER` chain is supported (`a JOIN b … JOIN c …`); the
+business-key match, NULL handling, and the `WHERE` / aggregate / `ORDER BY` / `LIMIT`
+tail are the same as the point join's ([STL-264]). The un-ranged axis follows the single-table
+convention (a system range is valid-agnostic; a valid range pins the system snapshot
+and ranges the valid axis). See **Over a `JOIN`** in
+[time-travel select](#for--system_time--valid_time--as-of-expr--time-travel-select).
+
 **Still rejected (tracked follow-ups), never silently dropped.** Combining a system
-range with **any** `AS OF` point qualifier; a `JOIN`; a subquery or period-predicate
+range with **any** `AS OF` point qualifier; a non-`INNER` `JOIN` (`LEFT` / `SEMI` /
+`ANTI` — each needs interval *difference* over the unmatched side) or a `JOIN` whose
+input is a CTE / derived table (no axis to range); a subquery or period-predicate
 `WHERE`; a computed / scalar-subquery select item; a CTE / derived-table source; the
 read-your-own-writes overlay (a range reads the committed snapshot only, unlike a
 point read or a join, [STL-325]); and `FOR SYSTEM_TIME ALL` (the trivially-full
@@ -204,8 +237,13 @@ range — it fixes the system snapshot the valid history is read at (the cross-a
 `FOR VALID_TIME AS OF` is rejected (a point and a range on the *same* axis). The
 same SELECT surface composes over a valid range as a system one ([STL-329]):
 result-shaping, aggregation / `GROUP BY`, and projected provenance pseudo-columns;
-the same shapes a system range rejects (subquery / period `WHERE`, `JOIN`, CTE,
-computed projection, read-your-own-writes) are rejected here too. The correctness
+a valid range over an `INNER` `JOIN` is the valid-axis interval read of every input
+([STL-344]; see **Over a `JOIN`** in
+[time-travel select](#for--system_time--valid_time--as-of-expr--time-travel-select)),
+intersecting the inputs' valid intervals at the one system snapshot; the same
+residual shapes a system range rejects
+(a non-`INNER` or CTE-input `JOIN`, subquery / period `WHERE`, CTE source, computed
+projection, read-your-own-writes) are rejected here too. The correctness
 oracle (`crates/stele-engine/tests/valid_range_oracle.rs`,
 [docs/06 §4](06-testing-strategy.md#4-correctness-oracles-the-temporal-heart))
 sweeps a bitemporal workload across both axes and the flush/seal boundary against a
