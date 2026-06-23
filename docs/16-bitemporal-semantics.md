@@ -101,6 +101,7 @@ Valid-time is often a **business date**, not an instant ("effective March 2024")
 
 | Concern | Engine | Notes |
 |---|---|---|
+| Which time axes a table carries | **System-time always-on; valid-time opt-in per table** | The settled answer to [open question O3](assumptions.md): every table is system-versioned; a table opts into the valid-time axis at DDL. The sealed segment carries the `valid_from`/`valid_to` columns only for an opt-in table ([STL-117], [segment-format.md](segment-format.md)); [feature A.1](01-feature-plan.md#a1--bitemporality). |
 | Half-open boundaries, `+∞`, reversed/zero-length rejection | **Enforces** | §2 |
 | At-most-one-active-version (2D tiling) per key | **Enforces** | §5; via the validity index + per-key serialization ([ADR-0023](adr/0023-append-only-record-model-validity-index.md)) |
 | Temporal primary key (no overlapping valid-time per key per system slice) | **Enforces** | [feature A.1](01-feature-plan.md#a1--bitemporality) (v0.5) |
@@ -109,6 +110,8 @@ Valid-time is often a **business date**, not an instant ("effective March 2024")
 | **Cascading correction** of derived aggregates | **Punts** (app's job) | engine makes staleness **detectable** via the change-feed + derivation lineage ([12](12-data-migration-and-interop.md#6-change-feed-out)) — it does not recompute |
 
 This honesty *is* the product: in a trust-led domain, a precisely-stated guarantee beats an over-claimed one.
+
+[STL-117]: https://allegromusic.atlassian.net/browse/STL-117
 
 ## 12. Deletes, retractions & the deletion gap
 

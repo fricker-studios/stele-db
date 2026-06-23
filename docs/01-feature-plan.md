@@ -19,6 +19,8 @@ Milestones are *ordered*, not dated (this is a no-deadline track — see [03](03
 
 > The in-between versions (v0.4, v0.6, v0.8, v0.9) are **checkpoints** that subdivide the v0.5 / v0.7 / v1.0 anchors; the [roadmap](03-roadmap.md#milestone-sequence-ordered-undated) is authoritative for what each contains. A few feature rows below still carry their original anchor tag (e.g. the object-store tier as v0.5) where the roadmap has since pulled them into a checkpoint — retagging those rows is a tracked follow-up, not a contradiction.
 
+> **"Shipped early" annotations.** A row whose milestone reads e.g. **v0.2** *(shipped early — planned v0.3)* landed ahead of its planned milestone; the bold tag is the **actual** shipping milestone and the note records the original plan. The v0.2/v0.3 rows were swept against the as-built milestones in [STL-261](https://allegromusic.atlassian.net/browse/STL-261) — the bitemporal `AS OF (sys, valid)` row below is the one that moved (it proved the v0.2 exit criterion, [roadmap §v0.2](03-roadmap.md#v02--full-bitemporality--vectorized-execution)); the rest landed in the milestone shown.
+
 ---
 
 # A. Differentiator features (the identity)
@@ -34,7 +36,7 @@ These are the reason Stele exists. They get the novelty budget.
 | **Bitemporal tables** | A table can carry *both* axes simultaneously — the full 2D (system × valid) history. | Must | **v0.2** |
 | **`FOR SYSTEM_TIME AS OF`** | SQL:2011-style point-in-time read on the system axis. | Must | **v0.1** |
 | **Valid-time `AS OF` / period predicates** | `FOR VALID_TIME AS OF`, `CONTAINS`, `OVERLAPS`, `PRECEDES`, etc. | Must | **v0.2** |
-| **Bitemporal `AS OF (sys, valid)`** | Joint point-in-time across both axes ("as we believed at T1, about the world at T2"). | Must | **v0.3** |
+| **Bitemporal `AS OF (sys, valid)`** | Joint point-in-time across both axes ("as we believed at T1, about the world at T2"). | Must | **v0.2** *(shipped early — planned v0.3; STL-162–164)* |
 | **Temporal `BETWEEN`/range scans** | Return all versions over a system or valid interval. | Should | **v0.3** |
 | **Temporal DDL** | `CREATE TABLE … WITH SYSTEM VERSIONING`, add/drop valid-time period, period constraints. | Must | **v0.2** |
 | **Valid-time integrity** | Temporal primary keys and temporal foreign keys (no overlapping valid-time for the same key). | Should | **v0.5** |

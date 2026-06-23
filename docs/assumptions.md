@@ -54,7 +54,7 @@ These four were answered directly by the project owner and are treated as decide
 | A11 | Object storage | **S3-compatible API** (AWS S3, MinIO, R2, GCS via compat layer) as the tiering target; local-disk and in-memory backends for dev/test. | `ASSUMED` | Pluggable object-store trait so backends are swappable. [ADR-0007](adr/0007-storage-compute-separation.md) |
 | A12 | Distribution mechanism | When distribution arrives, **Raft for metadata/control-plane consensus** and **shared object storage for data** (compute nodes are largely stateless over S3), rather than a Paxos-from-scratch or a Spanner-style TrueTime approach. | `ASSUMED` | Decision deferred; recorded as a *direction*, not a commitment. [ADR-0006](adr/0006-distribution-later-shared-storage.md) |
 | A13 | Async runtime | **Tokio** as the async runtime; **but** the storage engine's deterministic core is written runtime-agnostic so it can run under the simulation harness's virtual clock/scheduler. | `ASSUMED` | DST requirement ([06](06-testing-strategy.md)) constrains how tightly we may couple to Tokio. |
-| A14 | Rust edition / MSRV | **Rust 2024 edition** (stable since 1.85, Feb 2025). MSRV pinned and bumped deliberately; toolchain pinned via `rust-toolchain.toml`. | `ASSUMED` | Current as of June 2026. [05](05-dev-environment.md), [04](04-cicd.md). |
+| A14 | Rust edition / MSRV | **Rust 2024 edition** (stable since 1.85, Feb 2025). MSRV pinned and bumped deliberately; toolchain pinned via `rust-toolchain.toml`. | `ASSUMED` | Current as of June 2026. MSRV floor now decided — **1.89.0** (O1 resolved; STL-225, [ADR-0005](adr/0005-reproducible-builds-pinned-toolchain.md)). [05](05-dev-environment.md), [04](04-cicd.md). |
 | A15 | Licensing — Change License legality | **Apache-2.0 is a valid BSL Change License.** BSL 1.1 requires a Change License "compatible with GPL v2.0 or later"; Apache-2.0 is GPLv3-compatible (a "later" version), and CockroachDB used Apache-2.0 as its BSL change license as precedent. | `ASSUMED` | If a lawyer disputes this, fall back to MPL-2.0 or GPLv2+ as Change License. [ADR-0004](adr/0004-licensing-bsl.md) |
 | A16 | Governance | **BDFL/maintainer-led** open governance initially (single steward + contributors), evolving toward a small maintainer council as the community grows. No foundation donation in the foreseeable term. | `ASSUMED` | [07](07-licensing-and-oss.md) |
 | A17 | Provenance scope (v1) | First-class lineage means **per-row transaction provenance** (who/what/when wrote this version) in v1; *derivation* lineage (this row computed from those inputs) is a later, opt-in feature. | `ASSUMED` | Full derivation lineage is expensive; phase it. [02](02-architecture.md) §lineage. |
@@ -65,13 +65,15 @@ These four were answered directly by the project owner and are treated as decide
 
 ## Open questions (decide before they block work)
 
-| # | Question | Why it matters | Blocks |
+> O1–O3 were settled across v0.1–v0.2 and are recorded here as resolved (history kept, per the legend). O4–O5 remain genuinely open.
+
+| # | Question | Why it matters | Status / resolution |
 |---|---|---|---|
-| O1 | Exact MSRV floor and bump cadence. | Affects which crate features we can use and the CI matrix. | Not blocking now; decide before v0.1 tag. |
-| O2 | Final on-disk segment format spec (encodings, compression codecs, footer layout). | The format is the hardest thing to change post-data. | Blocks v0.1 storage work; needs its own design doc + ADR amendment. |
-| O3 | Whether valid-time is *required* on every table or *opt-in per table*. | Affects the catalog, SQL surface, and storage overhead. | Blocks the temporal DDL design. Leaning **opt-in per table** (system-time always-on, valid-time opt-in). |
-| O4 | Trademark strategy for "Stele"/"steledb" and any logo. | Name protection for the OSS + future commercial split. | Not blocking; resolve before a public launch. [07](07-licensing-and-oss.md) |
-| O5 | Whether to expose a native (non-pg) wire protocol at all, or pg-wire only. | Affects client-library surface area. | Leaning **pg-wire only** for external clients; native API is in-process/embedded. |
+| O1 | Exact MSRV floor and bump cadence. | Affects which crate features we can use and the CI matrix. | `CONFIRMED` — MSRV is pinned at **1.89.0** in `rust-toolchain.toml` (the single source of truth, also the CI floor) and bumped **only deliberately**; the 1.85→1.89 bump (STL-225) exercised that policy. [ADR-0005](adr/0005-reproducible-builds-pinned-toolchain.md), [A14](#working-assumptions-proceed-unless-overturned). |
+| O2 | Final on-disk segment format spec (encodings, compression codecs, footer layout). | The format is the hardest thing to change post-data. | `CONFIRMED` — the spec is written: **[segment-format.md](segment-format.md)** (header/footer/trailer, column encodings, NULL sentinel, zone maps, row groups, optional sections, v1–v14 history), the design doc + ADR amendment [ADR-0002](adr/0002-on-disk-storage-format.md) always promised. Pre-1.0 the format still **evolves per ticket** (each bump documented, currently v14); it freezes forward at v1.0 — so "final" means *specified and versioned*, not *immutable yet*. |
+| O3 | Whether valid-time is *required* on every table or *opt-in per table*. | Affects the catalog, SQL surface, and storage overhead. | `CONFIRMED` — **opt-in per table**: system-time is always-on, a table opts into valid-time at DDL. Settled de facto across v0.1–v0.2 (segment format v3 carries the `valid_from`/`valid_to` pair *only* for opt-in tables, STL-117). Recorded in [16 §11](16-bitemporal-semantics.md#11-what-the-engine-enforces-vs-punts-stated-honestly); see [feature A.1](01-feature-plan.md#a1--bitemporality). |
+| O4 | Trademark strategy for "Stele"/"steledb" and any logo. | Name protection for the OSS + future commercial split. | `OPEN` — not blocking; resolve before a public launch. [07](07-licensing-and-oss.md) |
+| O5 | Whether to expose a native (non-pg) wire protocol at all, or pg-wire only. | Affects client-library surface area. | `OPEN` — leaning **pg-wire only** for external clients; native API is in-process/embedded. |
 
 ---
 

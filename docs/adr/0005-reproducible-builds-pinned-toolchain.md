@@ -30,5 +30,5 @@ The [Charter](../00-charter.md#6-guiding-principles) makes reproducibility a fir
 - Full bit-for-bit reproducibility can be fiddly (build-path/timestamp normalization); treated as a goal, not a v0.1 gate.
 
 ### Neutral / follow-ups
-- MSRV floor and bump cadence are [open question O1](../assumptions.md), settled before the v0.1 tag.
+- MSRV floor and bump cadence — [open question O1](../assumptions.md) — are now settled: MSRV is pinned at **1.89.0** and bumped only deliberately; the 1.85→1.89 bump (STL-225) exercised the policy. O1 is resolved (STL-261).
 - A `beta`/`nightly` early-warning CI job runs against newer compilers to catch breakage ahead of pinned bumps.
