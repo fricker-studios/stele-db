@@ -431,6 +431,7 @@ const fn query_stats(scan: &ScanStats, rows: usize, snapshot: SystemTimeMicros) 
         row_groups_total: scan.row_groups_total as u64,
         row_groups_scanned: scan.row_groups_scanned as u64,
         row_groups_pruned_zone: scan.row_groups_pruned_zone as u64,
+        row_groups_pruned_valid: scan.row_groups_pruned_valid as u64,
     }
 }
 
@@ -1014,6 +1015,16 @@ pub struct SessionEngine<C: Clock + Clone, D: Disk + Clone> {
     /// tier is still resident keeps that slice on re-creation (the tier is reused,
     /// not reopened), so its history is never dropped.
     next_namespace: u64,
+    /// Optional override for the rows-per-row-group bound each table's flush seals
+    /// segments with ([`Engine::with_flush_row_group_rows`], [STL-197]): `None`
+    /// keeps the storage default (a narrow flush stays one row-group), `Some(n)`
+    /// splits every flush into finer, independently-skippable row-groups. Applied
+    /// to each tier as it is opened ([`open_tier`](Self::open_tier)). The
+    /// read-accounting tests seed a small bound through it to exercise
+    /// row-group-granular pruning end-to-end; production leaves it `None`.
+    ///
+    /// [STL-197]: https://allegromusic.atlassian.net/browse/STL-197
+    flush_row_group_rows: Option<usize>,
     /// The next transaction id to stamp on a routed DML commit. v0.1 has no real
     /// transaction manager yet ([STL-99]); a per-session monotonic counter gives
     /// each `INSERT` / `UPDATE` / `DELETE` distinct provenance until one exists.
@@ -1156,6 +1167,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             disk,
             tables: BTreeMap::new(),
             next_namespace: 0,
+            flush_row_group_rows: None,
             next_txn: 1,
             commit_head: Digest::ZERO,
             commit_seq: 1,
@@ -1170,6 +1182,24 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             users: BTreeMap::new(),
             write_principal: Principal::new(WIRE_PRINCIPAL.to_vec()),
         }
+    }
+
+    /// Override the rows-per-row-group bound each table's flush seals segments with
+    /// ([`Engine::with_flush_row_group_rows`], [STL-197]), for **every** tier this
+    /// session opens after the call. Builder-style so the [`open`](Self::open) /
+    /// [`recover`](Self::recover) call sites that want the storage default stay
+    /// untouched. A smaller bound splits a flush into more, finer row-groups — each
+    /// independently skippable by the read path ([STL-155]) — so the read-accounting
+    /// tests can exercise row-group-granular pruning end-to-end without a
+    /// thousand-row fixture; `0` is clamped to `1`, the same clamp
+    /// [`Engine::with_flush_row_group_rows`] applies.
+    ///
+    /// [STL-155]: https://allegromusic.atlassian.net/browse/STL-155
+    /// [STL-197]: https://allegromusic.atlassian.net/browse/STL-197
+    #[must_use]
+    pub fn with_flush_row_group_rows(mut self, rows: usize) -> Self {
+        self.flush_row_group_rows = Some(rows.max(1));
+        self
     }
 
     /// **Recover** a session from existing on-disk state — the cold-boot path
@@ -1311,6 +1341,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             disk,
             tables,
             next_namespace,
+            flush_row_group_rows: None,
             next_txn,
             commit_head: recovered_chain.head,
             commit_seq: recovered_chain.seq.saturating_add(1),
@@ -3202,7 +3233,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     fn open_tier(&mut self, valid_time: bool) -> Result<TableState<C, D>, EngineError> {
         let namespace = self.next_namespace;
         let disk = NamespacedDisk::new(self.disk.clone(), namespace);
-        let engine = Engine::open(disk, self.clock.clone(), valid_time)?;
+        let mut engine = Engine::open(disk, self.clock.clone(), valid_time)?;
+        if let Some(rows) = self.flush_row_group_rows {
+            engine = engine.with_flush_row_group_rows(rows);
+        }
         engine.set_metrics(Arc::clone(&self.metrics));
         self.next_namespace += 1;
         Ok(TableState {
@@ -14598,6 +14632,95 @@ mod tests {
             "a probe reaching a covered band does not prune on the valid axis"
         );
         assert_eq!(covered.segments_scanned, 1, "the segment is materialized");
+    }
+
+    #[test]
+    fn valid_axis_row_group_prune_surfaces_in_the_query_stats_footer() {
+        // STL-339 DoD: the per-query footer DTO must also carry the *row-group-level*
+        // valid prune (`row_groups_pruned_valid`, STL-316/STL-336) the engine fold
+        // `query_stats()` previously dropped — the row-group-granular companion to
+        // the segment-level prune STL-333 surfaced just above. Flushing one row per
+        // row-group (the `with_flush_row_group_rows(1)` knob) scatters backdated
+        // valid windows across several row-groups of a single segment. A per-row
+        // `PERIOD … OVERLAPS` probe then survives the *segment*-level summary (one
+        // row-group covers it) yet prunes the row-groups whose own summary it misses
+        // — and that skip must show in the footer's `row_groups_pruned_valid` (so in
+        // `row_groups_pruned()`, keeping the displayed `scanned + pruned == total`
+        // honest on the row-group axis).
+        let mut engine = session().with_flush_row_group_rows(1);
+        engine
+            .execute(&parse_one(
+                "CREATE TABLE booking (id INT PRIMARY KEY, vf TIMESTAMP, vt TIMESTAMP) \
+                 WITH SYSTEM VERSIONING VALID TIME (vf, vt)",
+            ))
+            .expect("create");
+
+        // Two rows whose windows overlap the probe [20, 80) and two backdated to
+        // [100, 200) — entirely outside it. One row per row-group, so each is its
+        // own independently-prunable row-group whatever the business-key sort order.
+        let rows = [(1, 20, 80), (2, 30, 70), (3, 100, 150), (4, 120, 200)];
+        for (txn, &(id, vf, vt)) in rows.iter().enumerate() {
+            let payload = row_codec::encode_payload(&[
+                cell(Some(ScalarValue::Timestamp(vf))),
+                cell(Some(ScalarValue::Timestamp(vt))),
+            ]);
+            engine
+                .insert(
+                    "booking",
+                    business_key(&ScalarValue::Int4(id)),
+                    Some(ValidInterval::new(ValidTimeMicros(vf), ValidTimeMicros(vt)).unwrap()),
+                    payload,
+                    0,
+                    TxnId(u64::try_from(txn).unwrap() + 1),
+                    Principal::new(b"demo".to_vec()),
+                )
+                .expect("insert");
+        }
+        engine.flush().expect("flush seals one row per row-group");
+
+        let footer = |engine: &mut SessionEngine<ZeroClock, MemDisk>, pred: &str| -> QueryStats {
+            let sql = format!("SELECT id FROM booking WHERE PERIOD(vf, vt) {pred}");
+            select(engine, &sql)
+                .stats
+                .expect("a sealed read reports scan stats")
+        };
+
+        // The probe [20, 80) overlaps the first two row-groups but neither backdated
+        // one. The segment as a whole still overlaps it, so the *segment* is not
+        // pruned — the skip happens at row-group granularity.
+        let gap = footer(&mut engine, "OVERLAPS PERIOD(20, 80)");
+        assert_eq!(gap.segments_total, 1, "one sealed segment offered");
+        assert_eq!(gap.segments_scanned, 1, "the segment survives — it is read");
+        assert_eq!(
+            gap.segments_pruned_valid, 0,
+            "the prune is at row-group granularity, not segment-wholesale"
+        );
+        assert_eq!(
+            gap.row_groups_total, 4,
+            "one row per row-group ⇒ four row-groups"
+        );
+        assert_eq!(
+            gap.row_groups_pruned_valid, 2,
+            "the two out-of-window row-groups are pruned on the valid axis — the footer says so"
+        );
+        assert_eq!(
+            gap.row_groups_scanned, 2,
+            "only the overlapping row-groups are read"
+        );
+        assert_eq!(
+            gap.row_groups_scanned + gap.row_groups_pruned(),
+            gap.row_groups_total,
+            "the valid prune keeps scanned + pruned == total honest on the row-group axis"
+        );
+
+        // A probe spanning every window prunes no row-group on the valid axis; all
+        // four are read, so the footer shows no row-group valid prune.
+        let covered = footer(&mut engine, "OVERLAPS PERIOD(0, 250)");
+        assert_eq!(
+            covered.row_groups_pruned_valid, 0,
+            "a probe overlapping every window prunes no row-group on the valid axis"
+        );
+        assert_eq!(covered.row_groups_scanned, 4, "every row-group is read");
     }
 
     // --- STL-218: plain (no-valid-pin) reads of a both-axes table ------------
