@@ -1493,9 +1493,11 @@ pub enum SelectError {
     /// ([STL-244]) was combined with a clause v0.3 does not yet support over a
     /// range. Result shaping, aggregation, and projected provenance compose
     /// ([STL-329]), and an `INNER` `JOIN` is the interval read over the join
-    /// ([STL-344]); still rejected is an `AS OF` point qualifier, a non-`INNER` or
-    /// CTE / derived-table-input `JOIN`, a subquery or period-predicate `WHERE`, a
-    /// computed projection, or a CTE / derived-table source. Each is a tracked
+    /// ([STL-344]) — including one whose input is a CTE / derived table, read as a
+    /// degenerate `[−∞, +∞)`-live side ([STL-349]). Still rejected is an `AS OF`
+    /// point qualifier, a non-`INNER` `JOIN` or a `JOIN` of only materialized sides
+    /// (no axis to range), a subquery or period-predicate `WHERE`, a computed
+    /// projection, or a single-table CTE / derived-table source. Each is a tracked
     /// follow-up; rejected rather than silently mis-bound.
     #[error("unsupported range scan: {0}")]
     UnsupportedSystemRange(String),
@@ -1505,10 +1507,11 @@ pub enum SelectError {
     /// axis allows a `FOR SYSTEM_TIME AS OF` point pin (it fixes the system snapshot
     /// the valid history is read at — `v(k, S, V_range)`), but rejects a
     /// `FOR VALID_TIME AS OF` (a point and a range on the *same* axis), and the same
-    /// residual shapes the system-axis range rejects: a non-`INNER` or CTE /
-    /// derived-table-input `JOIN` ([STL-344]), a subquery or period-predicate
-    /// `WHERE`, a computed projection, or a CTE / derived-table source. Each is a
-    /// tracked follow-up.
+    /// residual shapes the system-axis range rejects: a non-`INNER` `JOIN` or a
+    /// `JOIN` of only materialized sides ([STL-344], [STL-349] — a CTE / derived
+    /// input joined to a valid-axis base side now binds), a subquery or
+    /// period-predicate `WHERE`, a computed projection, or a single-table CTE /
+    /// derived-table source. Each is a tracked follow-up.
     #[error("unsupported valid-time range scan: {0}")]
     UnsupportedValidRange(String),
 
@@ -3102,10 +3105,14 @@ fn bind_join<'a>(
 
     // An interval read over the join ([STL-344]): `Some(valid_axis)` when a system
     // or valid range qualifies the join (the two are mutually exclusive — the parser
-    // lifts one axis). The intersection that defines it ranges every input, so each
-    // must be a base table with the ranged axis; a materialized (CTE / derived) side
-    // has neither system nor valid axis to range, and a valid range additionally
-    // needs every side's valid axis, exactly as the valid pin above does.
+    // lifts one axis). The intersection that defines it ranges every input that *has*
+    // the ranged axis; a materialized (CTE / derived) side has neither system nor
+    // valid axis to range, so it is read once at the statement snapshot and treated
+    // as a degenerate `[−∞, +∞)`-live input ([STL-349], docs/16 §8) — the identity
+    // for interval intersection, contributing no narrowing, so the joined tuple's
+    // period is the intersection of the ranged base sides. A valid range still needs
+    // every *base* side's valid axis (it ranges that axis), exactly as the valid pin
+    // above does; the materialized side is exempt (it has no axis either way).
     let range_axis: Option<bool> = if valid_range.is_some() {
         Some(true)
     } else if system_range.is_some() {
@@ -3114,18 +3121,32 @@ fn bind_join<'a>(
         None
     };
     if let Some(valid_axis) = range_axis {
+        let mut base_sides = 0usize;
         for side in &sides {
+            // A materialized side ([`TableSchema::ephemeral`]'s `SchemaId(0)`) is the
+            // degenerate `[−∞, +∞)`-live input — no axis to range, so the valid-axis
+            // requirement below (which guards a *base* table lacking a valid axis)
+            // does not apply to it.
             if side.schema.schema_id() == SchemaId(0) {
-                return Err(unsupported_range(
-                    valid_axis,
-                    format!("over a CTE / derived table (`{}`) in a JOIN", side.table),
-                ));
+                continue;
             }
+            base_sides += 1;
             if valid_axis && !side.schema.temporal().valid_time_enabled() {
                 return Err(SelectError::ValidTimeUnsupported {
                     table: side.table.to_owned(),
                 });
             }
+        }
+        // At least one input must carry the ranged axis: with every side materialized
+        // there is nothing to range, and the exposed `from`/`to` endpoints would be
+        // the unbounded `[−∞, +∞)` sentinel rather than a real period — reject rather
+        // than expose a meaningless interval ([STL-349]).
+        if base_sides == 0 {
+            return Err(unsupported_range(
+                valid_axis,
+                "over a JOIN with no base-table side to range (every input is a CTE / derived table)"
+                    .to_owned(),
+            ));
         }
     }
 
@@ -9439,18 +9460,68 @@ mod tests {
     }
 
     #[test]
-    fn a_range_over_a_cte_join_side_is_rejected() {
-        // A materialized (CTE / derived) side has no system / valid axis to range,
-        // so the interval read over it is rejected ([STL-344]).
+    fn a_system_range_over_a_cte_join_side_binds() {
+        // A materialized (CTE / derived) side has no system axis to range, so it is
+        // treated as a degenerate `[−∞, +∞)`-live input intersected with the ranged
+        // base side ([STL-349]) — no longer rejected.
+        let catalog = catalog_with_bitemporal_join_tables();
+        let bound = bind(
+            "WITH c AS (SELECT k, v FROM la) \
+             SELECT c.k, lb.v FROM c JOIN lb ON c.k = lb.k FOR SYSTEM_TIME FROM 0 TO 100",
+            &catalog,
+        )
+        .expect("bind a system range over a CTE-side join");
+        assert!(bound.join.is_some(), "the join plan is set");
+        assert!(bound.system_range.is_some(), "the system range is carried");
+    }
+
+    #[test]
+    fn a_valid_range_over_a_cte_join_side_binds_when_a_base_side_has_the_axis() {
+        // The materialized side is exempt from the valid-axis requirement (it has no
+        // axis either way); the base side `lb` carries a valid axis, so the valid
+        // range binds ([STL-349]).
+        let catalog = catalog_with_bitemporal_join_tables();
+        let bound = bind(
+            "WITH c AS (SELECT k, v FROM la) \
+             SELECT c.k, lb.v FROM c JOIN lb ON c.k = lb.k FOR VALID_TIME FROM 0 TO 100",
+            &catalog,
+        )
+        .expect("bind a valid range over a CTE-side join");
+        assert!(bound.join.is_some(), "the join plan is set");
+        assert!(bound.valid_range.is_some(), "the valid range is carried");
+    }
+
+    #[test]
+    fn a_valid_range_over_a_cte_joined_to_a_system_only_base_is_rejected() {
+        // A valid range still ranges every *base* side's valid axis; `sys` is a
+        // system-only base table, so it is rejected — the CTE exemption does not
+        // extend to a base table that genuinely lacks the axis ([STL-349]).
         let catalog = catalog_with_bitemporal_join_tables();
         let err = bind(
             "WITH c AS (SELECT k, v FROM la) \
-             SELECT * FROM c JOIN lb ON c.k = lb.k FOR SYSTEM_TIME FROM 0 TO 100",
+             SELECT c.k, sys.v FROM c JOIN sys ON c.k = sys.k FOR VALID_TIME FROM 0 TO 100",
             &catalog,
         )
         .unwrap_err();
         assert!(
-            matches!(&err, SelectError::UnsupportedSystemRange(what) if what.contains("CTE")),
+            matches!(&err, SelectError::ValidTimeUnsupported { table } if table == "sys"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_range_over_a_join_of_only_materialized_sides_is_rejected() {
+        // With no base-table side there is no axis to range and the exposed endpoints
+        // would be the unbounded `[−∞, +∞)` sentinel, so it is rejected ([STL-349]).
+        let catalog = catalog_with_bitemporal_join_tables();
+        let err = bind(
+            "WITH c AS (SELECT k, v FROM la), d AS (SELECT k, v FROM lb) \
+             SELECT c.k FROM c JOIN d ON c.k = d.k FOR SYSTEM_TIME FROM 0 TO 100",
+            &catalog,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SelectError::UnsupportedSystemRange(what) if what.contains("no base-table side")),
             "got {err:?}"
         );
     }

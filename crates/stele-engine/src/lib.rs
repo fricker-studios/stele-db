@@ -3393,9 +3393,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // valid range are both bound, routing to the range-join path (each input
             // range-scanned, the per-input intervals intersected) rather than the
             // point-snapshot join below. The range is read-committed like the
-            // single-table range path, so the overlay is not threaded ([STL-329]).
+            // single-table range path, so the overlay is not threaded ([STL-329]);
+            // `scope` is, so a CTE / derived input ([STL-349]) is read from its
+            // materialization (which already reflects the overlay, [STL-242]).
             if bound.system_range.is_some() || bound.valid_range.is_some() {
-                return self.run_join_range(bound);
+                return self.run_join_range(bound, scope);
             }
             return self.run_join(bound, overlay, scope);
         }
@@ -5366,13 +5368,23 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// runs over those rows through the shared join helpers, so the range composes
     /// with the rest of the SELECT surface the way the point join does ([STL-264]).
     ///
-    /// The binder restricts this to the `INNER` shape over base-table inputs (a
-    /// `LEFT` / `SEMI` / `ANTI` interval read needs interval *difference*; a
-    /// materialized side has no axis to range — each a tracked follow-up), so every
-    /// input is a base-table range scan and the footer always reports their summed
-    /// accounting. The read is committed-only, like the single-table range path
-    /// ([STL-329]'s read-your-own-writes-over-a-range follow-up applies here too).
-    fn run_join_range(&self, bound: &BoundSelect) -> Result<StatementOutcome, EngineError> {
+    /// The binder restricts this to the `INNER` shape (a `LEFT` / `SEMI` / `ANTI`
+    /// interval read needs interval *difference* — a tracked follow-up). A
+    /// materialized (CTE / derived) input has no axis to range, so it is read once
+    /// from its materialization in `scope` and treated as a degenerate `[−∞, +∞)`-live
+    /// side ([STL-349]) — the identity for the interval intersection, so a joined
+    /// tuple's period is the intersection of the ranged *base* sides; the binder
+    /// guarantees at least one base side, so the exposed endpoints are always a real
+    /// period rather than the unbounded sentinel. The footer reports the base inputs'
+    /// summed scan accounting, suppressed (`None`) when any input is materialized,
+    /// exactly as the point join does ([STL-318]). The read is committed-only, like
+    /// the single-table range path ([STL-329]'s read-your-own-writes-over-a-range
+    /// follow-up applies here too).
+    fn run_join_range(
+        &self,
+        bound: &BoundSelect,
+        scope: &CteScope,
+    ) -> Result<StatementOutcome, EngineError> {
         let join = bound
             .join
             .as_ref()
@@ -5389,10 +5401,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         };
 
         // The leftmost input seeds the accumulated output; each row carries its
-        // range version's interval `[from, to)` (`to == +∞` for an open version),
-        // the running intersection the fold narrows.
+        // range version's interval `[from, to)` (`to == +∞` for an open version, or
+        // the whole `[−∞, +∞)` line for a materialized side, [STL-349]), the running
+        // intersection the fold narrows.
         let (mut acc_rows, mut acc_intervals, mut stats) =
-            self.join_side_range_rows(&join.left, snapshot, axis)?;
+            self.join_side_range_rows(&join.left, snapshot, axis, scope)?;
         let mut acc_meta = join.left.columns.clone();
 
         // Fold each `INNER` step left-deep ([STL-323]): match on the join key through
@@ -5406,7 +5419,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 "the binder rejects a non-INNER range join"
             );
             let (right_rows, right_intervals, right_stats) =
-                self.join_side_range_rows(&step.right, snapshot, axis)?;
+                self.join_side_range_rows(&step.right, snapshot, axis, scope)?;
             let left_keys = range_key_vectors(&acc_rows, &acc_meta, step.left_key)?;
             let right_keys = range_key_vectors(&right_rows, &step.right.columns, step.right_key)?;
             let indices = hash_join(
@@ -5438,7 +5451,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             acc_rows = next_rows;
             acc_intervals = next_intervals;
             acc_meta.extend(step.right.columns.iter().cloned());
-            stats = stats.combine(right_stats);
+            stats = combine_join_stats(stats, right_stats);
         }
 
         // The addressable output: the join columns, then the two intersected period
@@ -5476,9 +5489,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // ([STL-264]), addressing the endpoints as the trailing columns.
         let plan = filter_plan(bound);
         let rows = RowSource::Rows(filter_rows(&plan, &addressable, rows)?);
-        // Every range-join input is a base table, so the footer always reports their
-        // summed scan accounting ([STL-318]) over the rows the read returns.
-        let join_stats = Some(stats);
+        // The base inputs' summed scan accounting ([STL-318]) over the rows the read
+        // returns — `None` (footer suppressed) if any input was a materialized
+        // relation ([STL-349]), the same convention the point join uses.
+        let join_stats = stats;
 
         if let Some(agg) = &bound.aggregate {
             let mut result = run_aggregate(bound, agg, &addressable, &rows)?;
@@ -5500,24 +5514,54 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         }))
     }
 
-    /// Scan one base-table join input over a range axis ([STL-344]) into row-major
-    /// rows paired with each version's interval — the per-side feed
+    /// Scan one join input over a range axis ([STL-344]) into row-major rows paired
+    /// with each row's interval — the per-side feed
     /// [`run_join_range`](Self::run_join_range) folds.
     ///
-    /// Each returned row is the side's canonical `[business key, value cells…]`
+    /// **A base-table side** returns the side's canonical `[business key, value cells…]`
     /// (the same reconstruction [`run_system_range`](Self::run_system_range) /
     /// [`run_valid_range`](Self::run_valid_range) make), paired with that version's
     /// `[from, to)` interval on the ranged axis — the system interval
     /// `[sys_from, sys_to)` or the valid interval `[valid_from, valid_to)`, with
-    /// `to == +∞` ([`SYSTEM_TIME_OPEN`] / [`VALID_TIME_OPEN`]) for an open version.
-    /// The binder guarantees the side is a base table (a materialized side is
-    /// rejected over a range join), so this always reads storage tiers.
+    /// `to == +∞` ([`SYSTEM_TIME_OPEN`] / [`VALID_TIME_OPEN`]) for an open version —
+    /// and `Some` scan accounting for the footer.
+    ///
+    /// **A materialized (CTE / derived) side** ([`SchemaId(0)`](SchemaId), [STL-349])
+    /// has no axis to range: it is read once from its materialization in `scope`
+    /// (already computed at the statement snapshot over the transaction's overlay,
+    /// [`materialize_cte`](Self::materialize_cte)) and each row is paired with the whole
+    /// `[−∞, +∞)` line — the identity for the interval intersection the fold computes,
+    /// so it contributes no narrowing and a joined tuple's period comes from the ranged
+    /// base sides. Its `i64::MIN` lower sentinel is always dominated by a base side's
+    /// finite `from` (the binder guarantees at least one base side), and the `+∞` upper
+    /// is the axis open sentinel. The accounting is `None` (footer suppressed) — the
+    /// relation's storage reads were accounted at materialization, the same convention
+    /// the point join uses ([`join_side_columns`](Self::join_side_columns), [STL-318]).
     fn join_side_range_rows(
         &self,
         side: &BoundJoinSide,
         snapshot: SystemTimeMicros,
         axis: RangeAxis,
+        scope: &CteScope,
     ) -> Result<RangeSideRows, EngineError> {
+        if side.schema_id == SchemaId(0) {
+            let relation = scope
+                .get(side.table.as_str())
+                .ok_or_else(|| EngineError::UnknownTable(side.table.clone()))?;
+            // The binder stamps a materialized relation with exactly its bound column
+            // count; a mismatch is a contract break, surfaced here with context rather
+            // than slipping through to an index panic in the fold's key decode.
+            assert_eq!(
+                relation.columns.len(),
+                side.columns.len(),
+                "a materialized relation carries exactly its bound column count"
+            );
+            let rows = rows_from_columns(&relation.columns, relation.row_count);
+            // Each materialized row is `[−∞, +∞)`-live ([STL-349]): `i64::MIN` is below
+            // every real instant, the axis open sentinel is `+∞`.
+            let intervals = vec![(i64::MIN, axis.open_sentinel()); relation.row_count];
+            return Ok((rows, intervals, None));
+        }
         let state = self
             .tables
             .get(&side.table)
@@ -5569,7 +5613,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 stats
             }
         };
-        Ok((rows, intervals, stats))
+        // A base-table side always reports its scan accounting; a materialized side
+        // returned `None` above ([STL-349]).
+        Ok((rows, intervals, Some(stats)))
     }
 
     /// Scan and hash-join one chain step ([STL-323]).
@@ -9070,6 +9116,26 @@ fn columns_from_rows(rows: Vec<Vec<Option<Vec<u8>>>>, ncols: usize) -> Vec<Colum
         .collect()
 }
 
+/// Transpose a materialized relation's columnar cells ([STL-242]) into the row-major
+/// shape the range-join fold consumes ([STL-349]) — the inverse of
+/// [`columns_from_rows`]. A materialized relation's columns are always
+/// [`Column::Bytes`] (canonical cell encodings, [`MaterializedRelation::from_rows`]);
+/// a fixed-width column never appears, but is reinterpreted losslessly rather than
+/// panicking if one ever did, mirroring [`batch_cell`].
+fn rows_from_columns(columns: &[Column], row_count: usize) -> Vec<Vec<Option<Vec<u8>>>> {
+    (0..row_count)
+        .map(|r| {
+            columns
+                .iter()
+                .map(|col| match col {
+                    Column::Bytes(cells) => cells[r].clone(),
+                    Column::I64(values) => Some(values[r].to_le_bytes().to_vec()),
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Read one valid-time period bound (`valid_from` / `valid_to`) out of an overlaid
 /// row as raw microseconds. The bound is one of the row's value cells, stored as a
 /// little-endian `i64` — a `TIMESTAMP` / `TIMESTAMPTZ` / `BIGINT` cell, all of which
@@ -9270,12 +9336,20 @@ const fn lower_join_type(join_type: JoinType) -> ExecJoinType {
     }
 }
 
-/// One base-table input's range scan for a range-over-join ([STL-344]): the
-/// row-major reconstructed rows `[business key, value cells…]`, the per-row interval
-/// `[from, to)` on the ranged axis (index-aligned to the rows), and the scan
-/// accounting. The fold in [`run_join_range`](SessionEngine::run_join_range)
-/// hash-joins the rows and intersects the intervals.
-type RangeSideRows = (Vec<Vec<Option<Vec<u8>>>>, Vec<(i64, i64)>, ScanStats);
+/// One input's range scan for a range-over-join ([STL-344]): the row-major
+/// reconstructed rows (`[business key, value cells…]` for a base table, the
+/// materialized cells for a CTE / derived side), the per-row interval `[from, to)` on
+/// the ranged axis (index-aligned to the rows), and the side's scan accounting —
+/// `Some` for a base-table scan, `None` for a materialized (CTE / derived) side, whose
+/// storage reads were accounted at materialization ([STL-349], the same
+/// footer-suppression convention the point join uses, [STL-318]). The fold in
+/// [`run_join_range`](SessionEngine::run_join_range) hash-joins the rows and intersects
+/// the intervals.
+type RangeSideRows = (
+    Vec<Vec<Option<Vec<u8>>>>,
+    Vec<(i64, i64)>,
+    Option<ScanStats>,
+);
 
 /// Which temporal axis an interval read over a join ranges ([STL-344]): the system
 /// axis (a version's `[sys_from, sys_to)`) or the valid axis (`[valid_from,

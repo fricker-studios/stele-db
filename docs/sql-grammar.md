@@ -108,12 +108,17 @@ docs/16 §8's pointwise intersection lifted to an interval, so a pair whose inte
 never overlap does not join, and the intersected period endpoints (`sys_from` /
 `sys_to`, or `valid_from` / `valid_to`) are exposed on the join output exactly as a
 single-table range exposes them (STL-244/STL-328/STL-329). The whole left-deep
-`INNER` chain is supported; a `LEFT` / `SEMI` / `ANTI` range join (each needs
-interval *difference* over the unmatched side) and a range join with a CTE / derived
-input (no axis to range) remain follow-ups. The differential oracle
+`INNER` chain is supported, including one whose input is a CTE / derived table: a
+materialized side has no axis to range, so it is read once at the statement snapshot
+and treated as a degenerate `[−∞, +∞)`-live relation (STL-349) — the identity for the
+interval intersection, so a joined tuple's period comes from the ranged base sides
+(at least one input must be a base table, else a range over a join of only
+materialized inputs is rejected — no axis to range). A `LEFT` / `SEMI` / `ANTI` range
+join (each needs interval *difference* over the unmatched side) remains a follow-up.
+The differential oracle
 (`crates/stele-engine/tests/bitemporal_join_range_oracle.rs`) checks the range join
 against joining the inputs' single-table range reads, both axes, across the
-flush/seal boundary.
+flush/seal boundary, with a CTE-side workload covering the materialized input.
 
 ### `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` — temporal range scans (STL-244)
 
