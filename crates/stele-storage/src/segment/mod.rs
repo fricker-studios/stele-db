@@ -6,24 +6,33 @@
 //! ([architecture §3.1–3.2](../../../../docs/02-architecture.md#31-tiered-layout-lsm-flavored-history-preserving),
 //! [ADR-0002](../../../../docs/adr/0002-on-disk-storage-format.md)).
 //!
+//! The canonical, human-readable byte-level spec is
+//! [`docs/segment-format.md`](../../../../docs/segment-format.md) ([STL-261]);
+//! this module is its implementation — `format.rs` (constants), `writer.rs`
+//! (layout), `reader.rs` (parse) — with `FORMAT_VERSION` the source of truth for
+//! the current generation. Keep the two in sync: a format change updates both.
+//!
 //! ## On-disk layout
 //!
 //! ```text
-//! +------------------+
-//! | HEADER (16 B)    |  magic "STLSEG\0\0" || format_version: u16 || flags: u16 || reserved: u32
-//! +------------------+
-//! | ROW-GROUP 0      |  concatenation of COLUMN_CHUNKs in column order
-//! |   COLUMN_CHUNK 0 |    16-B header + CRC32C-protected payload
-//! |   COLUMN_CHUNK 1 |
-//! |   ...            |
-//! +------------------+
-//! | ROW-GROUP 1      |  v0.1 emits exactly one row-group; format supports N
-//! | ...              |
-//! +------------------+
-//! | FOOTER (var)     |  schema_id || flags || row_groups: [ row_count, columns: [ id, codec, offset, length, value_count, min, max ] ]
-//! +------------------+
-//! | TRAILER (16 B)   |  footer_crc: u32 || footer_len: u32 || magic "STLSEGFT"
-//! +------------------+
+//! +---------------------+
+//! | HEADER (16 B)       |  magic "STLSEG\0\0" || format_version: u16 || flags: u16 || reserved: u32
+//! +---------------------+
+//! | ROW-GROUP 0         |  concatenation of COLUMN_CHUNKs in schema order
+//! |   COLUMN_CHUNK 0    |    16-B header + CRC32C-protected payload
+//! |   ...               |
+//! +---------------------+
+//! | ROW-GROUP 1 .. N-1  |  one row-group by default; the writer may bound
+//! | ...                 |    rows/group so a wide segment splits (STL-155/197)
+//! +---------------------+
+//! | RETRACTION CHUNKS   |  payload-less tombstone columns; only if >=1 delete (v7)
+//! +---------------------+
+//! | FOOTER (var)        |  schema_id || flags || row_groups[ row_count, columns[ id, codec, offset, length, value_count, min, max ] ]
+//! |                     |    || retraction_meta || then the optional trailing sections the flags announce:
+//! |                     |    [ bloom (v11) ] [ valid-interval summary (v12) ] [ per-row-group summaries (v14) ]
+//! +---------------------+
+//! | TRAILER (16 B)      |  footer_crc: u32 || footer_len: u32 || magic "STLSEGFT"
+//! +---------------------+
 //! ```
 //!
 //! Every column chunk's CRC32C covers `chunk_header[0..12] || payload`, and
@@ -57,22 +66,23 @@
 //! unknown codec byte mid-footer rather than reject cleanly at the header), the
 //! same generation discipline every change follows.
 //!
-//! ## What is *not* in v0.1
+//! ## Beyond the v0.1 baseline
 //!
-//! * Default multi-row-group writes. The format describes N row-groups and the
-//!   reader walks them all; the writer emits one unless
-//!   [`SegmentWriter::with_max_row_group_rows`] bounds it ([STL-155]), which
-//!   lets the read path scope a column read to the row-groups it needs
-//!   ([`SegmentReader::read_column_in_row_groups`]). Wiring a row-group bound
-//!   into the engine's flush policy is a follow-up; either way it is a
-//!   writer-side choice with no format implications.
-//! * Bloom filters. The footer reserves a stats area per column; the per-column
-//!   min/max stats it records feed the zone-map pruning that landed with
-//!   [STL-89] ([`ZoneMap`]), and bloom filters slot in alongside them as new
-//!   typed fields in a later ticket.
-//! * Schema evolution. v0.1 has one implicit schema id — 0, the implicit
-//!   `Version` schema. Real schema resolution rides on [STL-98]'s versioned
-//!   catalog.
+//! Several things the original v0.1 format deferred have since landed (all
+//! covered above and in [`docs/segment-format.md`](../../../../docs/segment-format.md)):
+//! bounded **multi-row-group** writes — the writer splits when
+//! [`SegmentWriter::with_max_row_group_rows`] bounds it ([STL-155]), wired into
+//! the engine's flush policy by [STL-197], and the read path scopes a column read
+//! to the row-groups it needs ([`SegmentReader::read_column_in_row_groups`]); and
+//! the per-segment business-key **bloom** section ([STL-238]), which rides
+//! alongside the per-column min/max zone-map stats. Both are optional and
+//! advisory (read-gating only, never consulted for a result).
+//!
+//! What is still deferred:
+//!
+//! * Schema evolution. The format still has one implicit schema id — 0, the
+//!   implicit `Version` schema. Real schema resolution rides on [STL-98]'s
+//!   versioned catalog.
 //!
 //! ## Format versioning & pre-transition segments (migration note)
 //!
