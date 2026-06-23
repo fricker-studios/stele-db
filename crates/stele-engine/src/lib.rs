@@ -81,8 +81,8 @@ use stele_exec::{
     AggregateFunc as ExecAggregateFunc, Aggregator, ArithOp as ExecArithOp, Batch, CmpOp, Column,
     DEFAULT_BATCH_SIZE, ExplodePayload, Expr, ExprError, Filter, GatheredColumns, JoinIndices,
     JoinType as ExecJoinType, LogicOp, Operator, ScanError, ScanSource, ScanStats, SnapshotScan,
-    SortKey, SystemRange, Vector, distinct_selection, eval_expr, evaluate, hash_aggregate,
-    hash_join, limit_selection, sort_selection,
+    SortKey, SystemRange, ValidRange, Vector, distinct_selection, eval_expr, evaluate,
+    hash_aggregate, hash_join, limit_selection, sort_selection,
 };
 use stele_sql::Password;
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
@@ -3406,9 +3406,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // projected columns. It reconstructs versions differently from a point read,
         // then routes through the shared `finish_select` tail so result-shaping,
         // aggregation, and the provenance pseudo-columns compose over it ([STL-329]).
-        // The scan reads committed history; the read-your-own-writes overlay is a
-        // deferred follow-up, so `overlay` rides in only for `finish_select`'s
-        // (binder-rejected over a range) subquery shapes.
+        // Inside a transaction the buffered writes overlay the committed version set
+        // (read-your-own-writes, [STL-343]); a system time-travel read has already
+        // dropped the overlay upstream ([`execute_at`](Self::execute_at)).
         if let Some(range) = bound.system_range {
             return self.run_system_range(bound, range, overlay, scope);
         }
@@ -4015,10 +4015,15 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// A key-equality `WHERE` is pushed down to the scan for zone-map pruning; the
     /// full predicate is re-applied over the reconstructed rows.
     ///
-    /// Read-committed only: the read-your-own-writes overlay ([STL-203]) is not
-    /// applied to a range scan (a tracked follow-up), matching the join path; the
-    /// `overlay` / `scope` arguments feed only `finish_select`'s subquery shapes,
-    /// which the binder rejects over a range.
+    /// Read-your-own-writes ([STL-343]): inside a transaction with buffered writes
+    /// for this table, the buffer is spliced into the committed version set
+    /// ([`overlay_system_range_rows`]) before the tail. A buffered write is observed
+    /// at the pinned snapshot `now` (what `now()` folds to): it opens a `[now, +∞)`
+    /// version and closes the prior live one at `now`, so whether the new version
+    /// appears turns on the range's upper bound — a `BETWEEN … AND now()` admits it,
+    /// a half-open `FROM … TO now()` does not. A `FOR SYSTEM_TIME AS OF` system
+    /// time-travel read drops the overlay upstream ([`execute_at`](Self::execute_at)),
+    /// so only the genuinely-current range reads here ever overlay.
     fn run_system_range(
         &self,
         bound: &BoundSelect,
@@ -4086,26 +4091,51 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         .metrics(Arc::clone(&self.metrics));
         let (versions, stats) = scan.execute_range()?;
 
-        // Reconstruct each row as `[key, value cells…, sys_from, sys_to, (provenance…)]`.
-        // `sys_from` is the version's recorded start, `sys_to` its resolved end —
-        // `NULL` for a still-current (open) version, the convention `version_history`
-        // uses. Provenance, when referenced, follows the endpoints.
-        let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(versions.len());
-        for v in &versions {
-            let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(range_addressable.len());
-            row.push(Some(v.business_key.as_bytes().to_vec()));
-            row.extend(row_codec::decode_payload(
-                value_count,
-                v.payload.as_deref(),
-            )?);
-            let open = v.sys_to == SYSTEM_TIME_OPEN;
-            row.push(Some(encode_value(&ScalarValue::TimestampTz(v.sys_from.0))));
-            row.push((!open).then(|| encode_value(&ScalarValue::TimestampTz(v.sys_to.0))));
-            if needs_provenance {
-                row.extend(provenance_cells(&v.provenance));
-            }
-            rows.push(row);
-        }
+        // Read-your-own-writes ([STL-343]): a range read inside a transaction that
+        // has buffered writes for this table observes them, spliced into the
+        // committed version set by [`overlay_system_range_rows`] — a buffered write
+        // opens a `[now, +∞)` version (now = the pinned snapshot, what `now()` folds
+        // to) and closes the prior live one at `now`. The buffer's live values come
+        // from the same unfiltered point scan + fold the single-table overlay uses
+        // ([`overlaid_rows`]); `buffered` is the set of keys it touched (closing each
+        // one's open version), `buffer_live` its surviving rows (the new versions).
+        // With no buffered write for the table both are empty and the helper renders
+        // the committed versions unchanged.
+        let exec_range = SystemRange {
+            lo: range.from.0,
+            hi: range.to.0,
+            closed_upper: range.closed_upper,
+        };
+        let (buffered, buffer_live) = if overlay.iter().any(|d| d.table() == table) {
+            let buffered: BTreeSet<Vec<u8>> = overlay
+                .iter()
+                .filter(|d| d.table() == table)
+                .filter_map(buffered_key_bytes)
+                .collect();
+            let base = Self::scan_all_rows(state, snapshot, value_count, &self.metrics)?;
+            // Only the buffer's own keys ever open a new `[now, +∞)` version, so keep
+            // just those from the merged live state — the rest of the table's live rows
+            // are never looked up and would only bloat the map.
+            let buffer_live: BTreeMap<Vec<u8>, Vec<Option<Vec<u8>>>> =
+                overlay_table_writes(base.rows, overlay, table, value_count, false)
+                    .into_iter()
+                    .filter_map(|r| r.first().cloned().flatten().map(|k| (k, r)))
+                    .filter(|(k, _)| buffered.contains(k))
+                    .collect();
+            (buffered, buffer_live)
+        } else {
+            (BTreeSet::new(), BTreeMap::new())
+        };
+        let rows = overlay_system_range_rows(
+            &versions,
+            &buffered,
+            &buffer_live,
+            exec_range,
+            snapshot.0,
+            value_count,
+            needs_provenance,
+            range_addressable.len(),
+        )?;
 
         // Apply the bound `WHERE` over the reconstructed rows. A subquery `WHERE`
         // is rejected over a range, so the syntactic [`filter_plan`] is exact — and
@@ -4153,8 +4183,15 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// A key-equality `WHERE` is pushed down for zone-map pruning; the full predicate
     /// is re-applied over the reconstructed rows.
     ///
-    /// Read-committed only, like the system-axis range and the join path
-    /// ([STL-203] read-your-own-writes is a tracked follow-up).
+    /// Read-your-own-writes ([STL-343]): inside a transaction with buffered writes for
+    /// this table, the overlay replaces the committed-scan base — the unfiltered
+    /// system-live point scan + buffer fold the single-table overlay uses
+    /// ([`overlaid_rows`](Self::overlaid_rows)), each row's `[valid_from, valid_to)`
+    /// then re-filtered against the range ([`overlay_valid_range_rows`]). A
+    /// retroactive or post-dated buffered write can move a key's valid window into or
+    /// out of the queried range, so the filter runs *after* the overlay, building on
+    /// the [STL-223] overlay + post-overlay re-filter. A `FOR SYSTEM_TIME AS OF` pin
+    /// drops the overlay upstream ([`execute_at`](Self::execute_at)).
     fn run_valid_range(
         &self,
         bound: &BoundSelect,
@@ -4186,59 +4223,86 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let needs_provenance =
             references_provenance(bound, &range_addressable, range_schema_columns.len());
 
-        // Push a business-key equality down for zone-map pruning when the `WHERE`
-        // pins one; the row filter below re-applies the full predicate. The scan's
-        // [`valid_range`](SnapshotScan::valid_range) builder declares the valid-time
-        // policy itself (a valid range is always over a valid-time table — the binder
-        // proved it), so the delta tier's framed payload is stripped to the bare row.
-        let predicate = bound
-            .filter
-            .as_ref()
-            .and_then(BoundPredicate::key_equality)
-            .map_or(Predicate::All, |value| Predicate::Eq {
-                column: ColumnId::BusinessKey,
-                value: ZoneBound::Bytes(encode_value(value)),
-            });
-        let mut project = vec![ColumnId::BusinessKey, ColumnId::Payload];
-        if needs_provenance {
-            project.extend([ColumnId::TxnId, ColumnId::CommittedAt, ColumnId::Principal]);
-        }
-        let readers = state.engine.open_segment_readers()?;
-        let scan = SnapshotScan::new(
-            state.engine.delta(),
-            state.engine.index(),
-            &readers,
-            Snapshot(snapshot),
-        )
-        .project(project)
-        .filter(predicate)
-        .valid_range(range.from.0, range.to.0, range.closed_upper)
-        .metrics(Arc::clone(&self.metrics));
-        let (versions, stats) = scan.execute_valid_range()?;
-
-        // Reconstruct each row as `[key, value cells…, valid_from, valid_to, (provenance…)]`.
-        // The value cells decode from the bare payload (the valid-time period columns
-        // ride the row codec too, so a `SELECT *` still reads the user's `vf`/`vt`);
-        // the appended endpoints are the resolved valid interval — `valid_to` is
-        // `NULL` for an open-ended (`+∞`) period. Provenance, when referenced, follows.
-        let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(versions.len());
-        for (v, interval) in &versions {
-            let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(range_addressable.len());
-            row.push(Some(v.business_key.as_bytes().to_vec()));
-            row.extend(row_codec::decode_payload(
+        let exec_range = ValidRange {
+            lo: range.from.0,
+            hi: range.to.0,
+            closed_upper: range.closed_upper,
+        };
+        let (rows, stats) = if overlay.iter().any(|d| d.table() == table) {
+            // Read-your-own-writes ([STL-343]): a valid-time write supersedes one
+            // system-live version per key ([STL-223]), so the overlay's row set is the
+            // point-read base — the unfiltered system-live scan (provenance-bearing
+            // when referenced) with the buffer folded on — re-filtered on each row's
+            // own `[valid_from, valid_to)` cells against the range. The period columns
+            // ride the row codec ([STL-194]), so the bounds are read straight off
+            // them; a buffered write's provenance is `NULL` ([`overlay_table_writes`]).
+            let (from_idx, to_idx) = valid_period_indices(schema, &schema_columns)
+                .ok_or(EngineError::MalformedValidBound)?;
+            let base = if needs_provenance {
+                Self::scan_all_rows_with_provenance(
+                    state,
+                    snapshot,
+                    None,
+                    value_count,
+                    &self.metrics,
+                )?
+            } else {
+                Self::scan_all_rows(state, snapshot, value_count, &self.metrics)?
+            };
+            let overlaid =
+                overlay_table_writes(base.rows, overlay, table, value_count, needs_provenance);
+            let rows = overlay_valid_range_rows(
+                overlaid,
+                exec_range,
+                from_idx,
+                to_idx,
                 value_count,
-                v.payload.as_deref(),
-            )?);
-            let open = interval.to == VALID_TIME_OPEN;
-            row.push(Some(encode_value(&ScalarValue::TimestampTz(
-                interval.from.0,
-            ))));
-            row.push((!open).then(|| encode_value(&ScalarValue::TimestampTz(interval.to.0))));
+                needs_provenance,
+                range_addressable.len(),
+            )?;
+            (rows, base.stats)
+        } else {
+            // Committed-only fast path. Push a business-key equality down for zone-map
+            // pruning when the `WHERE` pins one; the row filter below re-applies the
+            // full predicate. The [`valid_range`](SnapshotScan::valid_range) builder
+            // declares the valid-time policy itself (a valid range is always over a
+            // valid-time table — the binder proved it), so the delta tier's framed
+            // payload is stripped to the bare row.
+            let predicate = bound
+                .filter
+                .as_ref()
+                .and_then(BoundPredicate::key_equality)
+                .map_or(Predicate::All, |value| Predicate::Eq {
+                    column: ColumnId::BusinessKey,
+                    value: ZoneBound::Bytes(encode_value(value)),
+                });
+            let mut project = vec![ColumnId::BusinessKey, ColumnId::Payload];
             if needs_provenance {
-                row.extend(provenance_cells(&v.provenance));
+                project.extend([ColumnId::TxnId, ColumnId::CommittedAt, ColumnId::Principal]);
             }
-            rows.push(row);
-        }
+            let readers = state.engine.open_segment_readers()?;
+            let scan = SnapshotScan::new(
+                state.engine.delta(),
+                state.engine.index(),
+                &readers,
+                Snapshot(snapshot),
+            )
+            .project(project)
+            .filter(predicate)
+            .valid_range(range.from.0, range.to.0, range.closed_upper)
+            .metrics(Arc::clone(&self.metrics));
+            let (versions, stats) = scan.execute_valid_range()?;
+            // Reconstruct each resolved version's row `[key, value cells…, valid_from,
+            // valid_to, (provenance…)]` — the committed counterpart of the overlay's
+            // [`overlay_valid_range_rows`].
+            let rows = render_valid_range_rows(
+                &versions,
+                value_count,
+                needs_provenance,
+                range_addressable.len(),
+            )?;
+            (rows, stats)
+        };
 
         // Apply the bound `WHERE` over the reconstructed rows (a subquery `WHERE` is
         // rejected over a range; a period-predicate `WHERE` composes — [STL-345]),
@@ -8625,6 +8689,206 @@ fn balanced_logic(terms: Vec<Expr>, op: LogicOp) -> Option<Expr> {
         level = next;
     }
     level.into_iter().next()
+}
+
+/// The business-key bytes a per-key buffered DML targets ([STL-343]). Only
+/// [`Insert`](BoundDml::Insert) / [`Update`](BoundDml::Update) /
+/// [`Delete`](BoundDml::Delete) ever reach a transaction's buffer — the multi-row,
+/// scan-then-write, and `MERGE` shapes are expanded into those at staging
+/// ([`stage_dml`](SessionEngine::stage_dml)) — so any other variant maps to `None`.
+fn buffered_key_bytes(dml: &BoundDml) -> Option<Vec<u8>> {
+    match dml {
+        BoundDml::Insert { key, .. }
+        | BoundDml::Update { key, .. }
+        | BoundDml::Delete { key, .. } => Some(encode_value(key)),
+        _ => None,
+    }
+}
+
+/// Splice a transaction's buffered writes into a system-time range's committed
+/// version set and render the result rows — the read-your-own-writes overlay for
+/// [`run_system_range`](SessionEngine::run_system_range) ([STL-343]).
+///
+/// A buffered write is observed at the transaction's pinned snapshot `s` (the value
+/// `now()` folds to): it opens a new live version `[s, +∞)` and closes the prior one
+/// at `s`. So for every key the buffer touched (`buffered`) the currently-open
+/// committed version is rendered `[sys_from, s)` instead of open — and dropped when
+/// that shrinks it out of the range (an empty `[s, s)` among them) — while every key
+/// the buffer leaves live (`buffer_live`, its `[business key, value cells…]` rows)
+/// contributes a `[s, +∞)` version, included exactly when that interval overlaps the
+/// range. Whether the new version appears therefore turns on the upper bound: a
+/// `BETWEEN … AND now()` (`s <= hi`) admits it, a half-open `FROM … TO now()`
+/// (`s < hi`) does not. A buffered version has no commit provenance yet, so its
+/// pseudo-columns render `NULL`, exactly as the point-read overlay stamps them
+/// ([STL-247], [`overlay_row`]).
+///
+/// Overlap is re-decided by the executor's own [`SystemRange::overlaps`] — the
+/// production predicate the committed scan used, not a re-derivation — so the
+/// closed-prior and new-version cuts agree with it at the half-open / closed
+/// boundary. With `buffered` and `buffer_live` both empty (no buffered write for the
+/// table) every committed version renders unchanged: the committed-only path.
+#[allow(clippy::too_many_arguments)]
+fn overlay_system_range_rows(
+    committed: &[Version],
+    buffered: &BTreeSet<Vec<u8>>,
+    buffer_live: &BTreeMap<Vec<u8>, Vec<Option<Vec<u8>>>>,
+    range: SystemRange,
+    s: i64,
+    value_count: usize,
+    needs_provenance: bool,
+    width: usize,
+) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+    let prov_nulls = if needs_provenance {
+        provenance::PSEUDO_COLUMNS.len()
+    } else {
+        0
+    };
+    // At most one new `[s, +∞)` version per *buffered* key, so size to `buffered`
+    // rather than `buffer_live` (which may hold every live row before its caller
+    // filters it).
+    let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(committed.len() + buffered.len());
+    for v in committed {
+        let open = v.sys_to == SYSTEM_TIME_OPEN;
+        // The buffer closes a touched key's currently-open version at `s`; an
+        // already-closed historical version is untouched by the buffer.
+        let closed_by_buffer = open && buffered.contains(v.business_key.as_bytes());
+        let sys_to = if closed_by_buffer { s } else { v.sys_to.0 };
+        // Closing can shrink a version out of the range (`[sys_from, s)` no longer
+        // reaches it, or the degenerate `[s, s)`); the executor's predicate decides.
+        if closed_by_buffer && !range.overlaps(v.sys_from.0, sys_to) {
+            continue;
+        }
+        let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(width);
+        row.push(Some(v.business_key.as_bytes().to_vec()));
+        row.extend(row_codec::decode_payload(
+            value_count,
+            v.payload.as_deref(),
+        )?);
+        row.push(Some(encode_value(&ScalarValue::TimestampTz(v.sys_from.0))));
+        // `sys_to` is NULL only for a still-open version the buffer did not close.
+        row.push(
+            (closed_by_buffer || !open).then(|| encode_value(&ScalarValue::TimestampTz(sys_to))),
+        );
+        if needs_provenance {
+            row.extend(provenance_cells(&v.provenance));
+        }
+        rows.push(row);
+    }
+    // The buffer's surviving live state opens a `[s, +∞)` version per touched key.
+    // They all share that one interval, so a single overlap check gates the set.
+    if range.overlaps(s, SYSTEM_TIME_OPEN.0) {
+        for key in buffered {
+            let Some(brow) = buffer_live.get(key) else {
+                continue; // the key was net-deleted by the buffer — no live version
+            };
+            let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(width);
+            row.push(Some(key.clone()));
+            row.extend(brow.iter().skip(1).take(value_count).cloned());
+            row.push(Some(encode_value(&ScalarValue::TimestampTz(s))));
+            row.push(None); // still open
+            row.extend(std::iter::repeat_n(None, prov_nulls));
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+/// The `(from, to)` positions of a valid-time table's period columns within a row
+/// (key-then-values) — the indices [`overlay_valid_range_rows`] / [`filter_overlaid_valid`]
+/// read the `[valid_from, valid_to)` bounds from. `None` for a system-only table (so
+/// the caller fails closed rather than reading bounds from the wrong cells).
+fn valid_period_indices(
+    schema: &TableSchema,
+    schema_columns: &[(String, LogicalType)],
+) -> Option<(usize, usize)> {
+    let spec = schema.temporal().valid_time()?;
+    let idx = |name: &str| schema_columns.iter().position(|(n, _)| n == name);
+    Some((idx(spec.from_column())?, idx(spec.to_column())?))
+}
+
+/// Render a committed valid-time range's resolved versions to result rows
+/// `[key, value cells…, valid_from, valid_to, (provenance…)]` ([STL-328]) — the
+/// committed-only counterpart of [`overlay_valid_range_rows`]. The value cells decode
+/// from the bare payload (the valid-time period columns ride the row codec too, so a
+/// `SELECT *` still reads the user's `vf`/`vt`); the appended endpoints are the
+/// resolved valid interval, `valid_to` `NULL` for an open-ended (`+∞`) period;
+/// provenance, when referenced, follows the endpoints.
+fn render_valid_range_rows(
+    versions: &[(Version, ValidInterval)],
+    value_count: usize,
+    needs_provenance: bool,
+    width: usize,
+) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+    let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(versions.len());
+    for (v, interval) in versions {
+        let mut row: Vec<Option<Vec<u8>>> = Vec::with_capacity(width);
+        row.push(Some(v.business_key.as_bytes().to_vec()));
+        row.extend(row_codec::decode_payload(
+            value_count,
+            v.payload.as_deref(),
+        )?);
+        let open = interval.to == VALID_TIME_OPEN;
+        row.push(Some(encode_value(&ScalarValue::TimestampTz(
+            interval.from.0,
+        ))));
+        row.push((!open).then(|| encode_value(&ScalarValue::TimestampTz(interval.to.0))));
+        if needs_provenance {
+            row.extend(provenance_cells(&v.provenance));
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// Re-filter a transaction's overlaid valid-time rows by a valid-time range and
+/// render the result — the read-your-own-writes overlay for
+/// [`run_valid_range`](SessionEngine::run_valid_range) ([STL-343]).
+///
+/// A valid-time write supersedes one system-live version per business key ([STL-223]),
+/// so the buffer's effect is the point-read overlay's row set — [`overlay_table_writes`]
+/// over the unfiltered system-live scan — one row per key carrying its
+/// `[valid_from, valid_to)` in its own value cells ([STL-194]). Each overlaid row is
+/// kept iff that interval overlaps the range, the valid-axis mirror of the committed
+/// scan's [`SnapshotScan::execute_valid_range`] filter — decided here by the
+/// executor's own [`ValidRange::overlaps`], so the two paths agree at the half-open /
+/// closed boundary — then rendered `[key, value cells…, valid_from, valid_to,
+/// (provenance…)]` exactly as the committed path does: `valid_to` is `NULL` for an
+/// open-ended (`+∞`) period, and a buffered write's provenance pseudo-columns are
+/// already `NULL` ([`overlay_table_writes`]).
+///
+/// `from_idx` / `to_idx` are the period columns' positions in a row (key-then-values),
+/// the same indices [`filter_overlaid_valid`] reads.
+#[allow(clippy::too_many_arguments)]
+fn overlay_valid_range_rows(
+    overlaid: Vec<Vec<Option<Vec<u8>>>>,
+    range: ValidRange,
+    from_idx: usize,
+    to_idx: usize,
+    value_count: usize,
+    needs_provenance: bool,
+    width: usize,
+) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+    let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(overlaid.len());
+    for row in overlaid {
+        let vf = valid_bound_micros(&row, from_idx)?;
+        let vt = valid_bound_micros(&row, to_idx)?;
+        if !range.overlaps(vf, vt) {
+            continue;
+        }
+        let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(width);
+        // `[key, value cells…]` carry over verbatim — the user's `vf`/`vt` columns
+        // ride the value cells too ([STL-194]), so a `SELECT *` still reads them.
+        out.extend(row.iter().take(value_count + 1).cloned());
+        out.push(Some(encode_value(&ScalarValue::TimestampTz(vf))));
+        out.push((vt != VALID_TIME_OPEN.0).then(|| encode_value(&ScalarValue::TimestampTz(vt))));
+        if needs_provenance {
+            // Provenance follows the endpoints ([STL-329]); the overlaid row carries
+            // it after the value cells (`NULL` for a buffered write), so copy it across.
+            out.extend(row.iter().skip(value_count + 1).cloned());
+        }
+        rows.push(out);
+    }
+    Ok(rows)
 }
 
 /// Overlay a transaction's buffered writes for `table` onto the snapshot-resolved
