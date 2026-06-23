@@ -81,8 +81,8 @@ use stele_exec::{
     AggregateFunc as ExecAggregateFunc, Aggregator, ArithOp as ExecArithOp, Batch, CmpOp, Column,
     DEFAULT_BATCH_SIZE, ExplodePayload, Expr, ExprError, Filter, GatheredColumns, JoinIndices,
     JoinType as ExecJoinType, LogicOp, Operator, ScanError, ScanSource, ScanStats, SnapshotScan,
-    SortKey, Vector, distinct_selection, eval_expr, evaluate, hash_aggregate, hash_join,
-    limit_selection, sort_selection,
+    SortKey, SystemRange, Vector, distinct_selection, eval_expr, evaluate, hash_aggregate,
+    hash_join, limit_selection, sort_selection,
 };
 use stele_sql::Password;
 use stele_sql::ddl::{DdlOutcome, DdlStatement};
@@ -91,8 +91,8 @@ use stele_sql::merge::{BoundMerge, MergeBound, MergeSource, MergeValid, MergeVal
 use stele_sql::select::{
     AggregateFunc, ArithOp, BoundAggregate, BoundCte, BoundHaving, BoundJoinSide, BoundJoinStep,
     BoundPeriod, BoundPeriodPredicate, BoundPredicate, BoundScalar, BoundSelect,
-    BoundSubqueryFilter, CompareOp, CompositeSemiDecorrelation, Correlation, HavingScalar,
-    JoinType, OutputItem, PeriodEndpoint, Projection, ProjectionItem, ProjectionValue, SelectError,
+    BoundSubqueryFilter, CompareOp, CompositeKeyDecorrelation, Correlation, HavingScalar, JoinType,
+    OutputItem, PeriodEndpoint, Projection, ProjectionItem, ProjectionValue, SelectError,
     SemiAntiDecorrelation, SortTarget, SubqueryKind, SystemTimeRange, ValidTimeRange,
 };
 use stele_sql::{
@@ -3388,6 +3388,15 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // empty slice), so a `FOR SYSTEM_TIME AS OF` join sees committed history and
         // a `FOR VALID_TIME AS OF` join keeps the overlay.
         if bound.join.is_some() {
+            // A range qualifier over the join is the "history of the joined result
+            // over an interval" read ([STL-344]): the join plan *and* a system /
+            // valid range are both bound, routing to the range-join path (each input
+            // range-scanned, the per-input intervals intersected) rather than the
+            // point-snapshot join below. The range is read-committed like the
+            // single-table range path, so the overlay is not threaded ([STL-329]).
+            if bound.system_range.is_some() || bound.valid_range.is_some() {
+                return self.run_join_range(bound);
+            }
             return self.run_join(bound, overlay, scope);
         }
 
@@ -4344,11 +4353,25 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         }
         // A correlated non-negated `IN` on an equality key decorrelates onto a single
         // **composite-key** semi join ([STL-337]) — the same one-scan win for the
-        // two-key shape `EXISTS` could not fold. Every remaining correlation (a range
-        // comparison, `NOT IN`, a scalar lookup, or a non-plain inner) keeps the
-        // per-row fallback below.
+        // two-key shape `EXISTS` could not fold.
         if let Some(plan) = sub.composite_semi_decorrelation() {
             return self.filter_composite_semi_decorrelated(
+                plan,
+                sub,
+                schema_columns,
+                rows,
+                overlay,
+                scope,
+            );
+        }
+        // A correlated `NOT IN` on an equality key decorrelates onto a NULL-aware
+        // composite **anti** join ([STL-346]) — the same composite-key plan, run as an
+        // anti join with per-correlation-group NULL tracking layered on for the 3VL
+        // trap a plain anti join cannot express. Every remaining correlation (a range
+        // comparison, a scalar lookup, or a non-plain inner) keeps the per-row
+        // fallback below.
+        if let Some(plan) = sub.composite_anti_decorrelation() {
+            return self.filter_composite_anti_decorrelated(
                 plan,
                 sub,
                 schema_columns,
@@ -4478,7 +4501,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// never reaches here — it keeps the per-row fallback.
     fn filter_composite_semi_decorrelated(
         &self,
-        plan: CompositeSemiDecorrelation,
+        plan: CompositeKeyDecorrelation,
         sub: &BoundSubqueryFilter,
         schema_columns: &[(String, LogicalType)],
         rows: Vec<Vec<Option<Vec<u8>>>>,
@@ -4526,6 +4549,127 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .iter()
             .map(|&l| std::mem::take(&mut rows[l]))
             .collect())
+    }
+
+    /// Filter the reconstructed outer `rows` by a **decorrelated** correlated `NOT IN`
+    /// — the NULL-aware **composite-key anti-join** path ([STL-346]) the
+    /// [`composite_anti_decorrelation`](BoundSubqueryFilter::composite_anti_decorrelation)
+    /// recognizer selects, replacing the [STL-239] per-row re-execution.
+    ///
+    /// `NOT IN` is **not** a plain anti join. Under SQL three-valued logic, `t.a NOT IN
+    /// (SELECT s.a FROM s WHERE s.k = t.k)` keeps an outer row iff its correlation group
+    /// `{s.a : s.k = t.k}` is empty, **or** `t.a` is non-NULL, the group holds no NULL
+    /// membership value, and `t.a` differs from every member. It is `UNKNOWN` (drop)
+    /// whenever `t.a` is NULL over a non-empty group, or the group contains a NULL
+    /// membership value and `t.a` matches no non-NULL member.
+    ///
+    /// A plain composite anti join — keep `(t.k, t.a)` when no inner `(s.k, s.a)`
+    /// matches — gets every case right **except** it wrongly *keeps* those two
+    /// `UNKNOWN` rows (their composite key is NULL, or no non-NULL inner composite
+    /// matches). So this runs the composite anti join (reusing [`composite_key_vector`],
+    /// like the `IN` semi path) and then drops the over-kept rows with
+    /// **per-correlation-group NULL tracking** built from the *same* single inner scan:
+    ///
+    /// * `nonempty` — the correlation keys `k` (non-NULL) with ≥ 1 inner row
+    ///   (`s.k = k`), i.e. a non-empty group; and
+    /// * `null_member` — those whose group holds a NULL membership value (`s.k = k`,
+    ///   `s.a` NULL).
+    ///
+    /// An anti-kept row drops iff its group is non-empty **and** either its `t.a` is
+    /// NULL or its group is in `null_member` (a non-NULL `t.a` that matched a member
+    /// was already dropped by the anti join). A NULL `t.k` is an empty group —
+    /// `NOT IN ()` is TRUE — and the anti join keeps it (its composite is NULL),
+    /// correctly, with no entry in `nonempty`.
+    ///
+    /// The inner runs **once**, over the same `overlay` and snapshot the outer reads,
+    /// so the per-statement `(sys, valid)` and read-your-own-writes rules hold across
+    /// both join inputs (docs/16 §6, [STL-203]) exactly as the per-row re-runs did.
+    fn filter_composite_anti_decorrelated(
+        &self,
+        plan: CompositeKeyDecorrelation,
+        sub: &BoundSubqueryFilter,
+        schema_columns: &[(String, LogicalType)],
+        rows: Vec<Vec<Option<Vec<u8>>>>,
+        overlay: &[BoundDml],
+        scope: &CteScope,
+    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+        let StatementOutcome::Rows(inner) =
+            self.run_select_scoped(&sub.subquery, overlay, scope)?
+        else {
+            return Err(EngineError::Unsupported("a subquery must be a SELECT"));
+        };
+
+        // Each composite component decodes with its outer column's type: the binder
+        // proved the inner correlation key shares the outer key column's type and the
+        // inner membership the outer tested column's type.
+        let key_ty = schema_columns[plan.outer_key_column].1;
+        let member_ty = schema_columns[plan.outer_member_column].1;
+
+        // The plain composite ANTI join: keep each outer row whose `(t.k, t.a)`
+        // composite matches no inner `(s.k, s.a)` composite (NULL when either component
+        // is NULL, and a NULL key never matches).
+        let outer_keys = composite_key_vector(
+            &rows,
+            (plan.outer_key_column, key_ty),
+            (plan.outer_member_column, member_ty),
+        )?;
+        let inner_keys = composite_key_vector(
+            &inner.rows,
+            (plan.inner_key_column, key_ty),
+            (plan.inner_member_column, member_ty),
+        )?;
+        let indices = hash_join(
+            ExecJoinType::Anti,
+            std::slice::from_ref(&outer_keys),
+            rows.len(),
+            &Expr::col(0),
+            std::slice::from_ref(&inner_keys),
+            inner.rows.len(),
+            &Expr::col(0),
+        )
+        .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
+
+        // Per-correlation-group NULL tracking, built from the same inner scan. A NULL
+        // inner correlation key (`s.k`) matches no outer key (`s.k = t.k` needs both
+        // non-NULL), so it forms no group and is skipped.
+        let inner_key_col = key_vector(&inner.rows, plan.inner_key_column, key_ty)?;
+        let inner_member_col = key_vector(&inner.rows, plan.inner_member_column, member_ty)?;
+        let mut nonempty: HashSet<Vec<u8>> = HashSet::new();
+        let mut null_member: HashSet<Vec<u8>> = HashSet::new();
+        for j in 0..inner.rows.len() {
+            if let Some(sk) = inner_key_col.get(j) {
+                let key = encode_value(&sk);
+                if inner_member_col.get(j).is_none() {
+                    null_member.insert(key.clone());
+                }
+                nonempty.insert(key);
+            }
+        }
+
+        // Drop the rows the plain anti join over-keeps. Decode the outer key / member
+        // components to read each surviving row's `(t.k, t.a)`.
+        let outer_key_col = key_vector(&rows, plan.outer_key_column, key_ty)?;
+        let outer_member_col = key_vector(&rows, plan.outer_member_column, member_ty)?;
+        let mut rows = rows;
+        let mut kept = Vec::with_capacity(indices.left.len());
+        for &l in &indices.left {
+            // A NULL correlation key → empty group → `NOT IN ()` is TRUE → keep.
+            if let Some(tk) = outer_key_col.get(l) {
+                let key = encode_value(&tk);
+                // Non-empty group + (NULL outer value, or a NULL member in the group)
+                // → 3VL `UNKNOWN` → drop. A non-NULL `t.a` equal to a member is already
+                // gone (the anti join dropped it).
+                let drop = nonempty.contains(&key)
+                    && (outer_member_col.get(l).is_none() || null_member.contains(&key));
+                if drop {
+                    continue;
+                }
+            }
+            // The anti join emits each surviving outer row once in ascending probe
+            // order, and this drop pass preserves it, so the outer scan order holds.
+            kept.push(std::mem::take(&mut rows[l]));
+        }
+        Ok(kept)
     }
 
     /// Resolve a bound `SELECT`'s rows through the vectorized operator pipeline
@@ -5130,6 +5274,238 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             rows: out_rows,
             stats,
         }))
+    }
+
+    /// Run a `FOR { SYSTEM_TIME | VALID_TIME } { FROM a TO b | BETWEEN a AND b }`
+    /// range over a join — the "history of the joined result over an interval"
+    /// read ([STL-344]).
+    ///
+    /// This is the interval generalization of the both-axes `AS OF` join
+    /// ([`run_join`](Self::run_join), [STL-243]). Where that pins one `(sys, valid)`
+    /// point and reads one version per key, this **range-scans every input** over
+    /// the qualified interval (the single-table [`run_system_range`](Self::run_system_range)
+    /// / [`run_valid_range`](Self::run_valid_range) version selection, per side) and
+    /// **intersects** the matched versions' intervals: a joined tuple's period is
+    /// `[max(from), min(to))` over its inputs — docs/16 §8's "a temporal join
+    /// intersects both axes", lifted from a point to an interval. An empty
+    /// intersection means the two versions were never both live, so they never join.
+    ///
+    /// The chain folds left-deep over [`hash_join`] exactly as the point path does —
+    /// so the business-key match (NULL never matches, typed equality) is identical —
+    /// carrying each surviving row's running interval intersection alongside. After
+    /// the fold, a row is kept iff its intersected interval **overlaps the query
+    /// range** (the same [`SystemRange::overlaps`] boundary test the single-table
+    /// range applies — the formula is axis-agnostic), and the intersected
+    /// endpoints are appended **unclipped** (the joined tuple's actual period, like
+    /// the single-table range exposes a version's actual period; `min(to) == +∞`
+    /// renders `NULL`). The `WHERE` / aggregate / projection / shaping tail then
+    /// runs over those rows through the shared join helpers, so the range composes
+    /// with the rest of the SELECT surface the way the point join does ([STL-264]).
+    ///
+    /// The binder restricts this to the `INNER` shape over base-table inputs (a
+    /// `LEFT` / `SEMI` / `ANTI` interval read needs interval *difference*; a
+    /// materialized side has no axis to range — each a tracked follow-up), so every
+    /// input is a base-table range scan and the footer always reports their summed
+    /// accounting. The read is committed-only, like the single-table range path
+    /// ([STL-329]'s read-your-own-writes-over-a-range follow-up applies here too).
+    fn run_join_range(&self, bound: &BoundSelect) -> Result<StatementOutcome, EngineError> {
+        let join = bound
+            .join
+            .as_ref()
+            .expect("run_join_range is routed only for a bound join plan");
+        let snapshot = bound.snapshot;
+        let axis = match (bound.system_range, bound.valid_range) {
+            (Some(range), _) => RangeAxis::System(range),
+            (_, Some(range)) => RangeAxis::Valid(range),
+            (None, None) => {
+                return Err(EngineError::Unsupported(
+                    "run_join_range requires a system or valid range",
+                ));
+            }
+        };
+
+        // The leftmost input seeds the accumulated output; each row carries its
+        // range version's interval `[from, to)` (`to == +∞` for an open version),
+        // the running intersection the fold narrows.
+        let (mut acc_rows, mut acc_intervals, mut stats) =
+            self.join_side_range_rows(&join.left, snapshot, axis)?;
+        let mut acc_meta = join.left.columns.clone();
+
+        // Fold each `INNER` step left-deep ([STL-323]): match on the join key through
+        // [`hash_join`] (the point join's exact matching) and intersect the paired
+        // intervals, dropping a pair whose intersection is empty — they were never
+        // both live, so the tuple never joins.
+        for step in &join.steps {
+            debug_assert_eq!(
+                step.join_type,
+                JoinType::Inner,
+                "the binder rejects a non-INNER range join"
+            );
+            let (right_rows, right_intervals, right_stats) =
+                self.join_side_range_rows(&step.right, snapshot, axis)?;
+            let left_keys = range_key_vectors(&acc_rows, &acc_meta, step.left_key)?;
+            let right_keys = range_key_vectors(&right_rows, &step.right.columns, step.right_key)?;
+            let indices = hash_join(
+                ExecJoinType::Inner,
+                &left_keys,
+                acc_rows.len(),
+                &Expr::col(step.left_key),
+                &right_keys,
+                right_rows.len(),
+                &Expr::col(step.right_key),
+            )
+            .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
+
+            let mut next_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(indices.left.len());
+            let mut next_intervals: Vec<(i64, i64)> = Vec::with_capacity(indices.left.len());
+            for (&li, ri) in indices.left.iter().zip(indices.right.iter()) {
+                let ri = ri.expect("an INNER hash join pairs every surviving left with a right");
+                let (lf, lt) = acc_intervals[li];
+                let (rf, rt) = right_intervals[ri];
+                let from = lf.max(rf);
+                let to = lt.min(rt);
+                if from < to {
+                    let mut row = acc_rows[li].clone();
+                    row.extend(right_rows[ri].iter().cloned());
+                    next_rows.push(row);
+                    next_intervals.push((from, to));
+                }
+            }
+            acc_rows = next_rows;
+            acc_intervals = next_intervals;
+            acc_meta.extend(step.right.columns.iter().cloned());
+            stats = stats.combine(right_stats);
+        }
+
+        // The addressable output: the join columns, then the two intersected period
+        // endpoints — the same `[…join columns…, from, to]` shape the single-table
+        // range appends ([STL-329]), so the bound projection (which the binder bound
+        // against the join scope *plus* these endpoints) and the shaping tail address
+        // it identically.
+        let (from_name, to_name) = bound
+            .range_endpoint_names()
+            .expect("a range-join names its period endpoints");
+        let mut addressable = acc_meta;
+        addressable.push((from_name.to_owned(), LogicalType::TimestampTz));
+        addressable.push((to_name.to_owned(), LogicalType::TimestampTz));
+
+        // Keep a tuple iff its intersected interval overlaps the query range (the
+        // joined tuple was live at some instant in it), then append the **unclipped**
+        // endpoints — the tuple's actual period (docs/16 §8), exactly as the
+        // single-table range exposes a version's actual `[sys_from, sys_to)`. The
+        // overlap test reuses the single-table boundary predicate; an open `to`
+        // (`+∞`) renders `NULL`, the convention `run_system_range` shares.
+        let overlap = axis.overlap_window();
+        let open = axis.open_sentinel();
+        let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(acc_rows.len());
+        for (cells, &(from, to)) in acc_rows.into_iter().zip(acc_intervals.iter()) {
+            if overlap.overlaps(from, to) {
+                let mut row = cells;
+                row.push(Some(encode_value(&ScalarValue::TimestampTz(from))));
+                row.push((to != open).then(|| encode_value(&ScalarValue::TimestampTz(to))));
+                rows.push(row);
+            }
+        }
+
+        // The `WHERE` over the materialized rows, then the aggregate or the
+        // projection + shaping tail — the shared single-table / join helpers
+        // ([STL-264]), addressing the endpoints as the trailing columns.
+        let plan = filter_plan(bound);
+        let rows = RowSource::Rows(filter_rows(&plan, &addressable, rows)?);
+        // Every range-join input is a base table, so the footer always reports their
+        // summed scan accounting ([STL-318]) over the rows the read returns.
+        let join_stats = Some(stats);
+
+        if let Some(agg) = &bound.aggregate {
+            let mut result = run_aggregate(bound, agg, &addressable, &rows)?;
+            result.stats = join_stats.map(|s| query_stats(&s, result.rows.len(), snapshot));
+            return Ok(StatementOutcome::Rows(result));
+        }
+
+        let projection = &join.output;
+        let selection = shape_rows(bound, &addressable, projection, &rows)?;
+        let out_rows: Vec<Vec<Option<Vec<u8>>>> = selection
+            .iter()
+            .map(|&r| projection.iter().map(|&i| rows.cell(r, i)).collect())
+            .collect();
+        let stats = join_stats.map(|s| query_stats(&s, out_rows.len(), snapshot));
+        Ok(StatementOutcome::Rows(SelectResult {
+            columns: join.columns.clone(),
+            rows: out_rows,
+            stats,
+        }))
+    }
+
+    /// Scan one base-table join input over a range axis ([STL-344]) into row-major
+    /// rows paired with each version's interval — the per-side feed
+    /// [`run_join_range`](Self::run_join_range) folds.
+    ///
+    /// Each returned row is the side's canonical `[business key, value cells…]`
+    /// (the same reconstruction [`run_system_range`](Self::run_system_range) /
+    /// [`run_valid_range`](Self::run_valid_range) make), paired with that version's
+    /// `[from, to)` interval on the ranged axis — the system interval
+    /// `[sys_from, sys_to)` or the valid interval `[valid_from, valid_to)`, with
+    /// `to == +∞` ([`SYSTEM_TIME_OPEN`] / [`VALID_TIME_OPEN`]) for an open version.
+    /// The binder guarantees the side is a base table (a materialized side is
+    /// rejected over a range join), so this always reads storage tiers.
+    fn join_side_range_rows(
+        &self,
+        side: &BoundJoinSide,
+        snapshot: SystemTimeMicros,
+        axis: RangeAxis,
+    ) -> Result<RangeSideRows, EngineError> {
+        let state = self
+            .tables
+            .get(&side.table)
+            .ok_or_else(|| EngineError::UnknownTable(side.table.clone()))?;
+        let value_count = side.columns.len().saturating_sub(1);
+        let readers = state.engine.open_segment_readers()?;
+        let scan = SnapshotScan::new(
+            state.engine.delta(),
+            state.engine.index(),
+            &readers,
+            Snapshot(snapshot),
+        )
+        .project(vec![ColumnId::BusinessKey, ColumnId::Payload])
+        .valid_time(state.valid_time)
+        .metrics(Arc::clone(&self.metrics));
+
+        // One reconstructed row `[business key, value cells…]` per version (the same
+        // codec the single-table range path decodes), paired with the version's
+        // interval on the ranged axis.
+        let reconstruct = |key: &BusinessKey,
+                           payload: Option<&[u8]>|
+         -> Result<Vec<Option<Vec<u8>>>, EngineError> {
+            let mut cells: Vec<Option<Vec<u8>>> = Vec::with_capacity(value_count + 1);
+            cells.push(Some(key.as_bytes().to_vec()));
+            cells.extend(row_codec::decode_payload(value_count, payload)?);
+            Ok(cells)
+        };
+        let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+        let mut intervals: Vec<(i64, i64)> = Vec::new();
+        let stats = match axis {
+            RangeAxis::System(range) => {
+                let (versions, stats) = scan
+                    .system_range(range.from.0, range.to.0, range.closed_upper)
+                    .execute_range()?;
+                for v in &versions {
+                    rows.push(reconstruct(&v.business_key, v.payload.as_deref())?);
+                    intervals.push((v.sys_from.0, v.sys_to.0));
+                }
+                stats
+            }
+            RangeAxis::Valid(range) => {
+                let (versions, stats) = scan
+                    .valid_range(range.from.0, range.to.0, range.closed_upper)
+                    .execute_valid_range()?;
+                for (v, interval) in &versions {
+                    rows.push(reconstruct(&v.business_key, v.payload.as_deref())?);
+                    intervals.push((interval.from.0, interval.to.0));
+                }
+                stats
+            }
+        };
+        Ok((rows, intervals, stats))
     }
 
     /// Scan and hash-join one chain step ([STL-323]).
@@ -8628,6 +9004,80 @@ const fn lower_join_type(join_type: JoinType) -> ExecJoinType {
         JoinType::Semi => ExecJoinType::Semi,
         JoinType::Anti => ExecJoinType::Anti,
     }
+}
+
+/// One base-table input's range scan for a range-over-join ([STL-344]): the
+/// row-major reconstructed rows `[business key, value cells…]`, the per-row interval
+/// `[from, to)` on the ranged axis (index-aligned to the rows), and the scan
+/// accounting. The fold in [`run_join_range`](SessionEngine::run_join_range)
+/// hash-joins the rows and intersects the intervals.
+type RangeSideRows = (Vec<Vec<Option<Vec<u8>>>>, Vec<(i64, i64)>, ScanStats);
+
+/// Which temporal axis an interval read over a join ranges ([STL-344]): the system
+/// axis (a version's `[sys_from, sys_to)`) or the valid axis (`[valid_from,
+/// valid_to)`). It both selects the per-side range scan
+/// ([`join_side_range_rows`](SessionEngine::join_side_range_rows)) and carries the
+/// query range the intersected interval is filtered against.
+#[derive(Clone, Copy)]
+enum RangeAxis {
+    /// A `FOR SYSTEM_TIME` range — intersect the inputs' system intervals.
+    System(SystemTimeRange),
+    /// A `FOR VALID_TIME` range — intersect the inputs' valid intervals, every
+    /// input read system-live at the statement snapshot.
+    Valid(ValidTimeRange),
+}
+
+impl RangeAxis {
+    /// The half-open / closed overlap window the intersected interval is selected
+    /// by — the same [`SystemRange::overlaps`] boundary test the single-table range
+    /// applies ([STL-244]). The formula is axis-agnostic raw-µs math (`ValidRange`
+    /// draws the identical `<` vs `<=`, [STL-328]), so the system range type serves
+    /// the valid axis too.
+    const fn overlap_window(self) -> SystemRange {
+        let (lo, hi, closed_upper) = match self {
+            Self::System(r) => (r.from.0, r.to.0, r.closed_upper),
+            Self::Valid(r) => (r.from.0, r.to.0, r.closed_upper),
+        };
+        SystemRange {
+            lo,
+            hi,
+            closed_upper,
+        }
+    }
+
+    /// The open-interval sentinel (`+∞`) on the ranged axis — the `to` an open
+    /// version's interval carries, and the value the appended `to` endpoint renders
+    /// as `NULL`. Both axes are `i64::MAX`, but each names its own constant.
+    const fn open_sentinel(self) -> i64 {
+        match self {
+            Self::System(_) => SYSTEM_TIME_OPEN.0,
+            Self::Valid(_) => VALID_TIME_OPEN.0,
+        }
+    }
+}
+
+/// Decode one join-key column out of row-major range rows into the
+/// [`hash_join`]-shaped [`Vector`] set ([STL-344]) — the row-major mirror of
+/// [`decode_key_column`].
+///
+/// Only the `key` slot is a real [`Vector`]; the rest are empty placeholders the
+/// key expression (`Expr::col(key)`) never reads, so a carried-through column is
+/// never forced through the evaluator. The key cells are canonical encodings (a
+/// business key is `encode_value` of the key, a value column its codec cell) —
+/// exactly what a fresh scan's [`decode_key_column`] reads — so the match is
+/// identical to the point join's (NULL never matches, typed equality).
+fn range_key_vectors(
+    rows: &[Vec<Option<Vec<u8>>>],
+    schema: &[(String, LogicalType)],
+    key: usize,
+) -> Result<Vec<Vector>, EngineError> {
+    let column = Column::Bytes(rows.iter().map(|r| r[key].clone()).collect());
+    let mut cols: Vec<Vector> = (0..schema.len())
+        .map(|_| Vector::Bool(Vec::new()))
+        .collect();
+    cols[key] = Vector::from_column(schema[key].1, &column)
+        .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
+    Ok(cols)
 }
 
 /// Decode one side's join-key column into a positional [`Vector`] slot for the
@@ -19957,7 +20407,12 @@ mod tests {
     }
 
     #[test]
-    fn correlated_not_in_null_member_is_the_per_row_three_valued_trap() {
+    fn decorrelated_not_in_drops_the_per_group_null_trap() {
+        // `a NOT IN (SELECT a FROM s WHERE s.k = t.k)` folds onto a NULL-aware
+        // composite ANTI join on `(k, a)` ([STL-346]). The trap a plain anti join
+        // cannot express: a NULL membership value *anywhere* in an outer row's
+        // correlation group makes `NOT IN` UNKNOWN for it, even though its composite
+        // never matches.
         let mut engine = keyed_session();
         for sql in [
             "INSERT INTO t VALUES (1, 100, 5)",
@@ -19967,9 +20422,9 @@ mod tests {
         ] {
             engine.execute(&parse_one(sql)).expect("insert");
         }
-        // The classic trap, evaluated per outer row:
-        //   id 1 (k=100): inner {NULL} → `5 NOT IN (NULL)` is unknown → drop
-        //   id 2 (k=200): inner {8}    → `9 NOT IN (8)` is true       → keep
+        //   id 1 (k=100): group {NULL} → `5 NOT IN (NULL)` UNKNOWN → drop (the
+        //                 per-group NULL trap the post-anti pass catches)
+        //   id 2 (k=200): group {8}    → `9 NOT IN (8)` TRUE       → keep
         let got = subquery_ids(&select(
             &mut engine,
             "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s WHERE s.k = t.k)",
@@ -19982,6 +20437,68 @@ mod tests {
             "SELECT id FROM t WHERE a IN (SELECT a FROM s WHERE s.k = t.k)",
         ));
         assert!(got.is_empty(), "got {got:?}");
+    }
+
+    #[test]
+    fn decorrelated_not_in_keeps_the_complement_of_the_in_semi_join() {
+        // The mirror of `correlated_in_decorrelates_to_a_composite_semi_join`: over a
+        // fixture with no NULLs, `NOT IN` is the exact complement of `IN` on `(k, a)`
+        // ([STL-346]). A right `k` with a wrong `a`, and a right `a` under the wrong
+        // `k`, are kept (no `(k, a)` match); a row matching a member is dropped.
+        let mut engine = keyed_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 100, 5)",
+            "INSERT INTO t VALUES (2, 100, 7)",
+            "INSERT INTO t VALUES (3, 200, 8)",
+            "INSERT INTO t VALUES (4, 200, 9)",
+            "INSERT INTO t VALUES (5, 100, 8)",
+            // Distinct inner `(k, a)` set {(100,5), (100,6), (200,8)}; (100,5) twice.
+            "INSERT INTO s VALUES (10, 100, 5)",
+            "INSERT INTO s VALUES (11, 100, 5)",
+            "INSERT INTO s VALUES (12, 100, 6)",
+            "INSERT INTO s VALUES (13, 200, 8)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        //   id 1 (100,5): ∈ set                    → drop
+        //   id 2 (100,7): 7 ∉ {5,6} under k=100     → keep (right k, wrong a)
+        //   id 3 (200,8): ∈ set                    → drop
+        //   id 4 (200,9): 9 ∉ {8}   under k=200     → keep
+        //   id 5 (100,8): 8 only under k=200        → keep (wrong k)
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s WHERE s.k = t.k)",
+        ));
+        assert_eq!(got, vec![2, 4, 5]);
+    }
+
+    #[test]
+    fn decorrelated_not_in_keeps_empty_groups_and_drops_a_null_outer_value() {
+        // The two non-trap drops/keeps the post-anti pass must get right ([STL-346]):
+        // an empty correlation group keeps regardless of `t.a` (even NULL), and a NULL
+        // `t.a` over a *non-empty* group drops (`NULL NOT IN (non-empty)` is UNKNOWN).
+        let mut engine = keyed_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 100, 5)",
+            "INSERT INTO t VALUES (2, 300, 5)",
+            "INSERT INTO t VALUES (3, 300, NULL)",
+            "INSERT INTO t VALUES (4, 100, NULL)",
+            "INSERT INTO t VALUES (5, NULL, NULL)",
+            "INSERT INTO s VALUES (10, 100, 6)",
+            "INSERT INTO s VALUES (11, 100, 7)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        //   id 1 (100,5):    group {6,7}, 5 ∉, no NULL → `5 NOT IN (6,7)` TRUE → keep
+        //   id 2 (300,5):    empty group → `5 NOT IN ()` TRUE              → keep
+        //   id 3 (300,NULL): empty group → `NULL NOT IN ()` TRUE          → keep
+        //   id 4 (100,NULL): non-empty group → `NULL NOT IN (6,7)` UNKNOWN → drop
+        //   id 5 (NULL,*):   NULL key → empty group → TRUE                → keep
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s WHERE s.k = t.k)",
+        ));
+        assert_eq!(got, vec![1, 2, 3, 5]);
     }
 
     #[test]
@@ -20307,6 +20824,63 @@ mod tests {
         // Era 1: only t id 1 (100,5) is in s's set; era 2 / present: only t id 2 (100,6).
         assert_eq!(at(&mut engine, 4_000), vec![1]);
         assert_eq!(at(&mut engine, 9_000), vec![2]);
+    }
+
+    #[test]
+    fn decorrelated_not_in_inherits_the_outer_statement_snapshot() {
+        // STL-346 DoD (docs/16 §6): the composite anti-join `NOT IN` decorrelation
+        // runs the inner once at the *outer statement's* snapshot, so the one
+        // consistent `(sys, valid)` snapshot holds across both join inputs *and* the
+        // per-group NULL tracking is built from the snapshot's inner set, not the
+        // present. The two eras give genuinely different answers, so reading the
+        // present at either would fail. Same fixture as the `IN` oracle; `NOT IN` is
+        // its complement under these no-NULL groups.
+        let clock = SteppedClock::new(1_000);
+        let mut engine = SessionEngine::open(MemDisk::new(), clock.clone());
+        for ddl in [
+            "CREATE TABLE t (id INT PRIMARY KEY, k INT, a INT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE s (id INT PRIMARY KEY, k INT, a INT) WITH SYSTEM VERSIONING",
+        ] {
+            engine.execute(&parse_one(ddl)).expect("create");
+        }
+        // Era 1 @ 2_000: s's `(k, a)` set is {(100,5), (200,9)}.
+        clock.set(2_000);
+        for sql in [
+            "INSERT INTO t VALUES (1, 100, 5)",
+            "INSERT INTO t VALUES (2, 100, 6)",
+            "INSERT INTO t VALUES (3, 200, 7)",
+            "INSERT INTO s VALUES (10, 100, 5)",
+            "INSERT INTO s VALUES (11, 200, 9)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert era1");
+        }
+        // Era 2 @ 5_000: (100,5) leaves, (100,6) joins.
+        clock.set(5_000);
+        for sql in [
+            "DELETE FROM s WHERE id = 10",
+            "INSERT INTO s VALUES (12, 100, 6)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("update era2");
+        }
+        clock.set(9_000);
+
+        let at = |engine: &mut SessionEngine<SteppedClock, MemDisk>, instant: i64| -> Vec<i32> {
+            let sql = format!(
+                "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s WHERE s.k = t.k) \
+                 FOR SYSTEM_TIME AS OF {instant}"
+            );
+            let StatementOutcome::Rows(r) = engine.execute(&parse_one(&sql)).expect("select")
+            else {
+                panic!("SELECT must return rows");
+            };
+            subquery_ids(&r)
+        };
+        // Era 1 groups k=100→{5}, k=200→{9}: id 1 `5 NOT IN {5}` drops; id 2 `6 NOT IN
+        // {5}` and id 3 `7 NOT IN {9}` keep → [2, 3].
+        assert_eq!(at(&mut engine, 4_000), vec![2, 3]);
+        // Present groups k=100→{6}, k=200→{9}: id 1 `5 NOT IN {6}` keeps; id 2 `6 NOT
+        // IN {6}` drops; id 3 keeps → [1, 3].
+        assert_eq!(at(&mut engine, 9_000), vec![1, 3]);
     }
 
     #[test]

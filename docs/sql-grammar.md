@@ -97,6 +97,24 @@ join output (STL-264) and across an N-way chain (STL-323, see
 [Joins](#joins-stl-172-stl-264-stl-323)); `RIGHT` / `FULL` / non-equi joins
 (STL-270) remain follow-ups.
 
+A `FOR { SYSTEM_TIME | VALID_TIME } { FROM a TO b | BETWEEN a AND b }` **range**
+over a join (STL-344) is the interval generalization of that pinned read — "the
+history of the joined result over the queried window" (`[a, b)` for the half-open
+`FROM..TO`, `[a, b]` for the closed `BETWEEN`, the same boundary contract as the
+single-table range below). Instead of one version per input at a point, every input
+is range-scanned and the matched versions' intervals are **intersected**: a joined
+tuple's period is `[max(from), min(to))` over its inputs —
+docs/16 §8's pointwise intersection lifted to an interval, so a pair whose intervals
+never overlap does not join, and the intersected period endpoints (`sys_from` /
+`sys_to`, or `valid_from` / `valid_to`) are exposed on the join output exactly as a
+single-table range exposes them (STL-244/STL-328/STL-329). The whole left-deep
+`INNER` chain is supported; a `LEFT` / `SEMI` / `ANTI` range join (each needs
+interval *difference* over the unmatched side) and a range join with a CTE / derived
+input (no axis to range) remain follow-ups. The differential oracle
+(`crates/stele-engine/tests/bitemporal_join_range_oracle.rs`) checks the range join
+against joining the inputs' single-table range reads, both axes, across the
+flush/seal boundary.
+
 ### `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` — temporal range scans (STL-244)
 
 ```sql
@@ -154,6 +172,19 @@ keys are restricted to `INT4` / `INT8` / `BOOL` / `TEXT` today, so `GROUP BY
 sys_from` — `TIMESTAMPTZ` — is the pre-existing unsupported-grouping-type error, not
 range-specific.) A range scan is now subject to the simple-query default row cap
 too, like any plain read ([below](#default-row-cap-on-the-simple-query-path-stl-306)).
+
+**Over an `INNER` `JOIN` ([STL-344]).** A range qualifies a join too — the "history
+of the joined result over an interval". Each input is range-scanned and the matched
+versions' intervals are **intersected**: a joined tuple's period is `[max(from),
+min(to))` over its inputs (docs/16 §8's point intersection lifted to an interval), so
+a pair whose intervals don't overlap never joins, and the **intersected** endpoints
+(`sys_from` / `sys_to`, unclipped — the tuple's actual period) are exposed on the
+output. The whole left-deep `INNER` chain is supported (`a JOIN b … JOIN c …`); the
+business-key match, NULL handling, and the `WHERE` / aggregate / `ORDER BY` / `LIMIT`
+tail are the same as the point join's ([STL-264]). The un-ranged axis follows the single-table
+convention (a system range is valid-agnostic; a valid range pins the system snapshot
+and ranges the valid axis). See **Over a `JOIN`** in
+[time-travel select](#for--system_time--valid_time--as-of-expr--time-travel-select).
 
 **Still rejected (tracked follow-ups), never silently dropped.** Combining a system
 range with **any** `AS OF` point qualifier; a `JOIN`; a subquery `WHERE`; a computed
@@ -766,10 +797,11 @@ SELECT id FROM t WHERE a = (SELECT a FROM s WHERE s.id = t.id);        -- scalar
   `IN` false, a scalar `NULL`. The `NOT IN`-with-a-NULL-member trap is evaluated
   against *each* outer row's inner set. Both are checked against DuckDB in the
   nightly differential oracle (`correlated_subquery_differential.rs`).
-- **Decorrelation (STL-317, STL-337).** A correlated `EXISTS` / `NOT EXISTS`, or a
-  non-negated `IN`, whose correlation is an **equality** on the key (`inner.k =
-  outer.k`) and whose inner is a plain single-table scan is lowered to a **hash join**
-  (STL-172's machinery) — one inner scan instead of `O(outer rows)` re-executions:
+- **Decorrelation (STL-317, STL-337, STL-346).** A correlated `EXISTS` / `NOT
+  EXISTS`, `IN`, or `NOT IN`, whose correlation is an **equality** on the key
+  (`inner.k = outer.k`) and whose inner is a plain single-table scan is lowered to a
+  **hash join** (STL-172's machinery) — one inner scan instead of `O(outer rows)`
+  re-executions:
   - **`EXISTS` / `NOT EXISTS`** → a single-key **semi** / **anti** join on the
     correlation key. "∃ an inner row for this outer row" is exactly "the outer key is
     a member of the inner key set", so `SEMI` answers `EXISTS` and `ANTI` `NOT
@@ -781,6 +813,16 @@ SELECT id FROM t WHERE a = (SELECT a FROM s WHERE s.id = t.id);        -- scalar
     into one synthetic key that is NULL when *either* component is NULL — reproducing
     `IN`'s three-valued logic (a NULL membership value or correlation key, on either
     side, never makes `IN` true).
+  - **`NOT IN`** → a **NULL-aware composite-key anti** join on the same
+    `(correlation key, membership value)`. A plain composite anti join is *not* `NOT
+    IN`: under 3VL a NULL membership value anywhere in an outer row's correlation
+    group makes `NOT IN` unknown for it (drop), yet the anti join keeps it (its
+    composite never matches). So the engine layers **per-correlation-group NULL
+    tracking** over the anti join — for each correlation key, whether its inner group
+    is non-empty and whether it holds a NULL member — and drops the over-kept rows: a
+    NULL `t.a` over a non-empty group, or a non-empty group with a NULL member. An
+    empty group keeps (`NOT IN ()` is true), as does a NULL correlation key (its group
+    is empty).
 
   The inner still runs at the outer's `(sys, valid)` snapshot and over the
   read-your-own-writes overlay, so the per-statement snapshot rule (docs/16 §6) holds
@@ -788,10 +830,7 @@ SELECT id FROM t WHERE a = (SELECT a FROM s WHERE s.id = t.id);        -- scalar
   — the nightly DuckDB oracle (`correlated_subquery_differential.rs`) covers both.
 - **Still per-row** (the `O(outer rows × inner cost)` fallback the v0.3 bar permits):
   a **non-equality** correlation (`<` / `>` / … — a range, not key-set membership);
-  correlated **`NOT IN`** (its NULL-in-set trap is *per correlation group* — a NULL
-  membership value anywhere in an outer row's inner set makes `NOT IN` unknown for it
-  — which is not an anti join, so a NULL-aware composite anti is a tracked follow-up,
-  STL-346); and a correlated **scalar** lookup.
+  and a correlated **scalar** lookup.
 
 A scalar subquery also binds in the **select list** — **uncorrelated** (STL-303) or
 **correlated** (STL-331), see

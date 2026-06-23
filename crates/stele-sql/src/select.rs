@@ -480,9 +480,11 @@ pub struct BoundSelect {
     /// [`snapshot`](Self::snapshot) — exposing the period endpoints (`sys_from`,
     /// `sys_to`) as addressable columns after the table's own ([STL-329]). Result
     /// shaping, aggregation, and projected provenance pseudo-columns compose over it;
-    /// mutually exclusive with an `AS OF` point read, and the binder still rejects a
-    /// range combined with a `JOIN`, a subquery / period `WHERE`, a computed
-    /// projection, or a CTE / derived source (each a tracked follow-up).
+    /// mutually exclusive with an `AS OF` point read. A range over an `INNER` `JOIN`
+    /// is the interval read of every input ([STL-344]; the [`join`](Self::join) plan
+    /// is set too); the binder still rejects a range combined with a subquery /
+    /// period `WHERE`, a computed projection, or a CTE / derived source (each a
+    /// tracked follow-up).
     pub system_range: Option<SystemTimeRange>,
     /// A bound `FOR VALID_TIME { FROM a TO b | BETWEEN a AND b }` range ([STL-328]),
     /// or `None`. When `Some`, the query is a **valid-time range scan**: the
@@ -494,8 +496,9 @@ pub struct BoundSelect {
     /// [`valid_snapshot`](Self::valid_snapshot) (a system `AS OF` pin is allowed and
     /// sets [`snapshot`](Self::snapshot)). The same SELECT surface composes over it
     /// as the system range — shaping, aggregation, projected provenance ([STL-329]) —
-    /// and the binder rejects the same residual shapes (subquery / period `WHERE`,
-    /// `JOIN`, computed projection, CTE / derived source).
+    /// a range over an `INNER` `JOIN` is the valid-axis interval read of every input
+    /// ([STL-344]), and the binder rejects the same residual shapes (subquery /
+    /// period `WHERE`, computed projection, CTE / derived source).
     pub valid_range: Option<ValidTimeRange>,
     /// The columns the query projects.
     pub projection: Projection,
@@ -633,6 +636,19 @@ const fn range_endpoint_names(system: bool, valid: bool) -> Option<(&'static str
     }
 }
 
+/// The axis-tagged "unsupported range" error a range-over-JOIN rejection raises
+/// ([STL-344]) — [`UnsupportedValidRange`](SelectError::UnsupportedValidRange) on
+/// the valid axis, [`UnsupportedSystemRange`](SelectError::UnsupportedSystemRange)
+/// on the system axis, so a rejected interval read names the same axis the
+/// qualifier did.
+const fn unsupported_range(valid_axis: bool, what: String) -> SelectError {
+    if valid_axis {
+        SelectError::UnsupportedValidRange(what)
+    } else {
+        SelectError::UnsupportedSystemRange(what)
+    }
+}
+
 /// Build the schema a **range scan** binds its projection, result-shaping,
 /// aggregate, and `WHERE` clauses against ([STL-329]): the table's own columns
 /// followed by the two period endpoints the read appends (`sys_from`/`sys_to`, or
@@ -758,10 +774,10 @@ pub struct Correlation {
 /// rule (a NULL outer key drops under `EXISTS`, survives under `NOT EXISTS`) without
 /// any per-row run.
 ///
-/// `IN` / `NOT IN` (which carry a second equality — the membership column — so they
-/// need a composite key, and whose `NOT IN` NULL-in-set trap is not an anti join)
-/// and a correlated scalar lookup keep the per-row fallback, so this is `None` for
-/// them.
+/// `IN` / `NOT IN` carry a second equality — the membership column — so they need a
+/// composite key and fold onto [`CompositeKeyDecorrelation`] instead (a NULL-aware
+/// anti join for `NOT IN`); a correlated scalar lookup keeps the per-row fallback. So
+/// this single-key recognizer is `None` for all of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SemiAntiDecorrelation {
     /// The join to compute: [`JoinType::Semi`] for `EXISTS`, [`JoinType::Anti`] for
@@ -776,32 +792,38 @@ pub struct SemiAntiDecorrelation {
     pub inner_column: usize,
 }
 
-/// A correlated `IN` subquery lowered to a **composite-key (two-column) semi hash
-/// join** ([STL-337]).
+/// A correlated `IN` / `NOT IN` subquery lowered to a **composite-key (two-column)
+/// hash join** — a **semi** join for `IN` ([STL-337]), a NULL-aware **anti** join for
+/// `NOT IN` ([STL-346]).
 ///
-/// The `IN` analogue of [`SemiAntiDecorrelation`]: `t.a IN (SELECT s.a FROM s WHERE
-/// s.k = t.k)` keeps an outer row iff there is an inner row with `s.k = t.k` **and**
-/// `s.a = t.a` — a two-key semi join, not the single-key one `EXISTS` folds onto.
-/// `hash_join` is single-key, so the engine joins on a **synthetic composite key**
-/// `(correlation key, membership value)` per side; a key is NULL when *either*
-/// component is NULL, so the join's "a NULL key never matches" rule reproduces
-/// `IN`'s three-valued logic exactly — a NULL outer membership value (or correlation
-/// key), or a NULL inner one, can never make `IN` `TRUE`, so the row drops.
+/// The `IN` / `NOT IN` analogue of [`SemiAntiDecorrelation`]: `t.a IN (SELECT s.a
+/// FROM s WHERE s.k = t.k)` keeps an outer row iff there is an inner row with `s.k =
+/// t.k` **and** `s.a = t.a` — a two-key test, not the single-key one `EXISTS` folds
+/// onto. `hash_join` is single-key, so the engine joins on a **synthetic composite
+/// key** `(correlation key, membership value)` per side; a key is NULL when *either*
+/// component is NULL, so the join's "a NULL key never matches" rule reproduces `IN`'s
+/// three-valued logic exactly — a NULL outer membership value (or correlation key),
+/// or a NULL inner one, can never make `IN` `TRUE`, so a `SEMI` join drops the row.
 ///
-/// Recognized by [`BoundSubqueryFilter::composite_semi_decorrelation`]: a
-/// **non-negated** `IN` whose correlation is an **equality** on the key and whose
-/// inner is a plain single-table scan. `NOT IN` is deliberately excluded — its
-/// NULL-in-set trap is per-correlation-group and **not** an anti join (a NULL
-/// membership value anywhere in an outer row's inner set makes `NOT IN` unknown for
-/// it, which a plain composite anti join would wrongly keep), so it stays on the
-/// [STL-239] per-row fallback (a NULL-aware anti variant is a tracked follow-up).
+/// `NOT IN` is **not** a plain anti join: under 3VL a NULL membership value anywhere
+/// in an outer row's correlation group makes `NOT IN` `UNKNOWN` for it (drop), yet a
+/// plain composite anti join *keeps* such a row (its composite never matches). So the
+/// engine layers **per-correlation-group NULL tracking** over the anti join
+/// ([STL-346]). The same plan shape drives both lowerings — the negation only selects
+/// semi vs. anti at execution.
+///
+/// Recognized by [`BoundSubqueryFilter::composite_semi_decorrelation`] (`IN`) and
+/// [`BoundSubqueryFilter::composite_anti_decorrelation`] (`NOT IN`): an `IN` / `NOT
+/// IN` whose correlation is an **equality** on the key and whose inner is a plain
+/// single-table scan. A range correlation, an uncorrelated `IN` / `NOT IN`, and a
+/// non-plain inner stay on the [STL-239] per-row fallback.
 ///
 /// The binder lays the inner result out as `[membership, correlation key]` (it
-/// appends the correlation key after the `IN` membership column — see
+/// appends the correlation key after the membership column — see
 /// `project_in_correlation_key`), so [`inner_member_column`](Self::inner_member_column)
 /// is `0` and [`inner_key_column`](Self::inner_key_column) is `1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompositeSemiDecorrelation {
+pub struct CompositeKeyDecorrelation {
     /// The outer correlation column (by **outer** schema index) — the first
     /// component of the outer probe key (`t.k`).
     pub outer_key_column: usize,
@@ -867,32 +889,52 @@ impl BoundSubqueryFilter {
         })
     }
 
-    /// Recognize a correlated `IN` that decorrelates onto a **composite-key semi
-    /// hash join** ([STL-337]), or `None` to keep the [STL-239] per-row fallback.
+    /// Recognize a correlated **`IN`** that decorrelates onto a **composite-key semi
+    /// hash join** ([STL-337]), or `None` to keep the [STL-239] per-row fallback. The
+    /// `IN` half of `composite_key_decorrelation` (the shared private recognizer).
+    #[must_use]
+    pub fn composite_semi_decorrelation(&self) -> Option<CompositeKeyDecorrelation> {
+        self.composite_key_decorrelation(/* negated = */ false)
+    }
+
+    /// Recognize a correlated **`NOT IN`** that decorrelates onto a NULL-aware
+    /// **composite-key anti hash join** ([STL-346]), or `None` to keep the [STL-239]
+    /// per-row fallback. The `NOT IN` half of `composite_key_decorrelation` (the
+    /// shared private recognizer).
     ///
-    /// Decorrelation is sound only when keeping an outer row is exactly "∃ an inner
-    /// row whose `(correlation key, membership value)` equals the outer
-    /// `(correlation key, tested column)`":
+    /// The recognition is identical to the `IN` case — `NOT IN` reads the same
+    /// `[membership, correlation key]` inner layout, and the per-correlation-group
+    /// NULL trap that distinguishes it from a plain anti join is handled in the
+    /// engine, not the recognizer.
+    #[must_use]
+    pub fn composite_anti_decorrelation(&self) -> Option<CompositeKeyDecorrelation> {
+        self.composite_key_decorrelation(/* negated = */ true)
+    }
+
+    /// Recognize a correlated `IN` (`want_negated = false`) or `NOT IN`
+    /// (`want_negated = true`) that decorrelates onto a composite-key join, or `None`
+    /// to keep the [STL-239] per-row fallback.
     ///
-    /// * the predicate is a **non-negated `IN`** — `NOT IN`'s per-group NULL-in-set
-    ///   trap is not an anti join (see [`CompositeSemiDecorrelation`]), and a scalar
-    ///   / `EXISTS` is a different shape ([`semi_anti_decorrelation`] handles
-    ///   `EXISTS`); and
+    /// Decorrelation is sound only when an outer row's membership in the inner set is
+    /// exactly "∃ an inner row whose `(correlation key, membership value)` equals the
+    /// outer `(correlation key, tested column)`":
+    ///
+    /// * the predicate is the requested `[NOT] IN` — a scalar / `EXISTS` is a
+    ///   different shape ([`semi_anti_decorrelation`] handles `EXISTS`); and
     /// * the correlation comparison is an **equality** (`=`) — a range correlation
     ///   is not key-set membership; and
     /// * the inner is a **plain single base-table scan** (`is_plain_scan`) — the same
     ///   gate `EXISTS` uses, for the same reason (an aggregate / `DISTINCT` /
     ///   `LIMIT` / nested inner can change which rows the membership set contains).
     ///
-    /// For such an `IN` the binder appended the correlation key after the membership
-    /// column (`project_in_correlation_key`), so the inner result is exactly
-    /// `[membership, correlation key]`; this confirms that two-column layout before
-    /// returning a plan, so the engine never reads a column the binder did not
+    /// For such a predicate the binder appended the correlation key after the
+    /// membership column (`project_in_correlation_key`), so the inner result is
+    /// exactly `[membership, correlation key]`; this confirms that two-column layout
+    /// before returning a plan, so the engine never reads a column the binder did not
     /// project (a missing layout falls back to the still-correct per-row path).
     ///
     /// [`semi_anti_decorrelation`]: Self::semi_anti_decorrelation
-    #[must_use]
-    pub fn composite_semi_decorrelation(&self) -> Option<CompositeSemiDecorrelation> {
+    fn composite_key_decorrelation(&self, want_negated: bool) -> Option<CompositeKeyDecorrelation> {
         let correlation = self.correlation?;
         if correlation.op != CompareOp::Eq {
             return None;
@@ -900,14 +942,14 @@ impl BoundSubqueryFilter {
         let SubqueryKind::In { column, negated } = self.kind else {
             return None;
         };
-        if negated {
+        if negated != want_negated {
             return None;
         }
         if !self.subquery.is_plain_scan() {
             return None;
         }
         // The binder appended the correlation key as the inner's second projected
-        // column, so a decorrelatable `IN` inner projects exactly `[membership,
+        // column, so a decorrelatable `[NOT] IN` inner projects exactly `[membership,
         // correlation key]`. Anything else means the layout was not built — keep the
         // per-row path.
         let Projection::Items(items) = &self.subquery.projection else {
@@ -916,7 +958,7 @@ impl BoundSubqueryFilter {
         if items.len() != 2 {
             return None;
         }
-        Some(CompositeSemiDecorrelation {
+        Some(CompositeKeyDecorrelation {
             outer_key_column: correlation.outer_column,
             outer_member_column: column,
             inner_key_column: 1,
@@ -1449,10 +1491,12 @@ pub enum SelectError {
 
     /// A `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` range scan
     /// ([STL-244]) was combined with a clause v0.3 does not yet support over a
-    /// range — any `AS OF` point qualifier, a `JOIN`, an aggregate / `GROUP BY`,
-    /// `DISTINCT` / `ORDER BY` / `LIMIT` / `OFFSET`, a subquery or period-predicate
-    /// `WHERE`, or a CTE / derived-table source. Each is a tracked follow-up;
-    /// rejected rather than silently mis-bound.
+    /// range. Result shaping, aggregation, and projected provenance compose
+    /// ([STL-329]), and an `INNER` `JOIN` is the interval read over the join
+    /// ([STL-344]); still rejected is an `AS OF` point qualifier, a non-`INNER` or
+    /// CTE / derived-table-input `JOIN`, a subquery or period-predicate `WHERE`, a
+    /// computed projection, or a CTE / derived-table source. Each is a tracked
+    /// follow-up; rejected rather than silently mis-bound.
     #[error("unsupported range scan: {0}")]
     UnsupportedSystemRange(String),
 
@@ -1461,8 +1505,10 @@ pub enum SelectError {
     /// axis allows a `FOR SYSTEM_TIME AS OF` point pin (it fixes the system snapshot
     /// the valid history is read at — `v(k, S, V_range)`), but rejects a
     /// `FOR VALID_TIME AS OF` (a point and a range on the *same* axis), and the same
-    /// shaping / aggregate / subquery / period-predicate / `JOIN` / CTE clauses the
-    /// system-axis range rejects. Each is a tracked follow-up.
+    /// residual shapes the system-axis range rejects: a non-`INNER` or CTE /
+    /// derived-table-input `JOIN` ([STL-344]), a subquery or period-predicate
+    /// `WHERE`, a computed projection, or a CTE / derived-table source. Each is a
+    /// tracked follow-up.
     #[error("unsupported valid-time range scan: {0}")]
     UnsupportedValidRange(String),
 
@@ -1727,17 +1773,14 @@ fn bind_select_scoped(
     // clauses compose over the join's output ([STL-264]) — bound against its
     // addressable columns.
     if let Some(join) = detect_join(select) {
-        // A range scan over a join is a tracked follow-up — the single consistent
-        // `(sys, valid)` snapshot rule a join pins (docs/16 §8) does not generalize
-        // to an interval read of every input.
-        if system_range.is_some() {
-            return Err(SelectError::UnsupportedSystemRange(
-                "over a JOIN".to_owned(),
-            ));
-        }
-        if valid_range.is_some() {
-            return Err(SelectError::UnsupportedValidRange("over a JOIN".to_owned()));
-        }
+        // A `FOR { SYSTEM_TIME | VALID_TIME } { FROM a TO b | BETWEEN a AND b }`
+        // range over a join is the "history of the joined result over an interval"
+        // read ([STL-344]): each input is range-scanned and the per-input intervals
+        // are intersected (docs/16 §8's point intersection generalized to an
+        // interval), the intersected period endpoints exposed on the join output.
+        // `bind_join` threads the range through — appending the endpoint columns to
+        // the join scope and restricting to the `INNER` shape the intersection is
+        // defined for.
         let (mut bound, mut side_ctes) = bind_join(
             stmt,
             ctx,
@@ -1747,6 +1790,8 @@ fn bind_select_scoped(
             &sigs,
             snapshot,
             valid_snapshot,
+            system_range,
+            valid_range,
         )?;
         // The `WITH` relations materialize first (a derived join side may reference
         // one), then any derived tables the join sides introduced.
@@ -2985,12 +3030,27 @@ fn detect_join(select: &Select) -> Option<&TableWithJoins> {
 /// [STL-270]) stay rejected (each a tracked follow-up); join reordering /
 /// cost-based planning is out of scope — the chain runs in syntactic, left-deep
 /// order.
-// Eight inputs because the join binds the whole `SELECT` over every relation: the
+/// A `FOR { SYSTEM_TIME | VALID_TIME } { FROM a TO b | BETWEEN a AND b }` range
+/// (`system_range` / `valid_range`, [STL-344]) makes this an **interval read over
+/// the join**: each input is range-scanned and the per-input version intervals are
+/// intersected (docs/16 §8's point intersection lifted to an interval), the
+/// intersected period endpoints (`sys_from`/`sys_to` or `valid_from`/`valid_to`)
+/// appended to the addressable output by [`JoinScope::append_range_endpoints`] so
+/// they ride the same projection / shaping tail a single-table range's do
+/// ([STL-329]). The intersection is defined for the `INNER` shape, so a range over
+/// a `LEFT` / `SEMI` / `ANTI` join — or over a materialized (CTE / derived) side,
+/// which has no system / valid axis to range — is rejected (each a tracked
+/// follow-up).
+// Ten inputs because the join binds the whole `SELECT` over every relation: the
 // statement (temporal qualifiers) and its `query` / `select` halves, the catalog
-// `ctx`, the `from` relations, the CTE `sigs` in scope, and the resolved
-// `(snapshot, valid_snapshot)` pin every input reads at. Bundling any subset only
-// moves the plumbing without clarifying it.
-#[allow(clippy::too_many_arguments)]
+// `ctx`, the `from` relations, the CTE `sigs` in scope, the resolved
+// `(snapshot, valid_snapshot)` pin every input reads at, and the optional system /
+// valid range ([STL-344]). Bundling any subset only moves the plumbing without
+// clarifying it.
+// The chain fold, the range guards, and the projection / shaping / WHERE binders
+// read as one top-to-bottom pass over the join; splitting them would scatter the
+// addressable-output construction the rest of the body depends on.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn bind_join<'a>(
     stmt: &Statement,
     ctx: &'a BindContext<'a>,
@@ -3000,6 +3060,8 @@ fn bind_join<'a>(
     sigs: &[CteSig],
     snapshot: SystemTimeMicros,
     valid_snapshot: Option<SystemTimeMicros>,
+    system_range: Option<SystemTimeRange>,
+    valid_range: Option<ValidTimeRange>,
 ) -> Result<(BoundSelect, Vec<BoundCte>), SelectError> {
     // A `FOR … AS OF` on either axis *is* threaded ([STL-243]); a period predicate
     // over a join stays a follow-up: rejected, never dropped.
@@ -3038,6 +3100,35 @@ fn bind_join<'a>(
         }
     }
 
+    // An interval read over the join ([STL-344]): `Some(valid_axis)` when a system
+    // or valid range qualifies the join (the two are mutually exclusive — the parser
+    // lifts one axis). The intersection that defines it ranges every input, so each
+    // must be a base table with the ranged axis; a materialized (CTE / derived) side
+    // has neither system nor valid axis to range, and a valid range additionally
+    // needs every side's valid axis, exactly as the valid pin above does.
+    let range_axis: Option<bool> = if valid_range.is_some() {
+        Some(true)
+    } else if system_range.is_some() {
+        Some(false)
+    } else {
+        None
+    };
+    if let Some(valid_axis) = range_axis {
+        for side in &sides {
+            if side.schema.schema_id() == SchemaId(0) {
+                return Err(unsupported_range(
+                    valid_axis,
+                    format!("over a CTE / derived table (`{}`) in a JOIN", side.table),
+                ));
+            }
+            if valid_axis && !side.schema.temporal().valid_time_enabled() {
+                return Err(SelectError::ValidTimeUnsupported {
+                    table: side.table.to_owned(),
+                });
+            }
+        }
+    }
+
     // Fold the chain left-deep. `scope` accumulates the addressable output; each
     // step binds its `ON` condition against (the accumulated output) + (the new
     // input), then — for an `INNER` / `LEFT` join — widens the scope with the new
@@ -3046,6 +3137,17 @@ fn bind_join<'a>(
     let mut steps: Vec<BoundJoinStep> = Vec::with_capacity(from.joins.len());
     for (i, join_ast) in from.joins.iter().enumerate() {
         let (join_type, constraint) = join_kind_and_constraint(&join_ast.join_operator)?;
+        // The interval read intersects the inputs' intervals, defined only for an
+        // `INNER` step ([STL-344]); a `LEFT` / `SEMI` / `ANTI` interval read needs
+        // interval *difference* over the unmatched side — a tracked follow-up.
+        if let Some(valid_axis) = range_axis
+            && join_type != JoinType::Inner
+        {
+            return Err(unsupported_range(
+                valid_axis,
+                "over a non-INNER JOIN".to_owned(),
+            ));
+        }
         let new_side = &sides[i + 1];
         let (left_key, right_key) = bind_step_condition(constraint, &scope, new_side)?;
         steps.push(BoundJoinStep {
@@ -3055,6 +3157,17 @@ fn bind_join<'a>(
             right_key,
         });
         scope.push(new_side, join_type);
+    }
+
+    // The interval read exposes the intersected period endpoints; append them now
+    // the addressable output is fully folded ([STL-344]), so they sit past every
+    // input's columns — `SELECT *` includes them and `ORDER BY sys_from` / a named
+    // endpoint resolves through `JoinScope`, exactly as a single-table range's
+    // appended endpoints ([STL-329], [`range_effective_schema`]).
+    if let Some(valid_axis) = range_axis {
+        let names = range_endpoint_names(!valid_axis, valid_axis)
+            .expect("a range axis always names its endpoints");
+        scope.append_range_endpoints(names, valid_axis)?;
     }
 
     // An aggregate query (`GROUP BY`, or an aggregate in the SELECT list) replaces
@@ -3099,10 +3212,11 @@ fn bind_join<'a>(
         schema_id: sides[0].schema.schema_id(),
         snapshot,
         valid_snapshot,
-        // A range scan over a join is rejected at bind time (see the join path in
-        // `bind_select_scoped`), so the join plan never carries one on either axis.
-        system_range: None,
-        valid_range: None,
+        // An interval read over the join carries its range so the engine routes to
+        // the range-join path ([STL-344]); a plain join leaves both `None`. The two
+        // are mutually exclusive (one axis ranges).
+        system_range,
+        valid_range,
         projection: Projection::All,
         filter,
         period_filter: None,
@@ -3500,6 +3614,14 @@ struct JoinScope<'a> {
     dropped: Vec<&'a SideSchema<'a>>,
     /// The flat addressable columns `(name, type)`, in output order.
     columns: Vec<(String, LogicalType)>,
+    /// The count of trailing range-endpoint columns appended past the inputs'
+    /// columns by [`append_range_endpoints`](Self::append_range_endpoints) — `0`
+    /// for a non-range join, `2` for a range over a join ([STL-344]). They are the
+    /// `(sys_from, sys_to)` / `(valid_from, valid_to)` period endpoints the
+    /// interval read exposes; addressable by name (the [`resolve`](Self::resolve)
+    /// fallback) but belonging to no input side, so a qualified `t.sys_from` never
+    /// resolves to one.
+    endpoints: usize,
 }
 
 impl<'a> JoinScope<'a> {
@@ -3518,7 +3640,53 @@ impl<'a> JoinScope<'a> {
             }],
             dropped: Vec::new(),
             columns,
+            endpoints: 0,
         }
+    }
+
+    /// Append the two period-endpoint columns a range scan over a join exposes
+    /// ([STL-344]) — `(sys_from, sys_to)` for a system range, `(valid_from,
+    /// valid_to)` for a valid range, both `TIMESTAMPTZ` — past every input's
+    /// columns, so they ride the addressable output exactly as a single-table
+    /// range's appended endpoints do ([STL-329], [`range_effective_schema`]). With
+    /// them in [`columns`](Self::columns), `SELECT *` over the range-join expands to
+    /// include them and a named projection / `WHERE` / `GROUP BY` / `ORDER BY`
+    /// resolves them through the [`resolve`](Self::resolve) endpoint fallback.
+    ///
+    /// # Errors
+    ///
+    /// Rejects (axis-tagged) when an input already exposes a column named like an
+    /// appended endpoint — the output name would be ambiguous — mirroring the
+    /// single-table [`range_effective_schema`] collision check.
+    fn append_range_endpoints(
+        &mut self,
+        names: (&'static str, &'static str),
+        valid_axis: bool,
+    ) -> Result<(), SelectError> {
+        let reject = |what: String| {
+            Err(if valid_axis {
+                SelectError::UnsupportedValidRange(what)
+            } else {
+                SelectError::UnsupportedSystemRange(what)
+            })
+        };
+        for name in [names.0, names.1] {
+            if self
+                .sides
+                .iter()
+                .any(|s| s.schema.column_index(name).is_some())
+            {
+                return reject(format!(
+                    "over a JOIN whose input has a column named like the appended `{name}` endpoint"
+                ));
+            }
+        }
+        self.columns
+            .push((names.0.to_owned(), LogicalType::TimestampTz));
+        self.columns
+            .push((names.1.to_owned(), LogicalType::TimestampTz));
+        self.endpoints = 2;
+        Ok(())
     }
 
     /// Fold a freshly joined input into the scope: an `INNER` / `LEFT` step widens
@@ -3569,15 +3737,45 @@ impl<'a> JoinScope<'a> {
     /// rejected with a pointed diagnostic rather than addressing a column the output
     /// omits.
     fn resolve(&self, expr: &Expr) -> Result<(usize, LogicalType), SelectError> {
-        match resolve_scope_column(expr, &self.sides) {
-            Ok(index) => Ok((index, self.columns[index].1)),
-            Err(SelectError::UnknownJoinColumn { .. }) if self.names_dropped(expr) => {
-                Err(SelectError::UnsupportedJoinProjection(
-                    "a SEMI/ANTI join exposes only its left table's columns".to_owned(),
-                ))
-            }
-            Err(e) => Err(e),
+        let err = match resolve_scope_column(expr, &self.sides) {
+            Ok(index) => return Ok((index, self.columns[index].1)),
+            Err(e) => e,
+        };
+        // A bare endpoint name (`sys_from` / `valid_to`) resolves to its appended
+        // column ([STL-344]): the endpoints belong to no input side, so
+        // `resolve_scope_column` (which scans the sides) misses them. The collision
+        // check in `append_range_endpoints` guarantees an endpoint name shadows no
+        // input column, so this can only fire after a genuine side miss.
+        if let Some(found) = self.endpoint_index(expr) {
+            return Ok(found);
         }
+        // An unknown column naming a `SEMI` / `ANTI`-dropped input gets the pointed
+        // diagnostic rather than the bare "unknown column".
+        if matches!(err, SelectError::UnknownJoinColumn { .. }) && self.names_dropped(expr) {
+            return Err(SelectError::UnsupportedJoinProjection(
+                "a SEMI/ANTI join exposes only its left table's columns".to_owned(),
+            ));
+        }
+        Err(err)
+    }
+
+    /// Resolve a **bare** identifier to one of the range-endpoint columns appended
+    /// by [`append_range_endpoints`](Self::append_range_endpoints), or `None`
+    /// ([STL-344]). The endpoints occupy the final [`endpoints`](Self::endpoints)
+    /// addressable slots; a qualified reference never matches (endpoints have no
+    /// owning side).
+    fn endpoint_index(&self, expr: &Expr) -> Option<(usize, LogicalType)> {
+        if self.endpoints == 0 {
+            return None;
+        }
+        let Expr::Identifier(id) = unwrap_nested(expr) else {
+            return None;
+        };
+        let base = self.columns.len() - self.endpoints;
+        self.columns[base..]
+            .iter()
+            .position(|(name, _)| name == &id.value)
+            .map(|k| (base + k, self.columns[base + k].1))
     }
 
     /// Whether `expr` names a column of an input dropped by a `SEMI` / `ANTI` step —
@@ -4421,11 +4619,13 @@ fn bind_exists_subquery(
 /// Bind `<column> [NOT] IN (SELECT <col>)`. The outer operand must be a bare
 /// value column, and the inner must return exactly one column of the same type.
 ///
-/// A non-negated, equality-correlated `IN` over a plain-scan inner is shaped for
-/// **composite-key decorrelation** ([STL-337]): its correlation key is appended to
-/// the inner's projection ([`project_in_correlation_key`]) so the engine can fold it
-/// onto a single semi join. `NOT IN`, a range correlation, an uncorrelated `IN`, and
-/// a non-plain inner keep the per-row / once-folded shape (a lone membership column).
+/// An equality-correlated `IN` **or** `NOT IN` over a plain-scan inner is shaped for
+/// **composite-key decorrelation**: its correlation key is appended to the inner's
+/// projection ([`project_in_correlation_key`]) so the engine can fold it onto a
+/// single join — a composite-key semi join for `IN` ([STL-337]), a NULL-aware
+/// composite anti join for `NOT IN` ([STL-346]). A range correlation, an uncorrelated
+/// `IN` / `NOT IN`, and a non-plain inner keep the per-row / once-folded shape (a
+/// lone membership column).
 fn bind_in_subquery(
     lhs: &Expr,
     subquery: &Query,
@@ -4433,13 +4633,17 @@ fn bind_in_subquery(
     outer: &OuterScope,
     ctx: &BindContext,
 ) -> Result<BoundSubqueryFilter, SelectError> {
-    let column = subquery_anchor_column(lhs, outer.schema, outer.table, "IN")?;
+    // Label diagnostics with the predicate as written (`NOT IN` vs `IN`).
+    let what = if negated { "NOT IN" } else { "IN" };
+    let column = subquery_anchor_column(lhs, outer.schema, outer.table, what)?;
     let (mut inner, correlation) =
         bind_inner_query(subquery, outer, ctx, /* exists = */ false)?;
-    check_subquery_column_type(&inner, outer.schema, column, ctx.catalog, "IN")?;
+    check_subquery_column_type(&inner, outer.schema, column, ctx.catalog, what)?;
+    // Both `IN` and `NOT IN` decorrelate onto a composite-key join (semi / anti), and
+    // both read the same `[membership, correlation key]` inner layout, so the negation
+    // does not gate the projection shaping — the recognizer keys off it instead.
     if let Some(corr) = correlation
         && corr.op == CompareOp::Eq
-        && !negated
         && inner.is_plain_scan()
     {
         project_in_correlation_key(&mut inner, corr, ctx.catalog)?;
@@ -4451,18 +4655,20 @@ fn bind_in_subquery(
     })
 }
 
-/// Append the **correlation key** column to a decorrelatable `IN` inner's
-/// projection ([STL-337]), so its result is `[membership, correlation key]` — the
-/// two components the composite-key semi join
-/// ([`BoundSubqueryFilter::composite_semi_decorrelation`]) reads per inner row.
+/// Append the **correlation key** column to a decorrelatable `IN` / `NOT IN` inner's
+/// projection ([STL-337], [STL-346]), so its result is `[membership, correlation
+/// key]` — the two components the composite-key semi / anti join
+/// ([`BoundSubqueryFilter::composite_semi_decorrelation`],
+/// [`BoundSubqueryFilter::composite_anti_decorrelation`]) reads per inner row.
 ///
 /// The membership the `IN` projects is preserved unchanged at result position `0`
-/// (so the [STL-239] per-row fold, which reads column `0`, is unaffected for any `IN`
-/// that does not in fact decorrelate) — it is whatever single column the `IN`
-/// selected, a plain column or a computed expression already type-checked to the
-/// outer column's type. The appended correlation key (`s.k`, a plain column by inner
-/// schema index [`Correlation::inner_column`]) lands at position `1`. The binder
-/// type-checked the membership before this widened the result to two columns.
+/// (so the [STL-239] per-row fold, which reads column `0`, is unaffected for any
+/// `IN` / `NOT IN` that does not in fact decorrelate) — it is whatever single column
+/// the predicate selected, a plain column or a computed expression already
+/// type-checked to the outer column's type. The appended correlation key (`s.k`, a
+/// plain column by inner schema index [`Correlation::inner_column`]) lands at position
+/// `1`. The binder type-checked the membership before this widened the result to two
+/// columns.
 fn project_in_correlation_key(
     inner: &mut BoundSelect,
     correlation: Correlation,
@@ -9133,6 +9339,123 @@ mod tests {
     }
 
     #[test]
+    fn a_system_range_over_an_inner_join_binds_and_exposes_endpoints() {
+        // The interval read over the join ([STL-344]): the join plan *and* the
+        // system range are both set, and `SELECT *` appends the two intersected
+        // period endpoints after every input's columns.
+        let catalog = catalog_with_bitemporal_join_tables();
+        let bound = bind(
+            "SELECT * FROM la JOIN lb ON la.k = lb.k FOR SYSTEM_TIME FROM 0 TO 100",
+            &catalog,
+        )
+        .expect("bind system range over a join");
+        assert!(bound.join.is_some(), "the join plan is set");
+        assert!(bound.system_range.is_some(), "the system range is carried");
+        assert!(bound.valid_range.is_none());
+        let names: Vec<&str> = bound
+            .join
+            .as_ref()
+            .unwrap()
+            .columns
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(
+            &names[names.len() - 2..],
+            ["sys_from", "sys_to"],
+            "`SELECT *` ends with the appended endpoints"
+        );
+    }
+
+    #[test]
+    fn a_valid_range_over_an_inner_join_exposes_valid_endpoints_and_names_them() {
+        // The valid-axis mirror, and a named endpoint resolves through the join
+        // scope ([STL-344]): `valid_from` is projectable past the inputs' columns.
+        let catalog = catalog_with_bitemporal_join_tables();
+        let bound = bind(
+            "SELECT la.k, valid_from, valid_to FROM la JOIN lb ON la.k = lb.k \
+             FOR VALID_TIME FROM 0 TO 100",
+            &catalog,
+        )
+        .expect("bind valid range over a join with named endpoints");
+        assert!(bound.valid_range.is_some(), "the valid range is carried");
+        let names: Vec<&str> = bound
+            .join
+            .as_ref()
+            .unwrap()
+            .columns
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["k", "valid_from", "valid_to"],
+            "the named endpoints project alongside a join column"
+        );
+    }
+
+    #[test]
+    fn a_range_over_a_non_inner_join_is_rejected() {
+        // The interval intersection is defined for the `INNER` shape; a `LEFT` /
+        // `SEMI` / `ANTI` interval read needs interval difference — a follow-up.
+        let catalog = catalog_with_bitemporal_join_tables();
+        for (sql, valid) in [
+            (
+                "SELECT * FROM la LEFT JOIN lb ON la.k = lb.k FOR SYSTEM_TIME FROM 0 TO 100",
+                false,
+            ),
+            (
+                "SELECT * FROM la LEFT JOIN lb ON la.k = lb.k FOR VALID_TIME FROM 0 TO 100",
+                true,
+            ),
+        ] {
+            let err = bind(sql, &catalog).unwrap_err();
+            let ok = if valid {
+                matches!(err, SelectError::UnsupportedValidRange(_))
+            } else {
+                matches!(err, SelectError::UnsupportedSystemRange(_))
+            };
+            assert!(
+                ok,
+                "expected an axis-tagged rejection for `{sql}`, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_range_over_a_system_only_join_side_is_rejected() {
+        // A valid range needs every input to have a valid axis (it ranges that
+        // axis), so a system-only side is rejected — mirroring the valid-pin rule.
+        let catalog = catalog_with_bitemporal_join_tables();
+        let err = bind(
+            "SELECT la.k FROM la JOIN sys ON la.k = sys.k FOR VALID_TIME FROM 0 TO 100",
+            &catalog,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SelectError::ValidTimeUnsupported { table } if table == "sys"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_range_over_a_cte_join_side_is_rejected() {
+        // A materialized (CTE / derived) side has no system / valid axis to range,
+        // so the interval read over it is rejected ([STL-344]).
+        let catalog = catalog_with_bitemporal_join_tables();
+        let err = bind(
+            "WITH c AS (SELECT k, v FROM la) \
+             SELECT * FROM c JOIN lb ON c.k = lb.k FOR SYSTEM_TIME FROM 0 TO 100",
+            &catalog,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SelectError::UnsupportedSystemRange(what) if what.contains("CTE")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
     fn two_system_qualifiers_across_join_inputs_are_rejected() {
         // The per-table SQL:2011 form is sugar for one statement-level pin
         // ([STL-243] — the v0.3 floor). The parser lifts both qualifiers regardless
@@ -9423,7 +9746,7 @@ mod tests {
         );
     }
 
-    // ---- STL-337: composite-key IN decorrelation recognition ----
+    // ---- STL-337 / STL-346: composite-key IN / NOT IN decorrelation recognition ----
 
     /// The bound subquery filter for `sql`, for inspecting the inner shape the
     /// composite-key decorrelation depends on.
@@ -9446,7 +9769,7 @@ mod tests {
         // membership column the outer `a` (column 1).
         assert_eq!(
             filter.composite_semi_decorrelation(),
-            Some(CompositeSemiDecorrelation {
+            Some(CompositeKeyDecorrelation {
                 outer_key_column: 0,
                 outer_member_column: 1,
                 inner_key_column: 1,
@@ -9455,7 +9778,41 @@ mod tests {
         );
         // The binder appended the correlation key after the membership column, so the
         // inner projects exactly `[a, id]` — the two composite-key components in
-        // result order. It is not the single-key `EXISTS` shape.
+        // result order. It is the semi (not anti) shape, and not the single-key
+        // `EXISTS` shape.
+        assert_eq!(
+            filter.subquery.projection,
+            Projection::Items(vec![
+                ProjectionItem::column("a"),
+                ProjectionItem::column("id")
+            ])
+        );
+        assert_eq!(filter.composite_anti_decorrelation(), None);
+        assert_eq!(filter.semi_anti_decorrelation(), None);
+    }
+
+    #[test]
+    fn correlated_not_in_on_an_equality_key_decorrelates_to_a_composite_anti_join() {
+        let catalog = catalog_with_subquery_tables();
+        let filter = subquery_filter(
+            "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s WHERE s.id = t.id)",
+            &catalog,
+        );
+        // `NOT IN` decorrelates onto the same composite-key plan as `IN` ([STL-346]);
+        // the engine runs it as a NULL-aware ANTI join. The recognizer returns the
+        // plan via the anti sibling, and `None` from the semi one.
+        assert_eq!(
+            filter.composite_anti_decorrelation(),
+            Some(CompositeKeyDecorrelation {
+                outer_key_column: 0,
+                outer_member_column: 1,
+                inner_key_column: 1,
+                inner_member_column: 0,
+            })
+        );
+        assert_eq!(filter.composite_semi_decorrelation(), None);
+        // The binder appended the correlation key for `NOT IN` too, so the inner
+        // projects `[a, id]` — the two composite-key components.
         assert_eq!(
             filter.subquery.projection,
             Projection::Items(vec![
@@ -9467,38 +9824,39 @@ mod tests {
     }
 
     #[test]
-    fn not_in_and_non_decorrelatable_in_keep_the_per_row_fallback() {
+    fn non_decorrelatable_in_or_not_in_keeps_the_per_row_fallback() {
         let catalog = catalog_with_subquery_tables();
-        // `NOT IN`'s NULL-in-set trap is per-correlation-group, not an anti join, so
-        // it stays per-row (a NULL-aware anti is a tracked follow-up). Its inner is
-        // left as the lone membership column.
-        let not_in = subquery_filter(
-            "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s WHERE s.id = t.id)",
-            &catalog,
-        );
-        assert_eq!(not_in.composite_semi_decorrelation(), None);
-        assert_eq!(
-            not_in.subquery.projection,
-            Projection::Items(vec![ProjectionItem::column("a")])
-        );
-        // A range correlation is not key-set membership.
-        assert_eq!(
-            subquery_filter(
-                "SELECT id FROM t WHERE a IN (SELECT a FROM s WHERE s.id > t.id)",
-                &catalog,
-            )
-            .composite_semi_decorrelation(),
-            None
-        );
-        // An *uncorrelated* IN folds to an OR-set once, not a join — and its inner is
-        // never widened.
-        let uncorrelated =
-            subquery_filter("SELECT id FROM t WHERE a IN (SELECT a FROM s)", &catalog);
-        assert_eq!(uncorrelated.composite_semi_decorrelation(), None);
-        assert_eq!(
-            uncorrelated.subquery.projection,
-            Projection::Items(vec![ProjectionItem::column("a")])
-        );
+        // A range correlation is not key-set membership — neither `IN` nor `NOT IN`
+        // folds onto a composite key, and the inner is left as the lone membership
+        // column.
+        for sql in [
+            "SELECT id FROM t WHERE a IN (SELECT a FROM s WHERE s.id > t.id)",
+            "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s WHERE s.id > t.id)",
+        ] {
+            let filter = subquery_filter(sql, &catalog);
+            assert_eq!(filter.composite_semi_decorrelation(), None, "{sql}");
+            assert_eq!(filter.composite_anti_decorrelation(), None, "{sql}");
+            assert_eq!(
+                filter.subquery.projection,
+                Projection::Items(vec![ProjectionItem::column("a")]),
+                "{sql}"
+            );
+        }
+        // An *uncorrelated* IN / NOT IN folds to an OR-set once, not a join — and its
+        // inner is never widened.
+        for sql in [
+            "SELECT id FROM t WHERE a IN (SELECT a FROM s)",
+            "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s)",
+        ] {
+            let uncorrelated = subquery_filter(sql, &catalog);
+            assert_eq!(uncorrelated.composite_semi_decorrelation(), None, "{sql}");
+            assert_eq!(uncorrelated.composite_anti_decorrelation(), None, "{sql}");
+            assert_eq!(
+                uncorrelated.subquery.projection,
+                Projection::Items(vec![ProjectionItem::column("a")]),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
@@ -9527,7 +9885,20 @@ mod tests {
         let catalog = catalog_with_subquery_tables();
         // `t.a` is INT, `s2.b` is TEXT — no implicit coercion.
         let err = bind("SELECT id FROM t WHERE a IN (SELECT b FROM s2)", &catalog).unwrap_err();
-        assert!(matches!(err, SelectError::Subquery(_)), "got {err:?}");
+        assert!(
+            matches!(&err, SelectError::Subquery(msg) if msg.starts_with("IN yields")),
+            "got {err:?}"
+        );
+        // `NOT IN` labels the same diagnostic with the predicate as written.
+        let err = bind(
+            "SELECT id FROM t WHERE a NOT IN (SELECT b FROM s2)",
+            &catalog,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SelectError::Subquery(msg) if msg.starts_with("NOT IN yields")),
+            "got {err:?}"
+        );
     }
 
     #[test]
