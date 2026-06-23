@@ -332,7 +332,7 @@ Both jobs add `attestations: write` to their (otherwise least-privilege) permiss
 
 ```bash
 # A downloaded binary archive (provenance is looked up by its digest)
-gh attestation verify stele-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz --repo <owner>/stele
+gh attestation verify stele-vX.Y.Z-x86_64-linux.tar.gz --repo <owner>/stele
 
 # The image (provenance travels with the digest in ghcr.io)
 gh attestation verify oci://ghcr.io/<owner>/stele:vX.Y.Z --repo <owner>/stele
