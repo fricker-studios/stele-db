@@ -42,12 +42,22 @@
 //! workload is replayed across the delta/sealed flush boundary — history a range join
 //! must reconstruct identically whether a version is staged or sealed.
 //!
+//! A **CTE / derived-table input** ([STL-349]) is the degenerate `[−∞, +∞)`-live side:
+//! it has no axis to range, so it is read once at the statement snapshot and the
+//! reference models it ([`cte_side_rows`]) as a constant relation — the identity for
+//! the `INNER` intersection, so a joined tuple's period comes from the ranged base
+//! side. A materialized side is `INNER`-only (the binder rejects it in the outer /
+//! filtering shapes), so the CTE sweep runs the `INNER` differential with one side
+//! materialized, plus a focused test that the CTE joins *every* historical base version.
+//!
 //! [docs/06 §4]: ../../../docs/06-testing-strategy.md#4-correctness-oracles-the-temporal-heart
+//! [STL-100]: https://allegromusic.atlassian.net/browse/STL-100
 //! [STL-243]: https://allegromusic.atlassian.net/browse/STL-243
 //! [STL-244]: https://allegromusic.atlassian.net/browse/STL-244
 //! [STL-328]: https://allegromusic.atlassian.net/browse/STL-328
 //! [STL-344]: https://allegromusic.atlassian.net/browse/STL-344
 //! [STL-348]: https://allegromusic.atlassian.net/browse/STL-348
+//! [STL-349]: https://allegromusic.atlassian.net/browse/STL-349
 
 use stele_common::time::{Clock, SystemTimeMicros};
 use stele_common::types::ScalarValue;
@@ -565,6 +575,52 @@ fn engine_join(
     let sql = format!(
         "SELECT {}, {from_col}, {to_col} FROM {seed}{joins} {clause}",
         proj.join(", ")
+    );
+    let mut rows = select(engine, &sql);
+    rows.sort();
+    rows
+}
+
+/// A materialized (CTE / derived) join side modeled as a constant `[−∞, +∞)`-live
+/// relation ([STL-349]): the underlying table's *current* snapshot — a plain
+/// `SELECT id, v` (the heavily-oracle-backed point read, [STL-100], and exactly the
+/// body the engine query's `WITH c AS (SELECT id, v FROM …)` materializes) — with
+/// each row live across the whole ranged axis (`from = i64::MIN`, `to = i64::MAX`).
+/// Intersected with the ranged base sides, that interval is the identity, so the CTE
+/// contributes no narrowing and a joined tuple's period comes from the base sides.
+fn cte_side_rows(engine: &mut SessionEngine<ZeroClock, MemDisk>, table: &str) -> Vec<SideRow> {
+    let sql = format!("SELECT id, v FROM {table}");
+    select(engine, &sql)
+        .into_iter()
+        .map(|r| SideRow {
+            key: r[0].clone().expect("the id PRIMARY KEY is never NULL"),
+            val: r[1].clone(),
+            from: i64::MIN,
+            to: i64::MAX,
+        })
+        .collect()
+}
+
+/// The engine's rows for an `INNER` range over `c JOIN base`, where `c` is a CTE
+/// wrapping the *current* snapshot of `cte_src` (`WITH c AS (SELECT id, v FROM cte_src)`)
+/// — the CTE-side range join ([STL-349]). Projected `[c.id, c.v, base.id, base.v,
+/// from, to]` to match [`reference`]'s shape with the CTE as side 0, sorted to compare
+/// as a set.
+fn engine_cte_join(
+    engine: &mut SessionEngine<ZeroClock, MemDisk>,
+    cte_src: &str,
+    base: &str,
+    axis: Axis,
+    lo: i64,
+    hi: i64,
+    closed: bool,
+) -> Vec<Vec<Option<Vec<u8>>>> {
+    let (from_col, to_col) = endpoint_names(axis);
+    let clause = range_clause(axis, lo, hi, closed);
+    let sql = format!(
+        "WITH c AS (SELECT id, v FROM {cte_src}) \
+         SELECT c.id, c.v, {base}.id, {base}.v, {from_col}, {to_col} \
+         FROM c JOIN {base} ON c.id = {base}.id {clause}"
     );
     let mut rows = select(engine, &sql);
     rows.sort();
@@ -1119,4 +1175,124 @@ fn left_and_anti_fragment_a_left_version_around_a_mid_window_match() {
         vec![vec![id1, l10, ts(t2), ts(t3)]],
         "SEMI keeps the matched sub-interval"
     );
+}
+
+#[test]
+fn inner_range_join_with_a_cte_side_matches_the_reference_across_axes_seeds_and_boundaries() {
+    // An `INNER` range over `c JOIN r`, where `c` is a CTE wrapping the *current*
+    // snapshot of `l` ([STL-349]): the materialized side has no axis to range, so it is
+    // the degenerate `[−∞, +∞)`-live input the reference models with `cte_side_rows`.
+    // The base side `r` ranges as before; the CTE contributes the intersection
+    // identity, so a joined tuple's period is `r`'s. Swept over both axes, several
+    // seeds, every flush mode, and the boundary grid — the same differential the
+    // all-base `INNER` sweep runs, with one side materialized. (A materialized side is
+    // `INNER`-only — the binder rejects it in a `LEFT` / `SEMI` / `ANTI` range join.)
+    let steps = [RefJoin::Inner];
+    let mut probes: u64 = 0;
+    let mut rows_seen: u64 = 0;
+    for axis in [Axis::System, Axis::Valid] {
+        for seed in 0..6u64 {
+            for flush in [FlushMode::Never, FlushMode::Midway, FlushMode::Full] {
+                let (mut engine, commits) = build(seed, axis, flush, &["l", "r"]);
+                let marks = match axis {
+                    Axis::System => boundary_grid(&commits),
+                    Axis::Valid => (0..=(VMAX + 1)).collect(),
+                };
+                for (i, &lo) in marks.iter().enumerate() {
+                    for &hi in &marks[i..] {
+                        for &closed in &[false, true] {
+                            if !closed && lo >= hi {
+                                continue; // a half-open FROM..TO needs lo < hi
+                            }
+                            let sides = vec![
+                                cte_side_rows(&mut engine, "l"),
+                                side_rows(&mut engine, "r", axis, lo, hi, closed),
+                            ];
+                            let want = reference(
+                                &sides,
+                                &steps,
+                                lo,
+                                hi,
+                                closed,
+                                Combine::Intersect,
+                                Difference::Subtract,
+                            );
+                            let got = engine_cte_join(&mut engine, "l", "r", axis, lo, hi, closed);
+                            assert_eq!(
+                                got, want,
+                                "{axis:?} seed {seed}, {flush:?}, [{lo},{hi}) closed={closed}"
+                            );
+                            rows_seen += u64::try_from(got.len()).expect("fits");
+                            probes += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        rows_seen > 0,
+        "every probe was empty — the CTE-side join joined nothing"
+    );
+    assert!(
+        probes > 2_000,
+        "differential probed only {probes} cells — widen the sweep"
+    );
+}
+
+#[test]
+fn a_cte_side_joins_every_historical_base_version() {
+    // The teeth of the materialized-side semantics ([STL-349]): the CTE is a single
+    // snapshot, but treated as live across the whole system axis, so it joins *every*
+    // historical version of the ranged base side — not just the one live at `now` —
+    // and the joined period is the base version's own (the CTE's `[−∞, +∞)`
+    // contributes no narrowing). Were the engine to pin the CTE to a point, the older
+    // two rows would vanish; were it to clip the period to the CTE, they would shift.
+    let mut engine = SessionEngine::open(MemDisk::new(), ZeroClock);
+    run(
+        &mut engine,
+        "CREATE TABLE base (id INT PRIMARY KEY, v INT) WITH SYSTEM VERSIONING",
+    );
+    run(
+        &mut engine,
+        "CREATE TABLE snap (id INT PRIMARY KEY, v INT) WITH SYSTEM VERSIONING",
+    );
+    run(&mut engine, "INSERT INTO snap VALUES (1, 99)");
+    run(&mut engine, "INSERT INTO base VALUES (1, 10)");
+    let t1 = engine.commit_clock().0; // base.v=10 opens at t1
+    run(&mut engine, "UPDATE base SET v = 11 WHERE id = 1");
+    let t2 = engine.commit_clock().0; // closes 10 at t2, opens 11
+    run(&mut engine, "UPDATE base SET v = 12 WHERE id = 1");
+    let t3 = engine.commit_clock().0; // closes 11 at t3, opens 12 (open-ended)
+    let upper = t3 + 10;
+
+    let rows = {
+        let mut r = select(
+            &mut engine,
+            &format!(
+                "WITH c AS (SELECT id, v FROM snap) \
+                 SELECT c.v, base.v, sys_from, sys_to \
+                 FROM c JOIN base ON c.id = base.id FOR SYSTEM_TIME FROM 0 TO {upper}"
+            ),
+        );
+        r.sort();
+        r
+    };
+    // [c.v, base.v, sys_from, sys_to], one row per base version, each carrying base's
+    // own period (the open final version renders NULL sys_to).
+    let row = |bv: i32, from: i64, to: Option<i64>| {
+        vec![
+            Some(enc(&ScalarValue::Int4(99))),
+            Some(enc(&ScalarValue::Int4(bv))),
+            Some(enc(&ScalarValue::TimestampTz(from))),
+            to.map(|t| enc(&ScalarValue::TimestampTz(t))),
+        ]
+    };
+    let mut want = vec![
+        row(10, t1, Some(t2)),
+        row(11, t2, Some(t3)),
+        row(12, t3, None),
+    ];
+    want.sort();
+    assert_eq!(rows, want, "the CTE joins every historical base version");
 }
