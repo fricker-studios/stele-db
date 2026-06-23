@@ -3392,10 +3392,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // over an interval" read ([STL-344]): the join plan *and* a system /
             // valid range are both bound, routing to the range-join path (each input
             // range-scanned, the per-input intervals intersected) rather than the
-            // point-snapshot join below. The range is read-committed like the
-            // single-table range path, so the overlay is not threaded ([STL-329]);
-            // `scope` is, so a CTE / derived input ([STL-349]) is read from its
-            // materialization (which already reflects the overlay, [STL-242]).
+            // point-snapshot join below. `overlay` is not threaded to the base-table
+            // inputs, so they read committed-only — read-your-own-writes over a range
+            // *join* is not implemented yet, unlike the single-table range path, which
+            // overlays buffered writes ([STL-343]). `scope` is threaded, so a CTE /
+            // derived input ([STL-349]) is read from its materialization, which already
+            // reflects the transaction's overlay ([STL-242]).
             if bound.system_range.is_some() || bound.valid_range.is_some() {
                 return self.run_join_range(bound, scope);
             }
@@ -5377,9 +5379,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// guarantees at least one base side, so the exposed endpoints are always a real
     /// period rather than the unbounded sentinel. The footer reports the base inputs'
     /// summed scan accounting, suppressed (`None`) when any input is materialized,
-    /// exactly as the point join does ([STL-318]). The read is committed-only, like
-    /// the single-table range path ([STL-329]'s read-your-own-writes-over-a-range
-    /// follow-up applies here too).
+    /// exactly as the point join does ([STL-318]). The base-table inputs are read
+    /// **committed-only** — `overlay` is not threaded to them, so read-your-own-writes
+    /// over a range *join* is not implemented yet (the single-table range path, by
+    /// contrast, overlays buffered writes, [STL-343]). A CTE / derived input reflects
+    /// its materialization, which already incorporates the transaction's overlay
+    /// ([STL-242]).
     fn run_join_range(
         &self,
         bound: &BoundSelect,
