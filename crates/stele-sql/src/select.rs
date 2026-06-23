@@ -7533,9 +7533,7 @@ mod tests {
         assert!(valid.valid_range.is_some());
         assert!(valid.period_filter.is_some() && valid.filter.is_none());
 
-        // The constant shape composes over a valid range too, and the per-row shape
-        // over a system range against a `BIGINT` value column (an instant-typed
-        // endpoint is all the per-row path requires).
+        // The constant shape composes over a valid range too.
         assert!(
             bind(
                 "SELECT * FROM booking FOR VALID_TIME FROM 1 TO 9 \
@@ -7546,6 +7544,20 @@ mod tests {
             .period_filter
             .is_some()
         );
+
+        // …and the per-row shape composes over a *system* range as well: the period
+        // endpoints only need an instant-typed value column, not the valid axis, so
+        // `PERIOD(vf, vt)` over `booking`'s `TIMESTAMP` columns binds against a
+        // `FOR SYSTEM_TIME` range (the appended `sys_from`/`sys_to` endpoints follow
+        // the value columns, so the column indices line up the same way).
+        let sys_per_row = bind(
+            "SELECT * FROM booking FOR SYSTEM_TIME FROM 1 TO 9 \
+             WHERE PERIOD(vf, vt) OVERLAPS PERIOD(0, 100)",
+            &booking,
+        )
+        .expect("a per-row period predicate binds over a system range");
+        assert!(sys_per_row.system_range.is_some());
+        assert!(sys_per_row.period_filter.is_some() && sys_per_row.filter.is_none());
     }
 
     #[test]
