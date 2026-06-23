@@ -91,8 +91,8 @@ use stele_sql::merge::{BoundMerge, MergeBound, MergeSource, MergeValid, MergeVal
 use stele_sql::select::{
     AggregateFunc, ArithOp, BoundAggregate, BoundCte, BoundHaving, BoundJoinSide, BoundJoinStep,
     BoundPeriod, BoundPeriodPredicate, BoundPredicate, BoundScalar, BoundSelect,
-    BoundSubqueryFilter, CompareOp, CompositeSemiDecorrelation, Correlation, HavingScalar,
-    JoinType, OutputItem, PeriodEndpoint, Projection, ProjectionItem, ProjectionValue, SelectError,
+    BoundSubqueryFilter, CompareOp, CompositeKeyDecorrelation, Correlation, HavingScalar, JoinType,
+    OutputItem, PeriodEndpoint, Projection, ProjectionItem, ProjectionValue, SelectError,
     SemiAntiDecorrelation, SortTarget, SubqueryKind, SystemTimeRange, ValidTimeRange,
 };
 use stele_sql::{
@@ -4344,11 +4344,25 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         }
         // A correlated non-negated `IN` on an equality key decorrelates onto a single
         // **composite-key** semi join ([STL-337]) — the same one-scan win for the
-        // two-key shape `EXISTS` could not fold. Every remaining correlation (a range
-        // comparison, `NOT IN`, a scalar lookup, or a non-plain inner) keeps the
-        // per-row fallback below.
+        // two-key shape `EXISTS` could not fold.
         if let Some(plan) = sub.composite_semi_decorrelation() {
             return self.filter_composite_semi_decorrelated(
+                plan,
+                sub,
+                schema_columns,
+                rows,
+                overlay,
+                scope,
+            );
+        }
+        // A correlated `NOT IN` on an equality key decorrelates onto a NULL-aware
+        // composite **anti** join ([STL-346]) — the same composite-key plan, run as an
+        // anti join with per-correlation-group NULL tracking layered on for the 3VL
+        // trap a plain anti join cannot express. Every remaining correlation (a range
+        // comparison, a scalar lookup, or a non-plain inner) keeps the per-row
+        // fallback below.
+        if let Some(plan) = sub.composite_anti_decorrelation() {
+            return self.filter_composite_anti_decorrelated(
                 plan,
                 sub,
                 schema_columns,
@@ -4478,7 +4492,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// never reaches here — it keeps the per-row fallback.
     fn filter_composite_semi_decorrelated(
         &self,
-        plan: CompositeSemiDecorrelation,
+        plan: CompositeKeyDecorrelation,
         sub: &BoundSubqueryFilter,
         schema_columns: &[(String, LogicalType)],
         rows: Vec<Vec<Option<Vec<u8>>>>,
@@ -4526,6 +4540,127 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .iter()
             .map(|&l| std::mem::take(&mut rows[l]))
             .collect())
+    }
+
+    /// Filter the reconstructed outer `rows` by a **decorrelated** correlated `NOT IN`
+    /// — the NULL-aware **composite-key anti-join** path ([STL-346]) the
+    /// [`composite_anti_decorrelation`](BoundSubqueryFilter::composite_anti_decorrelation)
+    /// recognizer selects, replacing the [STL-239] per-row re-execution.
+    ///
+    /// `NOT IN` is **not** a plain anti join. Under SQL three-valued logic, `t.a NOT IN
+    /// (SELECT s.a FROM s WHERE s.k = t.k)` keeps an outer row iff its correlation group
+    /// `{s.a : s.k = t.k}` is empty, **or** `t.a` is non-NULL, the group holds no NULL
+    /// membership value, and `t.a` differs from every member. It is `UNKNOWN` (drop)
+    /// whenever `t.a` is NULL over a non-empty group, or the group contains a NULL
+    /// membership value and `t.a` matches no non-NULL member.
+    ///
+    /// A plain composite anti join — keep `(t.k, t.a)` when no inner `(s.k, s.a)`
+    /// matches — gets every case right **except** it wrongly *keeps* those two
+    /// `UNKNOWN` rows (their composite key is NULL, or no non-NULL inner composite
+    /// matches). So this runs the composite anti join (reusing [`composite_key_vector`],
+    /// like the `IN` semi path) and then drops the over-kept rows with
+    /// **per-correlation-group NULL tracking** built from the *same* single inner scan:
+    ///
+    /// * `nonempty` — the correlation keys `k` (non-NULL) with ≥ 1 inner row
+    ///   (`s.k = k`), i.e. a non-empty group; and
+    /// * `null_member` — those whose group holds a NULL membership value (`s.k = k`,
+    ///   `s.a` NULL).
+    ///
+    /// An anti-kept row drops iff its group is non-empty **and** either its `t.a` is
+    /// NULL or its group is in `null_member` (a non-NULL `t.a` that matched a member
+    /// was already dropped by the anti join). A NULL `t.k` is an empty group —
+    /// `NOT IN ()` is TRUE — and the anti join keeps it (its composite is NULL),
+    /// correctly, with no entry in `nonempty`.
+    ///
+    /// The inner runs **once**, over the same `overlay` and snapshot the outer reads,
+    /// so the per-statement `(sys, valid)` and read-your-own-writes rules hold across
+    /// both join inputs (docs/16 §6, [STL-203]) exactly as the per-row re-runs did.
+    fn filter_composite_anti_decorrelated(
+        &self,
+        plan: CompositeKeyDecorrelation,
+        sub: &BoundSubqueryFilter,
+        schema_columns: &[(String, LogicalType)],
+        rows: Vec<Vec<Option<Vec<u8>>>>,
+        overlay: &[BoundDml],
+        scope: &CteScope,
+    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
+        let StatementOutcome::Rows(inner) =
+            self.run_select_scoped(&sub.subquery, overlay, scope)?
+        else {
+            return Err(EngineError::Unsupported("a subquery must be a SELECT"));
+        };
+
+        // Each composite component decodes with its outer column's type: the binder
+        // proved the inner correlation key shares the outer key column's type and the
+        // inner membership the outer tested column's type.
+        let key_ty = schema_columns[plan.outer_key_column].1;
+        let member_ty = schema_columns[plan.outer_member_column].1;
+
+        // The plain composite ANTI join: keep each outer row whose `(t.k, t.a)`
+        // composite matches no inner `(s.k, s.a)` composite (NULL when either component
+        // is NULL, and a NULL key never matches).
+        let outer_keys = composite_key_vector(
+            &rows,
+            (plan.outer_key_column, key_ty),
+            (plan.outer_member_column, member_ty),
+        )?;
+        let inner_keys = composite_key_vector(
+            &inner.rows,
+            (plan.inner_key_column, key_ty),
+            (plan.inner_member_column, member_ty),
+        )?;
+        let indices = hash_join(
+            ExecJoinType::Anti,
+            std::slice::from_ref(&outer_keys),
+            rows.len(),
+            &Expr::col(0),
+            std::slice::from_ref(&inner_keys),
+            inner.rows.len(),
+            &Expr::col(0),
+        )
+        .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
+
+        // Per-correlation-group NULL tracking, built from the same inner scan. A NULL
+        // inner correlation key (`s.k`) matches no outer key (`s.k = t.k` needs both
+        // non-NULL), so it forms no group and is skipped.
+        let inner_key_col = key_vector(&inner.rows, plan.inner_key_column, key_ty)?;
+        let inner_member_col = key_vector(&inner.rows, plan.inner_member_column, member_ty)?;
+        let mut nonempty: HashSet<Vec<u8>> = HashSet::new();
+        let mut null_member: HashSet<Vec<u8>> = HashSet::new();
+        for j in 0..inner.rows.len() {
+            if let Some(sk) = inner_key_col.get(j) {
+                let key = encode_value(&sk);
+                if inner_member_col.get(j).is_none() {
+                    null_member.insert(key.clone());
+                }
+                nonempty.insert(key);
+            }
+        }
+
+        // Drop the rows the plain anti join over-keeps. Decode the outer key / member
+        // components to read each surviving row's `(t.k, t.a)`.
+        let outer_key_col = key_vector(&rows, plan.outer_key_column, key_ty)?;
+        let outer_member_col = key_vector(&rows, plan.outer_member_column, member_ty)?;
+        let mut rows = rows;
+        let mut kept = Vec::with_capacity(indices.left.len());
+        for &l in &indices.left {
+            // A NULL correlation key → empty group → `NOT IN ()` is TRUE → keep.
+            if let Some(tk) = outer_key_col.get(l) {
+                let key = encode_value(&tk);
+                // Non-empty group + (NULL outer value, or a NULL member in the group)
+                // → 3VL `UNKNOWN` → drop. A non-NULL `t.a` equal to a member is already
+                // gone (the anti join dropped it).
+                let drop = nonempty.contains(&key)
+                    && (outer_member_col.get(l).is_none() || null_member.contains(&key));
+                if drop {
+                    continue;
+                }
+            }
+            // The anti join emits each surviving outer row once in ascending probe
+            // order, and this drop pass preserves it, so the outer scan order holds.
+            kept.push(std::mem::take(&mut rows[l]));
+        }
+        Ok(kept)
     }
 
     /// Resolve a bound `SELECT`'s rows through the vectorized operator pipeline
@@ -20263,7 +20398,12 @@ mod tests {
     }
 
     #[test]
-    fn correlated_not_in_null_member_is_the_per_row_three_valued_trap() {
+    fn decorrelated_not_in_drops_the_per_group_null_trap() {
+        // `a NOT IN (SELECT a FROM s WHERE s.k = t.k)` folds onto a NULL-aware
+        // composite ANTI join on `(k, a)` ([STL-346]). The trap a plain anti join
+        // cannot express: a NULL membership value *anywhere* in an outer row's
+        // correlation group makes `NOT IN` UNKNOWN for it, even though its composite
+        // never matches.
         let mut engine = keyed_session();
         for sql in [
             "INSERT INTO t VALUES (1, 100, 5)",
@@ -20273,9 +20413,9 @@ mod tests {
         ] {
             engine.execute(&parse_one(sql)).expect("insert");
         }
-        // The classic trap, evaluated per outer row:
-        //   id 1 (k=100): inner {NULL} → `5 NOT IN (NULL)` is unknown → drop
-        //   id 2 (k=200): inner {8}    → `9 NOT IN (8)` is true       → keep
+        //   id 1 (k=100): group {NULL} → `5 NOT IN (NULL)` UNKNOWN → drop (the
+        //                 per-group NULL trap the post-anti pass catches)
+        //   id 2 (k=200): group {8}    → `9 NOT IN (8)` TRUE       → keep
         let got = subquery_ids(&select(
             &mut engine,
             "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s WHERE s.k = t.k)",
@@ -20288,6 +20428,68 @@ mod tests {
             "SELECT id FROM t WHERE a IN (SELECT a FROM s WHERE s.k = t.k)",
         ));
         assert!(got.is_empty(), "got {got:?}");
+    }
+
+    #[test]
+    fn decorrelated_not_in_keeps_the_complement_of_the_in_semi_join() {
+        // The mirror of `correlated_in_decorrelates_to_a_composite_semi_join`: over a
+        // fixture with no NULLs, `NOT IN` is the exact complement of `IN` on `(k, a)`
+        // ([STL-346]). A right `k` with a wrong `a`, and a right `a` under the wrong
+        // `k`, are kept (no `(k, a)` match); a row matching a member is dropped.
+        let mut engine = keyed_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 100, 5)",
+            "INSERT INTO t VALUES (2, 100, 7)",
+            "INSERT INTO t VALUES (3, 200, 8)",
+            "INSERT INTO t VALUES (4, 200, 9)",
+            "INSERT INTO t VALUES (5, 100, 8)",
+            // Distinct inner `(k, a)` set {(100,5), (100,6), (200,8)}; (100,5) twice.
+            "INSERT INTO s VALUES (10, 100, 5)",
+            "INSERT INTO s VALUES (11, 100, 5)",
+            "INSERT INTO s VALUES (12, 100, 6)",
+            "INSERT INTO s VALUES (13, 200, 8)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        //   id 1 (100,5): ∈ set                    → drop
+        //   id 2 (100,7): 7 ∉ {5,6} under k=100     → keep (right k, wrong a)
+        //   id 3 (200,8): ∈ set                    → drop
+        //   id 4 (200,9): 9 ∉ {8}   under k=200     → keep
+        //   id 5 (100,8): 8 only under k=200        → keep (wrong k)
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s WHERE s.k = t.k)",
+        ));
+        assert_eq!(got, vec![2, 4, 5]);
+    }
+
+    #[test]
+    fn decorrelated_not_in_keeps_empty_groups_and_drops_a_null_outer_value() {
+        // The two non-trap drops/keeps the post-anti pass must get right ([STL-346]):
+        // an empty correlation group keeps regardless of `t.a` (even NULL), and a NULL
+        // `t.a` over a *non-empty* group drops (`NULL NOT IN (non-empty)` is UNKNOWN).
+        let mut engine = keyed_session();
+        for sql in [
+            "INSERT INTO t VALUES (1, 100, 5)",
+            "INSERT INTO t VALUES (2, 300, 5)",
+            "INSERT INTO t VALUES (3, 300, NULL)",
+            "INSERT INTO t VALUES (4, 100, NULL)",
+            "INSERT INTO t VALUES (5, NULL, NULL)",
+            "INSERT INTO s VALUES (10, 100, 6)",
+            "INSERT INTO s VALUES (11, 100, 7)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert");
+        }
+        //   id 1 (100,5):    group {6,7}, 5 ∉, no NULL → `5 NOT IN (6,7)` TRUE → keep
+        //   id 2 (300,5):    empty group → `5 NOT IN ()` TRUE              → keep
+        //   id 3 (300,NULL): empty group → `NULL NOT IN ()` TRUE          → keep
+        //   id 4 (100,NULL): non-empty group → `NULL NOT IN (6,7)` UNKNOWN → drop
+        //   id 5 (NULL,*):   NULL key → empty group → TRUE                → keep
+        let got = subquery_ids(&select(
+            &mut engine,
+            "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s WHERE s.k = t.k)",
+        ));
+        assert_eq!(got, vec![1, 2, 3, 5]);
     }
 
     #[test]
@@ -20613,6 +20815,63 @@ mod tests {
         // Era 1: only t id 1 (100,5) is in s's set; era 2 / present: only t id 2 (100,6).
         assert_eq!(at(&mut engine, 4_000), vec![1]);
         assert_eq!(at(&mut engine, 9_000), vec![2]);
+    }
+
+    #[test]
+    fn decorrelated_not_in_inherits_the_outer_statement_snapshot() {
+        // STL-346 DoD (docs/16 §6): the composite anti-join `NOT IN` decorrelation
+        // runs the inner once at the *outer statement's* snapshot, so the one
+        // consistent `(sys, valid)` snapshot holds across both join inputs *and* the
+        // per-group NULL tracking is built from the snapshot's inner set, not the
+        // present. The two eras give genuinely different answers, so reading the
+        // present at either would fail. Same fixture as the `IN` oracle; `NOT IN` is
+        // its complement under these no-NULL groups.
+        let clock = SteppedClock::new(1_000);
+        let mut engine = SessionEngine::open(MemDisk::new(), clock.clone());
+        for ddl in [
+            "CREATE TABLE t (id INT PRIMARY KEY, k INT, a INT) WITH SYSTEM VERSIONING",
+            "CREATE TABLE s (id INT PRIMARY KEY, k INT, a INT) WITH SYSTEM VERSIONING",
+        ] {
+            engine.execute(&parse_one(ddl)).expect("create");
+        }
+        // Era 1 @ 2_000: s's `(k, a)` set is {(100,5), (200,9)}.
+        clock.set(2_000);
+        for sql in [
+            "INSERT INTO t VALUES (1, 100, 5)",
+            "INSERT INTO t VALUES (2, 100, 6)",
+            "INSERT INTO t VALUES (3, 200, 7)",
+            "INSERT INTO s VALUES (10, 100, 5)",
+            "INSERT INTO s VALUES (11, 200, 9)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("insert era1");
+        }
+        // Era 2 @ 5_000: (100,5) leaves, (100,6) joins.
+        clock.set(5_000);
+        for sql in [
+            "DELETE FROM s WHERE id = 10",
+            "INSERT INTO s VALUES (12, 100, 6)",
+        ] {
+            engine.execute(&parse_one(sql)).expect("update era2");
+        }
+        clock.set(9_000);
+
+        let at = |engine: &mut SessionEngine<SteppedClock, MemDisk>, instant: i64| -> Vec<i32> {
+            let sql = format!(
+                "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s WHERE s.k = t.k) \
+                 FOR SYSTEM_TIME AS OF {instant}"
+            );
+            let StatementOutcome::Rows(r) = engine.execute(&parse_one(&sql)).expect("select")
+            else {
+                panic!("SELECT must return rows");
+            };
+            subquery_ids(&r)
+        };
+        // Era 1 groups k=100→{5}, k=200→{9}: id 1 `5 NOT IN {5}` drops; id 2 `6 NOT IN
+        // {5}` and id 3 `7 NOT IN {9}` keep → [2, 3].
+        assert_eq!(at(&mut engine, 4_000), vec![2, 3]);
+        // Present groups k=100→{6}, k=200→{9}: id 1 `5 NOT IN {6}` keeps; id 2 `6 NOT
+        // IN {6}` drops; id 3 keeps → [1, 3].
+        assert_eq!(at(&mut engine, 9_000), vec![1, 3]);
     }
 
     #[test]

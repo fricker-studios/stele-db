@@ -3,10 +3,11 @@
 //!
 //! Correlated `EXISTS` / `NOT EXISTS` / `IN` / `NOT IN` and a correlated scalar
 //! lookup were each first shipped on [STL-239]'s per-row re-execution (performance
-//! is explicitly not the v0.3 bar). Some shapes now **decorrelate** onto a single
+//! is explicitly not the v0.3 bar). Most shapes now **decorrelate** onto a single
 //! hash join — `EXISTS` / `NOT EXISTS` onto a semi / anti join ([STL-317]), `IN`
-//! onto a composite-key semi join ([STL-337]) — while `NOT IN`, a non-equality
-//! correlation, and the scalar lookup stay per-row. This oracle is **path-agnostic**:
+//! onto a composite-key semi join ([STL-337]), `NOT IN` onto a NULL-aware composite
+//! anti join ([STL-346]) — while a non-equality correlation and the scalar lookup
+//! stay per-row. This oracle is **path-agnostic**:
 //! it builds the **same** randomized two-table fixture in an in-memory
 //! `SessionEngine` and an in-memory DuckDB, runs each correlated query — *verbatim*,
 //! the text is valid in both dialects — against both, and asserts the returned `id`
@@ -24,7 +25,7 @@
 //!   set containing a NULL is never TRUE for any outer row whose set it lands in (the
 //!   classic three-valued trap) — DuckDB is the independent witness that Stele gets
 //!   the 3VL right, whether `IN` decorrelates to the composite semi join or `NOT IN`
-//!   folds per row.
+//!   to the NULL-aware composite anti join.
 //!
 //! DuckDB is confined to this nightly-only crate (a dev-dependency, never linked
 //! into a shipped crate; held off the per-PR `--workspace` runs, [STL-158]), so
