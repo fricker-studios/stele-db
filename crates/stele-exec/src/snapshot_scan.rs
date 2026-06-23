@@ -785,9 +785,10 @@ impl SystemRange {
 }
 
 /// A valid-time **range** for an interval read ([STL-328]) — the valid-axis
-/// mirror of [`SystemRange`]. The [`SnapshotScan`]'s valid-interval mode keeps
-/// every system-live version whose valid interval `[valid_from, valid_to)`
-/// overlaps it.
+/// mirror of [`SystemRange`].
+///
+/// The [`SnapshotScan`]'s valid-interval mode keeps every system-live version
+/// whose valid interval `[valid_from, valid_to)` overlaps it.
 ///
 /// [`closed_upper`](Self::closed_upper) selects the upper bound's inclusivity:
 /// `false` is the half-open `FROM lo TO hi` (`[lo, hi)`), `true` the closed
