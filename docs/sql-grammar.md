@@ -98,22 +98,27 @@ join output (STL-264) and across an N-way chain (STL-323, see
 (STL-270) remain follow-ups.
 
 A `FOR { SYSTEM_TIME | VALID_TIME } { FROM a TO b | BETWEEN a AND b }` **range**
-over a join (STL-344) is the interval generalization of that pinned read — "the
-history of the joined result over the queried window" (`[a, b)` for the half-open
-`FROM..TO`, `[a, b]` for the closed `BETWEEN`, the same boundary contract as the
-single-table range below). Instead of one version per input at a point, every input
-is range-scanned and the matched versions' intervals are **intersected**: a joined
-tuple's period is `[max(from), min(to))` over its inputs —
-docs/16 §8's pointwise intersection lifted to an interval, so a pair whose intervals
-never overlap does not join, and the intersected period endpoints (`sys_from` /
-`sys_to`, or `valid_from` / `valid_to`) are exposed on the join output exactly as a
-single-table range exposes them (STL-244/STL-328/STL-329). The whole left-deep
-`INNER` chain is supported; a `LEFT` / `SEMI` / `ANTI` range join (each needs
-interval *difference* over the unmatched side) and a range join with a CTE / derived
-input (no axis to range) remain follow-ups. The differential oracle
+over a join (STL-344, STL-348) is the interval generalization of that pinned read —
+"the history of the joined result over the queried window" (`[a, b)` for the
+half-open `FROM..TO`, `[a, b]` for the closed `BETWEEN`, the same boundary contract as
+the single-table range below). Instead of one version per input at a point, every
+input is range-scanned and the join shape decides how the matched intervals combine
+(docs/16 §8's pointwise rule lifted to an interval): an **`INNER`** step
+**intersects** them — a joined tuple's period is `[max(from), min(to))`, a pair whose
+intervals never overlap does not join — while a **`LEFT` / `SEMI` / `ANTI`** step
+takes the **interval difference** of a left version's period against its matched
+right sub-intervals (STL-348). A `LEFT` join keeps the intersected matched rows and
+`NULL`-extends each maximal *gap* the left row was live with no overlapping match;
+`SEMI` keeps the left row over the sub-intervals it matched, `ANTI` over the gaps —
+so a match inside a left version's window **fragments** it into several output rows.
+The period endpoints (`sys_from` / `sys_to`, or `valid_from` / `valid_to`) are
+exposed on the join output exactly as a single-table range exposes them
+(STL-244/STL-328/STL-329). The whole left-deep chain is supported across mixed join
+shapes; only a range join with a CTE / derived input (no axis to range) remains a
+follow-up. The differential oracle
 (`crates/stele-engine/tests/bitemporal_join_range_oracle.rs`) checks the range join
-against joining the inputs' single-table range reads, both axes, across the
-flush/seal boundary.
+against joining the inputs' single-table range reads — an independent breakpoint-sweep
+reference for the difference — both axes, across the flush/seal boundary.
 
 ### `FOR SYSTEM_TIME { FROM a TO b | BETWEEN a AND b }` — temporal range scans (STL-244)
 
@@ -173,25 +178,32 @@ sys_from` — `TIMESTAMPTZ` — is the pre-existing unsupported-grouping-type er
 range-specific.) A range scan is now subject to the simple-query default row cap
 too, like any plain read ([below](#default-row-cap-on-the-simple-query-path-stl-306)).
 
-**Over an `INNER` `JOIN` ([STL-344]).** A range qualifies a join too — the "history
-of the joined result over an interval". Each input is range-scanned and the matched
-versions' intervals are **intersected**: a joined tuple's period is `[max(from),
-min(to))` over its inputs (docs/16 §8's point intersection lifted to an interval), so
-a pair whose intervals don't overlap never joins, and the **intersected** endpoints
-(`sys_from` / `sys_to`, unclipped — the tuple's actual period) are exposed on the
-output. The whole left-deep `INNER` chain is supported (`a JOIN b … JOIN c …`); the
-business-key match, NULL handling, and the `WHERE` / aggregate / `ORDER BY` / `LIMIT`
-tail are the same as the point join's ([STL-264]). The un-ranged axis follows the single-table
+**Over a `JOIN` ([STL-344], [STL-348]).** A range qualifies a join too — the "history
+of the joined result over an interval". Each input is range-scanned and the join shape
+decides how the matched intervals combine. An **`INNER`** step **intersects** them: a
+joined tuple's period is `[max(from), min(to))` over its inputs (docs/16 §8's point
+rule lifted to an interval), so a pair whose intervals don't overlap never joins, and
+the **intersected** endpoints (`sys_from` / `sys_to`, unclipped — the tuple's actual
+period) are exposed on the output. A **`LEFT` / `SEMI` / `ANTI`** step takes the
+**interval difference** of a left version's period against its matched right
+sub-intervals ([STL-348]): `LEFT` emits the matched rows and `NULL`-extends each gap
+the left row was live with no overlapping match, `SEMI` keeps the left row over the
+sub-intervals it matched, `ANTI` over the gaps — so a match inside a left version's
+window **fragments** it into several output rows. The whole left-deep chain is
+supported across mixed join shapes (`a JOIN b … LEFT JOIN c …`); the business-key
+match, NULL handling, and the `WHERE` / aggregate / `ORDER BY` / `LIMIT` tail are the
+same as the point join's ([STL-264]). The un-ranged axis follows the single-table
 convention (a system range is valid-agnostic; a valid range pins the system snapshot
 and ranges the valid axis). See **Over a `JOIN`** in
 [time-travel select](#for--system_time--valid_time--as-of-expr--time-travel-select).
 
 **Still rejected (tracked follow-ups), never silently dropped.** Combining a system
-range with **any** `AS OF` point qualifier; a `JOIN`; a subquery `WHERE`; a computed
-/ scalar-subquery select item; a CTE / derived-table source; the read-your-own-writes
-overlay (a range reads the committed snapshot only, unlike a point read or a join,
-[STL-325]); and `FOR SYSTEM_TIME ALL` (the trivially-full range). (The **valid axis**
-is the parallel form below
+range with **any** `AS OF` point qualifier; a `JOIN` whose input is a CTE / derived
+table (no axis to range, [STL-349] — a base-table `JOIN` of any shape is supported
+above); a subquery `WHERE`; a computed / scalar-subquery select item; a CTE /
+derived-table source; the read-your-own-writes overlay (a range reads the committed
+snapshot only, unlike a point read or a join, [STL-325]); and `FOR SYSTEM_TIME ALL`
+(the trivially-full range). (The **valid axis** is the parallel form below
 ([STL-328](#for-valid_time--from-a-to-b--between-a-and-b---valid-time-range-scans-stl-328)),
 which relaxes the `AS OF` rule.)
 

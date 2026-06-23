@@ -5356,22 +5356,36 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     ///
     /// The chain folds left-deep over [`hash_join`] exactly as the point path does —
     /// so the business-key match (NULL never matches, typed equality) is identical —
-    /// carrying each surviving row's running interval intersection alongside. After
-    /// the fold, a row is kept iff its intersected interval **overlaps the query
-    /// range** (the same [`SystemRange::overlaps`] boundary test the single-table
-    /// range applies — the formula is axis-agnostic), and the intersected
-    /// endpoints are appended **unclipped** (the joined tuple's actual period, like
-    /// the single-table range exposes a version's actual period; `min(to) == +∞`
-    /// renders `NULL`). The `WHERE` / aggregate / projection / shaping tail then
-    /// runs over those rows through the shared join helpers, so the range composes
-    /// with the rest of the SELECT surface the way the point join does ([STL-264]).
+    /// carrying each surviving row's running interval alongside. Each step keys its
+    /// matches through an `INNER` [`hash_join`] and then layers the **temporal** shape
+    /// on top of the key match ([STL-348]):
     ///
-    /// The binder restricts this to the `INNER` shape over base-table inputs (a
-    /// `LEFT` / `SEMI` / `ANTI` interval read needs interval *difference*; a
-    /// materialized side has no axis to range — each a tracked follow-up), so every
-    /// input is a base-table range scan and the footer always reports their summed
-    /// accounting. The read is committed-only, like the single-table range path
-    /// ([STL-329]'s read-your-own-writes-over-a-range follow-up applies here too).
+    /// * `INNER` — one output row per matched pair, interval `[max(from), min(to))`;
+    ///   an empty intersection means the two versions were never both live, so they
+    ///   never join.
+    /// * `LEFT` — those matched rows, **plus** for each left version the maximal
+    ///   sub-intervals of its period left uncovered by any matched right (the
+    ///   interval *difference*, [`interval_gaps`]) as `NULL`-extended rows: the
+    ///   instants the left row was live with no temporally-overlapping match.
+    /// * `SEMI` — each left version over the coalesced sub-intervals it *did* have a
+    ///   match ([`merge_covers`]); `ANTI` — over the gap sub-intervals it did not.
+    ///   `SEMI` / `ANTI` keep only the left columns. A right match strictly inside a
+    ///   left version's window fragments it into several output rows.
+    ///
+    /// After the fold, a row is kept iff its interval **overlaps the query range**
+    /// (the same [`SystemRange::overlaps`] boundary test the single-table range
+    /// applies — the formula is axis-agnostic), and the endpoints are appended
+    /// **unclipped** (the tuple's actual period, like the single-table range exposes a
+    /// version's actual period; `to == +∞` renders `NULL`). The `WHERE` / aggregate /
+    /// projection / shaping tail then runs over those rows through the shared join
+    /// helpers, so the range composes with the rest of the SELECT surface the way the
+    /// point join does ([STL-264]).
+    ///
+    /// The binder restricts this to base-table inputs (a materialized side has no axis
+    /// to range — a tracked follow-up), so every input is a base-table range scan and
+    /// the footer always reports their summed accounting. The read is committed-only,
+    /// like the single-table range path ([STL-329]'s read-your-own-writes-over-a-range
+    /// follow-up applies here too).
     fn run_join_range(&self, bound: &BoundSelect) -> Result<StatementOutcome, EngineError> {
         let join = bound
             .join
@@ -5395,49 +5409,19 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             self.join_side_range_rows(&join.left, snapshot, axis)?;
         let mut acc_meta = join.left.columns.clone();
 
-        // Fold each `INNER` step left-deep ([STL-323]): match on the join key through
-        // [`hash_join`] (the point join's exact matching) and intersect the paired
-        // intervals, dropping a pair whose intersection is empty — they were never
-        // both live, so the tuple never joins.
+        // Fold each step left-deep ([STL-323]); [`range_join_step`](Self::range_join_step)
+        // scans the right input, key-matches through an `INNER` [`hash_join`], and
+        // applies the step's temporal shape (`INNER` intersect, `LEFT` / `SEMI` /
+        // `ANTI` interval difference, [STL-348]). The accumulated columns grow by the
+        // step's right only when it keeps them.
         for step in &join.steps {
-            debug_assert_eq!(
-                step.join_type,
-                JoinType::Inner,
-                "the binder rejects a non-INNER range join"
-            );
-            let (right_rows, right_intervals, right_stats) =
-                self.join_side_range_rows(&step.right, snapshot, axis)?;
-            let left_keys = range_key_vectors(&acc_rows, &acc_meta, step.left_key)?;
-            let right_keys = range_key_vectors(&right_rows, &step.right.columns, step.right_key)?;
-            let indices = hash_join(
-                ExecJoinType::Inner,
-                &left_keys,
-                acc_rows.len(),
-                &Expr::col(step.left_key),
-                &right_keys,
-                right_rows.len(),
-                &Expr::col(step.right_key),
-            )
-            .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
-
-            let mut next_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(indices.left.len());
-            let mut next_intervals: Vec<(i64, i64)> = Vec::with_capacity(indices.left.len());
-            for (&li, ri) in indices.left.iter().zip(indices.right.iter()) {
-                let ri = ri.expect("an INNER hash join pairs every surviving left with a right");
-                let (lf, lt) = acc_intervals[li];
-                let (rf, rt) = right_intervals[ri];
-                let from = lf.max(rf);
-                let to = lt.min(rt);
-                if from < to {
-                    let mut row = acc_rows[li].clone();
-                    row.extend(right_rows[ri].iter().cloned());
-                    next_rows.push(row);
-                    next_intervals.push((from, to));
-                }
-            }
+            let (next_rows, next_intervals, right_stats) =
+                self.range_join_step(&acc_rows, &acc_intervals, &acc_meta, step, snapshot, axis)?;
             acc_rows = next_rows;
             acc_intervals = next_intervals;
-            acc_meta.extend(step.right.columns.iter().cloned());
+            if lower_join_type(step.join_type).keeps_right() {
+                acc_meta.extend(step.right.columns.iter().cloned());
+            }
             stats = stats.combine(right_stats);
         }
 
@@ -5498,6 +5482,114 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             rows: out_rows,
             stats,
         }))
+    }
+
+    /// Fold one chain step of a range join ([STL-348]): scan the step's right input
+    /// over the range axis, key-match it against the accumulated rows through an
+    /// `INNER` [`hash_join`] (the point join's exact matching — NULL never matches,
+    /// typed equality), and apply the step's **temporal shape** over that match.
+    ///
+    /// For each left (accumulated) version with period `[lf, lt)`, the matched right
+    /// versions' intervals are clipped to it — the "covers". The step's join type then
+    /// emits:
+    ///
+    /// * `INNER` — the matched row per cover (interval `[max(from), min(to))`).
+    /// * `LEFT` — those matched rows, **plus** a `NULL`-extended row per gap in
+    ///   `[lf, lt)` not covered by any match ([`interval_gaps`] over [`merge_covers`]).
+    /// * `SEMI` — the left cells over each coalesced cover ([`merge_covers`]).
+    /// * `ANTI` — the left cells over each gap.
+    ///
+    /// Returns the next `(rows, intervals)` and the right input's scan accounting;
+    /// every output row carries exactly one interval, so the next step folds onto it
+    /// the same way. The caller grows the addressable columns by the step's right only
+    /// when it [keeps them](stele_exec::JoinType::keeps_right).
+    fn range_join_step(
+        &self,
+        acc_rows: &[Vec<Option<Vec<u8>>>],
+        acc_intervals: &[(i64, i64)],
+        acc_meta: &[(String, LogicalType)],
+        step: &BoundJoinStep,
+        snapshot: SystemTimeMicros,
+        axis: RangeAxis,
+    ) -> Result<RangeSideRows, EngineError> {
+        let (right_rows, right_intervals, right_stats) =
+            self.join_side_range_rows(&step.right, snapshot, axis)?;
+        let left_keys = range_key_vectors(acc_rows, acc_meta, step.left_key)?;
+        let right_keys = range_key_vectors(&right_rows, &step.right.columns, step.right_key)?;
+        // `INNER` over the keys gives every key-matched `(left, right)` pair; the
+        // temporal logic below intersects / differences their intervals. Grouping the
+        // matches by left row lets a `LEFT` / `ANTI` left row with *no* match still
+        // emit its full-period gap row.
+        let indices = hash_join(
+            ExecJoinType::Inner,
+            &left_keys,
+            acc_rows.len(),
+            &Expr::col(step.left_key),
+            &right_keys,
+            right_rows.len(),
+            &Expr::col(step.right_key),
+        )
+        .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
+        let mut matches: Vec<Vec<usize>> = vec![Vec::new(); acc_rows.len()];
+        for (&li, ri) in indices.left.iter().zip(indices.right.iter()) {
+            matches[li].push(ri.expect("an INNER hash join pairs every left with a right"));
+        }
+
+        let keeps_right = lower_join_type(step.join_type).keeps_right();
+        let right_width = step.right.columns.len();
+        let mut next_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+        let mut next_intervals: Vec<(i64, i64)> = Vec::new();
+        for (li, ris) in matches.iter().enumerate() {
+            let (lf, lt) = acc_intervals[li];
+            // The matched right sub-intervals clipped to this left version's period —
+            // the "covers" the difference subtracts and the intersection emits. An
+            // `INNER` / `LEFT` step also emits the matched row here.
+            let mut covers: Vec<(i64, i64)> = Vec::new();
+            for &ri in ris {
+                let (rf, rt) = right_intervals[ri];
+                let from = lf.max(rf);
+                let to = lt.min(rt);
+                if from < to {
+                    if keeps_right {
+                        let mut row = acc_rows[li].clone();
+                        row.extend(right_rows[ri].iter().cloned());
+                        next_rows.push(row);
+                        next_intervals.push((from, to));
+                    }
+                    if step.join_type != JoinType::Inner {
+                        covers.push((from, to));
+                    }
+                }
+            }
+            match step.join_type {
+                // The matched rows above are the whole `INNER` output.
+                JoinType::Inner => {}
+                // The gaps in the left version's period → `NULL`-extended rows.
+                JoinType::Left => {
+                    for (from, to) in interval_gaps(lf, lt, &merge_covers(covers)) {
+                        let mut row = acc_rows[li].clone();
+                        row.extend(std::iter::repeat_n(None, right_width));
+                        next_rows.push(row);
+                        next_intervals.push((from, to));
+                    }
+                }
+                // The coalesced sub-intervals the left version *did* have a match.
+                JoinType::Semi => {
+                    for (from, to) in merge_covers(covers) {
+                        next_rows.push(acc_rows[li].clone());
+                        next_intervals.push((from, to));
+                    }
+                }
+                // The gap sub-intervals the left version did *not* have a match.
+                JoinType::Anti => {
+                    for (from, to) in interval_gaps(lf, lt, &merge_covers(covers)) {
+                        next_rows.push(acc_rows[li].clone());
+                        next_intervals.push((from, to));
+                    }
+                }
+            }
+        }
+        Ok((next_rows, next_intervals, right_stats))
     }
 
     /// Scan one base-table join input over a range axis ([STL-344]) into row-major
@@ -9268,6 +9360,52 @@ const fn lower_join_type(join_type: JoinType) -> ExecJoinType {
         JoinType::Semi => ExecJoinType::Semi,
         JoinType::Anti => ExecJoinType::Anti,
     }
+}
+
+/// Coalesce a left version's matched right sub-intervals into maximal, sorted,
+/// disjoint covers — the matched region a [`JoinType::Semi`] range join emits and the
+/// [`JoinType::Left`] / [`JoinType::Anti`] interval *difference* subtracts ([STL-348],
+/// the fold in [`run_join_range`](SessionEngine::run_join_range)).
+///
+/// Inputs are already clipped to the left version's period. Half-open intervals that
+/// *touch* (`next.from == cur.to`) coalesce: coverage is continuous across the shared
+/// instant — there is no gap — so the existential "is there a match" the `SEMI` form
+/// asks stays true with no break. Overlapping covers (the same key live on the system
+/// axis across two valid regions) coalesce likewise.
+fn merge_covers(mut covers: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    covers.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::with_capacity(covers.len());
+    for (from, to) in covers {
+        match merged.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => merged.push((from, to)),
+        }
+    }
+    merged
+}
+
+/// The maximal sub-intervals of `[lo, hi)` left uncovered by `merged` (already sorted,
+/// disjoint, and clipped to `[lo, hi)` by [`merge_covers`]) — the interval *difference*
+/// ([STL-348]).
+///
+/// These gaps are the instants a left version is live with **no** temporally-overlapping
+/// right match: a [`JoinType::Left`] range join `NULL`-extends them, a [`JoinType::Anti`]
+/// keeps them. A right match strictly inside `[lo, hi)` fragments it into the surrounding
+/// gaps (e.g. a cover `[3, 5)` of `[0, 10)` yields `[0, 3)` and `[5, 10)`); a cover
+/// running to `+∞` leaves an open-ended gap only if it starts past `lo`.
+fn interval_gaps(lo: i64, hi: i64, merged: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let mut gaps: Vec<(i64, i64)> = Vec::new();
+    let mut cursor = lo;
+    for &(from, to) in merged {
+        if cursor < from {
+            gaps.push((cursor, from));
+        }
+        cursor = cursor.max(to);
+    }
+    if cursor < hi {
+        gaps.push((cursor, hi));
+    }
+    gaps
 }
 
 /// One base-table input's range scan for a range-over-join ([STL-344]): the
