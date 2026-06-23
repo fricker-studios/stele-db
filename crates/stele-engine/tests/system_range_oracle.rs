@@ -635,3 +635,163 @@ fn provenance_over_a_range_matches_a_point_read() {
         );
     }
 }
+
+/// The seven SQL:2011 period predicates ([STL-165]), named for the SQL surface —
+/// a local mirror so the reference derives each truth value independently of the
+/// engine's `PeriodPredicate` / `evaluate`.
+#[derive(Debug, Clone, Copy)]
+enum Pred {
+    Contains,
+    Overlaps,
+    Equals,
+    Precedes,
+    Succeeds,
+    ImmediatelyPrecedes,
+    ImmediatelySucceeds,
+}
+
+/// `(SQL keyword, predicate)` for every period predicate, swept by the per-row
+/// period-`WHERE` differential below.
+const PREDS: [(&str, Pred); 7] = [
+    ("CONTAINS", Pred::Contains),
+    ("OVERLAPS", Pred::Overlaps),
+    ("EQUALS", Pred::Equals),
+    ("PRECEDES", Pred::Precedes),
+    ("SUCCEEDS", Pred::Succeeds),
+    ("IMMEDIATELY PRECEDES", Pred::ImmediatelyPrecedes),
+    ("IMMEDIATELY SUCCEEDS", Pred::ImmediatelySucceeds),
+];
+
+/// Whether the half-open interval `[af, at) <pred> [bf, bt)`, derived
+/// **independently** of the engine's `stele_exec::evaluate` by reasoning over the
+/// *inclusive integer instant* each interval covers (`last = to - 1`) — a second
+/// derivation of the SQL:2011 semantics rather than a copy of the evaluator. The
+/// grid below uses only finite, well-formed intervals, so no `+∞` end arises.
+///
+/// `row_upper_inclusive` is the teeth knob: treating the row interval's upper as
+/// inclusive (`[af, at]`) injects the classic half-open off-by-one.
+fn pred_holds(pred: Pred, af: i64, at: i64, bf: i64, bt: i64, row_upper_inclusive: bool) -> bool {
+    let la = if row_upper_inclusive { at } else { at - 1 };
+    let lb = bt - 1;
+    match pred {
+        Pred::Overlaps => af.max(bf) <= la.min(lb),
+        Pred::Contains => af <= bf && lb <= la,
+        Pred::Equals => af == bf && la == lb,
+        Pred::Precedes => la < bf,
+        Pred::Succeeds => lb < af,
+        Pred::ImmediatelyPrecedes => la + 1 == bf,
+        Pred::ImmediatelySucceeds => lb + 1 == af,
+    }
+}
+
+#[test]
+fn a_constant_period_predicate_where_composes_over_a_range() {
+    // [STL-345]: a fully-constant `WHERE PERIOD(..) <pred> PERIOD(..)` folds to one
+    // truth value the engine applies uniformly over the range output ([STL-165]) —
+    // a true predicate returns the whole range set, a false one returns none, never
+    // a silently-unfiltered read. Checked over a span of range windows (full,
+    // partials, a one-microsecond window) across seeds and the flush boundary.
+    for seed in 0..8u64 {
+        for flush in [FlushMode::Never, FlushMode::Midway, FlushMode::Full] {
+            let World {
+                mut engine,
+                versions,
+            } = build(seed, flush);
+            let marks = boundary_instants(&versions);
+            let lo0 = *marks.first().expect("at least one mark");
+            let hi_n = *marks.last().expect("at least one mark") + 1;
+            let mid = lo0 + (hi_n - lo0) / 2;
+            for (lo, hi) in [(lo0, hi_n), (mid, hi_n), (lo0, mid), (mid, mid + 1)] {
+                if lo >= hi {
+                    continue;
+                }
+                // [10,40) CONTAINS [20,30) → true: the whole range set survives.
+                let truthy = format!(
+                    "SELECT * FROM t FOR SYSTEM_TIME FROM {lo} TO {hi} \
+                     WHERE PERIOD(10, 40) CONTAINS PERIOD(20, 30)"
+                );
+                assert_eq!(
+                    engine_rows(&mut engine, &truthy),
+                    reference_rows(&versions, lo, hi, false),
+                    "a true constant predicate keeps the range set: {truthy}"
+                );
+                // [10,20) OVERLAPS [20,30) → false (they only touch, half-open): the
+                // range output is emptied, header preserved.
+                let falsy = format!(
+                    "SELECT * FROM t FOR SYSTEM_TIME FROM {lo} TO {hi} \
+                     WHERE PERIOD(10, 20) OVERLAPS PERIOD(20, 30)"
+                );
+                assert!(
+                    engine_rows(&mut engine, &falsy).is_empty(),
+                    "a false constant predicate empties the range: {falsy}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_per_row_period_predicate_where_composes_over_a_range() {
+    // [STL-345]: a per-row `WHERE PERIOD(vf, vt) <pred> PERIOD(lo, hi)` over an
+    // *instant-typed value column* composes over a system range too ([STL-193]
+    // lifted to the range path). The value columns are read at the schema indices
+    // the range row reconstruction preserves ahead of the appended `sys_from` /
+    // `sys_to` endpoints. An insert-only history keeps every row system-live over
+    // the full range, so the period `WHERE` is the sole discriminator — checked,
+    // every predicate and probe, against the independent inclusive-instant
+    // reference, with the same off-by-one teeth.
+    let mut engine = SessionEngine::open(MemDisk::new(), ZeroClock);
+    run(
+        &mut engine,
+        "CREATE TABLE ev (id INT PRIMARY KEY, vf BIGINT, vt BIGINT) WITH SYSTEM VERSIONING",
+    );
+    let grid = [0_i64, 5, 10, 15, 20, 25, 30];
+    let intervals: Vec<(i64, i64)> = grid
+        .iter()
+        .flat_map(|&a| grid.iter().filter(move |&&b| b > a).map(move |&b| (a, b)))
+        .collect();
+    for (i, (vf, vt)) in intervals.iter().enumerate() {
+        run(
+            &mut engine,
+            &format!("INSERT INTO ev VALUES ({i}, {vf}, {vt})"),
+        );
+    }
+    // A system range over the whole recorded history: every inserted version is
+    // live across it, so all rows reach the period filter.
+    let hi = engine.commit_clock().0 + 1;
+
+    let mut teeth = false;
+    for (kw, pred) in PREDS {
+        for &(lo, up) in &intervals {
+            let sql = format!(
+                "SELECT id FROM ev FOR SYSTEM_TIME FROM 0 TO {hi} \
+                 WHERE PERIOD(vf, vt) {kw} PERIOD({lo}, {up})"
+            );
+            let mut got: Vec<i32> = run_rows(&mut engine, &sql)
+                .rows
+                .iter()
+                .map(|r| dec_i32(r[0].as_deref()))
+                .collect();
+            got.sort_unstable();
+
+            let expected = |buggy: bool| -> Vec<i32> {
+                let mut ids: Vec<i32> = intervals
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &(vf, vt))| pred_holds(pred, vf, vt, lo, up, buggy))
+                    .map(|(i, _)| i32::try_from(i).expect("id fits i32"))
+                    .collect();
+                ids.sort_unstable();
+                ids
+            };
+            assert_eq!(got, expected(false), "predicate {kw} probe [{lo}, {up})");
+            if got != expected(true) {
+                teeth = true;
+            }
+        }
+    }
+    assert!(
+        teeth,
+        "an inclusive-row-period reference must disagree with the engine somewhere"
+    );
+}

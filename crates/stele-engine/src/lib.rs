@@ -4107,10 +4107,15 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             rows.push(row);
         }
 
-        // Apply the bound `WHERE` over the reconstructed rows (a subquery / period
-        // `WHERE` is rejected over a range, so the syntactic plan is exact). The
-        // endpoints and any materialized provenance are addressable to it, so it
-        // filters over the full `range_addressable` set.
+        // Apply the bound `WHERE` over the reconstructed rows. A subquery `WHERE`
+        // is rejected over a range, so the syntactic [`filter_plan`] is exact — and
+        // it now also carries a period-predicate `WHERE` ([STL-345]): a constant
+        // predicate folds to keep-all / keep-none, a per-row `PERIOD(col, …)` to an
+        // `Expr::Period` the row filter evaluates. The endpoints and any
+        // materialized provenance are addressable to it, so it filters over the full
+        // `range_addressable` set; a period predicate's value-column endpoints
+        // address the same indices in the reconstructed row (the endpoints are
+        // appended *after* the value columns) that the binder bound them to.
         let plan = filter_plan(bound);
         let rows = filter_rows(&plan, &range_addressable, rows)?;
 
@@ -4235,9 +4240,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             rows.push(row);
         }
 
-        // Apply the bound `WHERE` over the reconstructed rows (subquery / period are
-        // rejected over a range), then route through the shared shaping / aggregate /
-        // projection tail with the endpoints as the trailing schema columns.
+        // Apply the bound `WHERE` over the reconstructed rows (a subquery `WHERE` is
+        // rejected over a range; a period-predicate `WHERE` composes — [STL-345]),
+        // then route through the shared shaping / aggregate / projection tail with
+        // the endpoints as the trailing schema columns. A per-row `PERIOD(vf, vt)`
+        // predicate reads the user's valid-time value columns at their schema
+        // indices, which the row reconstruction preserves ahead of the appended
+        // `valid_from` / `valid_to` endpoints.
         let plan = filter_plan(bound);
         let rows = filter_rows(&plan, &range_addressable, rows)?;
 
