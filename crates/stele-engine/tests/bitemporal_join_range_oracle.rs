@@ -457,6 +457,14 @@ fn reference(
     combine: Combine,
     difference: Difference,
 ) -> Vec<Vec<Option<Vec<u8>>>> {
+    // One join step per side beyond the seed — a short `steps` would make the `zip`
+    // below silently drop trailing sides, comparing the engine against a reference for
+    // a *different* query shape. Fail loudly and locally instead.
+    assert_eq!(
+        steps.len(),
+        sides.len() - 1,
+        "reference: one step per side beyond the seed"
+    );
     // Accumulated rows: the projected cells so far, plus the running interval.
     let mut acc: Vec<(Row, i64, i64)> = sides[0]
         .iter()

@@ -5517,9 +5517,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let left_keys = range_key_vectors(acc_rows, acc_meta, step.left_key)?;
         let right_keys = range_key_vectors(&right_rows, &step.right.columns, step.right_key)?;
         // `INNER` over the keys gives every key-matched `(left, right)` pair; the
-        // temporal logic below intersects / differences their intervals. Grouping the
-        // matches by left row lets a `LEFT` / `ANTI` left row with *no* match still
-        // emit its full-period gap row.
+        // temporal logic below intersects / differences their intervals.
         let indices = hash_join(
             ExecJoinType::Inner,
             &left_keys,
@@ -5530,43 +5528,62 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             &Expr::col(step.right_key),
         )
         .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
+
+        // `INNER` fast path: emit the intersected matched pairs directly, in
+        // [`hash_join`] order — no per-left grouping (the common, pre-[STL-348] shape).
+        if step.join_type == JoinType::Inner {
+            let mut next_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(indices.left.len());
+            let mut next_intervals: Vec<(i64, i64)> = Vec::with_capacity(indices.left.len());
+            for (&li, ri) in indices.left.iter().zip(indices.right.iter()) {
+                let ri = ri.expect("an INNER hash join pairs every left with a right");
+                let (lf, lt) = acc_intervals[li];
+                let (rf, rt) = right_intervals[ri];
+                let from = lf.max(rf);
+                let to = lt.min(rt);
+                if from < to {
+                    let mut row = acc_rows[li].clone();
+                    row.extend(right_rows[ri].iter().cloned());
+                    next_rows.push(row);
+                    next_intervals.push((from, to));
+                }
+            }
+            return Ok((next_rows, next_intervals, right_stats));
+        }
+
+        // `LEFT` / `SEMI` / `ANTI`: group the matches by left row so an unmatched left
+        // row still emits its full-period gap and the interval difference sees every
+        // cover at once.
         let mut matches: Vec<Vec<usize>> = vec![Vec::new(); acc_rows.len()];
         for (&li, ri) in indices.left.iter().zip(indices.right.iter()) {
             matches[li].push(ri.expect("an INNER hash join pairs every left with a right"));
         }
-
-        let keeps_right = lower_join_type(step.join_type).keeps_right();
         let right_width = step.right.columns.len();
         let mut next_rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
         let mut next_intervals: Vec<(i64, i64)> = Vec::new();
         for (li, ris) in matches.iter().enumerate() {
             let (lf, lt) = acc_intervals[li];
             // The matched right sub-intervals clipped to this left version's period —
-            // the "covers" the difference subtracts and the intersection emits. An
-            // `INNER` / `LEFT` step also emits the matched row here.
+            // the "covers" the difference works over; `LEFT` also emits the matched row.
             let mut covers: Vec<(i64, i64)> = Vec::new();
             for &ri in ris {
                 let (rf, rt) = right_intervals[ri];
                 let from = lf.max(rf);
                 let to = lt.min(rt);
                 if from < to {
-                    if keeps_right {
+                    if step.join_type == JoinType::Left {
                         let mut row = acc_rows[li].clone();
                         row.extend(right_rows[ri].iter().cloned());
                         next_rows.push(row);
                         next_intervals.push((from, to));
                     }
-                    if step.join_type != JoinType::Inner {
-                        covers.push((from, to));
-                    }
+                    covers.push((from, to));
                 }
             }
+            let merged = merge_covers(covers);
             match step.join_type {
-                // The matched rows above are the whole `INNER` output.
-                JoinType::Inner => {}
-                // The gaps in the left version's period → `NULL`-extended rows.
+                // The matched rows above, plus a NULL-extended row per uncovered gap.
                 JoinType::Left => {
-                    for (from, to) in interval_gaps(lf, lt, &merge_covers(covers)) {
+                    for (from, to) in interval_gaps(lf, lt, &merged) {
                         let mut row = acc_rows[li].clone();
                         row.extend(std::iter::repeat_n(None, right_width));
                         next_rows.push(row);
@@ -5575,18 +5592,19 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 }
                 // The coalesced sub-intervals the left version *did* have a match.
                 JoinType::Semi => {
-                    for (from, to) in merge_covers(covers) {
+                    for (from, to) in merged {
                         next_rows.push(acc_rows[li].clone());
                         next_intervals.push((from, to));
                     }
                 }
                 // The gap sub-intervals the left version did *not* have a match.
                 JoinType::Anti => {
-                    for (from, to) in interval_gaps(lf, lt, &merge_covers(covers)) {
+                    for (from, to) in interval_gaps(lf, lt, &merged) {
                         next_rows.push(acc_rows[li].clone());
                         next_intervals.push((from, to));
                     }
                 }
+                JoinType::Inner => unreachable!("the INNER fast path returned above"),
             }
         }
         Ok((next_rows, next_intervals, right_stats))
