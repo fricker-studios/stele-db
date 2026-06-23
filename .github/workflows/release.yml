@@ -110,23 +110,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `target` is the Rust triple cargo builds with; `label` is the
+          # human-facing platform the published archive is named for. They
+          # match except for the Linux GNU targets, which ship as the shorter
+          # `<arch>-linux` — the `-unknown-…-gnu` is redundant noise for users,
+          # and glibc Linux is the only Linux flavor built (STL-262).
           # Tier 1
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: "" }
-          - { os: macos-latest, target: aarch64-apple-darwin, ext: "" }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, label: x86_64-linux, ext: "" }
+          - { os: macos-latest, target: aarch64-apple-darwin, label: aarch64-apple-darwin, ext: "" }
           # Tier 2
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, ext: "", linker: gcc-aarch64-linux-gnu }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, label: aarch64-linux, ext: "", linker: gcc-aarch64-linux-gnu }
           # `macos-15-intel`, not the retired `macos-13`: GitHub removed the
           # macOS 13 (Intel) image under its N-1 OS policy (~Dec 2025), so a
           # `macos-13` job hangs `queued` forever with no runner. macos-15-intel
           # is the last Intel-based hosted image (until ~Fall 2027); after that
           # GitHub drops hosted Intel macOS entirely and this target retires
           # (STL-161).
-          - { os: macos-15-intel, target: x86_64-apple-darwin, ext: "" }
+          - { os: macos-15-intel, target: x86_64-apple-darwin, label: x86_64-apple-darwin, ext: "" }
           # Tier 3 — restored by STL-160 (portable seek_read storage backend).
           # Unlike v0.1 this is no longer a release-only target: ci.yml's
           # `windows` job builds the workspace + runs the storage suite on
           # every PR, so a tag can't be the first time Windows compiles.
-          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: ".exe" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, label: x86_64-pc-windows-msvc, ext: ".exe" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -159,8 +164,11 @@ jobs:
         run: |
           ver="${GITHUB_REF_NAME}"
           target="${{ matrix.target }}"
+          label="${{ matrix.label }}"
           bindir="target/${target}/release"
-          staging="stele-${ver}-${target}"
+          # cargo emits under the real triple (target/${target}/release), but
+          # the archive carries the human-facing label (e.g. x86_64-linux) — STL-262.
+          staging="stele-${ver}-${label}"
           mkdir "${staging}"
           cp "${bindir}/stele-server${EXT}" "${bindir}/stele${EXT}" "${staging}/"
           cp README.md LICENSE "${staging}/"
@@ -168,7 +176,7 @@ jobs:
           echo "ARCHIVE=${staging}.tar.gz" >> "${GITHUB_ENV}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: binary-${{ matrix.target }}
+          name: binary-${{ matrix.label }}
           path: ${{ env.ARCHIVE }}
           if-no-files-found: error
 

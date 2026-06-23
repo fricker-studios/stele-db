@@ -59,7 +59,7 @@ Every image is **signed with cosign** and ships an attached **SBOM** and **SLSA 
 Standalone binaries for users who don't want containers.
 
 - **Target matrix** mirrors the [CI tiers](04-cicd.md#cross-platform-matrix): tier-1 `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`; tier-2 `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`; tier-3 `x86_64-pc-windows-msvc` (best effort — the storage backend's positioned read is platform-split `pread`/`seek_read`, and a per-PR CI job builds the workspace + runs the storage suite on Windows; STL-160).
-- **Naming:** `stele-<version>-<target>.<ext>` (e.g. `stele-1.4.2-aarch64-apple-darwin.tar.gz`), each with a `.sha256` and a cosign `.sig`.
+- **Naming:** `stele-<version>-<platform>.<ext>` (e.g. `stele-1.4.2-aarch64-apple-darwin.tar.gz`, `stele-1.4.2-x86_64-linux.tar.gz`), each with a `.sha256` and a cosign `.sig`. `<platform>` is the Rust target triple, except the Linux targets are shortened to `<arch>-linux` (dropping the `-unknown-…-gnu`) — only one Linux build ships per architecture, so the extra qualifiers are redundant noise for users (STL-262).
 - **Linking:** statically linked where the target allows (musl on Linux) so there are no runtime dependencies.
 - **Contents:** each archive bundles both `stele-server` and the `stele` CLI, plus shell completions and man pages.
 - **Self-update:** `stele self update` checks the release feed, verifies the signature, and swaps the binary in place (can be disabled for managed installs).
