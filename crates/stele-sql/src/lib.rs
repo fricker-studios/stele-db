@@ -77,8 +77,8 @@ pub mod select;
 pub mod types;
 
 pub use ast::{
-    AdminCommand, AsOf, Password, PeriodExpr, PeriodPredicateClause, SessionCommand, Statement,
-    StatementBody, Temporal, TimeDimension, UserDdl, ValidTimePeriod,
+    AdminCommand, AsOf, ExplainStmt, Password, PeriodExpr, PeriodPredicateClause, SessionCommand,
+    Statement, StatementBody, Temporal, TimeDimension, UserDdl, ValidTimePeriod,
 };
 pub use copy::{
     BoundCopy, CopyError, CopyFormat, CopyFormatKind, CopyShape, bind_copy, bind_copy_rows,

@@ -51,9 +51,10 @@
 pub mod backup;
 mod catalog_log;
 mod commit_log;
+mod explain;
 mod secondary;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::ops::Bound;
@@ -89,14 +90,15 @@ use stele_sql::ddl::{DdlOutcome, DdlStatement};
 use stele_sql::dml::{BoundDml, DmlError, InsertRow};
 use stele_sql::merge::{BoundMerge, MergeBound, MergeSource, MergeValid, MergeValue};
 use stele_sql::select::{
-    AggregateFunc, ArithOp, BoundAggregate, BoundCte, BoundHaving, BoundJoinSide, BoundJoinStep,
-    BoundPeriod, BoundPeriodPredicate, BoundPredicate, BoundScalar, BoundSelect,
-    BoundSubqueryFilter, CompareOp, CompositeKeyDecorrelation, Correlation, HavingScalar, JoinType,
-    OutputItem, PeriodEndpoint, Projection, ProjectionItem, ProjectionValue, SelectError,
-    SemiAntiDecorrelation, SortTarget, SubqueryKind, SystemTimeRange, ValidTimeRange,
+    AggregateCall, AggregateFunc, ArithOp, BoundAggregate, BoundCte, BoundHaving, BoundJoin,
+    BoundJoinSide, BoundJoinStep, BoundPeriod, BoundPeriodPredicate, BoundPredicate, BoundScalar,
+    BoundSelect, BoundSortKey, BoundSubqueryFilter, CompareOp, CompositeKeyDecorrelation,
+    Correlation, HavingScalar, JoinType, OutputItem, PeriodEndpoint, Projection, ProjectionItem,
+    ProjectionValue, SelectError, SemiAntiDecorrelation, SortTarget, SubqueryKind, SystemTimeRange,
+    ValidTimeRange,
 };
 use stele_sql::{
-    AdminCommand, BindContext, BindError, BoundCopy, CopyError, CopyShape, Statement,
+    AdminCommand, BindContext, BindError, BoundCopy, CopyError, CopyShape, ExplainStmt, Statement,
     StatementBody, TimeDimension, bind_copy, bind_copy_rows, bind_ddl, bind_dml, bind_select,
     resolve_as_of, without_filter,
 };
@@ -1114,6 +1116,13 @@ pub struct SessionEngine<C: Clock + Clone, D: Disk + Clone> {
     /// [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
     /// [STL-260]: https://allegromusic.atlassian.net/browse/STL-260
     index_probes: Cell<u64>,
+    /// The per-operator measurement sink for `EXPLAIN ANALYZE` ([STL-260]).
+    /// Disabled outside an `EXPLAIN ANALYZE` run, where the read path records
+    /// nothing and adds no measuring `Probe` — so a normal read pays no overhead.
+    /// A [`RefCell`] (interior-mutable, like [`index_probes`](Self::index_probes)'
+    /// [`Cell`]) so the `&self` read path records without a new `&mut`; timing
+    /// reads the same sourceless-in-test registry clock as the metrics.
+    analyze: RefCell<explain::Profiler>,
     /// The session's metric registry ([STL-253]): every statement, transaction
     /// outcome, flush/checkpoint, scan, and (via [`Engine::set_metrics`]) WAL
     /// append/fsync reports into it. Owned here — the engine is the one place
@@ -1178,6 +1187,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             pruned_below: SystemTimeMicros(0),
             index_states: BTreeMap::new(),
             index_probes: Cell::new(0),
+            analyze: RefCell::new(explain::Profiler::default()),
             metrics: SharedMetrics::default(),
             users: BTreeMap::new(),
             write_principal: Principal::new(WIRE_PRINCIPAL.to_vec()),
@@ -1352,6 +1362,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             pruned_below: SystemTimeMicros(0),
             index_states: BTreeMap::new(),
             index_probes: Cell::new(0),
+            analyze: RefCell::new(explain::Profiler::default()),
             metrics: SharedMetrics::default(),
             users,
             write_principal: Principal::new(WIRE_PRINCIPAL.to_vec()),
@@ -2255,6 +2266,15 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         read_snapshot: SystemTimeMicros,
         stmt: &Statement,
     ) -> Result<Option<Vec<(String, LogicalType)>>, EngineError> {
+        // `EXPLAIN [ANALYZE]` ([STL-260]) always returns the one-column `QUERY PLAN`
+        // shape, independent of the inner statement — advertise it so a prepared
+        // EXPLAIN's statement-level `Describe` matches what `Execute` returns.
+        if matches!(stmt.body, StatementBody::Explain(_)) {
+            return Ok(Some(vec![(
+                explain::QUERY_PLAN_COLUMN.to_owned(),
+                LogicalType::Text,
+            )]));
+        }
         let stripped = without_filter(stmt);
         let ctx = BindContext {
             snapshot: read_snapshot,
@@ -2314,6 +2334,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         stmt: &Statement,
         txn: &mut SessionTransaction,
     ) -> Result<StatementOutcome, EngineError> {
+        // `EXPLAIN [ANALYZE]` ([STL-260]) inside a transaction: render the inner
+        // statement's plan, executing it (under `ANALYZE`) through *this* path so
+        // an inner `DML` buffers into the block and an inner `SELECT` reads the
+        // pinned snapshot with the read-your-own-writes overlay — exactly as the
+        // bare inner statement would. Intercepted before `stage_dml` so the EXPLAIN
+        // wrapper is not mistaken for a buffered write.
+        if let StatementBody::Explain(explain) = &stmt.body {
+            return self.run_explain_in_txn(explain, txn);
+        }
+
         // Under READ COMMITTED every statement reads a fresh snapshot ([STL-248]):
         // re-pin toward the present *before* binding or executing this statement, so
         // it observes every transaction committed since the block began (and binds
@@ -2727,6 +2757,15 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             return Err(EngineError::CommitLog(io::Error::other(
                 "session poisoned by a failed commit-log append; restart to recover",
             )));
+        }
+
+        // `EXPLAIN [ANALYZE]` ([STL-260]) renders the inner statement's plan as a
+        // tree. Routed before the binders since it wraps any inner body; the inner
+        // is dispatched through this same router with **auto-commit** semantics
+        // (a `DML` under `ANALYZE` commits, Postgres-style). The transaction path
+        // intercepts it earlier — see [`execute_in_txn_inner`](Self::execute_in_txn_inner).
+        if let StatementBody::Explain(explain) = &stmt.body {
+            return self.run_explain(explain, read_snapshot, overlay);
         }
 
         // Admin commands (CHECKPOINT / FLUSH / COMPACT / BACKUP) have no SQL body,
@@ -3305,6 +3344,416 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         ))
     }
 
+    // -----------------------------------------------------------------------
+    // EXPLAIN [ANALYZE] ([STL-260])
+    // -----------------------------------------------------------------------
+
+    /// Render `EXPLAIN [ANALYZE] <inner>` as the `QUERY PLAN` row set, on the
+    /// auto-commit path.
+    ///
+    /// A bare `EXPLAIN` binds the inner and renders its plan shape without
+    /// executing. `EXPLAIN ANALYZE` arms the per-operator [`Profiler`](explain::Profiler),
+    /// runs the inner through the very same router (so a DML commits,
+    /// Postgres-style), then renders the tree annotated with measured rows + wall
+    /// time and a final `Execution Time` footer. The profiler is disarmed before
+    /// returning, on the error path too.
+    fn run_explain(
+        &mut self,
+        explain: &ExplainStmt,
+        read_snapshot: SystemTimeMicros,
+        overlay: &[BoundDml],
+    ) -> Result<StatementOutcome, EngineError> {
+        if !explain.analyze {
+            return self.explain_result(&explain.inner, read_snapshot, false, None, None);
+        }
+        self.analyze.borrow_mut().enable();
+        let started = self.metrics.now_micros();
+        let exec = self.execute_at(&explain.inner, read_snapshot, overlay);
+        let total_us = self.metrics.now_micros().saturating_sub(started);
+        let result = exec.and_then(|outcome| {
+            self.explain_result(
+                &explain.inner,
+                read_snapshot,
+                true,
+                Some(total_us),
+                Some(&outcome),
+            )
+        });
+        self.analyze.borrow_mut().disable();
+        result
+    }
+
+    /// As [`run_explain`](Self::run_explain), but inside an open transaction: the
+    /// inner runs through [`execute_in_txn_inner`](Self::execute_in_txn_inner) so a
+    /// DML buffers into the block and a `SELECT` reads the pinned snapshot with the
+    /// read-your-own-writes overlay — exactly as the bare inner would.
+    fn run_explain_in_txn(
+        &mut self,
+        explain: &ExplainStmt,
+        txn: &mut SessionTransaction,
+    ) -> Result<StatementOutcome, EngineError> {
+        let snapshot = txn.snapshot;
+        if !explain.analyze {
+            return self.explain_result(&explain.inner, snapshot, false, None, None);
+        }
+        self.analyze.borrow_mut().enable();
+        let started = self.metrics.now_micros();
+        let exec = self.execute_in_txn_inner(&explain.inner, txn);
+        let total_us = self.metrics.now_micros().saturating_sub(started);
+        let result = exec.and_then(|outcome| {
+            self.explain_result(
+                &explain.inner,
+                snapshot,
+                true,
+                Some(total_us),
+                Some(&outcome),
+            )
+        });
+        self.analyze.borrow_mut().disable();
+        result
+    }
+
+    /// Bind the inner statement, build its plan tree, and render it to the
+    /// `QUERY PLAN` row set (one text column, one row per line).
+    fn explain_result(
+        &self,
+        inner: &Statement,
+        read_snapshot: SystemTimeMicros,
+        analyze: bool,
+        total_us: Option<u64>,
+        executed: Option<&StatementOutcome>,
+    ) -> Result<StatementOutcome, EngineError> {
+        let mut root = self.plan_for(inner, read_snapshot)?;
+        if analyze {
+            // A path that runs no measured operator (a buffered / auto-commit DML
+            // does no scan) still reports actuals at the root: the executed
+            // outcome's headline row count and the statement's total wall time.
+            let rows = executed.map_or(0, outcome_rows);
+            root.set_measured_if_absent(explain::Measured {
+                rows,
+                time_us: total_us.unwrap_or(0),
+                scan: None,
+            });
+        }
+        let mut lines = root.render(analyze);
+        if let Some(total) = total_us {
+            // The whole-statement wall time — the true total the per-operator
+            // (inclusive) node times approximate (Postgres's `Execution Time`).
+            lines.push(format!("Execution Time: {total}us"));
+        }
+        let rows = lines
+            .into_iter()
+            .map(|line| vec![Some(encode_value(&ScalarValue::Text(line)))])
+            .collect();
+        Ok(StatementOutcome::Rows(SelectResult {
+            columns: vec![(explain::QUERY_PLAN_COLUMN.to_owned(), LogicalType::Text)],
+            rows,
+            // EXPLAIN's own output is synthetic — the scan it *describes* is shown
+            // in the plan, so there is no separate footer scan to report.
+            stats: None,
+        }))
+    }
+
+    /// Bind `inner` and build its [`PlanNode`](explain::PlanNode) — a `SELECT` or
+    /// an `INSERT`/`UPDATE`/`DELETE`; any other inner (DDL, …) is rejected, having
+    /// no query plan to render.
+    fn plan_for(
+        &self,
+        inner: &Statement,
+        read_snapshot: SystemTimeMicros,
+    ) -> Result<explain::PlanNode, EngineError> {
+        let ctx = BindContext {
+            snapshot: read_snapshot,
+            catalog: &self.catalog,
+        };
+        match bind_select(inner, &ctx) {
+            Ok(bound) => return self.plan_select(&bound),
+            Err(SelectError::NotSelect) => {}
+            Err(e) => return Err(EngineError::Select(e)),
+        }
+        match bind_dml(inner, &ctx) {
+            Ok(dml) => Ok(plan_dml(&dml, &self.analyze.borrow())),
+            Err(DmlError::NotDml) => {
+                // A DDL inner (`EXPLAIN CREATE TABLE …`) is neither a SELECT nor a
+                // DML, but it has its own non-plannable shape — give it a
+                // DDL-specific message rather than the generic SELECT/DML one.
+                // `bind_ddl` classifies it: anything but `NotDdl` (a valid DDL, or a
+                // malformed one) is a DDL statement.
+                if !matches!(bind_ddl(inner), Err(BindError::NotDdl)) {
+                    return Err(EngineError::Unsupported(
+                        "EXPLAIN does not support DDL statements \
+                         (only SELECT / INSERT / UPDATE / DELETE)",
+                    ));
+                }
+                Err(EngineError::Unsupported(
+                    "EXPLAIN supports a SELECT or INSERT / UPDATE / DELETE statement",
+                ))
+            }
+            Err(e) => Err(EngineError::Dml(e)),
+        }
+    }
+
+    /// The [`Measured`](explain::Measured) actuals recorded for `tag` this run, or
+    /// `None` (a bare `EXPLAIN`, or an operator that did not run).
+    fn measured(&self, tag: explain::OpTag) -> Option<explain::Measured> {
+        self.analyze.borrow().measured(tag)
+    }
+
+    /// The start instant for timing an engine-tail stage under `EXPLAIN ANALYZE`,
+    /// or `None` when not analyzing — so a normal read reads no clock and records
+    /// nothing ([STL-260]).
+    fn analyze_start(&self) -> Option<u64> {
+        self.analyze
+            .borrow()
+            .is_enabled()
+            .then(|| self.metrics.now_micros())
+    }
+
+    /// Record an engine-tail stage's actuals (its emitted `rows` and the wall time
+    /// since `started`) against `tag`; a no-op when `started` is `None`.
+    fn record_stage(&self, tag: explain::OpTag, started: Option<u64>, rows: usize) {
+        if let Some(t0) = started {
+            let elapsed = self.metrics.now_micros().saturating_sub(t0);
+            self.analyze.borrow_mut().add(tag, rows as u64, elapsed);
+        }
+    }
+
+    /// Record a temporal range scan as the `Source` plan node under `EXPLAIN
+    /// ANALYZE`: its emitted `rows`, the wall time since `started`, and its prune
+    /// accounting. A no-op when `started` is `None`.
+    fn record_range_source(&self, started: Option<u64>, rows: usize, stats: ScanStats) {
+        if let Some(t0) = started {
+            let elapsed = self.metrics.now_micros().saturating_sub(t0);
+            let mut profiler = self.analyze.borrow_mut();
+            profiler.add(explain::OpTag::Source, rows as u64, elapsed);
+            profiler.set_scan(explain::OpTag::Source, stats);
+        }
+    }
+
+    /// Build the plan tree for a bound `SELECT`: the source subtree, then the
+    /// correlated-subquery filter / aggregate / projection-and-shaping layers.
+    fn plan_select(&self, bound: &BoundSelect) -> Result<explain::PlanNode, EngineError> {
+        use explain::{OpTag, PlanNode};
+
+        let mut node = self.source_node(bound)?;
+
+        // A correlated subquery `WHERE` filters per outer row in the engine tail.
+        if bound
+            .subquery_filter
+            .as_ref()
+            .is_some_and(|s| s.correlation.is_some())
+        {
+            node = PlanNode::unary("Subquery Filter", Vec::new(), node)
+                .with_measured(self.measured(OpTag::SubqueryFilter));
+        }
+
+        // The aggregate, or the projection + result-shaping tail — either is the
+        // plan's output, so it carries the `Output:` column list.
+        let output = self.output_detail(bound);
+        let addressable = self.addressable_for(bound);
+        if let Some(agg) = &bound.aggregate {
+            let mut details = aggregate_details(agg, addressable.as_deref());
+            details.extend(shaping_details(bound, addressable.as_deref()));
+            if let Some(o) = output {
+                details.push(o);
+            }
+            node = PlanNode::unary("Aggregate", details, node)
+                .with_measured(self.measured(OpTag::Aggregate));
+        } else {
+            let mut details = shaping_details(bound, addressable.as_deref());
+            let shaped = !bound.order_by.is_empty()
+                || bound.distinct
+                || bound.limit.is_some()
+                || bound.offset > 0;
+            let computed = !bound.projection.is_all_columns();
+            if shaped || computed {
+                if let Some(o) = output {
+                    details.push(o);
+                }
+                node = PlanNode::unary("Project", details, node)
+                    .with_measured(self.measured(OpTag::Project));
+            } else if let Some(o) = output {
+                node.push_detail(o);
+            }
+        }
+        Ok(node)
+    }
+
+    /// The source subtree of a `SELECT`: a single-table scan pipeline, a join, a
+    /// temporal range scan, or a materialized CTE / derived table.
+    fn source_node(&self, bound: &BoundSelect) -> Result<explain::PlanNode, EngineError> {
+        use explain::{OpTag, PlanNode};
+        if let Some(join) = &bound.join {
+            return Ok(self.join_source(bound, join));
+        }
+        if bound.system_range.is_some() {
+            return Ok(self.range_source(bound, "system"));
+        }
+        if bound.valid_range.is_some() {
+            return Ok(self.range_source(bound, "valid"));
+        }
+        if bound.relation_columns.is_some() {
+            return Ok(
+                PlanNode::leaf(format!("CTE Scan on {}", bound.table), Vec::new())
+                    .with_measured(self.measured(OpTag::Source)),
+            );
+        }
+        self.scan_subtree(bound)
+    }
+
+    /// The single-table source pipeline: `Snapshot Scan → Explode Payload →
+    /// [Filter]`, with the scan node carrying the AS OF pins, the chosen index,
+    /// and the snapshot prune push-down.
+    fn scan_subtree(&self, bound: &BoundSelect) -> Result<explain::PlanNode, EngineError> {
+        use explain::{OpTag, PlanNode};
+        let schema_columns = self
+            .explain_schema_columns(bound)
+            .ok_or_else(|| EngineError::UnknownTable(bound.table.clone()))?;
+
+        let mut scan_details = vec![format!("System snapshot: {}", bound.snapshot.0)];
+        if let Some(v) = bound.valid_snapshot {
+            scan_details.push(format!("Valid AS OF: {}", v.0));
+        }
+        if let Some((name, kind, op)) = self.index_choice_for(&bound.table, bound, &schema_columns)
+        {
+            scan_details.push(format!("Index: {name} ({kind}, {op})"));
+        }
+        scan_details.push(format!("Prune: sys_from <= {}", bound.snapshot.0));
+
+        let scan = PlanNode::leaf(format!("Snapshot Scan on {}", bound.table), scan_details)
+            .with_measured(self.measured(OpTag::Scan));
+        let explode = PlanNode::unary("Explode Payload", Vec::new(), scan)
+            .with_measured(self.measured(OpTag::Explode));
+        let node = if has_value_filter(bound) {
+            PlanNode::unary(
+                "Filter",
+                vec![filter_detail(bound, &schema_columns)],
+                explode,
+            )
+            .with_measured(self.measured(OpTag::Filter))
+        } else {
+            explode
+        };
+        Ok(node)
+    }
+
+    /// A join source: a `Hash Join` node with one scan child per input in the
+    /// left-deep chain (the seed, then each step's right input). The inputs are
+    /// shown structurally; the `Hash Join` node carries the combined scan
+    /// accounting and the join's output rows + time under `EXPLAIN ANALYZE`.
+    fn join_source(&self, bound: &BoundSelect, join: &BoundJoin) -> explain::PlanNode {
+        use explain::{OpTag, PlanNode};
+        let mut children = vec![PlanNode::leaf(
+            format!("Snapshot Scan on {}", join.left.table),
+            Vec::new(),
+        )];
+        for step in &join.steps {
+            children.push(PlanNode::leaf(
+                format!("Snapshot Scan on {}", step.right.table),
+                Vec::new(),
+            ));
+        }
+        let jtype = join
+            .steps
+            .last()
+            .map_or("inner", |s| join_type_label(s.join_type));
+        let mut details = vec![format!("System snapshot: {}", bound.snapshot.0)];
+        if let Some(v) = bound.valid_snapshot {
+            details.push(format!("Valid AS OF: {}", v.0));
+        }
+        PlanNode::nary(format!("Hash Join ({jtype})"), details, children)
+            .with_measured(self.measured(OpTag::Join))
+    }
+
+    /// A temporal range scan source ([STL-244] / [STL-328]) on `axis`.
+    fn range_source(&self, bound: &BoundSelect, axis: &str) -> explain::PlanNode {
+        use explain::{OpTag, PlanNode};
+        let mut details = vec![format!("System snapshot: {}", bound.snapshot.0)];
+        if let Some(v) = bound.valid_snapshot {
+            details.push(format!("Valid AS OF: {}", v.0));
+        }
+        PlanNode::leaf(
+            format!("Temporal Range Scan on {} ({axis})", bound.table),
+            details,
+        )
+        .with_measured(self.measured(OpTag::Source))
+    }
+
+    /// The table's `(name, type)` columns live at the bound snapshot, for a
+    /// single-table read; `None` if the table does not resolve there.
+    fn explain_schema_columns(&self, bound: &BoundSelect) -> Option<Vec<(String, LogicalType)>> {
+        let schema = self.catalog.resolve(&bound.table, bound.snapshot)?;
+        Some(
+            schema
+                .columns()
+                .iter()
+                .map(|c| (c.name().to_owned(), c.ty()))
+                .collect(),
+        )
+    }
+
+    /// The addressable columns a single-table plan's `WHERE` / aggregate /
+    /// `ORDER BY` index into, for naming detail lines; `None` for a join (whose
+    /// addressable output this path does not reconstruct) — keys then show by index.
+    fn addressable_for(&self, bound: &BoundSelect) -> Option<Vec<(String, LogicalType)>> {
+        if bound.join.is_some() {
+            return None;
+        }
+        if let Some(columns) = &bound.relation_columns {
+            return Some(columns.clone());
+        }
+        let schema_columns = self.explain_schema_columns(bound)?;
+        Some(addressable_columns(&schema_columns))
+    }
+
+    /// The `Output:` detail — the plan's projected output column names.
+    fn output_detail(&self, bound: &BoundSelect) -> Option<String> {
+        let cols = self.output_columns(bound).ok()?;
+        let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+        Some(format!("Output: {}", names.join(", ")))
+    }
+
+    /// Which secondary index a single-table `SELECT` would use, if any — the same
+    /// rule-based eligibility [`index_window`](Self::index_window) applies, but
+    /// **without probing** (no storage read, no `index_probes` tick): the column
+    /// matches a live index whose floor admits the snapshot and whose kind answers
+    /// the comparison. Returns `(name, kind, operator)` for the plan's `Index:` line.
+    fn index_choice_for(
+        &self,
+        table: &str,
+        bound: &BoundSelect,
+        schema_columns: &[(String, LogicalType)],
+    ) -> Option<(String, &'static str, &'static str)> {
+        if self.index_states.is_empty() {
+            return None;
+        }
+        let (position, op, _literal) = bound.filter.as_ref()?.column_comparison()?;
+        let (column, _) = schema_columns.get(position)?;
+        self.catalog
+            .indexes_on(table)
+            .filter(|def| matches!(def.columns(), [c] if c == column))
+            .filter_map(|def| self.index_states.get(def.name()).map(|s| (def, s)))
+            .filter(|(_, state)| bound.snapshot >= state.floor)
+            .find_map(|(def, _)| {
+                // Equality probes on any kind; ranges only on a b-tree (a hash index
+                // cannot walk its keys in value order); `<>` never probes.
+                let serves = match op {
+                    CompareOp::Ne => false,
+                    CompareOp::Eq => true,
+                    CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge => {
+                        matches!(def.kind(), IndexKind::BTree)
+                    }
+                };
+                serves.then(|| {
+                    (
+                        def.name().to_owned(),
+                        index_kind_label(def.kind()),
+                        cmp_label(op),
+                    )
+                })
+            })
+    }
+
     /// Run a snapshot scan for a bound `SELECT`, honoring its projection list and
     /// `WHERE` filter through the vectorized operator pipeline ([STL-151], [STL-206]).
     ///
@@ -3326,10 +3775,6 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// A `GROUP BY` / aggregate query ([STL-171]) folds the same reconstructed,
     /// filtered rows into grouped output ([`run_aggregate`]); a plain query
     /// projects them.
-    // Threading the scan accounting up for the query-stats footer ([STL-201])
-    // pushed the row-production match a few lines past the limit; the control flow
-    // is unchanged, so splitting it would scatter it rather than clarify it.
-    #[allow(clippy::too_many_lines)]
     fn run_select(
         &self,
         bound: &BoundSelect,
@@ -3572,7 +4017,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 // all-zero accounting rather than suppressing the footer.
                 Some(Probe::Empty) => (Vec::new(), Some(ScanStats::default())),
                 Some(Probe::Window { low, high }) => {
-                    let scanned = Self::scan_rows(
+                    let scanned = self.scan_rows(
                         bound,
                         state,
                         &schema_columns,
@@ -3585,7 +4030,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     (scanned.rows, Some(scanned.stats))
                 }
                 None => {
-                    let scanned = Self::scan_rows(
+                    let scanned = self.scan_rows(
                         bound,
                         state,
                         &schema_columns,
@@ -3667,14 +4112,17 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // correlated `WHERE` filters rows *before* grouping, exactly as a plain one.
         let rows = match &bound.subquery_filter {
             Some(sub) if sub.correlation.is_some() => {
-                RowSource::Rows(self.filter_correlated_subquery(
+                let started = self.analyze_start();
+                let filtered = self.filter_correlated_subquery(
                     sub,
                     schema_columns,
                     addressable,
                     rows.into_rows(),
                     overlay,
                     scope,
-                )?)
+                )?;
+                self.record_stage(explain::OpTag::SubqueryFilter, started, filtered.len());
+                RowSource::Rows(filtered)
             }
             _ => rows,
         };
@@ -3686,13 +4134,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // axis) and over the read-your-own-writes overlay (ordering after
         // overlay, [STL-203]).
         if let Some(agg) = &bound.aggregate {
+            let started = self.analyze_start();
             let mut result = run_aggregate(bound, agg, schema_columns, &rows)?;
+            self.record_stage(explain::OpTag::Aggregate, started, result.rows.len());
             // The footer reports the rows the aggregate *returned* (its grouped
             // output), over the scan that fed it ([STL-201]).
             result.stats = scan_stats.map(|s| query_stats(&s, result.rows.len(), bound.snapshot));
             return Ok(StatementOutcome::Rows(result));
         }
 
+        let started = self.analyze_start();
         let columns = projected_columns(&bound.projection, addressable, n_schema);
         let out_rows: Vec<Vec<Option<Vec<u8>>>> = if bound.projection.is_all_columns() {
             // Fast path: every item is a plain addressable column, projected by
@@ -3732,6 +4183,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 .map(|&r| indices.iter().map(|&i| ext.cell(r, i)).collect())
                 .collect()
         };
+        self.record_stage(explain::OpTag::Project, started, out_rows.len());
         let stats = scan_stats.map(|s| query_stats(&s, out_rows.len(), bound.snapshot));
         Ok(StatementOutcome::Rows(SelectResult {
             columns,
@@ -4048,6 +4500,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .collect();
         let value_count = schema_columns.len().saturating_sub(1);
 
+        // Time the whole range source (scan + version reconstruction) as one plan
+        // node under `EXPLAIN ANALYZE` ([STL-260]).
+        let range_started = self.analyze_start();
+
         // The addressable set the projection / shaping / aggregate clauses bound
         // against: the table's own columns, then the two appended endpoints
         // (`range_schema_columns`), then the provenance pseudo-columns. A read
@@ -4149,6 +4605,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let plan = filter_plan(bound);
         let rows = filter_rows(&plan, &range_addressable, rows)?;
 
+        // Record the range scan as the source node under `EXPLAIN ANALYZE`
+        // ([STL-260]): its (post-`WHERE`) rows, time, and prune accounting; the
+        // shaping / aggregate / projection tail is timed inside `finish_select`.
+        self.record_range_source(range_started, rows.len(), stats);
+
         // Route through the shared shaping / aggregate / projection tail, with the
         // endpoints as the trailing schema columns and provenance past them.
         self.finish_select(
@@ -4215,6 +4676,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .map(|c| (c.name().to_owned(), c.ty()))
             .collect();
         let value_count = schema_columns.len().saturating_sub(1);
+
+        // Time the whole range source as one plan node under `EXPLAIN ANALYZE`.
+        let range_started = self.analyze_start();
 
         // The endpoints and provenance pseudo-columns the rest of the SELECT surface
         // binds against, as in [`run_system_range`](Self::run_system_range).
@@ -4313,6 +4777,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // `valid_from` / `valid_to` endpoints.
         let plan = filter_plan(bound);
         let rows = filter_rows(&plan, &range_addressable, rows)?;
+
+        // Record the valid range scan as the source node under `EXPLAIN ANALYZE`.
+        self.record_range_source(range_started, rows.len(), stats);
 
         self.finish_select(
             bound,
@@ -4756,6 +5223,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     // struct would only indirect the one call site.
     #[allow(clippy::too_many_arguments)]
     fn scan_rows(
+        &self,
         bound: &BoundSelect,
         state: &TableState<C, D>,
         schema_columns: &[(String, LogicalType)],
@@ -4849,14 +5317,51 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // first-class typed value columns (schema order: position 0 the key,
         // position i+1 value column i), then filter the whole batch. Exploded value
         // columns have no `ColumnId`, so the full row is read positionally.
+        //
+        // Under `EXPLAIN ANALYZE` ([STL-260]) each stage is wrapped in a measuring
+        // `Probe` that attributes its rows + wall time to the matching plan node;
+        // a normal read builds the bare pipeline and pays nothing. The boxing is
+        // uniform either way (`impl Operator for Box`), so the un-analyzed chain is
+        // the same `Box<dyn Operator>` it always was.
+        let analyzing = self.analyze.borrow().is_enabled();
         let source = ScanSource::new(scan, DEFAULT_BATCH_SIZE);
+        let source: Box<dyn Operator + '_> = if analyzing {
+            Box::new(explain::Probe::new(
+                source,
+                explain::OpTag::Scan,
+                &self.analyze,
+                metrics,
+            ))
+        } else {
+            Box::new(source)
+        };
         let exploded = ExplodePayload::new(source, value_count);
+        let exploded: Box<dyn Operator + '_> = if analyzing {
+            Box::new(explain::Probe::new(
+                exploded,
+                explain::OpTag::Explode,
+                &self.analyze,
+                metrics,
+            ))
+        } else {
+            Box::new(exploded)
+        };
         let mut pipeline: Box<dyn Operator + '_> = match filter_expr {
             Some(expr) => {
                 let schema_types = schema_columns.iter().map(|(_, ty)| *ty).collect();
-                Box::new(Filter::new(exploded, expr, schema_types))
+                let filter = Filter::new(exploded, expr, schema_types);
+                if analyzing {
+                    Box::new(explain::Probe::new(
+                        filter,
+                        explain::OpTag::Filter,
+                        &self.analyze,
+                        metrics,
+                    ))
+                } else {
+                    Box::new(filter)
+                }
             }
-            None => Box::new(exploded),
+            None => exploded,
         };
 
         let ncols = value_count + 1;
@@ -4871,6 +5376,12 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // The loop above drained at least one `next`, so the scan has resolved; the
         // default guards the impossible un-resolved case rather than panicking.
         let stats = pipeline.stats().unwrap_or_default();
+        // Attach the scan's prune accounting to its plan node for `EXPLAIN ANALYZE`.
+        if analyzing {
+            self.analyze
+                .borrow_mut()
+                .set_scan(explain::OpTag::Scan, stats);
+        }
         Ok(ScannedRows { rows, stats })
     }
 
@@ -5196,6 +5707,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// unless any input is a materialized CTE / derived table, which was accounted at
     /// materialization, not here, so the join then carries no single accounting and
     /// the footer is suppressed.
+    // The left-deep fold reads as one sequence; the `EXPLAIN ANALYZE` measurement
+    // points ([STL-260]) pushed it a few lines past the limit, but splitting it would
+    // scatter the join path rather than clarify it.
+    #[allow(clippy::too_many_lines)]
     fn run_join(
         &self,
         bound: &BoundSelect,
@@ -5208,6 +5723,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             .expect("run_join is routed only for a bound join plan");
         let snapshot = bound.snapshot;
         let valid_snapshot = bound.valid_snapshot;
+        // The whole join — every input scan plus the left-deep combine — is timed
+        // as one `Hash Join` node under `EXPLAIN ANALYZE` ([STL-260]); the post-join
+        // aggregate / projection tail is timed separately below.
+        let join_started = self.analyze_start();
 
         // The leftmost input seeds the accumulated output; the chain folds the rest
         // onto it. Each input is a base table scanned at the one statement
@@ -5307,6 +5826,20 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // projection + shaping tail — the shared single-table helpers ([STL-264]).
         let plan = filter_plan(bound);
         let rows = filter_rows(&plan, &addressable, rows)?;
+        // Under `EXPLAIN ANALYZE`, record the `Hash Join` node: its (post-`WHERE`)
+        // output rows, the time spent building the whole chain, and its combined
+        // per-input scan accounting ([STL-318]).
+        if let Some(t0) = join_started {
+            let elapsed = self.metrics.now_micros().saturating_sub(t0);
+            self.analyze
+                .borrow_mut()
+                .add(explain::OpTag::Join, rows.len() as u64, elapsed);
+            if let Some(stats) = join_stats {
+                self.analyze
+                    .borrow_mut()
+                    .set_scan(explain::OpTag::Join, stats);
+            }
+        }
         // The join's addressable output is already gathered row-major, so it rides the
         // shared shaping tail through [`RowSource::Rows`] ([STL-338]).
         let rows = RowSource::Rows(rows);
@@ -5316,7 +5849,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // accounting ([STL-318]) over the rows the aggregate *returned* (its
             // grouped output), mirroring the single-table aggregate path
             // ([`finish_select`]).
+            let started = self.analyze_start();
             let mut result = run_aggregate(bound, agg, &addressable, &rows)?;
+            self.record_stage(explain::OpTag::Aggregate, started, result.rows.len());
             result.stats = join_stats.map(|s| query_stats(&s, result.rows.len(), snapshot));
             return Ok(StatementOutcome::Rows(result));
         }
@@ -5324,12 +5859,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // The projection: the output columns, by addressable index. `DISTINCT` /
         // `ORDER BY` / `OFFSET` / `LIMIT` move row indices only ([`shape_rows`]),
         // then each surviving row is projected.
+        let started = self.analyze_start();
         let projection = &join.output;
         let selection = shape_rows(bound, &addressable, projection, &rows)?;
         let out_rows: Vec<Vec<Option<Vec<u8>>>> = selection
             .iter()
             .map(|&r| projection.iter().map(|&i| rows.cell(r, i)).collect())
             .collect();
+        self.record_stage(explain::OpTag::Project, started, out_rows.len());
         // Every input's scan accounting summed ([STL-318]), over the join's returned
         // row count; `None` (footer suppressed) if any input was a materialized relation.
         let stats = join_stats.map(|s| query_stats(&s, out_rows.len(), snapshot));
@@ -9485,6 +10022,217 @@ fn provenance_cells(prov: &provenance::Provenance) -> [Option<Vec<u8>>; 3] {
         Some(encode_value(&ScalarValue::TimestampTz(prov.committed_at.0))),
         Some(prov.principal.as_bytes().to_vec()),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// EXPLAIN plan-tree detail helpers ([STL-260])
+// ---------------------------------------------------------------------------
+
+/// The headline row count of an executed statement — for an `EXPLAIN ANALYZE`
+/// root that ran no measured operator (a DML), so the plan still reports actuals.
+const fn outcome_rows(outcome: &StatementOutcome) -> u64 {
+    match outcome {
+        StatementOutcome::Rows(result) => result.rows.len() as u64,
+        StatementOutcome::Dml(
+            DmlSummary::Insert(n)
+            | DmlSummary::Update(n)
+            | DmlSummary::Delete(n)
+            | DmlSummary::Merge(n),
+        ) => *n,
+        StatementOutcome::Ddl { .. } => 0,
+    }
+}
+
+/// Build the plan tree for a bound DML ([STL-260]). A predicate-driven
+/// `UPDATE`/`DELETE` and a `MERGE` scan the table to resolve the affected keys
+/// before writing; a point write does not.
+fn plan_dml(dml: &BoundDml, profiler: &explain::Profiler) -> explain::PlanNode {
+    use explain::{OpTag, PlanNode};
+    let table = dml.table();
+    let label = match dml {
+        BoundDml::Insert { .. } | BoundDml::InsertRows { .. } => "Insert",
+        BoundDml::Update { .. } | BoundDml::UpdateScan { .. } => "Update",
+        BoundDml::Delete { .. } | BoundDml::DeleteScan { .. } => "Delete",
+        BoundDml::Merge(_) => "Merge",
+    };
+    let scans = matches!(
+        dml,
+        BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. } | BoundDml::Merge(_)
+    );
+    if scans {
+        let scan = PlanNode::leaf(format!("Snapshot Scan on {table}"), Vec::new())
+            .with_measured(profiler.measured(OpTag::Scan));
+        PlanNode::unary(format!("{label} on {table}"), Vec::new(), scan)
+            .with_measured(profiler.measured(OpTag::Project))
+    } else {
+        PlanNode::leaf(format!("{label} on {table}"), Vec::new())
+            .with_measured(profiler.measured(OpTag::Project))
+    }
+}
+
+/// Whether a bound `SELECT` runs a distinct vectorized `Filter` operator — a
+/// value-column or period predicate — versus a key equality pushed to the scan or
+/// a subquery folded into it (which carry no separate `Filter` node).
+fn has_value_filter(bound: &BoundSelect) -> bool {
+    bound.period_filter.is_some()
+        || bound
+            .filter
+            .as_ref()
+            .is_some_and(|f| f.key_equality().is_none())
+}
+
+/// A one-line `WHERE` condition summary for a `Filter` node.
+fn filter_detail(bound: &BoundSelect, schema_columns: &[(String, LogicalType)]) -> String {
+    if let Some((position, op, literal)) = bound
+        .filter
+        .as_ref()
+        .and_then(BoundPredicate::column_comparison)
+    {
+        let column = col_name(Some(schema_columns), position);
+        format!("Cond: {column} {} {}", cmp_label(op), scalar_text(literal))
+    } else if bound.period_filter.is_some() {
+        "Cond: period predicate".to_owned()
+    } else {
+        "Cond: (filter)".to_owned()
+    }
+}
+
+/// The `Group Key` / `Aggregates` detail lines for an `Aggregate` node.
+fn aggregate_details(
+    agg: &BoundAggregate,
+    addressable: Option<&[(String, LogicalType)]>,
+) -> Vec<String> {
+    let mut details = Vec::new();
+    if !agg.group_by.is_empty() {
+        let keys: Vec<String> = agg
+            .group_by
+            .iter()
+            .map(|&i| col_name(addressable, i))
+            .collect();
+        details.push(format!("Group Key: {}", keys.join(", ")));
+    }
+    if !agg.aggregates.is_empty() {
+        let calls: Vec<String> = agg
+            .aggregates
+            .iter()
+            .map(|c| agg_call_text(c, addressable))
+            .collect();
+        details.push(format!("Aggregates: {}", calls.join(", ")));
+    }
+    details
+}
+
+/// `count(*)` / `sum(col)` / … for one aggregate call.
+fn agg_call_text(call: &AggregateCall, addressable: Option<&[(String, LogicalType)]>) -> String {
+    let func = match call.func {
+        AggregateFunc::Count => "count",
+        AggregateFunc::Sum => "sum",
+        AggregateFunc::Min => "min",
+        AggregateFunc::Max => "max",
+        AggregateFunc::Avg => "avg",
+    };
+    call.arg.map_or_else(
+        || format!("{func}(*)"),
+        |i| format!("{func}({})", col_name(addressable, i)),
+    )
+}
+
+/// The `Sort Key` / `Distinct` / `Limit` detail lines for a node that shapes its
+/// output (an `Aggregate` or a `Project`).
+fn shaping_details(
+    bound: &BoundSelect,
+    addressable: Option<&[(String, LogicalType)]>,
+) -> Vec<String> {
+    let mut details = Vec::new();
+    if !bound.order_by.is_empty() {
+        let keys: Vec<String> = bound
+            .order_by
+            .iter()
+            .map(|k| sort_key_text(k, addressable))
+            .collect();
+        details.push(format!("Sort Key: {}", keys.join(", ")));
+    }
+    if bound.distinct {
+        details.push("Distinct".to_owned());
+    }
+    if bound.limit.is_some() || bound.offset > 0 {
+        let mut parts = Vec::new();
+        if let Some(limit) = bound.limit {
+            parts.push(format!("limit {limit}"));
+        }
+        if bound.offset > 0 {
+            parts.push(format!("offset {}", bound.offset));
+        }
+        details.push(format!("Limit: {}", parts.join(", ")));
+    }
+    details
+}
+
+/// One `ORDER BY` key's text (`name` or `name DESC`).
+fn sort_key_text(key: &BoundSortKey, addressable: Option<&[(String, LogicalType)]>) -> String {
+    let name = match key.column {
+        SortTarget::Schema(i) => col_name(addressable, i),
+        SortTarget::Output(i) => format!("#{i}"),
+    };
+    if key.descending {
+        format!("{name} DESC")
+    } else {
+        name
+    }
+}
+
+/// The column name at `index`, or a positional `colN` fallback when the names are
+/// unavailable (a join, whose addressable output this path does not reconstruct).
+fn col_name(addressable: Option<&[(String, LogicalType)]>, index: usize) -> String {
+    addressable
+        .and_then(|cols| cols.get(index))
+        .map_or_else(|| format!("col{index}"), |(name, _)| name.clone())
+}
+
+const fn cmp_label(op: CompareOp) -> &'static str {
+    match op {
+        CompareOp::Eq => "=",
+        CompareOp::Ne => "<>",
+        CompareOp::Lt => "<",
+        CompareOp::Le => "<=",
+        CompareOp::Gt => ">",
+        CompareOp::Ge => ">=",
+    }
+}
+
+const fn index_kind_label(kind: IndexKind) -> &'static str {
+    match kind {
+        IndexKind::BTree => "btree",
+        IndexKind::Hash => "hash",
+    }
+}
+
+const fn join_type_label(join: JoinType) -> &'static str {
+    match join {
+        JoinType::Inner => "inner",
+        JoinType::Left => "left",
+        JoinType::Semi => "semi",
+        JoinType::Anti => "anti",
+    }
+}
+
+/// A concise, deterministic rendering of a literal in a plan detail line — bare
+/// for the scalar numeric / temporal types, quoted for text, and the canonical
+/// `Debug` for the structured ones (UUID / bytea / period).
+// The `i32` (`Int4` / `Date`) and `i64` (`Int8` / `Timestamp` / `TimestampTz`)
+// arms read identically but bind different integer widths, so they cannot fold
+// into one arm — the same-body lint is a false positive here.
+#[allow(clippy::match_same_arms)]
+fn scalar_text(value: &ScalarValue) -> String {
+    match value {
+        ScalarValue::Int4(n) | ScalarValue::Date(n) => n.to_string(),
+        ScalarValue::Int8(n) | ScalarValue::Timestamp(n) | ScalarValue::TimestampTz(n) => {
+            n.to_string()
+        }
+        ScalarValue::Bool(b) => b.to_string(),
+        ScalarValue::Text(s) => format!("'{s}'"),
+        other => format!("{other:?}"),
+    }
 }
 
 /// The `(name, type)` output columns a projection produces ([STL-303]): `All` is

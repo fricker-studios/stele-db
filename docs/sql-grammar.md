@@ -378,6 +378,84 @@ Declares the two columns that form the table's application-time (valid-time)
 period. Captured as `Temporal::valid_time: Option<ValidTimePeriod>`. May appear
 in either order relative to `WITH SYSTEM VERSIONING`.
 
+## `EXPLAIN [ANALYZE]` — plan introspection (STL-260)
+
+```sql
+EXPLAIN SELECT id FROM account WHERE balance >= 100;          -- plan only
+EXPLAIN ANALYZE SELECT id FROM account WHERE balance >= 100;  -- + run + measure
+```
+
+`EXPLAIN` renders the bound plan as an indented operator tree; `EXPLAIN ANALYZE`
+**executes the statement for real** and annotates each operator with its true row
+count and wall time. It is the introspection that makes the index / compaction /
+prune work observable — "print what's true, not invented numbers": Stele has no
+cost model, so a plan carries **no cost estimates**.
+
+`EXPLAIN` is recognized at the **token level** (like the admin / `SET` surfaces):
+`sqlparser` has its own `EXPLAIN` grammar, but it would reject the temporal
+clauses the inner statement may carry (`EXPLAIN SELECT … FOR SYSTEM_TIME AS OF
+…`), so the leading `EXPLAIN [ANALYZE]` is stripped and the remainder is parsed
+through the normal path (which lifts those clauses as usual). Captured as
+`StatementBody::Explain { analyze, inner }`; the inner is bound — and, under
+`ANALYZE`, executed — exactly as if issued on its own. `EXPLAIN` supports a
+`SELECT` or an `INSERT` / `UPDATE` / `DELETE`; a DDL / admin / nested `EXPLAIN`
+inner is rejected (no query plan to render). The parenthesized option list
+(`EXPLAIN (FORMAT …)`) and a JSON output format are out of v0.3 scope.
+
+**Result shape (the Postgres convention).** The output is one text column named
+`QUERY PLAN`, one row per line, so `psql` and the `stele` shell render it
+natively with no special-casing. `EXPLAIN`'s own output is synthetic — it carries
+no query-stats footer ([STL-201]); the scan it *describes* is shown inside the
+plan.
+
+**Reading a plan.** Consumer-on-top: a node's children (the inputs it pulls from)
+are indented below it under an `->` arrow; attribute lines sit under the label.
+
+```text
+Filter  (actual rows=2 time=0us)
+  Cond: balance >= 100
+  Output: id
+  ->  Explode Payload  (actual rows=2 time=0us)
+        ->  Snapshot Scan on account  (actual rows=2 time=0us)
+              System snapshot: 1700000000000000
+              Index: i_balance (btree, >=)
+              Prune: sys_from <= 1700000000000000
+              Buffers: segments 1/1 scanned (pruned 0 zone, 0 bloom, 0 superseded, 0 valid); row-groups 1/1 scanned (pruned 0 zone, 0 valid)
+Execution Time: 0us
+```
+
+- The scan node carries the **AS OF pins** (the resolved system snapshot, and a
+  `Valid AS OF` line for a `FOR VALID_TIME AS OF` read), the **chosen index**
+  (`Index: <name> (<kind>, <op>)`, absent for a full scan), and the snapshot
+  **prune push-down** (`Prune: sys_from <= …`). Above it sit the value-column
+  `Filter`, then the `Aggregate` (`Group Key` / `Aggregates`) or the projection
+  + result-shaping (`Sort Key` / `Distinct` / `Limit`), and `Output:` the
+  projected columns. A join renders as a `Hash Join` over its input scans.
+- `(actual rows=N time=Xus)` is **`EXPLAIN ANALYZE` only** — the operator's true
+  emitted rows and wall time (inclusive of its inputs, like Postgres). Above, the
+  index narrowed the scan to the 2 matching rows, so `actual rows=2` rather than
+  the table's 3 — the index's effect, made visible.
+- `Buffers:` is the scan's prune accounting ([STL-146] / [STL-173]): segments and
+  row-groups scanned versus skipped by each proof (zone map, bloom, superseded,
+  valid-interval). It is the same instrumentation the query-stats footer reports
+  ([STL-201]) — one set of counters, two renderers.
+- `Execution Time:` is the whole-statement wall time. Timing is engine-side (the
+  metric registry's clock), never inside the deterministic `stele-exec` operators
+  ([ADR-0027]); under test / the simulator no time source is installed, so every
+  time reads `0us` and the output is deterministic.
+
+**DML under `ANALYZE`.** `EXPLAIN ANALYZE` of an `INSERT` / `UPDATE` / `DELETE`
+runs the write **for real and commits it**, Postgres-style — it is not a dry run
+— so `EXPLAIN ANALYZE INSERT …` leaves the row behind. Inside a `BEGIN` block it
+buffers into the transaction like the bare statement (read-your-own-writes), and
+a `ROLLBACK` discards it. A bare `EXPLAIN` never executes.
+
+**Deferred** (each a tracked follow-up, never silently wrong): per-input
+row/time split for a join's side scans and a temporal range scan (the `Hash
+Join` / `Temporal Range Scan` node reports the combined accounting); reflecting a
+session `SET stele.{system,valid}_time` pin in the explained inner plan; a JSON
+output format; cost estimates (there is no cost model).
+
 ## DDL binding (STL-95)
 
 Beyond parsing, `stele_sql::bind_ddl` lowers a `CREATE TABLE` / `DROP TABLE`
