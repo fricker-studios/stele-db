@@ -152,22 +152,22 @@ psycopg, pgjdbc, and `tokio-postgres` all speak it natively:
   `CREATE USER`, then enable `[auth]` and restart; verifiers are durable.
 - **Channel binding over TLS (STL-297):** on a TLS connection whose certificate
   yields a `tls-server-end-point` binding (RFC 5929), the server advertises
-  `SCRAM-SHA-256-PLUS` first and folds the certificate's SHA-256 into the `c=`
-  check, so a man-in-the-middle that terminates TLS with a different certificate
-  cannot relay a captured proof. The RFC downgrade rule is enforced: over a
-  PLUS-advertising channel a `y` gs2 flag (the client believing the server has no
-  channel binding) is refused. Off TLS — or for a certificate whose signature
-  hash is not one we bind with SHA-256 — only plain SCRAM is offered, and a
-  `p=…` demand is refused as before. The plain floor still authenticates over TLS
-  for a client that opts out with `n`. The bundled `stele shell` client is
-  symmetric (STL-334): over TLS it prefers `SCRAM-SHA-256-PLUS`, computing the
+  `SCRAM-SHA-256-PLUS` first and folds the certificate hash into the `c=` check —
+  the digest the leaf's signature algorithm names (RFC 5929 §4.1: SHA-256,
+  SHA-384, or SHA-512; STL-330 lifted the original SHA-256-only floor) — so a
+  man-in-the-middle that terminates TLS with a different certificate cannot relay
+  a captured proof. The RFC downgrade rule is enforced: over a PLUS-advertising
+  channel a `y` gs2 flag (the client believing the server has no channel binding)
+  is refused. Off TLS — or for a certificate whose signature algorithm names no
+  binding digest (legacy MD5/SHA-1, RSASSA-PSS, Ed25519) — only plain SCRAM is
+  offered, and a `p=…` demand is refused as before. The plain floor still
+  authenticates over TLS for a client that opts out with `n`. The bundled
+  `stele shell` client is symmetric (STL-334, with the SHA-384/512 selection
+  mirrored by STL-342): over TLS it prefers `SCRAM-SHA-256-PLUS`, computing the
   binding from the certificate the handshake negotiated with the same RFC 5929
   §4.1 hash selection as the server, so both sides derive the identical `c=`; it
   falls back to plain `n` (never `y`) off TLS or for a certificate it cannot bind.
-- **Deliberate v0.3 floor, filed as a follow-up:** `tls-server-end-point` binding
-  for SHA-384/512-signed server certificates (today PLUS is advertised only for
-  SHA-256-signed certs; a stronger-hash cert falls back to plain SCRAM — STL-330,
-  on both the server and the shell client). The authenticated identity reaches
+- **Authenticated identity → provenance.** The authenticated identity reaches
   the connection trace span (STL-107) **and the stored write provenance**: each
   wire-issued write stamps the connection's identity into `_stele_principal`
   (STL-300/STL-291), set per statement under the engine lock so a shared engine

@@ -64,10 +64,13 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::pem::PemObject as _;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
-use stele_common::hash::sha256;
+use stele_common::hash::{sha256, sha384, sha512};
 use stele_common::query_stats::QueryStats;
 use stele_common::scram::{self, ScramVerifier};
-use x509_parser::oid_registry::{OID_PKCS1_SHA256WITHRSA, OID_SIG_ECDSA_WITH_SHA256};
+use x509_parser::oid_registry::{
+    OID_PKCS1_SHA256WITHRSA, OID_PKCS1_SHA384WITHRSA, OID_PKCS1_SHA512WITHRSA,
+    OID_SIG_ECDSA_WITH_SHA256, OID_SIG_ECDSA_WITH_SHA384, OID_SIG_ECDSA_WITH_SHA512,
+};
 use x509_parser::prelude::{FromDer as _, X509Certificate};
 
 use crate::render::Column;
@@ -884,19 +887,32 @@ fn select_mechanism<'a>(
 /// algorithm. Mirrors the server's selection (`stele_pgwire::tls`) so both sides
 /// compute the identical `c=`.
 ///
-/// RFC 5929 §4.1 derives the hash from the certificate's `signatureAlgorithm`.
-/// This binds the SHA-256 case — an RSA-SHA-256 or ECDSA-SHA-256 leaf, every
-/// modern certificate — and returns `None` for any other signature hash
-/// (SHA-384/512 is the filed follow-up STL-330; legacy MD5/SHA-1 is not worth a
-/// path). `None` means the client degrades to plain SCRAM over the encrypted
+/// RFC 5929 §4.1 derives the hash from the certificate's `signatureAlgorithm`:
+/// an RSA/ECDSA leaf signed with SHA-256, SHA-384, or SHA-512 binds with that
+/// same digest. STL-342 lifts the SHA-256-only floor STL-334 shipped, mirroring
+/// the server's wider-hash selection (STL-330) so a shell dialing a server with a
+/// SHA-384- or SHA-512-signed certificate computes the binding the server's `c=`
+/// check expects instead of a SHA-256 it would reject.
+///
+/// Every other signature algorithm returns `None` (the legacy MD5/SHA-1 — the
+/// RFC's SHA-256 upgrade is deliberately not wired up, as on the server — plus
+/// RSASSA-PSS, Ed25519, and the post-quantum schemes, none naming a single fixed
+/// hash). `None` means the client degrades to plain SCRAM over the encrypted
 /// channel rather than computing a binding the server would not — the safe
 /// degrade, and the symmetric mirror of the server advertising PLUS only for the
 /// certificates it can bind.
 fn endpoint_channel_binding(cert_der: &[u8]) -> Option<Vec<u8>> {
     let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
     let sig_alg = &cert.signature_algorithm.algorithm;
-    (*sig_alg == OID_PKCS1_SHA256WITHRSA || *sig_alg == OID_SIG_ECDSA_WITH_SHA256)
-        .then(|| sha256(cert_der).as_bytes().to_vec())
+    if *sig_alg == OID_PKCS1_SHA256WITHRSA || *sig_alg == OID_SIG_ECDSA_WITH_SHA256 {
+        Some(sha256(cert_der).as_bytes().to_vec())
+    } else if *sig_alg == OID_PKCS1_SHA384WITHRSA || *sig_alg == OID_SIG_ECDSA_WITH_SHA384 {
+        Some(sha384(cert_der).to_vec())
+    } else if *sig_alg == OID_PKCS1_SHA512WITHRSA || *sig_alg == OID_SIG_ECDSA_WITH_SHA512 {
+        Some(sha512(cert_der).to_vec())
+    } else {
+        None
+    }
 }
 
 /// The SCRAM client-first message — `<gs2-header>n=,r=<nonce>`: the gs2 header
@@ -1355,6 +1371,28 @@ mod tests {
         assert_eq!(cbind, sha256(der).as_bytes().to_vec());
         assert_eq!(cbind.len(), 32, "SHA-256 is 32 bytes");
         assert!(endpoint_channel_binding(b"not a certificate").is_none());
+    }
+
+    /// A P-384 (ECDSA-with-SHA-384) leaf must bind with SHA-384, not SHA-256 —
+    /// the wider-hash selection STL-342 mirrors from the server (STL-330) so a
+    /// shell dialing a stronger-hash server cert derives the binding the server's
+    /// `c=` check expects. (The SHA-512/RSA leg needs a provided RSA key the `ring`
+    /// backend cannot generate, so it is exercised end-to-end against a live server
+    /// in `tests/shell_session.rs`.)
+    #[test]
+    fn endpoint_channel_binding_tracks_a_sha384_signature() {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).expect("P-384 key");
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+            .expect("params")
+            .self_signed(&key)
+            .expect("self-sign P-384 leaf");
+        let der = cert.der().as_ref();
+
+        let cbind = endpoint_channel_binding(der).expect("SHA-384 binding");
+        assert_eq!(cbind, sha384(der).to_vec());
+        assert_eq!(cbind.len(), 48, "SHA-384 is 48 bytes");
+        // And not the 32-byte SHA-256 the pre-STL-342 floor would have produced.
+        assert_ne!(cbind, sha256(der).as_bytes().to_vec());
     }
 
     /// The proof the client builds verifies against a verifier derived from the

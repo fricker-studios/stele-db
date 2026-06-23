@@ -15,6 +15,8 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use rustls_pki_types::PrivatePkcs8KeyDer;
+use stele_common::scram;
 use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
 use stele_pgwire::{AuthMode, Server, ServerTls, SharedSession, TlsMode, TlsSettings};
@@ -37,11 +39,83 @@ async fn spawn_server() -> SocketAddr {
     addr
 }
 
+/// Which signature algorithm the test CA signs the server leaf with — and
+/// therefore the leaf's `signatureAlgorithm`, which RFC 5929 §4.1 reads to pick
+/// the `tls-server-end-point` channel-binding digest. Varying it is what
+/// exercises the shell's SHA-256 / SHA-384 / SHA-512 binding selection (STL-342).
+#[derive(Clone, Copy)]
+enum CaSig {
+    /// ECDSA P-256 → `ecdsa-with-SHA256` leaf → SHA-256 binding (the STL-334 floor).
+    EcdsaSha256,
+    /// ECDSA P-384 → `ecdsa-with-SHA384` leaf → SHA-384 binding (STL-342).
+    EcdsaSha384,
+    /// RSA-2048 → `sha512WithRSAEncryption` leaf → SHA-512 binding (STL-342).
+    RsaSha512,
+}
+
+/// A fixed, throwaway RSA-2048 PKCS#8 private key (base64 DER), used **only** to
+/// sign the [`CaSig::RsaSha512`] test CA so its leaf carries a SHA-512 signature.
+///
+/// rcgen's `ring` backend (the workspace's TLS provider) can *generate* ECDSA
+/// keys but not RSA ones — it can only *load* a supplied RSA key — so the SHA-512
+/// leg embeds one fixed key, the same pattern `stele-pgwire`'s
+/// `tests/scram_plus_wire.rs` uses (STL-330). It authenticates nothing real: a
+/// localhost test CA, regenerable by `openssl genpkey -algorithm RSA -pkeyopt
+/// rsa_keygen_bits:2048` if ever needed.
+const RSA_TEST_CA_PKCS8_DER_B64: &str = concat!(
+    "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCzJIiaqt6gXKRtF3E+myoND1oH6qcPFDGWL2zIlJId+etErpTB",
+    "jN8c4PjIEC4zg+KlB5k4E81SinVmoDV8F+33Y17mKu5JZ75AOuZiKJmTe95hw9DijzMbCBoLxVgG+ka6uTmvmy3rgz5dVH015E4D",
+    "tWZt12E+GRYfsUarsjMMTd5JJm81urhKpL1nO6W2AXmxfu3g6T0uo0Kb8164idFbu556xWWnkFC/VtEluZuwGKIuZWuG7wMi2H2l",
+    "ddJi1mrYYKftpqUJRfwcA56Lxmq423SJmVBu+DpzllPVT0J4ODxle3PxxP3/3WVkkaA93llQEOn7IxKvceAcDfuJGyojAgMBAAEC",
+    "ggEAU9j1MUNpuTAza7YttIpml79IOe1cLQQcI3nmFknnzC0GL9rw2FjJsxgfiXB9V3JS2kBguC0YjJou0g6JiiAfKwvxRpTwfB4Z",
+    "H7IR0/7BxxSSpTrEYc55spzLqBfBmF57TXlVpTpiN1nyDjf19Qv7cePtYdsN8kVGpCXS+JkLKKXfH+EQGlVTiW8JPd8nx1m1eU2Q",
+    "uPloVmNw62Z5U0XB+9RP0ShGFVuMiOZlodkT3zSlEFf0FhcEvYZYikbvVKHWSabBeFplzsg7Ik8GR1GTJAiLaeJN4BSqrDHoisGj",
+    "/Yy3ZEadLVXObNiLSMF4o8qnqVZFypImP6/I1MZtPsQ4tQKBgQDdiI8Qkg2lM5z1QaDUO81bai5HgRNai3nQky/GS4d+4s1gnXiQ",
+    "O04rvA3mEL7cQSafBz2sPvRIBUqsGNz+UbADNJijElUPBHHxGcRrDVkyhZmrffWGYu4VpNQvxe81mg7SHu/VjhResXFWxiO3zKKW",
+    "UKR4DNgZYs37/xki0F0lXQKBgQDPA5jo3JLMmq7gutsYdiw3ZALp6Vvipbv1uwmNIt6RKy8QzEdAqOfKczBLRswfa0TZdCtPty9W",
+    "5EKT0KkWzYLM+jrWiHSVFBaL3sFn4H1hnWVeHepBAv4XKeFRgmPNw7Ijkzit+bVF2PpCIEC4mTLR1zO8J5HicA4MU4sgl9kVfwKB",
+    "gQCZzl7ttUmOAhieWtNLpr18E2tQL7h9K8sGWbpYpUXMfbDzvEDheptaV/UaX1Pz3bPvw3o5JXg6rJnchGKim5plj1XOGkM96usk",
+    "5qvtW1YrcoBvhUM662K7WjYLeRQMlgpmLh57mWphGDdFdMmFqajUTebyhpBeh6/VnpYYCqww7QKBgDp1bpnbqAzlZZsKyVJIFMZz",
+    "lKsPfiYr3T9QWSsk/KsMAdeBiGGHESXHj4zCamQ4+5FYz95MAa9M+EwbsZRB5r0RsMnicOGkcZWACyfVajLFqtmAIyXGvZA3AGzv",
+    "IFX7/HM1YN0oVftqgYlo6D347TP6zJ5GoljKgf0THofOubvrAoGBAJTVXudiQMGRdjhysG3zJy4izpaL4knR1FDsBDqiXn7VsXnX",
+    "AkRqsk+48SD0DCYSQFwMpm76+ejo4gdVqyMdTi4g+S4gmA/5YKEWsCXa+w4yR/9QaBBb6Y0Rl/JUZWps2s/1e4Gs1bVUthba7L8r",
+    "UCWPlY4pRJoQDuL6Qmkilbht",
+);
+
+/// The CA signing key for a given [`CaSig`] — generated fresh (ECDSA) or loaded
+/// from the embedded throwaway key (RSA, which the `ring` backend cannot generate).
+fn ca_signing_key(sig: CaSig) -> rcgen::KeyPair {
+    match sig {
+        CaSig::EcdsaSha256 => rcgen::KeyPair::generate().expect("CA P-256 key"),
+        CaSig::EcdsaSha384 => {
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).expect("CA P-384 key")
+        }
+        CaSig::RsaSha512 => {
+            let der = scram::b64_decode(RSA_TEST_CA_PKCS8_DER_B64).expect("decode test CA key");
+            rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+                &PrivatePkcs8KeyDer::from(der),
+                &rcgen::PKCS_RSA_SHA512,
+            )
+            .expect("load RSA test CA key")
+        }
+    }
+}
+
 /// A self-signed CA + server certificate for `127.0.0.1`, written as PEM under
 /// a scratch dir (STL-251). Returns the cert/key paths for the server and the
-/// CA path for `--tls verify-full`.
+/// CA path for `--tls verify-full`. The CA is ECDSA-SHA-256; see [`mint_tls_with`]
+/// for the SHA-384/512 variants (STL-342).
 fn mint_tls(test: &str) -> (PathBuf, PathBuf, PathBuf) {
-    let ca_key = rcgen::KeyPair::generate().expect("CA key");
+    mint_tls_with(test, CaSig::EcdsaSha256)
+}
+
+/// [`mint_tls`], with the CA signing the leaf using `ca_sig` — so the leaf's
+/// signature algorithm (what RFC 5929 §4.1 binds against) is SHA-256, SHA-384, or
+/// SHA-512. The leaf's own key stays ECDSA-P256 for the handshake; only the
+/// signature digest varies, which is what the shell's channel-binding selection
+/// keys off (STL-342).
+fn mint_tls_with(test: &str, ca_sig: CaSig) -> (PathBuf, PathBuf, PathBuf) {
+    let ca_key = ca_signing_key(ca_sig);
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca_params
@@ -1014,11 +1088,16 @@ async fn a_group_readable_pgpass_file_is_ignored_with_a_warning() {
 // ---------------------------------------------------------------------------
 
 /// Boot a TLS-required **and** SCRAM-required server — the STL-334 combination —
-/// with `users` pre-created through the SQL path. `mint_tls` mints an
-/// ECDSA/SHA-256-signed leaf, so the server advertises `SCRAM-SHA-256-PLUS`
-/// alongside plain SCRAM. Returns the address and the CA path for `verify-full`.
-async fn spawn_tls_scram_server(test: &str, users: &[(&str, &str)]) -> (SocketAddr, PathBuf) {
-    let (cert, key, ca) = mint_tls(test);
+/// with `users` pre-created through the SQL path. The leaf is signed per `ca_sig`,
+/// so its `signatureAlgorithm` (SHA-256/384/512) drives the channel-binding digest
+/// both sides must agree on; the server advertises `SCRAM-SHA-256-PLUS` alongside
+/// plain SCRAM. Returns the address and the CA path for `verify-full`.
+async fn spawn_tls_scram_server(
+    test: &str,
+    users: &[(&str, &str)],
+    ca_sig: CaSig,
+) -> (SocketAddr, PathBuf) {
+    let (cert, key, ca) = mint_tls_with(test, ca_sig);
     let tls = ServerTls::load(&TlsSettings {
         cert,
         key,
@@ -1044,8 +1123,9 @@ async fn spawn_tls_scram_server(test: &str, users: &[(&str, &str)]) -> (SocketAd
     (addr, ca)
 }
 
-/// STL-334 Definition of Done: over TLS against a PLUS-advertising server the
-/// shell authenticates with `SCRAM-SHA-256-PLUS` end to end.
+/// Over TLS against a PLUS-advertising server whose leaf is signed per `ca_sig`,
+/// the shell must authenticate with `SCRAM-SHA-256-PLUS` end to end — the binding
+/// digest follows the leaf's signature hash (RFC 5929 §4.1).
 ///
 /// `\conninfo` reports the mechanism the connection actually negotiated, which is
 /// what pins the **PLUS** path rather than a silent fallback. Auth merely
@@ -1056,11 +1136,13 @@ async fn spawn_tls_scram_server(test: &str, users: &[(&str, &str)]) -> (SocketAd
 /// `SCRAM-SHA-256-PLUS` we require the channel-bound mechanism specifically — and
 /// because the server validates `c=` against its own certificate, that mechanism
 /// only succeeds when the shell computed the binding from the certificate the
-/// handshake actually presented. Driven over `verify-full` so the whole
-/// handshake → channel-binding → SCRAM path runs end to end.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn scram_plus_session_authenticates_over_tls() {
-    let (addr, ca) = spawn_tls_scram_server("scram-plus", &[("alice", "s3cret")]).await;
+/// handshake actually presented, **with the digest the leaf's signature names**.
+/// A shell that always hashed with SHA-256 would compute the wrong binding for a
+/// SHA-384/512 leaf and the server's `c=` check would reject it (the STL-342 bug).
+/// Driven over `verify-full` so the whole handshake → channel-binding → SCRAM path
+/// runs end to end.
+async fn assert_scram_plus_over_tls(test: &str, ca_sig: CaSig) {
+    let (addr, ca) = spawn_tls_scram_server(test, &[("alice", "s3cret")], ca_sig).await;
     let ca = ca.to_str().expect("utf-8 path").to_owned();
     let script = "\\conninfo\nSELECT 1;\n\\q\n";
     let output = tokio::task::spawn_blocking(move || {
@@ -1096,6 +1178,29 @@ async fn scram_plus_session_authenticates_over_tls() {
     );
     // The query also ran past authentication over the channel-bound connection.
     assert!(stdout.contains("(1 row)"), "{stdout}");
+}
+
+/// STL-334 Definition of Done: an ECDSA-SHA-256 leaf (the floor) — PLUS binds
+/// with SHA-256.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scram_plus_session_authenticates_over_tls() {
+    assert_scram_plus_over_tls("scram-plus", CaSig::EcdsaSha256).await;
+}
+
+/// STL-342: an ECDSA-P384 / SHA-384-signed leaf. The shell must compute a SHA-384
+/// binding and still negotiate PLUS end to end; the SHA-256 floor STL-334 shipped
+/// would compute the wrong digest and the server's `c=` check would reject it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scram_plus_session_authenticates_with_a_sha384_cert() {
+    assert_scram_plus_over_tls("scram-plus-sha384", CaSig::EcdsaSha384).await;
+}
+
+/// STL-342: an RSA / SHA-512-signed leaf — the RSA-signed leg the `ring` backend
+/// cannot generate, so the CA is the embedded throwaway RSA-2048 key. The shell
+/// must bind with SHA-512 and negotiate PLUS end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scram_plus_session_authenticates_with_a_sha512_cert() {
+    assert_scram_plus_over_tls("scram-plus-sha512", CaSig::RsaSha512).await;
 }
 
 /// `\segments` (STL-301) renders the columnar segment + zone-map table end to
