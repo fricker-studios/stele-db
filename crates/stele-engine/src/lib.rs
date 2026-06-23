@@ -353,7 +353,9 @@ struct ScannedRows {
 /// so a reference never re-copies the stored cells ([STL-321]): a join side clones
 /// the columns by `Arc` refcount bump ([`join_side_columns`](SessionEngine::join_side_columns)),
 /// and a read decodes only the `WHERE`-referenced columns straight off the shared
-/// buffers and gathers just the surviving rows ([`filter_relation_rows`]). Each cell
+/// buffers into a selection vector ([`relation_selection`]), then projects through the
+/// shared tail as a [`RowSource::Relation`] without a full-width row-major gather
+/// ([STL-338]). Each cell
 /// is the canonical-bytes form a base-table scan reconstructs (`Some(bytes)`, or
 /// `None` for a SQL `NULL`), so the outer query's `WHERE` / aggregate / projection /
 /// join feed from it through the very same downstream pipeline as a base table. The
@@ -3384,21 +3386,30 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // correlated-subquery / aggregate / projection pipeline exactly as a base
         // table's would.
         if let Some(columns) = &bound.relation_columns {
-            let relation = scope
+            let relation: &MaterializedRelation = scope
                 .get(bound.table.as_str())
                 .ok_or_else(|| EngineError::UnknownTable(bound.table.clone()))?;
             let schema_columns = columns.clone();
             let plan = self.resolve_filter(bound, overlay, scope)?;
             // Filter over the relation's shared columns ([STL-321]): the `WHERE`
-            // decodes only the columns it references, straight off those buffers,
-            // and only the surviving rows are gathered row-major for the tail —
-            // never the unconditional full copy `relation.rows.clone()` once made.
-            let rows = filter_relation_rows(&plan, &schema_columns, relation)?;
+            // decodes only the columns it references, straight off those buffers, into
+            // a selection vector of the surviving rows ([`relation_selection`]). The
+            // selection rides into the shared tail as a [`RowSource::Relation`]
+            // ([STL-338]) so shaping decodes only the columns a clause names and a
+            // passthrough / projected read gathers only the projected output cells —
+            // both straight off the shared columns by index. Nothing materializes the
+            // full-width row-major intermediate the per-reference gather once built,
+            // let alone the full copy `relation.rows.clone()` the original [STL-242]
+            // read made.
+            let selection = relation_selection(&plan, &schema_columns, relation)?;
             return self.finish_select(
                 bound,
                 &schema_columns,
                 &schema_columns,
-                rows,
+                RowSource::Relation {
+                    relation,
+                    selection,
+                },
                 None,
                 overlay,
                 scope,
@@ -3550,7 +3561,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             bound,
             &schema_columns,
             &addressable,
-            rows,
+            RowSource::Rows(rows),
             scan_stats,
             overlay,
             scope,
@@ -3598,7 +3609,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         bound: &BoundSelect,
         schema_columns: &[(String, LogicalType)],
         addressable: &[(String, LogicalType)],
-        rows: Vec<Vec<Option<Vec<u8>>>>,
+        rows: RowSource<'_>,
         scan_stats: Option<ScanStats>,
         overlay: &[BoundDml],
         scope: &CteScope,
@@ -3612,14 +3623,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // its predicate holds. This sits before the aggregate / projection so a
         // correlated `WHERE` filters rows *before* grouping, exactly as a plain one.
         let rows = match &bound.subquery_filter {
-            Some(sub) if sub.correlation.is_some() => self.filter_correlated_subquery(
-                sub,
-                schema_columns,
-                addressable,
-                rows,
-                overlay,
-                scope,
-            )?,
+            Some(sub) if sub.correlation.is_some() => {
+                RowSource::Rows(self.filter_correlated_subquery(
+                    sub,
+                    schema_columns,
+                    addressable,
+                    rows.into_rows(),
+                    overlay,
+                    scope,
+                )?)
+            }
             _ => rows,
         };
 
@@ -3640,19 +3653,28 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let columns = projected_columns(&bound.projection, addressable, n_schema);
         let out_rows: Vec<Vec<Option<Vec<u8>>>> = if bound.projection.is_all_columns() {
             // Fast path: every item is a plain addressable column, projected by
-            // gathering its cell — no per-row expression evaluation.
+            // gathering its cell — no per-row expression evaluation. For a CTE read
+            // ([STL-338]) the cell is read straight off the relation's shared columns
+            // by index, so only the projected output is materialized — never the
+            // full-width row-major intermediate a per-reference gather once built.
             let projection = projection_indices(&bound.projection, addressable, n_schema);
             let selection = shape_rows(bound, addressable, &projection, &rows)?;
             selection
                 .iter()
-                .map(|&r| projection.iter().map(|&i| rows[r][i].clone()).collect())
+                .map(|&r| projection.iter().map(|&i| rows.cell(r, i)).collect())
                 .collect()
         } else {
             // A computed expression or scalar subquery is projected ([STL-303]):
             // evaluate each item into a materialized column, append it as a virtual
             // column to every row, and shape / gather over the extended rows so
             // `DISTINCT` / `ORDER BY` / `LIMIT` apply identically to a column read.
-            let projected = self.materialize_projection(
+            // Widening appends per-row cells, so this shape is inherently row-major;
+            // it re-enters the tail through [`RowSource::Rows`].
+            let MaterializedProjection {
+                columns: ext_columns,
+                rows: ext_rows,
+                indices,
+            } = self.materialize_projection(
                 bound,
                 addressable,
                 schema_columns,
@@ -3660,21 +3682,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 overlay,
                 scope,
             )?;
-            let selection = shape_rows(
-                bound,
-                &projected.columns,
-                &projected.indices,
-                &projected.rows,
-            )?;
+            let ext = RowSource::Rows(ext_rows);
+            let selection = shape_rows(bound, &ext_columns, &indices, &ext)?;
             selection
                 .iter()
-                .map(|&r| {
-                    projected
-                        .indices
-                        .iter()
-                        .map(|&i| projected.rows[r][i].clone())
-                        .collect()
-                })
+                .map(|&r| indices.iter().map(|&i| ext.cell(r, i)).collect())
                 .collect()
         };
         let stats = scan_stats.map(|s| query_stats(&s, out_rows.len(), bound.snapshot));
@@ -3704,7 +3716,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         bound: &BoundSelect,
         addressable: &[(String, LogicalType)],
         schema_columns: &[(String, LogicalType)],
-        rows: Vec<Vec<Option<Vec<u8>>>>,
+        rows: RowSource<'_>,
         overlay: &[BoundDml],
         scope: &CteScope,
     ) -> Result<MaterializedProjection, EngineError> {
@@ -3715,6 +3727,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 "materialize_projection requires a projection-item list",
             ));
         };
+        // A computed projection widens every row with per-row virtual cells, so it
+        // is inherently row-major; a CTE read materializes its surviving rows here
+        // ([STL-338]) — only the column-only fast path stays gather-free.
+        let rows = rows.into_rows();
         let row_count = rows.len();
         // The virtual columns start after the columns the rows already carry: the
         // schema columns, plus the provenance pseudo-columns when a read
@@ -4061,7 +4077,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             bound,
             &range_schema_columns,
             &range_addressable,
-            rows,
+            RowSource::Rows(rows),
             Some(stats),
             overlay,
             scope,
@@ -4186,7 +4202,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             bound,
             &range_schema_columns,
             &range_addressable,
-            rows,
+            RowSource::Rows(rows),
             Some(stats),
             overlay,
             scope,
@@ -5040,6 +5056,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // projection + shaping tail — the shared single-table helpers ([STL-264]).
         let plan = filter_plan(bound);
         let rows = filter_rows(&plan, &addressable, rows)?;
+        // The join's addressable output is already gathered row-major, so it rides the
+        // shared shaping tail through [`RowSource::Rows`] ([STL-338]).
+        let rows = RowSource::Rows(rows);
 
         if let Some(agg) = &bound.aggregate {
             // A join reads every input's scan; the footer reports their summed
@@ -5058,7 +5077,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let selection = shape_rows(bound, &addressable, projection, &rows)?;
         let out_rows: Vec<Vec<Option<Vec<u8>>>> = selection
             .iter()
-            .map(|&r| projection.iter().map(|&i| rows[r][i].clone()).collect())
+            .map(|&r| projection.iter().map(|&i| rows.cell(r, i)).collect())
             .collect();
         // Every input's scan accounting summed ([STL-318]), over the join's returned
         // row count; `None` (footer suppressed) if any input was a materialized relation.
@@ -7729,6 +7748,111 @@ struct MaterializedProjection {
     indices: Vec<usize>,
 }
 
+/// The post-`WHERE` row set the shared [`finish_select`](SessionEngine::finish_select)
+/// tail shapes and projects ([STL-338]), addressed by `(row, column)` — either a
+/// row-major buffer the read already reconstructed, or a materialized CTE / derived
+/// table read **columnar** through a selection vector over its shared
+/// [`Cells`](stele_exec::Cells) buffers.
+///
+/// A base-table point read, a system / valid range scan, a join, and the slow CTE
+/// shapes (a computed projection, a correlated-subquery `WHERE`) all feed
+/// [`Rows`](Self::Rows): the rows are already row-major, so the tail reads them in
+/// place — behavior identical to the pre-[STL-338] `Vec<Vec<…>>` it replaced. A
+/// passthrough / projected CTE read feeds [`Relation`](Self::Relation): the tail
+/// decodes only the columns a clause references and gathers only the projected output
+/// cells straight off the shared buffers, never the full-width row-major intermediate
+/// a per-reference gather once built ([STL-321]'s read path) — the
+/// [`Filter`](Filter) selection-vector posture ([STL-214]) carried through the
+/// shaping tail.
+///
+/// `selection` holds the surviving rows' **physical** indices into the relation's
+/// columns (a `WHERE` keeps an ordered subset, [`relation_selection`]); the logical
+/// row `r` the tail addresses is the cell at `selection[r]`. The [`Rows`](Self::Rows)
+/// variant's logical and physical indices coincide.
+enum RowSource<'a> {
+    /// Row-major reconstructed rows, owned — each row one cell per addressable column.
+    Rows(Vec<Vec<Option<Vec<u8>>>>),
+    /// A materialized CTE / derived table read columnar: its shared columns, plus the
+    /// `WHERE`-surviving physical row indices ([`relation_selection`]).
+    Relation {
+        relation: &'a MaterializedRelation,
+        selection: Vec<usize>,
+    },
+}
+
+impl RowSource<'_> {
+    /// The number of logical (post-`WHERE`) rows the tail shapes.
+    const fn row_count(&self) -> usize {
+        match self {
+            Self::Rows(rows) => rows.len(),
+            Self::Relation { selection, .. } => selection.len(),
+        }
+    }
+
+    /// Logical row `row`'s cell at addressable column `col` — the per-cell read the
+    /// projection gather uses. An out-of-range column reads as a SQL `NULL` (`None`),
+    /// the same defensive decode [`eval_projection_scalar`] takes.
+    fn cell(&self, row: usize, col: usize) -> Option<Vec<u8>> {
+        match self {
+            Self::Rows(rows) => rows[row].get(col).cloned().flatten(),
+            Self::Relation {
+                relation,
+                selection,
+            } => relation
+                .columns
+                .get(col)
+                .and_then(|column| relation_cell(column, selection[row])),
+        }
+    }
+
+    /// Materialize column `col`'s cells over the logical row set — the column-decode
+    /// step [`shape_rows`] / [`run_aggregate`] take to build a typed [`Vector`] from
+    /// just the columns a clause references. Reads straight off the shared buffers for
+    /// a [`Relation`](Self::Relation), with no full-width row-major gather.
+    fn column(&self, col: usize) -> Vec<Option<Vec<u8>>> {
+        match self {
+            Self::Rows(rows) => rows.iter().map(|r| r.get(col).cloned().flatten()).collect(),
+            Self::Relation {
+                relation,
+                selection,
+            } => {
+                let column = relation.columns.get(col);
+                selection
+                    .iter()
+                    .map(|&phys| column.and_then(|c| relation_cell(c, phys)))
+                    .collect()
+            }
+        }
+    }
+
+    /// Materialize the full-width row-major form — the shape the row-iterating slow
+    /// paths (a correlated-subquery `WHERE`
+    /// [`filter_correlated_subquery`](SessionEngine::filter_correlated_subquery), a
+    /// computed projection
+    /// [`materialize_projection`](SessionEngine::materialize_projection)) consume. For
+    /// a [`Relation`](Self::Relation) this gathers each surviving row's cells off the
+    /// shared columns; a passthrough / projected read never reaches here, so it pays
+    /// no full-width gather.
+    fn into_rows(self) -> Vec<Vec<Option<Vec<u8>>>> {
+        match self {
+            Self::Rows(rows) => rows,
+            Self::Relation {
+                relation,
+                selection,
+            } => selection
+                .iter()
+                .map(|&phys| {
+                    relation
+                        .columns
+                        .iter()
+                        .map(|column| relation_cell(column, phys))
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+}
+
 /// What a bound `SELECT`'s `WHERE` resolves to over the row set ([STL-213]).
 ///
 /// Both the committed-only fused scan ([`scan_rows`](SessionEngine::scan_rows)) and
@@ -8451,39 +8575,6 @@ fn relation_cell(column: &Column, row: usize) -> Option<Vec<u8>> {
     }
 }
 
-/// Apply a materialized relation's `WHERE` and reconstruct just the surviving rows
-/// row-major ([STL-321]), the shape the shared [`finish_select`](SessionEngine::finish_select)
-/// tail consumes.
-///
-/// A `Predicate` filters by a [`relation_selection`] over the shared columns — no
-/// row copied to filter, the selection bounded by the survivors it keeps (which the
-/// read must materialize anyway). `KeepAll` / `Empty` need no selection vector at
-/// all, so they iterate the row range directly rather than first allocating O(n)
-/// indices for an unfiltered read. Either way a row is gathered once for the tail,
-/// never the **extra** full copy `relation.rows.clone()` once paid before filtering.
-fn filter_relation_rows(
-    plan: &FilterPlan,
-    schema_columns: &[(String, LogicalType)],
-    relation: &MaterializedRelation,
-) -> Result<Vec<Vec<Option<Vec<u8>>>>, EngineError> {
-    // Gather one row's cells off the shared columns, row-major.
-    let row = |r: usize| -> Vec<Option<Vec<u8>>> {
-        relation
-            .columns
-            .iter()
-            .map(|col| relation_cell(col, r))
-            .collect()
-    };
-    Ok(match plan {
-        FilterPlan::Empty => Vec::new(),
-        FilterPlan::KeepAll => (0..relation.row_count).map(row).collect(),
-        FilterPlan::Predicate(_) => relation_selection(plan, schema_columns, relation)?
-            .into_iter()
-            .map(row)
-            .collect(),
-    })
-}
-
 /// Map a bound [`JoinType`] to the executor's `ExecJoinType`. The two enums are
 /// parallel; stele-sql and stele-exec do not depend on each other, so the engine
 /// is the lowering point (the same split [`lower_aggregate_func`] draws).
@@ -8763,16 +8854,18 @@ fn run_aggregate(
     bound: &BoundSelect,
     agg: &BoundAggregate,
     schema_columns: &[(String, LogicalType)],
-    rows: &[Vec<Option<Vec<u8>>>],
+    rows: &RowSource<'_>,
 ) -> Result<SelectResult, EngineError> {
     // Decode each referenced schema column into a typed vector; a column the plan
     // never reads stays an empty placeholder the evaluator never touches (the same
-    // discipline the Filter operator uses).
+    // discipline the Filter operator uses). The column is read off the row source by
+    // index ([STL-338]) — straight from a CTE's shared buffers, with no full-width
+    // row-major gather.
     let mut columns: Vec<Vector> = (0..schema_columns.len())
         .map(|_| Vector::Bool(Vec::new()))
         .collect();
     for &i in &referenced_columns(agg) {
-        let cells: Vec<Option<Vec<u8>>> = rows.iter().map(|r| r[i].clone()).collect();
+        let cells = rows.column(i);
         columns[i] = Vector::from_column(schema_columns[i].1, &Column::Bytes(cells.into()))
             .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
     }
@@ -8789,7 +8882,7 @@ fn run_aggregate(
         })
         .collect();
 
-    let out = hash_aggregate(&group_keys, &aggregators, &columns, rows.len())
+    let out = hash_aggregate(&group_keys, &aggregators, &columns, rows.row_count())
         .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
 
     // Re-interleave grouping + aggregate columns into SELECT-list order.
@@ -8911,9 +9004,9 @@ fn shape_rows(
     bound: &BoundSelect,
     schema_columns: &[(String, LogicalType)],
     projection: &[usize],
-    rows: &[Vec<Option<Vec<u8>>>],
+    rows: &RowSource<'_>,
 ) -> Result<Vec<usize>, EngineError> {
-    let mut selection: Vec<usize> = (0..rows.len()).collect();
+    let mut selection: Vec<usize> = (0..rows.row_count()).collect();
     if !bound.distinct && bound.order_by.is_empty() {
         limit_selection(&mut selection, bound.offset, bound.limit);
         return Ok(selection);
@@ -8942,7 +9035,7 @@ fn shape_rows(
     }
     let mut decoded: BTreeMap<usize, Vector> = BTreeMap::new();
     for &i in &referenced {
-        let cells: Vec<Option<Vec<u8>>> = rows.iter().map(|r| r[i].clone()).collect();
+        let cells = rows.column(i);
         let vector = Vector::from_column(schema_columns[i].1, &Column::Bytes(cells.into()))
             .map_err(|e| EngineError::Scan(ScanError::Eval(e)))?;
         decoded.insert(i, vector);
@@ -17144,6 +17237,116 @@ mod tests {
                  SELECT a.id FROM c AS a JOIN c AS b ON a.balance = b.balance WHERE a.id >= 2"
             ),
             vec![int_row(2), int_row(3)]
+        );
+    }
+
+    #[test]
+    fn row_source_relation_matches_row_major_through_the_tail_api() {
+        // The columnar CTE read path ([STL-338]) must be indistinguishable from the
+        // row-major path through the shared tail's accessor API: a
+        // `RowSource::Relation` over a relation + `WHERE` selection answers
+        // `row_count` / `cell` / `column` / `into_rows` exactly as a `RowSource::Rows`
+        // over the same surviving rows would. This is the per-cell
+        // behavior-preservation the wire suite and the `cte_differential` oracle guard
+        // end-to-end.
+        let stored = vec![
+            vec![Some(b"k0".to_vec()), Some(b"v0".to_vec())],
+            vec![Some(b"k1".to_vec()), None],
+            vec![Some(b"k2".to_vec()), Some(b"v2".to_vec())],
+            vec![Some(b"k3".to_vec()), Some(b"v3".to_vec())],
+        ];
+        let relation = MaterializedRelation::from_rows(stored.clone(), 2);
+        // A `WHERE` that kept rows 1 and 3 — an ordered subset, as a real selection is.
+        let selection = vec![1usize, 3];
+        let columnar = RowSource::Relation {
+            relation: &relation,
+            selection: selection.clone(),
+        };
+        // The equivalent row-major source: just the surviving rows, gathered.
+        let row_major = RowSource::Rows(selection.iter().map(|&r| stored[r].clone()).collect());
+
+        assert_eq!(columnar.row_count(), 2);
+        assert_eq!(columnar.row_count(), row_major.row_count());
+        // Every `(row, col)` cell agrees — including the NULL in row 1's value column,
+        // kept distinct from an empty value.
+        for r in 0..columnar.row_count() {
+            for c in 0..2 {
+                assert_eq!(columnar.cell(r, c), row_major.cell(r, c));
+            }
+        }
+        // A whole-column decode (the `shape_rows` / `run_aggregate` step) agrees.
+        assert_eq!(
+            columnar.column(0),
+            vec![Some(b"k1".to_vec()), Some(b"k3".to_vec())]
+        );
+        assert_eq!(columnar.column(0), row_major.column(0));
+        assert_eq!(columnar.column(1), vec![None, Some(b"v3".to_vec())]);
+        assert_eq!(columnar.column(1), row_major.column(1));
+        // An out-of-range column reads as SQL NULL, not a panic (the defensive decode).
+        assert_eq!(columnar.cell(0, 9), None);
+        assert_eq!(columnar.column(9), vec![None, None]);
+        // The slow-path materialization yields exactly the surviving rows.
+        assert_eq!(columnar.into_rows(), row_major.into_rows());
+    }
+
+    #[test]
+    fn cte_passthrough_read_shapes_and_projects_off_shared_columns() {
+        // The shared shaping tail now runs over a CTE reference's shared columns via a
+        // selection vector ([STL-338]): `shape_rows` decodes only the ORDER BY /
+        // DISTINCT columns off the buffers, and a passthrough / projected read gathers
+        // only its output cells — no full-width row-major intermediate. The answers
+        // match the row-major path a base table takes (the `cte_differential` oracle
+        // is the broad witness).
+        let mut engine = session();
+        run_sql(&mut engine, CREATE);
+        for (id, bal) in [(1, 300), (2, 100), (3, 300), (4, 200)] {
+            run_sql(
+                &mut engine,
+                &format!("INSERT INTO account (id, balance) VALUES ({id}, {bal})"),
+            );
+        }
+        // ORDER BY an *unprojected* column + LIMIT over a passthrough reference:
+        // shaping decodes `balance` straight off the shared column, the projection
+        // emits only `id`.
+        assert_eq!(
+            query_rows(
+                &mut engine,
+                "WITH c AS (SELECT id, balance FROM account) \
+                 SELECT id FROM c ORDER BY balance DESC, id ASC LIMIT 2"
+            ),
+            vec![int_row(1), int_row(3)]
+        );
+        // DISTINCT over a projected column dedups off the shared buffer.
+        assert_eq!(
+            query_rows(
+                &mut engine,
+                "WITH c AS (SELECT id, balance FROM account) \
+                 SELECT DISTINCT balance FROM c ORDER BY balance"
+            ),
+            vec![int_row(100), int_row(200), int_row(300)]
+        );
+        // An aggregate over a CTE reads its grouping / argument columns straight off
+        // the shared buffers ([STL-338]) through the same `RowSource`.
+        assert_eq!(
+            query_rows(
+                &mut engine,
+                "WITH c AS (SELECT id, balance FROM account) \
+                 SELECT balance, COUNT(*) FROM c GROUP BY balance ORDER BY balance"
+            ),
+            vec![
+                vec![
+                    cell(Some(ScalarValue::Int4(100))),
+                    cell(Some(ScalarValue::Int8(1)))
+                ],
+                vec![
+                    cell(Some(ScalarValue::Int4(200))),
+                    cell(Some(ScalarValue::Int8(1)))
+                ],
+                vec![
+                    cell(Some(ScalarValue::Int4(300))),
+                    cell(Some(ScalarValue::Int8(2)))
+                ],
+            ]
         );
     }
 
