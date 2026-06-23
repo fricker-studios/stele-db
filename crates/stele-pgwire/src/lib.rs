@@ -2996,6 +2996,9 @@ fn returns_rows(stmt: &Statement) -> bool {
     pg_catalog::classify(stmt).is_some()
         || constant_select(stmt).is_some()
         || matches!(stmt.sql(), Some(SqlStatement::Query(_)))
+        // `EXPLAIN [ANALYZE]` ([STL-260]) renders its plan as a one-column
+        // (`QUERY PLAN`) row set, so it carries a `RowDescription` like a `SELECT`.
+        || matches!(stmt.body, StatementBody::Explain(_))
 }
 
 /// Parse a prepared-statement query string into its single [`Statement`], or

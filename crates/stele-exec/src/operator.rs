@@ -94,6 +94,24 @@ pub trait Operator {
     }
 }
 
+/// A boxed operator is itself an operator, forwarding `next` / `stats` to the
+/// erased inner.
+///
+/// This lets a plan be assembled as a uniform chain of `Box<dyn Operator>` — one
+/// boxed stage fed as the child of the next — without re-monomorphizing at each
+/// level. The engine uses it to optionally wrap each stage in a measuring
+/// decorator under `EXPLAIN ANALYZE` ([STL-260]) while leaving the un-analyzed
+/// pipeline (and its concrete generic chain) untouched.
+impl<O: Operator + ?Sized> Operator for Box<O> {
+    fn next(&mut self) -> Result<Option<Batch>, ScanError> {
+        (**self).next()
+    }
+
+    fn stats(&self) -> Option<ScanStats> {
+        (**self).stats()
+    }
+}
+
 /// The fully resolved scan output, plus the cursor into it. Filled lazily on the
 /// first [`Operator::next`] so building a [`ScanSource`] does no I/O.
 struct Resolved {

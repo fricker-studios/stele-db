@@ -66,6 +66,33 @@ pub enum StatementBody {
     ///
     /// [STL-246]: https://allegromusic.atlassian.net/browse/STL-246
     Session(SessionCommand),
+    /// `EXPLAIN [ANALYZE] <statement>` — render the inner statement's query plan
+    /// as a tree, optionally executing it and annotating each operator with true
+    /// rows and wall time ([STL-260]). Lifted at the token level like the other
+    /// non-`sqlparser` surfaces: `sqlparser` has its own `EXPLAIN` grammar, but it
+    /// would reject the Stele temporal clauses (`EXPLAIN SELECT … FOR SYSTEM_TIME
+    /// AS OF …`) the inner statement may carry, so EXPLAIN is recognized here and
+    /// the inner is parsed through the same path, which strips those clauses as
+    /// usual. Boxed because the inner [`Statement`] is the large common case and an
+    /// `Explain` is rare.
+    ///
+    /// [STL-260]: https://allegromusic.atlassian.net/browse/STL-260
+    Explain(Box<ExplainStmt>),
+}
+
+/// The body of an `EXPLAIN [ANALYZE] <statement>` ([STL-260]).
+///
+/// The `inner` is a fully parsed [`Statement`] — body plus temporal grammar — so
+/// the binder and engine bind it (and, under `ANALYZE`, execute it) exactly as if
+/// it had been issued on its own; EXPLAIN only wraps it to render its plan.
+#[derive(Debug, Clone)]
+pub struct ExplainStmt {
+    /// `EXPLAIN ANALYZE` — execute the inner statement for real and annotate the
+    /// plan with measured per-operator rows and timing. `false` for a bare
+    /// `EXPLAIN`, which renders the plan shape without executing it.
+    pub analyze: bool,
+    /// The statement whose plan is explained.
+    pub inner: Statement,
 }
 
 /// A `SET` / `RESET` session command ([STL-246]), recognized at the token level
@@ -213,7 +240,10 @@ impl Statement {
     pub const fn sql(&self) -> Option<&SqlStatement> {
         match &self.body {
             StatementBody::Sql(body) => Some(body),
-            StatementBody::Admin(_) | StatementBody::User(_) | StatementBody::Session(_) => None,
+            StatementBody::Admin(_)
+            | StatementBody::User(_)
+            | StatementBody::Session(_)
+            | StatementBody::Explain(_) => None,
         }
     }
 
@@ -223,7 +253,10 @@ impl Statement {
     pub const fn sql_mut(&mut self) -> Option<&mut SqlStatement> {
         match &mut self.body {
             StatementBody::Sql(body) => Some(body),
-            StatementBody::Admin(_) | StatementBody::User(_) | StatementBody::Session(_) => None,
+            StatementBody::Admin(_)
+            | StatementBody::User(_)
+            | StatementBody::Session(_)
+            | StatementBody::Explain(_) => None,
         }
     }
 }

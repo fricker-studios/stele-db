@@ -26,8 +26,8 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 use stele_common::period::PeriodPredicate;
 
 use crate::ast::{
-    AdminCommand, AsOf, Password, PeriodExpr, PeriodPredicateClause, SessionCommand, Statement,
-    StatementBody, Temporal, TemporalRange, TimeDimension, UserDdl, ValidTimePeriod,
+    AdminCommand, AsOf, ExplainStmt, Password, PeriodExpr, PeriodPredicateClause, SessionCommand,
+    Statement, StatementBody, Temporal, TemporalRange, TimeDimension, UserDdl, ValidTimePeriod,
 };
 use crate::dialect::SteleDialect;
 use crate::error::ParseError;
@@ -92,6 +92,18 @@ fn split_statements(tokens: Vec<Token>) -> Vec<Vec<Token>> {
 /// and stitch the two back together.
 fn parse_one(mut tokens: Vec<Token>) -> Result<Statement, ParseError> {
     let dialect = SteleDialect::default();
+
+    // `EXPLAIN [ANALYZE] <statement>` ([STL-260]) wraps an inner statement, so it
+    // is lifted first — ahead of the other token-level lifts and `sqlparser` —
+    // and the remainder is parsed recursively through this same path (so the
+    // inner's temporal clauses are stripped as usual). `sqlparser` has its own
+    // `EXPLAIN`, but it would reject those clauses.
+    if let Some(explain) = lift_explain(&tokens)? {
+        return Ok(Statement {
+            body: StatementBody::Explain(Box::new(explain)),
+            temporal: Temporal::default(),
+        });
+    }
 
     // Stele admin commands (`CHECKPOINT` / `FLUSH`) have no `sqlparser` grammar,
     // so recognize them at the token level before handing the remainder to
@@ -183,6 +195,48 @@ fn parse_one(mut tokens: Vec<Token>) -> Result<Statement, ParseError> {
             period_predicate,
         },
     })
+}
+
+/// Recognize a leading `EXPLAIN [ANALYZE]` and lift it off the token stream
+/// ([STL-260]), recursively parsing the remainder as the statement being
+/// explained.
+///
+/// `sqlparser` has its own `EXPLAIN` grammar, but the inner statement may carry
+/// Stele temporal clauses (`EXPLAIN SELECT … FOR SYSTEM_TIME AS OF …`) it would
+/// reject — so EXPLAIN is recognized here and the inner is parsed through
+/// [`parse_one`], which strips those clauses. Returns the lifted statement,
+/// `None` if the tokens are not an EXPLAIN, or an error for a malformed one (no
+/// inner statement, or an inner that is not a plannable SQL statement — a nested
+/// `EXPLAIN`, an admin/session/user command).
+fn lift_explain(tokens: &[Token]) -> Result<Option<ExplainStmt>, ParseError> {
+    let Some(first) = tokens.first() else {
+        return Ok(None);
+    };
+    if !word_is(first, "EXPLAIN") {
+        return Ok(None);
+    }
+    let syntax = |msg: &str| ParseError::Syntax(ParserError::ParserError(msg.to_owned()));
+    // `EXPLAIN ANALYZE` opts into executing the inner statement and measuring it;
+    // a bare `EXPLAIN` only renders the plan shape. The parenthesized option list
+    // (`EXPLAIN (FORMAT …)`) and other modifiers are out of v0.3 scope.
+    let mut rest = &tokens[1..];
+    let analyze = rest.first().is_some_and(|t| word_is(t, "ANALYZE"));
+    if analyze {
+        rest = &rest[1..];
+    }
+    if rest.is_empty() {
+        return Err(syntax("EXPLAIN requires a statement to explain"));
+    }
+    let inner = parse_one(rest.to_vec())?;
+    // EXPLAIN renders a query/DML plan; an admin/session/user command or a nested
+    // EXPLAIN has no plan to render. (A DDL body parses as `Sql` and is rejected
+    // later, at bind time, with a clearer message.)
+    if !matches!(inner.body, StatementBody::Sql(_)) {
+        return Err(syntax(
+            "EXPLAIN supports only a SELECT / INSERT / UPDATE / DELETE statement",
+        ));
+    }
+    Ok(Some(ExplainStmt { analyze, inner }))
 }
 
 /// Recognize a Stele admin command — `CHECKPOINT` / `FLUSH` / `COMPACT` (a bare

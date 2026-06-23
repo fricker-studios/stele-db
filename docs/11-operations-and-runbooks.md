@@ -95,6 +95,53 @@ rate(stele_scan_segments_pruned_zone_total[5m])
 probe_success{job="stele-readyz"} == 0   # via blackbox_exporter on /readyz
 ```
 
+### 1.2 Reading a query plan (`EXPLAIN ANALYZE` — STL-260)
+
+When the dashboard says a query is slow, `EXPLAIN ANALYZE` is the per-query
+counterpart of the metrics above — it runs the statement and annotates each
+operator with its **true** rows and wall time, plus the scan's prune accounting,
+so you can see *where* the time and the I/O went (the grammar and the deferred
+edges are in [sql-grammar.md](sql-grammar.md#explain-analyze--plan-introspection-stl-260)).
+
+```text
+stele=> EXPLAIN ANALYZE SELECT id FROM account WHERE balance >= 100;
+QUERY PLAN
+Filter  (actual rows=2 time=812us)
+  Cond: balance >= 100
+  Output: id
+  ->  Explode Payload  (actual rows=2 time=540us)
+        ->  Snapshot Scan on account  (actual rows=2 time=505us)
+              System snapshot: 1700000000000000
+              Index: i_balance (btree, >=)
+              Prune: sys_from <= 1700000000000000
+              Buffers: segments 1/4 scanned (pruned 3 zone, 0 bloom, 0 superseded, 0 valid); row-groups 2/9 scanned (pruned 7 zone, 0 valid)
+Execution Time: 905us
+```
+
+What to look at, and what it tells you:
+
+- **`Index:` / no `Index:` line.** A missing index line on a hot, selective
+  predicate means a full scan — the read consulted no secondary index. Compare the
+  `Snapshot Scan`'s `actual rows` against the table size: if it scanned far more
+  rows than it returned, an index (or a better predicate shape) is the fix. Above,
+  the index narrowed the scan to the 2 matching rows.
+- **`Buffers:` — the prune story.** `segments 1/4 scanned (pruned 3 zone …)` means
+  the zone maps skipped 3 of 4 sealed segments with no I/O. Prune ratios near zero
+  on a large table are the same "zone maps aren't helping" signal the
+  `…_pruned_*_total` metrics raise (§1.1, signal 4) — a flush / compaction or a
+  predicate-shape change is due. This is the same instrumentation the per-query
+  stats footer reports — one set of counters, two renderers.
+- **`actual rows` down the tree.** A `Filter` that emits far fewer rows than its
+  child scanned is a predicate that could be pushed to an index; an `Aggregate` or
+  `Hash Join` row count that explodes points at the expensive stage.
+- **`Execution Time:`** is the whole-statement wall time (the per-operator times
+  are inclusive, like Postgres). It is engine-side instrumentation — the
+  deterministic `stele-exec` operators read no clock — so the simulator and tests
+  report `0us` while a live server reports real microseconds.
+
+`EXPLAIN ANALYZE` **runs the statement for real**, committing a DML it wraps
+(Postgres-style) — use a plain `EXPLAIN` for a write you do not want to apply.
+
 ## 2. Incident response
 
 A blameless, severity-driven process (the engineering `incident-response` workflow applies).

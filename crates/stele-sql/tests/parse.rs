@@ -50,6 +50,68 @@ fn create_table_without_versioning_is_not_temporal() {
 }
 
 #[test]
+fn explain_wraps_a_select() {
+    let stmts = parse("EXPLAIN SELECT balance FROM account WHERE id = 1").unwrap();
+    let StatementBody::Explain(e) = &stmts[0].body else {
+        panic!("expected EXPLAIN");
+    };
+    assert!(!e.analyze, "bare EXPLAIN does not analyze");
+    assert!(matches!(e.inner.sql(), Some(SqlStatement::Query(_))));
+    // The wrapper itself carries no temporal grammar; the inner does.
+    assert!(!stmts[0].is_temporal());
+}
+
+#[test]
+fn explain_analyze_sets_the_flag() {
+    let stmts = parse("EXPLAIN ANALYZE SELECT balance FROM account").unwrap();
+    let StatementBody::Explain(e) = &stmts[0].body else {
+        panic!("expected EXPLAIN");
+    };
+    assert!(e.analyze, "EXPLAIN ANALYZE executes + measures");
+    assert!(matches!(e.inner.sql(), Some(SqlStatement::Query(_))));
+}
+
+#[test]
+fn explain_lifts_the_inner_temporal_clause() {
+    // The inner statement's `FOR SYSTEM_TIME AS OF` must be lifted onto the inner,
+    // not choke `sqlparser` — the whole reason EXPLAIN is recognized at the token
+    // level rather than handed to `sqlparser`'s own EXPLAIN grammar.
+    let stmts = parse(
+        "EXPLAIN ANALYZE SELECT balance FROM account \
+         FOR SYSTEM_TIME AS OF (now() - interval '1 second') WHERE id = 1",
+    )
+    .unwrap();
+    let StatementBody::Explain(e) = &stmts[0].body else {
+        panic!("expected EXPLAIN");
+    };
+    assert_eq!(e.inner.temporal.as_of.len(), 1, "inner carries the AS OF");
+    assert_eq!(e.inner.temporal.as_of[0].dimension, TimeDimension::System);
+    assert!(matches!(e.inner.sql(), Some(SqlStatement::Query(_))));
+}
+
+#[test]
+fn explain_wraps_dml() {
+    let stmts = parse("EXPLAIN INSERT INTO account VALUES (1, 100)").unwrap();
+    let StatementBody::Explain(e) = &stmts[0].body else {
+        panic!("expected EXPLAIN");
+    };
+    assert!(matches!(e.inner.sql(), Some(SqlStatement::Insert(_))));
+}
+
+#[test]
+fn explain_requires_a_statement() {
+    assert!(parse("EXPLAIN").is_err());
+    assert!(parse("EXPLAIN ANALYZE").is_err());
+}
+
+#[test]
+fn explain_rejects_non_plannable_inner() {
+    // An admin command and a nested EXPLAIN have no query plan to render.
+    assert!(parse("EXPLAIN CHECKPOINT").is_err());
+    assert!(parse("EXPLAIN EXPLAIN SELECT 1").is_err());
+}
+
+#[test]
 fn create_table_captures_valid_time_period() {
     let stmts = parse(
         "CREATE TABLE t (id INT, vf TIMESTAMP, vt TIMESTAMP) \
