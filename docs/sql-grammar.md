@@ -99,9 +99,11 @@ join output (STL-264) and across an N-way chain (STL-323, see
 
 A `FOR { SYSTEM_TIME | VALID_TIME } { FROM a TO b | BETWEEN a AND b }` **range**
 over a join (STL-344) is the interval generalization of that pinned read — "the
-history of the joined result over `[a, b)`". Instead of one version per input at a
-point, every input is range-scanned and the matched versions' intervals are
-**intersected**: a joined tuple's period is `[max(from), min(to))` over its inputs —
+history of the joined result over the queried window" (`[a, b)` for the half-open
+`FROM..TO`, `[a, b]` for the closed `BETWEEN`, the same boundary contract as the
+single-table range below). Instead of one version per input at a point, every input
+is range-scanned and the matched versions' intervals are **intersected**: a joined
+tuple's period is `[max(from), min(to))` over its inputs —
 docs/16 §8's pointwise intersection lifted to an interval, so a pair whose intervals
 never overlap does not join, and the intersected period endpoints (`sys_from` /
 `sys_to`, or `valid_from` / `valid_to`) are exposed on the join output exactly as a
@@ -176,7 +178,7 @@ a pair whose intervals don't overlap never joins, and the **intersected** endpoi
 (`sys_from` / `sys_to`, unclipped — the tuple's actual period) are exposed on the
 output. The whole left-deep `INNER` chain is supported (`a JOIN b … JOIN c …`); the
 business-key match, NULL handling, and the `WHERE` / aggregate / `ORDER BY` / `LIMIT`
-tail are the point join's ([STL-264]). The un-ranged axis follows the single-table
+tail are the same as the point join's ([STL-264]). The un-ranged axis follows the single-table
 convention (a system range is valid-agnostic; a valid range pins the system snapshot
 and ranges the valid axis). See **Over a `JOIN`** in
 [time-travel select](#for--system_time--valid_time--as-of-expr--time-travel-select).
