@@ -761,10 +761,11 @@ SELECT id FROM t WHERE a = (SELECT a FROM s WHERE s.id = t.id);        -- scalar
   `IN` false, a scalar `NULL`. The `NOT IN`-with-a-NULL-member trap is evaluated
   against *each* outer row's inner set. Both are checked against DuckDB in the
   nightly differential oracle (`correlated_subquery_differential.rs`).
-- **Decorrelation (STL-317, STL-337).** A correlated `EXISTS` / `NOT EXISTS`, or a
-  non-negated `IN`, whose correlation is an **equality** on the key (`inner.k =
-  outer.k`) and whose inner is a plain single-table scan is lowered to a **hash join**
-  (STL-172's machinery) — one inner scan instead of `O(outer rows)` re-executions:
+- **Decorrelation (STL-317, STL-337, STL-346).** A correlated `EXISTS` / `NOT
+  EXISTS`, `IN`, or `NOT IN`, whose correlation is an **equality** on the key
+  (`inner.k = outer.k`) and whose inner is a plain single-table scan is lowered to a
+  **hash join** (STL-172's machinery) — one inner scan instead of `O(outer rows)`
+  re-executions:
   - **`EXISTS` / `NOT EXISTS`** → a single-key **semi** / **anti** join on the
     correlation key. "∃ an inner row for this outer row" is exactly "the outer key is
     a member of the inner key set", so `SEMI` answers `EXISTS` and `ANTI` `NOT
@@ -776,6 +777,16 @@ SELECT id FROM t WHERE a = (SELECT a FROM s WHERE s.id = t.id);        -- scalar
     into one synthetic key that is NULL when *either* component is NULL — reproducing
     `IN`'s three-valued logic (a NULL membership value or correlation key, on either
     side, never makes `IN` true).
+  - **`NOT IN`** → a **NULL-aware composite-key anti** join on the same
+    `(correlation key, membership value)`. A plain composite anti join is *not* `NOT
+    IN`: under 3VL a NULL membership value anywhere in an outer row's correlation
+    group makes `NOT IN` unknown for it (drop), yet the anti join keeps it (its
+    composite never matches). So the engine layers **per-correlation-group NULL
+    tracking** over the anti join — for each correlation key, whether its inner group
+    is non-empty and whether it holds a NULL member — and drops the over-kept rows: a
+    NULL `t.a` over a non-empty group, or a non-empty group with a NULL member. An
+    empty group keeps (`NOT IN ()` is true), as does a NULL correlation key (its group
+    is empty).
 
   The inner still runs at the outer's `(sys, valid)` snapshot and over the
   read-your-own-writes overlay, so the per-statement snapshot rule (docs/16 §6) holds
@@ -783,10 +794,7 @@ SELECT id FROM t WHERE a = (SELECT a FROM s WHERE s.id = t.id);        -- scalar
   — the nightly DuckDB oracle (`correlated_subquery_differential.rs`) covers both.
 - **Still per-row** (the `O(outer rows × inner cost)` fallback the v0.3 bar permits):
   a **non-equality** correlation (`<` / `>` / … — a range, not key-set membership);
-  correlated **`NOT IN`** (its NULL-in-set trap is *per correlation group* — a NULL
-  membership value anywhere in an outer row's inner set makes `NOT IN` unknown for it
-  — which is not an anti join, so a NULL-aware composite anti is a tracked follow-up,
-  STL-346); and a correlated **scalar** lookup.
+  and a correlated **scalar** lookup.
 
 A scalar subquery also binds in the **select list** — **uncorrelated** (STL-303) or
 **correlated** (STL-331), see

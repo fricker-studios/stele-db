@@ -758,10 +758,10 @@ pub struct Correlation {
 /// rule (a NULL outer key drops under `EXISTS`, survives under `NOT EXISTS`) without
 /// any per-row run.
 ///
-/// `IN` / `NOT IN` (which carry a second equality — the membership column — so they
-/// need a composite key, and whose `NOT IN` NULL-in-set trap is not an anti join)
-/// and a correlated scalar lookup keep the per-row fallback, so this is `None` for
-/// them.
+/// `IN` / `NOT IN` carry a second equality — the membership column — so they need a
+/// composite key and fold onto [`CompositeKeyDecorrelation`] instead (a NULL-aware
+/// anti join for `NOT IN`); a correlated scalar lookup keeps the per-row fallback. So
+/// this single-key recognizer is `None` for all of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SemiAntiDecorrelation {
     /// The join to compute: [`JoinType::Semi`] for `EXISTS`, [`JoinType::Anti`] for
@@ -776,32 +776,38 @@ pub struct SemiAntiDecorrelation {
     pub inner_column: usize,
 }
 
-/// A correlated `IN` subquery lowered to a **composite-key (two-column) semi hash
-/// join** ([STL-337]).
+/// A correlated `IN` / `NOT IN` subquery lowered to a **composite-key (two-column)
+/// hash join** — a **semi** join for `IN` ([STL-337]), a NULL-aware **anti** join for
+/// `NOT IN` ([STL-346]).
 ///
-/// The `IN` analogue of [`SemiAntiDecorrelation`]: `t.a IN (SELECT s.a FROM s WHERE
-/// s.k = t.k)` keeps an outer row iff there is an inner row with `s.k = t.k` **and**
-/// `s.a = t.a` — a two-key semi join, not the single-key one `EXISTS` folds onto.
-/// `hash_join` is single-key, so the engine joins on a **synthetic composite key**
-/// `(correlation key, membership value)` per side; a key is NULL when *either*
-/// component is NULL, so the join's "a NULL key never matches" rule reproduces
-/// `IN`'s three-valued logic exactly — a NULL outer membership value (or correlation
-/// key), or a NULL inner one, can never make `IN` `TRUE`, so the row drops.
+/// The `IN` / `NOT IN` analogue of [`SemiAntiDecorrelation`]: `t.a IN (SELECT s.a
+/// FROM s WHERE s.k = t.k)` keeps an outer row iff there is an inner row with `s.k =
+/// t.k` **and** `s.a = t.a` — a two-key test, not the single-key one `EXISTS` folds
+/// onto. `hash_join` is single-key, so the engine joins on a **synthetic composite
+/// key** `(correlation key, membership value)` per side; a key is NULL when *either*
+/// component is NULL, so the join's "a NULL key never matches" rule reproduces `IN`'s
+/// three-valued logic exactly — a NULL outer membership value (or correlation key),
+/// or a NULL inner one, can never make `IN` `TRUE`, so a `SEMI` join drops the row.
 ///
-/// Recognized by [`BoundSubqueryFilter::composite_semi_decorrelation`]: a
-/// **non-negated** `IN` whose correlation is an **equality** on the key and whose
-/// inner is a plain single-table scan. `NOT IN` is deliberately excluded — its
-/// NULL-in-set trap is per-correlation-group and **not** an anti join (a NULL
-/// membership value anywhere in an outer row's inner set makes `NOT IN` unknown for
-/// it, which a plain composite anti join would wrongly keep), so it stays on the
-/// [STL-239] per-row fallback (a NULL-aware anti variant is a tracked follow-up).
+/// `NOT IN` is **not** a plain anti join: under 3VL a NULL membership value anywhere
+/// in an outer row's correlation group makes `NOT IN` `UNKNOWN` for it (drop), yet a
+/// plain composite anti join *keeps* such a row (its composite never matches). So the
+/// engine layers **per-correlation-group NULL tracking** over the anti join
+/// ([STL-346]). The same plan shape drives both lowerings — the negation only selects
+/// semi vs. anti at execution.
+///
+/// Recognized by [`BoundSubqueryFilter::composite_semi_decorrelation`] (`IN`) and
+/// [`BoundSubqueryFilter::composite_anti_decorrelation`] (`NOT IN`): an `IN` / `NOT
+/// IN` whose correlation is an **equality** on the key and whose inner is a plain
+/// single-table scan. A range correlation, an uncorrelated `IN` / `NOT IN`, and a
+/// non-plain inner stay on the [STL-239] per-row fallback.
 ///
 /// The binder lays the inner result out as `[membership, correlation key]` (it
-/// appends the correlation key after the `IN` membership column — see
+/// appends the correlation key after the membership column — see
 /// `project_in_correlation_key`), so [`inner_member_column`](Self::inner_member_column)
 /// is `0` and [`inner_key_column`](Self::inner_key_column) is `1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompositeSemiDecorrelation {
+pub struct CompositeKeyDecorrelation {
     /// The outer correlation column (by **outer** schema index) — the first
     /// component of the outer probe key (`t.k`).
     pub outer_key_column: usize,
@@ -867,32 +873,52 @@ impl BoundSubqueryFilter {
         })
     }
 
-    /// Recognize a correlated `IN` that decorrelates onto a **composite-key semi
-    /// hash join** ([STL-337]), or `None` to keep the [STL-239] per-row fallback.
+    /// Recognize a correlated **`IN`** that decorrelates onto a **composite-key semi
+    /// hash join** ([STL-337]), or `None` to keep the [STL-239] per-row fallback. The
+    /// `IN` half of `composite_key_decorrelation` (the shared private recognizer).
+    #[must_use]
+    pub fn composite_semi_decorrelation(&self) -> Option<CompositeKeyDecorrelation> {
+        self.composite_key_decorrelation(/* negated = */ false)
+    }
+
+    /// Recognize a correlated **`NOT IN`** that decorrelates onto a NULL-aware
+    /// **composite-key anti hash join** ([STL-346]), or `None` to keep the [STL-239]
+    /// per-row fallback. The `NOT IN` half of `composite_key_decorrelation` (the
+    /// shared private recognizer).
     ///
-    /// Decorrelation is sound only when keeping an outer row is exactly "∃ an inner
-    /// row whose `(correlation key, membership value)` equals the outer
-    /// `(correlation key, tested column)`":
+    /// The recognition is identical to the `IN` case — `NOT IN` reads the same
+    /// `[membership, correlation key]` inner layout, and the per-correlation-group
+    /// NULL trap that distinguishes it from a plain anti join is handled in the
+    /// engine, not the recognizer.
+    #[must_use]
+    pub fn composite_anti_decorrelation(&self) -> Option<CompositeKeyDecorrelation> {
+        self.composite_key_decorrelation(/* negated = */ true)
+    }
+
+    /// Recognize a correlated `IN` (`want_negated = false`) or `NOT IN`
+    /// (`want_negated = true`) that decorrelates onto a composite-key join, or `None`
+    /// to keep the [STL-239] per-row fallback.
     ///
-    /// * the predicate is a **non-negated `IN`** — `NOT IN`'s per-group NULL-in-set
-    ///   trap is not an anti join (see [`CompositeSemiDecorrelation`]), and a scalar
-    ///   / `EXISTS` is a different shape ([`semi_anti_decorrelation`] handles
-    ///   `EXISTS`); and
+    /// Decorrelation is sound only when an outer row's membership in the inner set is
+    /// exactly "∃ an inner row whose `(correlation key, membership value)` equals the
+    /// outer `(correlation key, tested column)`":
+    ///
+    /// * the predicate is the requested `[NOT] IN` — a scalar / `EXISTS` is a
+    ///   different shape ([`semi_anti_decorrelation`] handles `EXISTS`); and
     /// * the correlation comparison is an **equality** (`=`) — a range correlation
     ///   is not key-set membership; and
     /// * the inner is a **plain single base-table scan** (`is_plain_scan`) — the same
     ///   gate `EXISTS` uses, for the same reason (an aggregate / `DISTINCT` /
     ///   `LIMIT` / nested inner can change which rows the membership set contains).
     ///
-    /// For such an `IN` the binder appended the correlation key after the membership
-    /// column (`project_in_correlation_key`), so the inner result is exactly
-    /// `[membership, correlation key]`; this confirms that two-column layout before
-    /// returning a plan, so the engine never reads a column the binder did not
+    /// For such a predicate the binder appended the correlation key after the
+    /// membership column (`project_in_correlation_key`), so the inner result is
+    /// exactly `[membership, correlation key]`; this confirms that two-column layout
+    /// before returning a plan, so the engine never reads a column the binder did not
     /// project (a missing layout falls back to the still-correct per-row path).
     ///
     /// [`semi_anti_decorrelation`]: Self::semi_anti_decorrelation
-    #[must_use]
-    pub fn composite_semi_decorrelation(&self) -> Option<CompositeSemiDecorrelation> {
+    fn composite_key_decorrelation(&self, want_negated: bool) -> Option<CompositeKeyDecorrelation> {
         let correlation = self.correlation?;
         if correlation.op != CompareOp::Eq {
             return None;
@@ -900,14 +926,14 @@ impl BoundSubqueryFilter {
         let SubqueryKind::In { column, negated } = self.kind else {
             return None;
         };
-        if negated {
+        if negated != want_negated {
             return None;
         }
         if !self.subquery.is_plain_scan() {
             return None;
         }
         // The binder appended the correlation key as the inner's second projected
-        // column, so a decorrelatable `IN` inner projects exactly `[membership,
+        // column, so a decorrelatable `[NOT] IN` inner projects exactly `[membership,
         // correlation key]`. Anything else means the layout was not built — keep the
         // per-row path.
         let Projection::Items(items) = &self.subquery.projection else {
@@ -916,7 +942,7 @@ impl BoundSubqueryFilter {
         if items.len() != 2 {
             return None;
         }
-        Some(CompositeSemiDecorrelation {
+        Some(CompositeKeyDecorrelation {
             outer_key_column: correlation.outer_column,
             outer_member_column: column,
             inner_key_column: 1,
@@ -4419,11 +4445,13 @@ fn bind_exists_subquery(
 /// Bind `<column> [NOT] IN (SELECT <col>)`. The outer operand must be a bare
 /// value column, and the inner must return exactly one column of the same type.
 ///
-/// A non-negated, equality-correlated `IN` over a plain-scan inner is shaped for
-/// **composite-key decorrelation** ([STL-337]): its correlation key is appended to
-/// the inner's projection ([`project_in_correlation_key`]) so the engine can fold it
-/// onto a single semi join. `NOT IN`, a range correlation, an uncorrelated `IN`, and
-/// a non-plain inner keep the per-row / once-folded shape (a lone membership column).
+/// An equality-correlated `IN` **or** `NOT IN` over a plain-scan inner is shaped for
+/// **composite-key decorrelation**: its correlation key is appended to the inner's
+/// projection ([`project_in_correlation_key`]) so the engine can fold it onto a
+/// single join — a composite-key semi join for `IN` ([STL-337]), a NULL-aware
+/// composite anti join for `NOT IN` ([STL-346]). A range correlation, an uncorrelated
+/// `IN` / `NOT IN`, and a non-plain inner keep the per-row / once-folded shape (a
+/// lone membership column).
 fn bind_in_subquery(
     lhs: &Expr,
     subquery: &Query,
@@ -4435,9 +4463,11 @@ fn bind_in_subquery(
     let (mut inner, correlation) =
         bind_inner_query(subquery, outer, ctx, /* exists = */ false)?;
     check_subquery_column_type(&inner, outer.schema, column, ctx.catalog, "IN")?;
+    // Both `IN` and `NOT IN` decorrelate onto a composite-key join (semi / anti), and
+    // both read the same `[membership, correlation key]` inner layout, so the negation
+    // does not gate the projection shaping — the recognizer keys off it instead.
     if let Some(corr) = correlation
         && corr.op == CompareOp::Eq
-        && !negated
         && inner.is_plain_scan()
     {
         project_in_correlation_key(&mut inner, corr, ctx.catalog)?;
@@ -4449,18 +4479,20 @@ fn bind_in_subquery(
     })
 }
 
-/// Append the **correlation key** column to a decorrelatable `IN` inner's
-/// projection ([STL-337]), so its result is `[membership, correlation key]` — the
-/// two components the composite-key semi join
-/// ([`BoundSubqueryFilter::composite_semi_decorrelation`]) reads per inner row.
+/// Append the **correlation key** column to a decorrelatable `IN` / `NOT IN` inner's
+/// projection ([STL-337], [STL-346]), so its result is `[membership, correlation
+/// key]` — the two components the composite-key semi / anti join
+/// ([`BoundSubqueryFilter::composite_semi_decorrelation`],
+/// [`BoundSubqueryFilter::composite_anti_decorrelation`]) reads per inner row.
 ///
 /// The membership the `IN` projects is preserved unchanged at result position `0`
-/// (so the [STL-239] per-row fold, which reads column `0`, is unaffected for any `IN`
-/// that does not in fact decorrelate) — it is whatever single column the `IN`
-/// selected, a plain column or a computed expression already type-checked to the
-/// outer column's type. The appended correlation key (`s.k`, a plain column by inner
-/// schema index [`Correlation::inner_column`]) lands at position `1`. The binder
-/// type-checked the membership before this widened the result to two columns.
+/// (so the [STL-239] per-row fold, which reads column `0`, is unaffected for any
+/// `IN` / `NOT IN` that does not in fact decorrelate) — it is whatever single column
+/// the predicate selected, a plain column or a computed expression already
+/// type-checked to the outer column's type. The appended correlation key (`s.k`, a
+/// plain column by inner schema index [`Correlation::inner_column`]) lands at position
+/// `1`. The binder type-checked the membership before this widened the result to two
+/// columns.
 fn project_in_correlation_key(
     inner: &mut BoundSelect,
     correlation: Correlation,
@@ -9360,7 +9392,7 @@ mod tests {
         );
     }
 
-    // ---- STL-337: composite-key IN decorrelation recognition ----
+    // ---- STL-337 / STL-346: composite-key IN / NOT IN decorrelation recognition ----
 
     /// The bound subquery filter for `sql`, for inspecting the inner shape the
     /// composite-key decorrelation depends on.
@@ -9383,7 +9415,7 @@ mod tests {
         // membership column the outer `a` (column 1).
         assert_eq!(
             filter.composite_semi_decorrelation(),
-            Some(CompositeSemiDecorrelation {
+            Some(CompositeKeyDecorrelation {
                 outer_key_column: 0,
                 outer_member_column: 1,
                 inner_key_column: 1,
@@ -9392,7 +9424,41 @@ mod tests {
         );
         // The binder appended the correlation key after the membership column, so the
         // inner projects exactly `[a, id]` — the two composite-key components in
-        // result order. It is not the single-key `EXISTS` shape.
+        // result order. It is the semi (not anti) shape, and not the single-key
+        // `EXISTS` shape.
+        assert_eq!(
+            filter.subquery.projection,
+            Projection::Items(vec![
+                ProjectionItem::column("a"),
+                ProjectionItem::column("id")
+            ])
+        );
+        assert_eq!(filter.composite_anti_decorrelation(), None);
+        assert_eq!(filter.semi_anti_decorrelation(), None);
+    }
+
+    #[test]
+    fn correlated_not_in_on_an_equality_key_decorrelates_to_a_composite_anti_join() {
+        let catalog = catalog_with_subquery_tables();
+        let filter = subquery_filter(
+            "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s WHERE s.id = t.id)",
+            &catalog,
+        );
+        // `NOT IN` decorrelates onto the same composite-key plan as `IN` ([STL-346]);
+        // the engine runs it as a NULL-aware ANTI join. The recognizer returns the
+        // plan via the anti sibling, and `None` from the semi one.
+        assert_eq!(
+            filter.composite_anti_decorrelation(),
+            Some(CompositeKeyDecorrelation {
+                outer_key_column: 0,
+                outer_member_column: 1,
+                inner_key_column: 1,
+                inner_member_column: 0,
+            })
+        );
+        assert_eq!(filter.composite_semi_decorrelation(), None);
+        // The binder appended the correlation key for `NOT IN` too, so the inner
+        // projects `[a, id]` — the two composite-key components.
         assert_eq!(
             filter.subquery.projection,
             Projection::Items(vec![
@@ -9404,38 +9470,39 @@ mod tests {
     }
 
     #[test]
-    fn not_in_and_non_decorrelatable_in_keep_the_per_row_fallback() {
+    fn non_decorrelatable_in_or_not_in_keeps_the_per_row_fallback() {
         let catalog = catalog_with_subquery_tables();
-        // `NOT IN`'s NULL-in-set trap is per-correlation-group, not an anti join, so
-        // it stays per-row (a NULL-aware anti is a tracked follow-up). Its inner is
-        // left as the lone membership column.
-        let not_in = subquery_filter(
-            "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s WHERE s.id = t.id)",
-            &catalog,
-        );
-        assert_eq!(not_in.composite_semi_decorrelation(), None);
-        assert_eq!(
-            not_in.subquery.projection,
-            Projection::Items(vec![ProjectionItem::column("a")])
-        );
-        // A range correlation is not key-set membership.
-        assert_eq!(
-            subquery_filter(
-                "SELECT id FROM t WHERE a IN (SELECT a FROM s WHERE s.id > t.id)",
-                &catalog,
-            )
-            .composite_semi_decorrelation(),
-            None
-        );
-        // An *uncorrelated* IN folds to an OR-set once, not a join — and its inner is
-        // never widened.
-        let uncorrelated =
-            subquery_filter("SELECT id FROM t WHERE a IN (SELECT a FROM s)", &catalog);
-        assert_eq!(uncorrelated.composite_semi_decorrelation(), None);
-        assert_eq!(
-            uncorrelated.subquery.projection,
-            Projection::Items(vec![ProjectionItem::column("a")])
-        );
+        // A range correlation is not key-set membership — neither `IN` nor `NOT IN`
+        // folds onto a composite key, and the inner is left as the lone membership
+        // column.
+        for sql in [
+            "SELECT id FROM t WHERE a IN (SELECT a FROM s WHERE s.id > t.id)",
+            "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s WHERE s.id > t.id)",
+        ] {
+            let filter = subquery_filter(sql, &catalog);
+            assert_eq!(filter.composite_semi_decorrelation(), None, "{sql}");
+            assert_eq!(filter.composite_anti_decorrelation(), None, "{sql}");
+            assert_eq!(
+                filter.subquery.projection,
+                Projection::Items(vec![ProjectionItem::column("a")]),
+                "{sql}"
+            );
+        }
+        // An *uncorrelated* IN / NOT IN folds to an OR-set once, not a join — and its
+        // inner is never widened.
+        for sql in [
+            "SELECT id FROM t WHERE a IN (SELECT a FROM s)",
+            "SELECT id FROM t WHERE a NOT IN (SELECT a FROM s)",
+        ] {
+            let uncorrelated = subquery_filter(sql, &catalog);
+            assert_eq!(uncorrelated.composite_semi_decorrelation(), None, "{sql}");
+            assert_eq!(uncorrelated.composite_anti_decorrelation(), None, "{sql}");
+            assert_eq!(
+                uncorrelated.subquery.projection,
+                Projection::Items(vec![ProjectionItem::column("a")]),
+                "{sql}"
+            );
+        }
     }
 
     #[test]

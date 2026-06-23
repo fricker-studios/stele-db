@@ -113,9 +113,10 @@ async fn tokio_postgres_runs_uncorrelated_subqueries() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tokio_postgres_runs_correlated_subqueries() {
-    // STL-239 Definition of Done: correlated `EXISTS` / `NOT EXISTS` / `IN` and
-    // scalar correlated subqueries return Postgres-equivalent results over the wire,
-    // including the `NOT IN`-with-NULL three-valued trap evaluated per outer row.
+    // STL-239 Definition of Done: correlated `EXISTS` / `NOT EXISTS` / `IN` / `NOT IN`
+    // and scalar correlated subqueries return Postgres-equivalent results over the
+    // wire, including the `NOT IN`-with-NULL three-valued trap (now decorrelated onto a
+    // NULL-aware composite anti join, STL-346).
     let session: SharedSession =
         Arc::new(Mutex::new(SessionEngine::open(MemDisk::new(), SystemClock)));
     let addr = common::spawn_server(session).await;
@@ -169,9 +170,10 @@ async fn tokio_postgres_runs_correlated_subqueries() {
         .expect("correlated IN");
     assert_eq!(ids(&reply), vec![1]);
 
-    // Correlated NOT IN: id 3's inner {NULL} makes `9 NOT IN (NULL)` unknown (the
-    // per-row trap, dropped); id 1's `5 NOT IN (5, 6)` is false; id 2's `7 NOT IN
-    // (5, 6)` is true → keep; id 4's empty inner makes `NOT IN ()` true → keep.
+    // Correlated NOT IN — `(k, a)` NULL-aware composite anti join (STL-346): id 3's
+    // group {NULL} makes `9 NOT IN (NULL)` unknown (the per-group NULL trap, dropped);
+    // id 1's `5 NOT IN (5, 6)` is false; id 2's `7 NOT IN (5, 6)` is true → keep; id
+    // 4's empty group makes `NOT IN ()` true → keep.
     let reply = client
         .simple_query("SELECT id FROM t WHERE a NOT IN (SELECT a FROM s WHERE s.k = t.k)")
         .await
