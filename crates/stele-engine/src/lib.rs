@@ -4104,10 +4104,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 .filter_map(buffered_key_bytes)
                 .collect();
             let base = Self::scan_all_rows(state, snapshot, value_count, &self.metrics)?;
+            // Only the buffer's own keys ever open a new `[now, +∞)` version, so keep
+            // just those from the merged live state — the rest of the table's live rows
+            // are never looked up and would only bloat the map.
             let buffer_live: BTreeMap<Vec<u8>, Vec<Option<Vec<u8>>>> =
                 overlay_table_writes(base.rows, overlay, table, value_count, false)
                     .into_iter()
                     .filter_map(|r| r.first().cloned().flatten().map(|k| (k, r)))
+                    .filter(|(k, _)| buffered.contains(k))
                     .collect();
             (buffered, buffer_live)
         } else {
@@ -8354,8 +8358,10 @@ fn overlay_system_range_rows(
     } else {
         0
     };
-    let mut rows: Vec<Vec<Option<Vec<u8>>>> =
-        Vec::with_capacity(committed.len() + buffer_live.len());
+    // At most one new `[s, +∞)` version per *buffered* key, so size to `buffered`
+    // rather than `buffer_live` (which may hold every live row before its caller
+    // filters it).
+    let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(committed.len() + buffered.len());
     for v in committed {
         let open = v.sys_to == SYSTEM_TIME_OPEN;
         // The buffer closes a touched key's currently-open version at `s`; an
