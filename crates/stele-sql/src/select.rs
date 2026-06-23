@@ -4459,10 +4459,12 @@ fn bind_in_subquery(
     outer: &OuterScope,
     ctx: &BindContext,
 ) -> Result<BoundSubqueryFilter, SelectError> {
-    let column = subquery_anchor_column(lhs, outer.schema, outer.table, "IN")?;
+    // Label diagnostics with the predicate as written (`NOT IN` vs `IN`).
+    let what = if negated { "NOT IN" } else { "IN" };
+    let column = subquery_anchor_column(lhs, outer.schema, outer.table, what)?;
     let (mut inner, correlation) =
         bind_inner_query(subquery, outer, ctx, /* exists = */ false)?;
-    check_subquery_column_type(&inner, outer.schema, column, ctx.catalog, "IN")?;
+    check_subquery_column_type(&inner, outer.schema, column, ctx.catalog, what)?;
     // Both `IN` and `NOT IN` decorrelate onto a composite-key join (semi / anti), and
     // both read the same `[membership, correlation key]` inner layout, so the negation
     // does not gate the projection shaping — the recognizer keys off it instead.
@@ -9531,7 +9533,20 @@ mod tests {
         let catalog = catalog_with_subquery_tables();
         // `t.a` is INT, `s2.b` is TEXT — no implicit coercion.
         let err = bind("SELECT id FROM t WHERE a IN (SELECT b FROM s2)", &catalog).unwrap_err();
-        assert!(matches!(err, SelectError::Subquery(_)), "got {err:?}");
+        assert!(
+            matches!(&err, SelectError::Subquery(msg) if msg.starts_with("IN yields")),
+            "got {err:?}"
+        );
+        // `NOT IN` labels the same diagnostic with the predicate as written.
+        let err = bind(
+            "SELECT id FROM t WHERE a NOT IN (SELECT b FROM s2)",
+            &catalog,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SelectError::Subquery(msg) if msg.starts_with("NOT IN yields")),
+            "got {err:?}"
+        );
     }
 
     #[test]
