@@ -1888,16 +1888,21 @@ fn bind_select_scoped(
 
     // A range scan ([STL-244] system axis, [STL-328] valid axis) is the "all
     // versions over an interval" read. Result-shaping ([STL-263]), aggregation
-    // ([STL-171]), and the provenance pseudo-columns ([STL-247]) now compose over
-    // it ([STL-329]): they bind against `bind_schema` above (the table's columns
-    // plus the appended endpoints) and run through the engine's shared
-    // `finish_select` pipeline. What does *not* yet compose is rejected here so a
-    // range scan never silently drops a clause — a subquery `WHERE` ([STL-234]), a
-    // period-predicate `WHERE` ([STL-165]), a CTE / derived relation, and a
-    // computed / scalar-subquery select item ([STL-303]), each a tracked follow-up.
-    // (The read-your-own-writes overlay and a range over a `JOIN` are deferred too,
-    // handled at the engine / join paths respectively.) Both axes reject the same
-    // shapes; only the error axis differs.
+    // ([STL-171]), the provenance pseudo-columns ([STL-247], all [STL-329]), and a
+    // period-predicate `WHERE` ([STL-165] / [STL-193], [STL-345]) now compose over
+    // it: they bind against `bind_schema` above (the table's columns plus the
+    // appended endpoints) and run through the engine's shared `finish_select`
+    // pipeline. A period predicate's `PERIOD(...)` operands bind against the base
+    // `schema` (above), so a value-column endpoint addresses the same index in the
+    // reconstructed range row — where the endpoints are appended *after* the
+    // value columns — that it does on a point read; the engine const-folds the
+    // constant case and per-row-evaluates the column case identically over the
+    // range output. What does *not* yet compose is rejected here so a range scan
+    // never silently drops a clause — a subquery `WHERE` ([STL-234]), a CTE /
+    // derived relation, and a computed / scalar-subquery select item ([STL-303]),
+    // each a tracked follow-up. (The read-your-own-writes overlay and a range over
+    // a `JOIN` are deferred too, handled at the engine / join paths respectively.)
+    // Both axes reject the same shapes; only the error axis differs.
     if system_range.is_some() || valid_range.is_some() {
         let valid_axis = valid_range.is_some();
         let reject = |what: &str| {
@@ -1909,9 +1914,6 @@ fn bind_select_scoped(
         };
         if subquery_filter.is_some() {
             return reject("with a subquery WHERE");
-        }
-        if period_filter.is_some() {
-            return reject("with a period-predicate WHERE");
         }
         if materialized {
             return reject("over a CTE / derived table");
@@ -7495,6 +7497,55 @@ mod tests {
                 "expected UnsupportedSystemRange for: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn a_period_predicate_where_composes_over_a_range() {
+        // [STL-345] lifts the [STL-329] rejection: a `WHERE PERIOD(..) <pred>
+        // PERIOD(..)` now binds over a range, both axes, in both the constant
+        // ([STL-165]) and per-row value-column ([STL-193]) shapes. The predicate
+        // lands in `period_filter` (not the plain `filter`), alongside the range.
+        let account = catalog_with_account(1_000);
+        let booking = catalog_with_booking(1_000);
+
+        // System range + a constant period predicate (account has no instant-typed
+        // value column, so the per-row shape is exercised on the valid axis below).
+        let sys = bind(
+            "SELECT * FROM account FOR SYSTEM_TIME FROM 1 TO 9 \
+             WHERE PERIOD(10, 20) CONTAINS PERIOD(12, 15)",
+            &account,
+        )
+        .expect("a constant period predicate binds over a system range");
+        assert!(sys.system_range.is_some());
+        assert!(
+            sys.period_filter.is_some() && sys.filter.is_none(),
+            "the period predicate is the WHERE, not a plain filter"
+        );
+
+        // Valid range + a per-row period predicate over the table's own valid
+        // columns — the natural `PERIOD(vf, vt)` shape against a constant probe.
+        let valid = bind(
+            "SELECT * FROM booking FOR VALID_TIME FROM 1 TO 9 \
+             WHERE PERIOD(vf, vt) OVERLAPS PERIOD(0, 100)",
+            &booking,
+        )
+        .expect("a per-row period predicate binds over a valid range");
+        assert!(valid.valid_range.is_some());
+        assert!(valid.period_filter.is_some() && valid.filter.is_none());
+
+        // The constant shape composes over a valid range too, and the per-row shape
+        // over a system range against a `BIGINT` value column (an instant-typed
+        // endpoint is all the per-row path requires).
+        assert!(
+            bind(
+                "SELECT * FROM booking FOR VALID_TIME FROM 1 TO 9 \
+                 WHERE PERIOD(10, 20) EQUALS PERIOD(10, 20)",
+                &booking,
+            )
+            .expect("a constant period predicate binds over a valid range")
+            .period_filter
+            .is_some()
+        );
     }
 
     #[test]

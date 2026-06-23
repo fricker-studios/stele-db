@@ -141,23 +141,26 @@ returns exactly what it lists (`SELECT a` is `[a]`; `SELECT a, sys_from` is
 `WHERE` like any column. `sys_to` is `NULL` for a still-current (open) version. This
 is the row shape STL-199's `\history` consumes (it names the endpoints explicitly).
 
-**Composing the SELECT surface ([STL-329]).** The rest of the read surface composes
-over a range, routed through the shared `finish_select` pipeline exactly as a point
-read is: result-shaping (`DISTINCT` / `ORDER BY` — including on `sys_from` /
-`sys_to` — / `LIMIT` / `OFFSET`), aggregation / `GROUP BY` over the range output,
-and the provenance pseudo-columns ([STL-247]) projected from the range. (Grouping
-on the endpoints is bounded by the same rule as any read: `GROUP BY` keys are
-restricted to `INT4` / `INT8` / `BOOL` / `TEXT` today, so `GROUP BY sys_from` —
-`TIMESTAMPTZ` — is the pre-existing unsupported-grouping-type error, not range-specific.)
-A range scan is now subject to the simple-query default row cap too, like any plain
-read ([below](#default-row-cap-on-the-simple-query-path-stl-306)).
+**Composing the SELECT surface ([STL-329], [STL-345]).** The rest of the read
+surface composes over a range, routed through the shared `finish_select` pipeline
+exactly as a point read is: result-shaping (`DISTINCT` / `ORDER BY` — including on
+`sys_from` / `sys_to` — / `LIMIT` / `OFFSET`), aggregation / `GROUP BY` over the
+range output, the provenance pseudo-columns ([STL-247]) projected from the range,
+and a period-predicate `WHERE` ([STL-345]) — `WHERE PERIOD(a, b) <pred> PERIOD(c, d)`
+folds its constant case to keep-all / keep-none and per-row-evaluates an endpoint
+that names a value column ([STL-165] / [STL-193]), over each reconstructed range
+row. (Grouping on the endpoints is bounded by the same rule as any read: `GROUP BY`
+keys are restricted to `INT4` / `INT8` / `BOOL` / `TEXT` today, so `GROUP BY
+sys_from` — `TIMESTAMPTZ` — is the pre-existing unsupported-grouping-type error, not
+range-specific.) A range scan is now subject to the simple-query default row cap
+too, like any plain read ([below](#default-row-cap-on-the-simple-query-path-stl-306)).
 
 **Still rejected (tracked follow-ups), never silently dropped.** Combining a system
-range with **any** `AS OF` point qualifier; a `JOIN`; a subquery or period-predicate
-`WHERE`; a computed / scalar-subquery select item; a CTE / derived-table source; the
-read-your-own-writes overlay (a range reads the committed snapshot only, unlike a
-point read or a join, [STL-325]); and `FOR SYSTEM_TIME ALL` (the trivially-full
-range). (The **valid axis** is the parallel form below
+range with **any** `AS OF` point qualifier; a `JOIN`; a subquery `WHERE`; a computed
+/ scalar-subquery select item; a CTE / derived-table source; the read-your-own-writes
+overlay (a range reads the committed snapshot only, unlike a point read or a join,
+[STL-325]); and `FOR SYSTEM_TIME ALL` (the trivially-full range). (The **valid axis**
+is the parallel form below
 ([STL-328](#for-valid_time--from-a-to-b--between-a-and-b---valid-time-range-scans-stl-328)),
 which relaxes the `AS OF` rule.)
 
@@ -202,11 +205,13 @@ open system period.
 range — it fixes the system snapshot the valid history is read at (the cross-axis
 `v(k, S, V_range)`, the range-extension of the both-axes point read). A
 `FOR VALID_TIME AS OF` is rejected (a point and a range on the *same* axis). The
-same SELECT surface composes over a valid range as a system one ([STL-329]):
-result-shaping, aggregation / `GROUP BY`, and projected provenance pseudo-columns;
-the same shapes a system range rejects (subquery / period `WHERE`, `JOIN`, CTE,
-computed projection, read-your-own-writes) are rejected here too. The correctness
-oracle (`crates/stele-engine/tests/valid_range_oracle.rs`,
+same SELECT surface composes over a valid range as a system one ([STL-329],
+[STL-345]): result-shaping, aggregation / `GROUP BY`, projected provenance
+pseudo-columns, and a period-predicate `WHERE` — a per-row `WHERE PERIOD(vf, vt)
+<pred> PERIOD(c, d)` over the version's own valid columns is the natural valid-axis
+shape ([STL-345]); the same shapes a system range rejects (subquery `WHERE`, `JOIN`,
+CTE, computed projection, read-your-own-writes) are rejected here too. The
+correctness oracle (`crates/stele-engine/tests/valid_range_oracle.rs`,
 [docs/06 §4](06-testing-strategy.md#4-correctness-oracles-the-temporal-heart))
 sweeps a bitemporal workload across both axes and the flush/seal boundary against a
 reference model, with the same off-by-one teeth check.

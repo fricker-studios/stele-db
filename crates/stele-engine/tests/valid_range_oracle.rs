@@ -259,6 +259,117 @@ fn reference_rows(
     rows
 }
 
+/// The seven SQL:2011 period predicates ([STL-165]), named for the SQL surface.
+/// A local mirror of `stele_common::period::PeriodPredicate` so the reference
+/// derives each truth value [independently](pred_holds) of the engine.
+#[derive(Debug, Clone, Copy)]
+enum Pred {
+    Contains,
+    Overlaps,
+    Equals,
+    Precedes,
+    Succeeds,
+    ImmediatelyPrecedes,
+    ImmediatelySucceeds,
+}
+
+/// `(SQL keyword, predicate)` for every period predicate, swept by the
+/// period-`WHERE` differential below.
+const PREDS: [(&str, Pred); 7] = [
+    ("CONTAINS", Pred::Contains),
+    ("OVERLAPS", Pred::Overlaps),
+    ("EQUALS", Pred::Equals),
+    ("PRECEDES", Pred::Precedes),
+    ("SUCCEEDS", Pred::Succeeds),
+    ("IMMEDIATELY PRECEDES", Pred::ImmediatelyPrecedes),
+    ("IMMEDIATELY SUCCEEDS", Pred::ImmediatelySucceeds),
+];
+
+/// The inclusive last instant a half-open `[_, to)` covers: `to - 1`, or `+∞`
+/// (`i64::MAX`) for an open-ended period.
+const fn last_instant(to: i64) -> i64 {
+    if to == i64::MAX { i64::MAX } else { to - 1 }
+}
+
+/// Whether `[af, at) <pred> [bf, bt)` holds, derived **independently** of the
+/// engine's `stele_exec::evaluate` by reasoning over the *inclusive integer
+/// instant* each half-open interval covers — the same inclusive-range style the
+/// overlap check in [`reference_rows`] uses, a second derivation of the SQL:2011
+/// semantics rather than a copy of the evaluator.
+///
+/// `row_upper_inclusive` is the teeth knob: when set, the left (row) interval's
+/// upper is treated as inclusive (`[af, at]`), injecting the classic half-open
+/// off-by-one the [teeth test](the_period_oracle_has_teeth_off_by_one_on_the_row_period)
+/// proves the differential catches.
+fn pred_holds(pred: Pred, af: i64, at: i64, bf: i64, bt: i64, row_upper_inclusive: bool) -> bool {
+    let la = if row_upper_inclusive {
+        at
+    } else {
+        last_instant(at)
+    };
+    let lb = last_instant(bt);
+    match pred {
+        // The two inclusive instant sets intersect.
+        Pred::Overlaps => af.max(bf) <= la.min(lb),
+        // Every instant of the right interval is also an instant of the left.
+        Pred::Contains => af <= bf && lb <= la,
+        Pred::Equals => af == bf && la == lb,
+        // The left's whole instant set lies strictly before the right's first.
+        Pred::Precedes => la < bf,
+        Pred::Succeeds => lb < af,
+        // Adjacency: the instant just past the left's last is the right's first.
+        // `checked_add` keeps an open interval (`la == i64::MAX`) from wrapping —
+        // an interval that ends nowhere abuts nothing.
+        Pred::ImmediatelyPrecedes => la.checked_add(1) == Some(bf),
+        Pred::ImmediatelySucceeds => lb.checked_add(1) == Some(af),
+    }
+}
+
+/// The reference rows for a valid range with a per-row period-predicate `WHERE`
+/// ([STL-345]): every version system-live at `s` whose valid interval `[vf, vt)`
+/// overlaps the query window **and** stands in relation `pred` to the constant
+/// probe `[probe.0, probe.1)`, projected `[id, balance, valid_from, valid_to]`.
+///
+/// The range overlap is the same independent inclusive-range derivation
+/// [`reference_rows`] uses; the period predicate is [`pred_holds`]. `range` is the
+/// valid query window `(lo, hi)`; `closed` selects `BETWEEN [lo, hi]` over
+/// `FROM..TO [lo, hi)`; `buggy_period` forwards the teeth knob.
+fn reference_rows_period(
+    versions: &[Ver],
+    s: i64,
+    range: (i64, i64),
+    closed: bool,
+    probe: (i64, i64),
+    pred: Pred,
+    buggy_period: bool,
+) -> Vec<Vec<Option<Vec<u8>>>> {
+    let (lo, hi) = range;
+    let query_hi = if closed { hi } else { hi - 1 };
+    let (p_lo, p_hi) = probe;
+    let mut rows: Vec<Vec<Option<Vec<u8>>>> = versions
+        .iter()
+        .filter(|v| {
+            let sys_to = v.sys_to.unwrap_or(i64::MAX);
+            let sys_live = v.sys_from <= s && s < sys_to;
+            let last_active = last_instant(v.vt);
+            let range_overlap =
+                v.vf <= last_active && lo <= query_hi && v.vf.max(lo) <= last_active.min(query_hi);
+            let period_holds = pred_holds(pred, v.vf, v.vt, p_lo, p_hi, buggy_period);
+            sys_live && range_overlap && period_holds
+        })
+        .map(|v| {
+            vec![
+                Some(enc(&ScalarValue::Int4(v.id))),
+                Some(enc(&ScalarValue::Int4(v.balance))),
+                Some(enc(&ScalarValue::TimestampTz(v.vf))),
+                (v.vt != i64::MAX).then(|| enc(&ScalarValue::TimestampTz(v.vt))),
+            ]
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
 /// The engine's rows for a `SELECT id, balance, valid_from, valid_to` valid range,
 /// sorted to compare as a set.
 fn engine_rows(
@@ -637,5 +748,149 @@ fn no_system_qualifier_reads_the_current_valid_history() {
         ),
         vec![enc(&ScalarValue::Int4(1))],
         "the current valid window is found at now",
+    );
+}
+
+#[test]
+fn period_predicate_where_composes_over_a_valid_range() {
+    // [STL-345]: a per-row `WHERE PERIOD(vf, vt) <pred> PERIOD(p_lo, p_hi)` now
+    // composes over a valid range — the binder rejection [STL-329] kept is lifted,
+    // and the predicate evaluates over each reconstructed range row, the user's
+    // `vf`/`vt` value columns read at the schema indices the row reconstruction
+    // preserves ahead of the appended `valid_from`/`valid_to` endpoints. Every
+    // returned set is checked against the independent reference: system-live at the
+    // snapshot, valid interval overlapping the range, **and** the period predicate
+    // true against the probe — all seven SQL:2011 predicates, both range forms,
+    // across seeds, flush boundaries, sampled system snapshots, range windows, and
+    // probe windows (some open-ended rows fold the `+∞` valid upper into the
+    // predicate, since an omitted `vt` is stored as the concrete VALID_TIME_OPEN
+    // sentinel the row codec carries).
+    let mut total_probes: u64 = 0;
+    let mut rows_seen: u64 = 0;
+
+    for seed in 0..8u64 {
+        for flush in [FlushMode::Never, FlushMode::Midway, FlushMode::Full] {
+            let World {
+                mut engine,
+                versions,
+                created,
+            } = build(seed, flush);
+            for (i, s) in system_instants(&versions).into_iter().enumerate() {
+                // A strided sample of system snapshots — the system-live resolution
+                // is exhaustively oracled by the main sweep; here we confirm the
+                // period `WHERE` composes atop whatever set it produces.
+                if s < created || i % 3 != 0 {
+                    continue;
+                }
+                // A full window (every system-live row passes the range, isolating
+                // the period predicate) and a partial inner one (range + period both
+                // narrow).
+                for &(lo, hi) in &[(0, VMAX + 1), (3, 7)] {
+                    // Probe windows over the valid grid: full, an inner band, a
+                    // one-microsecond probe (the touch boundary), and a probe at the
+                    // top edge.
+                    for &(p_lo, p_hi) in &[(0, VMAX + 1), (4, 7), (5, 6), (VMAX, VMAX + 1)] {
+                        for (kw, pred) in PREDS {
+                            let half_open = format!(
+                                "SELECT id, balance, valid_from, valid_to FROM acct \
+                                 FOR SYSTEM_TIME AS OF {s} FOR VALID_TIME FROM {lo} TO {hi} \
+                                 WHERE PERIOD(vf, vt) {kw} PERIOD({p_lo}, {p_hi})"
+                            );
+                            let got = engine_rows(&mut engine, &half_open);
+                            assert_eq!(
+                                got,
+                                reference_rows_period(
+                                    &versions,
+                                    s,
+                                    (lo, hi),
+                                    false,
+                                    (p_lo, p_hi),
+                                    pred,
+                                    false,
+                                ),
+                                "seed {seed}, {flush:?}: {half_open}"
+                            );
+                            rows_seen += u64::try_from(got.len()).expect("fits");
+                            total_probes += 1;
+
+                            let closed = format!(
+                                "SELECT id, balance, valid_from, valid_to FROM acct \
+                                 FOR SYSTEM_TIME AS OF {s} FOR VALID_TIME BETWEEN {lo} AND {hi} \
+                                 WHERE PERIOD(vf, vt) {kw} PERIOD({p_lo}, {p_hi})"
+                            );
+                            assert_eq!(
+                                engine_rows(&mut engine, &closed),
+                                reference_rows_period(
+                                    &versions,
+                                    s,
+                                    (lo, hi),
+                                    true,
+                                    (p_lo, p_hi),
+                                    pred,
+                                    false,
+                                ),
+                                "seed {seed}, {flush:?}: {closed}"
+                            );
+                            total_probes += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        rows_seen > 0,
+        "every period probe was empty — the predicate filtered everything"
+    );
+    assert!(
+        total_probes > 3_000,
+        "period differential probed only {total_probes} cells — widen the sweep"
+    );
+}
+
+#[test]
+fn the_period_oracle_has_teeth_off_by_one_on_the_row_period() {
+    // A reference that treats the row's own valid period `[vf, vt)` as the *closed*
+    // `[vf, vt]` (the classic half-open off-by-one in the period predicate, not the
+    // range) must be caught by the very differential the test above runs. Sweeps a
+    // full valid range so the period `WHERE` is the sole discriminator.
+    let World {
+        mut engine,
+        versions,
+        created,
+    } = build(6, FlushMode::Midway);
+    let mut mismatch = false;
+    for s in system_instants(&versions) {
+        if s < created {
+            continue;
+        }
+        for (p_lo, p_hi) in [(0, VMAX + 1), (4, 7), (5, 6), (VMAX, VMAX + 1)] {
+            for (kw, pred) in PREDS {
+                let sql = format!(
+                    "SELECT id, balance, valid_from, valid_to FROM acct \
+                     FOR SYSTEM_TIME AS OF {s} FOR VALID_TIME FROM 0 TO {} \
+                     WHERE PERIOD(vf, vt) {kw} PERIOD({p_lo}, {p_hi})",
+                    VMAX + 1
+                );
+                let engine = engine_rows(&mut engine, &sql);
+                let buggy = reference_rows_period(
+                    &versions,
+                    s,
+                    (0, VMAX + 1),
+                    false,
+                    (p_lo, p_hi),
+                    pred,
+                    true,
+                );
+                if engine != buggy {
+                    mismatch = true;
+                }
+            }
+        }
+    }
+    assert!(
+        mismatch,
+        "an inclusive-row-period reference must disagree with the engine somewhere"
     );
 }
