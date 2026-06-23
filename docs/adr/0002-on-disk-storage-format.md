@@ -31,7 +31,7 @@ Parquet/Arrow remain **interop** formats (import/export, foreign tables) — not
 - Format mistakes are expensive post-data — hence the pre-1.0 freedom to break it, freezing forward only at [v1.0](../03-roadmap.md#versioning).
 
 ### Neutral / follow-ups
-- The detailed segment spec (encodings, codecs, footer layout) is [open question O2](../assumptions.md) and gets its own design doc + an amendment to this ADR before v0.1 storage work.
+- The detailed segment spec (encodings, codecs, footer layout) — [open question O2](../assumptions.md), once deferred to "its own design doc + an amendment to this ADR" — **is now written: [segment-format.md](../segment-format.md)** (the canonical byte-level spec), with this ADR's [Amendments](#amendments) carrying each format change. O2 is resolved (STL-261).
 - Format version is embedded in the header from day one so migrations are always possible.
 
 ## Amendments
