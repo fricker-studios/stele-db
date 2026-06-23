@@ -19,7 +19,7 @@ use rustls_pki_types::PrivatePkcs8KeyDer;
 use stele_common::scram;
 use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
-use stele_pgwire::{AuthMode, Server, ServerTls, SharedSession, TlsMode, TlsSettings};
+use stele_pgwire::{AuthMode, Server, ServerTls, SharedSession, TlsMode, TlsReloader, TlsSettings};
 use stele_server::admin::http::AdminHttp;
 use stele_server::admin::{AdminAuth, AdminService};
 use stele_server::ops::{OpsServer, OpsState};
@@ -448,6 +448,9 @@ UPDATE account SET balance = 250 WHERE id = 1;
         stdout.contains("verify the tamper-evident hash chain"),
         "{stdout}"
     );
+    // The admin tier lists the cross-platform TLS reload trigger ([STL-340]).
+    assert!(stdout.contains("\\reload-tls"), "{stdout}");
+    assert!(stdout.contains("hot-reload the TLS cert/key"), "{stdout}");
 
     // \history — the live version-history surface (STL-199), end to end: two
     // versions of key 1, the current one flagged, with the append-only trailer.
@@ -1274,6 +1277,20 @@ struct AdminServer {
 /// Boot one engine shared by the pg-wire server and the admin HTTP/JSON gateway
 /// (the same wiring `stele_server::run` does), each on its own ephemeral port.
 async fn spawn_admin_server(label: &str) -> AdminServer {
+    spawn_admin_server_with(label, None).await
+}
+
+/// As [`spawn_admin_server`], but installs `reloader` on the admin gateway so the
+/// `\reload-tls` trigger ([STL-340]) has reloadable `[tls]` material to rotate —
+/// the same `AdminHttp::with_tls_reloader` wiring `stele_server::run` does when the
+/// server booted with operator `[tls]`.
+async fn spawn_admin_server_with_reloader(label: &str, reloader: TlsReloader) -> AdminServer {
+    spawn_admin_server_with(label, Some(reloader)).await
+}
+
+/// The shared boot. `reloader` is `Some` exactly when the admin gateway should
+/// expose a hot-reloadable `[tls]` certificate (mirrors the server's two postures).
+async fn spawn_admin_server_with(label: &str, reloader: Option<TlsReloader>) -> AdminServer {
     let scratch = Scratch::new(label);
     // The engine handle is shared two ways, exactly as the server does it: a typed
     // handle for the admin core, and the same handle coerced to the pg-wire /
@@ -1295,7 +1312,11 @@ async fn spawn_admin_server(label: &str) -> AdminServer {
     let core = AdminService::new(Arc::clone(&engine));
     let ops_state = Arc::new(OpsState::new());
     ops_state.set_ready(Arc::clone(&session));
-    ops_state.set_admin(Arc::new(AdminHttp::new(core, auth)));
+    let mut admin_http = AdminHttp::new(core, auth);
+    if let Some(reloader) = &reloader {
+        admin_http = admin_http.with_tls_reloader(reloader);
+    }
+    ops_state.set_admin(Arc::new(admin_http));
     let ops = OpsServer::new("127.0.0.1:0".parse().unwrap(), Arc::clone(&ops_state))
         .bind()
         .await
@@ -1452,6 +1473,87 @@ INSERT INTO account VALUES (3, 300);
 
     // The bogus id is a clear not-found error on stderr.
     assert!(stderr.contains("not found in account"), "{stderr}");
+}
+
+/// A [`TlsReloader`] over a freshly self-signed cert/key pair written under
+/// `scratch` — reloadable `[tls]` material for `\reload-tls` to rotate, without
+/// standing up an actual TLS listener (this test exercises the shell verb, not the
+/// on-the-wire swap, which the server's own tests cover). Returns the cert path the
+/// reloader will echo back. `scratch` must outlive the server so `reload()` can
+/// re-read the files.
+fn reloadable_tls(scratch: &Scratch) -> (TlsReloader, String) {
+    let key = rcgen::KeyPair::generate().expect("server key");
+    let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned()]).expect("cert params");
+    let cert = params.self_signed(&key).expect("self-sign");
+    let cert_path = scratch.path().join("server.crt");
+    let key_path = scratch.path().join("server.key");
+    std::fs::write(&cert_path, cert.pem()).expect("write cert");
+    std::fs::write(&key_path, key.serialize_pem()).expect("write key");
+    let reloader = TlsReloader::load(TlsSettings {
+        cert: cert_path.clone(),
+        key: key_path,
+        client_ca: None,
+        mode: TlsMode::Required,
+    })
+    .expect("load reloader");
+    (reloader, cert_path.display().to_string())
+}
+
+/// `\reload-tls` (and its `\reload` alias) rotates the cert in place over the admin
+/// tier and prints the path the server confirms ([STL-340]).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_reload_tls_rotates_and_echoes_the_cert_path() {
+    // The cert/key files must outlive the server (reload() re-reads them), so the
+    // scratch dir is held by the test, not the server.
+    let certs = Scratch::new("reload-tls-certs");
+    let (reloader, cert_path) = reloadable_tls(&certs);
+    let server = spawn_admin_server_with_reloader("reload-tls", reloader).await;
+
+    // Both the verb and its alias trigger a rotation.
+    let script = "\\reload-tls\n\\reload\n\\q\n".to_owned();
+    let output = run_admin_shell(server.pg, server.ops.port(), script).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // The control-plane header and the confirmed certificate path.
+    assert!(stdout.contains("Reload TLS"), "{stdout}");
+    assert!(stdout.contains("reloaded certificate from"), "{stdout}");
+    // The server echoes back the exact configured path; the verb and the alias each
+    // print it, so it appears twice.
+    assert_eq!(
+        stdout.matches(cert_path.as_str()).count(),
+        2,
+        "both \\reload-tls and \\reload should echo the cert path {cert_path}:\n{stdout}"
+    );
+    assert!(stderr.is_empty(), "reload wrote to stderr: {stderr}");
+}
+
+/// A server with no reloadable `[tls]` material answers 409 / `FAILED_PRECONDITION`;
+/// the shell renders it cleanly (the reason, the SQLSTATE) and stays alive ([STL-340]).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_reload_tls_without_material_is_a_clean_precondition_failure() {
+    // The default admin boot installs no reloader (the plaintext / loopback /
+    // self-signed posture), so the trigger is a precondition failure.
+    let server = spawn_admin_server("reload-tls-none").await;
+    let script = "\\reload-tls\n\\q\n".to_owned();
+    let output = run_admin_shell(server.pg, server.ops.port(), script).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The error is rendered, not fatal — the shell exits cleanly.
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The 409 surfaces the server's "no reloadable [tls]" reason, the HTTP code, and
+    // the precondition SQLSTATE (55000, not the generic XX000).
+    assert!(stderr.contains("no reloadable [tls]"), "{stderr}");
+    assert!(stderr.contains("HTTP 409"), "{stderr}");
+    assert!(stderr.contains("55000"), "{stderr}");
 }
 
 /// Without a token the admin tier is refused locally — no round-trip, an
