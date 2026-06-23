@@ -480,11 +480,12 @@ pub struct BoundSelect {
     /// [`snapshot`](Self::snapshot) — exposing the period endpoints (`sys_from`,
     /// `sys_to`) as addressable columns after the table's own ([STL-329]). Result
     /// shaping, aggregation, and projected provenance pseudo-columns compose over it;
-    /// mutually exclusive with an `AS OF` point read. A range over an `INNER` `JOIN`
-    /// is the interval read of every input ([STL-344]; the [`join`](Self::join) plan
-    /// is set too); the binder still rejects a range combined with a subquery /
-    /// period `WHERE`, a computed projection, or a CTE / derived source (each a
-    /// tracked follow-up).
+    /// mutually exclusive with an `AS OF` point read. A range over a `JOIN` is the
+    /// interval read of every input ([STL-344] `INNER` intersection, [STL-348]
+    /// `LEFT` / `SEMI` / `ANTI` interval difference; the [`join`](Self::join) plan is
+    /// set too); the binder still rejects a range combined with a subquery / period
+    /// `WHERE`, a computed projection, or a CTE / derived source (each a tracked
+    /// follow-up).
     pub system_range: Option<SystemTimeRange>,
     /// A bound `FOR VALID_TIME { FROM a TO b | BETWEEN a AND b }` range ([STL-328]),
     /// or `None`. When `Some`, the query is a **valid-time range scan**: the
@@ -496,9 +497,10 @@ pub struct BoundSelect {
     /// [`valid_snapshot`](Self::valid_snapshot) (a system `AS OF` pin is allowed and
     /// sets [`snapshot`](Self::snapshot)). The same SELECT surface composes over it
     /// as the system range — shaping, aggregation, projected provenance ([STL-329]) —
-    /// a range over an `INNER` `JOIN` is the valid-axis interval read of every input
-    /// ([STL-344]), and the binder rejects the same residual shapes (subquery /
-    /// period `WHERE`, computed projection, CTE / derived source).
+    /// a range over a `JOIN` is the valid-axis interval read of every input
+    /// ([STL-344] `INNER`, [STL-348] `LEFT` / `SEMI` / `ANTI`), and the binder rejects
+    /// the same residual shapes (subquery / period `WHERE`, computed projection, CTE /
+    /// derived source).
     pub valid_range: Option<ValidTimeRange>,
     /// The columns the query projects.
     pub projection: Projection,
@@ -3036,14 +3038,14 @@ fn detect_join(select: &Select) -> Option<&TableWithJoins> {
 /// A `FOR { SYSTEM_TIME | VALID_TIME } { FROM a TO b | BETWEEN a AND b }` range
 /// (`system_range` / `valid_range`, [STL-344]) makes this an **interval read over
 /// the join**: each input is range-scanned and the per-input version intervals are
-/// intersected (docs/16 §8's point intersection lifted to an interval), the
-/// intersected period endpoints (`sys_from`/`sys_to` or `valid_from`/`valid_to`)
-/// appended to the addressable output by [`JoinScope::append_range_endpoints`] so
-/// they ride the same projection / shaping tail a single-table range's do
-/// ([STL-329]). The intersection is defined for the `INNER` shape, so a range over
-/// a `LEFT` / `SEMI` / `ANTI` join — or over a materialized (CTE / derived) side,
-/// which has no system / valid axis to range — is rejected (each a tracked
-/// follow-up).
+/// folded (docs/16 §8's point join lifted to an interval) — an `INNER` step
+/// intersects them, a `LEFT` / `SEMI` / `ANTI` step takes the interval difference of
+/// the left version against its matched right sub-intervals ([STL-348]) — the period
+/// endpoints (`sys_from`/`sys_to` or `valid_from`/`valid_to`) appended to the
+/// addressable output by [`JoinScope::append_range_endpoints`] so they ride the same
+/// projection / shaping tail a single-table range's do ([STL-329]). Only a range
+/// over a materialized (CTE / derived) side — which has no system / valid axis to
+/// range — stays rejected (a tracked follow-up).
 // Ten inputs because the join binds the whole `SELECT` over every relation: the
 // statement (temporal qualifiers) and its `query` / `select` halves, the catalog
 // `ctx`, the `from` relations, the CTE `sigs` in scope, the resolved
@@ -3150,23 +3152,37 @@ fn bind_join<'a>(
         }
     }
 
+    // Whether any input is a materialized (CTE / derived) relation — gates the join
+    // shapes a range over such a side is defined for ([STL-349], the loop below).
+    let any_materialized_side = sides.iter().any(|s| s.schema.schema_id() == SchemaId(0));
+
     // Fold the chain left-deep. `scope` accumulates the addressable output; each
     // step binds its `ON` condition against (the accumulated output) + (the new
     // input), then — for an `INNER` / `LEFT` join — widens the scope with the new
     // input's columns (a `SEMI` / `ANTI` step keeps only the accumulated left).
+    //
+    // The interval read ([STL-344]) folds every join shape over base-table inputs: an
+    // `INNER` step intersects the inputs' intervals, and a `LEFT` / `SEMI` / `ANTI`
+    // step takes the **interval difference** of the left version against its matched
+    // right sub-intervals ([STL-348]) — both the per-step transform the engine's
+    // `run_join_range` carries. A materialized side restricts that to `INNER`
+    // ([STL-349], the rejection in the loop).
     let mut scope = JoinScope::seed(&sides[0]);
     let mut steps: Vec<BoundJoinStep> = Vec::with_capacity(from.joins.len());
     for (i, join_ast) in from.joins.iter().enumerate() {
         let (join_type, constraint) = join_kind_and_constraint(&join_ast.join_operator)?;
-        // The interval read intersects the inputs' intervals, defined only for an
-        // `INNER` step ([STL-344]); a `LEFT` / `SEMI` / `ANTI` interval read needs
-        // interval *difference* over the unmatched side — a tracked follow-up.
+        // A materialized side participates in a range join only under the `INNER`
+        // shape ([STL-349]): its degenerate `[−∞, +∞)`-live interval is the identity
+        // for the intersection, but a `LEFT` / `SEMI` / `ANTI` interval *difference*
+        // over an unbounded period yields meaningless `−∞` endpoints — a tracked
+        // follow-up. Reject the combination rather than emit them.
         if let Some(valid_axis) = range_axis
+            && any_materialized_side
             && join_type != JoinType::Inner
         {
             return Err(unsupported_range(
                 valid_axis,
-                "over a non-INNER JOIN".to_owned(),
+                "over a non-INNER JOIN with a CTE / derived-table side".to_owned(),
             ));
         }
         let new_side = &sides[i + 1];
@@ -9416,30 +9432,31 @@ mod tests {
     }
 
     #[test]
-    fn a_range_over_a_non_inner_join_is_rejected() {
-        // The interval intersection is defined for the `INNER` shape; a `LEFT` /
-        // `SEMI` / `ANTI` interval read needs interval difference — a follow-up.
+    fn a_range_over_a_non_inner_join_now_binds() {
+        // [STL-348] lifts the [STL-344] `INNER`-only restriction: a `LEFT` / `SEMI` /
+        // `ANTI` range join binds on either axis, carrying the range and the join
+        // type the engine's interval-difference fold reads. (The endpoints still
+        // append after the addressable output; a `SEMI` / `ANTI` scope keeps only the
+        // left side, so the projection names only `la`'s columns.)
         let catalog = catalog_with_bitemporal_join_tables();
-        for (sql, valid) in [
-            (
-                "SELECT * FROM la LEFT JOIN lb ON la.k = lb.k FOR SYSTEM_TIME FROM 0 TO 100",
-                false,
-            ),
-            (
-                "SELECT * FROM la LEFT JOIN lb ON la.k = lb.k FOR VALID_TIME FROM 0 TO 100",
-                true,
-            ),
+        for (kind, want) in [
+            ("LEFT", JoinType::Left),
+            ("SEMI", JoinType::Semi),
+            ("ANTI", JoinType::Anti),
         ] {
-            let err = bind(sql, &catalog).unwrap_err();
-            let ok = if valid {
-                matches!(err, SelectError::UnsupportedValidRange(_))
-            } else {
-                matches!(err, SelectError::UnsupportedSystemRange(_))
-            };
-            assert!(
-                ok,
-                "expected an axis-tagged rejection for `{sql}`, got {err:?}"
-            );
+            for (axis, valid) in [("SYSTEM_TIME", false), ("VALID_TIME", true)] {
+                let sql = format!(
+                    "SELECT la.k FROM la {kind} JOIN lb ON la.k = lb.k FOR {axis} FROM 0 TO 100"
+                );
+                let bound = bind(&sql, &catalog).expect("a non-INNER range join binds");
+                assert_eq!(valid, bound.valid_range.is_some(), "{sql}");
+                assert_eq!(!valid, bound.system_range.is_some(), "{sql}");
+                assert_eq!(
+                    bound.join.as_ref().expect("a join plan").steps[0].join_type,
+                    want,
+                    "{sql}"
+                );
+            }
         }
     }
 
@@ -9524,6 +9541,27 @@ mod tests {
             matches!(&err, SelectError::UnsupportedSystemRange(what) if what.contains("no base-table side")),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn a_range_over_a_non_inner_join_with_a_cte_side_is_rejected() {
+        // A materialized side is the degenerate `[−∞, +∞)`-live input — the identity
+        // for the `INNER` intersection, but a `LEFT` / `SEMI` / `ANTI` interval
+        // *difference* over an unbounded period has no meaningful endpoints, so the
+        // combination is rejected ([STL-349]) even though both a non-INNER range join
+        // ([STL-348]) and a CTE-side INNER range join bind on their own.
+        let catalog = catalog_with_bitemporal_join_tables();
+        for kind in ["LEFT", "SEMI", "ANTI"] {
+            let sql = format!(
+                "WITH c AS (SELECT k, v FROM la) \
+                 SELECT c.k FROM c {kind} JOIN lb ON c.k = lb.k FOR SYSTEM_TIME FROM 0 TO 100"
+            );
+            let err = bind(&sql, &catalog).unwrap_err();
+            assert!(
+                matches!(&err, SelectError::UnsupportedSystemRange(what) if what.contains("non-INNER")),
+                "got {err:?} for {kind}"
+            );
+        }
     }
 
     #[test]
