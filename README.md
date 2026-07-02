@@ -3,7 +3,9 @@
 [![ci](https://github.com/fricker-studios/stele-db/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/fricker-studios/stele-db/actions/workflows/ci.yml)
 [![nightly](https://github.com/fricker-studios/stele-db/actions/workflows/nightly.yml/badge.svg?branch=main)](https://github.com/fricker-studios/stele-db/actions/workflows/nightly.yml)
 [![release](https://img.shields.io/github/v/release/fricker-studios/stele-db?include_prereleases&label=release)](https://github.com/fricker-studios/stele-db/releases)
-[![docker hub](https://img.shields.io/docker/v/frickerstudios/stele/latest?logo=docker&label=docker%20hub)](https://hub.docker.com/r/frickerstudios/stele)
+<!-- shields.io's docker/v badge chokes on the cosign .sig tags in this repo (badges/shields#7583),
+     so this queries the Docker Hub tags API directly for the newest v0* tag. -->
+[![docker hub](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fhub.docker.com%2Fv2%2Frepositories%2Ffrickerstudios%2Fstele%2Ftags%3Fname%3Dv0%26ordering%3Dlast_updated%26page_size%3D1&query=%24.results%5B0%5D.name&label=docker%20hub&logo=docker&color=2496ED)](https://hub.docker.com/r/frickerstudios/stele)
 [![MSRV](https://img.shields.io/badge/MSRV-1.89-orange?logo=rust)](rust-toolchain.toml)
 [![license](https://img.shields.io/badge/license-BSL%201.1-blue)](docs/07-licensing-and-oss.md)
 
