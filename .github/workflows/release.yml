@@ -264,7 +264,7 @@ jobs:
       # can still resolve the provenance. push-to-registry stores it next to
       # the image in ghcr.io.
       - name: Attest SLSA build provenance for the image
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-name: ghcr.io/${{ github.repository_owner }}/stele
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -273,7 +273,7 @@ jobs:
       # registry). The fully-qualified `index.docker.io` form is what the
       # action resolves Docker Hub credentials under for push-to-registry.
       - name: Attest SLSA build provenance for the Docker Hub image
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-name: index.docker.io/frickerstudios/stele
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -363,7 +363,7 @@ jobs:
       # `gh attestation verify <archive> --repo <owner>/stele` (or
       # `cosign verify-attestation`), no path-matching needed.
       - name: Attest SLSA build provenance for the binaries
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-checksums: dist/SHA256SUMS
       - name: Create or update the GitHub Release
