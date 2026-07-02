@@ -53,7 +53,7 @@ jobs:
         with:
           toolchain: "1.89.0"
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
-      - uses: taiki-e/install-action@ace6ebe54a6a0c86dfb5f7764b17f793b6925bc3 # v2.82.3
+      - uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
           tool: nextest
       - name: Tag is annotated and matches the workspace version
@@ -306,7 +306,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master (no semver tags)
         with:
           toolchain: "1.89.0"
-      - uses: taiki-e/install-action@ace6ebe54a6a0c86dfb5f7764b17f793b6925bc3 # v2.82.3
+      - uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
           # cargo-cyclonedx emits the per-crate BOMs; cyclonedx (CycloneDX CLI)
           # merges them into one workspace document (STL-156).
