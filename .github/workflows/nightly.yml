@@ -138,4 +138,16 @@ jobs:
       - uses: taiki-e/install-action@ace6ebe54a6a0c86dfb5f7764b17f793b6925bc3 # v2.82.3
         with:
           tool: nextest
-      - run: cargo nextest run -p stele-exec-oracle --all-features
+      # The ARC runner pod has a 16Gi cgroup limit and kubelet sets
+      # memory.oom.group, so one over-limit allocation kills the whole
+      # container — Runner.Worker included. GitHub then reports "runner lost
+      # communication" with no logs (nightly red 2026-06-21..07-01, kernel
+      # oom-kill on iron-1 confirmed). A cold --all-features build of this
+      # crate runs several `ld` jobs at ~2.6GiB RSS each in parallel, which
+      # is what tipped it over. Cap build parallelism and drop debuginfo
+      # (the bulk of link-time memory); the oracle diffs row sets, so
+      # backtraces without symbols are an acceptable trade.
+      - run: cargo nextest run -p stele-exec-oracle --all-features --build-jobs 4
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
