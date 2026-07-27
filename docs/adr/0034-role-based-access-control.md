@@ -96,9 +96,10 @@ store, [ADR-0016]'s "one authorization model, not two" holds by construction
 rather than by convention.
 
 **What it costs.** Every statement now resolves the tables it touches against
-the grant map before executing — a hash lookup per table per statement, taken
-under the engine lock that already serializes dispatch, so it does not change
-the concurrency story. The larger cost is that the check must sit at *every*
+the grant map before executing — an ordered-map lookup per table per statement
+(the grant and owner maps are `BTreeMap`s, matching the determinism the rest of
+the engine prefers), taken under the engine lock that already serializes
+dispatch, so it does not change the concurrency story. The larger cost is that the check must sit at *every*
 dispatch entry point; the audit found the commit-log poison guarded one of seven
 such points, and a privilege check with the same gap would be worse than none.
 The mitigation is structural: one `authorize` helper, called from the same

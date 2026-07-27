@@ -234,7 +234,8 @@ pub(crate) enum CatalogRecord {
         at: SystemTimeMicros,
         /// The table the privileges are on.
         table: String,
-        /// The grantee — a role name, or the empty string for `PUBLIC`.
+        /// The grantee — a named role or `PUBLIC`. (Its *encoding* uses the
+        /// empty name for `PUBLIC`; see [`put_grant`].)
         grantee: Grantee,
         /// The privileges added.
         privileges: Vec<Privilege>,

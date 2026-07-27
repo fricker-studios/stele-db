@@ -331,6 +331,57 @@ fn drop_if_exists_on_an_absent_table_is_allowed_for_any_role() {
     denied(&mut e, "mallory", "DROP TABLE account");
 }
 
+/// The bootstrap identity is reserved from role DDL.
+///
+/// Its entire security property is that it has **no stored credential**, so
+/// under `auth = "scram"` no client can authenticate as it. `CREATE USER stele
+/// PASSWORD …` would mint exactly that credential and hand the built-in
+/// superuser to whoever chose the password — a superuser-only statement, but
+/// one that converts "nobody can be `stele`" into "this person is `stele`",
+/// permanently and durably.
+#[test]
+fn the_bootstrap_identity_cannot_be_created_rotated_or_dropped() {
+    let mut e = seeded();
+    for sql in [
+        "CREATE USER stele PASSWORD 'hijack'",
+        "ALTER USER stele PASSWORD 'hijack'",
+        "DROP USER stele",
+    ] {
+        // Refused even for the superuser: the name belongs to the engine, not
+        // to the role store.
+        assert!(
+            matches!(
+                run_as(&mut e, "stele", sql),
+                Err(EngineError::ReservedRole(_))
+            ),
+            "{sql} must be refused as a reserved name",
+        );
+    }
+}
+
+/// A nameless principal holds nothing.
+///
+/// Reachable directly — a client may send an empty `user` in its startup packet
+/// — and it is also where a **non-UTF-8** principal lands: `current_role`
+/// resolves undecodable bytes to the empty name rather than to the bootstrap
+/// superuser, so a caller bug fails closed instead of becoming a total
+/// authorization bypass. (`set_principal` `debug_assert`s UTF-8, so the
+/// undecodable case cannot be reached from a test build; this pins the value it
+/// falls back to.)
+#[test]
+fn a_nameless_principal_holds_nothing() {
+    let mut e = seeded();
+    denied(&mut e, "", "SELECT id FROM account");
+    denied(&mut e, "", "INSERT INTO account VALUES (4, 4)");
+    // …and specifically cannot reach the superuser-only surface.
+    denied(&mut e, "", "CREATE USER eve PASSWORD 'pw'");
+    denied(
+        &mut e,
+        "",
+        "BACKUP TO '/tmp/stele-nameless-should-not-exist'",
+    );
+}
+
 /// A grant must name a live table and a real role, so a typo cannot stash a
 /// privilege that springs to life later.
 #[test]

@@ -214,6 +214,9 @@ const SQLSTATE_UNDEFINED_OBJECT: &str = "42704";
 /// `insufficient_privilege` ([ADR-0034]) — the role may not do this. The code
 /// stock drivers and ORMs already classify as a permission failure.
 const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
+/// `reserved_name` — the statement named an identifier the engine reserves
+/// (the bootstrap superuser, [ADR-0034]).
+const SQLSTATE_RESERVED_NAME: &str = "42939";
 // DDL-routing SQLSTATEs (STL-131): the standard Postgres codes for the catalog
 // failures a `CREATE`/`DROP TABLE` can hit, so a stock client classifies them
 // the way it would against Postgres.
@@ -2609,6 +2612,7 @@ fn sqlstate_for_query(err: &EngineError) -> &'static str {
         }
         // A write-write conflict at COMMIT — the retryable serialization failure.
         EngineError::PermissionDenied { .. } => SQLSTATE_INSUFFICIENT_PRIVILEGE,
+        EngineError::ReservedRole(_) => SQLSTATE_RESERVED_NAME,
         EngineError::Conflict => SQLSTATE_SERIALIZATION_FAILURE,
     }
 }
@@ -2780,6 +2784,7 @@ const fn sqlstate_for(err: &EngineError) -> &'static str {
         // catch-all, so without one a denial would report `XX000` (internal
         // error) and no driver would classify it as a permission failure.
         EngineError::PermissionDenied { .. } => SQLSTATE_INSUFFICIENT_PRIVILEGE,
+        EngineError::ReservedRole(_) => SQLSTATE_RESERVED_NAME,
         // Storage/scan/select/unknown-table/unsupported can't arise from a DDL
         // route, but map them rather than panic if the contract ever shifts.
         _ => SQLSTATE_INTERNAL_ERROR,

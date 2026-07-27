@@ -1010,6 +1010,17 @@ pub enum EngineError {
         object: Option<String>,
     },
 
+    /// A role DDL statement named the reserved bootstrap identity ([ADR-0034]).
+    ///
+    /// Reported as SQLSTATE `42939` (`reserved_name`). The built-in superuser
+    /// deliberately has no stored credential — that is what makes it
+    /// unauthenticatable under SCRAM — so creating, rotating, or dropping it is
+    /// refused rather than allowed to undo the property.
+    ///
+    /// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+    #[error("role {0:?} is reserved")]
+    ReservedRole(String),
+
     /// A `CREATE USER` named a user that already exists ([STL-252]). Postgres
     /// wording so the wire layer's `42710` (`duplicate_object`) reads natively.
     ///
@@ -1782,12 +1793,15 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// The role the current statement runs as — the connection's authenticated
     /// principal, re-applied under the engine lock before every dispatch.
     ///
-    /// Falls back to the bootstrap superuser name if the principal is not UTF-8,
-    /// which `set_principal` already `debug_assert`s cannot happen; a non-UTF-8
-    /// principal could not have matched a role name anyway, so the fallback
-    /// grants nothing a valid name would not.
+    /// A principal that is not valid UTF-8 resolves to the empty name, which no
+    /// role can hold (the parser requires an identifier) and which is not
+    /// [`BOOTSTRAP_SUPERUSER`] — so it owns nothing, holds nothing, and is
+    /// refused everywhere. `set_principal` already `debug_assert`s the input is
+    /// UTF-8; this is what happens in release if that assertion is ever wrong,
+    /// and it must fail **closed**. Falling back to the bootstrap identity would
+    /// turn a caller bug into a total authorization bypass.
     fn current_role(&self) -> &str {
-        std::str::from_utf8(self.write_principal.as_bytes()).unwrap_or(BOOTSTRAP_SUPERUSER)
+        std::str::from_utf8(self.write_principal.as_bytes()).unwrap_or("")
     }
 
     /// Whether the current role bypasses every privilege check.
@@ -3457,6 +3471,20 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         ddl: DdlStatement,
         at: SystemTimeMicros,
     ) -> Result<StatementOutcome, EngineError> {
+        // The bootstrap identity is reserved ([ADR-0034] decision 8). Its whole
+        // security property is that it has **no stored credential**, so under
+        // `auth = "scram"` no client can authenticate as it — `CREATE USER stele
+        // PASSWORD …` would mint exactly that credential and hand the built-in
+        // superuser to whoever chose the password. Dropping or rotating it is
+        // refused for the same reason: the name is the engine's, not the role
+        // store's.
+        if let DdlStatement::CreateUser { name, .. }
+        | DdlStatement::AlterUserPassword { name, .. }
+        | DdlStatement::DropUser { name, .. } = &ddl
+            && name == BOOTSTRAP_SUPERUSER
+        {
+            return Err(EngineError::ReservedRole(name.clone()));
+        }
         match ddl {
             DdlStatement::CreateUser {
                 name,

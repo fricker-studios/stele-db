@@ -540,7 +540,8 @@ fn bind_privileges(privileges: &Privileges) -> Result<Vec<Privilege>, BindError>
             }
             other => {
                 return Err(BindError::Unsupported(format!(
-                    "privilege {other} (only SELECT/INSERT/UPDATE/DELETE and ALL PRIVILEGES                      apply to a table)"
+                    "privilege {other} (only SELECT/INSERT/UPDATE/DELETE and \
+                     ALL PRIVILEGES apply to a table)"
                 )));
             }
         };
