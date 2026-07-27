@@ -160,6 +160,8 @@ pub struct OpsServer {
 }
 
 impl OpsServer {
+    /// A plaintext ops listener for `listen_addr` over `state`; layer TLS on
+    /// with [`with_tls`](Self::with_tls).
     #[must_use]
     pub const fn new(listen_addr: SocketAddr, state: Arc<OpsState>) -> Self {
         Self {

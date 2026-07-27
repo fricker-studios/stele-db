@@ -143,7 +143,10 @@ pub struct Snapshot(pub SystemTimeMicros);
 /// [validity index](crate::validity).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
+    /// The logical row this version belongs to.
     pub business_key: BusinessKey,
+    /// System-time start of this version's period — the commit instant that
+    /// asserted it.
     pub sys_from: SystemTimeMicros,
     /// Per-commit monotonic sequence number ([ADR-0024]) — the total-order
     /// tiebreak for writes sharing the same µs `sys_from`. Assigned by the

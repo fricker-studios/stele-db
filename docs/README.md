@@ -33,6 +33,7 @@ This `/docs` set is the **single source of truth** for the project's vision, arc
 - [**Architecture Decision Records**](adr/README.md) — one record per significant decision (Context / Decision / Status / Consequences). Twenty-six ADRs to date.
 - [**Assumptions log**](assumptions.md) — the running ledger of what was decided on faith, and the open questions.
 - [**Portable hash-key spec v1**](hash-key-v1.md) — the frozen byte-encoding behind SQL `hash(...)`, with test vectors, so external clients compute identical keys ([ADR-0011](adr/0011-hash-distribution-integration-groundwork.md)).
+- [**Codebase audit — July 2026**](audit-2026-07.md) — a full sweep for correctness, security, durability, and performance at v0.3.0. The standing backlog of what was found and not yet fixed, each entry sized to become a ticket.
 
 ## The thesis in four SQL statements
 

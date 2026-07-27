@@ -79,22 +79,38 @@ pub struct TlsSettings {
 /// errors: they happen once at boot, never per connection.
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
+    /// A PEM file failed to read or parse.
     #[error("reading {what} from {path}: {source}")]
     Pem {
+        /// Which material was being read ("certificate", "private key", …).
         what: &'static str,
+        /// The file that failed.
         path: PathBuf,
+        /// The underlying PEM parse / I/O error.
         source: rustls_pki_types::pem::Error,
     },
 
+    /// A PEM file parsed but held no entries of the expected kind.
     #[error("{what} file {path} contains no PEM-encoded entries")]
-    Empty { what: &'static str, path: PathBuf },
+    Empty {
+        /// Which material was expected ("certificate", "private key", …).
+        what: &'static str,
+        /// The file that was empty of it.
+        path: PathBuf,
+    },
 
+    /// rustls rejected the certificate/key material while building the
+    /// server config (mismatched pair, unsupported key type).
     #[error("building TLS server config: {0}")]
     Config(#[from] rustls::Error),
 
+    /// The mTLS client-CA bundle could not be turned into a verifier.
     #[error("building mTLS client verifier: {0}")]
     ClientVerifier(#[from] rustls::server::VerifierBuilderError),
 
+    /// Minting the ephemeral self-signed certificate failed ([STL-304]).
+    ///
+    /// [STL-304]: https://allegromusic.atlassian.net/browse/STL-304
     #[error("generating a self-signed certificate: {0}")]
     SelfSigned(#[from] rcgen::Error),
 }

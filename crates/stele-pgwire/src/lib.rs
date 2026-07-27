@@ -642,6 +642,9 @@ pub struct Server {
 }
 
 impl Server {
+    /// A plaintext server for `listen_addr` over `session`, with TLS
+    /// unconfigured and the default [`AuthMode`]; layer policy on with
+    /// [`with_tls`](Self::with_tls) / [`with_auth`](Self::with_auth).
     #[must_use]
     pub fn new(listen_addr: SocketAddr, session: SharedSession) -> Self {
         Self {
@@ -816,15 +819,22 @@ impl BoundServer {
 /// listener loop and do not affect other connections.
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
+    /// The socket failed mid-conversation (reset, broken pipe, timeout).
     #[error("io error: {0}")]
     Io(#[from] io::Error),
 
+    /// The client sent bytes that do not parse as the message the protocol
+    /// state expects.
     #[error("protocol violation: {0}")]
     Protocol(&'static str),
 
+    /// The startup packet asked for a protocol major.minor this server does
+    /// not speak (only 3.0 is supported).
     #[error("unsupported protocol version: {0}")]
     UnsupportedVersion(i32),
 
+    /// The client closed the connection during startup — the ordinary end of
+    /// a `CancelRequest` probe or a port scan, not a fault.
     #[error("client cancelled startup")]
     Cancelled,
 

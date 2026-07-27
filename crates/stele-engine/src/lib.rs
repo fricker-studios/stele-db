@@ -547,11 +547,16 @@ pub enum IsolationLevel {
 /// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
 #[derive(Debug)]
 pub struct SessionTransaction {
-    /// The system-time snapshot pinned at [`begin`](SessionEngine::begin). Every
-    /// read in the transaction resolves here, and a write-write conflict is one
-    /// whose key was committed by another transaction *after* this instant. Under
-    /// [`IsolationLevel::ReadCommitted`] it is re-pinned toward the present before
-    /// each statement, so the conflict anchor advances with it.
+    /// The system-time snapshot this transaction currently **reads** at. Pinned
+    /// at [`begin`](SessionEngine::begin); re-pinned toward the present by
+    /// [`repin_snapshot`](SessionEngine::repin_snapshot) — before each statement
+    /// under [`IsolationLevel::ReadCommitted`], and after a DDL auto-commits
+    /// inside any block.
+    ///
+    /// This is the *read* pin only. Write-write conflict detection anchors on
+    /// [`write_anchors`](Self::write_anchors) instead: a re-pin advances what the
+    /// transaction can see, and must never retroactively forgive a conflict
+    /// against a write that was already staged under an older snapshot.
     snapshot: SystemTimeMicros,
     /// The isolation level this transaction reads under ([STL-248]). The default,
     /// [`IsolationLevel::RepeatableRead`], keeps the single `BEGIN`-pinned snapshot;
@@ -562,6 +567,18 @@ pub struct SessionTransaction {
     /// at commit so a later `UPDATE` of a key staged after its `INSERT` lands in
     /// the order the client issued them.
     writes: Vec<BoundDml>,
+    /// Per-write conflict anchors, parallel to [`writes`](Self::writes): entry `i`
+    /// is the read snapshot `writes[i]` was staged under.
+    ///
+    /// [`commit`](SessionEngine::commit) tests each write against *its own*
+    /// anchor, because a write computed from state read at snapshot `s` is only
+    /// safe if nobody else committed that key after `s`. Anchoring on the live
+    /// [`snapshot`](Self::snapshot) instead would lose updates: a re-pin (a DDL
+    /// inside the block, or every statement under `READ COMMITTED`) moves the
+    /// pin past a concurrent commit, and the conflict that should abort this
+    /// transaction silently passes — the concurrent writer's row is overwritten
+    /// by a value derived from a version that no longer exists.
+    write_anchors: Vec<SystemTimeMicros>,
     /// The open savepoints, innermost last ([STL-176]). Each marks the length of
     /// `writes` at the instant the savepoint was established, so `ROLLBACK TO`
     /// truncates `writes` back to that marker — undoing exactly the writes staged
@@ -714,6 +731,9 @@ impl SessionTransaction {
             return false;
         };
         self.writes.truncate(self.savepoints[idx].mark);
+        // The anchors run parallel to `writes` — truncate in step so every
+        // surviving write keeps its own conflict anchor.
+        self.write_anchors.truncate(self.savepoints[idx].mark);
         // Keep the named savepoint (index `idx`); drop the ones nested inside it.
         self.savepoints.truncate(idx + 1);
         true
@@ -1681,6 +1701,34 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         self.commit_poisoned || self.tables.values().any(|state| state.engine.is_poisoned())
     }
 
+    /// Refuse the caller if a prior commit record failed to reach disk.
+    ///
+    /// A commit-log poison is session-fatal: the record failed *after* its data
+    /// leg was already durable, so live state and what [`recover`](Self::recover)
+    /// would reconstruct have diverged ([STL-314]). Every statement is refused —
+    /// reads included, since a divergent write may be visible — until a restart
+    /// into recovery resolves it. (The per-table WAL poison refuses lazily at the
+    /// next write; this is the more serious whole-session condition.)
+    ///
+    /// This is the single gate every entry point that reads or writes must pass
+    /// through. It is not enough to guard [`execute`](Self::execute) alone: the
+    /// transaction path buffers through [`stage_dml`](Self::stage_dml) and lands
+    /// through [`commit`](Self::commit), `COPY` lands through
+    /// [`copy_apply`](Self::copy_apply), and the typed
+    /// [`insert`](Self::insert)/[`update`](Self::update)/[`delete`](Self::delete)
+    /// bypass the router entirely — so a poisoned session that guarded only the
+    /// router would keep appending commit records past the divergence.
+    ///
+    /// [STL-314]: https://allegromusic.atlassian.net/browse/STL-314
+    fn refuse_if_commit_poisoned(&self) -> Result<(), EngineError> {
+        if self.commit_poisoned {
+            return Err(EngineError::CommitLog(io::Error::other(
+                "session poisoned by a failed commit-log append; restart to recover",
+            )));
+        }
+        Ok(())
+    }
+
     /// The session's catalog — schemas resolve at a snapshot through it.
     #[must_use]
     pub const fn catalog(&self) -> &Catalog {
@@ -2461,6 +2509,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         stmt: &Statement,
         rows: &[Vec<Option<String>>],
     ) -> Result<u64, EngineError> {
+        self.refuse_if_commit_poisoned()?;
         let snapshot = self.clock.observe();
         if rows.len() <= BULK_COPY_CHUNK_ROWS {
             let dml = self.bind_copy_insert(stmt, snapshot, rows)?;
@@ -2597,6 +2646,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         rows: &[Vec<Option<String>>],
         txn: &mut SessionTransaction,
     ) -> Result<u64, EngineError> {
+        self.refuse_if_commit_poisoned()?;
         let dml = self.bind_copy_insert(stmt, txn.snapshot, rows)?;
         let (writes, summary) = expand_insert_rows(dml);
         txn.writes.extend(writes);
@@ -2747,17 +2797,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         read_snapshot: SystemTimeMicros,
         overlay: &[BoundDml],
     ) -> Result<StatementOutcome, EngineError> {
-        // A commit-log poison is session-fatal: a prior commit record failed to reach
-        // disk *after* its data leg was durable, so the live state and what recovery
-        // would reconstruct have diverged ([STL-314]). Refuse every further statement
-        // — reads included, since a divergent write may be visible — until a restart
-        // into `recover` resolves it. (The per-table WAL poison refuses lazily at the
-        // next write; this is the more serious whole-session condition.)
-        if self.commit_poisoned {
-            return Err(EngineError::CommitLog(io::Error::other(
-                "session poisoned by a failed commit-log append; restart to recover",
-            )));
-        }
+        self.refuse_if_commit_poisoned()?;
 
         // `EXPLAIN [ANALYZE]` ([STL-260]) renders the inner statement's plan as a
         // tree. Routed before the binders since it wraps any inner body; the inner
@@ -7697,6 +7737,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             snapshot,
             isolation,
             writes: Vec::new(),
+            write_anchors: Vec::new(),
             savepoints: Vec::new(),
             // Register the pinned snapshot so it holds the prune floor down for as
             // long as this transaction is open ([STL-204]). `begin` is `&self`, but
@@ -7729,6 +7770,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         stmt: &Statement,
         txn: &mut SessionTransaction,
     ) -> Result<Option<DmlSummary>, EngineError> {
+        self.refuse_if_commit_poisoned()?;
         let ctx = BindContext {
             snapshot: txn.snapshot,
             catalog: &self.catalog,
@@ -7783,6 +7825,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 }
                 let summary = dml_summary(&dml);
                 txn.writes.push(dml);
+                // Anchor this write at the snapshot it was just bound and
+                // resolved against, so a later re-pin cannot forgive a
+                // conflict it should abort on.
+                txn.write_anchors.push(txn.snapshot);
                 Ok(Some(summary))
             }
             Err(DmlError::NotDml) => Ok(None),
@@ -7850,14 +7896,22 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// in-memory tiers when a *later* one fails is not yet rolled back in memory
     /// ([STL-216]).
     pub fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError> {
+        self.refuse_if_commit_poisoned()?;
         // First-committer-wins write-write conflict detection. Checked up front, so
         // a conflict aborts the whole transaction before any write lands.
-        for dml in &txn.writes {
+        //
+        // Each write is tested against **its own** staging snapshot, not the
+        // transaction's live read pin: the pin advances on a re-pin (a DDL inside
+        // the block, or every statement under READ COMMITTED), and anchoring on it
+        // would let a commit that landed before the re-pin slip past the check —
+        // silently overwriting it with a value derived from a version that is no
+        // longer current. See [`SessionTransaction::write_anchors`].
+        for (dml, &anchor) in txn.writes.iter().zip(&txn.write_anchors) {
             let key = (dml.table().to_owned(), dml_business_key(dml));
             if self
                 .write_index
                 .get(&key)
-                .is_some_and(|&committed_at| committed_at > txn.snapshot)
+                .is_some_and(|&committed_at| committed_at > anchor)
             {
                 self.metrics.txn_conflicts.inc();
                 return Err(EngineError::Conflict);
@@ -8093,6 +8147,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<DmlOutcome, EngineError> {
+        self.refuse_if_commit_poisoned()?;
         let state = self.table_mut(table)?;
         Ok(state
             .engine
@@ -8115,6 +8170,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<DmlOutcome, EngineError> {
+        self.refuse_if_commit_poisoned()?;
         let state = self.table_mut(table)?;
         Ok(state
             .engine
@@ -8133,6 +8189,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<DmlOutcome, EngineError> {
+        self.refuse_if_commit_poisoned()?;
         let state = self.table_mut(table)?;
         Ok(state.engine.delete(key, txn_id, principal)?)
     }
@@ -14385,6 +14442,86 @@ mod tests {
             vec![encode_value(&ScalarValue::Int4(200))],
             "first committer wins; the conflicting transaction had no effect"
         );
+    }
+
+    /// A re-pin must not forgive a conflict against a write staged before it.
+    ///
+    /// The read pin advances mid-block — after a DDL auto-commits, and before
+    /// every statement under READ COMMITTED. Anchoring the conflict check on
+    /// that moving pin loses updates: the concurrent commit lands *below* the
+    /// advanced pin, the check passes, and this transaction overwrites it with
+    /// a value computed from the version it read at `BEGIN`. Each write is
+    /// therefore anchored at the snapshot it was staged under.
+    #[test]
+    fn a_repin_does_not_forgive_a_conflict_against_an_already_staged_write() {
+        for repin_via_ddl in [true, false] {
+            let mut engine = session();
+            engine.execute(&parse_one(CREATE)).expect("create");
+            engine
+                .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+                .expect("seed");
+
+            let mut txn = if repin_via_ddl {
+                engine.begin()
+            } else {
+                engine.begin_with_isolation(IsolationLevel::ReadCommitted)
+            };
+            // Staged from balance = 100, the value visible at this snapshot.
+            engine
+                .stage_dml(
+                    &parse_one("UPDATE account SET balance = 90 WHERE id = 1"),
+                    &mut txn,
+                )
+                .expect("stage");
+
+            // A concurrent transaction commits the same key.
+            engine
+                .execute(&parse_one("UPDATE account SET balance = 50 WHERE id = 1"))
+                .expect("concurrent commit");
+
+            // Something moves the read pin past that commit: a DDL that
+            // auto-commits inside the block, or — under READ COMMITTED — any
+            // ordinary statement.
+            if repin_via_ddl {
+                engine
+                    .execute_in_txn(
+                        &parse_one(
+                            "CREATE TABLE scratch (id INT PRIMARY KEY, v INT) \
+                             WITH SYSTEM VERSIONING",
+                        ),
+                        &mut txn,
+                    )
+                    .expect("ddl in txn");
+            } else {
+                engine
+                    .execute_in_txn(&parse_one("SELECT balance FROM account"), &mut txn)
+                    .expect("read re-pins under READ COMMITTED");
+            }
+
+            let err = engine.commit(txn).unwrap_err();
+            assert!(
+                matches!(err, EngineError::Conflict),
+                "re-pin via {}: the staged write must still conflict, got {err:?}",
+                if repin_via_ddl {
+                    "DDL"
+                } else {
+                    "READ COMMITTED"
+                }
+            );
+
+            // The concurrent writer's value stands — no lost update.
+            let StatementOutcome::Rows(result) = engine
+                .execute(&parse_one("SELECT balance FROM account"))
+                .expect("select")
+            else {
+                panic!("rows");
+            };
+            assert_eq!(
+                payload_column(&result),
+                vec![encode_value(&ScalarValue::Int4(50))],
+                "the first committer's write survives the re-pinned transaction"
+            );
+        }
     }
 
     #[test]

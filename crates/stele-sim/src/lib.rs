@@ -3817,6 +3817,11 @@ pub fn run_bulk_load_recover_faults_seed(seed: u64) -> u64 {
     digest
 }
 
+/// Every registered scenario, in sweep order — the single list the seed-sweep
+/// driver and `--scenario` filtering both consult. Adding a scenario is one
+/// `FnScenario` line here ([STL-110]).
+///
+/// [STL-110]: https://allegromusic.atlassian.net/browse/STL-110
 pub fn registry() -> Vec<Box<dyn Scenario>> {
     vec![
         FnScenario::boxed("storage", run_storage_seed),

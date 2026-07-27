@@ -49,6 +49,7 @@ pub const VALID_TIME_OPEN: ValidTimeMicros = ValidTimeMicros(i64::MAX);
 /// Injectable monotonic-ish clock. Implementations decide reality (OS clock) vs
 /// virtual time (sim).
 pub trait Clock: Send + Sync {
+    /// The current instant on the system-time axis.
     fn now(&self) -> SystemTimeMicros;
 }
 

@@ -111,6 +111,43 @@ fn explain_rejects_non_plannable_inner() {
     assert!(parse("EXPLAIN EXPLAIN SELECT 1").is_err());
 }
 
+/// A nested `EXPLAIN` is refused from the token stream, before recursing.
+///
+/// The lift re-enters the parser for the inner statement, so deciding this
+/// from the *parsed* inner would descend once per leading `EXPLAIN` — and
+/// each level builds a fresh `Parser`, so sqlparser's own depth guard never
+/// applies. A few thousand repeats (far inside the wire's 16 MiB message cap)
+/// would overflow the stack, which under `panic = "abort"` takes the whole
+/// server down. This depth would abort the process before the fix.
+#[test]
+fn deeply_nested_explain_is_refused_without_recursing() {
+    let sql = format!("{}SELECT 1", "EXPLAIN ".repeat(50_000));
+    assert!(
+        parse(&sql).is_err(),
+        "a deep EXPLAIN nest must be refused, not recursed into"
+    );
+}
+
+/// A long run of `FOR … AS OF` qualifiers is refused rather than parsed.
+///
+/// Each operand parse copies the token suffix it is handed, so an unbounded
+/// run is quadratic in the statement length — enough to stall a runtime worker
+/// for minutes from one ordinary-looking statement. The binder accepts at most
+/// one qualifier per axis anyway, so the run was always invalid.
+#[test]
+fn a_long_run_of_as_of_qualifiers_is_refused() {
+    let sql = format!("SELECT 1 {}", "FOR SYSTEM_TIME AS OF 1 ".repeat(10_000));
+    assert!(
+        parse(&sql).is_err(),
+        "a pathological qualifier run must be refused before the quadratic copy"
+    );
+    // One per axis — what the grammar actually allows — still parses.
+    assert!(
+        parse("SELECT 1 FOR SYSTEM_TIME AS OF 1 FOR VALID_TIME AS OF 2").is_ok(),
+        "the legitimate two-axis pin is unaffected"
+    );
+}
+
 #[test]
 fn create_table_captures_valid_time_period() {
     let stmts = parse(

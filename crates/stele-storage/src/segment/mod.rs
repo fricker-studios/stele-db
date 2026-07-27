@@ -142,7 +142,12 @@ pub enum SegmentError {
 
     /// The header advertised a format version the reader does not understand.
     #[error("unsupported segment format version: got {got}, expected {expected}")]
-    UnsupportedVersion { got: u16, expected: u16 },
+    UnsupportedVersion {
+        /// The format version the file's header actually carried.
+        got: u16,
+        /// The format version this reader supports.
+        expected: u16,
+    },
 
     /// A row, column chunk, or footer field exceeded the per-frame limits
     /// encoded in the format (typically u32 lengths).
