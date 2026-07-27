@@ -69,6 +69,7 @@ use stele_common::hash::{Digest, SHA256_LEN, sha256};
 use stele_common::scram::ScramVerifier;
 use stele_common::time::SystemTimeMicros;
 use stele_common::types::LogicalType;
+use stele_sql::ddl::{Grantee, Privilege};
 use stele_storage::backend::{Disk, DiskFile};
 use stele_storage::checksum::crc32c;
 
@@ -127,6 +128,16 @@ pub(crate) enum CatalogRecord {
         columns: Vec<ColumnDef>,
         /// The temporal configuration (system-only, or + valid-time period).
         temporal: TableTemporal,
+        /// The role that created the table and therefore **owns** it
+        /// ([ADR-0034]) — implicitly holding every privilege on it, and the
+        /// only non-superuser who may drop it or grant on it.
+        ///
+        /// [`None`] only for a record written before ownership existed
+        /// (kind [`KIND_CREATE_TABLE`]); recovery treats such a table as owned
+        /// by the bootstrap superuser, which is the fail-closed reading.
+        ///
+        /// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+        owner: Option<String>,
     },
     /// A `DROP TABLE` took effect at `at` (a catalog version transition — the
     /// table's history and tier remain).
@@ -183,6 +194,12 @@ pub(crate) enum CatalogRecord {
         name: String,
         /// The stored SCRAM-SHA-256 verifier.
         verifier: ScramVerifier,
+        /// Whether the role bypasses every privilege check ([ADR-0034]).
+        /// Always `false` for a record written before the attribute existed
+        /// (kind [`KIND_CREATE_USER`]) — the fail-closed reading.
+        ///
+        /// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+        superuser: bool,
     },
     /// An `ALTER USER … PASSWORD` was acknowledged at `at` ([STL-252]): a
     /// fresh salt + verifier replace the user's stored one on replay. The old
@@ -208,6 +225,39 @@ pub(crate) enum CatalogRecord {
         /// The dropped user's name.
         name: String,
     },
+    /// A `GRANT` was acknowledged at `at` ([ADR-0034]): the named privileges
+    /// are added to the grantee's set for `table`.
+    ///
+    /// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+    Grant {
+        /// The system time the grant was acknowledged.
+        at: SystemTimeMicros,
+        /// The table the privileges are on.
+        table: String,
+        /// The grantee — a named role or `PUBLIC`. (Its *encoding* uses the
+        /// empty name for `PUBLIC`; see [`put_grant`].)
+        grantee: Grantee,
+        /// The privileges added.
+        privileges: Vec<Privilege>,
+    },
+    /// A `REVOKE` was acknowledged at `at` ([ADR-0034]): the named privileges
+    /// are removed from the grantee's set for `table`.
+    ///
+    /// The revoked grant's own record stays in the log — it is append-only, and
+    /// the grant/revoke history is part of the audit trail ([ADR-0031]). Only
+    /// the *folded* state loses the privilege.
+    ///
+    /// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+    Revoke {
+        /// The system time the revoke was acknowledged.
+        at: SystemTimeMicros,
+        /// The table the privileges were on.
+        table: String,
+        /// The grantee losing them.
+        grantee: Grantee,
+        /// The privileges removed.
+        privileges: Vec<Privilege>,
+    },
 }
 
 /// Record-kind discriminants. `0` is deliberately unused so a zero-filled
@@ -219,6 +269,40 @@ const KIND_DROP_INDEX: u8 = 4;
 const KIND_CREATE_USER: u8 = 5;
 const KIND_ALTER_USER: u8 = 6;
 const KIND_DROP_USER: u8 = 7;
+// ADR-0034. The kind byte is the format's only versioning seam: `decode_payload`
+// requires the cursor to be exhausted, so a field cannot be appended to an
+// existing kind without refusing every log an earlier build wrote. `…_OWNED` and
+// `…_ROLE` are therefore new kinds carrying the extra field, and the originals
+// still decode — with the attribute at its fail-closed default.
+const KIND_CREATE_TABLE_OWNED: u8 = 8;
+const KIND_CREATE_ROLE: u8 = 9;
+const KIND_GRANT: u8 = 10;
+const KIND_REVOKE: u8 = 11;
+
+/// Map a [`Privilege`] to its stable on-log tag. Exhaustive on purpose: a
+/// sibling ticket adding a privilege fails compilation here until it assigns a
+/// tag (append-only; never renumber).
+const fn privilege_tag(privilege: Privilege) -> u8 {
+    match privilege {
+        Privilege::Select => 1,
+        Privilege::Insert => 2,
+        Privilege::Update => 3,
+        Privilege::Delete => 4,
+    }
+}
+
+/// The inverse of [`privilege_tag`], or [`None`] for a tag this build does not
+/// know (a log written by a newer build) — which replay treats as corruption
+/// rather than silently dropping a privilege it cannot represent.
+const fn privilege_from_tag(tag: u8) -> Option<Privilege> {
+    Some(match tag {
+        1 => Privilege::Select,
+        2 => Privilege::Insert,
+        3 => Privilege::Update,
+        4 => Privilege::Delete,
+        _ => return None,
+    })
+}
 
 /// Map an [`IndexKind`] to its stable on-log tag. Exhaustive, like
 /// [`type_tag`]: a sibling ticket adding a kind fails compilation here until
@@ -326,6 +410,10 @@ fn put_verifier(buf: &mut Vec<u8>, verifier: &ScramVerifier) -> io::Result<()> {
 }
 
 /// Encode one record's payload (everything between the header and the CRC).
+// One arm per record kind, each writing that kind's fields in order. The
+// length is the format's, not a missing abstraction's: the byte layout is
+// easiest to check against `decode_payload` when both are one flat match.
+#[allow(clippy::too_many_lines)]
 fn encode_payload(record: &CatalogRecord) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     match record {
@@ -335,8 +423,16 @@ fn encode_payload(record: &CatalogRecord) -> io::Result<Vec<u8>> {
             name,
             columns,
             temporal,
+            owner,
         } => {
-            buf.push(KIND_CREATE_TABLE);
+            // A table always has an owner now, so new records take the `…_OWNED`
+            // kind; the legacy kind is still *written* when the owner is absent
+            // so a round-trip of a replayed pre-ownership record is byte-stable.
+            buf.push(if owner.is_some() {
+                KIND_CREATE_TABLE_OWNED
+            } else {
+                KIND_CREATE_TABLE
+            });
             buf.extend_from_slice(&at.0.to_le_bytes());
             buf.extend_from_slice(&namespace.to_le_bytes());
             put_str(&mut buf, name)?;
@@ -354,6 +450,11 @@ fn encode_payload(record: &CatalogRecord) -> io::Result<Vec<u8>> {
                     put_str(&mut buf, spec.from_column())?;
                     put_str(&mut buf, spec.to_column())?;
                 }
+            }
+            // Trails the legacy payload, so the two kinds share every field
+            // before it and the decoder can reuse one body.
+            if let Some(owner) = owner {
+                put_str(&mut buf, owner)?;
             }
         }
         CatalogRecord::DropTable { at, name } => {
@@ -385,11 +486,26 @@ fn encode_payload(record: &CatalogRecord) -> io::Result<Vec<u8>> {
             buf.extend_from_slice(&at.0.to_le_bytes());
             put_str(&mut buf, name)?;
         }
-        CatalogRecord::CreateUser { at, name, verifier } => {
-            buf.push(KIND_CREATE_USER);
+        CatalogRecord::CreateUser {
+            at,
+            name,
+            verifier,
+            superuser,
+        } => {
+            // As with `CreateTable`'s owner: a new kind carries the attribute,
+            // and the legacy kind is written only for an attribute-free role so
+            // a replayed pre-ADR-0034 record round-trips byte-stably.
+            buf.push(if *superuser {
+                KIND_CREATE_ROLE
+            } else {
+                KIND_CREATE_USER
+            });
             buf.extend_from_slice(&at.0.to_le_bytes());
             put_str(&mut buf, name)?;
             put_verifier(&mut buf, verifier)?;
+            if *superuser {
+                buf.push(1);
+            }
         }
         CatalogRecord::AlterUser { at, name, verifier } => {
             buf.push(KIND_ALTER_USER);
@@ -402,8 +518,54 @@ fn encode_payload(record: &CatalogRecord) -> io::Result<Vec<u8>> {
             buf.extend_from_slice(&at.0.to_le_bytes());
             put_str(&mut buf, name)?;
         }
+        CatalogRecord::Grant {
+            at,
+            table,
+            grantee,
+            privileges,
+        } => {
+            buf.push(KIND_GRANT);
+            put_grant(&mut buf, *at, table, grantee, privileges)?;
+        }
+        CatalogRecord::Revoke {
+            at,
+            table,
+            grantee,
+            privileges,
+        } => {
+            buf.push(KIND_REVOKE);
+            put_grant(&mut buf, *at, table, grantee, privileges)?;
+        }
     }
     Ok(buf)
+}
+
+/// The shared body of a [`Grant`](CatalogRecord::Grant) /
+/// [`Revoke`](CatalogRecord::Revoke) payload — everything after the kind byte.
+///
+/// `PUBLIC` encodes as the empty grantee name. A role name cannot be empty (the
+/// parser requires an identifier), so the two are unambiguous without a
+/// discriminant byte.
+fn put_grant(
+    buf: &mut Vec<u8>,
+    at: SystemTimeMicros,
+    table: &str,
+    grantee: &Grantee,
+    privileges: &[Privilege],
+) -> io::Result<()> {
+    buf.extend_from_slice(&at.0.to_le_bytes());
+    put_str(buf, table)?;
+    match grantee {
+        Grantee::Role(name) => put_str(buf, name)?,
+        Grantee::Public => put_str(buf, "")?,
+    }
+    let count = u16::try_from(privileges.len())
+        .map_err(|_| corrupt(format!("too many privileges ({})", privileges.len())))?;
+    buf.extend_from_slice(&count.to_le_bytes());
+    for privilege in privileges {
+        buf.push(privilege_tag(*privilege));
+    }
+    Ok(())
 }
 
 /// The chain link a record contributes: `sha256(prev_hash ‖ payload)` — the
@@ -520,11 +682,39 @@ impl<'a> Cursor<'a> {
 }
 
 /// Decode one CRC-verified payload back into a [`CatalogRecord`].
+/// The shared body of a `Grant`/`Revoke` payload — the inverse of [`put_grant`].
+fn take_grant(
+    cur: &mut Cursor<'_>,
+) -> io::Result<(SystemTimeMicros, String, Grantee, Vec<Privilege>)> {
+    let at = SystemTimeMicros(cur.i64()?);
+    let table = cur.string()?;
+    let name = cur.string()?;
+    // The empty name is `PUBLIC`'s encoding; a real role name cannot be empty.
+    let grantee = if name.is_empty() {
+        Grantee::Public
+    } else {
+        Grantee::Role(name)
+    };
+    let count = usize::from(cur.u16()?);
+    let mut privileges = Vec::with_capacity(count);
+    for _ in 0..count {
+        let tag = cur.u8()?;
+        privileges.push(
+            privilege_from_tag(tag)
+                .ok_or_else(|| corrupt(format!("unknown privilege tag {tag}")))?,
+        );
+    }
+    Ok((at, table, grantee, privileges))
+}
+
+// The mirror of `encode_payload`, and long for the same reason — keeping the
+// two readable side by side is what makes a format change reviewable.
+#[allow(clippy::too_many_lines)]
 fn decode_payload(payload: &[u8]) -> io::Result<CatalogRecord> {
     let mut cur = Cursor::new(payload);
     let kind = cur.u8()?;
     let record = match kind {
-        KIND_CREATE_TABLE => {
+        KIND_CREATE_TABLE | KIND_CREATE_TABLE_OWNED => {
             let at = SystemTimeMicros(cur.i64()?);
             let namespace = cur.u64()?;
             let name = cur.string()?;
@@ -551,12 +741,19 @@ fn decode_payload(payload: &[u8]) -> io::Result<CatalogRecord> {
                 }
                 other => return Err(corrupt(format!("bad valid-time flag {other}"))),
             };
+            // Only the `…_OWNED` kind carries the trailing owner; the legacy
+            // kind leaves the cursor exhausted here, so the shared body above
+            // decodes both without a probe.
+            let owner = (kind == KIND_CREATE_TABLE_OWNED)
+                .then(|| cur.string())
+                .transpose()?;
             CatalogRecord::CreateTable {
                 at,
                 namespace,
                 name,
                 columns,
                 temporal,
+                owner,
             }
         }
         KIND_DROP_TABLE => CatalogRecord::DropTable {
@@ -587,11 +784,26 @@ fn decode_payload(payload: &[u8]) -> io::Result<CatalogRecord> {
             at: SystemTimeMicros(cur.i64()?),
             name: cur.string()?,
         },
-        KIND_CREATE_USER => CatalogRecord::CreateUser {
-            at: SystemTimeMicros(cur.i64()?),
-            name: cur.string()?,
-            verifier: cur.verifier()?,
-        },
+        KIND_CREATE_USER | KIND_CREATE_ROLE => {
+            let at = SystemTimeMicros(cur.i64()?);
+            let name = cur.string()?;
+            let verifier = cur.verifier()?;
+            let superuser = if kind == KIND_CREATE_ROLE {
+                match cur.u8()? {
+                    0 => false,
+                    1 => true,
+                    other => return Err(corrupt(format!("bad superuser flag {other}"))),
+                }
+            } else {
+                false
+            };
+            CatalogRecord::CreateUser {
+                at,
+                name,
+                verifier,
+                superuser,
+            }
+        }
         KIND_ALTER_USER => CatalogRecord::AlterUser {
             at: SystemTimeMicros(cur.i64()?),
             name: cur.string()?,
@@ -601,6 +813,24 @@ fn decode_payload(payload: &[u8]) -> io::Result<CatalogRecord> {
             at: SystemTimeMicros(cur.i64()?),
             name: cur.string()?,
         },
+        KIND_GRANT | KIND_REVOKE => {
+            let (at, table, grantee, privileges) = take_grant(&mut cur)?;
+            if kind == KIND_GRANT {
+                CatalogRecord::Grant {
+                    at,
+                    table,
+                    grantee,
+                    privileges,
+                }
+            } else {
+                CatalogRecord::Revoke {
+                    at,
+                    table,
+                    grantee,
+                    privileges,
+                }
+            }
+        }
         other => return Err(corrupt(format!("unknown record kind {other}"))),
     };
     if !cur.finished() {
@@ -777,6 +1007,7 @@ mod tests {
                 col("balance", LogicalType::Int8),
             ],
             temporal: TableTemporal::system_only(),
+            owner: None,
         }
     }
 
@@ -811,6 +1042,7 @@ mod tests {
                 name: "account".to_owned(),
                 columns: vec![col("id", LogicalType::Int4)],
                 temporal: TableTemporal::system_only(),
+                owner: None,
             },
         ];
         let head = append_chain(&disk, &records);
@@ -878,6 +1110,7 @@ mod tests {
             temporal: TableTemporal::with_valid_time(
                 ValidTimeSpec::new("vf", "vt").expect("valid spec"),
             ),
+            owner: None,
         };
         append(&disk, &record, Digest::ZERO).expect("append");
         assert_eq!(replay(&disk).expect("replay").0, vec![record]);
@@ -925,6 +1158,7 @@ mod tests {
                 at: SystemTimeMicros(10),
                 name: "alice".to_owned(),
                 verifier,
+                superuser: false,
             },
             CatalogRecord::AlterUser {
                 at: SystemTimeMicros(20),

@@ -171,6 +171,20 @@ async fn the_connection_user_is_the_stored_write_principal() {
         .expect("bob connects");
     let bob_driver = tokio::spawn(bob_conn);
 
+    // The operator (the built-in `stele` superuser) creates bob's role. Under
+    // `trust` a connection names itself, but a *grant* still needs a real role
+    // to name — otherwise a typo'd grantee would silently grant to nobody
+    // ([ADR-0034]).
+    let (operator, operator_conn) =
+        tokio_postgres::connect(&common::conn_str_as(addr, "stele"), NoTls)
+            .await
+            .expect("operator connects");
+    let operator_driver = tokio::spawn(operator_conn);
+    operator
+        .batch_execute("CREATE USER bob PASSWORD 'unused-under-trust'")
+        .await
+        .expect("operator creates bob");
+
     // alice creates the table and inserts one row (auto-commit single write).
     alice
         .batch_execute(
@@ -182,6 +196,13 @@ async fn the_connection_user_is_the_stored_write_principal() {
         .simple_query("INSERT INTO account VALUES (1, 100)")
         .await
         .expect("alice insert");
+
+    // alice owns the table she created, so she is the one who can let bob write
+    // to it ([ADR-0034]). Without this his INSERT below is refused with `42501`.
+    alice
+        .batch_execute("GRANT INSERT ON account TO bob")
+        .await
+        .expect("alice grants bob INSERT");
 
     // bob writes *between* alice's writes (extended protocol, auto-commit): the
     // shared engine's principal must flip to bob for this statement and back to alice
@@ -232,6 +253,7 @@ async fn the_connection_user_is_the_stored_write_principal() {
 
     drop(alice);
     drop(bob);
+    drop(operator);
     alice_driver
         .await
         .expect("alice driver task did not panic")
@@ -240,4 +262,8 @@ async fn the_connection_user_is_the_stored_write_principal() {
         .await
         .expect("bob driver task did not panic")
         .expect("bob connection closed cleanly");
+    operator_driver
+        .await
+        .expect("operator driver task did not panic")
+        .expect("operator connection closed cleanly");
 }

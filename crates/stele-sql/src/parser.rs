@@ -359,9 +359,22 @@ fn lift_user_ddl(tokens: &[Token]) -> Result<Option<UserDdl>, ParseError> {
     if rest.first().is_some_and(|t| word_is(t, "WITH")) {
         rest = &rest[1..];
     }
+    // `SUPERUSER` ([ADR-0034]) — the one role attribute v0.3 carries, and only
+    // on CREATE: an attribute change is not a password rotation, so `ALTER USER`
+    // deliberately has no route to granting or dropping it.
+    let mut superuser = false;
+    if rest.first().is_some_and(|t| word_is(t, "SUPERUSER")) {
+        if verb == "ALTER" {
+            return Err(syntax(
+                "SUPERUSER cannot be set by ALTER USER — create the role with it".to_owned(),
+            ));
+        }
+        superuser = true;
+        rest = &rest[1..];
+    }
     let [password_kw, password_tok] = rest else {
         return Err(syntax(format!(
-            "expected {verb} USER <name> [WITH] PASSWORD '<password>'"
+            "expected {verb} USER <name> [WITH] [SUPERUSER] PASSWORD '<password>'"
         )));
     };
     if !word_is(password_kw, "PASSWORD") {
@@ -383,6 +396,7 @@ fn lift_user_ddl(tokens: &[Token]) -> Result<Option<UserDdl>, ParseError> {
         UserDdl::CreateUser {
             name: name.value,
             password,
+            superuser,
         }
     } else {
         UserDdl::AlterUserPassword {

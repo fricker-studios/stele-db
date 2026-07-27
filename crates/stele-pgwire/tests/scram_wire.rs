@@ -19,6 +19,7 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
+use stele_common::provenance::Principal;
 use stele_common::scram::{self, ScramVerifier};
 use stele_common::time::SystemClock;
 use stele_engine::SessionEngine;
@@ -42,6 +43,22 @@ fn session_with_users(users: &[(&str, &str)]) -> SharedSession {
         engine.execute(stmt).expect("create user");
     }
     Arc::new(Mutex::new(engine))
+}
+
+/// Drop a role as the built-in superuser, directly on the shared engine.
+///
+/// The in-process handle carries the bootstrap `stele` principal, so it is a
+/// superuser by construction ([ADR-0034] decision 8) — which is exactly how an
+/// operator administers a SCRAM deployment that has no superuser role yet.
+fn drop_user_as_operator(session: &SharedSession, name: &str) {
+    let sql = format!("DROP USER {name}");
+    let stmt = &stele_sql::parse(&sql).expect("parse")[0];
+    let mut engine = session.lock().expect("engine lock");
+    // The engine's principal is ambient: the wire layer re-applies it before
+    // every dispatch, so it still holds whichever connection ran last. An
+    // in-process operator states its own identity rather than inheriting one.
+    engine.set_principal(Principal::new(b"stele".to_vec()));
+    engine.execute(stmt).expect("drop user");
 }
 
 /// Boot a SCRAM-required server on an ephemeral port.
@@ -118,7 +135,8 @@ async fn unknown_user_is_refused_with_28p01() {
 
 #[tokio::test]
 async fn alter_and_drop_user_take_effect_on_the_next_connection() {
-    let addr = spawn_scram_server(session_with_users(&[("alice", "first")])).await;
+    let session = session_with_users(&[("alice", "first")]);
+    let addr = spawn_scram_server(Arc::clone(&session)).await;
 
     // Authenticate and rotate the password over the wire itself.
     let (client, connection) = tokio_postgres::connect(&conn_str(addr, "alice", "first"), NoTls)
@@ -133,16 +151,16 @@ async fn alter_and_drop_user_take_effect_on_the_next_connection() {
     // The old password is dead, the new one lives.
     let err = connect_refused(addr, "alice", "first").await;
     assert_eq!(err.code(), Some(&SqlState::INVALID_PASSWORD));
-    let (client, connection) = tokio_postgres::connect(&conn_str(addr, "alice", "second"), NoTls)
+    let (_client, connection) = tokio_postgres::connect(&conn_str(addr, "alice", "second"), NoTls)
         .await
         .expect("rotated password works");
     tokio::spawn(connection);
 
-    // Drop and verify the next authentication is refused.
-    client
-        .simple_query("DROP USER alice")
-        .await
-        .expect("drop over the wire");
+    // Dropping a role is superuser-only ([ADR-0034]) — alice rotating her own
+    // password above is not escalation, but removing an account is. The
+    // operator does it in-process, the way a superuser-less SCRAM deployment
+    // must until one is minted with `CREATE USER … SUPERUSER`.
+    drop_user_as_operator(&session, "alice");
     let err = connect_refused(addr, "alice", "second").await;
     assert_eq!(err.code(), Some(&SqlState::INVALID_PASSWORD));
 }

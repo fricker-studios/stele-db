@@ -566,9 +566,44 @@ the password itself is never stored, and the parsed AST redacts it from
 case-folding), like table and column names. The empty password is rejected at
 parse time.
 
-Out of scope until their tickets land: role options (`LOGIN`, `SUPERUSER`,
-`CREATEDB`, …), `CREATE ROLE`/`GRANT` (RBAC is v0.5), `IF NOT EXISTS`, and
-`RENAME TO`.
+`CREATE USER … SUPERUSER PASSWORD '…'` mints a role that bypasses every
+privilege check ([ADR-0034](adr/0034-role-based-access-control.md)); creating one
+is itself superuser-only, and the attribute is settable **only at creation** —
+`ALTER USER … SUPERUSER` is a syntax error rather than a silent no-op, because an
+attribute change is not a password rotation. An ordinary role may run
+`ALTER USER <self> PASSWORD`; anyone else's is superuser-only.
+
+Out of scope until their tickets land: the other role options (`LOGIN`,
+`CREATEDB`, …), `CREATE ROLE`, `IF NOT EXISTS`, and `RENAME TO`.
+
+### `GRANT` / `REVOKE` — table privileges (ADR-0034)
+
+```sql
+GRANT  { SELECT | INSERT | UPDATE | DELETE }[, …] | ALL [PRIVILEGES]
+       ON [TABLE] <table> TO   { <role> | PUBLIC }
+REVOKE { SELECT | INSERT | UPDATE | DELETE }[, …] | ALL [PRIVILEGES]
+       ON [TABLE] <table> FROM { <role> | PUBLIC }
+```
+
+Unlike the user-DDL family, these are **not** token-lifted: `sqlparser` parses
+`GRANT`/`REVOKE` natively under the Stele dialect, so the binder lowers its real
+AST and the surface is Postgres-shaped for free. Command tags are `GRANT` and
+`REVOKE`.
+
+Only the table's **owner** — the role that created it — or a superuser may grant
+on it; holding a privilege never confers the right to pass it on. The grantee
+must be a live role and the table a live table, so a typo cannot stash a
+privilege that springs to life later. Dropping a table or a role forgets every
+privilege attached to it, so a name re-created afterwards starts a fresh era. A
+denial is SQLSTATE `42501`.
+
+Rejected rather than silently widened — an authorization surface must never
+enforce *less* than it appears to: column-scoped grants (`GRANT SELECT (col) …`),
+`WITH GRANT OPTION`, `GRANTED BY` / `AS <grantor>`, `CASCADE` / `RESTRICT`,
+several tables or grantees in one statement, `ALL TABLES IN SCHEMA`, non-table
+objects, and privileges outside the four DML verbs. Role membership
+(`GRANT <role> TO <role>`) has no grammar here at all — `sqlparser` requires a
+privilege keyword — and is deferred with the rest to v0.5.
 
 ## Query binding (STL-101, STL-162)
 
