@@ -404,6 +404,7 @@ fn parses_the_user_ddl_family() {
             UserDdl::CreateUser {
                 name: "alice".to_owned(),
                 password: Password("s3cret".to_owned()),
+                superuser: false,
             },
         ),
         (
@@ -411,6 +412,7 @@ fn parses_the_user_ddl_family() {
             UserDdl::CreateUser {
                 name: "Bob".to_owned(),
                 password: Password("p w".to_owned()),
+                superuser: false,
             },
         ),
         (
@@ -520,4 +522,86 @@ fn table_has_version(stmt: &SqlStatement) -> bool {
             }
         )
     })
+}
+
+// ---------------------------------------------------------------------------
+// GRANT / REVOKE ([ADR-0034])
+// ---------------------------------------------------------------------------
+
+/// The privilege forms an operator actually types all bind, including the
+/// `ALL PRIVILEGES` expansion and `PUBLIC`.
+#[test]
+fn grant_and_revoke_bind() {
+    use stele_sql::ddl::{DdlStatement, Grantee, Privilege, bind_ddl};
+
+    let bind = |sql: &str| bind_ddl(&parse(sql).unwrap()[0]).unwrap();
+
+    assert_eq!(
+        bind("GRANT SELECT ON account TO alice"),
+        DdlStatement::Grant {
+            table: "account".to_owned(),
+            grantee: Grantee::Role("alice".to_owned()),
+            privileges: vec![Privilege::Select],
+        }
+    );
+    // `ON TABLE` is the same statement, and the four verbs keep source order.
+    assert_eq!(
+        bind("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE account TO alice"),
+        DdlStatement::Grant {
+            table: "account".to_owned(),
+            grantee: Grantee::Role("alice".to_owned()),
+            privileges: Privilege::ALL.to_vec(),
+        }
+    );
+    // ALL PRIVILEGES expands at bind time, so nothing downstream re-interprets it.
+    assert_eq!(
+        bind("GRANT ALL PRIVILEGES ON account TO alice"),
+        DdlStatement::Grant {
+            table: "account".to_owned(),
+            grantee: Grantee::Role("alice".to_owned()),
+            privileges: Privilege::ALL.to_vec(),
+        }
+    );
+    assert_eq!(
+        bind("GRANT SELECT ON account TO PUBLIC"),
+        DdlStatement::Grant {
+            table: "account".to_owned(),
+            grantee: Grantee::Public,
+            privileges: vec![Privilege::Select],
+        }
+    );
+    assert_eq!(
+        bind("REVOKE INSERT ON account FROM alice"),
+        DdlStatement::Revoke {
+            table: "account".to_owned(),
+            grantee: Grantee::Role("alice".to_owned()),
+            privileges: vec![Privilege::Insert],
+        }
+    );
+}
+
+/// Forms outside the v0.3 surface are **rejected**, never silently widened.
+///
+/// A column-scoped grant enforced at table granularity would hand out more
+/// than the operator asked for, which is the one failure mode an authorization
+/// surface must not have.
+#[test]
+fn unsupported_grant_forms_are_rejected_not_widened() {
+    use stele_sql::ddl::bind_ddl;
+
+    for sql in [
+        "GRANT SELECT (balance) ON account TO alice",
+        "GRANT SELECT ON account TO alice WITH GRANT OPTION",
+        "GRANT SELECT ON account, ledger TO alice",
+        "GRANT SELECT ON ALL TABLES IN SCHEMA public TO alice",
+        "GRANT USAGE ON account TO alice",
+        "GRANT SELECT ON account TO alice, bob",
+        "REVOKE SELECT ON account FROM alice CASCADE",
+    ] {
+        let stmt = &parse(sql).expect("parses")[0];
+        assert!(
+            bind_ddl(stmt).is_err(),
+            "{sql} must be refused, not partially applied"
+        );
+    }
 }

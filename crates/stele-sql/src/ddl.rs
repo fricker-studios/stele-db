@@ -43,9 +43,12 @@
 //!
 //! [STL-233]: https://allegromusic.atlassian.net/browse/STL-233
 
+use core::fmt;
+
 use sqlparser::ast::{
-    ColumnDef as SqlColumnDef, ColumnOption, CreateIndex, CreateTable, Expr, IndexColumn,
-    IndexType as SqlIndexType, ObjectName, ObjectType, Statement as SqlStatement,
+    Action, ColumnDef as SqlColumnDef, ColumnOption, CreateIndex, CreateTable, Expr, GranteeName,
+    GranteesType, IndexColumn, IndexType as SqlIndexType, ObjectName, ObjectType, Privileges,
+    Statement as SqlStatement,
 };
 use stele_catalog::{
     Catalog, CatalogError, ColumnDef, IndexDef, IndexKind, SchemaId, TableTemporal, ValidTimeSpec,
@@ -182,6 +185,10 @@ pub enum DdlStatement {
         name: String,
         /// The password to derive the verifier from (redacted `Debug`).
         password: Password,
+        /// Create the role with the `SUPERUSER` attribute ([ADR-0034]).
+        ///
+        /// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+        superuser: bool,
     },
     /// `ALTER USER <name> PASSWORD '…'` — rotate a user's password
     /// ([STL-252]): a fresh salt and verifier replace the stored one.
@@ -204,6 +211,93 @@ pub enum DdlStatement {
         /// rather than an error.
         if_exists: bool,
     },
+    /// `GRANT <privileges> ON [TABLE] <table> TO <grantee>` — add table
+    /// privileges to a role ([ADR-0034]).
+    ///
+    /// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+    Grant {
+        /// The table the privileges are on.
+        table: String,
+        /// The role receiving them, or [`Grantee::Public`].
+        grantee: Grantee,
+        /// The privileges, deduplicated and in a stable order.
+        privileges: Vec<Privilege>,
+    },
+    /// `REVOKE <privileges> ON [TABLE] <table> FROM <grantee>` — the inverse of
+    /// [`Grant`](Self::Grant). Revoking a privilege the grantee does not hold is
+    /// a no-op, matching Postgres.
+    Revoke {
+        /// The table the privileges are on.
+        table: String,
+        /// The role losing them, or [`Grantee::Public`].
+        grantee: Grantee,
+        /// The privileges to remove.
+        privileges: Vec<Privilege>,
+    },
+}
+
+/// A privilege on a table ([ADR-0034]).
+///
+/// Deliberately just the four DML verbs: they are what makes the read/write
+/// split — an auditor who can `SELECT` but not modify — expressible. The
+/// object-less operations (user DDL, the admin verbs) are gated on the
+/// `SUPERUSER` role attribute instead, not on a privilege.
+///
+/// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Privilege {
+    /// Read rows — `SELECT`, and every read that stands in for one (`EXPLAIN`
+    /// of a read, `DESCRIBE`, the provenance table functions).
+    Select,
+    /// Add rows — `INSERT`, `COPY … FROM STDIN`, and a `MERGE`'s insert arm.
+    Insert,
+    /// Modify existing rows — `UPDATE` and a `MERGE`'s update arm.
+    Update,
+    /// Remove rows — `DELETE` and a `MERGE`'s delete arm.
+    Delete,
+}
+
+impl Privilege {
+    /// Every privilege, in a stable order — what `ALL PRIVILEGES` expands to.
+    pub const ALL: [Self; 4] = [Self::Select, Self::Insert, Self::Update, Self::Delete];
+
+    /// The SQL keyword, for error messages and `GRANT` round-tripping.
+    #[must_use]
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::Select => "SELECT",
+            Self::Insert => "INSERT",
+            Self::Update => "UPDATE",
+            Self::Delete => "DELETE",
+        }
+    }
+}
+
+impl fmt::Display for Privilege {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.keyword())
+    }
+}
+
+/// Who a `GRANT` targets ([ADR-0034]).
+///
+/// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Grantee {
+    /// A named role.
+    Role(String),
+    /// `PUBLIC` — the implicit pseudo-role every role holds. A privilege
+    /// granted to `PUBLIC` is held by everyone, including roles created later.
+    Public,
+}
+
+impl fmt::Display for Grantee {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Role(name) => f.write_str(name),
+            Self::Public => f.write_str("PUBLIC"),
+        }
+    }
 }
 
 /// What [`DdlStatement::apply`] did to the catalog.
@@ -271,9 +365,14 @@ pub fn bind_ddl(stmt: &Statement) -> Result<DdlStatement, BindError> {
     // already validated its shape, so binding is a direct mapping.
     if let StatementBody::User(user) = &stmt.body {
         return Ok(match user {
-            UserDdl::CreateUser { name, password } => DdlStatement::CreateUser {
+            UserDdl::CreateUser {
+                name,
+                password,
+                superuser,
+            } => DdlStatement::CreateUser {
                 name: name.clone(),
                 password: password.clone(),
+                superuser: *superuser,
             },
             UserDdl::AlterUserPassword { name, password } => DdlStatement::AlterUserPassword {
                 name: name.clone(),
@@ -332,8 +431,163 @@ pub fn bind_ddl(stmt: &Statement) -> Result<DdlStatement, BindError> {
         SqlStatement::Drop { object_type, .. } => Err(BindError::Unsupported(format!(
             "DROP {object_type} (only DROP TABLE / DROP INDEX is supported)"
         ))),
+        SqlStatement::Grant(grant) => bind_grant(grant),
+        SqlStatement::Revoke(revoke) => bind_revoke(revoke),
         _ => Err(BindError::NotDdl),
     }
+}
+
+/// Bind `GRANT <privileges> ON [TABLE] <table> TO <grantee>` ([ADR-0034]).
+///
+/// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+fn bind_grant(grant: &sqlparser::ast::Grant) -> Result<DdlStatement, BindError> {
+    if grant.with_grant_option {
+        return Err(BindError::Unsupported(
+            "GRANT … WITH GRANT OPTION".to_owned(),
+        ));
+    }
+    if grant.as_grantor.is_some() {
+        return Err(BindError::Unsupported("GRANT … AS <grantor>".to_owned()));
+    }
+    if grant.granted_by.is_some() {
+        return Err(BindError::Unsupported("GRANT … GRANTED BY".to_owned()));
+    }
+    let table = grant_target_table(grant.objects.as_ref())?;
+    Ok(DdlStatement::Grant {
+        table,
+        grantee: bind_grantee(&grant.grantees)?,
+        privileges: bind_privileges(&grant.privileges)?,
+    })
+}
+
+/// Bind `REVOKE <privileges> ON [TABLE] <table> FROM <grantee>` — the mirror of
+/// [`bind_grant`].
+fn bind_revoke(revoke: &sqlparser::ast::Revoke) -> Result<DdlStatement, BindError> {
+    if revoke.granted_by.is_some() {
+        return Err(BindError::Unsupported("REVOKE … GRANTED BY".to_owned()));
+    }
+    // CASCADE/RESTRICT only matter once a grant can be re-granted (WITH GRANT
+    // OPTION), which is rejected above — so accepting them here would be
+    // accepting a modifier that provably cannot do anything.
+    if revoke.cascade.is_some() {
+        return Err(BindError::Unsupported(
+            "REVOKE … CASCADE/RESTRICT".to_owned(),
+        ));
+    }
+    let table = grant_target_table(revoke.objects.as_ref())?;
+    Ok(DdlStatement::Revoke {
+        table,
+        grantee: bind_grantee(&revoke.grantees)?,
+        privileges: bind_privileges(&revoke.privileges)?,
+    })
+}
+
+/// The single table a `GRANT`/`REVOKE` targets.
+///
+/// v0.3 grants on one table at a time: the multi-object and
+/// `ALL TABLES IN SCHEMA` forms are rejected rather than partially applied,
+/// because a privilege statement that silently covers fewer objects than it
+/// names is the worst possible failure mode for an authorization surface.
+fn grant_target_table(objects: Option<&sqlparser::ast::GrantObjects>) -> Result<String, BindError> {
+    use sqlparser::ast::GrantObjects;
+    let Some(objects) = objects else {
+        return Err(BindError::Unsupported(
+            "GRANT/REVOKE without an ON <table> target".to_owned(),
+        ));
+    };
+    let GrantObjects::Tables(names) = objects else {
+        return Err(BindError::Unsupported(
+            "GRANT/REVOKE on an object kind other than a table".to_owned(),
+        ));
+    };
+    match names.as_slice() {
+        [one] => bare_name(one),
+        [] => Err(BindError::Unsupported(
+            "GRANT/REVOKE naming no table".to_owned(),
+        )),
+        _ => Err(BindError::Unsupported(
+            "GRANT/REVOKE on several tables at once".to_owned(),
+        )),
+    }
+}
+
+/// Lower sqlparser's privilege list to [`Privilege`]s, expanding `ALL`.
+///
+/// Column-scoped grants (`GRANT SELECT (col) …`) are **rejected**, not
+/// silently widened to the whole table: accepting the syntax while enforcing
+/// something broader would under-enforce exactly where the operator was being
+/// most careful. Column-level security is a later ticket ([10 §6]).
+///
+/// [10 §6]: ../../../docs/10-security-and-compliance.md#6-authorization
+fn bind_privileges(privileges: &Privileges) -> Result<Vec<Privilege>, BindError> {
+    let actions = match privileges {
+        Privileges::All { .. } => return Ok(Privilege::ALL.to_vec()),
+        Privileges::Actions(actions) => actions,
+    };
+    let mut out = Vec::with_capacity(actions.len());
+    for action in actions {
+        let privilege = match action {
+            Action::Select { columns: None } => Privilege::Select,
+            Action::Insert { columns: None } => Privilege::Insert,
+            Action::Update { columns: None } => Privilege::Update,
+            Action::Delete => Privilege::Delete,
+            Action::Select { columns: Some(_) }
+            | Action::Insert { columns: Some(_) }
+            | Action::Update { columns: Some(_) } => {
+                return Err(BindError::Unsupported(
+                    "column-scoped GRANT/REVOKE (GRANT <priv> (column) …)".to_owned(),
+                ));
+            }
+            other => {
+                return Err(BindError::Unsupported(format!(
+                    "privilege {other} (only SELECT/INSERT/UPDATE/DELETE and ALL PRIVILEGES                      apply to a table)"
+                )));
+            }
+        };
+        if !out.contains(&privilege) {
+            out.push(privilege);
+        }
+    }
+    if out.is_empty() {
+        return Err(BindError::Unsupported(
+            "GRANT/REVOKE naming no privilege".to_owned(),
+        ));
+    }
+    Ok(out)
+}
+
+/// The single grantee a `GRANT`/`REVOKE` targets — a named role or `PUBLIC`.
+fn bind_grantee(grantees: &[sqlparser::ast::Grantee]) -> Result<Grantee, BindError> {
+    let [grantee] = grantees else {
+        return Err(BindError::Unsupported(
+            "GRANT/REVOKE to several grantees at once".to_owned(),
+        ));
+    };
+    if matches!(grantee.grantee_type, GranteesType::Public) {
+        return Ok(Grantee::Public);
+    }
+    // `ROLE x` / `USER x` are spelling variants of the same thing here: roles
+    // and users are one namespace ([ADR-0034]). Any other category names a
+    // concept Stele does not have.
+    if !matches!(
+        grantee.grantee_type,
+        GranteesType::None | GranteesType::Role | GranteesType::User
+    ) {
+        return Err(BindError::Unsupported(format!(
+            "grantee kind {:?} (only a role name or PUBLIC is supported)",
+            grantee.grantee_type
+        )));
+    }
+    match &grantee.name {
+        Some(GranteeName::ObjectName(name)) => bare_name(name),
+        Some(GranteeName::UserHost { .. }) => {
+            Err(BindError::Unsupported("a user@host grantee".to_owned()))
+        }
+        None => Err(BindError::Unsupported(
+            "GRANT/REVOKE naming no grantee".to_owned(),
+        )),
+    }
+    .map(Grantee::Role)
 }
 
 fn bind_create_table(create: &CreateTable, stmt: &Statement) -> Result<DdlStatement, BindError> {
@@ -614,12 +868,18 @@ impl DdlStatement {
                 Err(CatalogError::UnknownIndex(_)) if if_exists => Ok(DdlOutcome::DropIndexNoOp),
                 Err(e) => Err(e),
             },
-            // User DDL ([STL-252]) mutates the engine's durable user store, not
-            // the schema catalog — the engine matches these variants itself and
-            // never routes them here. Reaching this arm is a routing bug.
-            Self::CreateUser { .. } | Self::AlterUserPassword { .. } | Self::DropUser { .. } => {
-                unreachable!("user DDL is applied by the session engine's user store, not Catalog")
-            }
+            // User/role DDL ([STL-252]) and GRANT/REVOKE ([ADR-0034]) mutate the
+            // engine's durable role store, not the schema catalog — the engine
+            // matches these variants itself and never routes them here.
+            // Reaching an arm below is a routing bug in the caller, reported as
+            // an error rather than a panic: `apply` is public API and the
+            // release profile aborts on panic, so a mis-route would take the
+            // process down instead of failing one statement.
+            Self::CreateUser { .. } => Err(CatalogError::NotCatalogDdl("CREATE USER")),
+            Self::AlterUserPassword { .. } => Err(CatalogError::NotCatalogDdl("ALTER USER")),
+            Self::DropUser { .. } => Err(CatalogError::NotCatalogDdl("DROP USER")),
+            Self::Grant { .. } => Err(CatalogError::NotCatalogDdl("GRANT")),
+            Self::Revoke { .. } => Err(CatalogError::NotCatalogDdl("REVOKE")),
         }
     }
 }

@@ -211,6 +211,9 @@ const SQLSTATE_INVALID_PASSWORD: &str = "28P01";
 // failures, so stock clients classify them natively.
 const SQLSTATE_DUPLICATE_OBJECT: &str = "42710";
 const SQLSTATE_UNDEFINED_OBJECT: &str = "42704";
+/// `insufficient_privilege` ([ADR-0034]) — the role may not do this. The code
+/// stock drivers and ORMs already classify as a permission failure.
+const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
 // DDL-routing SQLSTATEs (STL-131): the standard Postgres codes for the catalog
 // failures a `CREATE`/`DROP TABLE` can hit, so a stock client classifies them
 // the way it would against Postgres.
@@ -2605,6 +2608,7 @@ fn sqlstate_for_query(err: &EngineError) -> &'static str {
             SQLSTATE_CARDINALITY_VIOLATION
         }
         // A write-write conflict at COMMIT — the retryable serialization failure.
+        EngineError::PermissionDenied { .. } => SQLSTATE_INSUFFICIENT_PRIVILEGE,
         EngineError::Conflict => SQLSTATE_SERIALIZATION_FAILURE,
     }
 }
@@ -2770,6 +2774,12 @@ const fn sqlstate_for(err: &EngineError) -> &'static str {
         // returns for `CREATE`/`DROP ROLE` failures.
         EngineError::DuplicateUser(_) => SQLSTATE_DUPLICATE_OBJECT,
         EngineError::UnknownUser(_) => SQLSTATE_UNDEFINED_OBJECT,
+        // A privilege refusal ([ADR-0034]) reaches this mapper on every DDL
+        // route — `CREATE TABLE`, `DROP TABLE`, role DDL, `GRANT`. It needs an
+        // explicit arm: unlike `sqlstate_for_query` this match ends in a
+        // catch-all, so without one a denial would report `XX000` (internal
+        // error) and no driver would classify it as a permission failure.
+        EngineError::PermissionDenied { .. } => SQLSTATE_INSUFFICIENT_PRIVILEGE,
         // Storage/scan/select/unknown-table/unsupported can't arise from a DDL
         // route, but map them rather than panic if the contract ever shifts.
         _ => SQLSTATE_INTERNAL_ERROR,
