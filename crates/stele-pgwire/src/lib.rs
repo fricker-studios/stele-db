@@ -211,6 +211,12 @@ const SQLSTATE_INVALID_PASSWORD: &str = "28P01";
 // failures, so stock clients classify them natively.
 const SQLSTATE_DUPLICATE_OBJECT: &str = "42710";
 const SQLSTATE_UNDEFINED_OBJECT: &str = "42704";
+/// `insufficient_privilege` ([ADR-0034]) — the role may not do this. The code
+/// stock drivers and ORMs already classify as a permission failure.
+const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
+/// `reserved_name` — the statement named an identifier the engine reserves
+/// (the bootstrap superuser, [ADR-0034]).
+const SQLSTATE_RESERVED_NAME: &str = "42939";
 // DDL-routing SQLSTATEs (STL-131): the standard Postgres codes for the catalog
 // failures a `CREATE`/`DROP TABLE` can hit, so a stock client classifies them
 // the way it would against Postgres.
@@ -642,6 +648,9 @@ pub struct Server {
 }
 
 impl Server {
+    /// A plaintext server for `listen_addr` over `session`, with TLS
+    /// unconfigured and the default [`AuthMode`]; layer policy on with
+    /// [`with_tls`](Self::with_tls) / [`with_auth`](Self::with_auth).
     #[must_use]
     pub fn new(listen_addr: SocketAddr, session: SharedSession) -> Self {
         Self {
@@ -816,15 +825,22 @@ impl BoundServer {
 /// listener loop and do not affect other connections.
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
+    /// The socket failed mid-conversation (reset, broken pipe, timeout).
     #[error("io error: {0}")]
     Io(#[from] io::Error),
 
+    /// The client sent bytes that do not parse as the message the protocol
+    /// state expects.
     #[error("protocol violation: {0}")]
     Protocol(&'static str),
 
+    /// The startup packet asked for a protocol major.minor this server does
+    /// not speak (only 3.0 is supported).
     #[error("unsupported protocol version: {0}")]
     UnsupportedVersion(i32),
 
+    /// The client closed the connection during startup — the ordinary end of
+    /// a `CancelRequest` probe or a port scan, not a fault.
     #[error("client cancelled startup")]
     Cancelled,
 
@@ -2595,6 +2611,8 @@ fn sqlstate_for_query(err: &EngineError) -> &'static str {
             SQLSTATE_CARDINALITY_VIOLATION
         }
         // A write-write conflict at COMMIT — the retryable serialization failure.
+        EngineError::PermissionDenied { .. } => SQLSTATE_INSUFFICIENT_PRIVILEGE,
+        EngineError::ReservedRole(_) => SQLSTATE_RESERVED_NAME,
         EngineError::Conflict => SQLSTATE_SERIALIZATION_FAILURE,
     }
 }
@@ -2760,6 +2778,13 @@ const fn sqlstate_for(err: &EngineError) -> &'static str {
         // returns for `CREATE`/`DROP ROLE` failures.
         EngineError::DuplicateUser(_) => SQLSTATE_DUPLICATE_OBJECT,
         EngineError::UnknownUser(_) => SQLSTATE_UNDEFINED_OBJECT,
+        // A privilege refusal ([ADR-0034]) reaches this mapper on every DDL
+        // route — `CREATE TABLE`, `DROP TABLE`, role DDL, `GRANT`. It needs an
+        // explicit arm: unlike `sqlstate_for_query` this match ends in a
+        // catch-all, so without one a denial would report `XX000` (internal
+        // error) and no driver would classify it as a permission failure.
+        EngineError::PermissionDenied { .. } => SQLSTATE_INSUFFICIENT_PRIVILEGE,
+        EngineError::ReservedRole(_) => SQLSTATE_RESERVED_NAME,
         // Storage/scan/select/unknown-table/unsupported can't arise from a DDL
         // route, but map them rather than panic if the contract ever shifts.
         _ => SQLSTATE_INTERNAL_ERROR,

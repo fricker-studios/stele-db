@@ -155,6 +155,11 @@ pub enum UserDdl {
         name: String,
         /// The password to derive a SCRAM verifier from.
         password: Password,
+        /// `SUPERUSER` was given — the role bypasses every privilege check
+        /// ([ADR-0034]). Settable only at creation, and only by a superuser.
+        ///
+        /// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+        superuser: bool,
     },
     /// `ALTER USER <name> [WITH] PASSWORD '<password>'` — rotate the password.
     AlterUserPassword {

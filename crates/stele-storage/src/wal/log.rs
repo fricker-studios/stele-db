@@ -40,11 +40,14 @@ impl Default for WalConfig {
 /// `LogOffset` directly usable as a [`Checkpoint`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LogOffset {
+    /// Which WAL segment file the offset falls in (numbered from 0).
     pub segment_index: u64,
+    /// Byte offset within that segment file.
     pub byte_offset: u64,
 }
 
 impl LogOffset {
+    /// The very start of the log: segment 0, byte 0.
     pub const ZERO: Self = Self {
         segment_index: 0,
         byte_offset: 0,
@@ -57,15 +60,19 @@ impl LogOffset {
 pub struct Checkpoint(pub LogOffset);
 
 impl Checkpoint {
+    /// Replay the whole log from its first byte — the checkpoint before any
+    /// checkpoint has been taken.
     pub const BEGIN: Self = Self(LogOffset::ZERO);
 }
 
 /// Errors surfaced from the WAL.
 #[derive(Debug, thiserror::Error)]
 pub enum WalError {
+    /// The record payload exceeds [`MAX_PAYLOAD_LEN`] and cannot be framed.
     #[error("payload too large: {0} > {MAX_PAYLOAD_LEN}")]
     PayloadTooLarge(usize),
 
+    /// Underlying disk I/O failed.
     #[error("i/o error: {0}")]
     Io(#[from] io::Error),
 

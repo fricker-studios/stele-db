@@ -286,6 +286,14 @@ impl<F: DiskFile> SegmentWriter<F> {
         (!summary.is_empty()).then_some(summary)
     }
 
+    /// Seal the segment: encode the buffered rows into column chunks, write
+    /// every row-group, the footer, and the trailer, then fsync. After this
+    /// returns the file is immutable and readable by [`SegmentReader`]; on
+    /// error the partial file is dead debris the manifest never names
+    /// ([ADR-0030]).
+    ///
+    /// [`SegmentReader`]: crate::segment::reader::SegmentReader
+    /// [ADR-0030]: ../../../../docs/adr/0030-segment-manifest-retirement.md
     #[allow(clippy::too_many_lines)] // one sequential seal: encode columns → write chunks → footer → trailer → sync
     pub fn finish(mut self) -> Result<(), SegmentError> {
         // Per-column buffers. Row order is preserved: column i's k-th value

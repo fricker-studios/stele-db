@@ -86,7 +86,7 @@ use stele_exec::{
     hash_aggregate, hash_join, limit_selection, sort_selection,
 };
 use stele_sql::Password;
-use stele_sql::ddl::{DdlOutcome, DdlStatement};
+use stele_sql::ddl::{DdlOutcome, DdlStatement, Grantee, Privilege};
 use stele_sql::dml::{BoundDml, DmlError, InsertRow};
 use stele_sql::merge::{BoundMerge, MergeBound, MergeSource, MergeValid, MergeValue};
 use stele_sql::select::{
@@ -547,11 +547,16 @@ pub enum IsolationLevel {
 /// [ADR-0008]: ../../../docs/adr/0008-mvcc-on-append-only.md
 #[derive(Debug)]
 pub struct SessionTransaction {
-    /// The system-time snapshot pinned at [`begin`](SessionEngine::begin). Every
-    /// read in the transaction resolves here, and a write-write conflict is one
-    /// whose key was committed by another transaction *after* this instant. Under
-    /// [`IsolationLevel::ReadCommitted`] it is re-pinned toward the present before
-    /// each statement, so the conflict anchor advances with it.
+    /// The system-time snapshot this transaction currently **reads** at. Pinned
+    /// at [`begin`](SessionEngine::begin); re-pinned toward the present by
+    /// [`repin_snapshot`](SessionEngine::repin_snapshot) — before each statement
+    /// under [`IsolationLevel::ReadCommitted`], and after a DDL auto-commits
+    /// inside any block.
+    ///
+    /// This is the *read* pin only. Write-write conflict detection anchors on
+    /// [`write_anchors`](Self::write_anchors) instead: a re-pin advances what the
+    /// transaction can see, and must never retroactively forgive a conflict
+    /// against a write that was already staged under an older snapshot.
     snapshot: SystemTimeMicros,
     /// The isolation level this transaction reads under ([STL-248]). The default,
     /// [`IsolationLevel::RepeatableRead`], keeps the single `BEGIN`-pinned snapshot;
@@ -562,6 +567,18 @@ pub struct SessionTransaction {
     /// at commit so a later `UPDATE` of a key staged after its `INSERT` lands in
     /// the order the client issued them.
     writes: Vec<BoundDml>,
+    /// Per-write conflict anchors, parallel to [`writes`](Self::writes): entry `i`
+    /// is the read snapshot `writes[i]` was staged under.
+    ///
+    /// [`commit`](SessionEngine::commit) tests each write against *its own*
+    /// anchor, because a write computed from state read at snapshot `s` is only
+    /// safe if nobody else committed that key after `s`. Anchoring on the live
+    /// [`snapshot`](Self::snapshot) instead would lose updates: a re-pin (a DDL
+    /// inside the block, or every statement under `READ COMMITTED`) moves the
+    /// pin past a concurrent commit, and the conflict that should abort this
+    /// transaction silently passes — the concurrent writer's row is overwritten
+    /// by a value derived from a version that no longer exists.
+    write_anchors: Vec<SystemTimeMicros>,
     /// The open savepoints, innermost last ([STL-176]). Each marks the length of
     /// `writes` at the instant the savepoint was established, so `ROLLBACK TO`
     /// truncates `writes` back to that marker — undoing exactly the writes staged
@@ -686,6 +703,44 @@ impl SessionTransaction {
         self.isolation = isolation;
     }
 
+    /// Buffer one bound write, anchored at the snapshot it was resolved against.
+    ///
+    /// **The only way to add to the write set**, together with
+    /// [`stage_all`](Self::stage_all). `writes` and
+    /// [`write_anchors`](Self::write_anchors) must stay exactly parallel —
+    /// [`SessionEngine::commit`] pairs them by index to conflict-check each
+    /// write against its own anchor — and a bare `writes.push` at any of the
+    /// five staging sites would silently desynchronize them. Routing every site
+    /// through here makes that drift unrepresentable rather than a convention
+    /// to remember.
+    fn stage(&mut self, dml: BoundDml, anchor: SystemTimeMicros) {
+        self.writes.push(dml);
+        self.write_anchors.push(anchor);
+    }
+
+    /// Buffer several bound writes that all resolved at the same snapshot — the
+    /// expansion of one statement (a multi-row `INSERT`, a scan-driven
+    /// `UPDATE`/`DELETE`, a `MERGE`, a staged `COPY`) into per-key writes.
+    ///
+    /// They share `anchor` because they share a statement: the expansion read
+    /// the rows it matched at that one snapshot.
+    fn stage_all(&mut self, dmls: impl IntoIterator<Item = BoundDml>, anchor: SystemTimeMicros) {
+        for dml in dmls {
+            self.stage(dml, anchor);
+        }
+    }
+
+    /// The buffered writes and their anchors, in staging order — paired, so a
+    /// caller cannot read one without the other.
+    fn staged(&self) -> impl Iterator<Item = (&BoundDml, SystemTimeMicros)> {
+        debug_assert_eq!(
+            self.writes.len(),
+            self.write_anchors.len(),
+            "write anchors must stay parallel to writes",
+        );
+        self.writes.iter().zip(self.write_anchors.iter().copied())
+    }
+
     /// Establish a savepoint at the current write position (`SAVEPOINT name`,
     /// [STL-176]).
     ///
@@ -714,6 +769,9 @@ impl SessionTransaction {
             return false;
         };
         self.writes.truncate(self.savepoints[idx].mark);
+        // The anchors run parallel to `writes` — truncate in step so every
+        // surviving write keeps its own conflict anchor.
+        self.write_anchors.truncate(self.savepoints[idx].mark);
         // Keep the named savepoint (index `idx`); drop the ones nested inside it.
         self.savepoints.truncate(idx + 1);
         true
@@ -931,6 +989,38 @@ pub enum EngineError {
     #[error("a scanned business key could not be decoded while expanding a predicate DML")]
     MalformedBusinessKey,
 
+    /// The connection's role may not perform this operation ([ADR-0034]).
+    ///
+    /// Reported to the wire as SQLSTATE `42501` (`insufficient_privilege`), the
+    /// code stock drivers and ORMs already classify as a permission failure.
+    /// The message names the role, the action, and the object so an operator
+    /// can write the `GRANT` that fixes it without turning on debug logging.
+    ///
+    /// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+    #[error("permission denied for role {role:?} to {action}{}",
+        object.as_ref().map_or_else(String::new, |o| format!(" table {o:?}")))]
+    PermissionDenied {
+        /// The role the statement ran as.
+        role: String,
+        /// What it tried to do — a privilege keyword, or a verb like
+        /// `administer` for an ownership check.
+        action: String,
+        /// The table involved, or [`None`] for an operation with no object
+        /// (role DDL, an admin verb).
+        object: Option<String>,
+    },
+
+    /// A role DDL statement named the reserved bootstrap identity ([ADR-0034]).
+    ///
+    /// Reported as SQLSTATE `42939` (`reserved_name`). The built-in superuser
+    /// deliberately has no stored credential — that is what makes it
+    /// unauthenticatable under SCRAM — so creating, rotating, or dropping it is
+    /// refused rather than allowed to undo the property.
+    ///
+    /// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+    #[error("role {0:?} is reserved")]
+    ReservedRole(String),
+
     /// A `CREATE USER` named a user that already exists ([STL-252]). Postgres
     /// wording so the wire layer's `42710` (`duplicate_object`) reads natively.
     ///
@@ -1143,7 +1233,14 @@ pub struct SessionEngine<C: Clock + Clone, D: Disk + Clone> {
     /// password.
     ///
     /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
-    users: BTreeMap<String, ScramVerifier>,
+    users: BTreeMap<String, Role>,
+    /// The live authorization state ([ADR-0034]): table owners and grants.
+    /// Current policy only — an `AS OF` read is authorized against *this*, not
+    /// against the grants that existed at its snapshot, so time travel cannot
+    /// re-enter a revoked privilege.
+    ///
+    /// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+    access: AccessControl,
     /// The principal stamped on every version this session commits ([STL-300]).
     ///
     /// Provenance is captured inline at commit (invariant 5); this is its identity
@@ -1190,6 +1287,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             analyze: RefCell::new(explain::Profiler::default()),
             metrics: SharedMetrics::default(),
             users: BTreeMap::new(),
+            access: AccessControl::default(),
             write_principal: Principal::new(WIRE_PRINCIPAL.to_vec()),
         }
     }
@@ -1302,6 +1400,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         let ReplayedCatalog {
             catalog,
             users,
+            access,
             tiers,
             latest_drop,
             next_namespace,
@@ -1365,6 +1464,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             analyze: RefCell::new(explain::Profiler::default()),
             metrics: SharedMetrics::default(),
             users,
+            access,
             write_principal: Principal::new(WIRE_PRINCIPAL.to_vec()),
         };
         // Recovered tiers were opened before the session's registry existed;
@@ -1679,6 +1779,259 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     #[must_use]
     pub fn is_poisoned(&self) -> bool {
         self.commit_poisoned || self.tables.values().any(|state| state.engine.is_poisoned())
+    }
+
+    // -----------------------------------------------------------------------
+    // Authorization ([ADR-0034])
+    //
+    // Every check resolves against the *current* policy, never the read
+    // snapshot: a `SELECT … AS OF <past>` is authorized by the grants that
+    // exist now, so revoking a privilege cannot be undone by time-travelling
+    // to before the `REVOKE` (docs/10 §6).
+    // -----------------------------------------------------------------------
+
+    /// The role the current statement runs as — the connection's authenticated
+    /// principal, re-applied under the engine lock before every dispatch.
+    ///
+    /// A principal that is not valid UTF-8 resolves to the empty name, which no
+    /// role can hold (the parser requires an identifier) and which is not
+    /// [`BOOTSTRAP_SUPERUSER`] — so it owns nothing, holds nothing, and is
+    /// refused everywhere. `set_principal` already `debug_assert`s the input is
+    /// UTF-8; this is what happens in release if that assertion is ever wrong,
+    /// and it must fail **closed**. Falling back to the bootstrap identity would
+    /// turn a caller bug into a total authorization bypass.
+    fn current_role(&self) -> &str {
+        std::str::from_utf8(self.write_principal.as_bytes()).unwrap_or("")
+    }
+
+    /// Whether the current role bypasses every privilege check.
+    ///
+    /// True for a role created with the attribute, and for the built-in
+    /// [`BOOTSTRAP_SUPERUSER`] identity — which is what makes a fresh database
+    /// administrable and what keeps the in-process/embedded API (whose default
+    /// principal is exactly that identity) unrestricted.
+    fn is_superuser(&self) -> bool {
+        let role = self.current_role();
+        role == BOOTSTRAP_SUPERUSER || self.users.get(role).is_some_and(|r| r.superuser)
+    }
+
+    /// Refuse unless the current role is a superuser.
+    ///
+    /// The gate for every operation with no object to grant on: role DDL and
+    /// the admin verbs. `what` names the operation in the error.
+    fn require_superuser(&self, what: &'static str) -> Result<(), EngineError> {
+        if self.is_superuser() {
+            return Ok(());
+        }
+        Err(EngineError::PermissionDenied {
+            role: self.current_role().to_owned(),
+            action: what.to_owned(),
+            object: None,
+        })
+    }
+
+    /// Refuse unless the current role owns `table` (or is a superuser).
+    ///
+    /// Ownership — not a privilege — is what permits `DROP`, `GRANT`, and
+    /// `REVOKE`: a privilege you were granted never lets you re-grant it.
+    fn require_table_owner(&self, table: &str) -> Result<(), EngineError> {
+        if self.is_superuser() {
+            return Ok(());
+        }
+        if self.access.owners.get(table).map(String::as_str) == Some(self.current_role()) {
+            return Ok(());
+        }
+        Err(EngineError::PermissionDenied {
+            role: self.current_role().to_owned(),
+            action: "administer".to_owned(),
+            object: Some(table.to_owned()),
+        })
+    }
+
+    /// Refuse unless the current role may exercise `privilege` on `table`.
+    ///
+    /// Three ways to pass, in the order they are cheapest to check: the role is
+    /// a superuser, it owns the table (an owner implicitly holds everything),
+    /// or the privilege was granted to it directly or to `PUBLIC`.
+    fn authorize_table(&self, table: &str, privilege: Privilege) -> Result<(), EngineError> {
+        if self.is_superuser() {
+            return Ok(());
+        }
+        let role = self.current_role();
+        if self.access.owners.get(table).map(String::as_str) == Some(role) {
+            return Ok(());
+        }
+        if self.access.holds(role, table, privilege) {
+            return Ok(());
+        }
+        Err(EngineError::PermissionDenied {
+            role: role.to_owned(),
+            action: privilege.keyword().to_owned(),
+            object: Some(table.to_owned()),
+        })
+    }
+
+    /// Refuse unless the current role holds `privilege` on **every** table in
+    /// `tables` — the whole-statement check.
+    fn authorize_tables<'a>(
+        &self,
+        tables: impl IntoIterator<Item = &'a str>,
+        privilege: Privilege,
+    ) -> Result<(), EngineError> {
+        for table in tables {
+            self.authorize_table(table, privilege)?;
+        }
+        Ok(())
+    }
+
+    /// Authorize a bound `SELECT` — [`Privilege::Select`] on every base table
+    /// it reads.
+    ///
+    /// The table set is not one field: a `SELECT` reads its own relation, every
+    /// join side, every CTE body, and any subquery in its `WHERE`. Missing one
+    /// would leave a read path unguarded, so the walk is centralized here and
+    /// in [`collect_select_tables`].
+    fn authorize_select(&self, bound: &BoundSelect) -> Result<(), EngineError> {
+        let mut tables = BTreeSet::new();
+        collect_select_tables(bound, &mut tables);
+        self.authorize_tables(tables.iter().map(String::as_str), Privilege::Select)
+    }
+
+    /// Authorize a bound DML statement — the privilege its verb implies on its
+    /// target, plus [`Privilege::Select`] on a `MERGE`'s source table.
+    ///
+    /// A `MERGE` is the case worth spelling out: `BoundDml::table()` returns
+    /// only the *target*, so checking that alone would let a role with
+    /// `INSERT` on the target read a source table it has no privilege on.
+    fn authorize_dml(&self, dml: &BoundDml) -> Result<(), EngineError> {
+        match dml {
+            BoundDml::Insert { table, .. } | BoundDml::InsertRows { table, .. } => {
+                self.authorize_table(table, Privilege::Insert)
+            }
+            BoundDml::Update { table, .. } | BoundDml::UpdateScan { table, .. } => {
+                self.authorize_table(table, Privilege::Update)
+            }
+            BoundDml::Delete { table, .. } | BoundDml::DeleteScan { table, .. } => {
+                self.authorize_table(table, Privilege::Delete)
+            }
+            // A MERGE can insert, update, and delete, and the bound form does
+            // not say which arms fired — so require all three on the target
+            // rather than under-checking a branch that may run.
+            BoundDml::Merge(merge) => {
+                for privilege in [Privilege::Insert, Privilege::Update, Privilege::Delete] {
+                    self.authorize_table(&merge.table, privilege)?;
+                }
+                if let MergeSource::Table { name, .. } = &merge.source {
+                    self.authorize_table(name, Privilege::Select)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Authorize a statement that is *described* or *explained* rather than
+    /// executed — the inner statement of an `EXPLAIN`.
+    ///
+    /// Binds it and applies the same check its execution would, so a plan can
+    /// never be rendered over a table the role may not touch. A statement that
+    /// does not bind as a read or a write needs no check here: it either has no
+    /// table, or its own route rejects it.
+    fn authorize_inner(
+        &self,
+        stmt: &Statement,
+        read_snapshot: SystemTimeMicros,
+    ) -> Result<(), EngineError> {
+        let ctx = BindContext {
+            snapshot: read_snapshot,
+            catalog: &self.catalog,
+        };
+        if let Ok(bound) = bind_select(stmt, &ctx) {
+            return self.authorize_select(&bound);
+        }
+        if let Ok(dml) = bind_dml(stmt, &ctx) {
+            return self.authorize_dml(&dml);
+        }
+        Ok(())
+    }
+
+    /// Authorize a DDL statement before anything is validated or written
+    /// ([ADR-0034]).
+    ///
+    /// Three shapes: a statement with an object checks *ownership* of it (a
+    /// granted privilege never confers the right to administer); one with no
+    /// object is superuser-only; and `CREATE TABLE` is open to every role,
+    /// because you own what you create — which is what keeps the ordinary path
+    /// unprivileged.
+    ///
+    /// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+    fn authorize_ddl(&self, ddl: &DdlStatement) -> Result<(), EngineError> {
+        match ddl {
+            // `CREATE TABLE` needs no check, and GRANT/REVOKE check ownership
+            // of their target inside `apply_grant_ddl`, once the table is known
+            // to be live — checking here would report "not the owner" for a
+            // table that does not exist.
+            DdlStatement::CreateTable { .. }
+            | DdlStatement::Grant { .. }
+            | DdlStatement::Revoke { .. } => Ok(()),
+            // Only check ownership of a table that actually exists: a
+            // `DROP TABLE IF EXISTS <absent>` is a no-op every role may issue,
+            // and demanding ownership of a table nobody owns would refuse the
+            // idempotent teardown every setup script opens with. An absent name
+            // falls through to the apply, which reports the no-op (or an
+            // `UnknownTable` without `IF EXISTS`).
+            DdlStatement::DropTable { name, .. } => {
+                if self.catalog.resolve(name, self.clock.current()).is_some() {
+                    self.require_table_owner(name)?;
+                }
+                Ok(())
+            }
+            DdlStatement::CreateIndex { table, .. } => self.require_table_owner(table),
+            // A `DROP INDEX` names the index, not the table — resolve the table
+            // it accelerates and check that. An unknown index falls through
+            // unchecked to the apply, which reports it properly.
+            DdlStatement::DropIndex { name, .. } => self
+                .catalog
+                .index(name)
+                .map(|index| index.table().to_owned())
+                .map_or(Ok(()), |table| self.require_table_owner(&table)),
+            DdlStatement::CreateUser { .. } => self.require_superuser("CREATE USER"),
+            // A role may rotate **its own** password without being a superuser:
+            // that is not escalation, and forcing an operator into the loop for
+            // every routine rotation is what makes people share credentials.
+            // Changing anyone *else*'s password is superuser-only — it is the
+            // account-takeover primitive the July 2026 audit found wide open.
+            DdlStatement::AlterUserPassword { name, .. } if name == self.current_role() => Ok(()),
+            DdlStatement::AlterUserPassword { .. } => self.require_superuser("ALTER USER"),
+            DdlStatement::DropUser { .. } => self.require_superuser("DROP USER"),
+        }
+    }
+
+    /// Refuse the caller if a prior commit record failed to reach disk.
+    ///
+    /// A commit-log poison is session-fatal: the record failed *after* its data
+    /// leg was already durable, so live state and what [`recover`](Self::recover)
+    /// would reconstruct have diverged ([STL-314]). Every statement is refused —
+    /// reads included, since a divergent write may be visible — until a restart
+    /// into recovery resolves it. (The per-table WAL poison refuses lazily at the
+    /// next write; this is the more serious whole-session condition.)
+    ///
+    /// This is the single gate every entry point that reads or writes must pass
+    /// through. It is not enough to guard [`execute`](Self::execute) alone: the
+    /// transaction path buffers through [`stage_dml`](Self::stage_dml) and lands
+    /// through [`commit`](Self::commit), `COPY` lands through
+    /// [`copy_apply`](Self::copy_apply), and the typed
+    /// [`insert`](Self::insert)/[`update`](Self::update)/[`delete`](Self::delete)
+    /// bypass the router entirely — so a poisoned session that guarded only the
+    /// router would keep appending commit records past the divergence.
+    ///
+    /// [STL-314]: https://allegromusic.atlassian.net/browse/STL-314
+    fn refuse_if_commit_poisoned(&self) -> Result<(), EngineError> {
+        if self.commit_poisoned {
+            return Err(EngineError::CommitLog(io::Error::other(
+                "session poisoned by a failed commit-log append; restart to recover",
+            )));
+        }
+        Ok(())
     }
 
     /// The session's catalog — schemas resolve at a snapshot through it.
@@ -2281,7 +2634,14 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             catalog: &self.catalog,
         };
         match bind_select(&stripped, &ctx) {
-            Ok(bound) => Ok(Some(self.output_columns(&bound)?)),
+            Ok(bound) => {
+                // `Describe` never executes, but it *discloses* the column
+                // names and types of every table the statement reads — so it
+                // needs the same privilege the read itself would. Without this
+                // a prepared `SELECT * FROM secret` is a free schema oracle.
+                self.authorize_select(&bound)?;
+                Ok(Some(self.output_columns(&bound)?))
+            }
             // Not a SELECT (DDL / DML / admin / empty) ⇒ no row description.
             Err(SelectError::NotSelect) => Ok(None),
             Err(e) => Err(EngineError::Select(e)),
@@ -2425,7 +2785,29 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             snapshot,
             catalog: &self.catalog,
         };
-        Ok(bind_copy(stmt, &ctx)?.shape())
+        let bound = bind_copy(stmt, &ctx)?;
+        // The shape discloses the target's column count and is the pre-flight
+        // for the load itself, so it needs the same privilege the load does —
+        // otherwise a role with no access learns the table's arity by starting
+        // a COPY it can never finish.
+        self.authorize_table(&bound.table, Privilege::Insert)?;
+        Ok(bound.shape())
+    }
+
+    /// Authorize a `COPY … FROM STDIN` — [`Privilege::Insert`] on its target.
+    ///
+    /// Binds the statement to learn the table; a bind failure is left for the
+    /// caller's own bind to report, so the error the client sees is the same
+    /// one it would have seen without authorization in the path.
+    fn authorize_copy(&self, stmt: &Statement) -> Result<(), EngineError> {
+        let ctx = BindContext {
+            snapshot: self.clock.current(),
+            catalog: &self.catalog,
+        };
+        if let Ok(bound) = bind_copy(stmt, &ctx) {
+            self.authorize_table(&bound.table, Privilege::Insert)?;
+        }
+        Ok(())
     }
 
     /// Apply a streamed `COPY ... FROM STDIN` as an **auto-commit** bulk load: bind
@@ -2461,6 +2843,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         stmt: &Statement,
         rows: &[Vec<Option<String>>],
     ) -> Result<u64, EngineError> {
+        self.refuse_if_commit_poisoned()?;
+        self.authorize_copy(stmt)?;
         let snapshot = self.clock.observe();
         if rows.len() <= BULK_COPY_CHUNK_ROWS {
             let dml = self.bind_copy_insert(stmt, snapshot, rows)?;
@@ -2597,9 +2981,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         rows: &[Vec<Option<String>>],
         txn: &mut SessionTransaction,
     ) -> Result<u64, EngineError> {
+        self.refuse_if_commit_poisoned()?;
+        self.authorize_copy(stmt)?;
         let dml = self.bind_copy_insert(stmt, txn.snapshot, rows)?;
         let (writes, summary) = expand_insert_rows(dml);
-        txn.writes.extend(writes);
+        txn.stage_all(writes, txn.snapshot);
         match summary {
             DmlSummary::Insert(n) => Ok(n),
             _ => unreachable!("expand_insert_rows of InsertRows summarizes as Insert"),
@@ -2663,7 +3049,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// [STL-252]: https://allegromusic.atlassian.net/browse/STL-252
     #[must_use]
     pub fn auth_verifier(&self, user: &str) -> Option<ScramVerifier> {
-        self.users.get(user).cloned()
+        self.users.get(user).map(|role| role.verifier.clone())
     }
 
     /// How many users the live user store holds ([STL-252]). The server reads
@@ -2747,17 +3133,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         read_snapshot: SystemTimeMicros,
         overlay: &[BoundDml],
     ) -> Result<StatementOutcome, EngineError> {
-        // A commit-log poison is session-fatal: a prior commit record failed to reach
-        // disk *after* its data leg was durable, so the live state and what recovery
-        // would reconstruct have diverged ([STL-314]). Refuse every further statement
-        // — reads included, since a divergent write may be visible — until a restart
-        // into `recover` resolves it. (The per-table WAL poison refuses lazily at the
-        // next write; this is the more serious whole-session condition.)
-        if self.commit_poisoned {
-            return Err(EngineError::CommitLog(io::Error::other(
-                "session poisoned by a failed commit-log append; restart to recover",
-            )));
-        }
+        self.refuse_if_commit_poisoned()?;
 
         // `EXPLAIN [ANALYZE]` ([STL-260]) renders the inner statement's plan as a
         // tree. Routed before the binders since it wraps any inner body; the inner
@@ -2772,6 +3148,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // so they are routed before the binders, which all assume one ([STL-219]).
         // `clone` (not `Copy`) because `BACKUP` carries an owned path.
         if let StatementBody::Admin(cmd) = &stmt.body {
+            // The admin verbs have no object to grant on, so they are
+            // superuser-only ([ADR-0034] decision 4). `BACKUP` most of all: its
+            // target is a caller-supplied path and its output is the whole
+            // database, including the role store.
+            self.require_superuser(match cmd {
+                AdminCommand::Checkpoint => "CHECKPOINT",
+                AdminCommand::Flush => "FLUSH",
+                AdminCommand::Compact => "COMPACT",
+                AdminCommand::Backup { .. } => "BACKUP",
+            })?;
             return self.apply_admin(cmd.clone());
         }
 
@@ -2794,6 +3180,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // committed state at the current instant, not the overlay/`read_snapshot`,
         // so it ignores both (a transaction's buffered writes do not appear).
         if let Some((table, key)) = stele_history_call(stmt) {
+            // These read a table's rows and their provenance, so they need the
+            // same privilege an ordinary `SELECT` on it would.
+            self.authorize_table(&table, Privilege::Select)?;
             return self
                 .version_history(&table, key)
                 .map(StatementOutcome::Rows);
@@ -2806,6 +3195,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // the tier metadata as an ordinary row set — same committed-state, ignore-
         // the-overlay semantics as the history surface.
         if let Some(table) = stele_segments_call(stmt) {
+            self.authorize_table(&table, Privilege::Select)?;
             return self.segment_metadata(&table).map(StatementOutcome::Rows);
         }
 
@@ -2815,6 +3205,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // ([STL-302], [ADR-0031]), and the `hash ← prevHash` source for `\lineage`.
         // Same structural recognition and read-only semantics as `stele_history`.
         if let Some((table, key)) = stele_audit_call(stmt) {
+            self.authorize_table(&table, Privilege::Select)?;
             return self.audit_chain(&table, key).map(StatementOutcome::Rows);
         }
 
@@ -2837,6 +3228,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             };
             match bind_select(stmt, &ctx) {
                 Ok(bound) => {
+                    // Authorize every base table the read touches, before any
+                    // of it is scanned ([ADR-0034]).
+                    self.authorize_select(&bound)?;
                     // Read-your-own-writes ([STL-203], [STL-223]): a current read in
                     // the transaction overlays its buffered writes. A `FOR SYSTEM_TIME
                     // AS OF` qualifier drops the overlay — it time-travels the system
@@ -2889,6 +3283,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 Err(e) => return Err(EngineError::Dml(e)),
             }
         };
+        // Authorize the write before any of it is applied ([ADR-0034]).
+        self.authorize_dml(&bound)?;
         // A predicate-driven (or whole-table) UPDATE / DELETE takes the
         // scan-then-write plan ([STL-229]): enumerate the matching live keys at
         // the read snapshot, then apply the per-key writes as one atomic group.
@@ -2934,6 +3330,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     ///
     /// [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
     fn apply_ddl(&mut self, ddl: DdlStatement) -> Result<StatementOutcome, EngineError> {
+        self.authorize_ddl(&ddl)?;
         let at = self.clock.now();
         match ddl {
             DdlStatement::CreateTable {
@@ -2959,18 +3356,25 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                         (Some(tier), namespace)
                     }
                 };
+                let owner = self.current_role().to_owned();
                 let record = CatalogRecord::CreateTable {
                     at,
                     namespace,
                     name: name.clone(),
                     columns: columns.clone(),
                     temporal: temporal.clone(),
+                    owner: Some(owner.clone()),
                 };
                 let mut staged = self.catalog.clone();
                 let schema_id = staged.create_table(name.clone(), columns, temporal, at)?;
                 self.catalog_head = catalog_log::append(&self.disk, &record, self.catalog_head)
                     .map_err(EngineError::CatalogLog)?;
                 self.catalog = staged;
+                // A re-created name starts a fresh privilege era: the prior
+                // era's owner and grants go, so the new owner inherits nothing
+                // ([ADR-0034]).
+                self.access.forget_table(&name);
+                self.access.owners.insert(name.clone(), owner);
                 if let Some(tier) = tier {
                     self.tables.insert(name, tier);
                 }
@@ -3048,6 +3452,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             user @ (DdlStatement::CreateUser { .. }
             | DdlStatement::AlterUserPassword { .. }
             | DdlStatement::DropUser { .. }) => self.apply_user_ddl(user, at),
+            grant @ (DdlStatement::Grant { .. } | DdlStatement::Revoke { .. }) => {
+                self.apply_grant_ddl(grant, at)
+            }
         }
     }
 
@@ -3064,8 +3471,26 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         ddl: DdlStatement,
         at: SystemTimeMicros,
     ) -> Result<StatementOutcome, EngineError> {
+        // The bootstrap identity is reserved ([ADR-0034] decision 8). Its whole
+        // security property is that it has **no stored credential**, so under
+        // `auth = "scram"` no client can authenticate as it — `CREATE USER stele
+        // PASSWORD …` would mint exactly that credential and hand the built-in
+        // superuser to whoever chose the password. Dropping or rotating it is
+        // refused for the same reason: the name is the engine's, not the role
+        // store's.
+        if let DdlStatement::CreateUser { name, .. }
+        | DdlStatement::AlterUserPassword { name, .. }
+        | DdlStatement::DropUser { name, .. } = &ddl
+            && name == BOOTSTRAP_SUPERUSER
+        {
+            return Err(EngineError::ReservedRole(name.clone()));
+        }
         match ddl {
-            DdlStatement::CreateUser { name, password } => {
+            DdlStatement::CreateUser {
+                name,
+                password,
+                superuser,
+            } => {
                 if self.users.contains_key(&name) {
                     return Err(EngineError::DuplicateUser(name));
                 }
@@ -3074,10 +3499,17 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     at,
                     name: name.clone(),
                     verifier: verifier.clone(),
+                    superuser,
                 };
                 self.catalog_head = catalog_log::append(&self.disk, &record, self.catalog_head)
                     .map_err(EngineError::CatalogLog)?;
-                self.users.insert(name, verifier);
+                self.users.insert(
+                    name,
+                    Role {
+                        verifier,
+                        superuser,
+                    },
+                );
                 Ok(StatementOutcome::Ddl {
                     tag: DdlOutcome::CreatedUser.command_tag(),
                 })
@@ -3097,7 +3529,16 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 };
                 self.catalog_head = catalog_log::append(&self.disk, &record, self.catalog_head)
                     .map_err(EngineError::CatalogLog)?;
-                self.users.insert(name, verifier);
+                // A rotation replaces the verifier and keeps the attributes:
+                // `ALTER USER … PASSWORD` is not a route to gaining superuser.
+                let superuser = self.users.get(&name).is_some_and(|r| r.superuser);
+                self.users.insert(
+                    name,
+                    Role {
+                        verifier,
+                        superuser,
+                    },
+                );
                 Ok(StatementOutcome::Ddl {
                     tag: DdlOutcome::AlteredUser.command_tag(),
                 })
@@ -3120,6 +3561,9 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                 self.catalog_head = catalog_log::append(&self.disk, &record, self.catalog_head)
                     .map_err(EngineError::CatalogLog)?;
                 self.users.remove(&name);
+                // Every grant *to* the dropped role goes with it, so a name
+                // re-created later inherits nothing ([ADR-0034]).
+                self.access.forget_role(&name);
                 Ok(StatementOutcome::Ddl {
                     tag: DdlOutcome::DroppedUser.command_tag(),
                 })
@@ -3127,6 +3571,75 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // The table/index arms route through `apply_ddl` itself.
             _ => unreachable!("apply_user_ddl is only called with user DDL"),
         }
+    }
+
+    /// Apply a `GRANT` / `REVOKE` ([ADR-0034]).
+    ///
+    /// Same write-ahead discipline as every other catalog mutation: validate,
+    /// append + fsync the record (the durability point), then mutate the live
+    /// map — so a crash can never leave a privilege granted in memory but not
+    /// on disk.
+    ///
+    /// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+    fn apply_grant_ddl(
+        &mut self,
+        ddl: DdlStatement,
+        at: SystemTimeMicros,
+    ) -> Result<StatementOutcome, EngineError> {
+        let (table, grantee, privileges, granting) = match ddl {
+            DdlStatement::Grant {
+                table,
+                grantee,
+                privileges,
+            } => (table, grantee, privileges, true),
+            DdlStatement::Revoke {
+                table,
+                grantee,
+                privileges,
+            } => (table, grantee, privileges, false),
+            _ => unreachable!("apply_grant_ddl is only called with GRANT/REVOKE"),
+        };
+
+        // The table must be live: granting on a name that does not exist would
+        // silently stash a privilege that springs to life if the name is later
+        // created by someone else.
+        if self.catalog.resolve(&table, self.clock.current()).is_none() {
+            return Err(EngineError::UnknownTable(table));
+        }
+        // …and so must the grantee, for the same reason.
+        if let Grantee::Role(name) = &grantee
+            && !self.users.contains_key(name)
+        {
+            return Err(EngineError::UnknownUser(name.clone()));
+        }
+        // Only the owner or a superuser may hand out privileges on a table.
+        self.require_table_owner(&table)?;
+
+        let record = if granting {
+            CatalogRecord::Grant {
+                at,
+                table: table.clone(),
+                grantee: grantee.clone(),
+                privileges: privileges.clone(),
+            }
+        } else {
+            CatalogRecord::Revoke {
+                at,
+                table: table.clone(),
+                grantee: grantee.clone(),
+                privileges: privileges.clone(),
+            }
+        };
+        self.catalog_head = catalog_log::append(&self.disk, &record, self.catalog_head)
+            .map_err(EngineError::CatalogLog)?;
+        if granting {
+            self.access.grant(&table, &grantee, &privileges);
+        } else {
+            self.access.revoke(&table, &grantee, &privileges);
+        }
+        Ok(StatementOutcome::Ddl {
+            tag: if granting { "GRANT" } else { "REVOKE" },
+        })
     }
 
     /// Apply a `CREATE INDEX` ([STL-233]), following the same write-ahead
@@ -3364,6 +3877,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         overlay: &[BoundDml],
     ) -> Result<StatementOutcome, EngineError> {
         if !explain.analyze {
+            // A bare EXPLAIN never executes, but it *renders a plan over* the
+            // inner statement's tables — column names, join shape, index use.
+            // Authorize the inner statement, or EXPLAIN is a free structural
+            // oracle over tables the role cannot read ([ADR-0034]). The ANALYZE
+            // path below needs no separate check: it runs the inner through
+            // `execute_at`, which authorizes it.
+            self.authorize_inner(&explain.inner, read_snapshot)?;
             return self.explain_result(&explain.inner, read_snapshot, false, None, None);
         }
         self.analyze.borrow_mut().enable();
@@ -3394,6 +3914,11 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     ) -> Result<StatementOutcome, EngineError> {
         let snapshot = txn.snapshot;
         if !explain.analyze {
+            // Same reasoning as the auto-commit path: a plan discloses shape,
+            // so the inner statement is authorized even though it never runs.
+            // This route also bypasses `execute_at` entirely, so it is the one
+            // place the check cannot be inherited from the router.
+            self.authorize_inner(&explain.inner, snapshot)?;
             return self.explain_result(&explain.inner, snapshot, false, None, None);
         }
         self.analyze.borrow_mut().enable();
@@ -7697,6 +8222,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             snapshot,
             isolation,
             writes: Vec::new(),
+            write_anchors: Vec::new(),
             savepoints: Vec::new(),
             // Register the pinned snapshot so it holds the prune floor down for as
             // long as this transaction is open ([STL-204]). `begin` is `&self`, but
@@ -7729,11 +8255,19 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         stmt: &Statement,
         txn: &mut SessionTransaction,
     ) -> Result<Option<DmlSummary>, EngineError> {
+        self.refuse_if_commit_poisoned()?;
         let ctx = BindContext {
             snapshot: txn.snapshot,
             catalog: &self.catalog,
         };
-        match bind_dml(stmt, &ctx) {
+        // Authorize at *staging* time, when the acting role is the one that
+        // issued the statement. Deferring to `commit` would check a whole
+        // block's writes against whichever role happened to commit it.
+        let bound = bind_dml(stmt, &ctx);
+        if let Ok(dml) = &bound {
+            self.authorize_dml(dml)?;
+        }
+        match bound {
             // A scan-then-write UPDATE / DELETE ([STL-229]) expands **now**, at
             // the statement: the matching live keys are enumerated at the pinned
             // snapshot with the transaction's own buffered writes overlaid
@@ -7746,7 +8280,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // only ever sees per-key writes.
             Ok(dml @ (BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. })) => {
                 let (writes, summary) = self.expand_scan_dml(dml, txn.snapshot, &txn.writes)?;
-                txn.writes.extend(writes);
+                txn.stage_all(writes, txn.snapshot);
                 Ok(Some(summary))
             }
             // A MERGE expands at staging the same way ([STL-230]): the probe and
@@ -7755,7 +8289,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // [STL-203]), and the buffer only ever holds the per-key writes.
             Ok(BoundDml::Merge(merge)) => {
                 let (writes, summary) = self.expand_merge(&merge, txn.snapshot, &txn.writes)?;
-                txn.writes.extend(writes);
+                txn.stage_all(writes, txn.snapshot);
                 Ok(Some(summary))
             }
             // A multi-row INSERT ([STL-228]) expands at staging into one buffered
@@ -7765,7 +8299,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // commit them as one atomic group. The tag reports the row count now.
             Ok(dml @ BoundDml::InsertRows { .. }) => {
                 let (writes, summary) = expand_insert_rows(dml);
-                txn.writes.extend(writes);
+                txn.stage_all(writes, txn.snapshot);
                 Ok(Some(summary))
             }
             Ok(dml) => {
@@ -7782,7 +8316,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     return Ok(Some(summary));
                 }
                 let summary = dml_summary(&dml);
-                txn.writes.push(dml);
+                // Anchored at the snapshot it was just bound and resolved
+                // against, so a later re-pin cannot forgive a conflict it
+                // should abort on.
+                txn.stage(dml, txn.snapshot);
                 Ok(Some(summary))
             }
             Err(DmlError::NotDml) => Ok(None),
@@ -7850,14 +8387,28 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
     /// in-memory tiers when a *later* one fails is not yet rolled back in memory
     /// ([STL-216]).
     pub fn commit(&mut self, txn: SessionTransaction) -> Result<(), EngineError> {
+        self.refuse_if_commit_poisoned()?;
         // First-committer-wins write-write conflict detection. Checked up front, so
         // a conflict aborts the whole transaction before any write lands.
-        for dml in &txn.writes {
+        //
+        // Each write is tested against **its own** staging snapshot, not the
+        // transaction's live read pin: the pin advances on a re-pin (a DDL inside
+        // the block, or every statement under READ COMMITTED), and anchoring on it
+        // would let a commit that landed before the re-pin slip past the check —
+        // silently overwriting it with a value derived from a version that is no
+        // longer current. See [`SessionTransaction::write_anchors`].
+        // `staged()` pairs each write with its own anchor. It is deliberately
+        // the only reader: iterating the two vectors with a bare `zip` here
+        // would silently *truncate* to the shorter one, so a staging site that
+        // forgot to record an anchor would skip conflict detection for its
+        // writes entirely — turning a missed line into a silent lost update
+        // rather than a loud failure.
+        for (dml, anchor) in txn.staged() {
             let key = (dml.table().to_owned(), dml_business_key(dml));
             if self
                 .write_index
                 .get(&key)
-                .is_some_and(|&committed_at| committed_at > txn.snapshot)
+                .is_some_and(|&committed_at| committed_at > anchor)
             {
                 self.metrics.txn_conflicts.inc();
                 return Err(EngineError::Conflict);
@@ -8093,6 +8644,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<DmlOutcome, EngineError> {
+        self.refuse_if_commit_poisoned()?;
+        self.authorize_table(table, Privilege::Insert)?;
         let state = self.table_mut(table)?;
         Ok(state
             .engine
@@ -8115,6 +8668,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<DmlOutcome, EngineError> {
+        self.refuse_if_commit_poisoned()?;
+        self.authorize_table(table, Privilege::Update)?;
         let state = self.table_mut(table)?;
         Ok(state
             .engine
@@ -8133,6 +8688,8 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         txn_id: TxnId,
         principal: Principal,
     ) -> Result<DmlOutcome, EngineError> {
+        self.refuse_if_commit_poisoned()?;
+        self.authorize_table(table, Privilege::Delete)?;
         let state = self.table_mut(table)?;
         Ok(state.engine.delete(key, txn_id, principal)?)
     }
@@ -8169,6 +8726,19 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
 /// [STL-300]: https://allegromusic.atlassian.net/browse/STL-300
 const WIRE_PRINCIPAL: &[u8] = b"stele";
 
+/// The built-in bootstrap superuser ([ADR-0034] decision 8).
+///
+/// A fresh database has no roles, so something must be able to create the
+/// first one. This identity — already the default principal for an
+/// unauthenticated startup and for a direct embedded writer (STL-300) — is a
+/// superuser by construction and has no stored credential. Under
+/// `auth = "scram"` no client can authenticate *as* it, so the bootstrap path
+/// is explicit: boot once on loopback with `auth = "trust"` (or `--dev`),
+/// create a role, then switch to `scram`.
+///
+/// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+const BOOTSTRAP_SUPERUSER: &str = "stele";
+
 /// Rows per chunk on the bulk `COPY` fast path ([STL-240]).
 ///
 /// A `COPY` larger than this streams through the chunked bulk-load path: each chunk
@@ -8181,13 +8751,112 @@ const WIRE_PRINCIPAL: &[u8] = b"stele";
 /// memory across chunks regardless of this value.
 const BULK_COPY_CHUNK_ROWS: usize = 4096;
 
+/// A role's stored attributes ([ADR-0034]).
+///
+/// Roles and users are one namespace, Postgres-style: a role with a verifier
+/// can log in, and the same name is what a `GRANT` targets.
+///
+/// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Role {
+    /// The stored SCRAM-SHA-256 verifier — what an authentication attempt is
+    /// checked against. Never a password.
+    pub verifier: ScramVerifier,
+    /// Whether this role bypasses every privilege check.
+    pub superuser: bool,
+}
+
+/// The live authorization state ([ADR-0034]) — current policy only.
+///
+/// Deliberately **not** bitemporal: a `SELECT … AS OF <past>` is authorized
+/// against the grants that exist *now*, so revoking a privilege cannot be
+/// undone by time-travelling to before the `REVOKE`. See [10 §6] and
+/// [ADR-0034] decision 5.
+///
+/// [10 §6]: ../../../docs/10-security-and-compliance.md#6-authorization
+/// [ADR-0034]: ../../../docs/adr/0034-role-based-access-control.md
+#[derive(Debug, Default, Clone)]
+struct AccessControl {
+    /// Table name → the role that owns it. A table with no entry is owned by
+    /// the bootstrap superuser (a pre-ADR-0034 record, or a table created
+    /// before ownership existed) — the fail-closed reading, since only a
+    /// superuser then reaches it.
+    owners: BTreeMap<String, String>,
+    /// `(table, grantee)` → the privileges that grantee holds on that table.
+    /// A `PUBLIC` grant is keyed by [`Grantee::Public`] and applies to every
+    /// role, including ones created later.
+    grants: BTreeMap<(String, Grantee), BTreeSet<Privilege>>,
+}
+
+impl AccessControl {
+    /// Add `privileges` to `grantee`'s set for `table`.
+    fn grant(&mut self, table: &str, grantee: &Grantee, privileges: &[Privilege]) {
+        self.grants
+            .entry((table.to_owned(), grantee.clone()))
+            .or_default()
+            .extend(privileges.iter().copied());
+    }
+
+    /// Remove `privileges` from `grantee`'s set for `table`. Revoking a
+    /// privilege the grantee does not hold is a no-op, matching Postgres; an
+    /// emptied set is dropped so the map does not accumulate hollow entries.
+    fn revoke(&mut self, table: &str, grantee: &Grantee, privileges: &[Privilege]) {
+        let key = (table.to_owned(), grantee.clone());
+        if let Some(held) = self.grants.get_mut(&key) {
+            for privilege in privileges {
+                held.remove(privilege);
+            }
+            if held.is_empty() {
+                self.grants.remove(&key);
+            }
+        }
+    }
+
+    /// Drop every trace of `table` — its owner and every grant on it.
+    ///
+    /// Called when the name is dropped, so a table later re-created under the
+    /// same name never inherits the previous era's privileges. Without this a
+    /// `DROP` + `CREATE` would silently resurrect grants the new owner never
+    /// made, which is the same class of bug [STL-211] fixed for rows.
+    ///
+    /// [STL-211]: https://allegromusic.atlassian.net/browse/STL-211
+    fn forget_table(&mut self, table: &str) {
+        self.owners.remove(table);
+        self.grants.retain(|(name, _), _| name != table);
+    }
+
+    /// Drop every grant *to* `role` — called when the role is dropped, so a
+    /// name later re-created never inherits the old role's privileges.
+    fn forget_role(&mut self, role: &str) {
+        self.grants
+            .retain(|(_, grantee), _| !matches!(grantee, Grantee::Role(name) if name == role));
+    }
+
+    /// Whether `role` holds `privilege` on `table`, by direct grant or via
+    /// `PUBLIC`. Ownership and superuser are checked by the caller.
+    fn holds(&self, role: &str, table: &str, privilege: Privilege) -> bool {
+        let direct = self
+            .grants
+            .get(&(table.to_owned(), Grantee::Role(role.to_owned())))
+            .is_some_and(|held| held.contains(&privilege));
+        direct
+            || self
+                .grants
+                .get(&(table.to_owned(), Grantee::Public))
+                .is_some_and(|held| held.contains(&privilege))
+    }
+}
+
 /// The in-memory state step 1 of [`SessionEngine::recover`] derives from the
 /// replayed catalog log, before any tier is reopened.
 struct ReplayedCatalog {
     /// The schema-version chains, reproduced in recorded order.
     catalog: Catalog,
-    /// The user store ([STL-252]): name → latest acknowledged verifier.
-    users: BTreeMap<String, ScramVerifier>,
+    /// The role store ([STL-252], [ADR-0034]): name → latest acknowledged
+    /// verifier and attributes.
+    users: BTreeMap<String, Role>,
+    /// The folded authorization state ([ADR-0034]) — table owners and grants.
+    access: AccessControl,
     /// Per name, the tier to reopen: the namespace and valid-time policy of
     /// its *latest* create. (A drop keeps the entry — the tier stays resident
     /// for history, exactly as in a live session.)
@@ -8211,8 +8880,13 @@ struct ReplayedCatalog {
 /// in-memory state — step 1 of [`SessionEngine::recover`] ([ADR-0028]).
 ///
 /// [ADR-0028]: ../../../docs/adr/0028-durable-catalog-log.md
+// One arm per record kind, each a few lines of folding — the length is the
+// record vocabulary's, not a missing abstraction's, and splitting it would put
+// half the replay semantics out of sight of the other half.
+#[allow(clippy::too_many_lines)]
 fn fold_catalog_records(records: Vec<CatalogRecord>) -> Result<ReplayedCatalog, EngineError> {
     let mut folded = ReplayedCatalog {
+        access: AccessControl::default(),
         catalog: Catalog::new(),
         users: BTreeMap::new(),
         tiers: BTreeMap::new(),
@@ -8228,13 +8902,24 @@ fn fold_catalog_records(records: Vec<CatalogRecord>) -> Result<ReplayedCatalog, 
                 name,
                 columns,
                 temporal,
+                owner,
             } => {
                 let valid_time = temporal.valid_time_enabled();
                 folded
                     .catalog
                     .create_table(name.clone(), columns, temporal, at)?;
+                // A re-created name starts a fresh era: clear the prior era's
+                // owner and grants before recording this one's, so privileges
+                // never survive a DROP.
+                folded.access.forget_table(&name);
+                if let Some(owner) = owner {
+                    folded.access.owners.insert(name.clone(), owner);
+                }
                 folded.tiers.insert(name, (namespace, valid_time));
-                folded.next_namespace = folded.next_namespace.max(namespace + 1);
+                // `saturating_add` matches every sibling allocator here: a
+                // hand-crafted `u64::MAX` namespace would otherwise wrap to 0
+                // and reopen an existing table's tier.
+                folded.next_namespace = folded.next_namespace.max(namespace.saturating_add(1));
                 folded.max_commit = folded.max_commit.max(at);
             }
             CatalogRecord::DropTable { at, name } => {
@@ -8242,6 +8927,9 @@ fn fold_catalog_records(records: Vec<CatalogRecord>) -> Result<ReplayedCatalog, 
                 // as the live session did ([STL-233]) — drops carry no
                 // per-index records.
                 folded.catalog.drop_table(&name, at)?;
+                // The owner and every grant go with the table ([ADR-0034]), so
+                // a name re-created later starts with a clean privilege slate.
+                folded.access.forget_table(&name);
                 // Records are in log order, so the last drop for a name wins.
                 folded.latest_drop.insert(name, at);
                 folded.max_commit = folded.max_commit.max(at);
@@ -8265,18 +8953,92 @@ fn fold_catalog_records(records: Vec<CatalogRecord>) -> Result<ReplayedCatalog, 
             // The user store ([STL-252]): the latest create/alter's verifier
             // wins, a drop removes the name. Records are in log order, so
             // plain map mutations reproduce the acknowledged end state.
-            CatalogRecord::CreateUser { at, name, verifier }
-            | CatalogRecord::AlterUser { at, name, verifier } => {
-                folded.users.insert(name, verifier);
+            CatalogRecord::CreateUser {
+                at,
+                name,
+                verifier,
+                superuser,
+            } => {
+                folded.users.insert(
+                    name,
+                    Role {
+                        verifier,
+                        superuser,
+                    },
+                );
+                folded.max_commit = folded.max_commit.max(at);
+            }
+            // A password rotation replaces the verifier and **keeps** the
+            // attributes: `ALTER USER … PASSWORD` is not a way to drop or gain
+            // superuser.
+            CatalogRecord::AlterUser { at, name, verifier } => {
+                let superuser = folded.users.get(&name).is_some_and(|r| r.superuser);
+                folded.users.insert(
+                    name,
+                    Role {
+                        verifier,
+                        superuser,
+                    },
+                );
                 folded.max_commit = folded.max_commit.max(at);
             }
             CatalogRecord::DropUser { at, name } => {
                 folded.users.remove(&name);
+                folded.access.forget_role(&name);
+                folded.max_commit = folded.max_commit.max(at);
+            }
+            CatalogRecord::Grant {
+                at,
+                table,
+                grantee,
+                privileges,
+            } => {
+                folded.access.grant(&table, &grantee, &privileges);
+                folded.max_commit = folded.max_commit.max(at);
+            }
+            CatalogRecord::Revoke {
+                at,
+                table,
+                grantee,
+                privileges,
+            } => {
+                folded.access.revoke(&table, &grantee, &privileges);
                 folded.max_commit = folded.max_commit.max(at);
             }
         }
     }
     Ok(folded)
+}
+
+/// Collect every **base table** a bound `SELECT` reads into `out`.
+///
+/// Walks all five places a relation can hide: the statement's own table, every
+/// join side, every CTE body, and a `WHERE` subquery. Query-local names — CTE
+/// names, and the alias a derived table resolves under — are subtracted at the
+/// end, because they name a result set this statement computed, not a catalog
+/// table an authorization check could resolve.
+fn collect_select_tables(bound: &BoundSelect, out: &mut BTreeSet<String>) {
+    if let Some(join) = &bound.join {
+        // N-way left-deep: the left side plus one right side per step.
+        out.insert(join.left.table.clone());
+        for step in &join.steps {
+            out.insert(step.right.table.clone());
+        }
+    } else if bound.relation_columns.is_none() {
+        // `relation_columns` is `Some` exactly when `table` names a CTE or
+        // derived relation rather than a catalog table.
+        out.insert(bound.table.clone());
+    }
+    for cte in &bound.ctes {
+        collect_select_tables(&cte.plan, out);
+    }
+    if let Some(filter) = &bound.subquery_filter {
+        collect_select_tables(&filter.subquery, out);
+    }
+    // A CTE name can also appear as a join side, so subtract after the walk.
+    for cte in &bound.ctes {
+        out.remove(&cte.name);
+    }
 }
 
 /// Derive a fresh SCRAM verifier for `password` under an OS-entropy salt and
@@ -14385,6 +15147,151 @@ mod tests {
             vec![encode_value(&ScalarValue::Int4(200))],
             "first committer wins; the conflicting transaction had no effect"
         );
+    }
+
+    /// Every staging shape records a conflict anchor, not just the point path.
+    ///
+    /// A statement that expands into several per-key writes — a multi-row
+    /// `INSERT`, a scan-driven `UPDATE`/`DELETE`, a `MERGE`, a staged `COPY` —
+    /// buffers them in one go. If such a site added writes without anchors, the
+    /// commit-time pairing would silently cover only the shorter prefix and
+    /// those writes would skip conflict detection altogether: a lost update,
+    /// reintroduced by omission. This walks each shape and asserts the
+    /// concurrent write still conflicts.
+    #[test]
+    fn every_staging_shape_anchors_its_writes_for_conflict_detection() {
+        // (label, the statement that stages, the key a concurrent writer takes)
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "multi-row INSERT",
+                "INSERT INTO account VALUES (7, 700), (8, 800)",
+                "INSERT INTO account VALUES (7, 1)",
+            ),
+            (
+                "scan UPDATE",
+                "UPDATE account SET balance = 5 WHERE balance = 100",
+                "UPDATE account SET balance = 50 WHERE id = 1",
+            ),
+            (
+                "scan DELETE",
+                "DELETE FROM account WHERE balance = 100",
+                "UPDATE account SET balance = 50 WHERE id = 1",
+            ),
+            (
+                "MERGE",
+                "MERGE INTO account USING (VALUES (1, 900)) AS s(id, balance)                  ON account.id = s.id                  WHEN MATCHED THEN UPDATE SET balance = s.balance",
+                "UPDATE account SET balance = 50 WHERE id = 1",
+            ),
+        ];
+
+        for (label, staged, concurrent) in cases {
+            let mut engine = session();
+            engine.execute(&parse_one(CREATE)).expect("create");
+            engine
+                .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+                .expect("seed");
+
+            let mut txn = engine.begin();
+            engine
+                .stage_dml(&parse_one(staged), &mut txn)
+                .unwrap_or_else(|e| panic!("{label}: stage: {e}"));
+            assert_eq!(
+                txn.writes.len(),
+                txn.write_anchors.len(),
+                "{label}: every buffered write needs an anchor",
+            );
+
+            // A concurrent transaction commits a key this block staged.
+            engine
+                .execute(&parse_one(concurrent))
+                .expect("concurrent commit");
+
+            let err = engine.commit(txn).unwrap_err();
+            assert!(
+                matches!(err, EngineError::Conflict),
+                "{label}: the staged write must conflict, got {err:?}",
+            );
+        }
+    }
+
+    /// A re-pin must not forgive a conflict against a write staged before it.
+    ///
+    /// The read pin advances mid-block — after a DDL auto-commits, and before
+    /// every statement under READ COMMITTED. Anchoring the conflict check on
+    /// that moving pin loses updates: the concurrent commit lands *below* the
+    /// advanced pin, the check passes, and this transaction overwrites it with
+    /// a value computed from the version it read at `BEGIN`. Each write is
+    /// therefore anchored at the snapshot it was staged under.
+    #[test]
+    fn a_repin_does_not_forgive_a_conflict_against_an_already_staged_write() {
+        for repin_via_ddl in [true, false] {
+            let mut engine = session();
+            engine.execute(&parse_one(CREATE)).expect("create");
+            engine
+                .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+                .expect("seed");
+
+            let mut txn = if repin_via_ddl {
+                engine.begin()
+            } else {
+                engine.begin_with_isolation(IsolationLevel::ReadCommitted)
+            };
+            // Staged from balance = 100, the value visible at this snapshot.
+            engine
+                .stage_dml(
+                    &parse_one("UPDATE account SET balance = 90 WHERE id = 1"),
+                    &mut txn,
+                )
+                .expect("stage");
+
+            // A concurrent transaction commits the same key.
+            engine
+                .execute(&parse_one("UPDATE account SET balance = 50 WHERE id = 1"))
+                .expect("concurrent commit");
+
+            // Something moves the read pin past that commit: a DDL that
+            // auto-commits inside the block, or — under READ COMMITTED — any
+            // ordinary statement.
+            if repin_via_ddl {
+                engine
+                    .execute_in_txn(
+                        &parse_one(
+                            "CREATE TABLE scratch (id INT PRIMARY KEY, v INT) \
+                             WITH SYSTEM VERSIONING",
+                        ),
+                        &mut txn,
+                    )
+                    .expect("ddl in txn");
+            } else {
+                engine
+                    .execute_in_txn(&parse_one("SELECT balance FROM account"), &mut txn)
+                    .expect("read re-pins under READ COMMITTED");
+            }
+
+            let err = engine.commit(txn).unwrap_err();
+            assert!(
+                matches!(err, EngineError::Conflict),
+                "re-pin via {}: the staged write must still conflict, got {err:?}",
+                if repin_via_ddl {
+                    "DDL"
+                } else {
+                    "READ COMMITTED"
+                }
+            );
+
+            // The concurrent writer's value stands — no lost update.
+            let StatementOutcome::Rows(result) = engine
+                .execute(&parse_one("SELECT balance FROM account"))
+                .expect("select")
+            else {
+                panic!("rows");
+            };
+            assert_eq!(
+                payload_column(&result),
+                vec![encode_value(&ScalarValue::Int4(50))],
+                "the first committer's write survives the re-pinned transaction"
+            );
+        }
     }
 
     #[test]

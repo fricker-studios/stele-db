@@ -223,6 +223,19 @@ fn run(engine: &mut SessionEngine<ZeroClock, MemDisk>, sql: &str) {
     engine.execute(&stmt).expect("execute");
 }
 
+/// Run an admin statement as the operator, restoring the test's write principal
+/// afterwards.
+///
+/// The admin verbs are superuser-only ([ADR-0034]) while these tests deliberately
+/// write as an ordinary role to exercise provenance stamping — so the flush is
+/// issued the way it happens in production, by the operator rather than the
+/// application role, and the provenance under test is untouched by it.
+fn run_as_operator(engine: &mut SessionEngine<ZeroClock, MemDisk>, sql: &str, principal: &str) {
+    engine.set_principal(Principal::new(b"stele".to_vec()));
+    run(engine, sql);
+    engine.set_principal(Principal::new(principal.as_bytes().to_vec()));
+}
+
 /// Run a `SELECT` and return its full result (columns + rows).
 fn select(engine: &mut SessionEngine<ZeroClock, MemDisk>, sql: &str) -> SelectResult {
     let stmt = parse(sql).expect("parse").remove(0);
@@ -403,7 +416,7 @@ fn provenance_survives_flush_to_sealed_segments() {
 
         // Seal every delta into a segment; the version provenance now lives in the
         // segment's `TxnId` / `CommittedAt` / `Principal` columns.
-        run(&mut engine, "FLUSH");
+        run_as_operator(&mut engine, "FLUSH", principal);
 
         let live = select(&mut engine, &format!("{FULL_SELECT} ORDER BY id"));
         assert_eq!(

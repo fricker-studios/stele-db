@@ -30,8 +30,8 @@ use stele_common::time::SystemTimeMicros;
 
 use crate::backend::{Disk, DiskFile};
 use crate::bloom::KeyBloom;
-use crate::checksum::crc32c;
-use crate::delta::{BusinessKey, Version};
+use crate::checksum::{Crc32c, crc32c};
+use crate::delta::{BusinessKey, MAX_VERSION_FRAME_LEN, Version};
 use crate::validity::Close;
 use crate::validtime::{ValidIntervalSummary, reframe_payload};
 
@@ -43,6 +43,19 @@ use super::format::{
     code_width_for,
 };
 use super::zone_map::{Predicate, ZoneBound, ZoneEnd, ZoneMap};
+
+/// Ceiling on the bytes one column chunk may decode into.
+///
+/// Every codec but [`Codec::Dict`] emits at most its own payload length, so the
+/// file size bounds them. Dictionary decoding is the exception: `value_count`
+/// codes each re-materialize a whole entry, so output is `codes × entry_len`
+/// — a *product* of two independently payload-bounded quantities, and a
+/// crafted chunk pairing one 16 MiB entry with millions of one-byte codes
+/// names terabytes from a ~32 MB file. This cap is what keeps a hostile or
+/// corrupt segment from turning recovery into an OOM. Legitimate segments are
+/// orders of magnitude below it — a default row-group is 1024 rows, so
+/// reaching 4 GiB needs a ~4 MiB mean value per row in a single group.
+const MAX_DECODED_CHUNK_LEN: usize = 4 * 1024 * 1024 * 1024;
 
 /// Decoded contents of one projected column chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1269,14 +1282,17 @@ fn read_chunk_payload<F: DiskFile>(
     // payload bytes. This is the same byte range the writer fed into
     // `crc32c` before stamping the CRC into header[12..16], so a flip
     // anywhere in those bytes — or in the CRC field itself — fails this
-    // comparison.
-    let mut crc_input = Vec::with_capacity(12 + payload_len);
-    crc_input.extend_from_slice(&buf[0..12]);
-    crc_input.extend_from_slice(&buf[CHUNK_HEADER_LEN..]);
-    if crc32c(&crc_input) != crc {
+    // comparison. Folding the two discontiguous pieces incrementally (and
+    // draining the header off `buf` in place) checksums and returns the
+    // payload without ever copying it.
+    let mut hasher = Crc32c::new();
+    hasher.update(&buf[0..12]);
+    hasher.update(&buf[CHUNK_HEADER_LEN..]);
+    if hasher.finish() != crc {
         return Err(SegmentError::Corrupt("chunk CRC mismatch"));
     }
-    Ok(buf[CHUNK_HEADER_LEN..].to_vec())
+    buf.drain(..CHUNK_HEADER_LEN);
+    Ok(buf)
 }
 
 /// Decode one bytes chunk's cells, dispatched on its codec, into `out` as
@@ -1379,14 +1395,41 @@ fn decode_dict_bytes_chunk(
         if len == BYTES_NULL_SENTINEL {
             dict.push(None);
         } else {
-            dict.push(Some(p.bytes(len as usize)?.to_vec()));
+            let len = len as usize;
+            // A single stored value can never exceed the delta frame limit the
+            // write path enforces, so a longer dictionary entry did not come
+            // from this engine. Re-imposing the write-path bound here is what
+            // keeps the expansion below proportional to real data.
+            if len > MAX_VERSION_FRAME_LEN {
+                return Err(SegmentError::TooLarge(
+                    "dictionary entry exceeds frame limit",
+                ));
+            }
+            dict.push(Some(p.bytes(len)?.to_vec()));
         }
     }
+    // Dictionary decoding is the one codec whose output is not bounded by its
+    // input: `value_count` codes each re-materialize a whole entry, so a
+    // crafted chunk pairing one huge entry with many one-byte codes expands
+    // quadratically (a ~32 MB chunk can name ~256 TiB of output). The codes
+    // and entries are individually payload-bounded, but their *product* is
+    // not — so bound the running total. Legitimate segments are nowhere near
+    // this: a default row-group is 1024 rows, so reaching the cap needs a
+    // ~4 MiB mean value per row in one group.
+    let mut expanded: usize = 0;
     for _ in 0..value_count {
         let code = p.code(code_width)? as usize;
         let entry = dict
             .get(code)
             .ok_or(SegmentError::Corrupt("dictionary code out of range"))?;
+        if let Some(bytes) = entry {
+            expanded = expanded.saturating_add(bytes.len());
+            if expanded > MAX_DECODED_CHUNK_LEN {
+                return Err(SegmentError::TooLarge(
+                    "dictionary column expands past the decode limit",
+                ));
+            }
+        }
         out.push(entry.clone());
     }
     if !p.is_empty() {

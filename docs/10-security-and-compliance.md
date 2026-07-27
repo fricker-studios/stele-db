@@ -197,12 +197,14 @@ database role, is a deliberate follow-up: today a verified certificate simply
 
 Layered, least-privilege:
 
-- **RBAC** — `GRANT`/`REVOKE` on objects; roles composed for least privilege (v0.5).
+- **RBAC** — `GRANT`/`REVOKE` on objects; roles composed for least privilege. **The core landed in v0.3** ([ADR-0034](adr/0034-role-based-access-control.md)): roles and users are one namespace, every table records the role that created it as its **owner**, and `SELECT`/`INSERT`/`UPDATE`/`DELETE` are granted per table to a role or to `PUBLIC`. A `SUPERUSER` role bypasses every check and is what gates the operations with no object to grant on — role DDL and the admin verbs (`BACKUP`, `CHECKPOINT`, `FLUSH`, `COMPACT`). An ordinary role may rotate **its own** password but no one else's. A denial is SQLSTATE `42501`. Still deferred to v0.5: role *membership* (`GRANT <role> TO <role>`), `WITH GRANT OPTION`, and column-scoped grants — each is **rejected** by the binder rather than silently widened.
 - **Row-level security (RLS)** — policy-based row visibility, pairing naturally with the audit/lineage model (v0.5).
 - **Column-level security & dynamic masking** — column grants plus masking/redaction of sensitive fields (PII/PHI/PAN) so analysts see only what they're entitled to (v0.7).
 - **ABAC / policy engine** — attribute/policy-based access (purpose, data classification, clearance) beyond static roles (v0.7+).
-- The **admin/control-plane API shares the same identities and authZ** as the SQL surface ([ADR-0016](adr/0016-admin-control-plane-api.md)) — one authorization model, not two.
-- **Temporal access control.** Time-travel must never become a privilege-escalation channel: an as-of read enforces the **current** access policy by default (you cannot read data as-of a time *before* you had access), with an optional as-of-policy mode where a use case genuinely requires it.
+- The **admin/control-plane API shares the same identities and authZ** as the SQL surface ([ADR-0016](adr/0016-admin-control-plane-api.md)) — one authorization model, not two. *(v0.3 status: the SQL surface enforces roles; the admin gRPC/HTTP surface is still gated by its coarser bearer token — threading the role identity through it is tracked in the [audit backlog](audit-2026-07.md).)*
+
+**Bootstrapping a role model.** A fresh database has no roles, so the built-in server identity `stele` is a superuser by construction and has no stored credential ([ADR-0034](adr/0034-role-based-access-control.md) decision 8). Under `auth = "scram"` no client can authenticate *as* it, so the path is explicit: boot once on loopback with `auth = "trust"` (or `--dev`), run `CREATE USER <name> SUPERUSER PASSWORD '…'`, then switch to `scram`. Verifiers and grants are durable, so they survive the restart.
+- **Temporal access control.** Time-travel must never become a privilege-escalation channel: an as-of read enforces the **current** access policy by default (you cannot read data as-of a time *before* you had access), with an optional as-of-policy mode where a use case genuinely requires it. **Implemented in v0.3**: privilege state is deliberately *not* bitemporal — it lives in the engine's live store, replayed from the catalog log — so a `SELECT … FOR SYSTEM_TIME AS OF <past>` resolves against the grants that exist *now*. Revoking a privilege cannot be undone by naming an instant before the `REVOKE`, and a new grant is immediately effective for history the role could not previously read.
 
 ## 7. Access auditing & monitoring
 

@@ -69,6 +69,20 @@ pub enum CatalogError {
     #[error("table {0:?} already exists")]
     TableAlreadyExists(String),
 
+    /// A DDL statement was routed to [`DdlStatement::apply`] that the catalog
+    /// does not own. User/role DDL and `GRANT`/`REVOKE` mutate the engine's
+    /// durable role store, not the schema catalog, so the engine matches those
+    /// variants itself and never routes them here — reaching this is a routing
+    /// bug in a caller.
+    ///
+    /// It is an error rather than a panic on purpose: `apply` is public API and
+    /// the release profile aborts on panic, so a mis-routing by any caller
+    /// would kill the process rather than fail one statement.
+    ///
+    /// [`DdlStatement::apply`]: ../stele_sql/ddl/enum.DdlStatement.html#method.apply
+    #[error("{0} is applied by the engine's role store, not the schema catalog")]
+    NotCatalogDdl(&'static str),
+
     /// An operation referenced a table not registered in the catalog — or one
     /// that existed once but has since been dropped, so it is not *currently*
     /// live. A read `AS OF` a past instant may still see it; a mutation cannot.

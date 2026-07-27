@@ -227,10 +227,23 @@ fn lift_explain(tokens: &[Token]) -> Result<Option<ExplainStmt>, ParseError> {
     if rest.is_empty() {
         return Err(syntax("EXPLAIN requires a statement to explain"));
     }
+    // Reject a nested EXPLAIN *before* recursing, not after. `parse_one` re-enters
+    // this function, so testing the parsed inner instead would descend once per
+    // leading `EXPLAIN` token first — and because each level builds a fresh
+    // `Parser`, sqlparser's own depth guard never applies. `EXPLAIN EXPLAIN …`
+    // repeated a few thousand times (well inside the wire's 16 MiB message cap)
+    // would overflow the stack, which under `panic = "abort"` kills the whole
+    // server, not one connection. Deciding it here from the token stream bounds
+    // the recursion at depth one and drops the quadratic `to_vec` chain with it.
+    if rest.first().is_some_and(|t| word_is(t, "EXPLAIN")) {
+        return Err(syntax(
+            "EXPLAIN supports only a SELECT / INSERT / UPDATE / DELETE statement",
+        ));
+    }
     let inner = parse_one(rest.to_vec())?;
-    // EXPLAIN renders a query/DML plan; an admin/session/user command or a nested
-    // EXPLAIN has no plan to render. (A DDL body parses as `Sql` and is rejected
-    // later, at bind time, with a clearer message.)
+    // EXPLAIN renders a query/DML plan; an admin/session/user command has no plan
+    // to render. (A DDL body parses as `Sql` and is rejected later, at bind time,
+    // with a clearer message.)
     if !matches!(inner.body, StatementBody::Sql(_)) {
         return Err(syntax(
             "EXPLAIN supports only a SELECT / INSERT / UPDATE / DELETE statement",
@@ -346,9 +359,22 @@ fn lift_user_ddl(tokens: &[Token]) -> Result<Option<UserDdl>, ParseError> {
     if rest.first().is_some_and(|t| word_is(t, "WITH")) {
         rest = &rest[1..];
     }
+    // `SUPERUSER` ([ADR-0034]) — the one role attribute v0.3 carries, and only
+    // on CREATE: an attribute change is not a password rotation, so `ALTER USER`
+    // deliberately has no route to granting or dropping it.
+    let mut superuser = false;
+    if rest.first().is_some_and(|t| word_is(t, "SUPERUSER")) {
+        if verb == "ALTER" {
+            return Err(syntax(
+                "SUPERUSER cannot be set by ALTER USER — create the role with it".to_owned(),
+            ));
+        }
+        superuser = true;
+        rest = &rest[1..];
+    }
     let [password_kw, password_tok] = rest else {
         return Err(syntax(format!(
-            "expected {verb} USER <name> [WITH] PASSWORD '<password>'"
+            "expected {verb} USER <name> [WITH] [SUPERUSER] PASSWORD '<password>'"
         )));
     };
     if !word_is(password_kw, "PASSWORD") {
@@ -370,6 +396,7 @@ fn lift_user_ddl(tokens: &[Token]) -> Result<Option<UserDdl>, ParseError> {
         UserDdl::CreateUser {
             name: name.value,
             password,
+            superuser,
         }
     } else {
         UserDdl::AlterUserPassword {
@@ -669,6 +696,12 @@ fn parse_valid_time_clause(
 /// [`ParseError`] if a qualifier has no/ill-formed operand, if a second range
 /// qualifier appears, or if a `FOR <axis>` is followed by none of `AS OF` /
 /// `FROM` / `BETWEEN` (e.g. the unsupported `FOR SYSTEM_TIME ALL`).
+/// Ceiling on `FOR … AS OF` qualifiers accepted off one token stream.
+///
+/// One per axis is the most the binder will accept, so this leaves headroom and
+/// still refuses the pathological runs that make the lift quadratic.
+const MAX_AS_OF_QUALIFIERS: usize = 8;
+
 fn lift_temporal_qualifiers(
     tokens: &mut Vec<Token>,
     dialect: &SteleDialect,
@@ -700,6 +733,18 @@ fn lift_temporal_qualifiers(
         if keyword.is_some_and(|t| word_is(t, "AS"))
             && tokens.get(i + 3).is_some_and(|t| word_is(t, "OF"))
         {
+            // Each operand parse copies the token suffix it is handed, so an
+            // unbounded run of qualifiers is Θ(qualifiers × tokens) of
+            // String-allocating clones — a single ordinary-looking statement
+            // could stall a runtime worker for minutes. The binder accepts at
+            // most one qualifier per axis (`SelectError::MultipleAsOf`), so any
+            // stream past this cap is already invalid; refusing it here bounds
+            // the work without changing what a valid statement does.
+            if as_of.len() >= MAX_AS_OF_QUALIFIERS {
+                return Err(ParseError::Syntax(ParserError::ParserError(
+                    "too many FOR … AS OF qualifiers".to_owned(),
+                )));
+            }
             let (timestamp, consumed) = parse_as_of_expr(&tokens[i + 4..], dialect)?;
             as_of.push(AsOf {
                 dimension,
