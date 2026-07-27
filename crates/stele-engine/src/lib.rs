@@ -703,6 +703,44 @@ impl SessionTransaction {
         self.isolation = isolation;
     }
 
+    /// Buffer one bound write, anchored at the snapshot it was resolved against.
+    ///
+    /// **The only way to add to the write set**, together with
+    /// [`stage_all`](Self::stage_all). `writes` and
+    /// [`write_anchors`](Self::write_anchors) must stay exactly parallel —
+    /// [`SessionEngine::commit`] pairs them by index to conflict-check each
+    /// write against its own anchor — and a bare `writes.push` at any of the
+    /// five staging sites would silently desynchronize them. Routing every site
+    /// through here makes that drift unrepresentable rather than a convention
+    /// to remember.
+    fn stage(&mut self, dml: BoundDml, anchor: SystemTimeMicros) {
+        self.writes.push(dml);
+        self.write_anchors.push(anchor);
+    }
+
+    /// Buffer several bound writes that all resolved at the same snapshot — the
+    /// expansion of one statement (a multi-row `INSERT`, a scan-driven
+    /// `UPDATE`/`DELETE`, a `MERGE`, a staged `COPY`) into per-key writes.
+    ///
+    /// They share `anchor` because they share a statement: the expansion read
+    /// the rows it matched at that one snapshot.
+    fn stage_all(&mut self, dmls: impl IntoIterator<Item = BoundDml>, anchor: SystemTimeMicros) {
+        for dml in dmls {
+            self.stage(dml, anchor);
+        }
+    }
+
+    /// The buffered writes and their anchors, in staging order — paired, so a
+    /// caller cannot read one without the other.
+    fn staged(&self) -> impl Iterator<Item = (&BoundDml, SystemTimeMicros)> {
+        debug_assert_eq!(
+            self.writes.len(),
+            self.write_anchors.len(),
+            "write anchors must stay parallel to writes",
+        );
+        self.writes.iter().zip(self.write_anchors.iter().copied())
+    }
+
     /// Establish a savepoint at the current write position (`SAVEPOINT name`,
     /// [STL-176]).
     ///
@@ -2649,7 +2687,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         self.refuse_if_commit_poisoned()?;
         let dml = self.bind_copy_insert(stmt, txn.snapshot, rows)?;
         let (writes, summary) = expand_insert_rows(dml);
-        txn.writes.extend(writes);
+        txn.stage_all(writes, txn.snapshot);
         match summary {
             DmlSummary::Insert(n) => Ok(n),
             _ => unreachable!("expand_insert_rows of InsertRows summarizes as Insert"),
@@ -7788,7 +7826,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // only ever sees per-key writes.
             Ok(dml @ (BoundDml::UpdateScan { .. } | BoundDml::DeleteScan { .. })) => {
                 let (writes, summary) = self.expand_scan_dml(dml, txn.snapshot, &txn.writes)?;
-                txn.writes.extend(writes);
+                txn.stage_all(writes, txn.snapshot);
                 Ok(Some(summary))
             }
             // A MERGE expands at staging the same way ([STL-230]): the probe and
@@ -7797,7 +7835,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // [STL-203]), and the buffer only ever holds the per-key writes.
             Ok(BoundDml::Merge(merge)) => {
                 let (writes, summary) = self.expand_merge(&merge, txn.snapshot, &txn.writes)?;
-                txn.writes.extend(writes);
+                txn.stage_all(writes, txn.snapshot);
                 Ok(Some(summary))
             }
             // A multi-row INSERT ([STL-228]) expands at staging into one buffered
@@ -7807,7 +7845,7 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
             // commit them as one atomic group. The tag reports the row count now.
             Ok(dml @ BoundDml::InsertRows { .. }) => {
                 let (writes, summary) = expand_insert_rows(dml);
-                txn.writes.extend(writes);
+                txn.stage_all(writes, txn.snapshot);
                 Ok(Some(summary))
             }
             Ok(dml) => {
@@ -7824,11 +7862,10 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
                     return Ok(Some(summary));
                 }
                 let summary = dml_summary(&dml);
-                txn.writes.push(dml);
-                // Anchor this write at the snapshot it was just bound and
-                // resolved against, so a later re-pin cannot forgive a
-                // conflict it should abort on.
-                txn.write_anchors.push(txn.snapshot);
+                // Anchored at the snapshot it was just bound and resolved
+                // against, so a later re-pin cannot forgive a conflict it
+                // should abort on.
+                txn.stage(dml, txn.snapshot);
                 Ok(Some(summary))
             }
             Err(DmlError::NotDml) => Ok(None),
@@ -7906,7 +7943,13 @@ impl<C: Clock + Clone, D: Disk + Clone> SessionEngine<C, D> {
         // would let a commit that landed before the re-pin slip past the check —
         // silently overwriting it with a value derived from a version that is no
         // longer current. See [`SessionTransaction::write_anchors`].
-        for (dml, &anchor) in txn.writes.iter().zip(&txn.write_anchors) {
+        // `staged()` pairs each write with its own anchor. It is deliberately
+        // the only reader: iterating the two vectors with a bare `zip` here
+        // would silently *truncate* to the shorter one, so a staging site that
+        // forgot to record an anchor would skip conflict detection for its
+        // writes entirely — turning a missed line into a silent lost update
+        // rather than a loud failure.
+        for (dml, anchor) in txn.staged() {
             let key = (dml.table().to_owned(), dml_business_key(dml));
             if self
                 .write_index
@@ -14442,6 +14485,71 @@ mod tests {
             vec![encode_value(&ScalarValue::Int4(200))],
             "first committer wins; the conflicting transaction had no effect"
         );
+    }
+
+    /// Every staging shape records a conflict anchor, not just the point path.
+    ///
+    /// A statement that expands into several per-key writes — a multi-row
+    /// `INSERT`, a scan-driven `UPDATE`/`DELETE`, a `MERGE`, a staged `COPY` —
+    /// buffers them in one go. If such a site added writes without anchors, the
+    /// commit-time pairing would silently cover only the shorter prefix and
+    /// those writes would skip conflict detection altogether: a lost update,
+    /// reintroduced by omission. This walks each shape and asserts the
+    /// concurrent write still conflicts.
+    #[test]
+    fn every_staging_shape_anchors_its_writes_for_conflict_detection() {
+        // (label, the statement that stages, the key a concurrent writer takes)
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "multi-row INSERT",
+                "INSERT INTO account VALUES (7, 700), (8, 800)",
+                "INSERT INTO account VALUES (7, 1)",
+            ),
+            (
+                "scan UPDATE",
+                "UPDATE account SET balance = 5 WHERE balance = 100",
+                "UPDATE account SET balance = 50 WHERE id = 1",
+            ),
+            (
+                "scan DELETE",
+                "DELETE FROM account WHERE balance = 100",
+                "UPDATE account SET balance = 50 WHERE id = 1",
+            ),
+            (
+                "MERGE",
+                "MERGE INTO account USING (VALUES (1, 900)) AS s(id, balance)                  ON account.id = s.id                  WHEN MATCHED THEN UPDATE SET balance = s.balance",
+                "UPDATE account SET balance = 50 WHERE id = 1",
+            ),
+        ];
+
+        for (label, staged, concurrent) in cases {
+            let mut engine = session();
+            engine.execute(&parse_one(CREATE)).expect("create");
+            engine
+                .execute(&parse_one("INSERT INTO account VALUES (1, 100)"))
+                .expect("seed");
+
+            let mut txn = engine.begin();
+            engine
+                .stage_dml(&parse_one(staged), &mut txn)
+                .unwrap_or_else(|e| panic!("{label}: stage: {e}"));
+            assert_eq!(
+                txn.writes.len(),
+                txn.write_anchors.len(),
+                "{label}: every buffered write needs an anchor",
+            );
+
+            // A concurrent transaction commits a key this block staged.
+            engine
+                .execute(&parse_one(concurrent))
+                .expect("concurrent commit");
+
+            let err = engine.commit(txn).unwrap_err();
+            assert!(
+                matches!(err, EngineError::Conflict),
+                "{label}: the staged write must conflict, got {err:?}",
+            );
+        }
     }
 
     /// A re-pin must not forgive a conflict against a write staged before it.
