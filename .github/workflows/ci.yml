@@ -72,7 +72,6 @@ jobs:
       matrix:
         include:
           - { os: arc-runner-fricker-amd64, target: x86_64-unknown-linux-gnu }
-          - { os: macos-latest,  target: aarch64-apple-darwin }
     runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && startsWith(matrix.os, 'arc-')) && 'ubuntu-latest' || matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -87,6 +86,30 @@ jobs:
       # per-PR test run — its bundled-amalgamation compile runs only in the
       # nightly `duckdb-oracle` job (STL-158). Per-PR temporal coverage still
       # comes from the in-process oracles (STL-111, STL-138).
+      - run: cargo nextest run --workspace --exclude stele-exec-oracle --all-features
+      - run: cargo test --doc --workspace --exclude stele-exec-oracle --all-features
+
+  # The same test gate on macOS, on dev-macbook — the homelab's macOS VM
+  # (homelab dev-macbook/) and the org's only macOS runner. A job of its own
+  # rather than a `test` matrix row so that it can skip pull requests from
+  # forks: that machine is also a developer's workstation, and untrusted code
+  # never runs on it. It is an Intel guest, so the native target is
+  # x86_64-apple-darwin; release.yml still ships aarch64-apple-darwin,
+  # cross-compiled, but no job test-runs it any more.
+  test-macos:
+    name: test (x86_64-apple-darwin)
+    needs: quick
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ vars.MACOS_RUNNER_LABEL || 'fricker-macos' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (no semver tags)
+        with:
+          toolchain: "1.89.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
+        with:
+          tool: nextest
       - run: cargo nextest run --workspace --exclude stele-exec-oracle --all-features
       - run: cargo test --doc --workspace --exclude stele-exec-oracle --all-features
 
