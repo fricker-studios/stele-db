@@ -109,8 +109,8 @@ fifth arguments). A wrong password is asserted to be refused with the `FATAL`
 
 | Tier | Targets | When |
 |---|---|---|
-| **Tier 1 (gating)** | `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` (macOS arm64) | Every PR |
-| **Tier 2** | `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin` | Nightly + release |
+| **Tier 1 (gating)** | `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin` (macOS, on dev-macbook; skipped for PRs from forks) | Every PR |
+| **Tier 2** | `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin` (cross-compiled on dev-macbook; built, not test-run) | Nightly + release |
 | **Tier 3 (best effort)** | `x86_64-pc-windows-msvc` | Every PR (build + storage tests) + release |
 
 Rationale in [assumption A6](assumptions.md): servers run Linux; contributors develop on macOS; Windows is built but not prioritized. The storage backend's positioned read is platform-split (`pread` on Unix, `seek_read` on Windows — STL-160); a dedicated per-PR `windows` job in `ci.yml` compiles the whole workspace (test targets included) and runs the storage backend suite — the one surface where platform file semantics diverge (append-mode writes vs the file cursor) — and `release.yml` ships the `x86_64-pc-windows-msvc` archive. The full test gate stays tier-1-only; Windows coverage widens if a Windows-heavy contributor base appears (A6).
@@ -369,7 +369,7 @@ flowchart LR
 - **`Swatinem/rust-cache`** for incremental compile caching; **`sccache`** optionally for heavier matrices.
 - **`cargo-nextest`** for faster, more reliable test runs and **flaky-test retries with quarantine** (a flaky test is a bug ticket, not an ignored failure).
 - **Concurrency groups** cancel superseded runs to save minutes.
-- **Self-hosted runners** are an option later for the long sim/fuzz jobs if GitHub-hosted minutes become a constraint.
+- **Self-hosted runners** run CI and releases: Linux on the homelab's ARC pool, macOS on dev-macbook. Pull requests from forks run on GitHub-hosted (Linux) or skip (macOS), so untrusted code stays off the lab. Windows is GitHub-hosted. The repository variables `RUNNER_LABEL` and `MACOS_RUNNER_LABEL` send a release back to GitHub-hosted if the lab is down.
 
 ---
 
