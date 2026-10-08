@@ -42,7 +42,7 @@ env:
 jobs:
   quick:
     name: quick (fmt · clippy · typos)
-    runs-on: arc-runner-fricker-amd64
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'arc-runner-fricker-amd64' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (no semver tags)
@@ -73,7 +73,7 @@ jobs:
         include:
           - { os: arc-runner-fricker-amd64, target: x86_64-unknown-linux-gnu }
           - { os: macos-latest,  target: aarch64-apple-darwin }
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && startsWith(matrix.os, 'arc-')) && 'ubuntu-latest' || matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (no semver tags)
@@ -122,7 +122,7 @@ jobs:
   msrv:
     name: msrv (1.89.0)
     needs: quick
-    runs-on: arc-runner-fricker-amd64
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'arc-runner-fricker-amd64' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (no semver tags)
@@ -134,7 +134,7 @@ jobs:
   docs:
     name: docs build
     needs: quick
-    runs-on: arc-runner-fricker-amd64
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'arc-runner-fricker-amd64' }}
     env:
       RUSTDOCFLAGS: "-D warnings"
     steps:
@@ -148,7 +148,7 @@ jobs:
   supply-chain:
     name: cargo-deny
     needs: quick
-    runs-on: arc-runner-fricker-amd64
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'arc-runner-fricker-amd64' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
@@ -156,13 +156,15 @@ jobs:
   five-minute-path:
     name: five-minute path (docker identity demo)
     needs: quick
-    # GitHub-hosted: the Docker daemon and the postgresql-client (`psql`) the
-    # smoke test needs are both preinstalled. The self-hosted ARC runners are
-    # unprivileged k8s pods with no Docker daemon, so the image build/run lives
-    # here (same place codeql.yml runs). Only the SHA-pinned actions/checkout is
-    # used; everything else is the runner's stock `docker` CLI (ADR-0005 keeps
-    # the third-party action surface small).
-    runs-on: ubuntu-latest
+    # ARC, like the rest of CI. Its runners have a Docker-in-Docker sidecar in
+    # the same pod, so `docker run -p` publishes on localhost exactly as on a
+    # hosted runner, and the runner image carries the postgresql-client (`psql`)
+    # and the JDK the smoke tests need (homelab#499). Pull requests from forks
+    # run on GitHub-hosted instead, as every job here does: untrusted code stays
+    # off the lab. Only the SHA-pinned actions/checkout is used; everything else
+    # is the runner's stock `docker` CLI (ADR-0005 keeps the third-party action
+    # surface small).
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'arc-runner-fricker-amd64' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Build the canonical image
@@ -176,7 +178,8 @@ jobs:
       # The v0.2 driver exit gate (STL-184): real Postgres drivers run a
       # parameterized prepared query against the same running container. The
       # venv dodges the runner image's externally-managed system Python
-      # (PEP 668); java + python3 are both preinstalled on ubuntu-latest. The
+      # (PEP 668); java + python3 are in the ARC runner image (homelab#499),
+      # as on the ubuntu-latest that fork PRs get. The
       # driver versions are pinned — psycopg here, pgjdbc (jar + SHA-256) in
       # ci/jdbc-smoke.sh — and documented in docs/04-cicd.md.
       - name: Driver gate — psycopg runs a parameterized prepared query
