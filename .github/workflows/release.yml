@@ -11,11 +11,14 @@
 # Nothing publishes until `gate` (the full test gate) is green on the tagged
 # commit, so a tag can never ship a build that wouldn't have merged.
 #
-# Runners: unlike the per-PR workflows, every job here runs on GitHub-hosted
-# runners (free for this public repo). A release must not depend on the
-# homelab ARC pods being up, needs macOS/Windows cross-targets the ARC pool
-# can't provide, and needs network egress to ghcr.io/Docker Hub + Sigstore
-# that the unprivileged ARC pods lack (same reasoning as ci.yml's docker job).
+# Runners: the Linux jobs run on the homelab ARC pool (`vars.RUNNER_LABEL`,
+# default arc-runner-fricker-amd64). Its pods have Docker-in-Docker, open
+# egress to ghcr.io, Docker Hub and Sigstore, and gh in the image
+# (homelab#499). A release must not depend on the lab being up, so the label
+# is a repository variable: set RUNNER_LABEL=ubuntu-latest (or the -egress
+# pool, homelab aws/tailscale-exit-node) and the next tag releases without
+# it. The macOS targets run on GitHub-hosted macOS until dev-macbook takes
+# them; Windows stays GitHub-hosted (no Windows runner in the lab).
 #
 # All `uses:` are pinned to a 40-char commit SHA per ADR-0005 (reproducible
 # builds); the trailing `# vX.Y.Z` is kept in sync when Dependabot bumps them.
@@ -44,7 +47,7 @@ jobs:
   # matches the tag — a tag is a promise, so verify it before building anything.
   gate:
     name: gate (version + tests)
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'arc-runner-fricker-amd64' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -82,7 +85,7 @@ jobs:
   changelog:
     name: changelog
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'arc-runner-fricker-amd64' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -116,10 +119,10 @@ jobs:
           # `<arch>-linux` — the `-unknown-…-gnu` is redundant noise for users,
           # and glibc Linux is the only Linux flavor built (STL-262).
           # Tier 1
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, label: x86_64-linux, ext: "" }
+          - { os: "${{ vars.RUNNER_LABEL || 'arc-runner-fricker-amd64' }}", target: x86_64-unknown-linux-gnu, label: x86_64-linux, ext: "" }
           - { os: macos-latest, target: aarch64-apple-darwin, label: aarch64-apple-darwin, ext: "" }
           # Tier 2
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, label: aarch64-linux, ext: "", linker: gcc-aarch64-linux-gnu }
+          - { os: "${{ vars.RUNNER_LABEL || 'arc-runner-fricker-amd64' }}", target: aarch64-unknown-linux-gnu, label: aarch64-linux, ext: "", linker: gcc-aarch64-linux-gnu }
           # `macos-15-intel`, not the retired `macos-13`: GitHub removed the
           # macOS 13 (Intel) image under its N-1 OS policy (~Dec 2025), so a
           # `macos-13` job hangs `queued` forever with no runner. macos-15-intel
@@ -187,7 +190,7 @@ jobs:
   docker:
     name: docker (ghcr.io + Docker Hub)
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'arc-runner-fricker-amd64' }}
     permissions:
       contents: read
       packages: write # push to ghcr.io + the provenance attestation
@@ -296,7 +299,7 @@ jobs:
   release:
     name: release (sign + publish)
     needs: [gate, changelog, binaries, docker]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'arc-runner-fricker-amd64' }}
     permissions:
       contents: write # create the GitHub Release
       id-token: write # keyless cosign signing + Sigstore-signed provenance
@@ -403,7 +406,7 @@ jobs:
   publish-crate:
     name: publish (crates.io)
     needs: release
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'arc-runner-fricker-amd64' }}
     # The deployment environment that gates the publish: configure
     # CARGO_REGISTRY_TOKEN (a crates.io API token scoped to publish-update) and
     # any required reviewers on it in the repo settings.

@@ -46,10 +46,11 @@ permissions:
 jobs:
   analyze:
     name: analyze (${{ matrix.language }})
-    # Hosted runner: free for public repos, comes with the CodeQL bundle
-    # pre-cached. The self-hosted ARC runner used elsewhere isn't worth the
-    # setup cost for this workload.
-    runs-on: ubuntu-latest
+    # ARC, like the rest of CI; pull requests from forks run on GitHub-hosted.
+    # The cost, accepted: an ARC runner is a fresh pod, so codeql-action
+    # downloads its bundle (~0.5 GB) each run where a hosted runner has it
+    # pre-cached.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'arc-runner-fricker-amd64' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
